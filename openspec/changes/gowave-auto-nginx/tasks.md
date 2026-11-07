@@ -15,12 +15,13 @@
 ## 3. Host Security and Hardening Modules
 
 - [ ] 3.1 Port and adapt `assets/security/managed.py` for non-destructive SSH inspection via both `sshd -T` and `systemctl show ssh.socket -p Listen` without modifying user configuration files
-- [ ] 3.2 Implement transactional Fail2ban jail installation (`/etc/fail2ban/jail.d/90-gowave-auto-nginx.local`) protecting SSH and NGINX, verified via `fail2ban-client status`
+- [ ] 3.2 Implement transactional Fail2ban jail installation (`/etc/fail2ban/jail.d/90-gowave-auto-nginx.local`) with `python3-systemd` prerequisite, configuring `backend = systemd` monitoring both `ssh.service` and `ssh.socket` (`ssh@*.service`), verified via `fail2ban-client status`
 - [ ] 3.3 Implement strict DNS-over-TLS via `systemd-resolved` with Cloudflare and Google upstream servers, preserving link DNS search routes and rolling back on network failure
 - [ ] 3.4 Implement safe UFW firewall configuration: whitelist detected SSH ports before enabling UFW, open public web ports 80/443, deny external access to local Node port 3002, and isolate internal loopback listeners
-- [ ] 3.5 Implement optional swap allocation (2 GiB) with filesystem space checks (>= 2 GiB free), mode `0600`, and graceful skipping in containerized environments (OpenVZ/LXC)
+- [ ] 3.5 Implement automatic swap allocation (2 GiB) on KVM VPS with <= 1GB RAM using `dd if=/dev/zero`, mode `0600`, graceful skipping in containerized environments, and set `GOMEMLIMIT=250MiB` systemd drop-in
 - [ ] 3.6 Implement `unattended-upgrades` configuration with distro-specific security origins and `Unattended-Upgrade::Automatic-Reboot "false"` by default to prevent unexpected VPN downtime
-- [ ] 3.7 Implement conditional BBR congestion control tuning in `/etc/sysctl.d/99-gowave.conf`, active only after verifying `modprobe tcp_bbr` kernel availability
+- [ ] 3.7 Implement conditional BBR congestion control and MTU probing (`net.ipv4.tcp_mtu_probing = 1`) in `/etc/sysctl.d/99-gowave.conf`, persisting kernel module loading via `/etc/modules-load.d/bbr.conf`
+- [ ] 3.8 Implement NGINX and systemd log rotation policies: deploy `/etc/logrotate.d/gowave-nginx` with daily rotation and gzip compression, and cap systemd journal size to 100MB via `SystemMaxUse=100M`
 
 ## 4. GoWave Panel Native Deployment (All-in-One)
 
@@ -53,27 +54,27 @@
 
 - [ ] 7.1 Hook top-level Stream configuration in `/etc/nginx/nginx.conf` (`stream { include /etc/nginx/stream-enabled/*.conf; }`) outside `http {}`, and verify `libnginx-mod-stream` loading
 - [ ] 7.2 Implement NGINX Stream configuration on port 443 (`ssl_preread on; proxy_protocol on;`) routing `reality_domain` to 127.0.0.1:8443, `panel_domain` to 127.0.0.1:7443, and default/scanners to 127.0.0.1:8443
-- [ ] 7.3 Implement NGINX panel vhost on 127.0.0.1:7443 (`listen 127.0.0.1:7443 ssl proxy_protocol; set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`) with Let's Encrypt TLS termination and reverse proxying to GoWave at 127.0.0.1:3000
+- [ ] 7.3 Implement 3-stage Let's Encrypt TLS bootstrap sequence: deploy temporary port 80 webroot vhost (`/var/www/gowave-acme`), issue certificates via Certbot, remove bootstrap vhost, and deploy NGINX panel vhost on 127.0.0.1:7443 (`listen 127.0.0.1:7443 ssl proxy_protocol; set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`) with Let's Encrypt TLS termination and reverse proxying to GoWave at 127.0.0.1:3000 with `access_log off;` on streaming paths (`/xhttp-down/`, `/ws`, `/trojan-grpc`)
 - [ ] 7.4 Implement NGINX REALITY fallback vhost on 127.0.0.1:9443 (`listen 127.0.0.1:9443 ssl proxy_protocol; set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`) with REALITY domain TLS certificate and static camouflage site (`cover-reality`)
-- [ ] 7.5 Configure Certbot webroot ACME challenge on port 80 and automated renewal hook in `/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` reloading NGINX
+- [ ] 7.5 Configure Certbot webroot ACME challenge on port 80 and automated renewal hook in `/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` reloading NGINX after verifying `nginx -t -q`
 
 ## 8. Protocol Transport Profiles & API Provisioning
 
 - [ ] 8.1 Implement automated GoWave REST API provisioning client adhering to `API_CONTRACTS.md`: bootstrap initial admin via `POST /api/auth/register`, login via `POST /api/auth/login`, handle 12-hour HS256 JWT lifecycle, and implement automated 401 re-login and error taxonomy retry policy
-- [ ] 8.2 Generate x25519 keypair natively via GoWave REST API `GET /api/system/tools/x25519/generate` and provision a single unified Config Profile ("GoWave MVP Unified Profile") via `POST /api/config-profiles` embedding reference templates from `assets/xray/` (REALITY 8443, XHTTP 10001, WS 10002, Trojan gRPC 10003)
+- [ ] 8.2 Generate x25519 keypair natively via GoWave REST API `GET /api/system/tools/x25519/generate` and provision a single unified Config Profile ("GoWave MVP Unified Profile") via `POST /api/config-profiles` embedding reference templates from `assets/xray/` (including `tcpSettings.acceptProxyProtocol: true` on REALITY 8443, XHTTP 10001, WS 10002, Trojan gRPC 10003)
 - [ ] 8.3 Validate compiled config via `GET /api/config-profiles/{uuid}/computed-config` against 5-point verification checklist (valid JSON, 4 inbounds, `streamSettings.security` populated, `realitySettings` present on 8443, zero errors), retrieve inbound UUIDs via `GET /api/config-profiles/{uuid}/inbounds`, and associate profile and inbounds to the Node via `POST /api/nodes` or `PATCH /api/nodes/{uuid}`
 - [ ] 8.4 Implement algorithmic idempotency and state reconciliation via `/var/lib/gowave-auto-nginx/state.json` adhering to `API_CONTRACTS.md`: match existing resources by canonical name/remark, adopt UUIDs, update via `PATCH`/`PUT`, and persist state atomically (`.tmp` + `fsync` + `rename`)
 - [ ] 8.5 Provision managed Internal Squad via `POST /api/internal-squads` with `name: "Default MVP Squad"` linking all 4 inbound UUIDs, verify read-back via `GET /api/internal-squads/{uuid}`, and implement idempotent sync
 - [ ] 8.6 Implement automated GoWave Host record provisioning via `POST /api/hosts` for each of the 4 MVP protocols, mapping public hostname, port 443, SNI, path, `"nodes": ["<node-uuid>"]`, `"internalSquads": {"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}`, and verified `securityLayer` values (`DEFAULT` for REALITY, `TLS` for XHTTP, WS, and Trojan gRPC), and verify read-back via `GET /api/hosts`
 - [ ] 8.7 Implement initial user lifecycle provisioning: create an active user via `POST /api/users` assigned to the managed Internal Squad (`activeInternalSquads: ["<squad-uuid>"]`), wait for node user-sync (`syncUserToSingleNode`), and extract the user's `shortUuid`
-- [ ] 8.8 Verify and configure GoWave Response Rules (`DisableSubscriptionAccessByPath=false`), verify default templates (`MIHOMO` and `XRAY_JSON`), and configure UA rules requiring non-empty User-Agent headers
+- [ ] 8.8 Verify and configure GoWave Response Rules (`DisableSubscriptionAccessByPath=false`), verify default templates (`MIHOMO` with `GEOIP,private,DIRECT,no-resolve` private network bypass and `XRAY_JSON`), and configure UA rules requiring non-empty User-Agent headers
 - [ ] 8.9 Generate, verify, and display both deterministic per-user subscription links (`GET /api/sub/{shortUuid}/v2ray-json` with Xray UA and `GET /api/sub/{shortUuid}/mihomo` with Mihomo UA), verifying HTTP 200, valid Content-Type, non-empty parseable bodies, zero loopback/internal leaks, outputting both links in installer completion summary, and providing CLI helper command `gowave-auto-nginx user links <id>`
 - [ ] 8.10 Issue scoped long-lived API token via `POST /api/tokens` with subscription-page and user scopes for external web subscription frontends (`remnawave/subscription-page`) and bots, saving API credentials to `/root/gowave-credentials.txt` with mode `0600`
 
 ## 9. Transaction-Safe Updates and Crash Recovery Journal
 
 - [ ] 9.1 Implement preflight SQLite check (`PRAGMA integrity_check;`) and WAL checkpoint (`PRAGMA wal_checkpoint(TRUNCATE);`) with 5s busy timeout
-- [ ] 9.2 Execute transactional database backup using SQLite Online Backup API (`sqlite3 /opt/gowave/gowave.db ".backup /var/lib/.../gowave.db"`) and verify destination integrity
+- [ ] 9.2 Execute transactional database backup using SQLite Online Backup API under service user privileges (`runuser -u gowave -- sqlite3 /opt/gowave/gowave.db ".backup /var/lib/.../gowave.db"`), restore database file permissions (`chown gowave:gowave`, mode `0640`), and verify destination integrity
 - [ ] 9.3 Maintain durable state journal at `/var/lib/gowave-auto-nginx/recovery/journal.json` using atomic write (`.tmp` + `fsync` + `rename`) tracking both initial provisioning (`PROVISION_PREPARED` -> `PROVISION_COMMITTED` with reverse-order rollback) and updates (`PREPARED`, `APPLYING`, `VERIFYING`, `COMMITTED`, `ROLLBACK_REQUIRED`, `ROLLED_BACK`)
 - [ ] 9.4 Implement channel switching command `gowave-auto.sh channel [stable|dev]` with automated pre-switch SQLite snapshot, migration irreversible downgrade warning with `--force` confirmation, asset update with SHA256 checksums, and rollback on failure
 - [ ] 9.5 Implement staged release download, SHA256 checksum verification, atomic file swap, and service restart
@@ -109,7 +110,7 @@
 - [ ] 12.6 Implement Suite `root`: user/group creation (`gowave:gowave`), sticky bit permissions (1770), service install verification, zero-leak secret delivery verification, and Fail2ban syntax check
 - [ ] 12.7 Integrate GoWave Node upstream test suite: run `go test ./...`, `go vet`, ShellCheck, `python3 tests/test_scripts.py`, and `gowave-node status --wait-ready` CLI verification
 - [ ] 12.8 Implement Suite `systemd` QEMU TCG runner (`tests/systemd/boot.sh`): verify PID 1 systemd cold boot, All-in-One port bindings, service persistence across reboot, power cut journal recovery, and backup/restore across Ubuntu 24.04, 26.04, Debian 12, and Debian 13
-- [ ] 12.9 Implement `tests/podman_testbed.sh` automating container lifecycle (`--systemd=always --privileged`), workspace mounting, 8-stage test execution, and cleanup across Ubuntu 24.04, Ubuntu 26.04, Debian 12, and Debian 13
+- [ ] 12.9 Implement `tests/podman_testbed.sh` compiling systemd-enabled testbed images via `tests/Containerfile.testbed` (installing systemd, systemd-sysv, dbus, python3-systemd), automating container lifecycle (`--systemd=always --privileged`), workspace mounting, 8-stage test execution, and cleanup across Ubuntu 24.04, Ubuntu 26.04, Debian 12, and Debian 13
 - [ ] 12.10 Enforce mandatory local Podman pre-flight validation gate: require passing testbed runs across all 4 target operating systems prior to production VPS deployment
 - [ ] 12.11 Implement multi-node E2E test target in `tests/podman_testbed.sh` (`multi-node`): provision 2-container Podman bridge network (`gowave-panel` and `gowave-worker`), deploy remote worker via `gowave-node-auto.sh` over SSH stdin, verify UFW panel IP whitelist, validate mTLS 1.3 handshake, push inbounds/users, and verify direct edge VPN client traffic
 

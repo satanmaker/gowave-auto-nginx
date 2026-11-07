@@ -103,12 +103,12 @@ The system SHALL provide two deterministic, per-user subscription URLs for every
 #### Scenario: Deterministic retrieval of Xray subscription
 - **GIVEN** an active user with short UUID `<shortUuid>` and a client sending a valid Xray User-Agent
 - **WHEN** an HTTP GET request is made to `https://<public-domain>/api/sub/<shortUuid>/v2ray-json`
-- **THEN** GoWave responds with HTTP 200, `Content-Type: application/json`, non-empty body (`body.strip() != ""`), and valid Xray JSON containing at least 4 inbounds and zero internal loopback endpoints.
+- **THEN** GoWave responds with HTTP 200, `Content-Type: application/json`, non-empty body (`body.strip() != ""`), valid Xray JSON containing at least 4 inbounds and zero internal loopback endpoints, and forwards `profile-update-interval: 24` and `Subscription-Userinfo` headers.
 
 #### Scenario: Deterministic retrieval of Mihomo subscription
 - **GIVEN** an active user with short UUID `<shortUuid>` and a client sending a valid Mihomo User-Agent
 - **WHEN** an HTTP GET request is made to `https://<public-domain>/api/sub/<shortUuid>/mihomo`
-- **THEN** GoWave responds with HTTP 200, `Content-Type: text/yaml` (or `text/yaml; charset=utf-8`), non-empty body (`body.strip() != ""`), and valid Mihomo YAML containing at least 4 proxies matching `assets/mihomo/expected.yaml` and zero internal loopback endpoints.
+- **THEN** GoWave responds with HTTP 200, `Content-Type: text/yaml` (or `text/yaml; charset=utf-8`), non-empty body (`body.strip() != ""`), valid Mihomo YAML containing at least 4 proxies matching `assets/mihomo/expected.yaml` with `GEOIP,private,DIRECT,no-resolve` private network bypass, and forwards `profile-update-interval: 24` and `Subscription-Userinfo` headers.
 
 #### Scenario: Verification of GoWave Response Rules and Subscription Templates
 - **GIVEN** a fresh or updated GoWave deployment

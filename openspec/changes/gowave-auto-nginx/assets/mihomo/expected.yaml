@@ -88,4 +88,5 @@ proxy-groups:
       - "Trojan-gRPC-TLS"
 
 rules:
+  - GEOIP,private,DIRECT,no-resolve
   - MATCH,→ GoWave

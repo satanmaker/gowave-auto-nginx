@@ -15,6 +15,9 @@
       "streamSettings": {
         "network": "tcp",
         "security": "reality",
+        "tcpSettings": {
+          "acceptProxyProtocol": true
+        },
         "realitySettings": {
           "show": false,
           "dest": "127.0.0.1:9443",

@@ -180,23 +180,32 @@ The system provides verified templates and testing for exactly 4 native protocol
    - Location `/trojan-grpc` passes HTTP/2 frames via `grpc_pass grpc://127.0.0.1:10003;` with `grpc_read_timeout 1h; grpc_send_timeout 1h;`.
    - Canonical Xray template: `assets/xray/trojan-grpc.json`.
 
-#### Explicit SNI Roles and Domain Separation
-To prevent conflation between camouflage sites, management panels, and public VPN connection endpoints, exactly 5 distinct domain and SNI roles are established:
+#### Explicit SNI Roles and Camouflage Architectures
+To prevent conflation between camouflage sites, management panels, and public VPN connection endpoints, exactly 5 distinct domain and SNI roles and 2 verified camouflage architectures are established:
 1. **Host Address (`address`)**: The public IPv4/IPv6 address or resolvable FQDN of the edge server (`vpn.example.com` or Worker IP). Clients send TCP SYN packets to this address on port 443.
-2. **REALITY Camouflage SNI (`reality_camouflage_sni` / `serverNames`)**: External, popular third-party TLS domain (e.g. `gateway.icloud.com`, `dl.google.com`) configured in Xray `realitySettings.serverNames` and sent by the client in the TLS ClientHello SNI extension during REALITY handshakes.
+2. **REALITY Camouflage SNI (`reality_camouflage_sni` / `serverNames`)**: Domain configured in Xray `realitySettings.serverNames` and sent by the client in the TLS ClientHello SNI extension during REALITY handshakes.
 3. **NGINX `ssl_preread` SNI Router**: NGINX Stream on port 443 evaluates `$ssl_preread_server_name`:
    - Matches `reality_camouflage_sni` -> forwards via PROXY v1 to Xray REALITY inbound (`127.0.0.1:8443`).
    - Matches `panel_domain` (or `worker_domain`) -> forwards via PROXY v1 to NGINX HTTPS listener (`127.0.0.1:7443`).
    - Missing SNI or unrecognized scanner probe -> forwards to `127.0.0.1:8443`, triggering REALITY fallback.
-4. **Decoy Destination (`realitySettings.dest`)**: Port 443 of the real camouflage domain (`gateway.icloud.com:443`) or internal decoy fallback port (`127.0.0.1:9443`) to which Xray proxies unauthenticated scanner handshakes with PROXY v1.
-5. **Decoy Web Site (`cover-reality`)**: An authentic multi-asset website (retained from `community-baseline` `cover-reality` under `/var/www/gowave-auto-nginx/cover-reality` including complete HTML, stylesheets, scripts, and media assets) served on loopback port `9443` by NGINX using a valid TLS certificate for the decoy/camouflage domain or self-signed fallback. Minimal single-file HTML stubs are explicitly rejected to provide realistic camouflage against active probing and DPI scanners.
+4. **Camouflage Architecture Options**:
+   - **Mode A: Owned Camouflage Domain with Local Decoy (Primary MVP)**: Operator configures an owned secondary domain (`reality_domain`, e.g. `cdn.example.com`). Certbot issues a valid Let's Encrypt certificate for it. NGINX on loopback port 9443 terminates TLS presenting this authentic certificate and serves `cover-reality`. Xray REALITY uses `serverNames: ["cdn.example.com"]` and `dest: "127.0.0.1:9443", xver: 1`. Active probes receive valid certificates matching the SNI.
+   - **Mode B: Third-Party SNI Stealing**: If an external third-party domain is chosen (e.g. `gateway.icloud.com`), `dest` is configured to `gateway.icloud.com:443` with `xver: 0`. Scanner probes are proxied directly to the genuine third-party server, returning authentic vendor certificates without self-signed certificate exposure.
+5. **Decoy Web Site (`cover-reality`)**: An authentic multi-asset website (retained from `community-baseline` `cover-reality` under `/var/www/gowave-auto-nginx/cover-reality` including complete HTML, stylesheets, scripts, and media assets) served on loopback port `9443` by NGINX. Minimal single-file HTML stubs are explicitly rejected to provide realistic camouflage against active probing and DPI scanners.
+
+#### 3-Stage Let's Encrypt TLS Bootstrapping
+To resolve the initial chicken-and-egg bootstrap deadlock (NGINX failing `nginx -t` due to missing certificate files before Certbot runs, while Certbot requires a running web server on port 80 to answer ACME HTTP-01 challenges):
+1. **Stage 1 (Temporary ACME Webroot vhost)**: The installer writes `/etc/nginx/conf.d/00-bootstrap-acme.conf` listening exclusively on HTTP port 80 with root `/var/www/gowave-acme` and no SSL directives, and starts NGINX.
+2. **Stage 2 (Certificate Acquisition)**: `certbot certonly --webroot -w /var/www/gowave-acme -d <domains>` acquires authentic Let's Encrypt certificates without port conflicts.
+3. **Stage 3 (Production Transition)**: The installer unlinks `00-bootstrap-acme.conf`, writes production NGINX Stream 443 and HTTPS 7443 configurations referencing the issued certificates, and reloads NGINX (`systemctl reload nginx`).
 
 #### Direct VLESS + TLS + Vision Deferral
 Direct VLESS + TLS + Vision (without REALITY) requires Xray itself to terminate TLS, which requires Xray to directly read Let's Encrypt certificates. When Certbot renews the certificate, Xray must be reloaded/restarted across process boundaries. To keep the MVP reliable and avoid privilege boundary violations, direct VLESS + TLS + Vision is **deferred to post-MVP Non-Goals**.
 
 #### Strict PROXY Protocol Boundaries
 - **Sender**: NGINX Stream on port 443 sends PROXY protocol v1 to `127.0.0.1:7443` and `127.0.0.1:8443`.
-- **Receiver**: NGINX listeners at 7443 and 9443 configure `proxy_protocol` and restrict trust strictly to loopback:
+- **Receiver (Xray)**: Inbound at `127.0.0.1:8443` strictly specifies `"tcpSettings": {"acceptProxyProtocol": true}`. When NGINX prepends the PROXY v1 header, Xray consumes it, restores the genuine client IP, and passes it to REALITY handshakes and fallback destinations.
+- **Receiver (NGINX)**: NGINX listeners at 7443 and 9443 configure `proxy_protocol` and restrict trust strictly to loopback:
   ```nginx
   listen 127.0.0.1:7443 ssl proxy_protocol;
   set_real_ip_from 127.0.0.1;
@@ -460,9 +469,11 @@ GoWave Auto NGINX implements a dedicated subcommand `gowave-auto.sh channel [sta
    - Verify panel health via `GET http://127.0.0.1:3000/api/system/health`.
    - Execute `PRAGMA integrity_check;` on live database.
    - Execute `PRAGMA wal_checkpoint(TRUNCATE);` with a 5-second busy timeout.
-   - Capture a consistent database snapshot using SQLite Online Backup API:
+   - Capture a consistent database snapshot using SQLite Online Backup API executing under service user privileges:
      ```bash
-     sqlite3 /opt/gowave/gowave.db ".backup /var/lib/gowave-auto-nginx/recovery/update-<ts>/gowave.db"
+     runuser -u gowave -- sqlite3 /opt/gowave/gowave.db ".backup /var/lib/gowave-auto-nginx/recovery/update-<ts>/gowave.db"
+     chown gowave:gowave /opt/gowave/gowave.db*
+     chmod 0640 /opt/gowave/gowave.db*
      ```
    - Verify `PRAGMA integrity_check;` on the backup copy.
 2. **Persistent Snapshot & Durable State Journal**:
@@ -542,6 +553,18 @@ Multi-distribution compatibility across target systems is achieved via three tar
 3. **APT Security Origins**:
    - Configures `/etc/apt/apt.conf.d/99zz-gowave-auto-nginx` with `origin=Debian,label=Debian-Security,codename=${distro_codename}-security` for Debian hosts.
    - Disables automatic reboots (`Unattended-Upgrade::Automatic-Reboot "false";`) by default.
+4. **Kernel Congestion Control (BBR) & MTU Probing (PLPMTUD)**:
+   - Writes `tcp_bbr` into `/etc/modules-load.d/bbr.conf` when supported so `systemd-sysctl` reliably finds the module on boot before setting `net.ipv4.tcp_congestion_control = bbr`.
+   - Enables Packetization Layer Path MTU Discovery (`net.ipv4.tcp_mtu_probing = 1`) in `/etc/sysctl.d/99-gowave.conf` to prevent TCP blackholing across non-1500 MTU cloud networks (e.g. Hetzner vSwitch 1450, GCP 1460, PPPoE).
+5. **Fail2ban Modern Systemd Journal & Socket Activation**:
+   - Installs `python3-systemd` prerequisite, configures `backend = systemd`, and monitors both standalone `ssh.service` (Debian 12) and socket-activated `ssh.socket` / `ssh@*.service` (Ubuntu 24.04).
+6. **Low-Memory (512MB-1GB RAM) Protection**:
+   - Automatically provisions 2 GB swap on KVM instances with <= 1 GB RAM using `dd if=/dev/zero` (avoiding `fallocate` holes on XFS/Btrfs).
+   - Injects `Environment="GOMEMLIMIT=250MiB"` into systemd service drop-ins for `gowave` and `gowave-node`, forcing timely Go garbage collection before hitting kernel OOM thresholds.
+7. **Log Rotation & Disk Space Depletion Prevention**:
+   - Disables access logging on high-volume streaming endpoints (`access_log off;` in locations `/xhttp-down/` and `/ws`).
+   - Deploys `/etc/logrotate.d/gowave-nginx` with daily rotation, 7-day retention, and gzip compression.
+   - Caps persistent systemd journal storage at `SystemMaxUse=100M` in `/etc/systemd/journald.conf.d/99-gowave.conf`.
 
 ---
 

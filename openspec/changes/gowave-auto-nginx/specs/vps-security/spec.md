@@ -15,12 +15,12 @@ The security subsystem SHALL discover active SSH ports and socket bindings using
 - **THEN** effective listening ports are extracted from both daemon configuration and socket units, and whitelisted in UFW before the firewall is activated.
 
 ### Requirement: Fail2ban Intrusion Prevention
-The security subsystem SHALL install an isolated project drop-in `/etc/fail2ban/jail.d/90-gowave-auto-nginx.local` protecting SSH and NGINX, and verify active jail status via `fail2ban-client status`.
+The security subsystem SHALL install `python3-systemd`, configure `/etc/fail2ban/jail.d/90-gowave-auto-nginx.local` using `backend = systemd` monitoring both `ssh.service` and `ssh.socket` (`ssh@*.service`), and verify active jail status via `fail2ban-client status`.
 
 #### Scenario: Fail2ban jail activation and verification
-- **GIVEN** a host with `fail2ban` installed
+- **GIVEN** a host with `fail2ban` and `python3-systemd` installed
 - **WHEN** the security module is applied
-- **THEN** the drop-in configuration is installed, `fail2ban` is reloaded, and `fail2ban-client status` confirms the jails are active and monitoring logs.
+- **THEN** the drop-in configuration is installed with `backend = systemd`, `fail2ban` is reloaded, and `fail2ban-client status` confirms the jails are active and monitoring both standalone services and socket-activated SSH sessions.
 
 ### Requirement: Strict DNS-over-TLS with Rollback
 The security subsystem SHALL optionally configure `systemd-resolved` with encrypted Cloudflare and Google DoT resolvers, auto-installing the package on Debian 12 if absent, and atomically reverting on failure.
@@ -74,10 +74,18 @@ The security subsystem SHALL configure `unattended-upgrades` with OS-specific se
 - **WHEN** automated updates are configured
 - **THEN** `/etc/apt/apt.conf.d/99zz-gowave-auto-nginx` is written with the appropriate distro security origin pattern, and `Unattended-Upgrade::Automatic-Reboot` is set to `"false"`.
 
-### Requirement: Conditional Kernel BBR Congestion Control
-The security subsystem SHALL conditionally enable BBR congestion control only after verifying kernel module support and qdisc availability.
+### Requirement: Conditional Kernel BBR Congestion Control and MTU Probing
+The security subsystem SHALL enable BBR congestion control and packetization layer path MTU discovery (`net.ipv4.tcp_mtu_probing = 1`), persisting module loading via `/etc/modules-load.d/bbr.conf` when supported.
 
-#### Scenario: BBR activation when module is available
+#### Scenario: BBR and MTU probing activation when module is available
 - **GIVEN** a Linux kernel supporting `tcp_bbr`
 - **WHEN** kernel performance tuning is requested
-- **THEN** `/etc/sysctl.d/99-gowave.conf` is written with `net.core.default_qdisc = fq` and `net.ipv4.tcp_congestion_control = bbr`, and verified via `sysctl net.ipv4.tcp_congestion_control`.
+- **THEN** `/etc/modules-load.d/bbr.conf` is written with `tcp_bbr`, and `/etc/sysctl.d/99-gowave.conf` is written with `net.core.default_qdisc = fq`, `net.ipv4.tcp_congestion_control = bbr`, and `net.ipv4.tcp_mtu_probing = 1`.
+
+### Requirement: NGINX and Journald Log Rotation Policy
+The security subsystem SHALL enforce log rotation policies via `/etc/logrotate.d/gowave-nginx` (daily, 7 days retention, compressed) and cap systemd journal size to 100MB to prevent disk exhaustion.
+
+#### Scenario: Logrotate and journald configuration verification
+- **GIVEN** an active GoWave installation producing access and system logs
+- **WHEN** log retention policies are configured
+- **THEN** `/etc/logrotate.d/gowave-nginx` is deployed with daily rotation and reload hooks, and `/etc/systemd/journald.conf.d/99-gowave.conf` caps journal storage at `SystemMaxUse=100M`.

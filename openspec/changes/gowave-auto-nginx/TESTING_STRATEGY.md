@@ -170,15 +170,32 @@ Podman provides containerized execution with genuine PID 1 `systemd` support (`-
 
 ### Container Launch Contract & Cgroups Configuration
 
+Because official Docker Hub base images for Ubuntu and Debian lack `/sbin/init` and systemd packages, `podman_testbed.sh` builds a systemd-enabled container image via `tests/Containerfile.testbed` before execution:
+
+```dockerfile
+ARG BASE_IMAGE=docker.io/library/ubuntu:24.04
+FROM ${BASE_IMAGE}
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    systemd systemd-sysv dbus python3 python3-systemd ufw fail2ban nginx libnginx-mod-stream sqlite3 curl tar gzip iproute2 ca-certificates \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
+```
+
 `podman_testbed.sh` invokes Podman with specific volume mounts and systemd integration flags:
 ```bash
+# Build testbed container image for target distribution
+podman build -t "gowave-testbed-${DISTRO}:latest" --build-arg BASE_IMAGE="${BASE_IMAGE}" -f tests/Containerfile.testbed tests/
+
+# Launch testbed container with PID 1 systemd
 podman run --rm -d \
   --name "gowave-testbed-${DISTRO}" \
   --systemd=always \
   --privileged \
   -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
   -v "${WORKSPACE_ROOT}:/workspace:ro" \
-  "${IMAGE_NAME}"
+  "gowave-testbed-${DISTRO}:latest"
 ```
 
 ### 8-Stage In-Container Verification Pipeline
@@ -209,15 +226,18 @@ Once the container reaches PID 1 `systemd` readiness, `podman_testbed.sh` execut
    - Generates scoped API tokens and records credentials to `/root/gowave-credentials.txt` with mode `0600`.
 6. **Stage 6: NGINX Stream & Reverse Proxy Verification**:
    - Tests SNI dispatch on port 443 (`panel_domain` -> 7443, `reality_domain` -> 8443).
-   - Validates XHTTP buffering disabled (`proxy_buffering off; proxy_request_buffering off;`).
+   - Validates Xray REALITY accepts PROXY protocol headers via `tcpSettings.acceptProxyProtocol: true`.
+   - Validates XHTTP buffering disabled (`proxy_buffering off; proxy_request_buffering off;`) and logging disabled (`access_log off;`).
    - Validates WebSocket connection upgrade headers and Trojan gRPC proxying.
    - Sends scanner probes to port 8443 and verifies PROXY protocol v1 fallback to decoy website on 9443.
 7. **Stage 7: Deterministic Subscription Delivery & Core Parser Validation**:
    - Fetches Xray JSON (`GET /api/sub/{shortUuid}/v2ray-json`) and validates schema using `xray run -test -c`.
-   - Fetches Mihomo YAML (`GET /api/sub/{shortUuid}/mihomo`) and validates schema using `mihomo -t -f`.
+   - Fetches Mihomo YAML (`GET /api/sub/{shortUuid}/mihomo`) and validates schema using `mihomo -t -f`, asserting `GEOIP,private,DIRECT,no-resolve` rule presence.
+   - Asserts response headers `Subscription-Userinfo` and `profile-update-interval` are preserved.
    - Confirms zero loopback leaks (`127.0.0.1`, `localhost`, internal ports) across all delivered client profiles.
 8. **Stage 8: Disaster Recovery & Rollback Simulation**:
    - Creates `GoWave Auto NGINX Backup Format v1` archive and verifies `0600` permissions.
+   - Verifies SQLite operations execute under `runuser -u gowave` and preserve file permissions (`0640 gowave:gowave`).
    - Injects simulated process failure into update transaction and asserts automatic rollback from `/var/lib/gowave-auto-nginx/recovery/` via `journal.json`.
 
 ### Multi-Node Distributed Edge E2E Pipeline (`tests/podman_testbed.sh multi-node`)

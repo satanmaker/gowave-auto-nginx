@@ -29,6 +29,11 @@ The routing subsystem SHALL bind TCP port 443 exclusively via top-level NGINX St
 - **WHEN** NGINX Stream evaluates the preread SNI on the Worker node
 - **THEN** requests matching `worker_domain` are routed with PROXY protocol v1 to local NGINX HTTPS listener (7443) for XHTTP, WS, and Trojan gRPC termination, while camouflage SNI and scanner probes are routed to local Xray REALITY (8443).
 
+#### Scenario: Xray REALITY loopback PROXY protocol acceptance
+- **GIVEN** NGINX Stream forwarding port 443 to `127.0.0.1:8443` with `proxy_protocol on;`
+- **WHEN** Xray REALITY inbound receives the initial PROXY protocol v1 header
+- **THEN** Xray consumes the PROXY header via `tcpSettings.acceptProxyProtocol: true`, restores the client source IP, and proceeds with the REALITY handshake without TLS framing errors.
+
 ### Requirement: Strict PROXY Protocol Boundaries and Sender/Receiver Isolation
 The routing subsystem SHALL enforce PROXY protocol reception strictly from loopback addresses, rejecting injected PROXY headers from untrusted external networks.
 
@@ -51,7 +56,7 @@ The NGINX HTTPS listener at 7443 SHALL terminate TLS for `panel_domain` and reve
 #### Scenario: Client XHTTP streaming session
 - **GIVEN** an authenticated client sending HTTP POST or GET requests to `https://<panel_domain>/<xhttp_path>/`
 - **WHEN** NGINX processes the request at 7443
-- **THEN** NGINX forwards the request to `http://127.0.0.1:10001` with `proxy_buffering off; proxy_request_buffering off; proxy_http_version 1.1;` and `Cache-Control "no-store, no-transform"`.
+- **THEN** NGINX forwards the request to `http://127.0.0.1:10001` with `proxy_buffering off; proxy_request_buffering off; proxy_http_version 1.1;`, `access_log off;`, and `Cache-Control "no-store, no-transform"`.
 
 ### Requirement: WebSocket and gRPC Inbound Proxying
 The NGINX HTTPS listener at 7443 SHALL proxy WebSocket and gRPC inbounds to designated loopback ports with protocol headers intact.
@@ -73,3 +78,16 @@ The routing subsystem SHALL bind port 443 (Stream) and port 80 (HTTP) on IPv6 on
 - **GIVEN** a host with a global unicast IPv6 address and default IPv6 route (`ip -6 route show default`)
 - **WHEN** NGINX configuration is generated
 - **THEN** listeners include both `listen 443;` and `listen [::]:443;` in stream, and `listen 80;` and `listen [::]:80;` in HTTP block.
+
+#### Scenario: Graceful omission of IPv6 listeners when IPv6 disabled
+- **GIVEN** a host with IPv6 disabled in kernel (`net.ipv6.conf.all.disable_ipv6=1`) or lacking an IPv6 default route
+- **WHEN** NGINX configuration is compiled
+- **THEN** listeners bind strictly to IPv4 (`listen 443;` and `listen 80;`), omitting `[::]` directives to prevent fatal `Address family not supported` socket errors.
+
+### Requirement: 3-Stage Let's Encrypt TLS Bootstrap Sequence
+The installer SHALL resolve the initial TLS bootstrap deadlock using a 3-stage sequence: deploy an unencrypted HTTP port 80 webroot vhost, issue certificates via Certbot, and then deploy the production Stream 443 and HTTPS 7443 configurations.
+
+#### Scenario: Bootstrap certificates on fresh host
+- **GIVEN** a clean host without pre-existing Let's Encrypt certificates
+- **WHEN** the installer initiates TLS provisioning
+- **THEN** it deploys a temporary HTTP-only port 80 vhost answering `/.well-known/acme-challenge/`, issues certificates via `certbot certonly --webroot`, removes the temporary vhost, and deploys production Stream and HTTPS configurations referencing the valid certificates.

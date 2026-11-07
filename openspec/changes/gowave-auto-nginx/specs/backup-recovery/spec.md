@@ -15,12 +15,12 @@ The backup subsystem SHALL generate a private gzip-compressed tar archive design
 - **THEN** an archive is generated with `meta.json` (format version 1) and `files/` directory, file permissions are set to `0600`, and the CLI explicitly outputs that the archive is unencrypted.
 
 ### Requirement: Transactional SQLite Consistency via Online Backup API
-The backup subsystem SHALL capture SQLite database snapshots using the SQLite Online Backup API (`sqlite3 <db> ".backup <dest>"`), guaranteeing transactional consistency under concurrent client writes.
+The backup subsystem SHALL capture SQLite database snapshots using the SQLite Online Backup API executing under the unprivileged service user (`runuser -u gowave -- sqlite3 <db> ...`), guaranteeing transactional consistency under concurrent writes and preserving database permissions (`0640 gowave:gowave`).
 
 #### Scenario: Database backup during active write transactions
 - **GIVEN** an active GoWave Panel with continuous read and write queries
 - **WHEN** backup creation executes
-- **THEN** SQLite integrity check and WAL checkpoint are run, the database is copied via `sqlite3 <db> ".backup <dest>"`, and the destination file passes integrity verification before archive compression.
+- **THEN** SQLite integrity check and WAL checkpoint are run under `gowave` user privileges, the database is copied via `sqlite3 <db> ".backup <dest>"`, database file permissions (`0640 gowave:gowave`) are preserved, and the destination file passes integrity verification before archive compression.
 
 ### Requirement: Independent Panel and Node Backup Scopes
 The backup tool SHALL support separate backup scopes for Central Panel servers and Edge Worker nodes.
