@@ -3,8 +3,8 @@
 mixed-port: 7890
 socks-port: 7891
 redir-port: 7892
-allow-lan: true
-mode: global
+allow-lan: false
+mode: rule
 log-level: info
 external-controller: 127.0.0.1:9090
 dns:
@@ -88,5 +88,12 @@ proxy-groups:
       - "Trojan-gRPC-TLS"
 
 rules:
+  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
+  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
+  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
+  - IP-CIDR6,fc00::/7,DIRECT,no-resolve
+  - IP-CIDR6,fe80::/10,DIRECT,no-resolve
   - GEOIP,private,DIRECT,no-resolve
   - MATCH,→ GoWave

@@ -270,12 +270,15 @@ flowchart TD
 ```bash
 atomic_write_state() {
     local target="/var/lib/gowave-auto-nginx/state.json"
-    local temp="${target}.tmp.$$"
-    mkdir -p "/var/lib/gowave-auto-nginx"
-    echo "$STATE_JSON" > "$temp"
+    local dir="/var/lib/gowave-auto-nginx"
+    local temp="${dir}/state.json.tmp.$$"
+    mkdir -p "$dir"
+    printf '%s\n' "$STATE_JSON" > "$temp"
     chmod 0600 "$temp"
     sync -d "$temp" 2>/dev/null || sync "$temp"
     mv -f "$temp" "$target"
+    # Fsync containing directory so directory entries survive unexpected power cuts
+    python3 -c "import os; d=os.open('$dir', os.O_RDONLY|os.O_DIRECTORY); os.fsync(d); os.close(d)" 2>/dev/null || sync -d "$dir" 2>/dev/null || sync
 }
 ```
 If interrupted at any point, `state.json` is never left truncated or corrupt.
@@ -286,7 +289,7 @@ If interrupted at any point, `state.json` is never left truncated or corrupt.
 
 ### 5.1 CLI Command Specification
 ```bash
-gowave-auto.sh node add <node-name> <node-ip> <node-domain> [ssh-user] [ssh-port]
+gowave-auto.sh node add <node-name> <node-ip> <worker-domain> <reality-domain> [ssh-user] [ssh-port]
 ```
 
 ### 5.2 Registration Protocol Flow
@@ -315,14 +318,23 @@ gowave-auto.sh node add <node-name> <node-ip> <node-domain> [ssh-user] [ssh-port
    - Executes `./gowave-server rescue --print-secret-key-raw` or fetches credentials payload to extract `SECRET_KEY` (`caCertPem`, `jwtPublicKey`, `nodeCertPem`, `nodeKeyPem`).
 4. **Host Entity Creation**:
    - Issues `POST /api/hosts` for each of the 4 transport profiles:
-     - REALITY: `address: "<node-domain>"`, `port: 443`, `securityLayer: "DEFAULT"`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy.
-     - XHTTP, WS, Trojan gRPC: `address: "<node-domain>"`, `port: 443`, `securityLayer: "TLS"`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy.
-5. **Remote Worker Deployment (SSH Streaming)**:
-   - When `ssh-user` is supplied:
+     - REALITY: `address: "<worker-domain>"`, `port: 443`, `securityLayer: "DEFAULT"`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy.
+     - XHTTP, WS, Trojan gRPC: `address: "<worker-domain>"`, `port: 443`, `securityLayer: "TLS"`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy.
+5. **Zero-Leak Remote Worker Deployment via Canonical `remote_payload`**:
+   - When `ssh-user` is supplied, dispatches configuration over SSH stdin (zero secrets in `argv`):
      ```bash
-     cat scripts/gowave-node-auto.sh | ssh -p "${ssh_port:-22}" "$ssh_user@$node_ip" \
-       "NODE_PORT=3000 PANEL_IP=$PANEL_IP SECRET_KEY='$SECRET_KEY' bash -s -- --worker-domain '$node_domain'"
+     PANEL_IP="$PANEL_IP" NODE_PORT=3000 SECRET_KEY="$SECRET_KEY" GOWAVE_NODE_VERSION=latest \
+       remote_payload "$node_ip" "${ssh_port:-22}" "$worker_domain" "$reality_domain"
      ```
-   - The remote script provisions UFW (`ufw allow from $PANEL_IP to any port 3000 proto tcp`), sets up NGINX Stream 443 demultiplexing, obtains Let's Encrypt certificates, installs `gowave-node`, and initiates supervision.
+   - The remote runner executes via `bash -s` from stdin under `umask 077`, provisions UFW (`ufw allow from $PANEL_IP to any port 3000 proto tcp`), sets up NGINX Stream 443 demultiplexing, obtains Let's Encrypt certificates for both `$WORKER_DOMAIN` and `$REALITY_DOMAIN`, installs `gowave-node`, unsets `SECRET_KEY`, and initiates daemon supervision.
 6. **State Persistence**:
    - Appends node entry into `/var/lib/gowave-auto-nginx/state.json` via `atomic_write_state()`.
+
+### 5.3 Provisioning Rollback & Resource Deletion Contract
+If any stage of provisioning fails or is aborted before completion, the orchestrator cleans up entities in strict reverse dependency order:
+1. `DELETE /api/tokens/{id}` (revokes provisioned API tokens)
+2. `DELETE /api/users/{uuid}` (removes created users)
+3. `DELETE /api/hosts/{uuid}` (removes created host endpoints)
+4. `DELETE /api/internal-squads/{uuid}` (removes internal squad)
+5. `DELETE /api/nodes/{uuid}` (unlinks and deletes registered worker nodes)
+6. `DELETE /api/config-profiles/{uuid}` (removes config profile)

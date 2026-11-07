@@ -59,12 +59,12 @@ The security subsystem SHALL manage UFW rules atomically, opening only necessary
 - **THEN** `IPV6=no` is set in `/etc/default/ufw` to prevent ip6tables failures, and firewall rules are applied exclusively across IPv4 interfaces.
 
 ### Requirement: Optional Swap Space Management
-The security subsystem SHALL provide swap allocation (up to 2 GiB) using `dd if=/dev/zero` (strictly avoiding `fallocate` holes on XFS/Btrfs), safely detecting existing swap and container virtualization limitations.
+The security subsystem SHALL provide filesystem-aware swap allocation (1 GiB) using `dd if=/dev/zero` or `btrfs filesystem mkswapfile` (strictly avoiding `fallocate` holes on XFS/Btrfs), safely detecting existing swap and container virtualization limitations.
 
 #### Scenario: Swap creation on low-memory VPS
 - **GIVEN** a KVM VPS with <= 1GB RAM and no active swap
 - **WHEN** swap configuration is evaluated
-- **THEN** a swap file is created using `dd if=/dev/zero` with mode 0600, activated via `swapon`, and recorded in `/etc/fstab`.
+- **THEN** a 1GB swap file is created with mode 0600, activated via `swapon`, and recorded in `/etc/fstab`.
 
 #### Scenario: Skip swap on containerized environments
 - **GIVEN** an LXC or OpenVZ container where `swapon` is restricted
@@ -80,12 +80,12 @@ The security subsystem SHALL configure `unattended-upgrades` with OS-specific se
 - **THEN** `/etc/apt/apt.conf.d/99zz-gowave-auto-nginx` is written with the appropriate distro security origin pattern, and `Unattended-Upgrade::Automatic-Reboot` is set to `"false"`.
 
 ### Requirement: Conditional Kernel BBR Congestion Control and MTU Probing
-The security subsystem SHALL enable BBR congestion control and path MTU discovery (`net.ipv4.tcp_mtu_probing = 1`), persisting module loading via dedicated oneshot service `bbr-load.service` ordered before `systemd-sysctl`.
+The security subsystem SHALL enable BBR congestion control and path MTU discovery (`net.ipv4.tcp_mtu_probing = 1`), persisting module loading via dedicated oneshot service `bbr-load.service` ordered before `systemd-sysctl` with graceful fallback on kernels lacking `tcp_bbr`.
 
 #### Scenario: BBR and MTU probing activation when module is available
 - **GIVEN** a Linux kernel supporting `tcp_bbr`
 - **WHEN** kernel performance tuning is requested
-- **THEN** `/etc/systemd/system/bbr-load.service` is deployed with `Before=systemd-sysctl.service` executing `/sbin/modprobe tcp_bbr` and `/sbin/sysctl -w net.ipv4.tcp_congestion_control=bbr`, and `/etc/sysctl.d/99-gowave.conf` configures `net.core.default_qdisc = fq`, `net.ipv4.tcp_congestion_control = bbr`, and `net.ipv4.tcp_mtu_probing = 1`.
+- **THEN** `/etc/systemd/system/bbr-load.service` is deployed with `Before=systemd-sysctl.service` executing `modprobe tcp_bbr` and `sysctl -w net.ipv4.tcp_congestion_control=bbr` (with `-` non-fatal prefix), and `/etc/sysctl.d/99-gowave.conf` configures `net.core.default_qdisc = fq`, `net.ipv4.tcp_congestion_control = bbr`, and `net.ipv4.tcp_mtu_probing = 1`.
 
 ### Requirement: NGINX and Journald Log Rotation Policy
 The security subsystem SHALL enforce log rotation policies via `/etc/logrotate.d/gowave-nginx` (daily, 7 days retention, compressed) and cap systemd journal size to 100MB to prevent disk exhaustion.

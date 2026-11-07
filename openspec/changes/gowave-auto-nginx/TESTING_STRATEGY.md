@@ -99,7 +99,7 @@ flowchart TD
   - `test_worker_edge_traffic`: Live client test connecting directly to remote Worker node on port 443 across all 4 protocols, validating Worker NGINX Stream, TLS termination, and direct data tunneling without traversing Central Panel.
   - `test_xray_subscription`: Fetch `GET /api/sub/{shortUuid}/v2ray-json` with Xray UA; verify explicit assertion checklist (AUD-08): `status_code == 200`, `len(body.strip()) > 0`, body parses as valid JSON with `len(inbounds) >= 4`, all 4 inbounds present on port 443, and zero loopback/internal leaks (`127.0.0.1`, internal ports, unix sockets).
   - `test_mihomo_subscription`: Fetch `GET /api/sub/{shortUuid}/mihomo` with Mihomo UA; verify explicit assertion checklist (AUD-08): `status_code == 200`, `Content-Type: text/yaml`, `len(body.strip()) > 0`, body parses as valid YAML matching `assets/mihomo/expected.yaml` structure with `len(proxies) >= 4`, and zero internal leaks.
-  - `test_client_import_validators`: Pass fetched Xray JSON to official Xray core (`v1.8.24`+ / `v24.9.30`+ via `xray run -test -c`) and Mihomo YAML to official Mihomo core (`v1.18.10`+ / `v1.19.0`+ via `mihomo -t -f`), asserting exit code 0 and verifying all proxy fields (type, server, port, cipher, password, uuid, flow, tls, sni, alpn, reality-opts, grpc-opts, ws-opts, xhttp-opts).
+  - `test_client_import_validators`: Pass fetched Xray JSON to official Xray core (`v1.8.24`+ / `v24.9.30`+ via `xray run -test -c`) and Mihomo YAML to official Mihomo core (`v1.19.22`+ / `v1.20.0`+ via `mihomo -t -f`), asserting exit code 0 and verifying all proxy fields (type, server, port, cipher, password, uuid, flow, tls, sni, alpn, reality-opts, grpc-opts, ws-opts, xhttp-opts).
   - `test_node_firewall_isolation`: Verify that external IPv4 (`<public-ipv4>:3002`) and IPv6 (`[<public-ipv6>]:3002`) probes are dropped or refused by UFW firewall rules, while local loopback connections (`127.0.0.1:3002`, `[::1]:3002`) succeed, and verify rule persistence after UFW reload.
 
 ### Suite 4: `root` (L2 Filesystem Permissions & Isolated System Drop-Ins)
@@ -107,7 +107,7 @@ flowchart TD
 - **Tests Covered**:
   - `test_user_permissions`: Creation of user `gowave:gowave`, verify directory permissions `1770 root:gowave` on `/opt/gowave`, and verify executable is owned by `root:root`.
   - `test_service_install`: Execution of `gowave-server service install /opt/gowave` and verification of generated `90-unprivileged.conf` and `gowave-update.path`.
-  - `test_secret_delivery`: Delivery of `SECRET_KEY` via stdin or temporary `0600` file; verify process inspection via `/proc/<pid>/cmdline` reveals zero credentials.
+  - `test_secret_delivery`: Delivery of `SECRET_KEY` strictly via stdin or temporary `0600` file; assert process inspection of both local `ssh` process and remote runner via `/proc/<pid>/cmdline` and `ps aux` reveals zero secrets.
   - `test_fail2ban_syntax`: Validation of `/etc/fail2ban/jail.d/90-gowave-auto-nginx.local` via `fail2ban-client --test`.
   - `test_backup_format_v1`: Generation of `GoWave Auto NGINX Backup Format v1` archive; verify mode `0600` and validation of `meta.json` manifest.
 
@@ -177,7 +177,7 @@ ARG BASE_IMAGE=docker.io/library/ubuntu:24.04
 FROM ${BASE_IMAGE}
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    systemd systemd-sysv dbus python3 python3-systemd ufw fail2ban nginx libnginx-mod-stream sqlite3 curl tar gzip iproute2 ca-certificates \
+    systemd systemd-sysv dbus python3 python3-systemd ufw fail2ban nginx libnginx-mod-stream sqlite3 curl tar gzip iproute2 ca-certificates openssh-server openssh-client \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
@@ -242,31 +242,33 @@ Once the container reaches PID 1 `systemd` readiness, `podman_testbed.sh` execut
 
 ### Multi-Node Distributed Edge E2E Pipeline (`tests/podman_testbed.sh multi-node`)
 
-To rigorously test `gowave-node-auto.sh` and multi-node orchestration prior to VPS deployment, the testbed executes an end-to-end verification across an isolated Podman bridge network (`gowave-net`):
+To test `gowave-node-auto.sh` and multi-node orchestration prior to VPS deployment, the testbed executes an end-to-end verification across an isolated Podman bridge network (`gowave-net`) with an untrusted client peer:
 
 ```mermaid
 flowchart LR
     client["Client Simulator (Test Runner)"]
     panel["Container: gowave-panel (10.89.0.10)<br/>GoWave Panel API :3000<br/>NGINX Reverse Proxy :7443"]
     worker["Container: gowave-worker (10.89.0.20)<br/>gowave-node :3000 (UFW allows 10.89.0.10)<br/>Worker NGINX Stream :443<br/>Worker Xray Inbounds :8443, :10001-:10003"]
+    untrusted["Container: gowave-untrusted (10.89.0.30)<br/>Non-whitelisted peer"]
 
     panel -- "1. mTLS 1.3 Handshake (rw-v1)<br/>2. Profile & User Sync" --> worker
     client -- "3. Direct VPN Tunnel (Port 443)<br/>VLESS REALITY / XHTTP / WS / Trojan" --> worker
+    untrusted -- "4. Probes port 3000 -> Dropped by UFW" --> worker
     client -. "Fetch Subscriptions" .-> panel
 ```
 
 The multi-node test executes the following 6 stages:
-1. **Network & Dual-Container Provisioning**:
+1. **Network & 3-Container Provisioning**:
    - Creates Podman network `gowave-net` (subnet `10.89.0.0/24`).
-   - Launches `gowave-panel` (`10.89.0.10`) and `gowave-worker` (`10.89.0.20`) with `--systemd=always --privileged`.
+   - Launches `gowave-panel` (`10.89.0.10`), `gowave-worker` (`10.89.0.20`), and `gowave-untrusted` (`10.89.0.30`) with `--systemd=always --privileged`.
 2. **Control Plane Provisioning**:
    - Installs GoWave Panel on `gowave-panel`, verifies API listening on `127.0.0.1:3000` and NGINX on `10.89.0.10:7443`.
    - Bootstraps admin user, single unified Config Profile, and Host records.
 3. **Remote Worker Deployment over SSH Stdin**:
-   - Dispatches `gowave-node-auto.sh` to `gowave-worker` (`10.89.0.20`) via the SSH stdin pipeline (`remote_payload`), passing `NODE_PORT=3000`, `SECRET_KEY`, and `PANEL_IP=10.89.0.10` without file transfer dependencies.
+   - Dispatches `gowave-node-auto.sh` to `gowave-worker` (`10.89.0.20`) via the SSH stdin pipeline (`remote_payload`), passing `NODE_PORT=3000`, `SECRET_KEY`, `PANEL_IP=10.89.0.10`, `WORKER_DOMAIN`, and `REALITY_DOMAIN` without file transfer dependencies.
 4. **Worker Firewall Lockdown Verification**:
    - Verifies UFW rule on Worker: `ufw allow proto tcp from 10.89.0.10 to any port 3000`.
-   - Confirms that probes from `10.89.0.10` succeed, while probes from other IPs are dropped.
+   - Confirms that probes from `10.89.0.10` succeed, while probes from `gowave-untrusted` (`10.89.0.30`) to port 3000 are dropped.
 5. **Panel-to-Node mTLS 1.3 Association & Config Push**:
    - Registers Worker node in Panel API via `POST /api/nodes` (`address: "10.89.0.20"`, `port: 3000`).
    - Initiates mTLS 1.3 handshake with HKDF-derived SNI (`rw-v1`), pushes inbounds, and syncs users via `syncUserToSingleNode`.

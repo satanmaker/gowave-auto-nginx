@@ -91,7 +91,7 @@ To prevent acceptance of corrupt or pseudo-valid subscription files, verificatio
 | Client Format | Target Minimum Version | Tested Baseline Version | Validation Command & Tool | Verified Transport Profiles | Evidence & Upstream Reference |
 |---|---|---|---|---|---|
 | **Xray JSON (`v2ray-json`)** | `v1.8.24` | `v24.9.30` | `xray run -test -c <config.json>` | All 4 MVP transports: VLESS-REALITY-Vision, VLESS-XHTTP, VLESS-WS, Trojan-gRPC | `XTLS/Xray-core` releases; exit code 0 indicates 100% schema and outbound validity |
-| **Mihomo YAML (`mihomo`)** | `v1.18.10` | `v1.19.0` | `mihomo -t -f <config.yaml>` | All client-compatible MVP transports: VLESS-REALITY, VLESS-WS, Trojan-gRPC, VLESS-XHTTP | `MetaCubeX/mihomo` releases; exit code 0 verifies full proxy stanza and YAML schema parsing |
+| **Mihomo YAML (`mihomo`)** | `v1.19.22` | `v1.20.0` | `mihomo -t -f <config.yaml>` | All client-compatible MVP transports: VLESS-REALITY, VLESS-WS, Trojan-gRPC, VLESS-XHTTP | `MetaCubeX/mihomo` releases; v1.19.22+ required for native XHTTP transport (`network: xhttp`) |
 
 ---
 
@@ -100,22 +100,23 @@ To prevent acceptance of corrupt or pseudo-valid subscription files, verificatio
 Before deploying to physical or virtual cloud servers, the automated test harness (`tests/podman_testbed.sh`) executes containerized pre-flight tests across all 4 supported operating systems using Podman's native systemd integration (`--systemd=always --privileged`).
 
 > [!NOTE]
-> Because official Docker Hub base images (`ubuntu:24.04`, `debian:12`, etc.) strip systemd and `/sbin/init` to minimize footprint, `tests/podman_testbed.sh` compiles local testbed images (`gowave-testbed-${DISTRO}:latest`) using `tests/Containerfile.testbed` to install `systemd`, `systemd-sysv`, `dbus`, `python3-systemd`, and core utilities before container execution.
+> Because official Docker Hub base images (`ubuntu:24.04`, `debian:12`, etc.) strip systemd and `/sbin/init` to minimize footprint, `tests/podman_testbed.sh` compiles local testbed images (`gowave-testbed-${DISTRO}:latest`) using `tests/Containerfile.testbed` to install `systemd`, `systemd-sysv`, `dbus`, `python3-systemd`, `openssh-server`, `openssh-client`, and core utilities before container execution.
 
 | Operating System | Distribution Codename | Official Base Image | Testbed Container Target | Container Init System | NGINX Version | Testbed Validation Status | Verified Adaptations in Testbed |
 |---|---|---|---|---|---|---|---|
 | **Ubuntu 24.04 LTS** | Noble Numbat | `docker.io/library/ubuntu:24.04` | `gowave-testbed-ubuntu24:latest` | `systemd` 255.4 (PID 1) | 1.24.0 (`< 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Legacy HTTP/2 syntax (`listen ... ssl http2;`), UFW bridge rules, native Panel/Node systemd units |
-| **Ubuntu 26.04 LTS** | Resolute Raccoon | `docker.io/library/ubuntu:devel` | `gowave-testbed-ubuntu26:latest` | `systemd` 256+ (PID 1) | 1.26+ (`>= 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Modern HTTP/2 syntax (`http2 on;`), Stream multiplexing, UFW isolation |
+| **Ubuntu 26.04 LTS** | Resolute Raccoon | `docker.io/library/ubuntu:26.04` | `gowave-testbed-ubuntu26:latest` | `systemd` 256+ (PID 1) | 1.26+ (`>= 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Modern HTTP/2 syntax (`http2 on;`), Stream multiplexing, UFW isolation |
 | **Debian 12** | Bookworm | `docker.io/library/debian:12` | `gowave-testbed-debian12:latest` | `systemd` 252.30 (PID 1) | 1.22.1 (`< 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Legacy HTTP/2 syntax (`listen ... ssl http2;`), auto-installation of `systemd-resolved`, Debian security origins |
-| **Debian 13** | Trixie | `docker.io/library/debian:testing` | `gowave-testbed-debian13:latest` | `systemd` 256+ (PID 1) | 1.26.3 (`>= 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Modern HTTP/2 syntax (`http2 on;`), systemd-resolved integration, Stream multiplexing |
+| **Debian 13** | Trixie | `docker.io/library/debian:13` | `gowave-testbed-debian13:latest` | `systemd` 256+ (PID 1) | 1.26.3 (`>= 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Modern HTTP/2 syntax (`http2 on;`), systemd-resolved integration, Stream multiplexing |
 
 ### Multi-Node Distributed Edge Testbed Matrix
 
-In addition to All-in-One single-container tests, the testbed executes a dual-container Distributed Edge test (`./tests/podman_testbed.sh multi-node`) across an isolated Podman bridge network (`gowave-net`):
+In addition to All-in-One single-container tests, the testbed executes an automated Distributed Edge test (`./tests/podman_testbed.sh multi-node`) across an isolated Podman bridge network (`gowave-net`) with an untrusted client peer to verify firewall isolation:
 
 | Node Role | Target Container Image | Assigned IP / Port | Verified Services & Components | Verification Scope in Testbed |
 |---|---|---|---|---|
 | **Control Plane (Panel)** | `docker.io/library/ubuntu:24.04` (or Debian 12) | `10.89.0.10` / `:3000`, `:7443` | GoWave Panel, SQLite, NGINX reverse proxy, Certbot | REST API onboarding, mTLS CA issuance, Worker node registration (`POST /api/nodes`), user sync |
 | **Worker Node (Edge)** | `docker.io/library/debian:12` (or Ubuntu 24.04) | `10.89.0.20` / `:3000` (mTLS), `:443`, `:8443` | `gowave-node`, Xray core, NGINX Stream, UFW | SSH stdin deployment via `gowave-node-auto.sh`, UFW whitelist (`10.89.0.10` only), mTLS 1.3 handshake (`rw-v1`), direct client VPN data plane |
+| **Untrusted Client Peer** | `docker.io/library/debian:12` | `10.89.0.30` | Client utilities, curl, nmap/nc | Verifies firewall drops connections to `10.89.0.20:3000` from unauthorized IPs outside allowlist |
 
 

@@ -57,14 +57,14 @@ The update module SHALL execute SQLite Online Backup, capture a persistent snaps
 - **THEN** preflight checks pass, WAL is truncated, database and binaries are snapshotted to persistent storage, `journal.json` transitions from `PREPARED` to `COMMITTED`, and healthcheck confirms HTTP 200 within 30 seconds.
 
 #### Scenario: Interrupted update recovery after reboot
-- **GIVEN** a host that rebooted or lost power while `journal.json` was in `APPLYING` state
+- **GIVEN** a host that rebooted or lost power while `journal.json` was in `APPLYING` or `VERIFYING` state
 - **WHEN** the host finishes booting or `gowave-auto.sh` is invoked
 - **THEN** the manager detects the uncommitted transaction, executes automated rollback to the persistent snapshot, restores service operation, and transitions journal state to `ROLLED_BACK`.
 
 #### Scenario: Initial provisioning failure rollback
 - **GIVEN** an initial installation where provisioning fails midway while creating Host records or binding nodes
 - **WHEN** the orchestrator detects an unhandled error or verification failure
-- **THEN** it reads the partial entity UUIDs recorded in `state.json.tmp`, invokes deletion APIs in reverse order (`DELETE /api/users/{uuid}`, `DELETE /api/hosts/{uuid}`, `DELETE /api/internal-squads/{uuid}`, `DELETE /api/config-profiles/{uuid}`), marks `journal.json` state as `PROVISION_ROLLED_BACK`, and leaves the system in a clean, re-runnable state.
+- **THEN** it reads the partial entity UUIDs recorded in `state.json.tmp`, invokes deletion APIs in strict reverse order (`DELETE /api/tokens`, `DELETE /api/users`, `DELETE /api/hosts`, `DELETE /api/internal-squads`, `DELETE /api/nodes`, `DELETE /api/config-profiles`), marks `journal.json` state as `PROVISION_ROLLED_BACK`, and leaves the system in a clean, re-runnable state.
 
 ### Requirement: Recovery Snapshot Retention Ceiling
 The lifecycle manager SHALL enforce a retention policy keeping the last 3 recovery snapshots and capping total snapshot storage at 5 GB, forbidding deletion of snapshots for active in-flight transactions.

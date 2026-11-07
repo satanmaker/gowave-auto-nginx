@@ -122,7 +122,7 @@ The system SHALL provide two deterministic, per-user subscription URLs for every
 
 #### Scenario: Client parser and import validation
 - **GIVEN** fetched Xray JSON and Mihomo YAML subscription payloads
-- **WHEN** the Xray JSON payload is validated using official Xray core (`v1.8.24`+ / `v24.9.30`+ via `xray run -test -c`) and the Mihomo YAML payload is validated using Mihomo (`v1.18.10`+ / `v1.19.0`+ via `mihomo -t -f`)
+- **WHEN** the Xray JSON payload is validated using official Xray core (`v1.8.24`+ / `v24.9.30`+ via `xray run -test -c`) and the Mihomo YAML payload is validated using Mihomo (`v1.19.22`+ / `v1.20.0`+ via `mihomo -t -f`)
 - **THEN** both tools complete validation with exit code 0, verifying proxy outbounds contain valid public server addresses, port 443, and zero internal loopback or socket references.
 
 #### Scenario: Protocol update reflection in subscriptions

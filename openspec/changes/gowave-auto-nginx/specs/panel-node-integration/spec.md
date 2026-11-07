@@ -62,8 +62,8 @@ The installer SHALL provide an independent automated worker script (`gowave-node
 
 #### Scenario: Automated worker registration via CLI node add command
 - **GIVEN** an active GoWave Panel and an accessible remote worker host
-- **WHEN** `gowave-auto.sh node add <name> <ip> <domain> [user] [port]` is executed
-- **THEN** it registers the node via `POST /api/nodes` linking unified profile inbounds, provisions worker Host records (`POST /api/hosts`), streams remote payload over SSH stdin, and stores node state in `state.json`.
+- **WHEN** `gowave-auto.sh node add <name> <ip> <worker-domain> <reality-domain> [user] [port]` is executed
+- **THEN** it registers the node via `POST /api/nodes` linking unified profile inbounds, provisions worker Host records (`POST /api/hosts`), streams deployment payload via `remote_payload` strictly over SSH stdin with zero secrets in `argv`, and stores node state in `state.json`.
 
 ### Requirement: Mutual TLS 1.3 Control Plane Protocol with Strict SNI Verification
 All panel-to-node management communication SHALL use TLS 1.3 with mutual certificate verification, derived HKDF SNI (`rw-v1`), RS256 JWT bearer token authentication, and strict SNI enforcement.
@@ -84,7 +84,7 @@ The installer SHALL provision `SECRET_KEY` to `gowave-node` strictly via standar
 #### Scenario: Secret key delivery without command-line exposure
 - **GIVEN** a newly generated base64 256-bit secret key for node provisioning
 - **WHEN** `gowave-node` is configured by the automated installer
-- **THEN** the base64 payload is piped via stdin or read from a mode `0600` file that is immediately unlinked, and process inspection via `/proc/<pid>/cmdline` or `ps aux` reveals zero credentials.
+- **THEN** the base64 payload is piped via stdin or read from a mode `0600` file that is immediately unlinked, and process inspection of both local `ssh` processes and remote runners via `/proc/<pid>/cmdline` or `ps aux` reveals zero credentials.
 
 ### Requirement: Exact Node Config Profile and Inbound Association Payload
 The system SHALL link Config Profiles and active inbounds to GoWave nodes using the exact API structure required by GoWave backend (`activeConfigProfileUuid` and `activeInbounds`), enforcing that all active inbounds assigned to the Node belong to that single active Config Profile.
