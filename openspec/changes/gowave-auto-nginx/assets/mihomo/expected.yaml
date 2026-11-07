@@ -1,0 +1,91 @@
+# Expected Mihomo Subscription Output for GoWave Auto NGINX
+# Pinned Upstream Engine: gowave 6d2c35788b3b038627b5e86e6c6486caff0851c8 (DefaultTemplateMihomo)
+mixed-port: 7890
+socks-port: 7891
+redir-port: 7892
+allow-lan: true
+mode: global
+log-level: info
+external-controller: 127.0.0.1:9090
+dns:
+  enable: true
+  use-hosts: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+  nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+  fake-ip-filter:
+    - '*.lan'
+    - stun.*.*.*
+    - time.windows.com
+    - time.apple.com
+
+proxies:
+  - name: "VLESS-REALITY-Vision"
+    type: vless
+    server: "vpn.example.com"
+    port: 443
+    uuid: "018d9f12-3456-7890-abcd-ef0123456789"
+    network: tcp
+    tls: true
+    flow: "xtls-rprx-vision"
+    servername: "gateway.icloud.com"
+    reality-opts:
+      public-key: "1111111111111111111111111111111111111111111="
+      short-id: "0123456789abcdef"
+    client-fingerprint: "chrome"
+
+  - name: "VLESS-XHTTP-TLS"
+    type: vless
+    server: "vpn.example.com"
+    port: 443
+    uuid: "018d9f12-3456-7890-abcd-ef0123456789"
+    network: xhttp
+    tls: true
+    servername: "vpn.example.com"
+    xhttp-opts:
+      path: "/xhttp-down/"
+      mode: "auto"
+    client-fingerprint: "chrome"
+
+  - name: "VLESS-WS-TLS"
+    type: vless
+    server: "vpn.example.com"
+    port: 443
+    uuid: "018d9f12-3456-7890-abcd-ef0123456789"
+    network: ws
+    tls: true
+    servername: "vpn.example.com"
+    ws-opts:
+      path: "/ws"
+      headers:
+        Host: "vpn.example.com"
+    client-fingerprint: "chrome"
+
+  - name: "Trojan-gRPC-TLS"
+    type: trojan
+    server: "vpn.example.com"
+    port: 443
+    password: "secure-user-trojan-password"
+    network: grpc
+    tls: true
+    servername: "vpn.example.com"
+    grpc-opts:
+      grpc-service-name: "trojan-grpc"
+    client-fingerprint: "chrome"
+
+proxy-groups:
+  - name: "→ GoWave"
+    type: select
+    proxies:
+      - "VLESS-REALITY-Vision"
+      - "VLESS-XHTTP-TLS"
+      - "VLESS-WS-TLS"
+      - "Trojan-gRPC-TLS"
+
+rules:
+  - MATCH,→ GoWave

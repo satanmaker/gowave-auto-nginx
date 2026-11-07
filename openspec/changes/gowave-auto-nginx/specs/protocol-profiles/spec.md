@@ -14,6 +14,11 @@ The system SHALL support VLESS with REALITY security and XTLS-Vision flow (`xtls
 - **WHEN** the client initiates a connection to port 443 with `reality_domain` SNI and valid REALITY public key
 - **THEN** Xray authenticates the handshake and establishes an encrypted VPN tunnel with Vision flow without requiring Let's Encrypt certificates.
 
+#### Scenario: Native cryptographic x25519 keypair generation via GoWave REST API
+- **GIVEN** an active GoWave Panel REST API instance with valid admin authorization
+- **WHEN** the installer requests key generation via `GET /api/system/tools/x25519/generate`
+- **THEN** GoWave returns HTTP 200 with a valid Curve25519 keypair containing `privateKey` and `publicKey` in base64 format, which are directly embedded into the REALITY inbound configuration without external binary execution.
+
 ### Requirement: Native VLESS XHTTP TLS Profile
 The system SHALL support VLESS over XHTTP (splitHTTP) transport multiplexed behind the main panel domain TLS termination on port 7443.
 
@@ -39,25 +44,53 @@ The system SHALL support Trojan protocol over gRPC transport with TLS multiplexe
 - **THEN** NGINX routes gRPC frames to Xray port 10003 and authenticates user traffic.
 
 ### Requirement: Automated Profile Provisioning via GoWave API
-The installer SHALL provision the 4 MVP protocol profiles by authenticating against GoWave Panel REST API, calling `POST /api/config-profiles` with raw Xray JSON, linking the profile to nodes using explicit `activeConfigProfileUuid` and `activeInbounds` DTO, and verifying `GET /api/config-profiles/{uuid}/computed-config`.
+The installer SHALL provision the 4 MVP protocol profiles by creating a single unified Config Profile via `POST /api/config-profiles`, associating the profile and its 4 inbounds to active nodes, and verifying `GET /api/config-profiles/{uuid}/computed-config`.
 
-#### Scenario: Idempotent API profile creation
-- **GIVEN** a newly installed GoWave Panel
+#### Scenario: Single unified Config Profile provisioning with 4 inbounds
+- **GIVEN** a newly installed GoWave Panel and registered Node
 - **WHEN** the provisioning script executes
-- **THEN** it checks for existing managed profiles, creates missing Config Profiles via `POST /api/config-profiles`, links them to active nodes via `POST /api/nodes` or `PATCH /api/nodes/{uuid}` with `{"configProfile": {"activeConfigProfileUuid": "<uuid>", "activeInbounds": [...]}}`, and verifies the compiled Xray config without creating duplicate profiles on subsequent runs.
+- **THEN** it creates one managed Config Profile embedding all 4 inbounds (REALITY, XHTTP, WS, Trojan gRPC) in raw Xray JSON, retrieves the 4 generated inbound UUIDs, links the single profile and all 4 inbound UUIDs to the Node, and verifies the compiled Xray config via `GET /api/config-profiles/{uuid}/computed-config` without creating duplicate profiles on subsequent runs.
+
+#### Scenario: Cross-profile inbound association rejection (negative test)
+- **GIVEN** an active GoWave Node associated with a primary Config Profile
+- **WHEN** an API request attempts to link an inbound UUID belonging to a different Config Profile into `configProfile.activeInbounds`
+- **THEN** GoWave rejects the transaction with an error indicating the inbound does not belong to the active config profile, and leaves the Node's active profile and inbounds unmutated.
+
+### Requirement: Managed Internal Squad and User Lifecycle Provisioning
+The system SHALL manage user inbound access and credential propagation through GoWave Internal Squads, linking all 4 MVP inbound UUIDs to a managed squad and provisioning an active user assigned to this squad.
+
+#### Scenario: Automated Internal Squad creation linking all MVP inbounds
+- **GIVEN** a provisioned unified Config Profile with 4 inbound UUIDs
+- **WHEN** Internal Squad provisioning executes
+- **THEN** `POST /api/internal-squads` creates a managed squad containing all 4 inbound UUIDs, and read-back via `GET /api/internal-squads/{uuid}` confirms the squad and its inbound associations.
+
+#### Scenario: Initial active user provisioning and squad assignment
+- **GIVEN** an active GoWave Panel with a managed Internal Squad
+- **WHEN** user provisioning executes via `POST /api/users` with `activeInternalSquads` containing the managed squad UUID
+- **THEN** GoWave creates the user with status `ACTIVE`, assigns a random nanoid `shortUuid`, and emits `user.created`.
+
+#### Scenario: User credential sync to Node for all active inbounds
+- **GIVEN** a newly created active user assigned to the managed Internal Squad
+- **WHEN** GoWave's user synchronization worker executes `syncUserToSingleNode()`
+- **THEN** GoWave resolves all 4 inbounds for the user via squad membership and dispatches the user's VLESS UUID and Trojan password to `gowave-node`, enabling client authentication across all 4 inbounds.
 
 ### Requirement: Automatic GoWave Host Record Provisioning
-For each provisioned MVP protocol profile, the provisioning system SHALL automatically create and verify a corresponding Host entity via GoWave API (`POST /api/hosts`) specifying public address, port 443, SNI, path, Host header, fingerprint, security layer, and inbound association.
+For each provisioned MVP protocol profile, the provisioning system SHALL automatically create and verify a corresponding Host entity via GoWave API (`POST /api/hosts`) with public endpoints, node associations, and squad permissions.
 
-#### Scenario: Automated creation of Host entities for MVP protocols
-- **GIVEN** an active GoWave Panel with provisioned Config Profiles and Inbounds
+#### Scenario: Automated creation of Host entities with Node and Squad links
+- **GIVEN** an active GoWave Panel with provisioned Config Profiles, Inbounds, and Node
 - **WHEN** Host provisioning executes for each of the 4 MVP protocols
-- **THEN** `POST /api/hosts` is invoked with `inbound.configProfileUuid`, `inbound.configProfileInboundUuid`, `remark`, `address` set to the public hostname, `port` set to 443, `sni`, `path`, and appropriate `securityLayer` (`REALITY` or `DEFAULT`), and the created hosts are confirmed via `GET /api/hosts`.
+- **THEN** `POST /api/hosts` is invoked with `inbound.configProfileUuid`, `inbound.configProfileInboundUuid`, `remark`, `address` set to the public hostname, `port` set to 443, `sni`, `path`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy, and appropriate `securityLayer` (`DEFAULT` for REALITY, `TLS` for XHTTP, WS, and Trojan gRPC), and the created hosts are confirmed via `GET /api/hosts`.
+
+#### Scenario: Host securityLayer resolution verification
+- **GIVEN** provisioned Host records in GoWave
+- **WHEN** Host records are retrieved via `GET /api/hosts` and subscription configurations are rendered
+- **THEN** the REALITY Host record has `securityLayer: "DEFAULT"` resolving to client `security: reality`, while XHTTP, WS, and Trojan gRPC Host records have `securityLayer: "TLS"` resolving to client `security: tls`, with invalid values like `"REALITY"` strictly absent.
 
 #### Scenario: Host record presence in subscription output
 - **GIVEN** provisioned Host records for VLESS-REALITY, VLESS-XHTTP, VLESS-WS, and Trojan-gRPC
-- **WHEN** subscription endpoints are queried for an active user
-- **THEN** all 4 configured Host endpoints appear in the generated client configurations with correct public hostnames and paths.
+- **WHEN** subscription endpoints are queried for an active user belonging to the managed squad
+- **THEN** all 4 configured Host endpoints appear in the generated client configurations with correct public hostnames, port 443, and paths.
 
 #### Scenario: Idempotent Host provisioning and atomic rollback
 - **GIVEN** a provisioning operation that experiences an interruption or failure while creating Host records
@@ -65,27 +98,32 @@ For each provisioned MVP protocol profile, the provisioning system SHALL automat
 - **THEN** partially created Host records are cleanly deleted or existing matching records are updated in place without leaving orphan or duplicate host entries.
 
 ### Requirement: Automatic Per-User Xray and Mihomo Subscription Links
-The system SHALL provide two deterministic, per-user subscription URLs for every user: an Xray subscription URL (`GET /api/sub/{shortUuid}/v2ray-json`) and a Mihomo subscription URL (`GET /api/sub/{shortUuid}/mihomo`), ensuring Response Rules and templates are properly configured, and displaying both links in the web panel and installer summary.
+The system SHALL provide two deterministic, per-user subscription URLs for every user: an Xray subscription URL (`GET /api/sub/{shortUuid}/v2ray-json`) and a Mihomo subscription URL (`GET /api/sub/{shortUuid}/mihomo`), ensuring Response Rules, templates, and User-Agent policies are properly configured, and displaying both links in the installer summary and CLI management commands.
 
 #### Scenario: Deterministic retrieval of Xray subscription
-- **GIVEN** an active user with short UUID `<shortUuid>`
+- **GIVEN** an active user with short UUID `<shortUuid>` and a client sending a valid Xray User-Agent
 - **WHEN** an HTTP GET request is made to `https://<public-domain>/api/sub/<shortUuid>/v2ray-json`
-- **THEN** GoWave responds with HTTP 200, `Content-Type: application/json`, and a non-empty, valid Xray JSON configuration containing all 4 MVP protocols.
+- **THEN** GoWave responds with HTTP 200, `Content-Type: application/json`, non-empty body (`body.strip() != ""`), and valid Xray JSON containing at least 4 inbounds and zero internal loopback endpoints.
 
 #### Scenario: Deterministic retrieval of Mihomo subscription
-- **GIVEN** an active user with short UUID `<shortUuid>`
+- **GIVEN** an active user with short UUID `<shortUuid>` and a client sending a valid Mihomo User-Agent
 - **WHEN** an HTTP GET request is made to `https://<public-domain>/api/sub/<shortUuid>/mihomo`
-- **THEN** GoWave responds with HTTP 200, `Content-Type: text/yaml`, and a non-empty, valid Mihomo YAML configuration containing all client-compatible MVP protocols.
+- **THEN** GoWave responds with HTTP 200, `Content-Type: text/yaml` (or `text/yaml; charset=utf-8`), non-empty body (`body.strip() != ""`), and valid Mihomo YAML containing at least 4 proxies matching `assets/mihomo/expected.yaml` and zero internal loopback endpoints.
 
 #### Scenario: Verification of GoWave Response Rules and Subscription Templates
 - **GIVEN** a fresh or updated GoWave deployment
-- **WHEN** subscription settings and templates are evaluated
-- **THEN** `DisableSubscriptionAccessByPath` is verified as false in `subscription_settings`, default subscription templates for `MIHOMO` (`DefaultTemplateMihomo`) and `XRAY_JSON` (`DefaultTemplateXrayJson`) exist in `subscription_templates`, and requests with or without client User-Agent resolve to valid non-empty configurations.
+- **WHEN** subscription settings, templates, and User-Agent evaluation are tested
+- **THEN** `DisableSubscriptionAccessByPath` is verified as false in `subscription_settings`, default subscription templates for `MIHOMO` (`DefaultTemplateMihomo`) and `XRAY_JSON` (`DefaultTemplateXrayJson`) exist in `subscription_templates`, requests with valid client User-Agents return HTTP 200, and requests with missing or empty User-Agent headers return HTTP 403 Forbidden.
+
+#### Scenario: Live Trojan gRPC handshake and data transfer verification
+- **GIVEN** a running All-in-One deployment and active Trojan gRPC inbound
+- **WHEN** a client initiates an HTTP/2 gRPC handshake to port 443 with valid Trojan password and service path
+- **THEN** NGINX terminates TLS, proxies gRPC frames via `grpc_pass` to port 10003, and Xray establishes an authenticated bidirectional VPN data session.
 
 #### Scenario: Client parser and import validation
 - **GIVEN** fetched Xray JSON and Mihomo YAML subscription payloads
-- **WHEN** the Xray JSON payload is loaded by an Xray configuration parser and the Mihomo YAML payload is parsed by a YAML/Mihomo schema validator
-- **THEN** both configurations parse with zero syntax errors, and all proxy outbounds contain valid public server addresses, port 443, and zero internal loopback or socket references.
+- **WHEN** the Xray JSON payload is validated using official Xray core (`v1.8.24`+ / `v24.9.30`+ via `xray run -test -c`) and the Mihomo YAML payload is validated using Mihomo (`v1.18.10`+ / `v1.19.0`+ via `mihomo -t -f`)
+- **THEN** both tools complete validation with exit code 0, verifying proxy outbounds contain valid public server addresses, port 443, and zero internal loopback or socket references.
 
 #### Scenario: Protocol update reflection in subscriptions
 - **GIVEN** an active user with working Xray and Mihomo subscriptions
@@ -99,6 +137,14 @@ The subscription engine SHALL publish client configuration links containing vali
 - **GIVEN** an active user requesting a subscription from `/api/sub/{shortUuid}`
 - **WHEN** the subscription response is parsed in Xray JSON, Clash/Mihomo, or sing-box format
 - **THEN** the server address points to the public domain or worker IP, port is 443, and loopback addresses (`127.0.0.1`, `::1`) or internal ports (`3000`, `3001`, `3002`, `7443`, `8443`, `9443`, `10001-10003`) are completely absent.
+
+### Requirement: Scoped API Token Generation for External Frontends
+The system SHALL support issuing long-lived API tokens via `POST /api/tokens` with granular scopes for external web subscription interfaces and bot integrations.
+
+#### Scenario: Provisioning long-lived API token with defined scopes
+- **GIVEN** an authenticated GoWave administrative session
+- **WHEN** the installer requests a new API token via `POST /api/tokens` with scopes for subscription page configurations and user lookups
+- **THEN** GoWave generates a persistent API token, returns the bearer token, and the installer records the token and panel endpoint into `/root/gowave-credentials.txt` with mode `0600`.
 
 ### Requirement: Formal Scope Boundaries for Auxiliary Protocols
 The installer SHALL NOT configure direct VLESS-TLS-Vision (without REALITY), Hysteria 2, or AmneziaWG in the MVP release.

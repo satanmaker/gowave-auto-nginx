@@ -1,0 +1,40 @@
+{
+  "tag": "vless-reality",
+  "port": 8443,
+  "listen": "127.0.0.1",
+  "protocol": "vless",
+  "settings": {
+    "clients": [],
+    "decryption": "none"
+  },
+  "streamSettings": {
+    "network": "tcp",
+    "security": "reality",
+    "realitySettings": {
+      "show": false,
+      "dest": "127.0.0.1:9443",
+      "xver": 1,
+      "serverNames": [
+        "gateway.icloud.com"
+      ],
+      "privateKey": "",
+      "shortIds": [
+        "",
+        "0123456789abcdef"
+      ],
+      "minClientVer": "",
+      "maxClientVer": "",
+      "maxTimeDiff": 0
+    }
+  },
+  "sniffing": {
+    "enabled": true,
+    "destOverride": [
+      "http",
+      "tls",
+      "quic"
+    ],
+    "metadataOnly": false,
+    "routeOnly": true
+  }
+}

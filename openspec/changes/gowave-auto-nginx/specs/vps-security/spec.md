@@ -41,12 +41,17 @@ The security subsystem SHALL manage UFW rules atomically, opening only necessary
 #### Scenario: Atomic UFW activation
 - **GIVEN** a host with SSH access
 - **WHEN** firewall rules are applied
-- **THEN** SSH ports are allowed first, ports 80 and 443 are allowed publicly, internal ports (3000, 3001, 3002, 7443, 8443, 9443, 10001-10003) remain closed to external interfaces via explicit deny rules, and UFW is enabled.
+- **THEN** SSH ports are allowed first, ports 80 and 443 are allowed publicly, internal ports (3000, 3001, 3002, 7443, 8443, 9443, 10001-10003) remain closed to external interfaces via explicit deny rules across both IPv4 and IPv6, and UFW is enabled.
 
 #### Scenario: Node control port whitelisting
 - **GIVEN** an edge node deployment with a defined `PANEL_IP`
 - **WHEN** firewall rules are applied on the node
 - **THEN** `NODE_PORT` is allowed strictly from `PANEL_IP` (for both IPv4 and IPv6 where enabled), and connections from all other external IPs are dropped.
+
+#### Scenario: Firewall persistence and dual-stack isolation across reboots
+- **GIVEN** an active UFW configuration with node port 3002 denied to external interfaces
+- **WHEN** UFW is reloaded or the operating system reboots
+- **THEN** effective iptables and ip6tables rules persist, node port 3002 remains strictly inaccessible from external IPv4 and IPv6 addresses, and loopback connectivity (`127.0.0.1`, `::1`) is unaffected.
 
 ### Requirement: Optional Swap Space Management
 The security subsystem SHALL provide optional swap file allocation (2 GiB), safely detecting existing swap and container virtualization limitations.

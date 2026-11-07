@@ -15,7 +15,7 @@ The routing subsystem SHALL bind TCP port 443 exclusively via top-level NGINX St
 - **THEN** NGINX forwards the stream with PROXY protocol v1 to `127.0.0.1:7443`.
 
 #### Scenario: Route traffic for REALITY domain
-- **GIVEN** an incoming TLS connection on public port 443 with SNI matching `reality_domain`
+- **GIVEN** an incoming TLS connection on public port 443 with SNI matching `reality_camouflage_sni`
 - **WHEN** NGINX Stream evaluates the preread SNI
 - **THEN** NGINX forwards the stream with PROXY protocol v1 to Xray at `127.0.0.1:8443`.
 
@@ -23,6 +23,11 @@ The routing subsystem SHALL bind TCP port 443 exclusively via top-level NGINX St
 - **GIVEN** an incoming connection on public port 443 with unrecognized SNI, IP address scan, or absent SNI
 - **WHEN** NGINX Stream evaluates the preread SNI
 - **THEN** NGINX forwards the connection to `127.0.0.1:8443` where Xray handles it via REALITY fallback.
+
+#### Scenario: Worker edge NGINX Stream and HTTPS proxying
+- **GIVEN** an incoming connection to a remote Worker edge node on public port 443
+- **WHEN** NGINX Stream evaluates the preread SNI on the Worker node
+- **THEN** requests matching `worker_domain` are routed with PROXY protocol v1 to local NGINX HTTPS listener (7443) for XHTTP, WS, and Trojan gRPC termination, while camouflage SNI and scanner probes are routed to local Xray REALITY (8443).
 
 ### Requirement: Strict PROXY Protocol Boundaries and Sender/Receiver Isolation
 The routing subsystem SHALL enforce PROXY protocol reception strictly from loopback addresses, rejecting injected PROXY headers from untrusted external networks.
@@ -38,7 +43,7 @@ The routing subsystem SHALL serve an authentic static camouflage website on loop
 #### Scenario: Scanner probe fallback to static cover
 - **GIVEN** an unauthenticated client or scanner connecting to `127.0.0.1:8443`
 - **WHEN** Xray REALITY fails to authenticate the handshake
-- **THEN** Xray forwards the connection with PROXY protocol v1 (`dest: "127.0.0.1:9443", xver: 1`) to `127.0.0.1:9443`, where NGINX terminates TLS with `reality_domain` certificate and serves the static decoy site.
+- **THEN** Xray forwards the connection with PROXY protocol v1 (`dest: "127.0.0.1:9443", xver: 1`) to `127.0.0.1:9443`, where NGINX terminates TLS with `reality_domain` certificate and serves the authentic multi-asset decoy website (retained from `community-baseline` `cover-reality` under `/var/www/gowave-auto-nginx/cover-reality`), rejecting minimal single-file HTML stubs.
 
 ### Requirement: XHTTP Inbound Reverse Proxy
 The NGINX HTTPS listener at 7443 SHALL terminate TLS for `panel_domain` and reverse proxy configured XHTTP path prefixes to local Xray inbounds using HTTP/1.1 with buffering disabled.

@@ -60,19 +60,32 @@ flowchart TD
   - `test_python_lint`: `flake8` and `mypy` on management Python utilities.
   - `test_scripts_py`: Execution of `python3 tests/test_scripts.py` verifying CLI script arguments and basic handlers.
   - `test_openspec`: OpenSpec CLI validation (`openspec validate --all --strict` / `openspec validate gowave-auto-nginx --strict`).
-  - `test_nginx_generator`: NGINX Stream and HTTP configuration generator tests for Debian 12 (NGINX 1.22 `listen ... http2;`) and Ubuntu 24/Debian 13 (`http2 on;`).
+  - `test_nginx_generator`: NGINX Stream and HTTP configuration generator tests evaluating runtime version detection (`nginx -v`): validates `listen ... ssl http2;` for NGINX < 1.25.1 (Ubuntu 24.04 with 1.24.0, Debian 12 with 1.22.1) and `listen ...; http2 on;` for NGINX >= 1.25.1 (Debian 13 with 1.26.3, Ubuntu 26.04), verifying syntax with `nginx -t`.
   - `test_archive_security`: Malicious tarball injection tests verifying rejection of `../` path traversals, leading `/`, symlinks escaping managed roots, device nodes, and FIFOs.
   - `test_node_secret_parser`: Unit tests verifying base64 `SECRET_KEY` parsing and HKDF-SHA256 SNI derivation (`rw-v1`).
+  - `test_nginx_conflict_scanner`: Unit tests scanning test `/etc/nginx/` trees with mock virtual hosts; asserts correct detection and reporting of unmanaged `listen ... 443` directives.
+  - `test_remote_payload_generator`: Unit tests verifying SSH stdin payload generation (packing variables via `declare -p` and modular shell functions via `declare -f`) for remote worker deployment without file transfer dependencies.
 
 ### Suite 2: `integration` (L3 Inter-Process Contracts & Online Backup)
 - **Privilege**: Non-root (`id -u != 0`).
+- **Execution Harness & Fixture Strategy (AUD-11)**:
+  - Runs in a disposable container under unprivileged UID (`--user 1001:1001`).
+  - Spawns a real, native `gowave-server` instance backed by tmpfs-isolated SQLite (`DATABASE_URL=/tmp/test-gowave-$$.db`).
+  - Bootstraps admin credentials dynamically via `POST /api/auth/register` (`username: "admin"`, `password: "testPassword123!"`).
+  - Request/response validation utilizes static JSON fixtures in `tests/fixtures/api/` representing canonical DTO schemas.
 - **Tests Covered**:
   - `test_sqlite_online_backup`: Continuous write transactions executed concurrently while `sqlite3 <db> ".backup <dest>"` executes; verify destination database passes `PRAGMA integrity_check;` with 100% data consistency.
   - `test_gowave_api_auth`: GoWave API admin bootstrap: query `/api/auth/status`, register initial admin via `POST /api/auth/register`, login via `POST /api/auth/login`, and verify JWT token issuance.
-  - `test_profile_provisioning`: Authenticated creation of Config Profile via `POST /api/config-profiles`, inbound generation, and verification of `GET /api/config-profiles/{uuid}/computed-config`.
-  - `test_node_association`: Verification of linking profile and inbounds to node via `POST /api/nodes` or `PATCH /api/nodes/{uuid}` with `{"configProfile": {"activeConfigProfileUuid": "<uuid>", "activeInbounds": [...]}}`.
-  - `test_host_provisioning`: Automated creation of Host records via `POST /api/hosts` for each MVP protocol and verification via `GET /api/hosts`.
+  - `test_profile_provisioning`: Authenticated creation of single unified Config Profile via `POST /api/config-profiles` containing all 4 inbounds, retrieving the 4 generated inbound UUIDs via `GET /api/config-profiles/{uuid}/inbounds`, and verifying `GET /api/config-profiles/{uuid}/computed-config`.
+  - `test_computed_config_validation`: Queries `GET /api/config-profiles/{uuid}/computed-config` and verifies explicit validation checklist (AUD-09): HTTP status is 200, `response.config` is valid JSON, no top-level `error` or `message` fields, `inbounds` array contains exactly 4 elements, `streamSettings.security` is populated for all inbounds, and REALITY settings with valid keys exist on port 8443.
+  - `test_node_association`: Verification of linking single unified profile and all 4 inbounds to node via `POST /api/nodes` or `PATCH /api/nodes/{uuid}` with `{"configProfile": {"activeConfigProfileUuid": "<uuid>", "activeInbounds": [...]}}`.
+  - `test_profile_cross_membership_negative`: Deliberately attempts to associate an inbound UUID belonging to a different Config Profile into `configProfile.activeInbounds`; asserts GoWave rejects the transaction with error `inbound X does not belong to config profile Y` without mutating the Node.
+  - `test_internal_squad_and_user_sync`: Automated creation of managed Internal Squad via `POST /api/internal-squads` with 4 inbounds, creation of user via `POST /api/users` with squad assignment, and assertion that `syncUserToSingleNode` dispatches credentials to the Node for all 4 inbounds.
+  - `test_host_provisioning`: Automated creation of Host records via `POST /api/hosts` for each MVP protocol with `"nodes": ["<node-uuid>"]`, `"internalSquads"`, and verified `securityLayer` (`DEFAULT` for REALITY, `TLS` for XHTTP, WS, and Trojan gRPC), followed by read-back verification via `GET /api/hosts` confirming node and squad relations.
+  - `test_subscription_user_agent`: Verification that requests with valid client User-Agents (`v2rayN`, `ClashMeta`) return HTTP 200, while requests with missing or empty User-Agent return HTTP 403 Forbidden.
   - `test_response_rules_and_templates`: Verification that `DisableSubscriptionAccessByPath=false` in GoWave database and default templates (`MIHOMO` and `XRAY_JSON`) are seeded and intact.
+  - `test_x25519_api_generation`: Integration test verifying Curve25519 keypair generation via `GET /api/system/tools/x25519/generate` returning valid base64 `privateKey` and `publicKey`.
+  - `test_api_token_generation`: Integration test verifying long-lived token creation via `POST /api/tokens` with granular scopes (`subscription-page-configs:*`, `subscriptions:subpage-config`, `users:by-username`) and secure credential file creation at `/root/gowave-credentials.txt` with mode `0600`.
   - `test_mtls_handshake`: Go test vectors validating Node mTLS 1.3 handshake with derived HKDF SNI and RS256 JWT bearer token against mock TLS server.
 
 ### Suite 3: `services` (L4 Live Services & Protocol Simulation)
@@ -82,10 +95,12 @@ flowchart TD
   - `test_reality_fallback`: Legitimate REALITY client handshake vs scanner probe; verify fallback sends PROXY protocol v1 to port 9443 where decoy static site is served.
   - `test_xhttp_streaming`: Bidirectional HTTP/1.1 and HTTP/2 POST stream sent to `https://panel_domain/<xhttp_path>/`; verify NGINX reverse proxies to loopback port without chunk buffering or request body truncation.
   - `test_websocket_upgrade`: Verification of WebSocket handshake and protocol upgrade headers.
-  - `test_xray_subscription`: Fetch `GET /api/sub/{shortUuid}/v2ray-json`; verify HTTP 200, `Content-Type: application/json`, non-empty body, parseable Xray JSON format containing all 4 MVP protocols, and zero internal leaks (`127.0.0.1`, internal ports, unix sockets).
-  - `test_mihomo_subscription`: Fetch `GET /api/sub/{shortUuid}/mihomo`; verify HTTP 200, `Content-Type: text/yaml`, non-empty body, parseable Mihomo YAML format containing client-compatible MVP protocols, and zero internal leaks.
-  - `test_client_import_validators`: Pass fetched Xray JSON and Mihomo YAML subscriptions to official client schema parsers/validators to ensure 100% client importability.
-  - `test_node_firewall_isolation`: Verify that external connections to `<public-ip>:3002` are dropped or refused by firewall rules, while local loopback connections succeed.
+  - `test_trojan_grpc`: Live client test connecting to Trojan gRPC over HTTP/2 with password authentication, `grpc_pass` proxying to 10003, and bidirectional data transfer.
+  - `test_worker_edge_traffic`: Live client test connecting directly to remote Worker node on port 443 across all 4 protocols, validating Worker NGINX Stream, TLS termination, and direct data tunneling without traversing Central Panel.
+  - `test_xray_subscription`: Fetch `GET /api/sub/{shortUuid}/v2ray-json` with Xray UA; verify explicit assertion checklist (AUD-08): `status_code == 200`, `len(body.strip()) > 0`, body parses as valid JSON with `len(inbounds) >= 4`, all 4 inbounds present on port 443, and zero loopback/internal leaks (`127.0.0.1`, internal ports, unix sockets).
+  - `test_mihomo_subscription`: Fetch `GET /api/sub/{shortUuid}/mihomo` with Mihomo UA; verify explicit assertion checklist (AUD-08): `status_code == 200`, `Content-Type: text/yaml`, `len(body.strip()) > 0`, body parses as valid YAML matching `assets/mihomo/expected.yaml` structure with `len(proxies) >= 4`, and zero internal leaks.
+  - `test_client_import_validators`: Pass fetched Xray JSON to official Xray core (`v1.8.24`+ / `v24.9.30`+ via `xray run -test -c`) and Mihomo YAML to official Mihomo core (`v1.18.10`+ / `v1.19.0`+ via `mihomo -t -f`), asserting exit code 0 and verifying all proxy fields (type, server, port, cipher, password, uuid, flow, tls, sni, alpn, reality-opts, grpc-opts, ws-opts, xhttp-opts).
+  - `test_node_firewall_isolation`: Verify that external IPv4 (`<public-ipv4>:3002`) and IPv6 (`[<public-ipv6>]:3002`) probes are dropped or refused by UFW firewall rules, while local loopback connections (`127.0.0.1:3002`, `[::1]:3002`) succeed, and verify rule persistence after UFW reload.
 
 ### Suite 4: `root` (L2 Filesystem Permissions & Isolated System Drop-Ins)
 - **Privilege**: Root (`id -u == 0`) inside disposable Docker container.
@@ -110,6 +125,9 @@ flowchart TD
 ---
 
 ## 3. GitHub Actions CI Pipeline Architecture
+
+> [!NOTE]
+> **Implementation Status (AUD-12)**: The GitHub Actions workflows listed below (`.github/workflows/*.yml`) and linter configuration files (`.shellcheckrc`) represent authoritative architectural specifications and are scheduled deliverables of Tasks 1.1, 1.3, and 13.1–13.3 (`[IMPLEMENTATION_PLANNED]`).
 
 | Workflow File | Trigger Events | Required Suites & Tasks | Status Check Name | Permissions |
 |---|---|---|---|---|

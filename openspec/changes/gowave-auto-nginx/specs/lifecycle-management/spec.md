@@ -61,6 +61,11 @@ The update module SHALL execute SQLite Online Backup, capture a persistent snaps
 - **WHEN** the host finishes booting or `gowave-auto.sh` is invoked
 - **THEN** the manager detects the uncommitted transaction, executes automated rollback to the persistent snapshot, restores service operation, and transitions journal state to `ROLLED_BACK`.
 
+#### Scenario: Initial provisioning failure rollback
+- **GIVEN** an initial installation where provisioning fails midway while creating Host records or binding nodes
+- **WHEN** the orchestrator detects an unhandled error or verification failure
+- **THEN** it reads the partial entity UUIDs recorded in `state.json.tmp`, invokes deletion APIs in reverse order (`DELETE /api/users/{uuid}`, `DELETE /api/hosts/{uuid}`, `DELETE /api/internal-squads/{uuid}`, `DELETE /api/config-profiles/{uuid}`), marks `journal.json` state as `PROVISION_ROLLED_BACK`, and leaves the system in a clean, re-runnable state.
+
 ### Requirement: Recovery Snapshot Retention Ceiling
 The lifecycle manager SHALL enforce a retention policy keeping the last 3 recovery snapshots and capping total snapshot storage at 5 GB, forbidding deletion of snapshots for active in-flight transactions.
 

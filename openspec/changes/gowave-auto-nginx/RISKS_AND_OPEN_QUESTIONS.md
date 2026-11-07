@@ -12,7 +12,7 @@
 |---|---|---|---|
 | **RES-01** | Panel & Node Port Collision | **RESOLVED**: In All-in-One topology, Panel binds to `127.0.0.1:3000`, local Node binds to `127.0.0.1:3002` (`NODE_PORT=3002`), metrics use `3001`. Preflight checks verify all ports and abort before mutating system. | `design.md`, `COMPATIBILITY_MATRIX.md` |
 | **RES-02** | Multi-Node Network Architecture | **RESOLVED**: Primary MVP is All-in-One (Topology A). Multi-Node is defined as Distributed Edge (Topology B): each worker has its own public IP and Stream/Xray; subscriptions point directly to worker nodes. Central Edge proxying is rejected. | `design.md`, `specs/traffic-routing/spec.md` |
-| **RES-03** | Inbound Configuration Mechanism | **RESOLVED**: Inbounds are managed strictly through GoWave's native API: bootstrap admin, call `POST /api/config-profiles`, link profile to Node, verify computed config. Zero direct editing of Xray files. | `specs/protocol-profiles/spec.md`, `design.md` |
+| **RES-03** | Inbound Configuration Mechanism | **RESOLVED**: Inbounds are managed strictly through GoWave's native API: bootstrap admin, login, call `POST /api/config-profiles`, link profile to Node, verify computed config. Full API DTOs, headers, 12h token TTL, and 401 re-login protocol are codified in `API_CONTRACTS.md`. Zero direct editing of Xray files. | `API_CONTRACTS.md`, `specs/protocol-profiles/spec.md`, `design.md` |
 | **RES-04** | Vision Terminology & Inbound Scope | **RESOLVED**: MVP covers VLESS + REALITY + Vision (`xtls-rprx-vision`). Direct VLESS + TLS + Vision without REALITY requires cross-boundary Let's Encrypt certificate renewal into Xray and is deferred to post-MVP. | `specs/protocol-profiles/spec.md`, `proposal.md` |
 | **RES-05** | Test Runner Contract | **RESOLVED**: Synchronized with upstream `tests/run_ci.py`: uses `--suite <name>` and `--check-completeness`. EUID privileges enforced: nonroot/integration/services require `EUID != 0`; root/systemd require `EUID == 0`. | `TESTING_STRATEGY.md` |
 | **RES-06** | SQLite Backup Consistency | **RESOLVED**: Replaced file copy with SQLite Online Backup API (`sqlite3 <db> ".backup <dest>"`), providing transactional consistency even under concurrent client write operations. | `specs/backup-recovery/spec.md`, `design.md` |
@@ -27,6 +27,17 @@
 | **RES-15** | External Proxy Mode Configuration | **RESOLVED**: Explicitly set `GOWAVE_PROXY=external` in `/opt/gowave/.env`, ensuring GoWave delegates reverse proxy management entirely to project-owned NGINX configurations. | `specs/lifecycle-management/spec.md`, `design.md` |
 | **RES-16** | Safe Channel Switching Contract | **RESOLVED**: Implement `gowave-auto.sh channel [stable|dev]` with automated pre-switch SQLite snapshot, schema downgrade warning with `--force`, asset update, and auto-rollback on failure. | `specs/lifecycle-management/spec.md`, `design.md` |
 | **RES-17** | Integration Suite Non-Root Container User | **RESOLVED**: Containerized integration suite runs under unprivileged UID/GID (`--user 1001:1001`), satisfying the upstream runner contract (`os.geteuid() != 0`) while root suite runs as root. | `TESTING_STRATEGY.md`, `tasks.md` |
+| **RES-18** | Single Unified Config Profile Constraint | **RESOLVED**: Upstream `updateNodeWithProfile` enforces that all active inbounds attached to a Node must belong to its active Config Profile. MVP provisions ONE managed profile containing all 4 inbounds inside raw Xray JSON. | `design.md`, `specs/protocol-profiles/spec.md` |
+| **RES-19** | Complete Host Payload & Valid SecurityLayer | **RESOLVED**: Host records include `nodes: [uuid]`, `internalSquads` policy, and verified enum `DEFAULT` (for REALITY) or `TLS` (for XHTTP, WS, Trojan gRPC). The invalid enum `REALITY` is completely eliminated. | `design.md`, `specs/protocol-profiles/spec.md` |
+| **RES-20** | User-Agent Enforcement on Subscriptions | **RESOLVED (Option A)**: Pinned commit `6d2c357` executes `responseRules` on all subscription paths, returning 403 on empty/missing User-Agent. Valid client UA is required; missing UA is tested as a negative security case. | `design.md`, `TECHNICAL_AUDIT.md` |
+| **RES-21** | Internal Squad & User Sync Lifecycle | **RESOLVED**: GoWave resolves user inbounds for nodes exclusively via Internal Squad membership. Installer creates managed squad with 4 inbounds and assigns user to it, triggering automated node credential sync. | `design.md`, `specs/protocol-profiles/spec.md` |
+| **RES-22** | Web Panel UI Scope Boundary | **RESOLVED**: Upstream GoWave React frontend displays base subscription link; we explicitly do NOT fork or modify the React frontend. Dedicated typed URLs are output by installer CLI and helper command. | `proposal.md`, `design.md` |
+| **RES-23** | Worker Edge Complete Traffic Plane | **RESOLVED**: Worker edge node deploys full NGINX Stream on port 443, HTTPS listener, Let's Encrypt certificates, and proxy routing for direct client connections without traversing Central Panel. | `design.md`, `specs/panel-node-integration/spec.md` |
+| **RES-24** | NGINX HTTP/2 Version Detection | **RESOLVED**: Runtime detection of `nginx -v`: versions < 1.25.1 (Ubuntu 24.04 with 1.24.0, Debian 12 with 1.22.1) generate `listen ... ssl http2;`, while >= 1.25.1 generate `listen ...; http2 on;`. | `COMPATIBILITY_MATRIX.md`, `design.md` |
+| **RES-25** | Contractual Panel API & Idempotency | **RESOLVED**: Complete API DTOs, methods, error taxonomy, and 5-step reconciliation algorithm via `state.json` are fully specified with line citations to commit `6d2c357` in `API_CONTRACTS.md`. | `API_CONTRACTS.md`, `specs/panel-node-integration/spec.md` |
+| **RES-26** | Canonical Xray & Mihomo Templates | **RESOLVED**: Authoritative reference JSON inbounds (`vless-reality.json`, `vless-xhttp.json`, `vless-ws.json`, `trojan-grpc.json`, `unified-profile.json`) and expected Mihomo YAML (`expected.yaml`) are codified in `assets/`. | `assets/xray/`, `assets/mihomo/`, `design.md` |
+| **RES-27** | NODE_PORT Override Verification | **RESOLVED**: Confirmed native support in `gowave-node/install.sh#L340-L351` and `config.go#L102-L105`. Hardened via systemd drop-in `10-port.conf` locking port 3002. | `design.md`, `TECHNICAL_AUDIT.md` |
+| **RES-28** | Provisioning Transaction Lifecycle | **RESOLVED**: Initial setup is tracked in `journal.json` (`PROVISION_PREPARED` -> `PROVISION_COMMITTED`), executing reverse-order deletion of created resources (`DELETE` users/hosts/squad/profile) upon error. | `design.md`, `specs/lifecycle-management/spec.md` |
 
 ---
 
@@ -79,3 +90,11 @@
 - **Mitigation**:
   1. Hook into `gowave-update.service`: Wrap the update execution so that `gowave-update.service` also performs the pre-update SQLite snapshot to `/var/lib/gowave-auto-nginx/recovery/` before invoking `gowave update apply`.
   2. Document both update workflows as supported and safe.
+
+### Risk 5: Canonical Specs vs. Change Delta Promotion (AUD-13)
+- **Description**: In OpenSpec workflow, delta specs reside in `openspec/changes/<change-id>/specs/` during change proposal and planning. Canonical directory `openspec/specs/` remains empty until the change is archived or synced.
+- **Likelihood**: Low | **Impact**: Low (Potential ambiguity over authoritative contract).
+- **Mitigation**:
+  1. OpenSpec CLI natively recognizes and validates changes via `openspec validate --all --strict`.
+  2. All delta specs in `openspec/changes/gowave-auto-nginx/specs/` and `API_CONTRACTS.md` are formally established as the binding authoritative contract for Phase 1–5 implementation.
+  3. Upon completion and verification of the implementation phase, the change will be synced to canonical specs via `openspec archive` (or `openspec-sync-specs`).

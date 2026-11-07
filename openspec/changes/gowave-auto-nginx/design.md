@@ -76,12 +76,15 @@ In Topology B, the Central Server acts as the Control Plane, while one or more r
    - Hosts GoWave Panel (`127.0.0.1:3000`), NGINX reverse proxy (`panel_domain:443`), and SQLite database.
    - Publishes user subscriptions containing the public addresses/ports of Worker Nodes.
    - Connects to remote Worker Nodes over mTLS 1.3 on `NODE_PORT` (default 3000) using derived HKDF SNI (`rw-v1`).
-2. **Worker Server (Edge Gateway)**:
-   - Has its own public IPv4/IPv6 and worker domain.
+2. **Worker Server (Edge Gateway & Complete Traffic Plane)**:
+   - Has its own public IPv4/IPv6 address and dedicated worker FQDN (`worker_domain`).
    - Runs `gowave-node` (installed via upstream `install.sh`) and Xray core, orchestrated via `gowave-node-auto.sh`.
-   - Runs NGINX Stream on port 443 for REALITY camouflage fallback and local decoy site hosting.
-   - UFW firewall allows public 443 (VPN traffic) and whitelists `PANEL_IP` strictly for `NODE_PORT` (3000) for both IPv4 and IPv6.
-   - Clients connect **directly to the Worker Server** on port 443 for VPN tunneling. Client VPN data does NOT pass through the Central Panel.
+   - Runs **full NGINX edge traffic plane**:
+     - NGINX Stream on public port 443 (`ssl_preread on; proxy_protocol on;`) demultiplexing incoming connections: `worker_domain` SNI to local NGINX HTTPS listener (`127.0.0.1:7443`), camouflage SNI to local Xray REALITY inbound (`127.0.0.1:8443`), and unrecognized/scanner probes to 8443 (which fall back to local decoy vhost on 9443).
+     - NGINX HTTPS listener on `127.0.0.1:7443` terminating Let's Encrypt TLS for `worker_domain`, with reverse proxy locations for XHTTP (`127.0.0.1:10001` with `proxy_buffering off;`), WebSocket upgrade (`127.0.0.1:10002`), and Trojan gRPC (`127.0.0.1:10003` via `grpc_pass`).
+     - Certbot automated ACME HTTP-01 challenge on port 80 with deployment reload hook for NGINX.
+   - UFW firewall permits public ports 80 and 443, and strictly whitelists `PANEL_IP` for `NODE_PORT` (default 3000) across both IPv4 and IPv6.
+   - Clients connect **directly to the Worker Server** on port 443 for all 4 MVP VPN transports. Client VPN data does NOT pass through the Central Panel.
 3. **Central Edge Proxying (Topology C) is Formally Rejected**:
    - Proxying all client VPN data through the central panel introduces a fatal latency bottleneck, doubles bandwidth costs, and creates a single point of failure.
 
@@ -126,6 +129,15 @@ sequenceDiagram
 | **10002**| TCP (Cleartext HTTP/WS) | Loopback (`127.0.0.1`) | Xray WS Inbound | In: None / Out: None | Internal backend inbound for VLESS-WS |
 | **10003**| TCP (Cleartext gRPC) | Loopback (`127.0.0.1`) | Xray gRPC Inbound | In: None / Out: None | Internal backend inbound for Trojan-gRPC |
 
+#### Preflight Port & NGINX Configuration Conflict Inspection
+To guarantee collision-free deployment:
+1. **Socket Inspection**: The preflight module verifies active TCP listeners on ports 80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, and 10003 via `ss -Hltnp "sport = :<port>"`. If occupied by non-project processes, installation halts with conflicting process name and PID before mutating any system state.
+2. **NGINX Configuration Inspection**: Port 443 is exclusively dedicated to the top-level NGINX `stream` block. The preflight module scans `/etc/nginx/` (excluding project-managed files) for conflicting `listen ... 443` directives:
+   ```bash
+   grep -rqsE --exclude="gowave-*.conf" --exclude="gowave-stream.conf" '^[[:space:]]*listen[[:space:]]+([^;]*:)?443[^0-9]' /etc/nginx/
+   ```
+   If unmanaged web server blocks listening on 443 are found, the installer detects the conflict and informs the operator to relocate existing HTTP SSL sites before applying the Stream configuration.
+
 ---
 
 ## Architectural Decisions
@@ -137,19 +149,47 @@ The system provides verified templates and testing for exactly 4 native protocol
 1. **VLESS + REALITY + Vision**:
    - `protocol: "vless"`, `security: "reality"`, `flow: "xtls-rprx-vision"`.
    - Incoming on port 443 Stream -> forwarded with PROXY v1 to Xray at `127.0.0.1:8443`.
-   - Handshake authenticated via REALITY keys. Scanners forward with PROXY v1 (`dest: "127.0.0.1:9443", xver: 1`) to NGINX decoy vhost.
+   - Handshake authenticated via REALITY keys. The installer generates cryptographic x25519 keypairs natively via GoWave Panel REST API `GET /api/system/tools/x25519/generate`, obtaining verified `privateKey` and `publicKey` without external binary dependencies.
+   - Scanners forward with PROXY v1 (`dest: "127.0.0.1:9443", xver: 1`) to NGINX decoy vhost.
 2. **VLESS + XHTTP + TLS**:
    - `protocol: "vless"`, `security: "none"`, `network: "xhttp"`.
    - Incoming on port 443 Stream (`panel_domain`) -> NGINX HTTPS listener at 7443 terminates TLS.
-   - Location `^~ /<xhttp_path>/` reverse proxies to `http://127.0.0.1:10001` with `proxy_buffering off; proxy_request_buffering off; proxy_http_version 1.1;`.
+   - Location `^~ /xhttp-down/` (and `^~ /xhttp-up/` for duplex mode) reverse proxies to `http://127.0.0.1:10001` with complete streaming directives:
+     ```nginx
+     location ^~ /xhttp-down/ {
+         proxy_pass http://127.0.0.1:10001;
+         proxy_http_version 1.1;
+         proxy_buffering off;
+         proxy_request_buffering off;
+         proxy_read_timeout 1h;
+         proxy_send_timeout 1h;
+         proxy_set_header Host $host;
+         proxy_set_header X-Real-IP $remote_addr;
+         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+     }
+     ```
+   - Canonical Xray template: `assets/xray/vless-xhttp.json`.
 3. **VLESS + WebSocket + TLS**:
    - `protocol: "vless"`, `security: "none"`, `network: "ws"`.
    - Incoming on port 443 Stream (`panel_domain`) -> NGINX HTTPS listener at 7443 terminates TLS.
-   - Location `= /<ws_path>` proxies to `http://127.0.0.1:10002` preserving `Upgrade: websocket` headers.
+   - Location `= /ws` proxies to `http://127.0.0.1:10002` preserving `Upgrade: websocket` headers (`proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";`).
+   - Canonical Xray template: `assets/xray/vless-ws.json`.
 4. **Trojan + gRPC + TLS**:
    - `protocol: "trojan"`, `security: "none"`, `network: "grpc"`.
    - Incoming on port 443 Stream (`panel_domain`) -> NGINX HTTPS listener at 7443 terminates TLS.
-   - Location `/serviceName` passes HTTP/2 frames via `grpc_pass grpc://127.0.0.1:10003`.
+   - Location `/trojan-grpc` passes HTTP/2 frames via `grpc_pass grpc://127.0.0.1:10003;` with `grpc_read_timeout 1h; grpc_send_timeout 1h;`.
+   - Canonical Xray template: `assets/xray/trojan-grpc.json`.
+
+#### Explicit SNI Roles and Domain Separation
+To prevent conflation between camouflage sites, management panels, and public VPN connection endpoints, exactly 5 distinct domain and SNI roles are established:
+1. **Host Address (`address`)**: The public IPv4/IPv6 address or resolvable FQDN of the edge server (`vpn.example.com` or Worker IP). Clients send TCP SYN packets to this address on port 443.
+2. **REALITY Camouflage SNI (`reality_camouflage_sni` / `serverNames`)**: External, popular third-party TLS domain (e.g. `gateway.icloud.com`, `dl.google.com`) configured in Xray `realitySettings.serverNames` and sent by the client in the TLS ClientHello SNI extension during REALITY handshakes.
+3. **NGINX `ssl_preread` SNI Router**: NGINX Stream on port 443 evaluates `$ssl_preread_server_name`:
+   - Matches `reality_camouflage_sni` -> forwards via PROXY v1 to Xray REALITY inbound (`127.0.0.1:8443`).
+   - Matches `panel_domain` (or `worker_domain`) -> forwards via PROXY v1 to NGINX HTTPS listener (`127.0.0.1:7443`).
+   - Missing SNI or unrecognized scanner probe -> forwards to `127.0.0.1:8443`, triggering REALITY fallback.
+4. **Decoy Destination (`realitySettings.dest`)**: Port 443 of the real camouflage domain (`gateway.icloud.com:443`) or internal decoy fallback port (`127.0.0.1:9443`) to which Xray proxies unauthenticated scanner handshakes with PROXY v1.
+5. **Decoy Web Site (`cover-reality`)**: An authentic multi-asset website (retained from `community-baseline` `cover-reality` under `/var/www/gowave-auto-nginx/cover-reality` including complete HTML, stylesheets, scripts, and media assets) served on loopback port `9443` by NGINX using a valid TLS certificate for the decoy/camouflage domain or self-signed fallback. Minimal single-file HTML stubs are explicitly rejected to provide realistic camouflage against active probing and DPI scanners.
 
 #### Direct VLESS + TLS + Vision Deferral
 Direct VLESS + TLS + Vision (without REALITY) requires Xray itself to terminate TLS, which requires Xray to directly read Let's Encrypt certificates. When Certbot renews the certificate, Xray must be reloaded/restarted across process boundaries. To keep the MVP reliable and avoid privilege boundary violations, direct VLESS + TLS + Vision is **deferred to post-MVP Non-Goals**.
@@ -166,10 +206,61 @@ Direct VLESS + TLS + Vision (without REALITY) requires Xray itself to terminate 
 
 ---
 
-### Decision 2: GoWave Subscriptions, Response Rules & Host Provisioning
+### Decision 2: GoWave Subscriptions, Response Rules, Internal Squads & Host Provisioning
 
-#### Deterministic Per-User Subscription Links
-GoWave supports route `GET /api/sub/{shortUuid}/{clientType}`. To eliminate dependency on ambiguous User-Agents or fallback rules, every user is provided two distinct, deterministic URLs:
+#### Unified Config Profile Architecture (Single Active Profile Constraint)
+In upstream GoWave (`backend-go/internal/nodes/service.go`), `updateNodeWithProfile()` delegates to `createNodeInboundLinks()`, which enforces:
+```go
+if inbound.ProfileUUID != profileID {
+    return fmt.Errorf("inbound %s does not belong to config profile %s", inbound.UUID, profileID)
+}
+```
+A GoWave Node can have exactly ONE `activeConfigProfileUuid`, and **all active inbounds assigned to the node must belong to this single active profile**. Creating separate profiles for each protocol and attempting to link their inbound UUIDs to one node is rejected by upstream validation.
+
+Therefore, for the All-in-One MVP:
+1. The installer creates **ONE managed Config Profile** (named `"GoWave MVP Unified Profile"`) via `POST /api/config-profiles`, embedding all 4 inbounds inside its raw Xray JSON configuration:
+   - Inbound 1: `protocol: "vless"`, `network: "tcp"`, `security: "reality"`, `port: 8443`
+   - Inbound 2: `protocol: "vless"`, `network: "xhttp"`, `security: "none"`, `port: 10001`
+   - Inbound 3: `protocol: "vless"`, `network: "ws"`, `security: "none"`, `port: 10002`
+   - Inbound 4: `protocol: "trojan"`, `network: "grpc"`, `security: "none"`, `port: 10003`
+2. Upon creation, GoWave parses the raw JSON and generates 4 `config_profile_inbounds` records.
+3. The installer retrieves the 4 generated UUIDs via `GET /api/config-profiles/{uuid}/inbounds`.
+4. The installer assigns the single profile UUID and all 4 inbound UUIDs to the node via `POST /api/nodes` or `PATCH /api/nodes/{uuid}` with `{"configProfile": {"activeConfigProfileUuid": "<single-profile-uuid>", "activeInbounds": ["<uuid1>", "<uuid2>", "<uuid3>", "<uuid4>"]}}`.
+5. Idempotency: Existing managed profiles are updated via `PUT /api/config-profiles/{uuid}` without duplicating inbounds or breaking node links.
+
+#### Internal Squad and User Lifecycle Provisioning
+In upstream GoWave (`backend-go/internal/nodes/service.go`), `GetUserResolvedInbounds(userID)` constructs user inbounds strictly via relational joins:
+`internal_squad_members` -> `internal_squads` -> `internal_squad_inbounds` -> `config_profile_inbounds`.
+Subsequently, `syncUserToSingleNode()` sends user credentials to the Node only for inbounds linked through the squads of which the user is an active member. If a user is not in an Internal Squad or the squad has no inbound links, the Node receives ZERO user credentials for those inbounds.
+
+To guarantee deterministic end-to-end credential sync:
+1. **Managed Internal Squad Provisioning**: The installer creates a managed Internal Squad (`POST /api/internal-squads`):
+   ```json
+   {
+     "name": "Default MVP Squad",
+     "inbounds": [
+       "<inbound-uuid-1>",
+       "<inbound-uuid-2>",
+       "<inbound-uuid-3>",
+       "<inbound-uuid-4>"
+     ]
+   }
+   ```
+2. **Initial User Provisioning**: The installer provisions an initial active user via `POST /api/users`:
+   ```json
+   {
+     "username": "default-user",
+     "status": "ACTIVE",
+     "trafficLimitStrategy": "NO_RESET",
+     "activeInternalSquads": ["<squad-uuid>"]
+   }
+   ```
+3. **Automated Credential Dispatch**: GoWave automatically executes `syncUserToSingleNode()`, transmitting user credentials (UUID, Trojan password) for all 4 inbounds to the Node.
+4. **Subscription Short UUID**: The created user response contains `shortUuid`, which forms the deterministic subscription links.
+5. If the operator subsequently creates users in the web panel, the setup documentation instructs them to assign the managed squad to receive all 4 protocols.
+
+#### Deterministic Per-User Subscription Links & Response Rules Contract
+GoWave supports route `GET /api/sub/{shortUuid}/{clientType}`. To eliminate dependency on ambiguous client sniffing, every user is provided two distinct, deterministic URLs:
 1. **Xray Subscription URL**:
    - Route: `https://<public-domain>/api/sub/<shortUuid>/v2ray-json`
    - Maps to GoWave response type `XRAY_JSON`.
@@ -178,42 +269,89 @@ GoWave supports route `GET /api/sub/{shortUuid}/{clientType}`. To eliminate depe
 2. **Mihomo Subscription URL**:
    - Route: `https://<public-domain>/api/sub/<shortUuid>/mihomo`
    - Maps to GoWave response type `MIHOMO`.
-   - Header: `Content-Type: text/yaml`.
-   - Contains all 4 MVP protocols formatted as Mihomo/Clash-Meta proxies in YAML format.
+   - Header: `Content-Type: text/yaml` (or `text/yaml; charset=utf-8`).
+   - Contains all client-compatible MVP protocols formatted as Mihomo/Clash-Meta proxies in YAML format.
 
-#### Response Rules & Template Integrity
-- In `subscription_settings`, `DisableSubscriptionAccessByPath` must be `false` to permit the `:clientType` route.
-- The `subscription_templates` database table must contain valid template records for `MIHOMO` (`DefaultTemplateMihomo`) and `XRAY_JSON` (`DefaultTemplateXrayJson`). If templates are absent, GoWave's `subtpl.Render` returns an empty string `""`. The installer verifies template presence and seeds them if missing.
-- User-Agent matching rules remain active for generic requests to `/api/sub/<shortUuid>`, falling back gracefully.
+#### Response Rules and User-Agent Enforcement (Option A)
+- **Pinned Upstream Fact**: On pinned GoWave commit `6d2c35788b3b038627b5e86e6c6486caff0851c8`, `responseRules()` in `backend-go/internal/subscription/serve.go` executes for **both** `/api/sub/{shortUuid}` and `/api/sub/{shortUuid}/{clientType}`. If the `User-Agent` header is missing or empty, it returns `HTTP 403 Forbidden`:
+  ```go
+  if err != nil || settings.ResponseRules == nil || userAgent == nil || *userAgent == "" {
+      nestError(w, r, http.StatusForbidden, "Forbidden")
+      return nil
+  }
+  ```
+  *(Note: The published web API documentation stated that the typed route bypasses Response Rules; however, the actual Go source code on this pinned commit executes responseRules for all subscription routes).*
+- **Adopted Contract (Option A)**:
+  - Clients requesting subscriptions must provide a non-empty, valid client User-Agent header (e.g. `v2rayN/6.23`, `Xray/1.8.4`, `ClashMeta/v1.18.0`, `Mihomo/1.18.0`).
+  - In `subscription_settings`, `DisableSubscriptionAccessByPath` is verified as `false`.
+  - The `subscription_templates` database table contains `DefaultTemplateMihomo` and `DefaultTemplateXrayJson`.
+  - Tests verify that valid client User-Agents return HTTP 200, while missing or empty User-Agent returns HTTP 403 Forbidden (negative security test).
 
-#### Automatic GoWave Host Record Provisioning
-In GoWave's data model, creating Config Profiles on a Node is not sufficient for client connections; client subscription links are generated from `Host` entities. For each provisioned MVP profile, the provisioning module creates a Host record via `POST /api/hosts`:
+#### Automatic GoWave Host Record Provisioning & Verified Security Layers
+Client subscription links are generated from `Host` entities in GoWave. For each provisioned MVP profile, the installer creates a Host record via `POST /api/hosts`:
 ```json
 {
   "inbound": {
-    "configProfileUuid": "<profile-uuid>",
+    "configProfileUuid": "<single-profile-uuid>",
     "configProfileInboundUuid": "<inbound-uuid>"
   },
+  "nodes": ["<node-uuid>"],
   "remark": "VLESS-REALITY-Vision",
   "address": "vpn.example.com",
   "port": 443,
-  "sni": "www.apple.com",
+  "sni": "gateway.icloud.com",
   "path": null,
   "host": null,
   "alpn": "h2,http/1.1",
   "fingerprint": "chrome",
-  "securityLayer": "REALITY",
+  "securityLayer": "DEFAULT",
+  "internalSquads": {
+    "mode": "ALLOW_ONLY",
+    "squads": ["<squad-uuid>"]
+  },
   "isDisabled": false
 }
 ```
-- For XHTTP and WebSocket, `path` and `host` headers are populated.
-- For Trojan gRPC, `path` is set to the gRPC service name and `securityLayer` to `DEFAULT`.
-- Provisioning is idempotent: existing hosts with identical inbound associations are updated via `PATCH /api/hosts`, preventing duplicates.
 
-#### Public Output & Zero Internal Leaks
-- The installer displays both subscription links (`v2ray-json` and `mihomo`) in its completion summary report.
-- Both links are displayed in the GoWave panel UI with one-click copy.
-- Subscriptions are validated to contain strictly public domain/IP and port 443; loopback addresses (`127.0.0.1`, `::1`), internal ports (`3000`, `3001`, `3002`, `7443`, `8443`, `9443`, `10001-10003`), and node secrets are guaranteed never to appear in subscription output.
+##### Upstream Host.securityLayer Resolution Contract
+In `backend-go/internal/configprofiles/handler.go`, `formatHostResponse()` normalizes `securityLayer` to exactly 3 values: `DEFAULT`, `TLS`, `NONE`. Any other string (including `"REALITY"`) is converted to `"DEFAULT"`.
+
+In `backend-go/internal/subtpl/resolve.go`, `resolveSecurity()` resolves client security:
+- If `securityLayer == "TLS"`: forces client `security = "tls"`.
+- If `securityLayer == "NONE"`: forces client `security = "none"`.
+- If `securityLayer == "DEFAULT"`: inherits security from the inbound's stream settings.
+
+| MVP Protocol Host | Inbound `streamSettings.security` | Host `securityLayer` | Resolved Client Security | Rationale |
+|---|---|---|---|---|
+| **VLESS REALITY Vision** | `reality` | `DEFAULT` | `reality` | Inherits `reality` from Xray inbound. `"REALITY"` is invalid enum; must be `"DEFAULT"`. |
+| **VLESS XHTTP TLS** | `none` | `TLS` | `tls` | NGINX terminates TLS on 443/7443; Xray listens with `none`. Host must force `"TLS"` so client connects with TLS. |
+| **VLESS WebSocket TLS** | `none` | `TLS` | `tls` | NGINX terminates TLS; Host must force `"TLS"`. |
+| **Trojan gRPC TLS** | `none` | `TLS` | `tls` | NGINX terminates TLS; Host must force `"TLS"`. |
+
+#### Web Panel UI vs. CLI Subscription Delivery (Scope Boundary)
+- Upstream GoWave React frontend natively displays `user.subscriptionUrl` (the base subscription URL `https://<subPublicDomain>/<shortUuid>`).
+- GoWave Auto NGINX explicitly **does NOT fork, rebuild, or patch the upstream React frontend bundle** in the MVP, avoiding frontend compilation fragility and maintenance divergence.
+- The installer completion summary outputs both direct typed URLs (`/v2ray-json` and `/mihomo`).
+- A CLI helper command `gowave-auto-nginx user links <username-or-shortUuid>` is provided to retrieve both typed URLs at any time.
+- Subscriptions are validated to contain strictly public domain/IP and port 443; loopback addresses (`127.0.0.1`, `::1`), internal ports (`3000`, `3001`, `3002`, `7443`, `8443`, `9443`, `10001-10003`), node secrets, and private keys never appear in subscription output.
+
+#### Scoped API Token Provisioning for External Web Frontends and Integrations
+To enable seamless integration with external web subscription portals (such as `remnawave/subscription-page`) or Telegram management bots without exposing administrative passwords or granting raw database access, the installer automates token generation via `POST /api/tokens`:
+```json
+{
+  "name": "gowave-auto-nginx subscription-page token",
+  "description": "Generated by gowave-auto-nginx for external web subscription interfaces and integrations",
+  "scopes": [
+    "subscription-page-configs:list",
+    "subscription-page-configs:get",
+    "subscriptions:subpage-config",
+    "system:metadata",
+    "users:by-username"
+  ],
+  "expiresAt": null
+}
+```
+The resulting Bearer token is appended along with the panel URL and administrative credentials to `/root/gowave-credentials.txt` with restricted permissions (`0600`).
 
 ---
 
@@ -241,6 +379,42 @@ In GoWave's data model, creating Config Profiles on a Node is not sufficient for
 - Orchestrator configures UFW firewall rules:
   - On All-in-One: `ufw deny 3002/tcp` blocks external access to the wildcard listener; only loopback is permitted.
   - On Worker: `ufw allow from <PANEL_IP> to any port <NODE_PORT> proto tcp` whitelists the Control Plane IP (both IPv4 and IPv6), dropping all other external traffic.
+
+##### Upstream NODE_PORT Support Verification & Fallback Contract (AUD-04)
+- **Source Verification**: In pinned commit `gowave-node` `7b3514d`:
+  - `gowave-node/install.sh#L340-L351`: Checks `port=$(env_get NODE_PORT); [ -n "$port" ] || port=${NODE_PORT:-}; port=$(unquote "${port:-3000}" NODE_PORT)`. Validates numeric range (`1-65535`), checks listener collision, and writes `NODE_PORT="$port"` into `/opt/gowave-node/.env`.
+  - `gowave-node/internal/config/config.go#L102-L105`: Reads `portStr := os.Getenv("NODE_PORT")` and falls back to 3000 only when unset.
+- **Hardening Fallback Drop-In**: To guarantee collision-free operation even if `/opt/gowave-node/.env` is modified manually or overwritten, the orchestrator deploys a persistent systemd drop-in `/etc/systemd/system/gowave-node.service.d/10-port.conf`:
+  ```ini
+  [Service]
+  Environment="NODE_PORT=3002"
+  ```
+  This guarantees that the node daemon unconditionally binds to port 3002 on All-in-One deployments.
+
+#### Remote Worker SSH Stdin Pipeline Orchestration (`remote_payload`)
+To deploy remote worker nodes over SSH without depending on `scp`, creating messy file transfers, or leaving orphaned scripts on target machines:
+1. `gowave-node-auto.sh` implements an SSH stdin streaming mechanism:
+   ```bash
+   remote_payload() {
+       local host="$1"
+       local port="${2:-22}"
+       {
+           # Safely serialize environment variables
+           declare -p PANEL_IP NODE_PORT SECRET_KEY GOWAVE_NODE_VERSION
+           # Safely serialize modular installer functions
+           declare -f setup_system_prereqs configure_firewall configure_edge_nginx run_upstream_node_installer
+           # Stream inline remote runner entrypoint
+           cat <<'REMOTE_EOF'
+   set -euo pipefail
+   setup_system_prereqs
+   configure_firewall
+   configure_edge_nginx
+   run_upstream_node_installer
+   REMOTE_EOF
+       } | ssh -p "$port" "$host" 'f=$(mktemp) && cat >"$f" && bash "$f"; rc=$?; rm -f "$f"; exit $rc'
+   }
+   ```
+2. The remote execution runs atomically in a secure temporary file created via `mktemp`, unlinks it unconditionally upon script exit, and transparently propagates the remote return code back to the orchestrator.
 
 #### Config Profile to Node Association API
 The installer associates Config Profiles and active inbounds to nodes using GoWave's exact API contract:
@@ -321,6 +495,23 @@ If the server suffers a sudden power loss or kernel panic during an update:
 - On system boot or when `gowave-auto.sh` is invoked, the script inspects `journal.json`.
 - If the journal state is `APPLYING` or `ROLLBACK_REQUIRED`, the manager detects an interrupted transaction and automatically initiates rollback to the snapshot, restoring service stability.
 
+#### Initial Provisioning Transaction Lifecycle & Rollback (AUD-05)
+To eliminate dirty partial setups and guarantee complete atomicity during initial installation, the initial provisioning phase (Config Profile, Squad, Hosts, User, API Token) is tracked inside `/var/lib/gowave-auto-nginx/recovery/journal.json`:
+1. **Provisioning State Transitions**:
+   - `PROVISION_PREPARED`: Initial admin authenticated, parameters validated.
+   - `PROVISION_APPLYING`: Entities are created and their UUIDs recorded sequentially into `/var/lib/gowave-auto-nginx/state.json.tmp`.
+   - `PROVISION_VERIFYING`: `GET /api/config-profiles/{uuid}/computed-config` and subscription test queries executed.
+   - `PROVISION_COMMITTED`: Atomic rename of `state.json.tmp` -> `state.json`. Journal marked `COMMITTED`.
+   - `PROVISION_ROLLBACK_REQUIRED`: Any step failed or verification timed out.
+   - `PROVISION_ROLLED_BACK`: Cleanup completed, system reverted to clean state.
+2. **Deterministic Rollback Actions on Failure**:
+   If an error occurs or verification fails during provisioning, the orchestrator parses the recorded UUIDs from `state.json.tmp` and executes deletion in strict reverse order:
+   - If User was created: `DELETE /api/users/{uuid}`
+   - If Hosts were created: `DELETE /api/hosts/{uuid}` for each provisioned host
+   - If Squad was created: `DELETE /api/internal-squads/{uuid}`
+   - If Config Profile was created: `DELETE /api/config-profiles/{uuid}`
+   - Remove temporary files, update journal state to `PROVISION_ROLLED_BACK`, and halt with exit code 1.
+
 ---
 
 ### Decision 6: Zero-Leak Secret Delivery
@@ -332,23 +523,24 @@ If the server suffers a sudden power loss or kernel panic during an update:
 
 ---
 
-### Decision 7: Debian 12 Compatibility Layer
+### Decision 7: Multi-Distribution Compatibility Layer (Debian & Ubuntu)
 
-Debian 12 compatibility is achieved via three targeted adaptations:
-1. **`systemd-resolved` Provisioning**:
+Multi-distribution compatibility across target systems is achieved via three targeted runtime adaptations, adhering strictly to the taxonomy defined in `COMPATIBILITY_MATRIX.md`:
+1. **`systemd-resolved` Provisioning (Debian 12 Bookworm `[SOURCE_COMPATIBLE]` & Debian 13 Trixie `[PROJECT_E2E_PLANNED]`)**:
    - Detected via `command -v resolvectl`. If missing and DoT is selected, runs `apt-get install -y systemd-resolved` and enables the unit.
-2. **NGINX 1.22.1 HTTP/2 Syntax Adaptation**:
-   - Evaluates `nginx -v`. For versions < 1.25.1 (Debian 12 has 1.22.1), renders:
+2. **NGINX Runtime HTTP/2 Syntax Detection**:
+   - Evaluates `nginx -v` dynamically rather than relying solely on OS release names.
+   - For NGINX versions < 1.25.1 (which includes Debian 12 Bookworm `[SOURCE_COMPATIBLE]` with 1.22.1 AND Ubuntu 24.04 Noble `[UPSTREAM_SUPPORTED]` with 1.24.0), renders:
      ```nginx
      listen 127.0.0.1:7443 ssl http2 proxy_protocol;
      ```
-   - For versions >= 1.25.1 (Ubuntu 24.04/Debian 13), renders:
+   - For NGINX versions >= 1.25.1 (Debian 13 Trixie `[PROJECT_E2E_PLANNED]` with 1.26.3, Ubuntu 26.04 Resolute `[PROJECT_E2E_PLANNED]`, or official nginx.org repos), renders:
      ```nginx
      listen 127.0.0.1:7443 ssl proxy_protocol;
      http2 on;
      ```
 3. **APT Security Origins**:
-   - Configures `/etc/apt/apt.conf.d/99zz-gowave-auto-nginx` with `origin=Debian,label=Debian-Security,codename=${distro_codename}-security`.
+   - Configures `/etc/apt/apt.conf.d/99zz-gowave-auto-nginx` with `origin=Debian,label=Debian-Security,codename=${distro_codename}-security` for Debian hosts.
    - Disables automatic reboots (`Unattended-Upgrade::Automatic-Reboot "false";`) by default.
 
 ---
