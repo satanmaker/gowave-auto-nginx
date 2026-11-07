@@ -91,25 +91,30 @@ flowchart TD
 ### Suite 3: `services` (L4 Live Services & Protocol Simulation)
 - **Privilege**: Non-root (`id -u != 0`).
 - **Tests Covered**:
-  - `test_stream_sni_routing`: NGINX Stream routing port 443 into `panel_domain` (7443) and `reality_domain` (8443).
   - `test_reality_fallback`: Legitimate REALITY client handshake vs scanner probe; verify fallback sends PROXY protocol v1 to port 9443 where decoy static site is served.
   - `test_xhttp_streaming`: Bidirectional HTTP/1.1 and HTTP/2 POST stream sent to `https://panel_domain/<xhttp_path>/`; verify NGINX reverse proxies to loopback port without chunk buffering or request body truncation.
   - `test_websocket_upgrade`: Verification of WebSocket handshake and protocol upgrade headers.
   - `test_trojan_grpc`: Live client test connecting to Trojan gRPC over HTTP/2 with password authentication, `grpc_pass` proxying to 10003, and bidirectional data transfer.
-  - `test_worker_edge_traffic`: Live client test connecting directly to remote Worker node on port 443 across all 4 protocols, validating Worker NGINX Stream, TLS termination, and direct data tunneling without traversing Central Panel.
   - `test_xray_subscription`: Fetch `GET /api/sub/{shortUuid}/v2ray-json` with Xray UA; verify explicit assertion checklist (AUD-08): `status_code == 200`, `len(body.strip()) > 0`, body parses as valid JSON with `len(inbounds) >= 4`, all 4 inbounds present on port 443, and zero loopback/internal leaks (`127.0.0.1`, internal ports, unix sockets).
   - `test_mihomo_subscription`: Fetch `GET /api/sub/{shortUuid}/mihomo` with Mihomo UA; verify explicit assertion checklist (AUD-08): `status_code == 200`, `Content-Type: text/yaml`, `len(body.strip()) > 0`, body parses as valid YAML matching `assets/mihomo/expected.yaml` structure with `len(proxies) >= 4`, and zero internal leaks.
-  - `test_client_import_validators`: Pass fetched Xray JSON to official Xray core (`v1.8.24`+ / `v24.9.30`+ via `xray run -test -c`) and Mihomo YAML to official Mihomo core (`v1.19.22`+ / `v1.20.0`+ via `mihomo -t -f`), asserting exit code 0 and verifying all proxy fields (type, server, port, cipher, password, uuid, flow, tls, sni, alpn, reality-opts, grpc-opts, ws-opts, xhttp-opts).
-  - `test_node_firewall_isolation`: Verify that external IPv4 (`<public-ipv4>:3002`) and IPv6 (`[<public-ipv6>]:3002`) probes are dropped or refused by UFW firewall rules, while local loopback connections (`127.0.0.1:3002`, `[::1]:3002`) succeed, and verify rule persistence after UFW reload.
+  - `test_client_import_validators`: Pass fetched Xray JSON to official Xray core (`v24.11.30`+ / `v25.x` via `xray run -test -c`) and Mihomo YAML to official Mihomo core (`v1.19.22`+ / `v1.20.0`+ via `mihomo -t -f`), asserting exit code 0 and verifying all proxy fields (type, server, port, cipher, password, uuid, flow, tls, sni, alpn, reality-opts, grpc-opts, ws-opts, xhttp-opts).
+  - `test_outbound_ssrf_block`: Execute client connections through the provisioned proxy tunnel to `127.0.0.1:3000`, `127.0.0.1:3001`, `127.0.0.1:3002`, `169.254.169.254`, and RFC1918 addresses; assert that Xray routing drops or terminates connections with blackhole/rejection, proving zero loopback leakage.
 
-### Suite 4: `root` (L2 Filesystem Permissions & Isolated System Drop-Ins)
-- **Privilege**: Root (`id -u == 0`) inside disposable Docker container.
+### Suite 4: `root` (L2 Filesystem Permissions, Firewall & Edge Ports)
+- **Privilege**: Root (`id -u == 0`) inside disposable container or VM.
 - **Tests Covered**:
   - `test_user_permissions`: Creation of user `gowave:gowave`, verify directory permissions `1770 root:gowave` on `/opt/gowave`, and verify executable is owned by `root:root`.
   - `test_service_install`: Execution of `gowave-server service install /opt/gowave` and verification of generated `90-unprivileged.conf` and `gowave-update.path`.
   - `test_secret_delivery`: Delivery of `SECRET_KEY` strictly via stdin or temporary `0600` file; assert process inspection of both local `ssh` process and remote runner via `/proc/<pid>/cmdline` and `ps aux` reveals zero secrets.
   - `test_fail2ban_syntax`: Validation of `/etc/fail2ban/jail.d/90-gowave-auto-nginx.local` via `fail2ban-client --test`.
   - `test_backup_format_v1`: Generation of `GoWave Auto NGINX Backup Format v1` archive; verify mode `0600` and validation of `meta.json` manifest.
+  - `test_stream_sni_routing`: NGINX Stream routing port 443 into `panel_domain` (7443) and `reality_domain` (8443).
+  - `test_worker_edge_traffic`: Live client test connecting directly to remote Worker node on port 443 across all 4 protocols, validating Worker NGINX Stream, TLS termination, and direct data tunneling without traversing Central Panel.
+  - `test_node_firewall_isolation`: Verify that external IPv4 (`<public-ipv4>:3002`) and IPv6 (`[<public-ipv6>]:3002`) probes are dropped by UFW firewall rules, while local loopback connections succeed, verify active UFW status enforcement, and verify fail-closed behavior.
+  - `test_certbot_renewal_dry_run`: Execute `certbot renew --dry-run` while NGINX is actively serving traffic on port 80/443; assert exit code 0, verifying webroot authenticator persistence.
+  - `test_decoy_tls13_h2`: Verify via `openssl s_client -tls1_3 -alpn h2 -connect 127.0.0.1:9443` that the fallback decoy vhost negotiates TLS 1.3 and ALPN HTTP/2.
+  - `test_backup_restore_preflight_security`: Feed malicious tar archives with directory traversal (`etc/cron.d/evil`), SUID binaries, and oversized manifests to 15-point preflight validator; assert immediate rejection.
+  - `test_multi_node_sequential_add`: Execute sequential `gowave-auto.sh node add` operations; assert dedicated worker profiles and canonical remarks (`<PROTO>@<node-name>`) are created without modifying or overwriting existing node hosts.
 
 ### Suite 5: `systemd` (L5 Genuine PID 1 Systemd in QEMU TCG Guest)
 - **Privilege**: Root (`id -u == 0`) inside QEMU virtual machine.
@@ -193,7 +198,6 @@ podman run --rm -d \
   --name "gowave-testbed-${DISTRO}" \
   --systemd=always \
   --privileged \
-  -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
   -v "${WORKSPACE_ROOT}:/workspace:ro" \
   "gowave-testbed-${DISTRO}:latest"
 ```

@@ -27,8 +27,8 @@
           ],
           "privateKey": "",
           "shortIds": [
-            "",
-            "0123456789abcdef"
+            "__SHORT_ID_1__",
+            "__SHORT_ID_2__"
           ],
           "minClientVer": "",
           "maxClientVer": "",
@@ -142,5 +142,32 @@
       "tag": "BLOCK",
       "protocol": "blackhole"
     }
-  ]
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "outboundTag": "BLOCK",
+        "ip": [
+          "127.0.0.0/8",
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "169.254.0.0/16",
+          "100.64.0.0/10",
+          "::1/128",
+          "fc00::/7",
+          "fe80::/10"
+        ]
+      },
+      {
+        "type": "field",
+        "outboundTag": "BLOCK",
+        "protocol": [
+          "bittorrent"
+        ]
+      }
+    ]
+  }
 }

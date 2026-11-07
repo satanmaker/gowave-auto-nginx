@@ -35,11 +35,11 @@ The backup tool SHALL support separate backup scopes for Central Panel servers a
 - **WHEN** `gowave-backup.sh backup --type node` is executed on an edge server
 - **THEN** the archive captures `/opt/gowave-node/.env` containing its specific assigned `SECRET_KEY`, local service configuration, and node metadata.
 
-### Requirement: 12-Point Archive Preflight Security Validation
-The restore subsystem SHALL inspect tarball headers using a dedicated Python preflight validator before extraction, rejecting malicious archives containing traversal attacks, symlink escapes, or resource exhaustion vectors.
+### Requirement: 15-Point Archive Preflight Security Validation
+The restore subsystem SHALL inspect tarball headers using a dedicated Python preflight validator before extraction, rejecting malicious archives containing traversal attacks, paths outside managed roots, SUID binaries, or resource exhaustion vectors.
 
-#### Scenario: Rejection of path traversal and absolute paths
-- **GIVEN** a malformed archive containing path members with `..` or leading `/`
+#### Scenario: Rejection of path traversal and unmanaged root paths
+- **GIVEN** a malformed archive containing path members with `..`, leading `/`, or paths outside managed roots (`etc/cron.d/`, `root/.ssh/`)
 - **WHEN** restore preflight validation is performed
 - **THEN** the archive is rejected before extraction, and no host filesystem state is modified.
 
@@ -52,6 +52,11 @@ The restore subsystem SHALL inspect tarball headers using a dedicated Python pre
 - **GIVEN** an archive containing character/block devices, FIFOs, more than 5,000 files, or an unpacked size exceeding 1 GB
 - **WHEN** restore preflight validation is performed
 - **THEN** the validator aborts restore with an informative error.
+
+#### Scenario: SUID and SGID stripping on restoration
+- **GIVEN** an archive containing files with SUID or SGID permission bits
+- **WHEN** restore extraction proceeds
+- **THEN** the validator clears SUID/SGID bits (`04000`, `02000`) and enforces managed permissions on destination paths.
 
 ### Requirement: Persistent Pre-Restore Recovery Snapshotting
 The restore subsystem SHALL create a persistent recovery snapshot of current host state in `/var/lib/gowave-auto-nginx/recovery/restore-<timestamp>/` before modifying any files, tracking operations in `journal.json`.

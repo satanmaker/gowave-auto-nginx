@@ -85,9 +85,9 @@ The routing subsystem SHALL bind port 443 (Stream) and port 80 (HTTP) on IPv6 on
 - **THEN** listeners bind strictly to IPv4 (`listen 443;` and `listen 80;`), omitting `[::]` directives to prevent fatal `Address family not supported` socket errors.
 
 ### Requirement: 3-Stage Dual-Lineage Let's Encrypt TLS Bootstrap Sequence
-The installer SHALL resolve the initial TLS bootstrap deadlock using a 3-stage sequence: issue initial certificates for both `PANEL_DOMAIN` and `REALITY_DOMAIN` via standalone mode or unencrypted port 80 webroot vhost, deploy production Stream 443 and HTTPS 7443 configurations, and maintain port 80 non-redirected ACME challenge routes.
+The installer SHALL resolve the initial TLS bootstrap deadlock using a 3-stage sequence: issue initial certificates for both PANEL_DOMAIN and REALITY_DOMAIN via temporary port 80 webroot vhost with webroot authenticator, deploy production Stream 443 and HTTPS 7443 configurations, verify automated renewal via dry-run, and maintain port 80 non-redirected ACME routes.
 
 #### Scenario: Bootstrap certificates on fresh host
 - **GIVEN** a clean host without pre-existing Let's Encrypt certificates
 - **WHEN** the installer initiates TLS provisioning
-- **THEN** it issues certificates via `certbot certonly --standalone` for both `PANEL_DOMAIN` and `REALITY_DOMAIN` before starting NGINX (or via temporary port 80 webroot vhost without HTTPS redirects), deploys production Stream and HTTPS configurations referencing both valid certificates, and ensures port 80 redirects exclude `/.well-known/acme-challenge/` for future renewals.
+- **THEN** it deploys temporary port 80 webroot vhost `/var/www/gowave-acme`, starts NGINX, issues certificates via `certbot certonly --webroot` for both `PANEL_DOMAIN` and `REALITY_DOMAIN`, deploys production Stream and HTTPS configurations referencing both certificates, verifies `certbot renew --dry-run` succeeds with NGINX online, and drops scanner traffic on unmanaged domains.

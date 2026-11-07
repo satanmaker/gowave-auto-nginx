@@ -22,8 +22,8 @@
       ],
       "privateKey": "",
       "shortIds": [
-        "",
-        "0123456789abcdef"
+        "__SHORT_ID_1__",
+        "__SHORT_ID_2__"
       ],
       "minClientVer": "",
       "maxClientVer": "",

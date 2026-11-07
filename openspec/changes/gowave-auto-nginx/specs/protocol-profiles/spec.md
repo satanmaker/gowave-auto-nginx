@@ -49,7 +49,7 @@ The installer SHALL provision the 4 MVP protocol profiles by creating a single u
 #### Scenario: Single unified Config Profile provisioning with 4 inbounds
 - **GIVEN** a newly installed GoWave Panel and registered Node
 - **WHEN** the provisioning script executes
-- **THEN** it creates one managed Config Profile embedding all 4 inbounds (REALITY, XHTTP, WS, Trojan gRPC) in raw Xray JSON, retrieves the 4 generated inbound UUIDs, links the single profile and all 4 inbound UUIDs to the Node, and verifies the compiled Xray config via `GET /api/config-profiles/{uuid}/computed-config` without creating duplicate profiles on subsequent runs.
+- **THEN** it creates one managed Config Profile embedding all 4 inbounds (REALITY, XHTTP, WS, Trojan gRPC) with `acceptProxyProtocol: true` strictly on REALITY 8443, outbound routing rules blocking loopback and cloud metadata (`169.254.169.254`), and random shortIds in raw Xray JSON, retrieves the 4 generated inbound UUIDs, links the profile and all 4 inbound UUIDs to the Node, and verifies the compiled Xray config via `GET /api/config-profiles/{uuid}/computed-config`.
 
 #### Scenario: Cross-profile inbound association rejection (negative test)
 - **GIVEN** an active GoWave Node associated with a primary Config Profile
@@ -66,7 +66,7 @@ The system SHALL manage user inbound access and credential propagation through G
 
 #### Scenario: Initial active user provisioning and squad assignment
 - **GIVEN** an active GoWave Panel with a managed Internal Squad
-- **WHEN** user provisioning executes via `POST /api/users` with `activeInternalSquads` containing the managed squad UUID
+- **WHEN** user provisioning executes via `POST /api/users` with mandatory `expireAt` timestamp and `activeInternalSquads` containing the managed squad UUID
 - **THEN** GoWave creates the user with status `ACTIVE`, assigns a random nanoid `shortUuid`, and emits `user.created`.
 
 #### Scenario: User credential sync to Node for all active inbounds
@@ -122,7 +122,7 @@ The system SHALL provide two deterministic, per-user subscription URLs for every
 
 #### Scenario: Client parser and import validation
 - **GIVEN** fetched Xray JSON and Mihomo YAML subscription payloads
-- **WHEN** the Xray JSON payload is validated using official Xray core (`v1.8.24`+ / `v24.9.30`+ via `xray run -test -c`) and the Mihomo YAML payload is validated using Mihomo (`v1.19.22`+ / `v1.20.0`+ via `mihomo -t -f`)
+- **WHEN** the Xray JSON payload is validated using official Xray core (`v24.11.30`+ / `v25.x` via `xray run -test -c`) and the Mihomo YAML payload is validated using Mihomo (`v1.19.22`+ / `v1.20.0`+ via `mihomo -t -f`)
 - **THEN** both tools complete validation with exit code 0, verifying proxy outbounds contain valid public server addresses, port 443, and zero internal loopback or socket references.
 
 #### Scenario: Protocol update reflection in subscriptions

@@ -118,7 +118,7 @@ All endpoints below require header `Authorization: Bearer <accessToken>` unless 
 | **Create Host** | `POST /api/hosts` | `server.go#L612`, `configprofiles/handler.go#L590-L614`, `service.go#L38-L95` | Full Host DTO (see Section 2.1) | `201 Created`:<br>`{"response": {"uuid": "<host-uuid>", "remark": "...", "nodes": ["<node-uuid>"], ...}}` | `400 Bad Request`<br>`500 Server Error` | Creates Host record. One Host entity created per MVP protocol (4 total). |
 | **Update Host** | `PATCH /api/hosts/{uuid}` | `server.go#L613`, `configprofiles/handler.go#L633-L670` | Subset of Host DTO fields | `200 OK`:<br>`{"response": { ... updated host ... }}` | `400 Bad Request`<br>`404 Not Found` | Updates existing Host record in place without duplicating records. |
 | **Delete Host** | `DELETE /api/hosts/{uuid}` | `server.go#L614`, `configprofiles/handler.go#L680-L700` | *None* | `200 OK` / `204 No Content` | `404 Not Found` | Used strictly during automated rollback if provisioning fails. |
-| **Create User** | `POST /api/users` | `server.go#L554`, `users/handler.go#L120-L170`, `users/service.go#L142-L232` | `{"username": "default-user", "status": "ACTIVE", "trafficLimitStrategy": "NO_RESET", "activeInternalSquads": ["<squad-uuid>"]}` | `201 Created`:<br>`{"response": {"uuid": "<user-uuid>", "username": "default-user", "shortUuid": "<nanoid>", "status": "ACTIVE", ...}}` | `400 Bad Request`<br>`409 Conflict` (username exists) | Automatically triggers `syncUserToSingleNode()` for all squad inbounds. |
+| **Create User** | `POST /api/users` | `server.go#L554`, `users/handler.go#L120-L170`, `users/service.go#L142-L232` | `{"username": "default-user", "status": "ACTIVE", "trafficLimitStrategy": "NO_RESET", "expireAt": "2099-01-01T00:00:00.000Z", "activeInternalSquads": ["<squad-uuid>"]}` | `201 Created`:<br>`{"response": {"uuid": "<user-uuid>", "username": "default-user", "shortUuid": "<nanoid>", "status": "ACTIVE", ...}}` | `400 Bad Request`<br>`409 Conflict` (username exists) | Automatically triggers `syncUserToSingleNode()` for all squad inbounds. `expireAt` is mandatory per OpenAPI schema. |
 | **Get User by Username** | `GET /api/users/by-username/{username}` | `server.go#L581`, `users/handler.go#L450-L480` | *None* | `200 OK`:<br>`{"response": {"uuid": "...", "username": "...", "shortUuid": "<nanoid>", ...}}` | `404 Not Found` | Retrieves existing user and extracts `shortUuid` if user was already provisioned. |
 | **Create Scoped API Token** | `POST /api/tokens` | `server.go#L673`, `tokens/handler.go#L35-L95` | `{"name": "gowave-auto-nginx token", "scopes": ["subscription-page-configs:list", "subscription-page-configs:get", "subscriptions:subpage-config", "system:metadata", "users:by-username"], "expiresAt": null}` | `201 Created`:<br>`{"response": {"uuid": "<token-uuid>", "token": "<bearer-token>", ...}}` | `400 Bad Request` | Issues long-lived token for external web subscription pages and Telegram bots. |
 
@@ -195,33 +195,36 @@ The file is written with mode `0600` owned by `root:root`:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "panelDomain": "panel.example.com",
-  "workerDomain": null,
-  "managedProfile": {
-    "name": "GoWave MVP Unified Profile",
-    "uuid": "018d9f12-3456-7890-abcd-ef0123456789",
-    "inbounds": {
-      "vless-reality": "018d9f12-3456-7890-abcd-ef012345678a",
-      "vless-xhttp": "018d9f12-3456-7890-abcd-ef012345678b",
-      "vless-ws": "018d9f12-3456-7890-abcd-ef012345678c",
-      "trojan-grpc": "018d9f12-3456-7890-abcd-ef012345678d"
+  "localRealityDomain": "cdn.example.com",
+  "nodes": [
+    {
+      "name": "local-node",
+      "uuid": "018d9f12-3456-7890-abcd-ef012345678e",
+      "port": 3002,
+      "realityDomain": "cdn.example.com",
+      "profile": {
+        "name": "GoWave MVP Unified Profile - local-node",
+        "uuid": "018d9f12-3456-7890-abcd-ef0123456789",
+        "inbounds": {
+          "vless-reality": "018d9f12-3456-7890-abcd-ef012345678a",
+          "vless-xhttp": "018d9f12-3456-7890-abcd-ef012345678b",
+          "vless-ws": "018d9f12-3456-7890-abcd-ef012345678c",
+          "trojan-grpc": "018d9f12-3456-7890-abcd-ef012345678d"
+        }
+      },
+      "hosts": {
+        "vless-reality": "018d9f12-3456-7890-abcd-ef0123456790",
+        "vless-xhttp": "018d9f12-3456-7890-abcd-ef0123456791",
+        "vless-ws": "018d9f12-3456-7890-abcd-ef0123456792",
+        "trojan-grpc": "018d9f12-3456-7890-abcd-ef0123456793"
+      }
     }
-  },
-  "managedNode": {
-    "name": "local-node",
-    "uuid": "018d9f12-3456-7890-abcd-ef012345678e",
-    "port": 3002
-  },
+  ],
   "managedSquad": {
     "name": "Default MVP Squad",
     "uuid": "018d9f12-3456-7890-abcd-ef012345678f"
-  },
-  "managedHosts": {
-    "vless-reality": "018d9f12-3456-7890-abcd-ef0123456790",
-    "vless-xhttp": "018d9f12-3456-7890-abcd-ef0123456791",
-    "vless-ws": "018d9f12-3456-7890-abcd-ef0123456792",
-    "trojan-grpc": "018d9f12-3456-7890-abcd-ef0123456793"
   },
   "defaultUser": {
     "username": "default-user",
@@ -295,39 +298,45 @@ gowave-auto.sh node add <node-name> <node-ip> <worker-domain> <reality-domain> [
 ### 5.2 Registration Protocol Flow
 1. **Admin Authentication**:
    - `POST /api/auth/login` with stored admin credentials to obtain an active JWT bearer token.
-2. **Node Creation in Panel**:
-   - `POST /api/nodes` with payload:
+2. **Dedicated Worker Config Profile Creation**:
+   - `POST /api/config-profiles` creates `"GoWave Worker <node-name> Profile"` with `realitySettings.serverNames: ["<reality-domain>"]`, native x25519 keypair, random 8-byte shortIds, and loopback SSRF blocking rules in `routing`.
+   - Fetches inbound UUIDs via `GET /api/config-profiles/{uuid}/inbounds`.
+3. **Node Creation in Panel**:
+   - `POST /api/nodes` with payload linking the worker profile and its 4 active inbounds:
      ```json
      {
        "name": "<node-name>",
        "address": "<node-ip>",
        "port": 3000,
        "configProfile": {
-         "activeConfigProfileUuid": "<profile-uuid>",
+         "activeConfigProfileUuid": "<worker-profile-uuid>",
          "activeInbounds": [
-           "<inbound-uuid-1>",
-           "<inbound-uuid-2>",
-           "<inbound-uuid-3>",
-           "<inbound-uuid-4>"
+           "<worker-inbound-1>",
+           "<worker-inbound-2>",
+           "<worker-inbound-3>",
+           "<worker-inbound-4>"
          ]
        }
      }
      ```
    - Receives `response.uuid` identifying the newly registered worker node.
-3. **Secret Key Extraction**:
+4. **Squad Inbound Association**:
+   - `PATCH /api/internal-squads/{squad-uuid}` appends the 4 worker inbound UUIDs to `inbounds` array, ensuring users in the squad receive credentials on the worker node.
+5. **Secret Key Extraction**:
    - Executes `./gowave-server rescue --print-secret-key-raw` or fetches credentials payload to extract `SECRET_KEY` (`caCertPem`, `jwtPublicKey`, `nodeCertPem`, `nodeKeyPem`).
-4. **Host Entity Creation**:
-   - Issues `POST /api/hosts` for each of the 4 transport profiles:
-     - REALITY: `address: "<worker-domain>"`, `port: 443`, `securityLayer: "DEFAULT"`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy.
-     - XHTTP, WS, Trojan gRPC: `address: "<worker-domain>"`, `port: 443`, `securityLayer: "TLS"`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy.
-5. **Zero-Leak Remote Worker Deployment via Canonical `remote_payload`**:
-   - When `ssh-user` is supplied, dispatches configuration over SSH stdin (zero secrets in `argv`):
+6. **Host Entity Creation**:
+   - Issues `POST /api/hosts` for each of the 4 transport profiles using canonical remarks `<PROTO>@<node-name>`:
+     - REALITY: `remark: "VLESS-REALITY-Vision@<node-name>"`, `address: "<worker-domain>"`, `sni: "<reality-domain>"`, `port: 443`, `securityLayer: "DEFAULT"`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy.
+     - XHTTP, WS, Trojan gRPC: `remark: "<PROTO>@<node-name>"`, `address: "<worker-domain>"`, `port: 443`, `securityLayer: "TLS"`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy.
+7. **Zero-Leak Remote Worker Deployment via Canonical `remote_payload`**:
+   - Dispatches configuration over SSH stdin (zero secrets in `argv`):
      ```bash
-     PANEL_IP="$PANEL_IP" NODE_PORT=3000 SECRET_KEY="$SECRET_KEY" GOWAVE_NODE_VERSION=latest \
-       remote_payload "$node_ip" "${ssh_port:-22}" "$worker_domain" "$reality_domain"
+     PANEL_IP="$PANEL_IP" PANEL_IPV6="${PANEL_IPV6:-}" NODE_PORT=3000 SECRET_KEY="$SECRET_KEY" \
+     GOWAVE_NODE_VERSION=latest ADMIN_EMAIL="$ADMIN_EMAIL" \
+       remote_payload "$node_ip" "${ssh_port:-22}" "$worker_domain" "$reality_domain" "${ssh_user:-root}"
      ```
-   - The remote runner executes via `bash -s` from stdin under `umask 077`, provisions UFW (`ufw allow from $PANEL_IP to any port 3000 proto tcp`), sets up NGINX Stream 443 demultiplexing, obtains Let's Encrypt certificates for both `$WORKER_DOMAIN` and `$REALITY_DOMAIN`, installs `gowave-node`, unsets `SECRET_KEY`, and initiates daemon supervision.
-6. **State Persistence**:
+   - The remote runner executes via `bash -s` from stdin, runs `main() </dev/null` preventing stdin theft, applies UFW rule (`ufw allow from $PANEL_IP to any port 3000 proto tcp`), sets up NGINX Stream 443, obtains Let's Encrypt certificates for both `$WORKER_DOMAIN` and `$REALITY_DOMAIN`, installs `gowave-node`, unsets `SECRET_KEY`, and initiates daemon supervision.
+8. **State Persistence**:
    - Appends node entry into `/var/lib/gowave-auto-nginx/state.json` via `atomic_write_state()`.
 
 ### 5.3 Provisioning Rollback & Resource Deletion Contract

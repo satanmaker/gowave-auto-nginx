@@ -20,7 +20,7 @@ The security subsystem SHALL install `python3-systemd`, configure `/etc/fail2ban
 #### Scenario: Fail2ban jail activation and verification
 - **GIVEN** a host with `fail2ban` and `python3-systemd` installed
 - **WHEN** the security module is applied
-- **THEN** the drop-in configuration is installed with `backend = systemd` and `journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd \n _SYSTEMD_UNIT=ssh@*.service + _COMM=sshd`, `fail2ban` is reloaded, and `fail2ban-client status` confirms the jails are active and monitoring both standalone services and socket-activated SSH sessions.
+- **THEN** the drop-in configuration is installed with `backend = systemd` and `journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd + _COMM=sshd-session`, `fail2ban` is reloaded, and `fail2ban-client status` confirms the jails are active and monitoring both standalone services and socket-activated SSH sessions.
 
 ### Requirement: Strict DNS-over-TLS with Rollback
 The security subsystem SHALL optionally configure `systemd-resolved` with encrypted Cloudflare and Google DoT resolvers, auto-installing the package on Debian 12 if absent, and atomically reverting on failure.

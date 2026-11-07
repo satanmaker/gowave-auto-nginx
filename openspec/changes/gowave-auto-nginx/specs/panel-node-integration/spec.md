@@ -48,7 +48,7 @@ The installer SHALL provide an independent automated worker script (`gowave-node
 #### Scenario: External inaccessibility verification of local node port
 - **GIVEN** a running All-in-One installation where `gowave-node` listens on wildcard `:3002`
 - **WHEN** external probes attempt to connect to `<public-ipv4>:3002` or `[<public-ipv6>]:3002`
-- **THEN** connections are dropped or refused by UFW firewall rules across both IPv4 and IPv6, while local connections from `127.0.0.1:3000` and `[::1]:3000` succeed.
+- **THEN** connections are dropped or refused by UFW firewall rules across both IPv4 and IPv6, while local connections from `127.0.0.1:3002` and `[::1]:3002` succeed.
 
 #### Scenario: Worker node complete edge traffic plane deployment
 - **GIVEN** a remote worker server running `gowave-node-auto.sh`
@@ -63,7 +63,7 @@ The installer SHALL provide an independent automated worker script (`gowave-node
 #### Scenario: Automated worker registration via CLI node add command
 - **GIVEN** an active GoWave Panel and an accessible remote worker host
 - **WHEN** `gowave-auto.sh node add <name> <ip> <worker-domain> <reality-domain> [user] [port]` is executed
-- **THEN** it registers the node via `POST /api/nodes` linking unified profile inbounds, provisions worker Host records (`POST /api/hosts`), streams deployment payload via `remote_payload` strictly over SSH stdin with zero secrets in `argv`, and stores node state in `state.json`.
+- **THEN** it creates a dedicated worker profile (`GoWave Worker <name> Profile`), registers the node via `POST /api/nodes`, links inbounds to the managed squad, provisions worker Host records with canonical remarks (`<PROTO>@<name>`), streams payload via `remote_payload` over SSH stdin with zero secrets in `argv`, and persists worker state in `state.json` schemaVersion 2.
 
 ### Requirement: Mutual TLS 1.3 Control Plane Protocol with Strict SNI Verification
 All panel-to-node management communication SHALL use TLS 1.3 with mutual certificate verification, derived HKDF SNI (`rw-v1`), RS256 JWT bearer token authentication, and strict SNI enforcement.

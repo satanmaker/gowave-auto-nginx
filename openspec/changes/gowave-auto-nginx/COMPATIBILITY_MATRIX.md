@@ -90,7 +90,7 @@ To prevent acceptance of corrupt or pseudo-valid subscription files, verificatio
 
 | Client Format | Target Minimum Version | Tested Baseline Version | Validation Command & Tool | Verified Transport Profiles | Evidence & Upstream Reference |
 |---|---|---|---|---|---|
-| **Xray JSON (`v2ray-json`)** | `v1.8.24` | `v24.9.30` | `xray run -test -c <config.json>` | All 4 MVP transports: VLESS-REALITY-Vision, VLESS-XHTTP, VLESS-WS, Trojan-gRPC | `XTLS/Xray-core` releases; exit code 0 indicates 100% schema and outbound validity |
+| **Xray JSON (`v2ray-json`)** | `v24.11.30+` / `v25.x` | `v25.x` | `xray run -test -c <config.json>` | All 4 MVP transports: VLESS-REALITY-Vision, VLESS-XHTTP, VLESS-WS, Trojan-gRPC | `XTLS/Xray-core` releases; exit code 0 indicates 100% schema and outbound validity (XHTTP transport requires v24.11.30+) |
 | **Mihomo YAML (`mihomo`)** | `v1.19.22` | `v1.20.0` | `mihomo -t -f <config.yaml>` | All client-compatible MVP transports: VLESS-REALITY, VLESS-WS, Trojan-gRPC, VLESS-XHTTP | `MetaCubeX/mihomo` releases; v1.19.22+ required for native XHTTP transport (`network: xhttp`) |
 
 ---
