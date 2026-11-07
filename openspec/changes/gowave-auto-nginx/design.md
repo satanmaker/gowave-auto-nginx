@@ -369,7 +369,8 @@ The resulting Bearer token is appended along with the panel URL and administrati
 #### GoWave Panel Native Service Installation
 - The installer downloads Panel binaries and frontend assets with SHA256 checksum verification.
 - Generates `/opt/gowave/.env` containing `GOWAVE_PROXY=external`.
-- Executes native command:
+- Writes the base systemd unit `/etc/systemd/system/gowave.service` (`Type=simple`, `ExecStart=/opt/gowave/gowave-server`, `WorkingDirectory=/opt/gowave`, `After=network-online.target`).
+- Executes the native command:
   ```bash
   /opt/gowave/gowave-server service install /opt/gowave
   ```
@@ -469,9 +470,11 @@ GoWave Auto NGINX implements a dedicated subcommand `gowave-auto.sh channel [sta
    - Verify panel health via `GET http://127.0.0.1:3000/api/system/health`.
    - Execute `PRAGMA integrity_check;` on live database.
    - Execute `PRAGMA wal_checkpoint(TRUNCATE);` with a 5-second busy timeout.
-   - Capture a consistent database snapshot using SQLite Online Backup API executing under service user privileges:
+   - Capture a consistent database snapshot using staged SQLite Online Backup executing under service user privileges:
      ```bash
-     runuser -u gowave -- sqlite3 /opt/gowave/gowave.db ".backup /var/lib/gowave-auto-nginx/recovery/update-<ts>/gowave.db"
+     runuser -u gowave -- sqlite3 /opt/gowave/gowave.db ".backup /opt/gowave/.backup-<ts>.db"
+     mv /opt/gowave/.backup-<ts>.db /var/lib/gowave-auto-nginx/recovery/update-<ts>/gowave.db
+     chmod 0600 /var/lib/gowave-auto-nginx/recovery/update-<ts>/gowave.db
      chown gowave:gowave /opt/gowave/gowave.db*
      chmod 0640 /opt/gowave/gowave.db*
      ```
@@ -502,9 +505,10 @@ GoWave Auto NGINX implements a dedicated subcommand `gowave-auto.sh channel [sta
    - Retain the last 3 recovery snapshots (enforcing a 5 GB maximum storage ceiling), pruning older snapshots safely.
 
 #### Reboot & Power Loss Recovery
-If the server suffers a sudden power loss or kernel panic during an update:
+If the server suffers a sudden power loss or kernel panic during an operation:
 - On system boot or when `gowave-auto.sh` is invoked, the script inspects `journal.json`.
-- If the journal state is `APPLYING` or `ROLLBACK_REQUIRED`, the manager detects an interrupted transaction and automatically initiates rollback to the snapshot, restoring service stability.
+- If the journal state is `APPLYING` or `ROLLBACK_REQUIRED`, the manager detects an interrupted update transaction and automatically initiates rollback to the snapshot, restoring service stability.
+- If the journal state is `PROVISION_APPLYING` or `PROVISION_ROLLBACK_REQUIRED`, the manager detects an interrupted initial setup and invokes automated reverse-order entity cleanup from `state.json.tmp` (`DELETE /api/users`, `DELETE /api/hosts`, `DELETE /api/internal-squads`), transitioning state to `PROVISION_ROLLED_BACK`.
 
 #### Initial Provisioning Transaction Lifecycle & Rollback (AUD-05)
 To eliminate dirty partial setups and guarantee complete atomicity during initial installation, the initial provisioning phase (Config Profile, Squad, Hosts, User, API Token) is tracked inside `/var/lib/gowave-auto-nginx/recovery/journal.json`:

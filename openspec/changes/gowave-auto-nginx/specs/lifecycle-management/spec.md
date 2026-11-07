@@ -23,12 +23,12 @@ The management utility SHALL enforce mutually exclusive execution using file loc
 - **THEN** the second instance detects the active lock, reports that another operation is in progress, and exits with code 1 without modifying system state.
 
 ### Requirement: External Proxy Mode and Service Ownership
-The installation and configuration module SHALL configure `GOWAVE_PROXY=external` in `/opt/gowave/.env` and utilize `gowave-server service install` for Panel service management, establishing that NGINX reverse proxy configuration is exclusively owned and managed by GoWave Auto NGINX without duplicate systemd drop-ins or conflicting Caddy/NGINX installs from upstream.
+The installation module SHALL configure `GOWAVE_PROXY=external` in `/opt/gowave/.env`, write base unit `/etc/systemd/system/gowave.service`, and invoke `gowave-server service install` for drop-in sandboxing `90-unprivileged.conf`, establishing that NGINX is exclusively owned without conflicting upstream proxy setups.
 
 #### Scenario: GoWave external proxy mode verification
 - **GIVEN** a newly provisioned GoWave Panel
-- **WHEN** `/opt/gowave/.env` is generated and `gowave-server service install` is executed
-- **THEN** `GOWAVE_PROXY=external` is present in `/opt/gowave/.env`, upstream installer routines bypass internal proxy configuration, and the native service unit drop-in `90-unprivileged.conf` is managed cleanly without conflicting overrides.
+- **WHEN** `/opt/gowave/.env` is generated, base unit `/etc/systemd/system/gowave.service` is written, and `gowave-server service install` is executed
+- **THEN** `GOWAVE_PROXY=external` is present in `/opt/gowave/.env`, the base unit is recognized by systemd, and the native service unit drop-in `90-unprivileged.conf` applies unprivileged user sandboxing without conflicting overrides.
 
 ### Requirement: Safe Channel Switching Between Stable and Dev Releases
 The manager SHALL provide a dedicated command `gowave-auto.sh channel [stable|dev]` supporting transitions between Stable and Dev release channels with automated pre-switch snapshotting, schema migration guardrails, health checks, and rollback on failure.
@@ -88,7 +88,7 @@ The uninstall command SHALL inspect `# Managed by GoWave Auto NGINX` ownership m
 #### Scenario: Clean component removal
 - **GIVEN** an installed GoWave Auto NGINX instance
 - **WHEN** `gowave-auto.sh uninstall --confirm` is executed
-- **THEN** `gowave` and `gowave-node` systemd units are stopped and disabled, NGINX project vhosts are removed, `/opt/gowave` and `/opt/gowave-node` are deleted, and system-wide packages (Python, systemd, SSH, base NGINX) remain intact.
+- **THEN** `gowave` and `gowave-node` systemd units are stopped and disabled, NGINX project vhosts and `# Managed by GoWave Auto NGINX` stream blocks in `/etc/nginx/nginx.conf` are cleanly removed, `/opt/gowave` and `/opt/gowave-node` are deleted, and system-wide packages (Python, systemd, SSH, base NGINX) remain intact.
 
 ### Requirement: Local Multi-Distribution Podman Testbed Gate
 The verification harness SHALL provide `tests/podman_testbed.sh` executing containerized pre-flight tests with PID 1 systemd across all 4 supported operating systems (Ubuntu 24.04, Ubuntu 26.04, Debian 12, Debian 13), requiring 100% pass rate across the 8-stage verification pipeline prior to VPS deployment.

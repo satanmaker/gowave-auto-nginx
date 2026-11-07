@@ -33,7 +33,7 @@ proxies:
     network: tcp
     tls: true
     flow: "xtls-rprx-vision"
-    servername: "gateway.icloud.com"
+    servername: "cdn.example.com"
     reality-opts:
       public-key: "1111111111111111111111111111111111111111111="
       short-id: "0123456789abcdef"

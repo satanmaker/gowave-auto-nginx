@@ -138,7 +138,7 @@ The request payload for `POST /api/hosts` MUST strictly follow this exact struct
   "remark": "VLESS-REALITY-Vision",
   "address": "vpn.example.com",
   "port": 443,
-  "sni": "gateway.icloud.com",
+  "sni": "cdn.example.com",
   "path": null,
   "host": null,
   "alpn": "h2,http/1.1",
@@ -162,7 +162,7 @@ The request payload for `POST /api/hosts` MUST strictly follow this exact struct
 | `remark` | `"VLESS-REALITY-Vision"` | `"VLESS-XHTTP-TLS"` | `"VLESS-WS-TLS"` | `"Trojan-gRPC-TLS"` |
 | `address` | `<public_fqdn_or_ip>` | `<public_fqdn_or_ip>` | `<public_fqdn_or_ip>` | `<public_fqdn_or_ip>` |
 | `port` | `443` | `443` | `443` | `443` |
-| `sni` | `<reality_camouflage_sni>` (e.g. `gateway.icloud.com`) | `<panel_or_worker_domain>` | `<panel_or_worker_domain>` | `<panel_or_worker_domain>` |
+| `sni` | `<reality_camouflage_sni>` (Mode A: `cdn.example.com`; Mode B: `gateway.icloud.com`) | `<panel_or_worker_domain>` | `<panel_or_worker_domain>` | `<panel_or_worker_domain>` |
 | `path` | `null` | `"/xhttp-down/"` | `"/ws"` | `"trojan-grpc"` |
 | `host` | `null` | `"<panel_or_worker_domain>"` | `"<panel_or_worker_domain>"` | `null` |
 | `alpn` | `"h2,http/1.1"` | `"h2,http/1.1"` | `"http/1.1"` | `"h2"` |
