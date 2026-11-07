@@ -25,7 +25,7 @@ The system SHALL support VLESS over XHTTP (splitHTTP) transport multiplexed behi
 #### Scenario: VLESS XHTTP TLS data transfer
 - **GIVEN** a client configured with VLESS XHTTP parameters matching `panel_domain` and `<xhttp_path>`
 - **WHEN** the client sends uplink packets via HTTP POST
-- **THEN** NGINX terminates TLS on 7443 and streams the data to Xray port 10001 without chunk buffering or request body truncation.
+- **THEN** NGINX terminates TLS on 7443 and streams the data to Xray port 10001 without chunk buffering or request body truncation, backed by kernel PLPMTUD (`net.ipv4.tcp_mtu_probing = 1`) preventing packet drops on non-standard MTU networks.
 
 ### Requirement: Native VLESS WebSocket TLS Profile
 The system SHALL support VLESS over WebSocket transport with TLS encryption for maximum CDN and proxy compatibility.

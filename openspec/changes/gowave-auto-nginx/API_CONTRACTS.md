@@ -279,3 +279,50 @@ atomic_write_state() {
 }
 ```
 If interrupted at any point, `state.json` is never left truncated or corrupt.
+
+---
+
+## 5. Worker Node Provisioning Contract & CLI Interface (`gowave-auto.sh node add`)
+
+### 5.1 CLI Command Specification
+```bash
+gowave-auto.sh node add <node-name> <node-ip> <node-domain> [ssh-user] [ssh-port]
+```
+
+### 5.2 Registration Protocol Flow
+1. **Admin Authentication**:
+   - `POST /api/auth/login` with stored admin credentials to obtain an active JWT bearer token.
+2. **Node Creation in Panel**:
+   - `POST /api/nodes` with payload:
+     ```json
+     {
+       "name": "<node-name>",
+       "address": "<node-ip>",
+       "port": 3000,
+       "configProfile": {
+         "activeConfigProfileUuid": "<profile-uuid>",
+         "activeInbounds": [
+           "<inbound-uuid-1>",
+           "<inbound-uuid-2>",
+           "<inbound-uuid-3>",
+           "<inbound-uuid-4>"
+         ]
+       }
+     }
+     ```
+   - Receives `response.uuid` identifying the newly registered worker node.
+3. **Secret Key Extraction**:
+   - Executes `./gowave-server rescue --print-secret-key-raw` or fetches credentials payload to extract `SECRET_KEY` (`caCertPem`, `jwtPublicKey`, `nodeCertPem`, `nodeKeyPem`).
+4. **Host Entity Creation**:
+   - Issues `POST /api/hosts` for each of the 4 transport profiles:
+     - REALITY: `address: "<node-domain>"`, `port: 443`, `securityLayer: "DEFAULT"`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy.
+     - XHTTP, WS, Trojan gRPC: `address: "<node-domain>"`, `port: 443`, `securityLayer: "TLS"`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy.
+5. **Remote Worker Deployment (SSH Streaming)**:
+   - When `ssh-user` is supplied:
+     ```bash
+     cat scripts/gowave-node-auto.sh | ssh -p "${ssh_port:-22}" "$ssh_user@$node_ip" \
+       "NODE_PORT=3000 PANEL_IP=$PANEL_IP SECRET_KEY='$SECRET_KEY' bash -s -- --worker-domain '$node_domain'"
+     ```
+   - The remote script provisions UFW (`ufw allow from $PANEL_IP to any port 3000 proto tcp`), sets up NGINX Stream 443 demultiplexing, obtains Let's Encrypt certificates, installs `gowave-node`, and initiates supervision.
+6. **State Persistence**:
+   - Appends node entry into `/var/lib/gowave-auto-nginx/state.json` via `atomic_write_state()`.

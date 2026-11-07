@@ -15,12 +15,12 @@
 ## 3. Host Security and Hardening Modules
 
 - [ ] 3.1 Port and adapt `assets/security/managed.py` for non-destructive SSH inspection via both `sshd -T` and `systemctl show ssh.socket -p Listen` without modifying user configuration files
-- [ ] 3.2 Implement transactional Fail2ban jail installation (`/etc/fail2ban/jail.d/90-gowave-auto-nginx.local`) with `python3-systemd` prerequisite, configuring `backend = systemd` monitoring both `ssh.service` and `ssh.socket` (`ssh@*.service`), verified via `fail2ban-client status`
+- [ ] 3.2 Implement transactional Fail2ban jail installation (`/etc/fail2ban/jail.d/90-gowave-auto-nginx.local`) with `python3-systemd` prerequisite, configuring `backend = systemd` and journalmatch monitoring both `ssh.service` and `ssh.socket` (`ssh@*.service`), verified via `fail2ban-client status`
 - [ ] 3.3 Implement strict DNS-over-TLS via `systemd-resolved` with Cloudflare and Google upstream servers, preserving link DNS search routes and rolling back on network failure
-- [ ] 3.4 Implement safe UFW firewall configuration: whitelist detected SSH ports before enabling UFW, open public web ports 80/443, deny external access to local Node port 3002, and isolate internal loopback listeners
-- [ ] 3.5 Implement automatic swap allocation (2 GiB) on KVM VPS with <= 1GB RAM using `dd if=/dev/zero`, mode `0600`, graceful skipping in containerized environments, and set `GOMEMLIMIT=250MiB` systemd drop-in
+- [ ] 3.4 Implement safe UFW firewall configuration: whitelist detected SSH ports before enabling UFW, open public web ports 80/443, deny external access to local Node port 3002, isolate internal loopback listeners, and conditionally configure `IPV6=no` in `/etc/default/ufw` when IPv6 is disabled in kernel to prevent ip6tables failures
+- [ ] 3.5 Implement automatic swap allocation (2 GiB) on KVM VPS with <= 1GB RAM using `dd if=/dev/zero` (avoiding fallocate holes on XFS/Btrfs), mode `0600`, graceful skipping in containerized environments, and set `GOMEMLIMIT=250MiB` systemd drop-in
 - [ ] 3.6 Implement `unattended-upgrades` configuration with distro-specific security origins and `Unattended-Upgrade::Automatic-Reboot "false"` by default to prevent unexpected VPN downtime
-- [ ] 3.7 Implement conditional BBR congestion control and MTU probing (`net.ipv4.tcp_mtu_probing = 1`) in `/etc/sysctl.d/99-gowave.conf`, persisting kernel module loading via `/etc/modules-load.d/bbr.conf`
+- [ ] 3.7 Implement conditional BBR congestion control and MTU probing (`net.ipv4.tcp_mtu_probing = 1`) in `/etc/sysctl.d/99-gowave.conf`, persisting kernel module loading via dedicated oneshot systemd unit `/etc/systemd/system/bbr-load.service` ordered `Before=systemd-sysctl.service` to prevent race conditions with async module loading
 - [ ] 3.8 Implement NGINX and systemd log rotation policies: deploy `/etc/logrotate.d/gowave-nginx` with daily rotation and gzip compression, and cap systemd journal size to 100MB via `SystemMaxUse=100M`
 
 ## 4. GoWave Panel Native Deployment (All-in-One)
@@ -28,7 +28,7 @@
 - [ ] 4.1 Implement preflight port availability verification (check ports 80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001-10003) and NGINX 443 conflict scan across /etc/nginx/ for unmanaged listen 443 directives; abort with conflicting process name or config location before mutating system state
 - [ ] 4.2 Implement GoWave Panel native installation module downloading `gowave-linux-$ARCH` and `gowave-frontend.tar.gz` with SHA256 verification against `SHA256SUMS`
 - [ ] 4.3 Generate secure `/opt/gowave/.env` configuration (`APP_HOST=127.0.0.1`, `APP_PORT=3000`, `METRICS_PORT=3001`, `DB_DRIVER=sqlite`, `DATABASE_URL=gowave.db`, `APP_SECRET=<random-64-hex>`, `GOWAVE_PROXY=external`, `GOWAVE_CHANNEL=stable`, `PANEL_DOMAIN`, `SUB_PUBLIC_DOMAIN`) with mode `0640`
-- [ ] 4.4 Configure systemd unit `gowave.service`: write base unit `/etc/systemd/system/gowave.service` (`Type=simple`, `ExecStart=/opt/gowave/gowave-server`, `WorkingDirectory=/opt/gowave`, `After=network-online.target`), and execute native `/opt/gowave/gowave-server service install /opt/gowave` generating unprivileged user `gowave`, directory mode `1770 root:gowave`, drop-in `90-unprivileged.conf`, and `gowave-update.path`
+- [ ] 4.4 Configure systemd unit `gowave.service`: pre-create `gowave` system user, write complete base unit `/etc/systemd/system/gowave.service` (`Type=simple`, `ExecStart=/opt/gowave/gowave-server`, `WorkingDirectory=/opt/gowave`, `After=network-online.target`, `LimitNOFILE=65535`), run `systemctl daemon-reload && systemctl enable gowave.service`, and execute native `/opt/gowave/gowave-server service install /opt/gowave` generating directory mode `1770 root:gowave`, drop-in `90-unprivileged.conf`, and `gowave-update.path`
 - [ ] 4.5 Verify panel startup and loopback listener availability at `http://127.0.0.1:3000`
 
 ## 5. Panel & Local Node Integration (Conflict-Free All-in-One)
@@ -55,8 +55,8 @@
 
 - [ ] 7.1 Hook top-level Stream configuration in `/etc/nginx/nginx.conf` (`stream { include /etc/nginx/stream-enabled/*.conf; }`) wrapped in `# Managed by GoWave Auto NGINX` markers outside `http {}`, and verify `libnginx-mod-stream` loading
 - [ ] 7.2 Implement NGINX Stream configuration on port 443 (`ssl_preread on; proxy_protocol on;`) routing `reality_domain` to 127.0.0.1:8443, `panel_domain` to 127.0.0.1:7443, and default/scanners to 127.0.0.1:8443
-- [ ] 7.3 Implement 3-stage Let's Encrypt TLS bootstrap sequence: deploy temporary port 80 webroot vhost (`/var/www/gowave-acme`), issue certificates via Certbot, remove bootstrap vhost, and deploy NGINX panel vhost on 127.0.0.1:7443 (`listen 127.0.0.1:7443 ssl proxy_protocol; set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`) with Let's Encrypt TLS termination and reverse proxying to GoWave at 127.0.0.1:3000 with `access_log off;` on streaming paths (`/xhttp-down/`, `/ws`, `/trojan-grpc`)
-- [ ] 7.4 Implement NGINX REALITY fallback vhost on 127.0.0.1:9443 (`listen 127.0.0.1:9443 ssl proxy_protocol; set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`) with REALITY domain TLS certificate and static camouflage site (`cover-reality`)
+- [ ] 7.3 Implement Let's Encrypt TLS bootstrap sequence: execute `certbot certonly --standalone` prior to starting NGINX (or deploy temporary port 80 webroot vhost `/var/www/gowave-acme` without HTTPS redirects), issue certificates via Certbot, remove bootstrap vhost, deploy NGINX panel vhost on 127.0.0.1:7443 (`listen 127.0.0.1:7443 ssl proxy_protocol; set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`) with Let's Encrypt TLS termination and reverse proxying to GoWave at 127.0.0.1:3000 with `access_log off;` on streaming paths (`/xhttp-down/`, `/ws`, `/trojan-grpc`), and configure port 80 with selective redirect preserving `/.well-known/acme-challenge/` for renewals
+- [ ] 7.4 Implement NGINX REALITY fallback vhost on 127.0.0.1:9443 (`listen 127.0.0.1:9443 ssl proxy_protocol; set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`) receiving PROXY protocol v1 from Xray fallback (`dest: "127.0.0.1:9443", xver: 1`), terminating TLS with REALITY domain TLS certificate, and serving static camouflage site (`cover-reality`)
 - [ ] 7.5 Configure Certbot webroot ACME challenge on port 80 and automated renewal hook in `/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` reloading NGINX after verifying `nginx -t -q`
 
 ## 8. Protocol Transport Profiles & API Provisioning
@@ -75,7 +75,7 @@
 ## 9. Transaction-Safe Updates and Crash Recovery Journal
 
 - [ ] 9.1 Implement preflight SQLite check (`PRAGMA integrity_check;`) and WAL checkpoint (`PRAGMA wal_checkpoint(TRUNCATE);`) with 5s busy timeout
-- [ ] 9.2 Execute transactional database backup using staged SQLite Online Backup under service user privileges (`runuser -u gowave -- sqlite3 /opt/gowave/gowave.db ".backup /opt/gowave/.backup-<ts>.db"`), moving backup copy to recovery snapshot directory with mode `0600`, restoring database file permissions (`chown gowave:gowave`, mode `0640`), and verifying destination integrity
+- [ ] 9.2 Execute transactional database backup using staged SQLite Online Backup under service user privileges: root pre-creates empty file `/opt/gowave/.backup-<ts>.db` with mode `0640` and ownership `gowave:gowave` (`install -o gowave -g gowave -m 0640 /dev/null ...`), gowave runs `sqlite3 .backup` into the pre-created file, root moves backup copy to recovery snapshot directory with mode `0600`, restores database file permissions (`chown gowave:gowave`, mode `0640`), and verifies destination integrity
 - [ ] 9.3 Maintain durable state journal at `/var/lib/gowave-auto-nginx/recovery/journal.json` using atomic write (`.tmp` + `fsync` + `rename`) tracking both initial provisioning (`PROVISION_PREPARED` -> `PROVISION_COMMITTED` with reverse-order rollback) and updates (`PREPARED`, `APPLYING`, `VERIFYING`, `COMMITTED`, `ROLLBACK_REQUIRED`, `ROLLED_BACK`)
 - [ ] 9.4 Implement channel switching command `gowave-auto.sh channel [stable|dev]` with automated pre-switch SQLite snapshot, migration irreversible downgrade warning with `--force` confirmation, asset update with SHA256 checksums, and rollback on failure
 - [ ] 9.5 Implement staged release download, SHA256 checksum verification, atomic file swap, and service restart
@@ -94,7 +94,7 @@
 
 ## 11. Interactive Management Interface
 
-- [ ] 11.1 Implement interactive CLI menu in `gowave-auto.sh` providing `status`, `health`, `install`, `update`, `channel`, `domain-change`, `backup`, `restore`, and `uninstall`
+- [ ] 11.1 Implement interactive CLI menu in `gowave-auto.sh` providing `status`, `health`, `install`, `update`, `channel`, `node` (`node add/list/remove`), `domain-change`, `backup`, `restore`, and `uninstall`
 - [ ] 11.2 Implement non-interactive CLI flags for all commands enabling headless execution and Ansible integration
 - [ ] 11.3 Implement exclusive file locking (`/run/lock/gowave-auto.lock`) preventing concurrent conflicting operations
 - [ ] 11.4 Implement installation progress checkpoints allowing resumed execution or safe rollback on interrupted initial setups

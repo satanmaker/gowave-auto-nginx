@@ -20,7 +20,7 @@ The backup subsystem SHALL capture SQLite database snapshots using staged SQLite
 #### Scenario: Database backup during active write transactions
 - **GIVEN** an active GoWave Panel with continuous read and write queries
 - **WHEN** backup creation executes
-- **THEN** SQLite integrity check and WAL checkpoint are run under `gowave` user privileges, the database is staged via `sqlite3 <db> ".backup /opt/gowave/.backup-<ts>.db"`, moved to the recovery snapshot directory with mode `0600`, database file permissions (`0640 gowave:gowave`) are preserved, and the destination file passes integrity verification before archive compression.
+- **THEN** SQLite integrity check and WAL checkpoint are run under `gowave` user privileges, root pre-creates `/opt/gowave/.backup-<ts>.db` with mode `0640` and ownership `gowave:gowave`, the database is staged via `sqlite3 <db> ".backup /opt/gowave/.backup-<ts>.db"`, moved to the recovery snapshot directory with mode `0600`, database file permissions (`0640 gowave:gowave`) are preserved, and the destination file passes integrity verification before archive compression.
 
 ### Requirement: Independent Panel and Node Backup Scopes
 The backup tool SHALL support separate backup scopes for Central Panel servers and Edge Worker nodes.

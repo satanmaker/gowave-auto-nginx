@@ -193,24 +193,33 @@ To prevent conflation between camouflage sites, management panels, and public VP
    - **Mode B: Third-Party SNI Stealing**: If an external third-party domain is chosen (e.g. `gateway.icloud.com`), `dest` is configured to `gateway.icloud.com:443` with `xver: 0`. Scanner probes are proxied directly to the genuine third-party server, returning authentic vendor certificates without self-signed certificate exposure.
 5. **Decoy Web Site (`cover-reality`)**: An authentic multi-asset website (retained from `community-baseline` `cover-reality` under `/var/www/gowave-auto-nginx/cover-reality` including complete HTML, stylesheets, scripts, and media assets) served on loopback port `9443` by NGINX. Minimal single-file HTML stubs are explicitly rejected to provide realistic camouflage against active probing and DPI scanners.
 
-#### 3-Stage Let's Encrypt TLS Bootstrapping
-To resolve the initial chicken-and-egg bootstrap deadlock (NGINX failing `nginx -t` due to missing certificate files before Certbot runs, while Certbot requires a running web server on port 80 to answer ACME HTTP-01 challenges):
-1. **Stage 1 (Temporary ACME Webroot vhost)**: The installer writes `/etc/nginx/conf.d/00-bootstrap-acme.conf` listening exclusively on HTTP port 80 with root `/var/www/gowave-acme` and no SSL directives, and starts NGINX.
-2. **Stage 2 (Certificate Acquisition)**: `certbot certonly --webroot -w /var/www/gowave-acme -d <domains>` acquires authentic Let's Encrypt certificates without port conflicts.
-3. **Stage 3 (Production Transition)**: The installer unlinks `00-bootstrap-acme.conf`, writes production NGINX Stream 443 and HTTPS 7443 configurations referencing the issued certificates, and reloads NGINX (`systemctl reload nginx`).
+#### 3-Stage Let's Encrypt TLS Bootstrapping & Deadlock Elimination
+To resolve the classic chicken-and-egg bootstrap deadlock (NGINX failing `nginx -t` due to missing certificate files before Certbot runs, while Certbot requires a listening web service on port 80 to answer ACME HTTP-01 challenges, and global HTTPS redirects breaking ACME validation):
+1. **Stage 1 (Standalone Cold Bootstrap)**: Before NGINX is started for the first time on a clean host, port 80 is completely free. The installer issues certificates directly via standalone mode without any dependency on a running web server or default distribution server-blocks:
+   ```bash
+   certbot certonly --standalone --preferred-challenges http-01 -d "$DOMAIN" --non-interactive --agree-tos -m "$ADMIN_EMAIL"
+   ```
+   Alternatively, if port 80 must be handled through NGINX, the installer writes a temporary bootstrap vhost `/etc/nginx/conf.d/00-bootstrap-acme.conf` listening exclusively on HTTP port 80 (`location /.well-known/acme-challenge/ { root /var/www/gowave-acme; }`), unlinks default distribution vhosts (`sites-enabled/default`), explicitly omits HTTPS redirects during bootstrap, starts NGINX, and executes `certbot certonly --webroot -w /var/www/gowave-acme -d "$DOMAIN"`.
+2. **Stage 2 (Production Configuration & Non-Conflicting Port 80 Redirects)**: Once certificates exist under `/etc/letsencrypt/live/$DOMAIN/`, the installer deploys production configurations:
+   - NGINX Stream 443 demultiplexing to `127.0.0.1:7443` and `127.0.0.1:8443`.
+   - NGINX HTTP port 80 with selective redirect: all incoming traffic redirects to HTTPS 443 with 301, **except** `location /.well-known/acme-challenge/` which remains mapped to `/var/www/gowave-acme` for non-deadlocking automated renewals.
+   - NGINX HTTPS listener at `127.0.0.1:7443` and Decoy listener at `127.0.0.1:9443`.
+3. **Stage 3 (Validation & Production Start)**: The installer removes any temporary bootstrap configs, tests syntax via `nginx -t`, starts or reloads NGINX (`systemctl reload nginx`), and establishes automated renewal hooks in `/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh`.
 
 #### Direct VLESS + TLS + Vision Deferral
 Direct VLESS + TLS + Vision (without REALITY) requires Xray itself to terminate TLS, which requires Xray to directly read Let's Encrypt certificates. When Certbot renews the certificate, Xray must be reloaded/restarted across process boundaries. To keep the MVP reliable and avoid privilege boundary violations, direct VLESS + TLS + Vision is **deferred to post-MVP Non-Goals**.
 
-#### Strict PROXY Protocol Boundaries
-- **Sender**: NGINX Stream on port 443 sends PROXY protocol v1 to `127.0.0.1:7443` and `127.0.0.1:8443`.
-- **Receiver (Xray)**: Inbound at `127.0.0.1:8443` strictly specifies `"tcpSettings": {"acceptProxyProtocol": true}`. When NGINX prepends the PROXY v1 header, Xray consumes it, restores the genuine client IP, and passes it to REALITY handshakes and fallback destinations.
-- **Receiver (NGINX)**: NGINX listeners at 7443 and 9443 configure `proxy_protocol` and restrict trust strictly to loopback:
+#### Strict PROXY Protocol Boundaries (443 -> 8443 -> 9443)
+- **Sender (NGINX Stream 443)**: NGINX Stream on port 443 sends PROXY protocol v1 (`proxy_protocol on;`) to `127.0.0.1:7443` and `127.0.0.1:8443`.
+- **Receiver (Xray 8443)**: Inbound at `127.0.0.1:8443` strictly specifies `"tcpSettings": {"acceptProxyProtocol": true}`. When NGINX prepends the PROXY v1 header, Xray consumes it, restores the genuine client IP, and passes it to REALITY handshakes and fallback destinations.
+- **Fallback Sender (Xray -> NGINX 9443)**: Both `realitySettings.dest: "127.0.0.1:9443", realitySettings.xver: 1` and `settings.fallbacks: [{"dest": "127.0.0.1:9443", "xver": 1}]` are explicitly configured with `xver: 1`. This guarantees that Xray preserves and forwards the genuine client IP via PROXY protocol v1 to loopback port 9443 when unauthorized scanners probe port 8443.
+- **Receiver (NGINX Decoy 9443 & HTTPS 7443)**: Both loopback listeners configure `proxy_protocol` and restrict trust strictly to `127.0.0.1`:
   ```nginx
-  listen 127.0.0.1:7443 ssl proxy_protocol;
+  listen 127.0.0.1:9443 ssl proxy_protocol;
   set_real_ip_from 127.0.0.1;
   real_ip_header proxy_protocol;
   ```
+  This ensures real client IPs are preserved across the entire 443 -> 8443 -> 9443 chain, logged in access logs, rate-limited accurately, and made available to Fail2ban.
 - Any external attempt to inject fake PROXY protocol headers from non-loopback addresses is discarded.
 
 ---
@@ -369,13 +378,34 @@ The resulting Bearer token is appended along with the panel URL and administrati
 #### GoWave Panel Native Service Installation
 - The installer downloads Panel binaries and frontend assets with SHA256 checksum verification.
 - Generates `/opt/gowave/.env` containing `GOWAVE_PROXY=external`.
-- Writes the base systemd unit `/etc/systemd/system/gowave.service` (`Type=simple`, `ExecStart=/opt/gowave/gowave-server`, `WorkingDirectory=/opt/gowave`, `After=network-online.target`).
-- Executes the native command:
+- Pre-creates system user and group `gowave:gowave` (`id -u gowave &>/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin gowave`).
+- Explicitly deploys the complete base systemd unit `/etc/systemd/system/gowave.service`:
+  ```ini
+  [Unit]
+  Description=GoWave Panel Server
+  After=network-online.target
+  Wants=network-online.target
+
+  [Service]
+  Type=simple
+  User=gowave
+  Group=gowave
+  WorkingDirectory=/opt/gowave
+  ExecStart=/opt/gowave/gowave-server
+  Restart=always
+  RestartSec=5
+  LimitNOFILE=65535
+
+  [Install]
+  WantedBy=multi-user.target
+  ```
+- Executes `systemctl daemon-reload && systemctl enable gowave.service` to register the base unit.
+- Executes the native upstream command:
   ```bash
   /opt/gowave/gowave-server service install /opt/gowave
   ```
-- This upstream command creates unprivileged user `gowave:gowave`, sets sticky bit permissions (`1770 root:gowave`), writes `/etc/systemd/system/gowave.service.d/90-unprivileged.conf` with full systemd sandboxing (`ProtectSystem=strict`, `NoNewPrivileges=true`, `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`), and sets up `gowave-update.path` and `gowave-update.service`.
-- The installer does **NOT** duplicate manual `90-unprivileged.conf` generation, avoiding conflicts.
+- This upstream command sets sticky bit permissions (`1770 root:gowave`), writes `/etc/systemd/system/gowave.service.d/90-unprivileged.conf` with full systemd sandboxing (`ProtectSystem=strict`, `NoNewPrivileges=true`, `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`), and sets up `gowave-update.path` and `gowave-update.service`.
+- Writing the base unit first eliminates the `Unit gowave.service not found` failure on minimal OS images while letting upstream manage the drop-in.
 
 #### GoWave Node Upstream Installer Orchestration
 - `gowave-node-auto.sh` utilizes the official upstream `gowave-node/install.sh` installer as its foundation.
@@ -449,6 +479,24 @@ PATCH /api/nodes/{uuid}
 ```
 - GoWave automatically compiles the Xray config and dispatches it to `gowave-node`.
 
+#### Distributed Worker Registration Workflow (`gowave-auto.sh node add`)
+To eliminate manual REST API calls and provide a complete all-in-one UX for registering distributed edge workers:
+1. **Command Syntax**:
+   ```bash
+   gowave-auto.sh node add <node-name> <node-ip> <node-domain> [ssh-user] [ssh-port]
+   ```
+2. **Automated Provisioning Sequence**:
+   - Authenticates against local Panel REST API (`POST /api/auth/login`) retrieving JWT bearer token.
+   - Issues `POST /api/nodes` with `name`, `address: <node-ip>`, `port: 3000`, and links `activeConfigProfileUuid` and `activeInbounds` from the unified profile.
+   - Extracts assigned `node-uuid` and retrieves node `SECRET_KEY` payload (`caCertPem`, `jwtPublicKey`, `nodeCertPem`, `nodeKeyPem`).
+   - Creates corresponding worker Host records via `POST /api/hosts` (`address: <node-domain>`, `port: 443`, linked to `node-uuid` and Internal Squad).
+   - If `ssh-user` is supplied (or configured), pipes deployment over SSH stdin streaming:
+     ```bash
+     cat scripts/gowave-node-auto.sh | ssh -p "${ssh_port:-22}" "$ssh_user@$node_ip" \
+       "NODE_PORT=3000 PANEL_IP=$PANEL_IP SECRET_KEY='$SECRET_KEY' bash -s -- --worker-domain '$node_domain'"
+     ```
+   - Records the provisioned worker node metadata into `/var/lib/gowave-auto-nginx/state.json` via atomic write.
+
 ---
 
 ### Decision 4: Safe Channel Switching (Stable vs. Dev)
@@ -472,7 +520,11 @@ GoWave Auto NGINX implements a dedicated subcommand `gowave-auto.sh channel [sta
    - Execute `PRAGMA wal_checkpoint(TRUNCATE);` with a 5-second busy timeout.
    - Capture a consistent database snapshot using staged SQLite Online Backup executing under service user privileges:
      ```bash
+     # 1. Root pre-creates empty destination file with service user ownership and mode 0640
+     install -o gowave -g gowave -m 0640 /dev/null "/opt/gowave/.backup-<ts>.db"
+     # 2. Service user executes online SQLite backup into the pre-created file
      runuser -u gowave -- sqlite3 /opt/gowave/gowave.db ".backup /opt/gowave/.backup-<ts>.db"
+     # 3. Root moves backup into root-only (0700) recovery storage and restores database permissions
      mv /opt/gowave/.backup-<ts>.db /var/lib/gowave-auto-nginx/recovery/update-<ts>/gowave.db
      chmod 0600 /var/lib/gowave-auto-nginx/recovery/update-<ts>/gowave.db
      chown gowave:gowave /opt/gowave/gowave.db*
@@ -558,14 +610,51 @@ Multi-distribution compatibility across target systems is achieved via three tar
    - Configures `/etc/apt/apt.conf.d/99zz-gowave-auto-nginx` with `origin=Debian,label=Debian-Security,codename=${distro_codename}-security` for Debian hosts.
    - Disables automatic reboots (`Unattended-Upgrade::Automatic-Reboot "false";`) by default.
 4. **Kernel Congestion Control (BBR) & MTU Probing (PLPMTUD)**:
-   - Writes `tcp_bbr` into `/etc/modules-load.d/bbr.conf` when supported so `systemd-sysctl` reliably finds the module on boot before setting `net.ipv4.tcp_congestion_control = bbr`.
+   - To eliminate the asynchronous race condition between `systemd-modules-load.service` and `systemd-sysctl.service` (which causes `net.ipv4.tcp_congestion_control = bbr` to silently fall back to `cubic` on boot), the installer deploys a dedicated oneshot systemd unit `/etc/systemd/system/bbr-load.service`:
+     ```ini
+     [Unit]
+     Description=Load tcp_bbr and set congestion control
+     Before=systemd-sysctl.service
+     DefaultDependencies=no
+
+     [Service]
+     Type=oneshot
+     ExecStart=/sbin/modprobe tcp_bbr
+     ExecStart=/sbin/sysctl -w net.ipv4.tcp_congestion_control=bbr
+     RemainAfterExit=yes
+
+     [Install]
+     WantedBy=sysinit.target
+     ```
+   - Enabled via `systemctl enable bbr-load.service`, replacing asynchronous `/etc/modules-load.d/bbr.conf` loading.
    - Enables Packetization Layer Path MTU Discovery (`net.ipv4.tcp_mtu_probing = 1`) in `/etc/sysctl.d/99-gowave.conf` to prevent TCP blackholing across non-1500 MTU cloud networks (e.g. Hetzner vSwitch 1450, GCP 1460, PPPoE).
 5. **Fail2ban Modern Systemd Journal & Socket Activation**:
-   - Installs `python3-systemd` prerequisite, configures `backend = systemd`, and monitors both standalone `ssh.service` (Debian 12) and socket-activated `ssh.socket` / `ssh@*.service` (Ubuntu 24.04).
-6. **Low-Memory (512MB-1GB RAM) Protection**:
-   - Automatically provisions 2 GB swap on KVM instances with <= 1 GB RAM using `dd if=/dev/zero` (avoiding `fallocate` holes on XFS/Btrfs).
+   - Installs `python3-systemd` prerequisite, configures `backend = systemd` in `/etc/fail2ban/jail.d/90-gowave-auto-nginx.local`:
+     ```ini
+     [sshd]
+     enabled = true
+     backend = systemd
+     journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd
+                 _SYSTEMD_UNIT=ssh@*.service + _COMM=sshd
+     ```
+   - Monitors both standalone `ssh.service` (Debian 12) and socket-activated `ssh.socket` / `ssh@*.service` (Ubuntu 24.04), eliminating brute-force detection blind spots.
+6. **Low-Memory (512MB-1GB RAM) Protection & Swap Allocation**:
+   - Pre-flight memory check evaluates `/proc/meminfo`:
+     ```bash
+     if [[ $(awk '/MemTotal/ {print $2}' /proc/meminfo) -lt 1048576 ]] && ! swapon --show | grep -q .; then
+       dd if=/dev/zero of=/swapfile bs=1M count=1024 status=progress
+       chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+       echo '/swapfile none swap sw 0 0' >> /etc/fstab
+     fi
+     ```
+   - Swapfile creation strictly uses `dd if=/dev/zero` rather than `fallocate` (because `fallocate` leaves unallocated extents/holes on XFS and Btrfs filesystems, causing kernel `swapon` to abort with `EINVAL`).
    - Injects `Environment="GOMEMLIMIT=250MiB"` into systemd service drop-ins for `gowave` and `gowave-node`, forcing timely Go garbage collection before hitting kernel OOM thresholds.
-7. **Log Rotation & Disk Space Depletion Prevention**:
+7. **Conditional IPv6 Firewall & Listener Adaptation**:
+   - Detects `sysctl -n net.ipv6.conf.all.disable_ipv6`. If `1` or if no valid IPv6 route exists:
+     - Sets `IPV6=no` in `/etc/default/ufw` to prevent UFW startup errors during `ip6tables` rule evaluation.
+     - Omits `listen [::]:443` and `listen [::]:80` in NGINX configurations, preventing fatal `bind() to [::] failed (97: Address family not supported by protocol)`.
+   - When IPv6 is enabled, provisions dual-stack listeners and firewall rules.
+8. **Log Rotation & Disk Space Depletion Prevention**:
    - Disables access logging on high-volume streaming endpoints (`access_log off;` in locations `/xhttp-down/` and `/ws`).
    - Deploys `/etc/logrotate.d/gowave-nginx` with daily rotation, 7-day retention, and gzip compression.
    - Caps persistent systemd journal storage at `SystemMaxUse=100M` in `/etc/systemd/journald.conf.d/99-gowave.conf`.

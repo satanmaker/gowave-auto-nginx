@@ -15,12 +15,12 @@ The security subsystem SHALL discover active SSH ports and socket bindings using
 - **THEN** effective listening ports are extracted from both daemon configuration and socket units, and whitelisted in UFW before the firewall is activated.
 
 ### Requirement: Fail2ban Intrusion Prevention
-The security subsystem SHALL install `python3-systemd`, configure `/etc/fail2ban/jail.d/90-gowave-auto-nginx.local` using `backend = systemd` monitoring both `ssh.service` and `ssh.socket` (`ssh@*.service`), and verify active jail status via `fail2ban-client status`.
+The security subsystem SHALL install `python3-systemd`, configure `/etc/fail2ban/jail.d/90-gowave-auto-nginx.local` using `backend = systemd` matching `ssh.service` and `ssh@*.service` (`ssh.socket`), and verify active jail status via `fail2ban-client status`.
 
 #### Scenario: Fail2ban jail activation and verification
 - **GIVEN** a host with `fail2ban` and `python3-systemd` installed
 - **WHEN** the security module is applied
-- **THEN** the drop-in configuration is installed with `backend = systemd`, `fail2ban` is reloaded, and `fail2ban-client status` confirms the jails are active and monitoring both standalone services and socket-activated SSH sessions.
+- **THEN** the drop-in configuration is installed with `backend = systemd` and `journalmatch = _SYSTEMD_UNIT=ssh.service + _COMM=sshd \n _SYSTEMD_UNIT=ssh@*.service + _COMM=sshd`, `fail2ban` is reloaded, and `fail2ban-client status` confirms the jails are active and monitoring both standalone services and socket-activated SSH sessions.
 
 ### Requirement: Strict DNS-over-TLS with Rollback
 The security subsystem SHALL optionally configure `systemd-resolved` with encrypted Cloudflare and Google DoT resolvers, auto-installing the package on Debian 12 if absent, and atomically reverting on failure.
@@ -53,13 +53,18 @@ The security subsystem SHALL manage UFW rules atomically, opening only necessary
 - **WHEN** UFW is reloaded or the operating system reboots
 - **THEN** effective iptables and ip6tables rules persist, node port 3002 remains strictly inaccessible from external IPv4 and IPv6 addresses, and loopback connectivity (`127.0.0.1`, `::1`) is unaffected.
 
+#### Scenario: Conditional UFW IPv6 handling when IPv6 is disabled in kernel
+- **GIVEN** a host with `net.ipv6.conf.all.disable_ipv6=1` or lacking IPv6 default route
+- **WHEN** firewall rules are applied
+- **THEN** `IPV6=no` is set in `/etc/default/ufw` to prevent ip6tables failures, and firewall rules are applied exclusively across IPv4 interfaces.
+
 ### Requirement: Optional Swap Space Management
-The security subsystem SHALL provide optional swap file allocation (2 GiB), safely detecting existing swap and container virtualization limitations.
+The security subsystem SHALL provide swap allocation (up to 2 GiB) using `dd if=/dev/zero` (strictly avoiding `fallocate` holes on XFS/Btrfs), safely detecting existing swap and container virtualization limitations.
 
 #### Scenario: Swap creation on low-memory VPS
 - **GIVEN** a KVM VPS with <= 1GB RAM and no active swap
 - **WHEN** swap configuration is evaluated
-- **THEN** a 2GB swap file is created with mode 0600, activated via `swapon`, and recorded in `/etc/fstab`.
+- **THEN** a swap file is created using `dd if=/dev/zero` with mode 0600, activated via `swapon`, and recorded in `/etc/fstab`.
 
 #### Scenario: Skip swap on containerized environments
 - **GIVEN** an LXC or OpenVZ container where `swapon` is restricted
@@ -75,12 +80,12 @@ The security subsystem SHALL configure `unattended-upgrades` with OS-specific se
 - **THEN** `/etc/apt/apt.conf.d/99zz-gowave-auto-nginx` is written with the appropriate distro security origin pattern, and `Unattended-Upgrade::Automatic-Reboot` is set to `"false"`.
 
 ### Requirement: Conditional Kernel BBR Congestion Control and MTU Probing
-The security subsystem SHALL enable BBR congestion control and packetization layer path MTU discovery (`net.ipv4.tcp_mtu_probing = 1`), persisting module loading via `/etc/modules-load.d/bbr.conf` when supported.
+The security subsystem SHALL enable BBR congestion control and path MTU discovery (`net.ipv4.tcp_mtu_probing = 1`), persisting module loading via dedicated oneshot service `bbr-load.service` ordered before `systemd-sysctl`.
 
 #### Scenario: BBR and MTU probing activation when module is available
 - **GIVEN** a Linux kernel supporting `tcp_bbr`
 - **WHEN** kernel performance tuning is requested
-- **THEN** `/etc/modules-load.d/bbr.conf` is written with `tcp_bbr`, and `/etc/sysctl.d/99-gowave.conf` is written with `net.core.default_qdisc = fq`, `net.ipv4.tcp_congestion_control = bbr`, and `net.ipv4.tcp_mtu_probing = 1`.
+- **THEN** `/etc/systemd/system/bbr-load.service` is deployed with `Before=systemd-sysctl.service` executing `/sbin/modprobe tcp_bbr` and `/sbin/sysctl -w net.ipv4.tcp_congestion_control=bbr`, and `/etc/sysctl.d/99-gowave.conf` configures `net.core.default_qdisc = fq`, `net.ipv4.tcp_congestion_control = bbr`, and `net.ipv4.tcp_mtu_probing = 1`.
 
 ### Requirement: NGINX and Journald Log Rotation Policy
 The security subsystem SHALL enforce log rotation policies via `/etc/logrotate.d/gowave-nginx` (daily, 7 days retention, compressed) and cap systemd journal size to 100MB to prevent disk exhaustion.

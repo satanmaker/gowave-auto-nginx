@@ -43,12 +43,12 @@ The routing subsystem SHALL enforce PROXY protocol reception strictly from loopb
 - **THEN** NGINX extracts the real client IP via `real_ip_header proxy_protocol;` and `set_real_ip_from 127.0.0.1;`, refusing PROXY headers from non-loopback IPs.
 
 ### Requirement: REALITY Camouflage Decoy Fallback
-The routing subsystem SHALL serve an authentic static camouflage website on loopback port 9443 for unauthenticated probes forwarded by Xray REALITY fallback with PROXY protocol v1.
+The routing subsystem SHALL serve an authentic static camouflage website on loopback port 9443 for unauthenticated probes forwarded by Xray REALITY fallback with PROXY protocol v1 (`xver: 1`), preserving real client IPs via `real_ip_header proxy_protocol;`.
 
 #### Scenario: Scanner probe fallback to static cover
 - **GIVEN** an unauthenticated client or scanner connecting to `127.0.0.1:8443`
 - **WHEN** Xray REALITY fails to authenticate the handshake
-- **THEN** Xray forwards the connection with PROXY protocol v1 (`dest: "127.0.0.1:9443", xver: 1`) to `127.0.0.1:9443`, where NGINX terminates TLS with `reality_domain` certificate and serves the authentic multi-asset decoy website (retained from `community-baseline` `cover-reality` under `/var/www/gowave-auto-nginx/cover-reality`), rejecting minimal single-file HTML stubs.
+- **THEN** Xray forwards the connection with PROXY protocol v1 (`dest: "127.0.0.1:9443", xver: 1`) to `127.0.0.1:9443`, where NGINX terminates TLS with `reality_domain` certificate, restores the real client IP via `set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`, and serves the authentic multi-asset decoy website (retained from `community-baseline` `cover-reality` under `/var/www/gowave-auto-nginx/cover-reality`), rejecting minimal single-file HTML stubs.
 
 ### Requirement: XHTTP Inbound Reverse Proxy
 The NGINX HTTPS listener at 7443 SHALL terminate TLS for `panel_domain` and reverse proxy configured XHTTP path prefixes to local Xray inbounds using HTTP/1.1 with buffering disabled.
@@ -85,9 +85,9 @@ The routing subsystem SHALL bind port 443 (Stream) and port 80 (HTTP) on IPv6 on
 - **THEN** listeners bind strictly to IPv4 (`listen 443;` and `listen 80;`), omitting `[::]` directives to prevent fatal `Address family not supported` socket errors.
 
 ### Requirement: 3-Stage Let's Encrypt TLS Bootstrap Sequence
-The installer SHALL resolve the initial TLS bootstrap deadlock using a 3-stage sequence: deploy an unencrypted HTTP port 80 webroot vhost, issue certificates via Certbot, and then deploy the production Stream 443 and HTTPS 7443 configurations.
+The installer SHALL resolve the initial TLS bootstrap deadlock using a 3-stage sequence: issue initial certificates via standalone mode or unencrypted port 80 webroot vhost, deploy production Stream 443 and HTTPS 7443 configurations, and maintain port 80 non-redirected ACME challenge routes.
 
 #### Scenario: Bootstrap certificates on fresh host
 - **GIVEN** a clean host without pre-existing Let's Encrypt certificates
 - **WHEN** the installer initiates TLS provisioning
-- **THEN** it deploys a temporary HTTP-only port 80 vhost answering `/.well-known/acme-challenge/`, issues certificates via `certbot certonly --webroot`, removes the temporary vhost, and deploys production Stream and HTTPS configurations referencing the valid certificates.
+- **THEN** it issues certificates via `certbot certonly --standalone` before starting NGINX (or via temporary port 80 webroot vhost without HTTPS redirects), deploys production Stream and HTTPS configurations referencing the valid certificates, and ensures port 80 redirects exclude `/.well-known/acme-challenge/` for future renewals.

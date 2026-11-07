@@ -5,7 +5,13 @@
   "protocol": "vless",
   "settings": {
     "clients": [],
-    "decryption": "none"
+    "decryption": "none",
+    "fallbacks": [
+      {
+        "dest": "127.0.0.1:9443",
+        "xver": 1
+      }
+    ]
   },
   "streamSettings": {
     "network": "tcp",

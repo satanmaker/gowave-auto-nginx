@@ -60,6 +60,11 @@ The installer SHALL provide an independent automated worker script (`gowave-node
 - **WHEN** the deployment begins
 - **THEN** environment variables and deployment functions are packed and piped directly over SSH stdin via `remote_payload`, executing inside a temporary remote script without copying files via `scp`, and cleaning up temporary files upon completion.
 
+#### Scenario: Automated worker registration via CLI node add command
+- **GIVEN** an active GoWave Panel and an accessible remote worker host
+- **WHEN** `gowave-auto.sh node add <name> <ip> <domain> [user] [port]` is executed
+- **THEN** it registers the node via `POST /api/nodes` linking unified profile inbounds, provisions worker Host records (`POST /api/hosts`), streams remote payload over SSH stdin, and stores node state in `state.json`.
+
 ### Requirement: Mutual TLS 1.3 Control Plane Protocol with Strict SNI Verification
 All panel-to-node management communication SHALL use TLS 1.3 with mutual certificate verification, derived HKDF SNI (`rw-v1`), RS256 JWT bearer token authentication, and strict SNI enforcement.
 
