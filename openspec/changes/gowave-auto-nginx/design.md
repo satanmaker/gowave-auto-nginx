@@ -584,3 +584,31 @@ Before extracting any archive, a dedicated Python validator inspects all tar mem
 10. Validates OS and architecture compatibility against target host.
 11. Restricts extraction strictly to a private staging directory (`mode 0700`).
 12. Restores files atomically using temporary siblings and renames.
+
+### Decision 9: Local Multi-Distribution Podman Testbed (Pre-Deployment VPS Gate)
+
+#### Motivation & Operational Context
+Deploying infrastructure code directly to remote VPS instances introduces high risk of mid-flight failures due to distribution discrepancies, systemd version differences, or package availability issues. To eliminate VPS deployment risks and provide instant developer feedback without the latency of launching full QEMU virtual machines, GoWave Auto NGINX establishes a local containerized pre-flight gate powered by Podman.
+
+#### PID 1 Systemd in Containerized Environments
+Unlike standard container runtimes, Podman natively supports systemd as PID 1 when invoked with `--systemd=always --privileged` and `/sys/fs/cgroup` mounted read-write. This enables complete lifecycle testing of systemd services (`gowave.service`, `gowave-node.service`, `nginx.service`, `fail2ban.service`), UFW firewall initialization, and socket-based activation across all target distributions.
+
+#### 4-Distribution Testbed Matrix
+The automated testbed runner (`tests/podman_testbed.sh`) executes against the official base images:
+- **Ubuntu 24.04 LTS**: `docker.io/library/ubuntu:24.04` (systemd 255.4, NGINX 1.24.0 legacy HTTP/2 syntax)
+- **Ubuntu 26.04 LTS**: `docker.io/library/ubuntu:devel` (systemd 256+, NGINX 1.26+ modern HTTP/2 syntax)
+- **Debian 12 Bookworm**: `docker.io/library/debian:12` (systemd 252.30, `systemd-resolved` installation adaptation)
+- **Debian 13 Trixie**: `docker.io/library/debian:testing` (systemd 256+, modern HTTP/2 syntax)
+
+#### 8-Stage In-Container Test Execution
+The testbed script executes an 8-stage verification pipeline inside each containerized distribution:
+1. Detects OS and provisions distribution-specific dependencies (including `systemd-resolved` on Debian 12).
+2. Verifies runtime NGINX version detection and configuration syntax (`listen ... ssl http2;` vs `http2 on;`).
+3. Executes preflight port and unmanaged NGINX port 443 conflict scanning.
+4. Bootstraps systemd services with port 3002 isolation and UFW loopback-only rules.
+5. Executes REST API provisioning (unified Config Profile, Host records, native x25519 key generation).
+6. Verifies NGINX Stream SNI multiplexing, XHTTP unbuffered streaming, and 9443 cover fallback.
+7. Retrieves deterministic Xray JSON and Mihomo YAML subscriptions and validates them with official core binaries.
+8. Simulates update transaction crash and asserts automatic state rollback via `journal.json`.
+
+Passing all 8 stages across all 4 distributions is enforced as a mandatory requirement prior to any VPS deployment.

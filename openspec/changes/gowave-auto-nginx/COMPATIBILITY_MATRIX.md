@@ -92,3 +92,17 @@ To prevent acceptance of corrupt or pseudo-valid subscription files, verificatio
 |---|---|---|---|---|---|
 | **Xray JSON (`v2ray-json`)** | `v1.8.24` | `v24.9.30` | `xray run -test -c <config.json>` | All 4 MVP transports: VLESS-REALITY-Vision, VLESS-XHTTP, VLESS-WS, Trojan-gRPC | `XTLS/Xray-core` releases; exit code 0 indicates 100% schema and outbound validity |
 | **Mihomo YAML (`mihomo`)** | `v1.18.10` | `v1.19.0` | `mihomo -t -f <config.yaml>` | All client-compatible MVP transports: VLESS-REALITY, VLESS-WS, Trojan-gRPC, VLESS-XHTTP | `MetaCubeX/mihomo` releases; exit code 0 verifies full proxy stanza and YAML schema parsing |
+
+---
+
+## 6. Local Podman Multi-Distribution Testbed Matrix
+
+Before deploying to physical or virtual cloud servers, the automated test harness (`tests/podman_testbed.sh`) executes containerized pre-flight tests across all 4 supported operating systems using Podman's native systemd integration (`--systemd=always --privileged`):
+
+| Operating System | Distribution Codename | Official Container Image | Container Init System | NGINX Version in Image | Testbed Validation Status | Verified Adaptations in Testbed |
+|---|---|---|---|---|---|---|
+| **Ubuntu 24.04 LTS** | Noble Numbat | `docker.io/library/ubuntu:24.04` | `systemd` 255.4 (PID 1) | 1.24.0 (`< 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Legacy HTTP/2 syntax (`listen ... ssl http2;`), UFW bridge rules, native Panel/Node systemd units |
+| **Ubuntu 26.04 LTS** | Resolute Raccoon | `docker.io/library/ubuntu:devel` | `systemd` 256+ (PID 1) | 1.26+ (`>= 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Modern HTTP/2 syntax (`http2 on;`), Stream multiplexing, UFW isolation |
+| **Debian 12** | Bookworm | `docker.io/library/debian:12` | `systemd` 252.30 (PID 1) | 1.22.1 (`< 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Legacy HTTP/2 syntax (`listen ... ssl http2;`), auto-installation of `systemd-resolved`, Debian security origins |
+| **Debian 13** | Trixie | `docker.io/library/debian:testing` | `systemd` 256+ (PID 1) | 1.26.3 (`>= 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Modern HTTP/2 syntax (`http2 on;`), systemd-resolved integration, Stream multiplexing |
+

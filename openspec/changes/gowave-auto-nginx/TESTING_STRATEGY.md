@@ -134,3 +134,90 @@ flowchart TD
 | `lint-and-nonroot.yml` | Push, Pull Request | Suite `nonroot`, ShellCheck, actionlint, completeness check | `lint-and-nonroot` | `contents: read` |
 | `root-integration.yml` | Push, Pull Request | Suite `root` (EUID 0) & Suite `integration` (container `--user 1001:1001`, EUID != 0) | `root-integration` | `contents: read` |
 | `systemd-acceptance.yml` | Schedule (daily), Manual dispatch | Suite `services` & Suite `systemd` across Ubuntu 24/26 & Debian 12/13 | `systemd-acceptance` | `contents: read`, `actions: write` |
+
+---
+
+## 4. Local Multi-Distribution Podman Testbed (Pre-Deployment VPS Gate)
+
+To guarantee that deployment scripts and automation execute cleanly before deploying to a physical or cloud VPS, the repository provides an automated local testbed runner script: `tests/podman_testbed.sh`.
+
+Podman provides containerized execution with genuine PID 1 `systemd` support (`--systemd=always --privileged`), eliminating the need to launch heavy QEMU virtual machines for fast, multi-distribution pre-flight checks.
+
+### Target Distribution Matrix & Container Images
+
+| Distribution Identifier | Target Operating System | Container Image | Container Init & Flags | Specific Adaptations Verified |
+|---|---|---|---|---|
+| `ubuntu24` | Ubuntu 24.04 LTS (Noble) | `docker.io/library/ubuntu:24.04` | PID 1 systemd 255.4 (`--systemd=always --privileged`) | NGINX 1.24.0 legacy HTTP/2 syntax (`listen ... ssl http2;`), UFW firewall loopback rules, native Panel/Node units |
+| `ubuntu26` | Ubuntu 26.04 LTS (Resolute) | `docker.io/library/ubuntu:devel` | PID 1 systemd 256+ (`--systemd=always --privileged`) | Modern NGINX HTTP/2 syntax (`http2 on;`), Stream multiplexing, UFW isolation |
+| `debian12` | Debian 12 (Bookworm) | `docker.io/library/debian:12` | PID 1 systemd 252.30 (`--systemd=always --privileged`) | Auto-installation of `systemd-resolved`, NGINX 1.22.1 legacy syntax (`listen ... ssl http2;`), Debian security origins |
+| `debian13` | Debian 13 (Trixie) | `docker.io/library/debian:testing` | PID 1 systemd 256+ (`--systemd=always --privileged`) | Modern NGINX HTTP/2 syntax (`http2 on;`), systemd-resolved integration, Stream multiplexing |
+
+### CLI Invocation Interface
+
+```bash
+# Run all 4 distributions sequentially and verify zero failures
+./tests/podman_testbed.sh all
+
+# Or run individual distribution testbeds
+./tests/podman_testbed.sh ubuntu24
+./tests/podman_testbed.sh ubuntu26
+./tests/podman_testbed.sh debian12
+./tests/podman_testbed.sh debian13
+```
+
+### Container Launch Contract & Cgroups Configuration
+
+`podman_testbed.sh` invokes Podman with specific volume mounts and systemd integration flags:
+```bash
+podman run --rm -d \
+  --name "gowave-testbed-${DISTRO}" \
+  --systemd=always \
+  --privileged \
+  -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+  -v "${WORKSPACE_ROOT}:/workspace:ro" \
+  "${IMAGE_NAME}"
+```
+
+### 8-Stage In-Container Verification Pipeline
+
+Once the container reaches PID 1 `systemd` readiness, `podman_testbed.sh` executes the following 8 stages via `podman exec`:
+
+1. **Stage 1: Base OS Detection & Prerequisite Provisioning**:
+   - Detects OS release via `/etc/os-release`.
+   - On Debian 12: explicitly verifies and executes automatic installation of `systemd-resolved`.
+   - Installs base prerequisites (`curl`, `tar`, `sqlite3`, `socat`, `jq`, `openssl`, `ufw`, `fail2ban`, `nginx`).
+2. **Stage 2: Runtime NGINX HTTP/2 Syntax Adaptation**:
+   - Inspects `nginx -v` version string.
+   - For NGINX < 1.25.1 (Ubuntu 24.04, Debian 12): verifies compiled configuration uses `listen 7443 ssl http2;`.
+   - For NGINX >= 1.25.1 (Ubuntu 26.04, Debian 13): verifies compiled configuration uses `listen 7443 ssl;` and `http2 on;`.
+   - Validates configuration integrity with `nginx -t`.
+3. **Stage 3: Preflight Conflict Scanner Verification**:
+   - Scans port availability for 3000, 3001, 3002, 7443, 8443, 9443, 443.
+   - Simulates unmanaged NGINX virtual hosts listening on 443 and verifies installer detection and clean diagnostic abort.
+4. **Stage 4: Systemd Service Bootstrap & Port Isolation**:
+   - Boots `gowave.service` on loopback port 3000 (`APP_PORT=3000`).
+   - Provisions `gowave-node.service` with drop-in `/etc/systemd/system/gowave-node.service.d/10-port.conf` enforcing port 3002.
+   - Applies UFW firewall rules denying public ingress to 3002 while permitting loopback `127.0.0.1:3002` and `[::1]:3002`.
+5. **Stage 5: GoWave REST API Provisioning & Native x25519 Keys**:
+   - Bootstraps admin account via `POST /api/auth/register` and verifies JWT session.
+   - Generates Curve25519 keypair via `GET /api/system/tools/x25519/generate`.
+   - Creates single unified Config Profile with all 4 inbounds via `POST /api/config-profiles`.
+   - Configures managed Internal Squad, associates user, and creates Host records (`POST /api/hosts`).
+   - Generates scoped API tokens and records credentials to `/root/gowave-credentials.txt` with mode `0600`.
+6. **Stage 6: NGINX Stream & Reverse Proxy Verification**:
+   - Tests SNI dispatch on port 443 (`panel_domain` -> 7443, `reality_domain` -> 8443).
+   - Validates XHTTP buffering disabled (`proxy_buffering off; proxy_request_buffering off;`).
+   - Validates WebSocket connection upgrade headers and Trojan gRPC proxying.
+   - Sends scanner probes to port 8443 and verifies PROXY protocol v1 fallback to decoy website on 9443.
+7. **Stage 7: Deterministic Subscription Delivery & Core Parser Validation**:
+   - Fetches Xray JSON (`GET /api/sub/{shortUuid}/v2ray-json`) and validates schema using `xray run -test -c`.
+   - Fetches Mihomo YAML (`GET /api/sub/{shortUuid}/mihomo`) and validates schema using `mihomo -t -f`.
+   - Confirms zero loopback leaks (`127.0.0.1`, `localhost`, internal ports) across all delivered client profiles.
+8. **Stage 8: Disaster Recovery & Rollback Simulation**:
+   - Creates `GoWave Auto NGINX Backup Format v1` archive and verifies `0600` permissions.
+   - Injects simulated process failure into update transaction and asserts automatic rollback from `/var/lib/gowave-auto-nginx/recovery/` via `journal.json`.
+
+### Pre-Deployment VPS Gate Rule
+
+> [!IMPORTANT]
+> **VPS Deployment Gate Requirement**: No changes to `gowave-auto.sh`, `gowave-node-auto.sh`, templates, or systemd configurations may be pushed to production branches or executed on physical/cloud VPS environments without passing `./tests/podman_testbed.sh all` across all 4 operating systems.

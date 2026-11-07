@@ -89,3 +89,16 @@ The uninstall command SHALL inspect `# Managed by GoWave Auto NGINX` ownership m
 - **GIVEN** an installed GoWave Auto NGINX instance
 - **WHEN** `gowave-auto.sh uninstall --confirm` is executed
 - **THEN** `gowave` and `gowave-node` systemd units are stopped and disabled, NGINX project vhosts are removed, `/opt/gowave` and `/opt/gowave-node` are deleted, and system-wide packages (Python, systemd, SSH, base NGINX) remain intact.
+
+### Requirement: Local Multi-Distribution Podman Testbed Gate
+The verification harness SHALL provide `tests/podman_testbed.sh` executing containerized pre-flight tests with PID 1 systemd across all 4 supported operating systems (Ubuntu 24.04, Ubuntu 26.04, Debian 12, Debian 13), requiring 100% pass rate across the 8-stage verification pipeline prior to VPS deployment.
+
+#### Scenario: Automated local Podman validation across all 4 supported distributions
+- **GIVEN** a local development or CI environment with Podman installed
+- **WHEN** `./tests/podman_testbed.sh all` is executed
+- **THEN** it sequentially launches official container images for Ubuntu 24.04, Ubuntu 26.04, Debian 12, and Debian 13 using `--systemd=always --privileged`, runs the 8-stage verification pipeline inside each container, collects structured logs, and confirms all 4 environments pass with zero errors.
+
+#### Scenario: Runtime distribution adaptation verification in Podman containers
+- **GIVEN** container testbeds running Debian 12, Debian 13, Ubuntu 24.04, and Ubuntu 26.04
+- **WHEN** the testbed executes stage 1 (prerequisites) and stage 2 (NGINX syntax)
+- **THEN** it verifies that `systemd-resolved` is auto-installed on Debian 12, that NGINX legacy syntax (`listen ... ssl http2;`) is configured on Ubuntu 24.04 and Debian 12, and modern syntax (`http2 on;`) is configured on Ubuntu 26.04 and Debian 13.

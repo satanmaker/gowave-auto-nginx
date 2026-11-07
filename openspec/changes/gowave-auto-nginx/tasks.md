@@ -109,6 +109,8 @@
 - [ ] 12.6 Implement Suite `root`: user/group creation (`gowave:gowave`), sticky bit permissions (1770), service install verification, zero-leak secret delivery verification, and Fail2ban syntax check
 - [ ] 12.7 Integrate GoWave Node upstream test suite: run `go test ./...`, `go vet`, ShellCheck, `python3 tests/test_scripts.py`, and `gowave-node status --wait-ready` CLI verification
 - [ ] 12.8 Implement Suite `systemd` QEMU TCG runner (`tests/systemd/boot.sh`): verify PID 1 systemd cold boot, All-in-One port bindings, service persistence across reboot, power cut journal recovery, and backup/restore across Ubuntu 24.04, 26.04, Debian 12, and Debian 13
+- [ ] 12.9 Implement `tests/podman_testbed.sh` automating container lifecycle (`--systemd=always --privileged`), workspace mounting, 8-stage test execution, and cleanup across Ubuntu 24.04, Ubuntu 26.04, Debian 12, and Debian 13
+- [ ] 12.10 Enforce mandatory local Podman pre-flight validation gate: require passing testbed runs across all 4 target operating systems prior to production VPS deployment
 
 ## 13. CI/CD Workflows and Acceptance
 
