@@ -1,0 +1,28 @@
+# Upstream reference repositories
+/gowave/
+/gowave-node/
+/community-baseline/
+
+# Audit reports and reviews
+openspec_gowave_*.txt
+*audit*
+*review*
+REMEDIATION_REPORT.md
+
+# IDE and Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary archives
+*.zip
+*.tar.gz
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
