@@ -26,7 +26,7 @@ There is a clear engineering requirement for a dedicated, independent deployment
 - **Hardened Backup & Restore (Format v1)**: Implement `GoWave Auto NGINX Backup Format v1` packaging GoWave SQLite database, `.env`, Node credentials, and NGINX configurations into an unencrypted gzip archive (`meta.json` + `files/`) with root-only file permissions (`0600`), SQLite Online Backup API consistency, strict Python preflight path-traversal prevention, and persistent recovery snapshots.
 - **Debian 12 Compatibility Layer**: Provide explicit adaptations for Debian 12 (NGINX 1.22 `listen ... http2;` syntax, `systemd-resolved` auto-installation, and Debian-specific APT origins).
 - **5-Suite Automated Testing & CI/CD**: Implement a 5-suite test architecture (`nonroot`, `root`, `integration`, `services`, `systemd` in QEMU TCG guest) with strict EUID privilege separation and automated CI workflows.
-- **Local Multi-Distribution Podman Pre-Flight Gate**: Provide `tests/podman_testbed.sh` automating local containerized execution with PID 1 systemd across all 4 supported operating systems (Ubuntu 24.04, Ubuntu 26.04, Debian 12, and Debian 13), establishing an authoritative pre-flight gate that must pass before deploying changes to physical or cloud VPS environments.
+- **Local Multi-Distribution Podman Pre-Flight Gate**: Provide `tests/podman_testbed.sh` automating local containerized execution with PID 1 systemd across all 4 supported operating systems (Ubuntu 24.04, Ubuntu 26.04, Debian 12, and Debian 13) in both All-in-One and Multi-Node Distributed Edge topologies (`multi-node`), establishing an authoritative pre-flight gate that must pass before deploying changes to physical or cloud VPS environments.
 
 ## Capabilities
 

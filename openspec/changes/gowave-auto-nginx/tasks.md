@@ -111,6 +111,7 @@
 - [ ] 12.8 Implement Suite `systemd` QEMU TCG runner (`tests/systemd/boot.sh`): verify PID 1 systemd cold boot, All-in-One port bindings, service persistence across reboot, power cut journal recovery, and backup/restore across Ubuntu 24.04, 26.04, Debian 12, and Debian 13
 - [ ] 12.9 Implement `tests/podman_testbed.sh` automating container lifecycle (`--systemd=always --privileged`), workspace mounting, 8-stage test execution, and cleanup across Ubuntu 24.04, Ubuntu 26.04, Debian 12, and Debian 13
 - [ ] 12.10 Enforce mandatory local Podman pre-flight validation gate: require passing testbed runs across all 4 target operating systems prior to production VPS deployment
+- [ ] 12.11 Implement multi-node E2E test target in `tests/podman_testbed.sh` (`multi-node`): provision 2-container Podman bridge network (`gowave-panel` and `gowave-worker`), deploy remote worker via `gowave-node-auto.sh` over SSH stdin, verify UFW panel IP whitelist, validate mTLS 1.3 handshake, push inbounds/users, and verify direct edge VPN client traffic
 
 ## 13. CI/CD Workflows and Acceptance
 

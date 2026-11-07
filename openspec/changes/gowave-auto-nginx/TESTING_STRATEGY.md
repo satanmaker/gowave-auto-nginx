@@ -155,8 +155,11 @@ Podman provides containerized execution with genuine PID 1 `systemd` support (`-
 ### CLI Invocation Interface
 
 ```bash
-# Run all 4 distributions sequentially and verify zero failures
+# Run all 4 distributions sequentially in All-in-One topology and verify zero failures
 ./tests/podman_testbed.sh all
+
+# Run multi-node distributed edge test (Panel + remote Worker across Podman bridge network)
+./tests/podman_testbed.sh multi-node
 
 # Or run individual distribution testbeds
 ./tests/podman_testbed.sh ubuntu24
@@ -217,7 +220,43 @@ Once the container reaches PID 1 `systemd` readiness, `podman_testbed.sh` execut
    - Creates `GoWave Auto NGINX Backup Format v1` archive and verifies `0600` permissions.
    - Injects simulated process failure into update transaction and asserts automatic rollback from `/var/lib/gowave-auto-nginx/recovery/` via `journal.json`.
 
+### Multi-Node Distributed Edge E2E Pipeline (`tests/podman_testbed.sh multi-node`)
+
+To rigorously test `gowave-node-auto.sh` and multi-node orchestration prior to VPS deployment, the testbed executes an end-to-end verification across an isolated Podman bridge network (`gowave-net`):
+
+```mermaid
+flowchart LR
+    client["Client Simulator (Test Runner)"]
+    panel["Container: gowave-panel (10.89.0.10)<br/>GoWave Panel API :3000<br/>NGINX Reverse Proxy :7443"]
+    worker["Container: gowave-worker (10.89.0.20)<br/>gowave-node :3000 (UFW allows 10.89.0.10)<br/>Worker NGINX Stream :443<br/>Worker Xray Inbounds :8443, :10001-:10003"]
+
+    panel -- "1. mTLS 1.3 Handshake (rw-v1)<br/>2. Profile & User Sync" --> worker
+    client -- "3. Direct VPN Tunnel (Port 443)<br/>VLESS REALITY / XHTTP / WS / Trojan" --> worker
+    client -. "Fetch Subscriptions" .-> panel
+```
+
+The multi-node test executes the following 6 stages:
+1. **Network & Dual-Container Provisioning**:
+   - Creates Podman network `gowave-net` (subnet `10.89.0.0/24`).
+   - Launches `gowave-panel` (`10.89.0.10`) and `gowave-worker` (`10.89.0.20`) with `--systemd=always --privileged`.
+2. **Control Plane Provisioning**:
+   - Installs GoWave Panel on `gowave-panel`, verifies API listening on `127.0.0.1:3000` and NGINX on `10.89.0.10:7443`.
+   - Bootstraps admin user, single unified Config Profile, and Host records.
+3. **Remote Worker Deployment over SSH Stdin**:
+   - Dispatches `gowave-node-auto.sh` to `gowave-worker` (`10.89.0.20`) via the SSH stdin pipeline (`remote_payload`), passing `NODE_PORT=3000`, `SECRET_KEY`, and `PANEL_IP=10.89.0.10` without file transfer dependencies.
+4. **Worker Firewall Lockdown Verification**:
+   - Verifies UFW rule on Worker: `ufw allow proto tcp from 10.89.0.10 to any port 3000`.
+   - Confirms that probes from `10.89.0.10` succeed, while probes from other IPs are dropped.
+5. **Panel-to-Node mTLS 1.3 Association & Config Push**:
+   - Registers Worker node in Panel API via `POST /api/nodes` (`address: "10.89.0.20"`, `port: 3000`).
+   - Initiates mTLS 1.3 handshake with HKDF-derived SNI (`rw-v1`), pushes inbounds, and syncs users via `syncUserToSingleNode`.
+   - Verifies `gowave-node` receives configuration and supervises Xray core.
+6. **Direct Edge Client Traffic & Camouflage Fallback**:
+   - Simulates client connections directly to `10.89.0.20:443` across all 4 MVP protocols (VLESS REALITY, XHTTP, WebSocket, Trojan gRPC).
+   - Verifies that client VPN traffic terminates and routes directly on `gowave-worker` without passing through `gowave-panel`.
+   - Verifies PROXY protocol fallback to local camouflage site on `10.89.0.20:9443` for unauthorized probes.
+
 ### Pre-Deployment VPS Gate Rule
 
 > [!IMPORTANT]
-> **VPS Deployment Gate Requirement**: No changes to `gowave-auto.sh`, `gowave-node-auto.sh`, templates, or systemd configurations may be pushed to production branches or executed on physical/cloud VPS environments without passing `./tests/podman_testbed.sh all` across all 4 operating systems.
+> **VPS Deployment Gate Requirement**: No changes to `gowave-auto.sh`, `gowave-node-auto.sh`, templates, or systemd configurations may be pushed to production branches or executed on physical/cloud VPS environments without passing both `./tests/podman_testbed.sh all` (All-in-One across all 4 operating systems) and `./tests/podman_testbed.sh multi-node` (Distributed Edge dual-container test).

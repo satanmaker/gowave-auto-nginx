@@ -612,3 +612,16 @@ The testbed script executes an 8-stage verification pipeline inside each contain
 8. Simulates update transaction crash and asserts automatic state rollback via `journal.json`.
 
 Passing all 8 stages across all 4 distributions is enforced as a mandatory requirement prior to any VPS deployment.
+
+#### Multi-Node Distributed Edge E2E Testbed (Panel + Remote Worker)
+In addition to All-in-One tests, `tests/podman_testbed.sh multi-node` deploys two interconnected containers on an isolated Podman bridge network (`gowave-net`):
+1. **`gowave-panel` (Control Plane)**: Hosts GoWave Panel, SQLite database, and NGINX reverse proxy.
+2. **`gowave-worker` (Edge Gateway)**: Deployed automatically via `gowave-node-auto.sh` using the SSH stdin pipeline (`remote_payload`), receiving `NODE_PORT=3000`, `SECRET_KEY`, and `PANEL_IP`.
+
+The multi-node testbed verifies:
+- Remote worker deployment without copying files via `scp`.
+- Worker UFW firewall configuration strictly whitelisting the panel IP for port 3000 while dropping unauthorized ingress.
+- Mutual TLS 1.3 control plane handshake between panel and worker node using HKDF-derived SNI (`rw-v1`).
+- GoWave user synchronization (`syncUserToSingleNode`) and unified Config Profile distribution.
+- Direct edge client VPN traffic tunneling to the worker's port 443 across all 4 MVP protocols without passing through the central panel.
+- Worker PROXY protocol fallback to decoy website on port 9443 for scanner probes.

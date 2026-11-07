@@ -111,3 +111,16 @@ The `gowave-node` daemon SHALL directly supervise the Xray core child process wi
 - **GIVEN** a running `gowave-node` daemon supervising Xray core
 - **WHEN** the Xray core process terminates unexpectedly
 - **THEN** `gowave-node` detects process exit and automatically respawns Xray core.
+
+### Requirement: Multi-Node Distributed Edge Podman Verification Gate
+The verification harness SHALL provide an automated dual-container Podman testbed (`./tests/podman_testbed.sh multi-node`) verifying end-to-end deployment of `gowave-node-auto.sh`, panel-to-node mTLS 1.3 handshake, firewall panel IP restriction, and direct edge client VPN data tunneling.
+
+#### Scenario: Automated multi-node deployment and mTLS connection in Podman testbed
+- **GIVEN** an isolated Podman bridge network connecting `gowave-panel` and `gowave-worker` containers
+- **WHEN** `./tests/podman_testbed.sh multi-node` is executed
+- **THEN** it deploys GoWave Panel on the first container, deploys `gowave-node-auto.sh` on the second container via SSH stdin streaming, verifies successful mTLS 1.3 handshake with HKDF SNI (`rw-v1`), registers the worker node in the panel, and syncs users.
+
+#### Scenario: Worker node firewall panel IP restriction and edge traffic routing in Podman testbed
+- **GIVEN** a running multi-node Podman testbed
+- **WHEN** client VPN connections are initiated to the worker container port 443
+- **THEN** client traffic is routed directly by the worker's NGINX Stream and Xray inbounds without passing through the panel container, while the worker's UFW denies external access to `NODE_PORT=3000` from IPs other than the panel.

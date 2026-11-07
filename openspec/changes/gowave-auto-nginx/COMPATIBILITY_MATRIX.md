@@ -106,3 +106,13 @@ Before deploying to physical or virtual cloud servers, the automated test harnes
 | **Debian 12** | Bookworm | `docker.io/library/debian:12` | `systemd` 252.30 (PID 1) | 1.22.1 (`< 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Legacy HTTP/2 syntax (`listen ... ssl http2;`), auto-installation of `systemd-resolved`, Debian security origins |
 | **Debian 13** | Trixie | `docker.io/library/debian:testing` | `systemd` 256+ (PID 1) | 1.26.3 (`>= 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Modern HTTP/2 syntax (`http2 on;`), systemd-resolved integration, Stream multiplexing |
 
+### Multi-Node Distributed Edge Testbed Matrix
+
+In addition to All-in-One single-container tests, the testbed executes a dual-container Distributed Edge test (`./tests/podman_testbed.sh multi-node`) across an isolated Podman bridge network (`gowave-net`):
+
+| Node Role | Target Container Image | Assigned IP / Port | Verified Services & Components | Verification Scope in Testbed |
+|---|---|---|---|---|
+| **Control Plane (Panel)** | `docker.io/library/ubuntu:24.04` (or Debian 12) | `10.89.0.10` / `:3000`, `:7443` | GoWave Panel, SQLite, NGINX reverse proxy, Certbot | REST API onboarding, mTLS CA issuance, Worker node registration (`POST /api/nodes`), user sync |
+| **Worker Node (Edge)** | `docker.io/library/debian:12` (or Ubuntu 24.04) | `10.89.0.20` / `:3000` (mTLS), `:443`, `:8443` | `gowave-node`, Xray core, NGINX Stream, UFW | SSH stdin deployment via `gowave-node-auto.sh`, UFW whitelist (`10.89.0.10` only), mTLS 1.3 handshake (`rw-v1`), direct client VPN data plane |
+
+
