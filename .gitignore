@@ -1,7 +1,5 @@
-# Upstream reference repositories
-/gowave/
-/gowave-node/
-/community-baseline/
+# Reference sources and documentation
+/sources/
 
 # Audit reports and reviews
 openspec_gowave_*.txt
