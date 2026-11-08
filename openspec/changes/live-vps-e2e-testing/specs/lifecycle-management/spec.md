@@ -31,13 +31,13 @@ staging and production reuse.
 
 - **GIVEN** both `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` are configured
 - **WHEN** Master and Worker certificates are issued
-- **THEN** Master and Worker each issue and verify a third Vision certificate using the same selected ACME directory as their two mandatory certificates; each Vision renewal lineage MUST match that directory
+- **THEN** Master and Worker each issue and verify a third Vision certificate using the same selected ACME directory as their two mandatory certificates; before Worker issuance, its HTTP-01 bootstrap vhost includes `WORKER_VISION_DOMAIN` in `server_name`; each Vision renewal lineage MUST match that directory
 
 #### Scenario: Vision certificate failure is not silently ignored
 
 - **GIVEN** the paired Vision domains are configured but Certbot issuance or certificate validation fails on either VPS
 - **WHEN** the corresponding installation phase runs
-- **THEN** that host's installation fails and rolls back; deployment MUST NOT proceed with a profile or NGINX route advertising an unusable Vision inbound
+- **THEN** that host's installation fails and rolls back; on Worker, the HTTP-01 bootstrap vhost must have included the Vision name before issuance, and rollback must remove any transaction-created Vision certificate/renewal lineage, stream-map entry, 9444 fallback vhost and generated profile/host state. It MUST preserve pre-existing/unowned lineages and unrelated resources. Deployment MUST NOT proceed with a profile or NGINX route advertising an unusable Vision inbound
 
 #### Scenario: One-sided Vision configuration is rejected before deployment
 
@@ -57,6 +57,12 @@ staging and production reuse.
 - **GIVEN** a valid certificate lineage exists for the requested domain
 - **WHEN** installation is repeated with the same ACME directory URL
 - **THEN** Certbot may reuse the lineage without unnecessary issuance, after validating its renewal configuration and certificate SAN/expiry
+
+#### Scenario: Failed transaction preserves pre-existing certificate lineages
+
+- **GIVEN** a requested-domain certificate lineage existed before installation and is valid for the selected ACME directory
+- **WHEN** a later Master or Worker provisioning step fails and compensation runs
+- **THEN** rollback MUST NOT delete the pre-existing lineage; if Certbot changed it, restore and verify its certificate, private key, renewal configuration, live symlink targets, ownership and modes from the same-host snapshot under `/var/lib/gowave-auto-nginx/recovery/<transaction-id>/acme/<domain>/` (root-owned `0700` directories, root-owned `0600` private-key files). Snapshots MUST NOT be copied to runner/CI artifacts or logs. Only lineages proven to have been absent before the failed transaction may be deleted. Remove snapshots only after verified commit/rollback; retain them and report incomplete recovery if restoration fails. If safe restoration cannot be guaranteed, the install MUST fail before issuance or report cleanup incomplete rather than claim rollback success.
 
 #### Scenario: ACME directory changes between staging and production
 

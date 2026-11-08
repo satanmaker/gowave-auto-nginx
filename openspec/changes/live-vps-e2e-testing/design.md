@@ -30,6 +30,8 @@ See `proposal.md — Why` for motivation. Key implementation constraints derived
   status.
 - Reuse existing crypto/mTLS logic via subprocess, not reimplementation.
 - SSH transport uses system OpenSSH CLI with `StrictHostKeyChecking=yes` and pre-pinned `known_hosts`.
+- E2E v1 connects to both VPS as `root`; the current deployment scripts have no `sudo` execution adapter. Preflight verifies `id -u == 0` on both hosts before acquiring remote locks or mutating either host; non-root SSH accounts fail closed.
+- `SSH_KNOWN_HOSTS` is one configured, pre-pinned file containing both target host keys. Each SSH invocation selects the exact target entry (including `[host]:port` for non-default ports); a second independent file is not required by this contract.
 - All log output passes through a redaction filter before writing.
 - Teardown is policy-driven and idempotent; it never destroys a VPS not created by this runner.
 - Run-level lock prevents concurrent tests on the same Master/Worker pair.
@@ -413,6 +415,11 @@ successful install records; `traffic` requires verification PASS; `negative` req
 environment; `teardown` requires an existing run and diagnostics/baseline record. A completed phase is not
 repeated implicitly. A mismatch or missing state record fails closed before remote modification.
 
+`TEST_RUN_ID` is a path component, not an arbitrary path. Accept only `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`;
+explicitly reject `.` and `..`, path separators, NUL and any value whose resolved artifact path escapes
+`artifacts/live-vps/`. Reject a pre-existing run directory, symlinked run directory, or symlinked parent path;
+create the directory atomically with restrictive permissions. The same validation applies to generated IDs.
+
 `install` requires a successful preflight record and, after reacquiring both remote locks, MUST re-collect the
 baseline/disposable-gate invariants and compare them with the saved preflight manifest before its first remote
 mutation. A stale run-state record or any baseline drift fails closed; it is not enough that the original
@@ -441,21 +448,41 @@ When the pair is configured:
    Panel and REALITY certificates before compiling/provisioning the Master profile. The current best-effort
    suppression of Vision Certbot/certificate-verification failures (`|| true`) MUST be removed for this E2E
    path. A missing, wrong-ACME-lineage, expired, or hostname-invalid Vision certificate fails Master
-   installation; implementation MUST provide an install cleanup/rollback path and test that no partial Vision
-   profile, certificate consumer, or NGINX route remains active. The runner MUST NOT report a partial
-   four-inbound Master as successful Vision-enabled installation.
+   installation; implementation MUST record which requested-domain lineages existed before the transaction.
+   Cleanup may remove only lineages created by the failed transaction. If Certbot changes a pre-existing
+   lineage, the implementation MUST restore its pre-install certificate, key, and renewal configuration from
+   a securely permissioned transaction snapshot; if safe restoration cannot be guaranteed, fail before
+   issuance. The rollback test MUST prove that no pre-existing lineage or unrelated certificate is lost and
+   no partial Vision profile, certificate consumer, or NGINX route remains active. The runner MUST NOT report
+   a partial four-inbound Master as successful Vision-enabled installation.
 2. `gowave-auto.sh node add` MUST receive the Worker Vision domain through an explicit named
    `--vision-domain` option (not by shifting the existing optional SSH-user/SSH-port positional arguments).
    It validates the domain, includes it in the Worker API profile via `compile_config_profile(...,
    vision_domain=...)` and `provision_hosts(..., vision_domain=...)`, and records it in `state.json`.
-3. `gowave-node-auto.sh remote_payload` MUST serialize the Worker Vision domain over SSH stdin. Worker
-   installation MUST issue and verify its Vision certificate using the same selected `GOWAVE_ACME_SERVER`
-   as its Panel/REALITY certificates, validate the matching renewal lineage, configure the `8444` SNI route
-   and `9444` HTTP fallback, and fail closed if any requested Vision prerequisite is missing.
-4. Panel API acceptance MUST verify five inbounds and five corresponding hosts per node, including each
+3. `gowave-node-auto.sh remote_payload` MUST serialize the Worker Vision domain over SSH stdin. Before
+   issuing the third certificate, the Worker HTTP-01 bootstrap server's `server_name` MUST include
+   `WORKER_VISION_DOMAIN` as well as the mandatory Worker and REALITY domains; the challenge path MUST resolve
+   to the same webroot for all three names. Worker installation MUST issue and verify its Vision certificate
+   using the same selected `GOWAVE_ACME_SERVER` as its Panel/REALITY certificates and validate the matching
+   renewal lineage. The NGINX stream map routes Vision SNI to `127.0.0.1:8444`; the Xray Vision fallback
+   template sends non-VLESS HTTP traffic to `127.0.0.1:9444` with PROXY protocol (`xver: 1`). Worker MUST
+   create a loopback-only cleartext HTTP decoy vhost on `127.0.0.1:9444` with `proxy_protocol` enabled,
+   serving the managed cover-reality content and never the GoWave Panel/API. `nginx -t` MUST pass before
+   activation/reload. Any requested Vision prerequisite failure fails the Worker phase.
+4. Worker failure compensation MUST account for all Worker certificate and Vision artifacts: record the
+   pre-transaction presence/identity of the Worker, REALITY and optional Vision lineages; remove only lineages
+   created by this transaction, and restore any pre-existing lineage changed by Certbot from a secure snapshot.
+   The same ownership rule applies to bootstrap names, renewal metadata, stream-map entries, the 9444 vhost,
+   generated inbound/profile/host state and deploy-hook effects. Rollback MUST restore a valid NGINX
+   configuration before reload and MUST NOT delete unrelated resources. If ownership or restoration cannot
+   be proven, fail closed and report cleanup incomplete. The Master orchestrator MUST check and record both
+   remote Worker rollback and Panel API rollback results; it MUST NOT suppress a failed `remote_rollback` with
+   `|| true`. If either compensation fails, preserve the recovery journal, mark rollback incomplete and force
+   the E2E run to `INCOMPLETE`; only verified success of both sides is rollback PASS.
+5. Panel API acceptance MUST verify five inbounds and five corresponding hosts per node, including each
    Vision inbound/host association. The subscription MUST expose one Vision proxy per VPS, and Xray and
    Mihomo MUST each execute the two Vision endpoints as independent runtime cases.
-5. When both Vision domains are absent, the default four-inbound topology remains unchanged: no Vision
+6. When both Vision domains are absent, the default four-inbound topology remains unchanged: no Vision
    certificate issuance, no Vision SNI route/fallback, and no Vision subscription endpoint.
 
 **Rationale:** The current Master installer suppresses Vision certificate issuance/verification errors, while
@@ -463,6 +490,29 @@ the current Worker dispatch does not propagate the Vision domain into Worker API
 certificate issuance. Treating Vision as active after either partial path can create mismatched Master/Worker
 profiles, missing TLS material, or an advertised proxy that cannot accept traffic. Pair validation and
 fail-closed activation make the sixteen-versus-twenty test matrix deterministic.
+
+---
+
+### D15: ACME Lineage Snapshot Ownership and Recovery
+
+**Chosen:** Before any Certbot command may reuse, renew, replace, or delete a requested-domain lineage, the
+installer records whether that lineage existed before the transaction. For an existing lineage, it snapshots
+the complete recoverable state on the same VPS under
+`/var/lib/gowave-auto-nginx/recovery/<transaction-id>/acme/<domain>/`: the renewal configuration, live symlink
+targets, archive certificate and private-key bytes, ownership, and file modes. Snapshot directories MUST be
+owned by root with mode `0700`; regular snapshot files containing private keys MUST be root-owned mode `0600`.
+The snapshot MUST NOT be copied to the Control Machine, runner artifacts, CI artifacts, logs, or reports.
+
+On successful installation, the snapshot is removed only after the transaction is committed and all certificate
+consumers, renewal configuration, and NGINX health checks have passed. On failure, rollback restores the complete
+pre-transaction state and verifies the restored bytes, symlink targets, ownership, and modes; only lineages
+recorded as absent before the transaction may be removed as transaction-created. If restoration cannot be
+verified, the snapshot is retained for operator recovery and the transaction/teardown is reported incomplete.
+The same ownership and recovery protocol applies to Master and Worker and to Panel, REALITY, and optional Vision
+domains.
+
+**Rationale:** Certbot can reuse an existing same-directory lineage, and a later failure must not cause broad
+rollback code to delete a certificate and private key that pre-dated the current deployment transaction.
 
 ---
 
@@ -499,8 +549,8 @@ Phase 0: Preflight
   0.1  Config load + validate (whitelist parser, reserved IP rejection)
   0.2  Acquire the local per-target `fcntl.flock` in the private runtime directory
   0.3  Control Machine tool check (python3, ssh, openssl, curl, dig, xray, mihomo)
-  0.4  SSH trust check (both VPS, StrictHostKeyChecking=yes)
-  0.5  DNS verification (4 domains required: Panel, Reality for Master/Worker; plus both optional Vision domains when the pair is configured, A/AAAA, 2+ resolvers)
+  0.4  SSH trust check (both VPS, StrictHostKeyChecking=yes, exact pinned entries from the single SSH_KNOWN_HOSTS file); verify `id -u == 0` on both hosts using read-only commands and fail before lock acquisition/mutation for non-root identities
+  0.5  Reject identical MASTER_IP/WORKER_IP and duplicate mandatory Panel/REALITY FQDNs; when Vision is enabled require all six FQDNs pairwise unique. Verify DNS (4 mandatory domains plus optional Vision pair, A/AAAA, 2+ resolvers)
   0.6  Baseline snapshot (systemd, listeners, firewall, GoWave dirs)
   0.7  Disposable gate (reject if GoWave present or ports occupied)
   0.8  Port hygiene (11+ required ports checked as free: 80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, 10003; plus 8444 and 9444 when the Vision domain pair is enabled)
@@ -721,20 +771,20 @@ the following strict schema:
 
 | Variable Name | Type / Format | Mandatory | Default | Description |
 |---------------|---------------|-----------|---------|-------------|
-| `MASTER_IP` | IPv4 address | Yes | — | Public IPv4 of Master VPS (disallowed: RFC-1918, loopback, docs) |
+| `MASTER_IP` | IPv4 address | Yes | — | Public IPv4 of Master VPS (disallowed: RFC-1918, loopback, docs); MUST differ from `WORKER_IP` |
 | `MASTER_PANEL_DOMAIN` | FQDN | Yes | — | Domain pointing to Master Panel NGINX HTTPS |
 | `MASTER_REALITY_DOMAIN` | FQDN | Yes | — | Camouflage decoy domain pointing to Master REALITY SNI |
 | `MASTER_VISION_DOMAIN` | FQDN | Conditional pair | — | Master Vision domain; must be set together with `WORKER_VISION_DOMAIN` |
 | `MASTER_SSH_PORT` | Integer 1–65535 | No | `22` | Master SSH management port |
-| `MASTER_SSH_USER` | String | No | `root` | Master SSH login user |
-| `WORKER_IP` | IPv4 address | Yes | — | Public IPv4 of Worker VPS |
+| `MASTER_SSH_USER` | Literal `root` | No | `root` | Master SSH login identity; non-root is unsupported in E2E v1 |
+| `WORKER_IP` | IPv4 address | Yes | — | Public IPv4 of Worker VPS; MUST differ from `MASTER_IP` |
 | `WORKER_DOMAIN` | FQDN | Yes | — | Domain pointing to Worker NGINX HTTPS |
 | `WORKER_REALITY_DOMAIN` | FQDN | Yes | — | Camouflage decoy domain pointing to Worker REALITY SNI |
 | `WORKER_VISION_DOMAIN` | FQDN | Conditional pair | — | Worker Vision domain; must be set together with `MASTER_VISION_DOMAIN` |
 | `WORKER_SSH_PORT` | Integer 1–65535 | No | `22` | Worker SSH management port |
-| `WORKER_SSH_USER` | String | No | `root` | Worker SSH login user |
+| `WORKER_SSH_USER` | Literal `root` | No | `root` | Worker SSH login identity; non-root is unsupported in E2E v1 |
 | `SSH_KEY_PATH` | File path | Yes | — | Path to private SSH key for authentication |
-| `SSH_KNOWN_HOSTS` | File path | Yes | — | Pre-pinned `known_hosts` file with both VPS host keys |
+| `SSH_KNOWN_HOSTS` | File path | Yes | — | One pre-pinned `known_hosts` file containing both VPS host keys; each connection selects its exact host/port entry |
 | `ACME_MODE` | `staging` \| `production` | No | `staging` | Let's Encrypt endpoint mode |
 | `GOWAVE_PANEL_VERSION` | SemVer / commit | Yes | — | Target GoWave Panel version to pin and verify |
 | `GOWAVE_NODE_VERSION` | SemVer / commit | Yes | — | Target GoWave Node version to pin and verify |
@@ -851,6 +901,7 @@ existing codebase unchanged. The ACME staging delta is a backward-compatible def
   in `assets/xray/` do not configure the Xray Stats gRPC API (`"stats": {}`, `"StatsService"`). Upstream binaries
   are treated as immutable per AGENTS.md. Therefore, server-side traffic evidence uses iptables/nftables packet
   counters and temporary SSH packet capture on the target port.
-- **Worker `isConnected` polling behavior:** What is the typical observed time between SSH deployment
-  completion and Panel marking `isConnected: true` in the pinned GoWave version? Default `NODE_READY_TIMEOUT`
-  is set to 120s with 5s fixed-interval polling, which is sufficient based on mock integration benchmarks.
+- **Worker `isConnected` polling behavior:** The 120s `NODE_READY_TIMEOUT` with 5s polling interval is a provisional
+  initial bound, not a measured real-VPS guarantee. Mock integration benchmarks do not establish the latency
+  distribution of the pinned Panel/Node pair; staging acceptance MUST record observed registration latency and
+  adjust the default or document the evidence before production acceptance.
