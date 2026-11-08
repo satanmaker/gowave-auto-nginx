@@ -35,7 +35,7 @@ jobs:
 
       - name: ShellCheck validation
         run: |
-          shellcheck gowave-auto.sh gowave-node-auto.sh assets/backup/gowave-backup.sh modules/*.sh tests/*.sh
+          shellcheck --severity=error gowave-auto.sh gowave-node-auto.sh assets/backup/gowave-backup.sh modules/*.sh tests/*.sh
 
       - name: OpenSpec validation
         run: |

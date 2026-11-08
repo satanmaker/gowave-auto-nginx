@@ -69,6 +69,13 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"response": {"keypairs": [{"privateKey": "priv-key-base64", "publicKey": "pub-key-base64"}]}})
         elif self.path == "/api/config-profiles":
             self.send_json(200, {"response": {"configProfiles": [{"uuid": k, **v} for k, v in self.profiles.items()]}})
+        elif self.path.startswith("/api/config-profiles/") and self.path.count("/") == 3:
+            uuid = self.path.split("/")[3]
+            profile = self.profiles.get(uuid)
+            if profile is None:
+                self.send_json(404, {"error": "Not found"})
+            else:
+                self.send_json(200, {"response": {"uuid": uuid, **profile}})
         elif self.path.startswith("/api/config-profiles/") and self.path.endswith("/computed-config"):
             uuid = self.path.split("/")[3]
             cfg_str = self.profiles.get(uuid, {}).get("config", "{}")
