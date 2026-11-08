@@ -58,6 +58,12 @@ staging and production reuse.
 - **WHEN** installation is repeated with the same ACME directory URL
 - **THEN** Certbot may reuse the lineage without unnecessary issuance, after validating its renewal configuration and certificate SAN/expiry
 
+#### Scenario: Failed transaction preserves pre-existing certificate lineages
+
+- **GIVEN** a requested-domain certificate lineage existed before installation and is valid for the selected ACME directory
+- **WHEN** a later Master or Worker provisioning step fails and compensation runs
+- **THEN** rollback MUST NOT delete the pre-existing lineage; if Certbot changed its certificate, private key, or renewal configuration, the exact pre-install files are restored from a securely permissioned transaction snapshot. Only lineages proven to have been created by the failed transaction may be deleted. If safe restoration cannot be guaranteed, the install MUST fail before issuance or report cleanup incomplete rather than claim rollback success.
+
 #### Scenario: ACME directory changes between staging and production
 
 - **GIVEN** the domain has a certificate lineage issued by the other ACME directory
