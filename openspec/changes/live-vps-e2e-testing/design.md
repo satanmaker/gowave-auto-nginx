@@ -90,19 +90,26 @@ that expand the attack surface. Shell `source` — rejected per AGENTS.md zero-l
    and `mTLS 1.3 control plane verification PASSED`; it treats both `200 OK` and `401 Unauthorized` as
    successful TLS/SNI handshake evidence.
 2. **Certificate/key consistency negative case** is local: pair a valid client certificate with a different
-   private key and assert that the client TLS library refuses to load the chain. This is not a remote
-   Worker-handshake test and MUST be reported separately.
+   private key and call the existing verifier's `validate_payload_crypto()` path. It compares the certificate
+   public key with the private key's derived public key through OpenSSL before any socket is opened; the
+   mismatch MUST fail this local validation. The test MUST assert that no TCP connection was attempted. This
+   is not a remote Worker-handshake test and MUST be reported separately.
 3. **Server-side client-auth negative cases** use a TCP/TLS client from Master: an untrusted client certificate
    and an absent client certificate must be rejected by Worker during handshake. Wrong-SNI behavior is tested
    independently against the documented SNI router and must assert the observed route/handshake outcome rather
    than assume every wrong SNI produces a TLS alert.
-4. **Server-certificate trust negative case** runs from a client that does not trust the GoWave CA and asserts
-   that client-side certificate verification fails. It MUST NOT be described as Worker rejecting the client.
+4. **Server-certificate trust negative case** uses a dedicated TLS probe with the valid HKDF-derived SNI and
+   valid client certificate/key unchanged, but replaces only the client's server-trust store with one that
+   does not contain the GoWave CA. The test MUST assert a server-certificate trust failure and MUST prove that
+   SNI routing and client identity were held constant. Do not derive a new SNI from the deliberately untrusted
+   trust bundle. This is client-side certificate verification failure, not Worker rejecting the client.
 
 **Rationale:** The current verifier performs local cryptographic validation before opening a socket and only
-then performs TLS 1.3 mTLS. A mismatched key fails locally before a network handshake. A wrong server CA is
-validated by the client, not by the Worker. Treating these as server-side handshake rejection would produce
-false security evidence.
+then performs TLS 1.3 mTLS. A mismatched key is rejected by `validate_payload_crypto()` through an OpenSSL
+public-key comparison before the socket function is called; it is not a TLS-library handshake failure. A wrong
+server CA is validated by the client, not by the Worker. To isolate that negative case, preserve the valid
+SNI and valid client certificate/key and change only the client's server trust anchors. Treating these as
+server-side handshake rejection would produce false security evidence.
 
 **Output contract:** The runner derives `MTLS_CRYPTO_VALIDATION_PASS` from successful verifier completion
 before socket creation only when that stage is independently exposed; otherwise it records the verifier as a
@@ -253,18 +260,23 @@ Control Machine's system-wide trust store, a browser trust store, or any non-E2E
    page no longer lists them as active. A changed source URL or root set requires an explicit design/manifest
    review, never an automatic fallback.
 
-5. `tools/live_vps/tls.py` MUST verify the vendored roots against `pins.json`, then construct one private
-   per-run bundle containing the Control Machine's complete default public CA bundle and the four verified
-   Staging roots. If the default public bundle cannot be resolved and read in full, preflight fails; a
-   Staging-only bundle is forbidden. Record the source public bundle path and SHA-256, the Staging pin
-   manifest SHA-256, and the selected certificate subjects in the redacted result metadata.
+5. `tools/live_vps/tls.py` MUST always resolve the Control Machine's complete default public CA bundle and
+   fail preflight if it cannot be read in full. Bundle composition is conditional on `ACME_MODE`:
+   - `staging`: verify exactly the four vendored roots against `pins.json` and append those roots to the
+     complete public bundle to create the private per-run combined bundle. A staging-only bundle is forbidden.
+   - `production`: use the complete public CA bundle without adding any Staging roots. Staging roots MUST NOT
+     become trust anchors in production-mode runs, even in the private per-run bundle.
+   Record the source public bundle path and SHA-256; for staging also record the Staging pin-manifest SHA-256
+   and selected certificate subjects in redacted result metadata.
 
-6. Python Panel API calls use `ssl.create_default_context(cafile=<combined-bundle>)`. Every curl request
+6. Python Panel API calls use `ssl.create_default_context(cafile=<mode-specific-bundle>)`. Every curl request
    that performs TLS verification, including the HTTPS public egress probe, passes
-   `--cacert <combined-bundle>`. Xray and Mihomo child processes receive
-   `SSL_CERT_FILE=<combined-bundle>` only in their process environment. The exact pinned binaries MUST
-   pass a staging endpoint, an ordinary public-CA endpoint, and an untrusted-CA rejection test before use.
-   `allowInsecure`, `skip-cert-verify`, and equivalent verification bypasses are prohibited.
+   `--cacert <mode-specific-bundle>`. Xray and Mihomo child processes receive
+   `SSL_CERT_FILE=<mode-specific-bundle>` only in their process environment. In staging mode, the exact pinned
+   binaries MUST pass a staging endpoint, an ordinary public-CA endpoint, and an untrusted-CA rejection test;
+   in production mode they MUST pass an ordinary public-CA endpoint and reject an untrusted test CA, without
+   trusting a Staging-only root. `allowInsecure`, `skip-cert-verify`, and equivalent verification bypasses
+   are prohibited.
 
 7. The combined bundle is mode `0600`, private to the current run, contains public certificates only, and is
    removed during local cleanup. It MUST NOT be installed in a host-wide trust directory or reused by
@@ -286,7 +298,8 @@ string-print limit as `STRACE_STRING_LIMIT = 32 * os.sysconf("SC_PAGE_SIZE")`. L
 at that bound is sufficient to print every legal individual string. Do not use `-s 0`: strace interprets
 zero as a zero-character limit, not unlimited output.
 
-Run the exact `gowave-auto.sh node add` process tree with both string and array abbreviation disabled:
+Run the exact `gowave-auto.sh node add` process tree on the Master VPS with both string and array abbreviation
+ disabled:
 `strace -f -v -s "$STRACE_STRING_LIMIT" -e trace=execve,execveat -o "$RAW_TRACE" -- ...`.
 The `-v` / `--no-abbrev` option is mandatory: it is equivalent to `-e abbrev=none` and prevents
 strace's default structure/array abbreviation from replacing later `argv` elements with an omission marker.
@@ -299,10 +312,12 @@ strace does not support either option, or the complete output cannot be parsed, 
 use a weaker observer as fallback.
 
 Because `-v` also expands the `envp` vector, the raw trace MUST be treated as containing arbitrary
-environment secrets as well as argv values. Store it only in a mode-`0600` file inside a private `/run`
-tmpfs directory (mode `0700`), never stream it to the Control Machine, console, logs, or artifacts. Parse the
-`argv` and `envp` fields separately; inspect `argv` for the exact `SECRET_KEY` and known encoded forms,
-and discard `envp` without publishing or logging it. If the parser cannot unambiguously separate both
+environment secrets as well as argv values. The `strace` process, parser, and raw file MUST all execute/remain
+on the Master VPS: store the trace only in a mode-`0600` file inside a private `/run` tmpfs directory (mode
+`0700`), never stream or copy it to the Control Machine, console, logs, or artifacts. Parse the `argv` and
+`envp` fields on Master separately; inspect `argv` for the exact `SECRET_KEY` and known encoded forms, and
+discard `envp` without publishing or logging it. Return to the Control Machine only a sanitized structured
+verdict (status, observer version/options, effective string limit, coverage metadata and timestamps). If the parser cannot unambiguously separate both
 vectors or establish that every `argv` element was decoded, record `INCOMPLETE`. Unlink the raw trace and
 remove the private directory in a guaranteed cleanup path; do not claim secure overwrite on SSD or
 journaled storage. The observer must exit successfully, follow all descendants, and contain no truncated,
@@ -445,10 +460,14 @@ Phase 0: Preflight
   0.8  Port hygiene (11+ required ports checked as free)
   0.9  Acquire and hold authoritative `flock` sessions on both VPS hosts in deterministic address order;
        preflight-only runs release them on exit; all mutating phases require both locks
+  0.10 Re-collect the read-only baseline/disposable gate on both hosts while both locks are held; if any
+       invariant differs from the snapshot taken in 0.6, fail before remote modification
 
 Phase 1: Master Installation
-  1.1  Copy pinned repo commit to Master /opt/gowave-auto-nginx
-  1.2  Run gowave-auto.sh install with `GOWAVE_ACME_SERVER` derived from `ACME_MODE`; set
+  1.1  After acquiring both remote locks (including in partial `install` mode), re-collect and compare the
+       stored preflight baseline before the first remote mutation; stale or changed baseline → fail closed
+  1.2  Copy pinned repo commit to Master /opt/gowave-auto-nginx
+  1.3  Run gowave-auto.sh install with `GOWAVE_ACME_SERVER` derived from `ACME_MODE`; set
        `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1` and provide the pinned Node installer commit + SHA256
   1.3  Verify service states, listeners, TLS certs
   1.4  Verify credentials file (mode, owner, keys present — values not logged)

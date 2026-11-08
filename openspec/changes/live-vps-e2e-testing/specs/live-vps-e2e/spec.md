@@ -230,14 +230,14 @@ authenticated Panel connectivity using existing verifier markers.
 #### Scenario: Mismatched client certificate and private key is classified as local failure
 
 - **GIVEN** the runner pairs a valid client certificate with a different private key
-- **WHEN** the client TLS library loads the identity
-- **THEN** local certificate/key loading fails; this is recorded as a client-side validation test, not a remote Worker handshake rejection
+- **WHEN** the existing `validate_payload_crypto()` validation path compares the certificate public key with the private key's derived public key through OpenSSL
+- **THEN** local cryptographic validation fails before any socket is opened; the runner records a client-side validation failure, not a remote Worker handshake rejection
 
 #### Scenario: Untrusted Worker CA is classified as client-side server verification failure
 
-- **GIVEN** the runner uses a trust store that does not contain the GoWave CA
-- **WHEN** Master connects to Worker:3002 with otherwise valid client credentials
-- **THEN** Master rejects the Worker certificate during server-certificate validation; this is not reported as Worker rejecting the client
+- **GIVEN** the runner has already derived the valid HKDF SNI and has a valid client certificate/key
+- **WHEN** Master connects with that same SNI and client identity but replaces only its server-trust store with one that does not contain the GoWave CA
+- **THEN** Master rejects the Worker certificate during server-certificate validation; the test isolates trust failure without changing SNI or client identity and is not reported as Worker rejecting the client
 
 #### Scenario: Wrong SNI routing is measured without assuming a TLS alert
 
@@ -453,6 +453,13 @@ ingress evidence; syntax-only checks do not count as traffic verification.
   remote modification
 
 
+#### Scenario: Production mode does not add Staging roots to trust
+
+- **GIVEN** `ACME_MODE=production`
+- **WHEN** the runner constructs the mode-specific TLS bundle
+- **THEN** the bundle contains the complete public CA roots and no Let's Encrypt Staging roots; a Staging-only
+  chain remains untrusted, and ordinary public-CA endpoints continue to validate
+
 #### Scenario: Ingress evidence is ambiguous
 
 - **GIVEN** unrelated background traffic changes the same listener counters during the test window
@@ -480,7 +487,7 @@ execute guaranteed cleanup and post-case baseline verification.
 
 #### Scenario: Matrix of fifteen fault scenarios verified (NEG-01..NEG-15)
 
-- **GIVEN** a confirmed disposable VPS testbed
+- **GIVEN** a valid E2E config with isolated local preflight fixtures and a confirmed disposable VPS testbed for the live fault-injection cases
 - **WHEN** the runner executes the negative test suite
 - **THEN** all 15 scenarios terminate at their designated boundaries per the following matrix:
 
@@ -516,22 +523,35 @@ execute guaranteed cleanup and post-case baseline verification.
 - **THEN** journal state is NOT `COMMITTED`; it is in a failure or recovery-required state requiring operator
   action before the Worker is considered registered
 
-#### Scenario: Negative preflight and credential scenarios verified (NEG-01..NEG-10)
+#### Scenario: Preflight, lifecycle, and protocol scenarios verified (NEG-01..NEG-10)
 
-- **GIVEN** disposable VPS confirmed and negative test suite enabled
+- **GIVEN** isolated fixtures for NEG-01..NEG-04, an isolated ACME failure setup for NEG-05, and a confirmed disposable VPS for the live scenarios
 - **WHEN** runner executes NEG-01 through NEG-10 per the normative matrix
 - **THEN** each scenario terminates or fails at the expected boundary; NEG-07 and NEG-08 bound Panel
   detection of Worker unavailability and reconnection within configured timeouts; NEG-10 rejects forged
   client certificate at TLS handshake before HTTP handler executes
 
-#### Scenario: Backup and restore negative scenarios verified (NEG-11, NEG-12, NEG-15)
+#### Scenario: Backup and restore negative scenarios verified (NEG-11, NEG-12)
 
 - **GIVEN** disposable VPS confirmed and negative test suite enabled
-- **WHEN** runner executes NEG-11 (corrupted archive), NEG-12 (corrupted SQLite DB in archive), and NEG-15 (invalid JWT)
+- **WHEN** runner executes NEG-11 (corrupted archive) and NEG-12 (corrupted SQLite DB in archive)
 - **THEN** NEG-11: restore rejects before modifying live data; NEG-12: restore fails before stopping or
-  replacing the live DB; NEG-15: authorized operations are rejected with 401
+  replacing the live DB
+
+#### Scenario: Forged or expired Panel JWT is rejected (NEG-15)
+
+- **GIVEN** the runner has an otherwise valid authenticated Panel API session
+- **WHEN** it sends a protected Panel API request with a forged or expired JWT
+- **THEN** the Panel returns HTTP 401 and the request is recorded as an authentication-negative PASS
 
 ---
+
+#### Scenario: Negative suite PASS requires all fifteen scenarios to pass
+
+- **GIVEN** `TEST_NEGATIVE_SUITE=true`
+- **WHEN** the negative phase completes with any scenario `FAIL`, `SKIP`, `NOT_RUN`, `PARTIAL`, or `INCOMPLETE`
+- **THEN** `negative_tests` is not `PASS` and overall status cannot be `PASS`; it is `FAIL` for a failed
+  assertion and `INCOMPLETE` when required evidence or execution is missing
 
 #### Scenario: Negative suite cannot be silently skipped for a passing run
 
@@ -629,9 +649,10 @@ or persist credentials, tokens, or secret keys.
 - **WHEN** `install`, `verify`, `traffic`, `negative`, or `teardown` is invoked with the printed run ID
 - **THEN** the runner verifies the matching state and prerequisite phase statuses before remote modification;
   completed phases are not repeated implicitly; missing state, mismatched identity or unmet prerequisites fail
-  closed. `install` requires preflight PASS, `verify` requires install PASS, `traffic` requires verification
-  PASS, `negative` requires an installed disposable environment, and `teardown` requires the original baseline
-  and diagnostic state.
+  closed. `install` requires preflight PASS, reacquires both remote locks, and re-collects the disposable
+  baseline while holding those locks; any drift from the stored preflight snapshot fails before modification.
+  `verify` requires install PASS, `traffic` requires verification PASS, `negative` requires an installed
+  disposable environment, and `teardown` requires the original baseline and diagnostic state.
 
 ---
 
