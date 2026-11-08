@@ -109,6 +109,11 @@ The system SHALL link Config Profiles and active inbounds to GoWave nodes using 
 - **WHEN** the installer queries `GET /api/config-profiles/{uuid}/computed-config`
 - **THEN** GoWave responds with HTTP 200, `response.config` is valid parseable JSON containing exactly 4 inbounds with populated `streamSettings.security` fields, REALITY settings with valid keys on port 8443, and zero top-level error fields.
 
+#### Scenario: Internal squad inbound union update via PATCH /api/internal-squads
+- **GIVEN** an existing Internal Squad (`Default MVP Squad`)
+- **WHEN** additional worker inbounds are associated during worker node onboarding
+- **THEN** the orchestrator dispatches `PATCH /api/internal-squads` with `uuid`, `name`, and the full union array of master and worker inbound UUIDs in the request body (calling `UpdateInternalSquadCommand`), avoiding 405 Method Not Allowed errors on `/api/internal-squads/{uuid}`, and GoWave updates the squad membership.
+
 ### Requirement: Native Xray Core Supervision
 The `gowave-node` daemon SHALL directly supervise the Xray core child process without external systemd watchdog timers or parallel process managers.
 
@@ -129,3 +134,8 @@ The verification harness SHALL provide an automated dual-container Podman testbe
 - **GIVEN** a running multi-node Podman testbed
 - **WHEN** client VPN connections are initiated to the worker container port 443
 - **THEN** client traffic is routed directly by the worker's NGINX Stream and Xray inbounds without passing through the panel container, while the worker's UFW denies external access to `NODE_PORT=3002` from IPs other than the panel.
+
+#### Scenario: Multi-node discovery and node address uniqueness
+- **GIVEN** a panel managing `local-node` on address `127.0.0.1`
+- **WHEN** an operator provisions an additional worker node
+- **THEN** GoWave enforces address uniqueness (`UNIQUE(address)`), requiring distinct network addressing for the worker, and subsequent queries to `GET /api/nodes` return both `local-node` and the worker node with their respective profiles and inbounds.
