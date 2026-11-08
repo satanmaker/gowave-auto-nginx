@@ -28,6 +28,37 @@ ensure_gowave_user() {
     fi
 }
 
+save_credentials() {
+    local username="$1"
+    local password="$2"
+    local panel_url="$3"
+    local token="${4:-}"
+    local creds_file="${5:-${CREDENTIALS_FILE:-/root/gowave-credentials.txt}}"
+
+    local creds_dir
+    creds_dir="$(dirname "$creds_file")"
+    mkdir -p "$creds_dir"
+    local tmp_file="${creds_file}.tmp"
+
+    (
+        umask 077
+        cat > "$tmp_file" <<EOF
+# GoWave Auto NGINX Administrative Credentials
+# Generated at $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+PANEL_URL=$panel_url
+ADMIN_USERNAME=$username
+ADMIN_PASSWORD=$password
+EOF
+        if [[ -n "$token" ]]; then
+            echo "SCOPED_API_TOKEN=$token" >> "$tmp_file"
+        fi
+    )
+    chmod 0600 "$tmp_file"
+    sync "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$creds_file"
+    sync "$creds_dir" 2>/dev/null || true
+}
+
 download_panel_release() {
     local target_dir="${1:-$GOWAVE_INSTALL_DIR}"
     local version="${2:-$GOWAVE_DEFAULT_VERSION}"

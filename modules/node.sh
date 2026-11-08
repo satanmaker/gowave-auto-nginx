@@ -50,13 +50,13 @@ EOF
 
 deploy_node_systemd_dropins() {
     local node_port="${1:-$DEFAULT_NODE_PORT}"
-    local dropin_dir="/etc/systemd/system/gowave-node.service.d"
+    local dropin_dir="${2:-/etc/systemd/system/gowave-node.service.d}"
 
     mkdir -p "$dropin_dir"
     cat > "$dropin_dir/10-port.conf" <<EOF
 [Service]
 Environment="NODE_PORT=$node_port"
-ExecStartPost=/usr/bin/env bash -c 'for i in {1..20}; do if curl -k -s -o /dev/null https://127.0.0.1:$node_port/ 2>/dev/null; then exit 0; fi; sleep 0.5; done; exit 1'
+ExecStartPost=/usr/bin/env bash -c 'for i in {1..30}; do if ss -Hltn "sport = :$node_port" 2>/dev/null | grep -q "$node_port" || (: < /dev/tcp/127.0.0.1/$node_port) 2>/dev/null; then exit 0; fi; sleep 0.5; done; exit 1'
 EOF
 
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then

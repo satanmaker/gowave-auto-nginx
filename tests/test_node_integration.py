@@ -65,6 +65,19 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertNotEqual(res_bad.returncode, 0)
         self.assertIn("Missing jwtPublicKey", res_bad.stderr)
 
+    def test_deploy_node_systemd_dropins(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            cmd = f'source "{NODE_SH}" && deploy_node_systemd_dropins 3002 "{tmp}"'
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0)
+            conf_file = tmp / "10-port.conf"
+            self.assertTrue(conf_file.exists())
+            content = conf_file.read_text()
+            self.assertIn('Environment="NODE_PORT=3002"', content)
+            self.assertIn("sport = :3002", content)
+            self.assertNotIn("curl -k", content)
+
 
 if __name__ == "__main__":
     unittest.main()

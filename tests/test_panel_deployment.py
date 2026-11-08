@@ -162,6 +162,22 @@ class TestPanelDeployment(unittest.TestCase):
             self.assertIn(f"listening on http://127.0.0.1:{port}", res.stdout)
         finally:
             server.shutdown()
+            server.server_close()
+
+    def test_save_credentials_bash(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            creds_file = Path(tmpdir) / "gowave-credentials.txt"
+            cmd = f'source "{PANEL_SH}" && save_credentials admin mysecretpass123 https://panel.example.com tok-abc "{creds_file}"'
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0)
+            self.assertTrue(creds_file.exists())
+            mode = oct(creds_file.stat().st_mode & 0o777)
+            self.assertEqual(mode, "0o600")
+            content = creds_file.read_text()
+            self.assertIn("PANEL_URL=https://panel.example.com", content)
+            self.assertIn("ADMIN_USERNAME=admin", content)
+            self.assertIn("ADMIN_PASSWORD=mysecretpass123", content)
+            self.assertIn("SCOPED_API_TOKEN=tok-abc", content)
 
 
 if __name__ == "__main__":
