@@ -573,7 +573,9 @@ write_journal_atomically('$JOURNAL_FILE', jdata)
             secret_key=$(extract_secret_key "$GOWAVE_DIR")
             if ! PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
                 SSH_KNOWN_HOSTS="$known_hosts" "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
-                echo "Remote Worker deployment failed; rolling back Panel API entities." >&2
+                echo "Remote Worker deployment failed; rolling back Worker host configuration and Panel API entities." >&2
+                PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
+                    "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user" || true
                 if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
 from modules.api_client import rollback_provisioning
 import sys
@@ -611,8 +613,28 @@ for n in data.get('nodes', []):
                 echo "No state file found."
             fi
             ;;
+        rollback|remove)
+            acquire_lock
+            local ip="${1:-}"
+            local worker_domain="${2:-}"
+            local reality_domain="${3:-}"
+            local ssh_user="${4:-root}"
+            local ssh_port="${5:-22}"
+
+            if [[ -z "$ip" || -z "$worker_domain" || -z "$reality_domain" ]]; then
+                echo "Usage: gowave-auto.sh node rollback <worker-ip> <worker-domain> <reality-domain> [ssh-user] [ssh-port]" >&2
+                return 1
+            fi
+            local known_hosts="${SSH_KNOWN_HOSTS:-/root/.ssh/known_hosts}"
+            local panel_ip panel_ipv6
+            panel_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org || true)
+            panel_ipv6=$(curl -s6 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s6 --connect-timeout 5 --max-time 10 https://api64.ipify.org || true)
+            local node_port=3002
+            PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
+                "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"
+            ;;
         *)
-            echo "Usage: gowave-auto.sh node {add|list}"
+            echo "Usage: gowave-auto.sh node {add|list|rollback}"
             ;;
     esac
 }

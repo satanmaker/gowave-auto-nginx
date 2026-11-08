@@ -1,4 +1,4 @@
-name: Systemd Contract Checks and Services
+name: Systemd Contract Checks, Services, and QEMU Matrix
 
 on:
   push:
@@ -20,10 +20,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -31,18 +31,51 @@ jobs:
         run: |
           python3 tests/run_ci.py --suite services
 
-  systemd-qemu-acceptance:
-    name: Systemd Contract Suite (no VM boot)
+  systemd-contracts:
+    name: Systemd Static Unit Contracts
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - name: Run systemd contract tests (not a cold-boot acceptance test)
+      - name: Run systemd static unit contract tests
         run: |
           sudo python3 tests/run_ci.py --suite systemd
+
+  qemu-cold-boot:
+    name: QEMU Cold Boot (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Ubuntu 24.04"
+            distro: "docker.io/library/ubuntu:24.04"
+          - name: "Ubuntu 26.04"
+            distro: "docker.io/library/ubuntu:26.04"
+          - name: "Debian 12"
+            distro: "docker.io/library/debian:12"
+          - name: "Debian 13"
+            distro: "docker.io/library/debian:13"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install QEMU and initramfs dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 cpio gzip
+
+      - name: Execute genuine QEMU Cold Boot acceptance
+        run: |
+          sudo REPO_DIR="${{ github.workspace }}" tests/systemd/boot.sh "${{ matrix.distro }}"

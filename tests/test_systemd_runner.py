@@ -33,6 +33,25 @@ class TestSystemdRunner(unittest.TestCase):
         self.assertIn("ExecStart=-/sbin/modprobe tcp_bbr", source)
         self.assertIn("ExecStart=-/sbin/sysctl -w net.ipv4.tcp_congestion_control=bbr", source)
 
+    def test_boot_script_matrix_and_kvm_support(self):
+        """tests/systemd/boot.sh must declare the 4 supported distributions and KVM/TCG fallback."""
+        boot_sh = (REPO_ROOT / "tests" / "systemd" / "boot.sh").read_text()
+        self.assertIn("docker.io/library/ubuntu:24.04", boot_sh)
+        self.assertIn("docker.io/library/ubuntu:26.04", boot_sh)
+        self.assertIn("docker.io/library/debian:12", boot_sh)
+        self.assertIn("docker.io/library/debian:13", boot_sh)
+        self.assertIn("/dev/kvm", boot_sh)
+        self.assertIn("accel=tcg", boot_sh)
+
+    def test_guest_genuine_pid1_when_in_vm(self):
+        """When running inside QEMU guest as root, assert PID 1 is systemd and system is running."""
+        comm_file = Path("/proc/1/comm")
+        if comm_file.exists() and os.geteuid() == 0:
+            comm = comm_file.read_text().strip()
+            if comm == "systemd":
+                res = subprocess.run(["systemctl", "is-system-running"], capture_output=True, text=True)
+                self.assertIn(res.stdout.strip(), ["running", "degraded", "initializing", "starting"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -103,6 +103,9 @@ setup_system_prereqs() {
 configure_host_security() {
     # Keep MTU/file-limit tuning independent from optional BBR support.
     mkdir -p /etc/sysctl.d
+    if [[ ! -e /etc/sysctl.d/99-gowave-node.conf ]]; then
+        _SYSCTL_CREATED_BY_US=1
+    fi
     modprobe tcp_bbr 2>/dev/null || true
     {
         echo "# Managed by GoWave Auto NGINX"
@@ -124,6 +127,7 @@ configure_host_security() {
         if [[ -e /swapfile ]]; then
             log_warn "/swapfile already exists; refusing to overwrite an unmanaged file."
         else
+            _SWAP_CREATED_BY_US=1
             fs_type=$(findmnt -n -o FSTYPE /)
             if [[ "$fs_type" == "btrfs" ]]; then
                 if ! command -v btrfs >/dev/null 2>&1 || ! btrfs filesystem mkswapfile --size 1G /swapfile; then
@@ -182,6 +186,13 @@ PY
         return 1
     fi
 
+    if ufw status 2>/dev/null | grep -q '^Status: active'; then
+        _UFW_WAS_ACTIVE=1
+    else
+        _UFW_WAS_ACTIVE=0
+    fi
+    _UFW_RULES_CONFIGURED=1
+
     ufw default deny incoming
     ufw default allow outgoing
     ufw allow "$ssh_port/tcp" comment "SSH administration"
@@ -211,6 +222,7 @@ unpack_cover_reality() {
     fi
     echo -n "$COVER_REALITY_B64" | base64 -d | tar -xzf - -C /var/www/gowave-auto-nginx/cover-reality
     chmod -R 0755 /var/www/gowave-auto-nginx/cover-reality
+    _COVER_UNPACKED=1
 }
 
 configure_edge_nginx() {
@@ -230,6 +242,7 @@ server {
     }
 }
 EOF
+    _NGINX_BOOTSTRAP_CREATED=1
     nginx -t
     systemctl reload nginx || systemctl restart nginx
     systemctl is-active --quiet nginx || { echo "Fatal: NGINX failed to activate bootstrap ACME config" >&2; return 1; }
@@ -238,13 +251,16 @@ EOF
     certbot certonly --webroot -w /var/www/gowave-acme \
         -d "$WORKER_DOMAIN" --cert-name "$WORKER_DOMAIN" \
         --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring
+    _ACME_WORKER_ISSUED=1
 
     echo "Acquiring Let's Encrypt TLS certificate for REALITY decoy ($REALITY_DOMAIN)..."
     certbot certonly --webroot -w /var/www/gowave-acme \
         -d "$REALITY_DOMAIN" --cert-name "$REALITY_DOMAIN" \
         --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring
+    _ACME_REALITY_ISSUED=1
 
     rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf
+    _NGINX_BOOTSTRAP_CREATED=0
 
     verify_worker_certificate() {
         local domain="$1" cert="/etc/letsencrypt/live/$1/fullchain.pem" key="/etc/letsencrypt/live/$1/privkey.pem"
@@ -274,6 +290,7 @@ EOF
 
     # Hook top-level stream if missing
     if ! grep -q 'stream-enabled' /etc/nginx/nginx.conf; then
+        _STREAM_INCLUDE_ADDED=1
         sed -i '/events {/i stream { include /etc/nginx/stream-enabled/*.conf; }' /etc/nginx/nginx.conf || \
         echo "stream { include /etc/nginx/stream-enabled/*.conf; }" >> /etc/nginx/nginx.conf
     fi
@@ -388,6 +405,7 @@ EOF
     nginx -t
     systemctl reload nginx || systemctl restart nginx
     systemctl is-active --quiet nginx || { echo "Fatal: NGINX failed to activate production configuration" >&2; return 1; }
+    _NGINX_CONFIGS_CREATED=1
 }
 
 run_upstream_node_installer() {
@@ -425,6 +443,114 @@ EOF
         echo "Fatal: gowave-node.service is not active after upstream installation." >&2
         return 1
     }
+    _NODE_SERVICE_CONFIGURED=1
+}
+
+compensate_remote_worker() {
+    local exit_code="${1:-1}"
+    if [[ "${_ROLLBACK_IN_PROGRESS:-0}" -eq 1 ]]; then
+        return "$exit_code"
+    fi
+    _ROLLBACK_IN_PROGRESS=1
+    echo "[ROLLBACK] Remote worker deployment failed (exit code: $exit_code). Initiating automated compensating rollback..." >&2
+
+    # 1. Stop and remove GoWave Node and Xray systemd services
+    if [[ "${_NODE_SERVICE_CONFIGURED:-0}" -eq 1 ]] || systemctl list-unit-files gowave-node.service 2>/dev/null | grep -q gowave-node; then
+        echo "[ROLLBACK] Stopping and disabling gowave-node.service and drop-ins..." >&2
+        systemctl stop gowave-node.service 2>/dev/null || true
+        systemctl disable gowave-node.service 2>/dev/null || true
+        systemctl stop xray.service 2>/dev/null || true
+        systemctl disable xray.service 2>/dev/null || true
+        rm -rf /etc/systemd/system/gowave-node.service.d
+        rm -f /etc/systemd/system/gowave-node.service
+        rm -f /etc/systemd/system/remnanode.service
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl reset-failed 2>/dev/null || true
+        rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode
+        rm -f /usr/local/bin/gowave-node /usr/local/bin/xray
+    fi
+
+    # 2. Revert NGINX and ACME bootstrap
+    if [[ "${_NGINX_CONFIGS_CREATED:-0}" -eq 1 ]] || [[ "${_NGINX_BOOTSTRAP_CREATED:-0}" -eq 1 ]]; then
+        echo "[ROLLBACK] Cleaning up worker NGINX virtual hosts and stream routing..." >&2
+        rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf
+        rm -f /etc/nginx/conf.d/gowave-worker-https.conf
+        rm -f /etc/nginx/conf.d/gowave-worker-decoy.conf
+        rm -f /etc/nginx/stream-enabled/gowave-worker-stream.conf
+        rm -f /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh
+        rm -rf /var/www/gowave-acme
+        if [[ "${_STREAM_INCLUDE_ADDED:-0}" -eq 1 ]]; then
+            sed -i '\#stream { include /etc/nginx/stream-enabled/\*\.conf; }#d' /etc/nginx/nginx.conf 2>/dev/null || true
+        fi
+        if nginx -t >/dev/null 2>&1; then
+            systemctl reload nginx 2>/dev/null || true
+        fi
+    fi
+
+    # 3. Clean Cover Reality decoy site
+    if [[ "${_COVER_UNPACKED:-0}" -eq 1 ]]; then
+        echo "[ROLLBACK] Removing cover decoy site assets..." >&2
+        rm -rf /var/www/gowave-auto-nginx/cover-reality
+        rmdir /var/www/gowave-auto-nginx 2>/dev/null || true
+    fi
+
+    # 4. Revert ACME certificates
+    if [[ "${_ACME_WORKER_ISSUED:-0}" -eq 1 ]] && [[ -n "${WORKER_DOMAIN:-}" ]]; then
+        echo "[ROLLBACK] Deleting ACME certificate for $WORKER_DOMAIN..." >&2
+        certbot delete --cert-name "$WORKER_DOMAIN" --non-interactive 2>/dev/null || true
+        rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || true
+    fi
+    if [[ "${_ACME_REALITY_ISSUED:-0}" -eq 1 ]] && [[ -n "${REALITY_DOMAIN:-}" ]]; then
+        echo "[ROLLBACK] Deleting ACME certificate for $REALITY_DOMAIN..." >&2
+        certbot delete --cert-name "$REALITY_DOMAIN" --non-interactive 2>/dev/null || true
+        rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || true
+    fi
+
+    # 5. Revert UFW firewall changes
+    if [[ "${_UFW_RULES_CONFIGURED:-0}" -eq 1 ]]; then
+        echo "[ROLLBACK] Reverting UFW firewall rules..." >&2
+        if [[ "${_UFW_WAS_ACTIVE:-0}" -eq 0 ]]; then
+            ufw --force disable 2>/dev/null || true
+        else
+            if [[ -n "${PANEL_IP:-}" ]]; then
+                ufw delete allow proto tcp from "$PANEL_IP" to any port "${NODE_PORT:-3002}" 2>/dev/null || true
+            fi
+            if [[ -n "${PANEL_IPV6:-}" ]]; then
+                ufw delete allow proto tcp from "$PANEL_IPV6" to any port "${NODE_PORT:-3002}" 2>/dev/null || true
+            fi
+            ufw delete allow 80/tcp 2>/dev/null || true
+            ufw delete allow 443/tcp 2>/dev/null || true
+        fi
+    fi
+
+    # 6. Revert Swap
+    if [[ "${_SWAP_CREATED_BY_US:-0}" -eq 1 ]]; then
+        echo "[ROLLBACK] Deactivating and removing swapfile..." >&2
+        swapoff /swapfile 2>/dev/null || true
+        if [[ -f /etc/fstab ]]; then
+            local swap_tmp
+            swap_tmp=$(mktemp /etc/fstab.gowave.XXXXXX)
+            grep -v -E '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab > "$swap_tmp" || true
+            chmod --reference=/etc/fstab "$swap_tmp"
+            chown --reference=/etc/fstab "$swap_tmp"
+            mv -f "$swap_tmp" /etc/fstab
+        fi
+        rm -f /swapfile
+    fi
+
+    # 7. Revert Sysctl
+    if [[ "${_SYSCTL_CREATED_BY_US:-0}" -eq 1 ]]; then
+        echo "[ROLLBACK] Removing sysctl configuration..." >&2
+        rm -f /etc/sysctl.d/99-gowave-node.conf
+        sysctl --system 2>/dev/null || true
+    fi
+
+    # 8. Clean temporary files and unset secrets
+    unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64
+    rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh
+
+    echo "[ROLLBACK] Compensating rollback completed on worker host." >&2
+    return "$exit_code"
 }
 RUNNER_FUNCS
 
@@ -433,7 +559,22 @@ RUNNER_FUNCS
 set -euo pipefail
 main() {
     umask 077
-    trap 'unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64; rm -f /tmp/gowave-verify-node-mtls.py' EXIT HUP INT TERM
+    _ROLLBACK_IN_PROGRESS=0
+    _SWAP_CREATED_BY_US=0
+    _SYSCTL_CREATED_BY_US=0
+    _UFW_WAS_ACTIVE=0
+    _UFW_RULES_CONFIGURED=0
+    _COVER_UNPACKED=0
+    _NGINX_BOOTSTRAP_CREATED=0
+    _ACME_WORKER_ISSUED=0
+    _ACME_REALITY_ISSUED=0
+    _NGINX_CONFIGS_CREATED=0
+    _STREAM_INCLUDE_ADDED=0
+    _NODE_SERVICE_CONFIGURED=0
+
+    trap 'exit_code=$?; compensate_remote_worker "$exit_code"; exit "$exit_code"' ERR
+    trap 'unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64; rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh' EXIT HUP INT TERM
+
     setup_system_prereqs </dev/null
     configure_host_security </dev/null
     configure_firewall </dev/null
@@ -450,6 +591,9 @@ main() {
     printf '%s' "$_NODE_SECRET_KEY" | python3 /tmp/gowave-verify-node-mtls.py --host 127.0.0.1 --port "$NODE_PORT"
     nginx -t
     systemctl is-active --quiet nginx
+
+    # Disable ERR compensation trap on verified success
+    trap - ERR
     unset _NODE_SECRET_KEY VERIFY_NODE_MTLS_B64
     echo "GoWave Edge Worker deployment complete (service, NGINX, TLS and mTLS health verified)."
 }
@@ -458,11 +602,121 @@ REMOTE_EOF
     } | ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" -o ServerAliveInterval=15 -p "$port" "${ssh_user}@${host}" 'bash -s'
 }
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    if [[ "${1:-}" == "pack-cover" ]]; then
-        pack_cover_reality
-    else
-        echo "Usage: gowave-node-auto.sh <command> [args]"
+# Standalone remote rollback mechanism callable on failure or deprovisioning
+remote_rollback() {
+    local host="$1"
+    local port="${2:-22}"
+    local worker_domain="${3:-}"
+    local reality_domain="${4:-}"
+    local ssh_user="${5:-root}"
+
+    local node_port="${NODE_PORT:-$RECOMMENDED_NODE_PORT}"
+    local panel_ip="${PANEL_IP:-}"
+    local panel_ipv6="${PANEL_IPV6:-}"
+    local known_hosts="${SSH_KNOWN_HOSTS:-/root/.ssh/known_hosts}"
+    local host_key="$host"
+    if [[ "$port" != "22" ]]; then
+        host_key="[$host]:$port"
     fi
+    if [[ ! -s "$known_hosts" ]] || ! ssh-keygen -F "$host_key" -f "$known_hosts" >/dev/null 2>&1; then
+        log_err "SSH host key for $host_key is not pre-pinned in $known_hosts."
+        return 1
+    fi
+
+    log_info "Initiating compensating remote rollback on ${ssh_user}@${host}:${port}..."
+
+    {
+        printf 'export PANEL_IP=%q\n' "$panel_ip"
+        printf 'export PANEL_IPV6=%q\n' "$panel_ipv6"
+        printf 'export NODE_PORT=%q\n' "$node_port"
+        printf 'export WORKER_DOMAIN=%q\n' "$worker_domain"
+        printf 'export REALITY_DOMAIN=%q\n' "$reality_domain"
+
+        cat <<'ROLLBACK_REMOTE_SCRIPT'
+set -euo pipefail
+
+echo "Executing worker compensation teardown..." >&2
+
+# 1. Stop and disable systemd services
+systemctl stop gowave-node.service 2>/dev/null || true
+systemctl disable gowave-node.service 2>/dev/null || true
+systemctl stop xray.service 2>/dev/null || true
+systemctl disable xray.service 2>/dev/null || true
+rm -rf /etc/systemd/system/gowave-node.service.d
+rm -f /etc/systemd/system/gowave-node.service
+rm -f /etc/systemd/system/remnanode.service
+systemctl daemon-reload 2>/dev/null || true
+systemctl reset-failed 2>/dev/null || true
+rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode
+rm -f /usr/local/bin/gowave-node /usr/local/bin/xray
+
+# 2. Remove NGINX worker configs
+rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf
+rm -f /etc/nginx/conf.d/gowave-worker-https.conf
+rm -f /etc/nginx/conf.d/gowave-worker-decoy.conf
+rm -f /etc/nginx/stream-enabled/gowave-worker-stream.conf
+rm -f /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh
+rm -rf /var/www/gowave-acme
+rm -rf /var/www/gowave-auto-nginx/cover-reality
+rmdir /var/www/gowave-auto-nginx 2>/dev/null || true
+
+# Revert stream include in nginx.conf if stream-enabled is empty
+if [[ -d /etc/nginx/stream-enabled ]] && ! ls -1 /etc/nginx/stream-enabled/*.conf >/dev/null 2>&1; then
+    sed -i '\#stream { include /etc/nginx/stream-enabled/\*\.conf; }#d' /etc/nginx/nginx.conf 2>/dev/null || true
+fi
+if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx 2>/dev/null || true
+fi
+
+# 3. Clean ACME certificates
+if [[ -n "${WORKER_DOMAIN:-}" ]]; then
+    certbot delete --cert-name "$WORKER_DOMAIN" --non-interactive 2>/dev/null || true
+    rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || true
+fi
+if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+    certbot delete --cert-name "$REALITY_DOMAIN" --non-interactive 2>/dev/null || true
+    rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || true
+fi
+
+# 4. Remove UFW rules added for Control Plane
+if command -v ufw >/dev/null 2>&1; then
+    if [[ -n "${PANEL_IP:-}" ]]; then
+        ufw delete allow proto tcp from "$PANEL_IP" to any port "${NODE_PORT:-3002}" 2>/dev/null || true
+    fi
+    if [[ -n "${PANEL_IPV6:-}" ]]; then
+        ufw delete allow proto tcp from "$PANEL_IPV6" to any port "${NODE_PORT:-3002}" 2>/dev/null || true
+    fi
+    ufw delete allow 80/tcp 2>/dev/null || true
+    ufw delete allow 443/tcp 2>/dev/null || true
+fi
+
+# 5. Clean sysctl and scratch
+rm -f /etc/sysctl.d/99-gowave-node.conf
+rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh
+sysctl --system 2>/dev/null || true
+
+echo "Remote worker compensation teardown finished." >&2
+ROLLBACK_REMOTE_SCRIPT
+    } | ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" -o ServerAliveInterval=15 -p "$port" "${ssh_user}@${host}" 'bash -s'
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    case "${1:-}" in
+        pack-cover)
+            pack_cover_reality
+            ;;
+        remote_payload)
+            shift
+            remote_payload "$@"
+            ;;
+        remote_rollback|rollback)
+            shift
+            remote_rollback "$@"
+            ;;
+        *)
+            echo "Usage: gowave-node-auto.sh <pack-cover|remote_payload|remote_rollback> [args]"
+            exit 1
+            ;;
+    esac
 fi
 
