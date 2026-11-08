@@ -1,0 +1,130 @@
+name: Live VPS E2E Verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target GitHub Environment"
+        required: true
+        default: "staging-vps"
+        type: string
+      acme_mode:
+        description: "ACME mode (staging or production)"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+      teardown_policy:
+        description: "Teardown policy (PRESERVE or RESTORE_SNAPSHOT)"
+        required: true
+        default: "PRESERVE"
+        type: choice
+        options:
+          - PRESERVE
+          - RESTORE_SNAPSHOT
+
+concurrency:
+  group: live-vps-e2e-${{ inputs.environment || 'staging-vps' }}
+  cancel-in-progress: false
+
+jobs:
+  live-vps-e2e:
+    name: Run Live VPS E2E Test Suite
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.environment || 'staging-vps' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install Control Machine system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends dnsutils openssh-client openssl curl libcap2-bin
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
+
+      - name: Download and install pinned Xray client binary
+        env:
+          XRAY_VERSION: "v25.1.30"
+        run: |
+          mkdir -p /tmp/xray-bin
+          curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" -o /tmp/xray.zip
+          unzip -q /tmp/xray.zip -d /tmp/xray-bin
+          sudo mv /tmp/xray-bin/xray /usr/local/bin/xray
+          sudo chmod 0755 /usr/local/bin/xray
+          xray version
+
+      - name: Download and install pinned Mihomo client binary
+        env:
+          MIHOMO_VERSION: "v1.19.2"
+        run: |
+          curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-amd64-${MIHOMO_VERSION}.gz" -o /tmp/mihomo.gz
+          gunzip /tmp/mihomo.gz
+          sudo mv /tmp/mihomo /usr/local/bin/mihomo
+          sudo chmod 0755 /usr/local/bin/mihomo
+          mihomo -v
+
+      - name: Materialize live VPS configuration and SSH credentials
+        env:
+          LIVE_VPS_CONFIG: ${{ secrets.LIVE_VPS_CONFIG }}
+          MASTER_SSH_KEY: ${{ secrets.MASTER_SSH_KEY }}
+          WORKER_SSH_KEY: ${{ secrets.WORKER_SSH_KEY }}
+          MASTER_KNOWN_HOSTS: ${{ secrets.MASTER_KNOWN_HOSTS }}
+          WORKER_KNOWN_HOSTS: ${{ secrets.WORKER_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 0700 ~/.ssh
+
+          # Materialize SSH keys with mode 0600
+          echo "$MASTER_SSH_KEY" > ~/.ssh/id_master
+          chmod 0600 ~/.ssh/id_master
+
+          echo "$WORKER_SSH_KEY" > ~/.ssh/id_worker
+          chmod 0600 ~/.ssh/id_worker
+
+          echo "$MASTER_KNOWN_HOSTS" > ~/.ssh/known_hosts_master
+          chmod 0600 ~/.ssh/known_hosts_master
+
+          echo "$WORKER_KNOWN_HOSTS" > ~/.ssh/known_hosts_worker
+          chmod 0600 ~/.ssh/known_hosts_worker
+
+          # Materialize runner configuration file
+          echo "$LIVE_VPS_CONFIG" > tools/live_vps_config.env
+          chmod 0600 tools/live_vps_config.env
+
+      - name: Execute Live VPS E2E Test Suite
+        run: |
+          python3 tools/test_live_vps.py --config tools/live_vps_config.env --mode full
+
+      - name: Upload JUnit XML test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-vps-junit-results
+          path: artifacts/live-vps/**/junit.xml
+          if-no-files-found: warn
+
+      - name: Upload sanitized diagnostics and test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-vps-diagnostics
+          path: |
+            artifacts/live-vps/**/result.json
+            artifacts/live-vps/**/summary.txt
+            artifacts/live-vps/**/diagnostics/
+          if-no-files-found: warn

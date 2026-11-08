@@ -169,6 +169,87 @@ class TestNginxRouting(unittest.TestCase):
             self.assertTrue((cover_dir / "robots.txt").exists())
             self.assertTrue((cover_dir / "404.html").exists())
 
+    def test_validate_acme_server(self):
+        # Empty/unset is allowed (production default)
+        cmd_empty = f'source "{NGINX_SH}" && validate_acme_server ""'
+        self.assertEqual(subprocess.run(["bash", "-c", cmd_empty], capture_output=True).returncode, 0)
+
+        # Official Staging URL allowed
+        cmd_staging = f'source "{NGINX_SH}" && validate_acme_server "https://acme-staging-v02.api.letsencrypt.org/directory"'
+        self.assertEqual(subprocess.run(["bash", "-c", cmd_staging], capture_output=True).returncode, 0)
+
+        # Official Production URL allowed
+        cmd_prod = f'source "{NGINX_SH}" && validate_acme_server "https://acme-v02.api.letsencrypt.org/directory"'
+        self.assertEqual(subprocess.run(["bash", "-c", cmd_prod], capture_output=True).returncode, 0)
+
+        # Arbitrary / untrusted URL rejected
+        cmd_bad = f'source "{NGINX_SH}" && validate_acme_server "https://attacker.example.com/directory"'
+        res_bad = subprocess.run(["bash", "-c", cmd_bad], capture_output=True, text=True)
+        self.assertNotEqual(res_bad.returncode, 0)
+        self.assertIn("Invalid GOWAVE_ACME_SERVER", res_bad.stderr)
+
+    def test_check_acme_lineage(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            renewal_conf = tmp / "panel.example.com.conf"
+            live_dir = tmp / "live"
+            live_dir.mkdir()
+            cert_file = live_dir / "fullchain.pem"
+
+            # Case 1: Fresh domain, no files exist -> passes
+            cmd_fresh = f'source "{NGINX_SH}" && check_acme_lineage "panel.example.com" "https://acme-v02.api.letsencrypt.org/directory" "{renewal_conf}" "{live_dir}"'
+            self.assertEqual(subprocess.run(["bash", "-c", cmd_fresh], capture_output=True).returncode, 0)
+
+            # Case 2: Renewal conf has matching production server -> passes
+            renewal_conf.write_text("[renewalparams]\nserver = https://acme-v02.api.letsencrypt.org/directory\n")
+            cmd_match = f'source "{NGINX_SH}" && check_acme_lineage "panel.example.com" "https://acme-v02.api.letsencrypt.org/directory" "{renewal_conf}" "{live_dir}"'
+            self.assertEqual(subprocess.run(["bash", "-c", cmd_match], capture_output=True).returncode, 0)
+
+            # Case 3: Renewal conf was staging, requested production -> rejected
+            renewal_conf.write_text("[renewalparams]\nserver = https://acme-staging-v02.api.letsencrypt.org/directory\n")
+            cmd_mismatch = f'source "{NGINX_SH}" && check_acme_lineage "panel.example.com" "https://acme-v02.api.letsencrypt.org/directory" "{renewal_conf}" "{live_dir}"'
+            res_mismatch = subprocess.run(["bash", "-c", cmd_mismatch], capture_output=True, text=True)
+            self.assertNotEqual(res_mismatch.returncode, 0)
+            self.assertIn("ACME directory mismatch", res_mismatch.stderr)
+
+            # Case 4: Renewal conf missing server parameter -> fails closed
+            renewal_conf.write_text("[renewalparams]\nauthenticator = webroot\n")
+            cmd_noserver = f'source "{NGINX_SH}" && check_acme_lineage "panel.example.com" "https://acme-v02.api.letsencrypt.org/directory" "{renewal_conf}" "{live_dir}"'
+            res_noserver = subprocess.run(["bash", "-c", cmd_noserver], capture_output=True, text=True)
+            self.assertNotEqual(res_noserver.returncode, 0)
+            self.assertIn("no readable 'server' field", res_noserver.stderr)
+
+            # Case 5: Renewal conf has unrecognized server URL -> fails closed
+            renewal_conf.write_text("[renewalparams]\nserver = https://unrecognized.acme.org/dir\n")
+            cmd_unrec = f'source "{NGINX_SH}" && check_acme_lineage "panel.example.com" "https://acme-v02.api.letsencrypt.org/directory" "{renewal_conf}" "{live_dir}"'
+            res_unrec = subprocess.run(["bash", "-c", cmd_unrec], capture_output=True, text=True)
+            self.assertNotEqual(res_unrec.returncode, 0)
+            self.assertIn("unrecognized ACME directory", res_unrec.stderr)
+
+            # Case 6: Certificate with (STAGING) in issuer rejected when production requested
+            renewal_conf.unlink()
+            key_file = live_dir / "privkey.pem"
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key_file), "-out", str(cert_file),
+                "-days", "1", "-subj", "/CN=(STAGING) Pretend Root"
+            ], check=True, stderr=subprocess.DEVNULL)
+            cmd_staging_cert = f'source "{NGINX_SH}" && check_acme_lineage "panel.example.com" "https://acme-v02.api.letsencrypt.org/directory" "{renewal_conf}" "{live_dir}"'
+            res_stg_cert = subprocess.run(["bash", "-c", cmd_staging_cert], capture_output=True, text=True)
+            self.assertNotEqual(res_stg_cert.returncode, 0)
+            self.assertIn("issued by staging", res_stg_cert.stderr)
+
+            # Case 7: Certificate with production issuer rejected when staging requested
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key_file), "-out", str(cert_file),
+                "-days", "1", "-subj", "/CN=ISRG Root X1"
+            ], check=True, stderr=subprocess.DEVNULL)
+            cmd_prod_cert = f'source "{NGINX_SH}" && check_acme_lineage "panel.example.com" "https://acme-staging-v02.api.letsencrypt.org/directory" "{renewal_conf}" "{live_dir}"'
+            res_prod_cert = subprocess.run(["bash", "-c", cmd_prod_cert], capture_output=True, text=True)
+            self.assertNotEqual(res_prod_cert.returncode, 0)
+            self.assertIn("issued by production", res_prod_cert.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

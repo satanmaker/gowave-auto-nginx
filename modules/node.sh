@@ -79,14 +79,43 @@ install_local_node() {
         fi
     fi
 
+    # E2E Gate: require bundled installer and verified SHA256 when configured
+    if [[ "${GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER:-0}" == "1" ]]; then
+        if [[ -z "$upstream_installer" || ! -f "$upstream_installer" ]]; then
+            echo "Error: GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1 but bundled installer is absent ($upstream_installer)." >&2
+            return 1
+        fi
+        if [[ -z "${GOWAVE_NODE_INSTALLER_SHA256:-}" ]]; then
+            echo "Error: GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1 but GOWAVE_NODE_INSTALLER_SHA256 is not set." >&2
+            return 1
+        fi
+        local actual_sha256
+        actual_sha256=$(sha256sum "$upstream_installer" | awk '{print $1}')
+        if [[ "$actual_sha256" != "$GOWAVE_NODE_INSTALLER_SHA256" ]]; then
+            echo "Error: Bundled installer SHA256 mismatch: expected $GOWAVE_NODE_INSTALLER_SHA256, got $actual_sha256." >&2
+            return 1
+        fi
+    fi
+
     # Pass SECRET_KEY and NODE_PORT strictly via environment to installer execution
     if [[ -n "$upstream_installer" && -f "$upstream_installer" ]]; then
+        if [[ -n "${GOWAVE_NODE_INSTALLER_SHA256:-}" ]]; then
+            local actual_sha256
+            actual_sha256=$(sha256sum "$upstream_installer" | awk '{print $1}')
+            if [[ "$actual_sha256" != "$GOWAVE_NODE_INSTALLER_SHA256" ]]; then
+                echo "Error: Bundled installer SHA256 mismatch: expected $GOWAVE_NODE_INSTALLER_SHA256, got $actual_sha256." >&2
+                return 1
+            fi
+        fi
         (
             export SECRET_KEY="$secret_key"
             export NODE_PORT="$node_port"
             export GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}"
             bash "$upstream_installer" </dev/null
         )
+    elif [[ "${GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER:-0}" == "1" ]]; then
+        echo "Error: GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1 prohibits remote download or floating fallback." >&2
+        return 1
     else
         echo "Fetching upstream gowave-node installer..."
         (

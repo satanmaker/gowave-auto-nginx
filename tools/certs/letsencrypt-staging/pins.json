@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "roots": [
+    {
+      "file": "pretend-pear-x1.pem",
+      "url": "https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem",
+      "subject_cn": "(STAGING) Pretend Pear X1",
+      "der_sha256": "e70570a989f8565aabdf7cae27abd1621872d6a3f811e3fef27e3dba02912198"
+    },
+    {
+      "file": "bogus-broccoli-x2.pem",
+      "url": "https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x2.pem",
+      "subject_cn": "(STAGING) Bogus Broccoli X2",
+      "der_sha256": "9b2a339fe6a3e85585c4cd75536cb8c1cf7cd603b9a64bec2521858ae48da85d"
+    },
+    {
+      "file": "yearning-yucca-root-ye.pem",
+      "url": "https://letsencrypt.org/certs/staging/gen-y/root-ye.pem",
+      "subject_cn": "(STAGING) Yearning Yucca Root YE",
+      "der_sha256": "b59bfc0ba52daf849853b7324a91e82f031db3397f35644157352cde6384b56c"
+    },
+    {
+      "file": "yonder-yam-root-yr.pem",
+      "url": "https://letsencrypt.org/certs/staging/gen-y/root-yr.pem",
+      "subject_cn": "(STAGING) Yonder Yam Root YR",
+      "der_sha256": "ef115fb59e040ff39d15fd8f3ef54063c704321d83cb081213272f77d3091672"
+    }
+  ]
+}
