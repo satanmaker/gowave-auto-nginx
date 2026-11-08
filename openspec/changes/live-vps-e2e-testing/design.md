@@ -211,9 +211,13 @@ to protect a shared VPS pair from two different Control Machines.
    file existence. Never remove a lock file to force acquisition. A contender that cannot acquire either
    lock fails closed. The lock owner metadata (run ID, Control Machine identity, start time) is informational
    only and MUST NOT override a held kernel lock.
-4. If either remote lock-holder session is lost during a run, stop starting new mutating phases, record
-   `INCOMPLETE`, attempt only bounded safe diagnostics/cleanup, and do not silently reconnect and continue
-   without reacquiring both locks and validating the saved run state.
+4. If either remote lock-holder session is lost during a run, stop starting new mutating phases and do not
+   silently reconnect and continue without reacquiring both locks and validating the saved run state. Outside
+   an already executing `RESTORE_SNAPSHOT` teardown, this is a terminal `INCOMPLETE` condition. During that
+   declared teardown only, loss caused by snapshot reboot is an expected interruption: keep teardown
+   non-passing, wait for the restore hook to confirm both resources, reacquire both locks in deterministic
+   order, and validate the saved run identity plus clean baseline before finalizing teardown. Failed
+   reacquisition or validation remains `TEARDOWN_FAILED`; no other phase may resume.
 
 **Rationale:** A lock under `/tmp` on the Control Machine only serializes processes on that one machine.
 Two operators or CI runners on different hosts could otherwise mutate the same Master or Worker at once.
@@ -364,11 +368,17 @@ The hook must exit zero and return valid JSON:
 ```
 Both returned snapshot IDs must exactly match the request. Hook stdout/stderr are captured in memory and MUST
 NOT be published verbatim; the operation is bounded by `RESTORE_TIMEOUT`.
-The runner then reconnects to both VPS, recollects the Phase 0 baseline manifest, and verifies the required
-clean-baseline invariants before recording teardown `PASS`. Missing/invalid hook configuration is a preflight
-`FAIL`; hook timeout, nonzero exit, invalid/mismatched response, failed reconnection or baseline mismatch
-produces `TEARDOWN_FAILED`, never a simulated restore success. The hook may use operator-managed provider
-credentials but must not print them.
+The runner then reconnects to both VPS and reacquires both authoritative remote `flock` sessions in the same
+deterministic address order used by preflight. It verifies the saved run identity and recollects the Phase 0
+baseline while both locks are held; only then may teardown be recorded `PASS`. Snapshot restoration may reboot
+either VPS and terminate the original lock-holder sessions, so the runner MUST NOT treat the hook's
+`RESTORED` response alone as teardown success or continue baseline verification without reacquiring both locks.
+If either lock cannot be reacquired, the saved run identity differs, or the baseline differs, teardown is
+`TEARDOWN_FAILED`; no further mutating phase may start. Keep both replacement locks through final reporting
+and release them only after the final result is durably written. Missing/invalid hook configuration is a
+preflight `FAIL`; hook timeout, nonzero exit, invalid/mismatched response or failed reconnection also produces
+`TEARDOWN_FAILED`, never a simulated restore success. The hook may use operator-managed provider credentials
+but must not print them.
 
 Boolean policy combinations are not accepted. The runner does not claim that `gowave-auto.sh uninstall`
 restores OS packages, UFW, sysctl, swap/fstab, certificates or unrelated host state. A clean baseline gate is
@@ -516,6 +526,26 @@ rollback code to delete a certificate and private key that pre-dated the current
 
 ---
 
+### D16: Scoped CA Trust for Master Installer TLS/SNI Verification
+
+**Chosen:** `gowave-auto.sh:verify_public_tls_sni` currently invokes OpenSSL with the system
+`/etc/ssl/certs` CA path. That check is incompatible with `ACME_MODE=staging`: Let's Encrypt Staging roots are
+not part of ordinary system trust and MUST NOT be installed there. For E2E invocations, the runner MUST stage
+the exact mode-specific CA bundle built by D9 on Master in a root-owned mode-`0700` directory under `/run`,
+with a root-owned mode-`0600` bundle file, and pass its path as `GOWAVE_TLS_CA_FILE`. When that variable is set,
+`verify_public_tls_sni` MUST use OpenSSL `-CAfile "$GOWAVE_TLS_CA_FILE"` while retaining
+`-verify_return_error` and `-verify_hostname`; it MUST NOT fall back to the system CA path on an error. The
+same optional override applies to `domain-change`. When unset, legacy callers retain the existing system
+`-CApath` behavior. The runner removes the remote bundle on both success and failure; it is never copied to
+system trust stores, kept in persistent state, or included in artifacts. Production mode uses the complete
+public-CA bundle; staging mode uses the same bundle plus the four validated Staging roots.
+
+**Rationale:** Master installation calls `verify_public_tls_sni` after certificate issuance, and domain change
+calls it after certificate replacement. Without a scoped trust override, a valid staging certificate fails
+that local OpenSSL probe because the staging roots are intentionally absent from system trust.
+
+---
+
 ## Runner Module Structure
 
 ```
@@ -562,9 +592,11 @@ Phase 0: Preflight
 Phase 1: Master Installation
   1.1  After acquiring both remote locks (including in partial `install` mode), re-collect and compare the
        stored preflight baseline before the first remote mutation; stale or changed baseline → fail closed
-  1.2  Copy pinned repo commit to Master /opt/gowave-auto-nginx
-  1.3  Run gowave-auto.sh install with `GOWAVE_ACME_SERVER` derived from `ACME_MODE`; set
-       `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1` and provide the pinned Node installer commit + SHA256;
+  1.2  Copy pinned repo commit to Master /opt/gowave-auto-nginx; stage the exact D9 mode-specific CA bundle
+       in a root-owned mode-0700 `/run` directory with a mode-0600 file
+  1.3  Run gowave-auto.sh install with `GOWAVE_ACME_SERVER` derived from `ACME_MODE` and
+       `GOWAVE_TLS_CA_FILE` pointing to the staged bundle; set `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1`
+       and provide the pinned Node installer commit + SHA256;
        when the validated Vision pair is enabled, pass `VISION_DOMAIN=MASTER_VISION_DOMAIN` in the
        controlled environment and require Master Vision certificate issuance/verification to succeed
   1.4  Verify service states, listeners, TLS certs
@@ -737,6 +769,10 @@ is set. When the variable is unset outside the runner, existing production-defau
 6. Tests cover both mandatory Master issuance calls, both mandatory Worker issuance calls, optional Vision
    issuance on each host, `domain-change`, SSH propagation, lineage isolation for every configured domain,
    and unset-variable backward compatibility.
+7. For E2E Master `install` and `domain-change`, the runner stages the D9 mode-specific CA bundle on Master
+   and supplies `GOWAVE_TLS_CA_FILE` to the installer. `verify_public_tls_sni` uses that file for chain and
+   hostname verification without changing `/etc/ssl/certs`; the remote bundle is removed after success or
+   failure. A staging certificate must pass this local probe, while an untrusted test CA must still fail.
 
 ---
 
@@ -759,7 +795,7 @@ The runner executes 15 negative scenarios in Phase 9 (and during isolated test p
 | **NEG-11**  | Backup Restore   | Corrupted archive header / invalid tar format | Preflight check rejects before mutating live files |
 | **NEG-12**  | Backup Restore   | SQLite DB file in archive corrupted | SQLite integrity check fails before replacing live DB |
 | **NEG-13**  | Worker Deploy    | SSH pipeline interrupted mid-execution | Master recovery journal does NOT enter `COMMITTED` |
-| **NEG-14**  | Worker Deploy    | Duplicate `node add` invocation for same node | Idempotent; no duplicate DB entities or hosts created |
+| **NEG-14**  | Worker Deploy    | Duplicate `node add` invocation when the name is already in `state.json` | Explicit fail-fast rejection before API client creation; no state/DB mutation or duplicate entities |
 | **NEG-15**  | Panel API Auth   | API request with expired or forged JWT | Panel returns 401 Unauthorized |
 
 ---
