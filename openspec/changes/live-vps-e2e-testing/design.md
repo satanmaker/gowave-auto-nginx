@@ -77,26 +77,37 @@ that expand the attack surface. Shell `source` — rejected per AGENTS.md zero-l
 
 ---
 
-### D3: mTLS Verification — Reuse `modules/verify_node_mtls.py` via subprocess for Positive Acceptance; Direct Python Socket for Negative TLS Tests
+### D3: mTLS Verification — Reuse Existing Verifier, Separate Client- and Server-Side Negative Cases
 
 **Chosen:**
-1. **Positive Verification**: Call `python3 modules/verify_node_mtls.py` via subprocess from the runner,
-   feeding the base64 `SECRET_KEY` payload over stdin, with `--host WORKER_IP --port 3002 --mode full`.
-2. **Negative TLS Handshake Tests**: The five negative live socket scenarios (wrong client certificate,
-   mismatched private key, wrong SNI, untrusted CA, and absent client certificate) are executed directly
-   by `tools/live_vps/mtls.py` opening a TCP connection to `WORKER_IP:3002` with specifically configured
-   `ssl.SSLContext` objects. This asserts that the TLS handshake is rejected by GoWave Node on the wire before
-   the HTTP layer executes, without relying on `verify_node_mtls.py`'s pre-socket crypto validation.
+1. **Positive verification** runs `modules/verify_node_mtls.py` on Master (the allowed source address),
+   with the base64 `SECRET_KEY` payload supplied over stdin. The runner records the verifier exit code,
+   negotiated TLS version and HTTP status as separate observations. It MUST NOT parse synthetic markers that
+   the current verifier does not emit. The existing verifier prints `Handshake SUCCESS`, `Node response`,
+   and `mTLS 1.3 control plane verification PASSED`; it treats both `200 OK` and `401 Unauthorized` as
+   successful TLS/SNI handshake evidence.
+2. **Certificate/key consistency negative case** is local: pair a valid client certificate with a different
+   private key and assert that the client TLS library refuses to load the chain. This is not a remote
+   Worker-handshake test and MUST be reported separately.
+3. **Server-side client-auth negative cases** use a TCP/TLS client from Master: an untrusted client certificate
+   and an absent client certificate must be rejected by Worker during handshake. Wrong-SNI behavior is tested
+   independently against the documented SNI router and must assert the observed route/handshake outcome rather
+   than assume every wrong SNI produces a TLS alert.
+4. **Server-certificate trust negative case** runs from a client that does not trust the GoWave CA and asserts
+   that client-side certificate verification fails. It MUST NOT be described as Worker rejecting the client.
 
-**Rationale:** `verify_node_mtls.py` already implements the exact HKDF-SHA256 SNI derivation matching the
-upstream GoWave Node implementation. Duplicating this logic in the runner would create two authoritative
-sources of truth for the crypto. However, `verify_node_mtls.py` terminates locally during preflight crypto checks
-when a key and certificate mismatch; direct socket tests are required to prove remote server-side rejection.
+**Rationale:** The current verifier performs local cryptographic validation before opening a socket and only
+then performs TLS 1.3 mTLS. A mismatched key fails locally before a network handshake. A wrong server CA is
+validated by the client, not by the Worker. Treating these as server-side handshake rejection would produce
+false security evidence.
 
-**Consequence for separate sub-checks:** The runner parses `verify_node_mtls.py` stdout to extract individual
-signals (`MTLS_HANDSHAKE_PASS`, `MTLS_CERTIFICATE_VALIDATION_PASS`, `WORKER_HTTP_HEALTH_PASS`).
-`PANEL_WORKER_AUTH_PASS` requires a separate authenticated Panel API call (Panel→Worker health from Panel's
-perspective), which the runner performs via the Panel REST API.
+**Output contract:** The runner derives `MTLS_CRYPTO_VALIDATION_PASS` from successful verifier completion
+before socket creation only when that stage is independently exposed; otherwise it records the verifier as a
+single `MTLS_VERIFIER_PASS` observation. It derives `MTLS_HANDSHAKE_PASS` from the explicit handshake-success
+output plus negotiated `TLSv1.3`, and records the HTTP status separately. `200 OK` is application health
+success; `401 Unauthorized` proves TLS/SNI reached the HTTP layer but is NOT an authenticated health pass.
+`PANEL_WORKER_AUTH_PASS` requires independent evidence of an authenticated Panel-to-Worker exchange and
+MUST NOT be inferred from the local verifier's HTTP response.
 
 ---
 
@@ -106,9 +117,9 @@ perspective), which the runner performs via the Panel REST API.
 (extracted from the real subscription), one SOCKS5 inbound with a unique local port, and mandatory `log`
 and `routing` sections. The config is written to a `tempfile.NamedTemporaryFile` with mode `0600`, the Xray
 process is started, the runner waits for the SOCKS5 port to become connectable (bounded poll), traffic test
-runs, then Xray is terminated and the temp file is deleted. When `ACME_MODE=staging`, the client outbound
-`tlsSettings` includes the Let's Encrypt Staging CA certificate (or `allowInsecure: true` in test configuration)
-to allow valid TLS negotiation without modifying host root stores.
+runs, then Xray is terminated and the temp file is deleted. When `ACME_MODE=staging`, the client trusts the
+specific Let's Encrypt Staging CA chain through a scoped CA bundle. `allowInsecure: true` is prohibited even
+for disposable tests because it disables server identity verification and can conceal SNI/certificate errors.
 
 **Rationale:** The subscription endpoint returns a JSON structure that may be an outbound-only fragment, not
 a standalone `xray run`-compatible config. Building the wrapper config ensures `xray run -test` and `xray run`
@@ -121,16 +132,25 @@ is not guaranteed to be a complete standalone config.
 
 ### D5: Server-Side Ingress Evidence and Egress IP Verification
 
-**Chosen:** Two-source verification:
-1. **Client-side Egress Verification**: Control Machine sends HTTPS request via tunnel and reads egress IP
-   from the response (e.g., `https://cloudflare.com/cdn-cgi/trace` with fallback to `https://api.ipify.org`).
-   If `EXPECTED_WORKER_EGRESS_IP` is set, the egress IP must match it. If not set, the runner first queries
-   the Worker's actual egress IP via SSH, then compares against the client-side observation.
-2. **Server-side Ingress Evidence**: As GoWave Panel does not enable the Xray gRPC Stats API in default
-   profile templates, server-side proof of traffic traversal uses iptables/nftables byte/packet accounting
-   on the inbound port (e.g. `iptables -I INPUT -p tcp --dport <port>`), or a temporary non-blocking `tcpdump`
-   capture during the test request on Worker. Server-side packets must increment during Worker tunnel requests,
-   and must NOT increment on Master for Worker-directed traffic (proving zero Master relay).
+**Chosen:** Each endpoint test is executed sequentially with a bounded observation window:
+1. Record baseline packet/byte counters (or start a bounded `tcpdump` capture) on the target VPS public
+   transport listener. In the current NGINX stream topology this is TCP/443; do not assume the four logical
+   protocols have four distinct public TCP ports. Use the exact configured listener and record the capture
+   filter and interface.
+2. Execute one tunnel request through the selected endpoint and record the client-observed egress IP.
+   Compare it with `EXPECTED_MASTER_EGRESS_IP` or `EXPECTED_WORKER_EGRESS_IP` when configured. If no expected
+   value is configured, query that VPS's direct egress independently and compare, while documenting that
+   this verifies shared egress identity rather than a predeclared address.
+3. Compare post-test ingress evidence with the baseline on the target VPS. For Worker endpoints, verify
+   Worker ingress increases and Master ingress does not increase for the same controlled request. For Master
+   endpoints, verify Master ingress increases. Counter deltas MUST be isolated per test window; unrelated
+   background traffic invalidates ambiguous evidence and produces `INCOMPLETE`, not `PASS`.
+4. If packet capture is used, capture metadata and packet counts only; do not persist payloads or credentials.
+
+**Rationale:** Default GoWave Xray templates do not enable the Xray Stats API. The public NGINX stream listener
+is shared by SNI-routed transports, so packet evidence proves traversal to the intended VPS but not by itself
+which protocol was selected. Protocol identity is established by the client runtime and successful request;
+server-side ingress is an independent host-traversal check.
 
 **Rationale:** A client-only egress check can be fooled if Master relays traffic. Server-side packet evidence
 combined with egress IP matching confirms the traffic genuinely traversed Worker, not Master.
@@ -188,30 +208,35 @@ allows strict verification without polluting the host machine's root store.
 
 ---
 
-### D10: Process argv Observation via Local Background Auditor on Master
+### D10: Process argv Observation During Worker Registration
 
-**Chosen:** During `gowave-auto.sh node add`, the runner starts a background auditor script on Master via SSH
-immediately before invoking deployment. The script monitors process creation locally (via `/proc/*/cmdline`
-sampling or bash debug trap output) and logs all executed command lines to a private temporary file (`mode 0600`).
-After deployment finishes, the runner inspects this log to confirm `SECRET_KEY` was never passed in `argv`,
-then deletes the log.
+**Chosen:** Do not use periodic `/proc/*/cmdline` sampling or a Bash DEBUG trap as proof: both can miss
+short-lived processes, and shell tracing can itself disclose expanded secrets. For the acceptance test,
+run the exact `gowave-auto.sh node add` invocation under a local `strace -f -e trace=execve` observer on Master
+(or an equivalent kernel-level exec event collector with documented completeness). Write raw observer output to
+an ephemeral mode-0600 file, never stream it to the Control Machine, scan it locally for the exact `SECRET_KEY`
+value and known encoded forms, then securely remove it. The report stores only `PASS`/`FAIL`, observer version,
+coverage limitations and timestamps. If the observer is unavailable, cannot attach to all child processes, or
+its output is truncated, record `INCOMPLETE`; do not infer PASS from absence in a sampled process list.
 
-**Rationale:** Polling `/proc/*/cmdline` over SSH network connections from the Control Machine introduces high
-latency and race conditions, missing short-lived helper processes. A local auditor on Master captures all
-executions reliably.
+**Rationale:** Process polling is inherently racy. A kernel-level exec observer gives a bounded observation
+of process creation. The raw trace contains sensitive argv and therefore must never become a normal diagnostic
+artifact. This verifies argv only; it does not prove absence from process environment, stdin, memory or files.
 
 ---
 
 ### D11: Operational Lifecycle and Disposable Baseline Policy in v1
 
-**Chosen:** In v1 (without cloud provider API adapters), disposable test VPS instances must be provisioned or
-re-imaged out-of-band by the operator before the test run.
-1. The Disposable Environment Gate (Phase 0.7) strictly rejects any VPS with existing GoWave directories,
-   running services, or listening ports.
-2. For a clean test run, `TEST_DESTROY_VPS_ON_SUCCESS` and `TEST_RESTORE_SNAPSHOT` will record `NOT_RUN` /
-   `TEARDOWN_UNAVAILABLE` on pre-existing VPS.
-3. To execute subsequent test runs, the operator must re-image the VPS via cloud hosting tools to restore
-   a clean OS baseline.
+**Chosen:** v1 accepts only operator-provisioned disposable VPS instances; it has no cloud provider adapter.
+Lifecycle policies are explicit and non-interchangeable:
+- `PRESERVE`: leave both VPS running and retain diagnostics; no uninstall is implied.
+- `RESTORE_SNAPSHOT`: allowed only when an externally managed snapshot identifier and restore procedure are
+  supplied and independently verified. The runner does not claim that the project uninstall command restores
+  OS packages, UFW, sysctl, swap/fstab, certificates or unrelated host state.
+- `DESTROY`: prohibited in v1 for pre-existing VPS. It is `NOT_RUN` with a reason. Future provider-managed
+  destruction requires an ownership record binding provider resource IDs to `TEST_RUN_ID`.
+A clean baseline gate is mandatory before installation. After `PRESERVE`, the next run requires operator
+re-image or a separately verified restore; running `gowave-auto.sh uninstall` is not an acceptable reset.
 
 **Rationale:** Attempting in-place uninstallation leaves residual files, modified kernel sysctl, and firewall
 state that invalidate clean-room acceptance testing. Clear documentation of this operational cycle prevents
@@ -273,13 +298,15 @@ Phase 2: Worker Deployment
   2.3  Verify Worker services, listeners, certs, deploy hook, cover-reality SHA256
   2.4  Poll Panel API isConnected until true (bounded NODE_READY_TIMEOUT)
 
-Phase 3: Public mTLS Verification
+Phase 3: Public mTLS Verification (execute allowed-source probes from Master)
   3.1  Extract SECRET_KEY payload from Master state (via SSH, in-memory)
-  3.2  Run verify_node_mtls.py --host WORKER_IP --port 3002 (subprocess from Master)
-  3.3  Parse outputs → MTLS_HANDSHAKE_PASS, MTLS_CERTIFICATE_VALIDATION_PASS
-  3.4  Verify WORKER_HTTP_HEALTH_PASS (200 OK from health endpoint)
-  3.5  Verify PANEL_WORKER_AUTH_PASS (Panel REST API perspective)
-  3.6  Run 5 negative mTLS sub-tests (wrong cert, wrong key, wrong SNI, wrong CA, no cert)
+  3.2  Run verify_node_mtls.py on Master against Worker:3002; retain raw output only in memory
+  3.3  Record verifier exit code, explicit TLSv1.3 handshake line, and HTTP status as separate observations
+  3.4  Treat 200 as HTTP health success; 401 as TLS/SNI reached HTTP layer but not authenticated health
+  3.5  Verify Panel↔Worker authenticated connectivity independently through Panel API state
+  3.6  Run client-cert rejected / no-client-cert server-side probes from Master
+  3.7  Run wrong-key local client-load test and wrong-server-CA client-verification test separately
+  3.8  Test wrong-SNI routing against observed NGINX/Xray behavior; do not assume a fixed TLS alert
 
 Phase 4: Panel API Audit
   4.1  GET /api/nodes — 2 nodes, correct addresses, 4 inbounds each, isConnected
@@ -296,9 +323,12 @@ Phase 5: Subscriptions
   5.6  Validate with mihomo -t
 
 Phase 6: Firewall
-  6.1  Master: local 127.0.0.1:3002 reachable; external MASTER_IP:3002 blocked (DROP)
-  6.2  Worker: Master egress IP determined; mTLS from Master allowed; Control Machine blocked (DROP)
-  6.3  IPv6 checks if ENABLE_IPV6=true
+  6.1  Master: loopback 127.0.0.1:3002 reachable; Control Machine public probe blocked
+  6.2  Worker: establish positive mTLS probe from Master first; record actual Master source IP seen by Worker
+  6.3  Compare observed source IP with the effective UFW allow rule; do not trust a separately queried egress IP alone
+  6.4  Control Machine negative probe must be paired with listener-positive and Master-positive controls
+  6.5  Confirm UFW DROP rule/counter or packet trace on Worker; TCP timeout alone is insufficient
+  6.6  Repeat equivalent checks over IPv6 when ENABLE_IPV6=true
 
 Phase 7: NGINX SNI + REALITY Decoy
   7.1  Panel HTTPS with correct SNI (TLS cert valid, Panel API responds)
@@ -309,16 +339,18 @@ Phase 7: NGINX SNI + REALITY Decoy
   7.6  cover-reality unique marker file accessible
   7.7  PROXY protocol integrity (inferred from correct Panel and Worker HTTPS responses)
 
-Phase 8: Data Plane E2E (8 × Xray + 8 × Mihomo)
-  8.1  For each of 8 endpoints:
-       - Extract outbound from real subscription
-       - Build temp Xray client config (unique SOCKS5 port, mode 0600)
-       - Start Xray subprocess, await SOCKS5 readiness
-       - curl socks5h://127.0.0.1:<port> https://cloudflare.com/cdn-cgi/trace
-       - Verify egress IP vs EXPECTED_*_EGRESS_IP
-       - Verify server-side inbound counter (SSH to target VPS)
-       - Stop Xray, delete temp config
-  8.2  Repeat 8 checks with Mihomo (if TEST_MIHOMO_TRAFFIC=true)
+Phase 8: Data Plane E2E (8 logical endpoints × 2 client runtimes = 16 required cases)
+  8.1  Logical endpoint matrix: Master × {VLESS REALITY, VLESS XHTTP, VLESS WS, Trojan gRPC}
+       and Worker × the same four protocols
+  8.2  For each logical endpoint, run a real Xray client case and a real Mihomo client case:
+       - Extract the corresponding proxy from the real subscription
+       - Build/validate a temporary Xray wrapper config or load the real Mihomo subscription
+       - Start the actual client process and wait for its local proxy listener
+       - Send HTTPS request through the selected proxy; verify HTTP response and observed egress IP
+       - Verify target VPS ingress evidence in an isolated observation window
+       - Stop client and remove temporary configuration
+  8.3  All 16 cases are mandatory for overall PASS. If a client runtime is intentionally disabled, mark its
+       eight cases SKIP and overall status INCOMPLETE. A syntax-only validation is not a runtime traffic pass.
 
 Phase 9: Negative Tests (NEG-01 .. NEG-15)
   Executed on disposable VPS; fault states cleaned up before next test where possible
