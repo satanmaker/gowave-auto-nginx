@@ -227,8 +227,8 @@ kernel-level observer that captures both syscall forms with the same completenes
 cannot be determined, the computed limit is invalid, or the installed strace cannot accept it, record
 `INCOMPLETE` and do not run a weaker observer as a fallback. Write raw output to a mode-0600 file inside a private `/run` tmpfs directory (mode `0700`), never persist it
 or stream it to the Control Machine, parse the strace-quoted argv including escaped bytes, scan locally for
-the exact `SECRET_KEY` and known encoded forms, then securely remove the raw trace. The observer must exit
-successfully, follow all descendants, and contain no truncated or unfinished exec records or observer errors.
+the exact `SECRET_KEY` and known encoded forms, then unlink the raw trace and remove the private tmpfs
+directory. Do not claim secure overwrite on SSD or journaled storage. The observer must exit successfully, follow all descendants, and contain no truncated or unfinished exec records or observer errors.
 The acceptance test MUST place a sentinel secret after byte 32 in arguments passed through both `execve` and
 `execveat`, then prove both complete values are present in the trace. The report stores only `PASS`/`FAIL`,
 observer version, effective string limit, coverage limitations and timestamps.
@@ -251,9 +251,18 @@ is implied.
 It requires `MASTER_SNAPSHOT_ID`, `WORKER_SNAPSHOT_ID`, an absolute `SNAPSHOT_RESTORE_HOOK` path, and a
 matching `SNAPSHOT_RESTORE_HOOK_SHA256`. Preflight verifies that the hook is a regular executable file owned
 by the runner user or root, is not group/world-writable, and matches the pinned SHA256; the digest is checked
-again immediately before execution. The runner invokes it directly with `shell=False`, sends a versioned JSON
-request containing `TEST_RUN_ID`, VPS addresses and snapshot IDs on stdin, and enforces `RESTORE_TIMEOUT`.
-The hook must exit zero and return valid JSON with `status=RESTORED` and matching snapshot IDs for both hosts.
+again immediately before execution. The hook path must not be a symlink; it must be a regular executable owned by the runner user or root and not
+group/world-writable. The runner invokes it directly with `shell=False` and sends this versioned JSON request
+on stdin:
+```json
+{"schema_version":1,"action":"restore","test_run_id":"...","master":{"address":"...","snapshot_id":"..."},"worker":{"address":"...","snapshot_id":"..."}}
+```
+The hook must exit zero and return valid JSON:
+```json
+{"schema_version":1,"status":"RESTORED","master":{"snapshot_id":"...","restored":true},"worker":{"snapshot_id":"...","restored":true}}
+```
+Both returned snapshot IDs must exactly match the request. Hook stdout/stderr are captured in memory and MUST
+NOT be published verbatim; the operation is bounded by `RESTORE_TIMEOUT`.
 The runner then reconnects to both VPS, recollects the Phase 0 baseline manifest, and verifies the required
 clean-baseline invariants before recording teardown `PASS`. Missing/invalid hook configuration is a preflight
 `FAIL`; hook timeout, nonzero exit, invalid/mismatched response, failed reconnection or baseline mismatch
