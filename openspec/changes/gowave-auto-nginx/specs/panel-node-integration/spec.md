@@ -128,17 +128,12 @@ The `gowave-node` daemon SHALL directly supervise the Xray core child process wi
 - **THEN** `gowave-node` detects process exit and automatically respawns Xray core.
 
 ### Requirement: Multi-Node Distributed Edge Podman Verification Gate
-The verification harness SHALL provide an automated dual-container Podman testbed (`./tests/podman_testbed.sh multi-node`) verifying end-to-end deployment of `gowave-node-auto.sh`, panel-to-node mTLS 1.3 handshake, firewall panel IP restriction, and direct edge client VPN data tunneling.
+The verification harness SHALL provide an automated dual-container Podman testbed (`./tests/podman_testbed.sh multi-node`) verifying deployment scaffolds, returning exit code 77 (unavailable/skipped) until full multi-node client tunneling is executed.
 
-#### Scenario: Automated multi-node deployment and mTLS connection in Podman testbed
-- **GIVEN** an isolated Podman bridge network connecting `gowave-panel` and `gowave-worker` containers
+#### Scenario: Multi-node Podman testbed scaffold status
+- **GIVEN** the isolated Podman bridge network scaffold in `tests/podman_testbed.sh`
 - **WHEN** `./tests/podman_testbed.sh multi-node` is executed
-- **THEN** it deploys GoWave Panel on the first container, deploys `gowave-node-auto.sh` on the second container via SSH stdin streaming, verifies successful mTLS 1.3 handshake with HKDF SNI (`rw-v1`), registers the worker node in the panel, and syncs users.
-
-#### Scenario: Worker node firewall panel IP restriction and edge traffic routing in Podman testbed
-- **GIVEN** a running multi-node Podman testbed
-- **WHEN** client VPN connections are initiated to the worker container port 443
-- **THEN** client traffic is routed directly by the worker's NGINX Stream and Xray inbounds without passing through the panel container, while the worker's UFW denies external access to `NODE_PORT=3002` from IPs other than the panel.
+- **THEN** it explicitly returns exit code 77 (unavailable/skipped), documenting that full multi-node E2E client data tunneling is deferred to dedicated live multi-node VPS testing, preventing false positive verification claims.
 
 #### Scenario: Multi-node discovery and node address uniqueness
 - **GIVEN** a panel managing `local-node` on address `127.0.0.1`

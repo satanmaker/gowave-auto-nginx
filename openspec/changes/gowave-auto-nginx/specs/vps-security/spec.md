@@ -64,7 +64,7 @@ The security subsystem SHALL provide filesystem-aware swap allocation (1 GiB) us
 #### Scenario: Swap creation on low-memory VPS
 - **GIVEN** a KVM VPS with <= 1GB RAM and no active swap
 - **WHEN** swap configuration is evaluated
-- **THEN** a 1GB swap file is created with mode 0600, activated via `swapon`, and recorded in `/etc/fstab`.
+- **THEN** it verifies that unmanaged `/swapfile` does not exist (refusing to overwrite), creates a 1GB swap file using filesystem-appropriate tools (handling Btrfs via `btrfs filesystem mkswapfile` and others via `fallocate`/`dd`), sets mode 0600, activates via `swapon`, and persists to `/etc/fstab` atomically only after successful activation.
 
 #### Scenario: Skip swap on containerized environments
 - **GIVEN** an LXC or OpenVZ container where `swapon` is restricted
