@@ -84,6 +84,13 @@ staging and production reuse.
   lineage migration updates all consumers and renewal hooks atomically before reload, or fails without
   replacing the active certificate
 
+#### Scenario: Existing global deploy hook is not overwritten or removed
+
+- **GIVEN** Master or Worker already contains
+  `/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` from another workflow
+- **WHEN** GoWave installation checks its ACME hook prerequisites or rollback executes
+- **THEN** installation fails before replacing the existing hook; rollback never deletes it, including when it is a symlink or non-regular object. A hook created by the current transaction is recorded with host-local ownership metadata and may be removed only if its current identity and digest still match that transaction
+
 #### Scenario: ACME parameter is unset
 
 - **GIVEN** `GOWAVE_ACME_SERVER` is unset
