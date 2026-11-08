@@ -427,6 +427,44 @@ negative-suite switch, so its effect on the acceptance gate must be normative.
 
 ---
 
+### D14: Optional Vision Is a Paired, Fail-Closed Capability
+
+**Chosen:** VLESS XTLS Vision is optional at the deployment level, but when enabled it is a required
+capability on both VPS. `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` MUST either both be configured
+or both be absent. A one-sided configuration is invalid and is rejected by the local config parser before
+SSH or any remote modification. This keeps the topology and runtime matrix unambiguous: four inbounds per
+node and sixteen client/runtime cases when disabled; five inbounds per node and twenty cases when enabled.
+
+When the pair is configured:
+
+1. Master installation MUST issue and cryptographically verify the Vision certificate in addition to the
+   Panel and REALITY certificates before compiling/provisioning the Master profile. The current best-effort
+   suppression of Vision Certbot/certificate-verification failures (`|| true`) MUST be removed for this E2E
+   path. A missing, wrong-ACME-lineage, expired, or hostname-invalid Vision certificate fails Master
+   installation and triggers rollback; the runner MUST NOT report a partial four-inbound Master as successful
+   Vision-enabled installation.
+2. `gowave-auto.sh node add` MUST receive the Worker Vision domain through an explicit named
+   `--vision-domain` option (not by shifting the existing optional SSH-user/SSH-port positional arguments).
+   It validates the domain, includes it in the Worker API profile via `compile_config_profile(...,
+   vision_domain=...)` and `provision_hosts(..., vision_domain=...)`, and records it in `state.json`.
+3. `gowave-node-auto.sh remote_payload` MUST serialize the Worker Vision domain over SSH stdin. Worker
+   installation MUST issue and verify its Vision certificate using the same selected `GOWAVE_ACME_SERVER`
+   as its Panel/REALITY certificates, validate the matching renewal lineage, configure the `8444` SNI route
+   and `9444` HTTP fallback, and fail closed if any requested Vision prerequisite is missing.
+4. Panel API acceptance MUST verify five inbounds and five corresponding hosts per node, including each
+   Vision inbound/host association. The subscription MUST expose one Vision proxy per VPS, and Xray and
+   Mihomo MUST each execute the two Vision endpoints as independent runtime cases.
+5. When both Vision domains are absent, the default four-inbound topology remains unchanged: no Vision
+   certificate issuance, no Vision SNI route/fallback, and no Vision subscription endpoint.
+
+**Rationale:** The current Master installer suppresses Vision certificate issuance/verification errors, while
+the current Worker dispatch does not propagate the Vision domain into Worker API provisioning or Worker
+certificate issuance. Treating Vision as active after either partial path can create mismatched Master/Worker
+profiles, missing TLS material, or an advertised proxy that cannot accept traffic. Pair validation and
+fail-closed activation make the sixteen-versus-twenty test matrix deterministic.
+
+---
+
 ## Runner Module Structure
 
 ```
@@ -476,7 +514,8 @@ Phase 1: Master Installation
   1.2  Copy pinned repo commit to Master /opt/gowave-auto-nginx
   1.3  Run gowave-auto.sh install with `GOWAVE_ACME_SERVER` derived from `ACME_MODE`; set
        `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1` and provide the pinned Node installer commit + SHA256;
-       pass `--vision-domain` if `MASTER_VISION_DOMAIN` is configured
+       when the validated Vision pair is enabled, pass `VISION_DOMAIN=MASTER_VISION_DOMAIN` in the
+       controlled environment and require Master Vision certificate issuance/verification to succeed
   1.4  Verify service states, listeners, TLS certs
   1.5  Verify credentials file (mode, owner, keys present — values not logged)
   1.6  Retrieve shortUuid (state.json + API cross-check)
@@ -488,8 +527,8 @@ Phase 1: Master Installation
 
 Phase 2: Worker Deployment
   2.1  Run `gowave-auto.sh node add worker-1` on Master with the same validated ACME directory and the
-       same Node-installer commit + SHA256 explicitly supplied again for the Worker dispatch;
-       pass `--vision-domain` if `WORKER_VISION_DOMAIN` is configured
+       same Node-installer commit + SHA256 explicitly supplied again for the Worker dispatch; when the
+       validated Vision pair is enabled, pass `--vision-domain WORKER_VISION_DOMAIN` as a named option
   2.2  Verify exit code, state.json, process argv observation (SECRET_KEY not in Master-side argv)
   2.3  Verify Worker services, listeners, certs, deploy hook, cover-reality SHA256
   2.4  Poll Panel API isConnected until true (bounded NODE_READY_TIMEOUT)
@@ -508,10 +547,10 @@ Phase 3: Public mTLS Verification (execute allowed-source probes from Master)
   3.7  Run wrong-key local client-load test and wrong-server-CA client-verification test separately
 
 Phase 4: Panel API Audit
-  4.1  GET /api/nodes — 2 nodes, correct addresses, 4 inbounds each (or 5 with vision), isConnected
-  4.2  GET /api/config-profiles — 2 profiles, 4 inbounds each (or 5 with vision), computed-config valid JSON
-  4.3  GET /api/internal-squads — Default MVP Squad, 8 inbound UUIDs (or 10 with vision), set equality
-  4.4  GET /api/hosts — 8 hosts (or 10 with vision), all fields verified, fingerprint="firefox", correct node/inbound associations
+  4.1  GET /api/nodes — 2 nodes, correct addresses, 4 inbounds each (or 5 with the validated Vision pair), isConnected
+  4.2  GET /api/config-profiles — 2 profiles, 4 inbounds each (or 5 with the validated Vision pair), computed-config valid JSON
+  4.3  GET /api/internal-squads — Default MVP Squad, 8 inbound UUIDs (or 10 with the validated Vision pair), set equality
+  4.4  GET /api/hosts — 8 hosts (or 10 with the validated Vision pair), all fields verified, fingerprint="firefox", correct node/inbound associations
 
 Phase 5: Subscriptions
   5.1  GET /api/users/by-username/default-user → shortUuid
@@ -630,17 +669,23 @@ is set. When the variable is unset outside the runner, existing production-defau
 **Propagation contract:**
 1. The runner derives the exact URL once and passes it to `gowave-auto.sh install` and `gowave-auto.sh node add`.
 2. `gowave-auto.sh install` and `domain-change` append `--server "$GOWAVE_ACME_SERVER"` to every Certbot issuance
-   call when set (two domain lineages in each path).
+   call when set. `install` issues two mandatory lineages (Panel and REALITY) and a third Vision lineage only
+   when the validated Vision pair is enabled; `domain-change` applies the selected server to every lineage it
+   issues for the domains being changed.
 3. `gowave-auto.sh node add` forwards the same value to `gowave-node-auto.sh remote_payload`.
-4. `remote_payload()` serializes the validated value into the SSH stdin script; Worker `certbot certonly`
-   calls for both Worker and REALITY domains use that exact URL.
+4. `remote_payload()` serializes the validated ACME URL and optional Worker Vision domain into the SSH stdin
+   script. Worker issues the two mandatory Worker/REALITY lineages and, when Vision is enabled, a third Vision
+   lineage; every requested Certbot call uses that exact URL. A configured Vision certificate is mandatory,
+   not best-effort.
 5. Before any certificate reuse, Master and Worker validate the renewal lineage's `server` directory URL
-   against the selected mode. Missing, unknown, or opposite-mode lineage metadata fails closed; do not infer
+   for every requested domain (including Vision when enabled) against the selected mode. Missing, unknown,
+   or opposite-mode lineage metadata fails closed; do not infer
    the ACME directory from a generic Let's Encrypt issuer string alone. A switch between modes requires a
    verified isolated lineage plus atomic consumer/renewal-hook path migration, or a fresh disposable baseline;
    never silently reuse or overwrite a cross-mode lineage.
-6. Tests cover both Master issuance calls, both Worker issuance calls, `domain-change`, SSH propagation, and
-   unset-variable backward compatibility.
+6. Tests cover both mandatory Master issuance calls, both mandatory Worker issuance calls, optional Vision
+   issuance on each host, `domain-change`, SSH propagation, lineage isolation for every configured domain,
+   and unset-variable backward compatibility.
 
 ---
 
@@ -678,13 +723,13 @@ the following strict schema:
 | `MASTER_IP` | IPv4 address | Yes | — | Public IPv4 of Master VPS (disallowed: RFC-1918, loopback, docs) |
 | `MASTER_PANEL_DOMAIN` | FQDN | Yes | — | Domain pointing to Master Panel NGINX HTTPS |
 | `MASTER_REALITY_DOMAIN` | FQDN | Yes | — | Camouflage decoy domain pointing to Master REALITY SNI |
-| `MASTER_VISION_DOMAIN` | FQDN | No | — | Optional dedicated domain for Master VLESS+XTLS Vision |
+| `MASTER_VISION_DOMAIN` | FQDN | Conditional pair | — | Master Vision domain; must be set together with `WORKER_VISION_DOMAIN` |
 | `MASTER_SSH_PORT` | Integer 1–65535 | No | `22` | Master SSH management port |
 | `MASTER_SSH_USER` | String | No | `root` | Master SSH login user |
 | `WORKER_IP` | IPv4 address | Yes | — | Public IPv4 of Worker VPS |
 | `WORKER_DOMAIN` | FQDN | Yes | — | Domain pointing to Worker NGINX HTTPS |
 | `WORKER_REALITY_DOMAIN` | FQDN | Yes | — | Camouflage decoy domain pointing to Worker REALITY SNI |
-| `WORKER_VISION_DOMAIN` | FQDN | No | — | Optional dedicated domain for Worker VLESS+XTLS Vision |
+| `WORKER_VISION_DOMAIN` | FQDN | Conditional pair | — | Worker Vision domain; must be set together with `MASTER_VISION_DOMAIN` |
 | `WORKER_SSH_PORT` | Integer 1–65535 | No | `22` | Worker SSH management port |
 | `WORKER_SSH_USER` | String | No | `root` | Worker SSH login user |
 | `SSH_KEY_PATH` | File path | Yes | — | Path to private SSH key for authentication |
