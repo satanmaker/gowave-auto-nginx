@@ -253,6 +253,8 @@ only be added to test-only trust stores. Vendoring the documented roots and pinn
 makes the test trust reproducible, reviewable, and independent of a mutable network download while preserving
 ordinary public trust for the E2E clients.
 
+---
+
 ### D10: Complete Process argv Observation During Worker Registration
 
 **Chosen:** Do not use periodic `/proc/*/cmdline` sampling or a Bash DEBUG trap as proof: both can miss
@@ -292,6 +294,8 @@ observer version, effective string limit, selected options, coverage limitations
 default abbreviation of structured syscall arguments. Both are required for a complete `argv` observation.
 The expanded raw trace can contain environment secrets, so it is strictly ephemeral. This verifies argv only;
 it does not prove absence from process environment, stdin, memory or files.
+
+---
 
 ### D11: Operational Lifecycle and Disposable Baseline Policy in v1
 
