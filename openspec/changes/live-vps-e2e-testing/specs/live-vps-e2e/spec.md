@@ -471,10 +471,9 @@ exists. Policy values are mutually exclusive; cleanup is idempotent and scoped t
 
 #### Scenario: Pre-existing VPS not destroyed
 
-- **GIVEN** `TEST_DESTROY_VPS_ON_SUCCESS=true` and VPS were manually provisioned (not created by Provider Adapter)
+- **GIVEN** `TEST_TEARDOWN_POLICY=DESTROY` and VPS were manually provisioned
 - **WHEN** the test run completes successfully
-- **THEN** the runner does NOT issue any destroy API call; it sets teardown status to `NOT_RUN` and records that
-  destruction of pre-existing VPS is prohibited
+- **THEN** configuration preflight fails before remote modification and records that destruction is unsupported in v1
 
 #### Scenario: Preserve policy after success or failure
 
