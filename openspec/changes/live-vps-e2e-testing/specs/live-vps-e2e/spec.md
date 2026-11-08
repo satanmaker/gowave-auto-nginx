@@ -497,8 +497,8 @@ Teardown is reported separately from test outcome; overall `PASS` requires the s
 - **GIVEN** `TEST_TEARDOWN_POLICY=RESTORE_SNAPSHOT`
 - **WHEN** configuration preflight validates the teardown policy
 - **THEN** both `MASTER_SNAPSHOT_ID` and `WORKER_SNAPSHOT_ID`, an absolute `SNAPSHOT_RESTORE_HOOK` path,
-  and `SNAPSHOT_RESTORE_HOOK_SHA256` MUST be supplied; the hook MUST be a regular executable owned by the
-  runner user or root, not group/world-writable, and its digest MUST match. Missing or invalid values fail
+  and `SNAPSHOT_RESTORE_HOOK_SHA256` MUST be supplied; the hook MUST be an absolute path to a non-symlink regular executable owned by the
+  runner user or root, not group/world-writable, and its digest MUST match before the run and immediately before execution. Missing or invalid values fail
   preflight before remote modification.
 
 #### Scenario: Restore hook receives a versioned request and returns both restored resources
