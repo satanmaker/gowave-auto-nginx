@@ -136,13 +136,24 @@ After running `gowave-auto.sh node add worker-1` from Master, the runner SHALL v
 recorded in `state.json`; Panel API entity created; SSH deployment used pre-pinned host key with
 `StrictHostKeyChecking=yes`; `SECRET_KEY` was not passed via process argv; `gowave-node.service` and
 `nginx.service` are active on Worker; certificates are valid; and NGINX config passes `nginx -t`.
+The argv assertion MUST use a complete descendant-following exec observer for both `execve` and `execveat`,
+with a positive string limit at least `32 * PAGE_SIZE`; sampling `/proc` is not acceptable evidence.
 
-#### Scenario: SECRET_KEY not in process argv at deployment time
+#### Scenario: SECRET_KEY not in complete process argv trace
 
-- **GIVEN** `gowave-auto.sh node add` is executing the SSH remote deployment
-- **WHEN** the runner observes running processes on Master during deployment
-- **THEN** no process argv contains the literal `SECRET_KEY` value; delivery is confirmed via stdin or
-  environment variable injection as implemented
+- **GIVEN** `gowave-auto.sh node add` is executing the SSH remote deployment on Master
+- **WHEN** the runner traces the entire descendant process tree with `strace -f -s N -e trace=execve,execveat`,
+  where `N=32 * os.sysconf("SC_PAGE_SIZE")`
+- **THEN** the observer exits successfully, every exec record is complete, the scanner parses escaped argv
+  bytes and finds no exact or known encoded `SECRET_KEY` value; only this complete observation can PASS
+
+#### Scenario: Long argv sentinel proves observer string completeness
+
+- **GIVEN** a test helper performs both `execve` and `execveat` with a sentinel embedded after the first 32
+  bytes of an argument
+- **WHEN** the argv observer acceptance test runs
+- **THEN** the complete sentinel is present in each corresponding trace record with no truncation marker; a
+  missing or truncated sentinel makes the observer acceptance test FAIL and the live observation INCOMPLETE
 
 #### Scenario: Worker node registered and connected in Panel
 
@@ -378,11 +389,13 @@ ingress evidence; syntax-only checks do not count as traffic verification.
 - **WHEN** a real Mihomo process sends an HTTPS request through the selected Worker proxy
 - **THEN** the request succeeds, egress is verified, Worker ingress evidence increases, and Master ingress evidence does not increase for that controlled request
 
-#### Scenario: Staging certificates are verified without disabling TLS validation
+#### Scenario: Staging and public CA chains are both trusted without bypass
 
-- **GIVEN** `ACME_MODE=staging` and a proxy transport terminates TLS with a Let's Encrypt Staging certificate
-- **WHEN** Xray or Mihomo performs the transport TLS handshake
-- **THEN** the client trusts the staging CA through a scoped trust bundle; `allowInsecure: true` is prohibited
+- **GIVEN** `ACME_MODE=staging` and the runner has built its scoped combined CA bundle
+- **WHEN** Python, curl, Xray and Mihomo perform their respective TLS requests
+- **THEN** each client validates both a Let's Encrypt Staging endpoint and an ordinary public-CA endpoint
+  (including the public HTTPS egress probe); an untrusted test CA is rejected; `allowInsecure` and
+  `skip-cert-verify` are prohibited
 
 #### Scenario: Ingress evidence is ambiguous
 
@@ -466,14 +479,26 @@ VPS.
 ### Requirement: Teardown Policy Enforcement
 
 The runner SHALL accept one `TEST_TEARDOWN_POLICY` enum: `PRESERVE` (default) or
-`RESTORE_SNAPSHOT`. `DESTROY` is rejected in v1 because VPS are operator-provisioned and no Provider Adapter
-exists. Policy values are mutually exclusive; cleanup is idempotent and scoped to the current run.
+`RESTORE_SNAPSHOT`. `DESTROY` is rejected in v1 during configuration preflight before remote modification.
+Policy values are mutually exclusive; cleanup is idempotent and scoped to the current run.
 
-#### Scenario: Pre-existing VPS not destroyed
+For `RESTORE_SNAPSHOT`, preflight SHALL require `MASTER_SNAPSHOT_ID`, `WORKER_SNAPSHOT_ID`, an absolute
+`SNAPSHOT_RESTORE_HOOK` executable path and a matching `SNAPSHOT_RESTORE_HOOK_SHA256`. The hook SHALL be a
+regular executable owned by the runner user or root, not group/world-writable, and its SHA256 SHALL be checked
+both during preflight and immediately before execution. The runner SHALL invoke the hook directly (no shell),
+send a versioned JSON request with the run ID, VPS addresses and snapshot IDs on stdin, and enforce
+`RESTORE_TIMEOUT`. A successful hook response SHALL be valid JSON with `status=RESTORED` and matching
+snapshot IDs for both hosts. The runner SHALL reconnect to both VPS and verify the required clean-baseline
+invariants against the pre-install manifest before teardown can PASS. Missing or invalid hook configuration
+fails preflight before remote modification. A timeout, nonzero exit, malformed/mismatched response, failed
+reconnection or baseline mismatch SHALL set teardown status to `TEARDOWN_FAILED`; it MUST NOT be reported
+as a successful restore.
 
-- **GIVEN** `TEST_TEARDOWN_POLICY=DESTROY` and VPS were manually provisioned
-- **WHEN** the test run completes successfully
-- **THEN** configuration preflight fails before remote modification and records that destruction is unsupported in v1
+#### Scenario: Destroy policy rejected before the run starts
+
+- **GIVEN** `TEST_TEARDOWN_POLICY=DESTROY`
+- **WHEN** configuration preflight validates the teardown policy
+- **THEN** preflight fails before any remote modification and records that destruction is unsupported in v1
 
 #### Scenario: Preserve policy after success or failure
 
@@ -482,11 +507,18 @@ exists. Policy values are mutually exclusive; cleanup is idempotent and scoped t
 - **THEN** diagnostics are collected, the actual test outcome is retained, teardown is recorded separately as
   `PASS`, and neither VPS is modified or destroyed
 
-#### Scenario: Snapshot restore policy when snapshot absent
+#### Scenario: Snapshot restore hook configuration is incomplete
 
-- **GIVEN** `TEST_TEARDOWN_POLICY=RESTORE_SNAPSHOT` and no externally verified snapshot ID/procedure is supplied
-- **WHEN** teardown starts
-- **THEN** no restore is attempted and teardown status is `NOT_RUN` with a reason
+- **GIVEN** `TEST_TEARDOWN_POLICY=RESTORE_SNAPSHOT` and one or more required snapshot IDs, hook path or SHA256
+  values are missing or invalid
+- **WHEN** configuration preflight validates the teardown policy
+- **THEN** preflight fails before any remote modification and reports the missing or invalid input
+
+#### Scenario: Snapshot restore hook does not restore both hosts
+
+- **GIVEN** preflight accepted the SHA256-pinned restore hook and both snapshot IDs
+- **WHEN** the hook times out, exits nonzero, returns invalid/mismatched JSON, or restored VPS fail the baseline check
+- **THEN** teardown is `TEARDOWN_FAILED`; neither test nor teardown status may be represented as overall `PASS`
 
 ---
 
@@ -496,13 +528,6 @@ The runner SHALL write per-run artifacts to `artifacts/live-vps/<TEST_RUN_ID>/` 
 `junit.xml`, `summary.txt`, and structured log files. The following data SHALL NOT appear in any artifact:
 credentials file content, `.env` file content, `SECRET_KEY`, private keys, admin password, scoped API
 token, raw `shortUuid`, or subscription content containing private parameters.
-
-#### Scenario: Destroy policy rejected in v1
-
-- **GIVEN** `TEST_TEARDOWN_POLICY=DESTROY`
-- **WHEN** configuration preflight runs
-- **THEN** preflight fails before remote modification and reports that destruction is unsupported for
-  operator-provisioned VPS
 
 #### Scenario: Redacted copy of credentials file
 
