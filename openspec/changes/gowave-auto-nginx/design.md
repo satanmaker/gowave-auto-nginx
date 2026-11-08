@@ -547,8 +547,9 @@ To guarantee recovery resilience, administrative credentials (username, strong 2
   ```ini
   [Service]
   Environment="NODE_PORT=3002"
+  ExecStartPost=/usr/bin/env bash -c 'for i in {1..30}; do if ss -Hltn "sport = :$node_port" 2>/dev/null | grep -q "$node_port" || (: < /dev/tcp/127.0.0.1/$node_port) 2>/dev/null; then exit 0; fi; sleep 0.5; done; exit 1'
   ```
-  This guarantees that the node daemon unconditionally binds to port 3002 on All-in-One deployments.
+  This guarantees that the node daemon unconditionally binds to port 3002 on All-in-One deployments, and systemd fails closed if the TCP listener does not come online within 15 seconds. Note that reachability is verified strictly via kernel socket / TCP connect (`ss` and `/dev/tcp`) rather than HTTP/TLS requests (`curl -k`), because `gowave-node` runs with `SNI_VERIFICATION=true` and rejects any TLS handshake lacking dynamic HKDF-derived SNI with `http: TLS handshake error: unknown sni`.
 
 #### Remote Worker SSH Stdin Pipeline Orchestration (`remote_payload`)
 To deploy remote worker nodes over SSH without depending on `scp`, creating messy file transfers, or leaving orphaned scripts or credentials on target machines:
@@ -790,6 +791,7 @@ Worker node addition (`gowave-auto.sh node add`) operates under an independent t
 - When configuring `gowave-node`, the secret is delivered strictly via standard input (`stdin`) or written to a private temporary file with mode `0600` that is unlinked immediately after ingestion.
 - The secret key is **never passed in CLI arguments** (`argv`), preventing credential exposure via `/proc/<pid>/cmdline` or `ps aux`.
 - `SNI_VERIFICATION=true` is explicitly set in `/opt/gowave-node/.env`.
+- Initial administrative credentials are saved via `save_credentials` (implemented natively in both Bash and Python with `umask 077`, mode `0600`, and immediate directory sync) into `/root/gowave-credentials.txt` prior to calling registration APIs.
 
 ---
 

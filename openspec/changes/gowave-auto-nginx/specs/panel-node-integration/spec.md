@@ -35,7 +35,7 @@ The orchestration system SHALL utilize the upstream `gowave-node/install.sh` ins
 #### Scenario: Node port configuration override and systemd drop-in verification
 - **GIVEN** an All-in-One deployment where `NODE_PORT=3002` is exported
 - **WHEN** `gowave-node/install.sh` executes
-- **THEN** the upstream installer validates the numeric port, writes `NODE_PORT=3002` to `/opt/gowave-node/.env`, the orchestrator writes systemd drop-in `10-port.conf` with `Environment="NODE_PORT=3002"`, and `gowave-node` binds to port 3002.
+- **THEN** the upstream installer validates the numeric port, writes `NODE_PORT=3002` to `/opt/gowave-node/.env`, the orchestrator writes systemd drop-in `10-port.conf` with `Environment="NODE_PORT=3002"` and fail-closed loopback TCP listener check (`ss -Hltn` and `/dev/tcp`), and `gowave-node` binds to port 3002 without triggering mTLS SNI handshake errors.
 
 ### Requirement: Remote Worker Node Deployment with Firewall Whitelisting
 The installer SHALL provide an independent automated worker script (`gowave-node-auto.sh`) that provisions `gowave-node` on remote edge servers using upstream installer routines, configures `NODE_PORT` (recommended default 3002), and whitelists access strictly from the Control Plane IP (both IPv4 and IPv6).

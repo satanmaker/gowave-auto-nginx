@@ -64,7 +64,7 @@ The update module SHALL execute SQLite Online Backup, capture a persistent snaps
 #### Scenario: Interrupted provisioning recovery after reboot
 - **GIVEN** a host that lost power while `journal.json` was in `PROVISION_*` or `NODE_ADD_*` state
 - **WHEN** systemd starts `gowave.service` and executes `gowave-recover-provision.service`
-- **THEN** `gowave-auto.sh recover --boot-provision` confirms panel health, executes reverse-order API cleanup of partial entities from `state.json.tmp`, and transitions journal state to `ROLLED_BACK`.
+- **THEN** `gowave-auto.sh recover --boot-provision` confirms panel health, executes reverse-order API cleanup of partial entities (`Tokens` -> `Users` -> `Hosts` -> `Squads` -> `Nodes` -> `Profiles`), and transitions journal state to `PROVISION_ROLLED_BACK` (or `NODE_ADD_ROLLED_BACK`).
 
 #### Scenario: Initial provisioning failure rollback
 - **GIVEN** an initial installation where provisioning fails midway while creating Host records or binding nodes
