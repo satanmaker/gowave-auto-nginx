@@ -191,7 +191,10 @@ This trace does not observe remote Worker processes beyond the SSH boundary.
 
 ### Requirement: Public mTLS Control Plane Verification (Master → Worker)
 
-The runner SHALL verify the public mTLS 1.3 control-plane connection from Master to Worker:3002 using credentials extracted on Master by `/opt/gowave/gowave-server rescue --print-secret-key-raw`, matching the existing `modules/node.sh:extract_secret_key` implementation. `SECRET_KEY` is not read from `state.json` or `/root/gowave-credentials.txt`. Probes requiring access to Worker:3002 MUST originate from Master because Worker UFW allowlists Master's actual source address. The runner SHALL report cryptographic input validation, TLS handshake, HTTP response, and authenticated Panel connectivity as distinct observations; it SHALL NOT invent output markers absent from the existing verifier.
+The runner SHALL verify public mTLS 1.3 control-plane connectivity from Master to Worker:3002 using
+credentials extracted via `modules/node.sh:extract_secret_key` on Master. All Worker:3002 probes MUST originate
+from Master. The runner SHALL independently report cryptographic validation, TLS handshake, HTTP health, and
+authenticated Panel connectivity using existing verifier markers.
 
 #### Scenario: Existing verifier succeeds with valid credentials
 
@@ -243,11 +246,9 @@ The runner SHALL verify the public mTLS 1.3 control-plane connection from Master
 
 ### Requirement: TLS-aware Bounded Panel API Client
 
-The runner SHALL call the real Panel through its public HTTPS endpoint with strict hostname and certificate
-verification. The client SHALL support the scoped combined CA bundle (including Staging roots when
-`ACME_MODE=staging`) and configured `API_TIMEOUT`. The current `GoWaveClient` defaults do not expose an SSL
-context or configurable timeout; the implementation SHALL add backward-compatible optional constructor
-parameters and pass them to `urllib.request.urlopen`, while preserving existing defaults for current callers.
+The runner SHALL query Panel REST APIs over public HTTPS with strict hostname and certificate validation.
+The client SHALL support an injected SSLContext and configurable `API_TIMEOUT` via backward-compatible
+optional constructor parameters passed to `urllib.request.urlopen`, preserving existing defaults when omitted.
 
 #### Scenario: Panel API client uses scoped trust and configured timeout
 
@@ -592,16 +593,10 @@ Teardown is reported separately from test outcome; overall `PASS` requires the s
 
 ### Requirement: Durable Run State for Partial CLI Modes
 
-The runner SHALL persist an atomic mode-`0600` `run-state.json` under
-`artifacts/live-vps/<TEST_RUN_ID>/`. A fresh `--mode preflight` without `--run-id` generates a unique run ID;
-it may accept an explicitly supplied unused ID. Preflight is read-only with respect to both VPS and creates
-the initial state record plus baseline-manifest reference locally. It MUST print the generated run ID so the
-operator can pass it to the next partial mode. `--mode full` also creates a new run ID and executes all phases
-in one invocation; an existing run directory MUST NOT be overwritten. The state SHALL contain only the
-repository commit, non-secret target/config identity, baseline-manifest reference, phase statuses and
-timestamps. It SHALL NOT contain credentials, tokens, `SECRET_KEY`, `shortUuid`, subscription bodies, or
-hashes of secret values. Every partial mode after `preflight` requires `--run-id` and a matching run-state
-record.
+The runner SHALL persist an atomic mode-`0600` `run-state.json` under `artifacts/live-vps/<TEST_RUN_ID>/`
+containing non-secret execution metadata, phase statuses, and timestamps. Partial modes following `preflight`
+SHALL require `--run-id` and a matching state record. The runner SHALL never overwrite existing run directories
+or persist credentials, tokens, or secret keys.
 
 #### Scenario: Partial mode cannot resume a different run or repeat completed installation
 
