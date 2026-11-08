@@ -12,14 +12,20 @@ import sys
 import time
 
 VALID_OPS = {"provision", "node_add", "update", "channel_switch", "restore"}
-VALID_STATES = {
-    # Update / Restore / Channel switch
-    "PREPARED", "APPLYING", "VERIFYING", "COMMITTED", "ROLLBACK_REQUIRED", "ROLLED_BACK",
-    # Initial Provision
-    "PROVISION_PREPARED", "PROVISION_APPLYING", "PROVISION_VERIFYING", "PROVISION_COMMITTED", "PROVISION_ROLLBACK_REQUIRED", "PROVISION_ROLLED_BACK",
-    # Node Add
-    "NODE_ADD_PREPARED", "NODE_ADD_APPLYING", "NODE_ADD_VERIFYING", "NODE_ADD_COMMITTED", "NODE_ADD_ROLLBACK_REQUIRED", "NODE_ADD_ROLLED_BACK",
+OP_ALLOWED_STATES = {
+    "provision": {
+        "PROVISION_PREPARED", "PROVISION_APPLYING", "PROVISION_VERIFYING",
+        "PROVISION_COMMITTED", "PROVISION_ROLLBACK_REQUIRED", "PROVISION_ROLLED_BACK",
+    },
+    "node_add": {
+        "NODE_ADD_PREPARED", "NODE_ADD_APPLYING", "NODE_ADD_VERIFYING",
+        "NODE_ADD_COMMITTED", "NODE_ADD_ROLLBACK_REQUIRED", "NODE_ADD_ROLLED_BACK",
+    },
+    "update": {"PREPARED", "APPLYING", "VERIFYING", "COMMITTED", "ROLLBACK_REQUIRED", "ROLLED_BACK"},
+    "restore": {"PREPARED", "APPLYING", "VERIFYING", "COMMITTED", "ROLLBACK_REQUIRED", "ROLLED_BACK"},
+    "channel_switch": {"PREPARED", "APPLYING", "VERIFYING", "COMMITTED", "ROLLBACK_REQUIRED", "ROLLED_BACK"},
 }
+VALID_STATES = {st for states in OP_ALLOWED_STATES.values() for st in states}
 
 
 class JournalValidationError(Exception):
@@ -35,11 +41,22 @@ def validate_journal(journal_data):
         if field not in journal_data:
             raise JournalValidationError(f"Missing required journal field: {field}")
 
-    if journal_data["op"] not in VALID_OPS:
-        raise JournalValidationError(f"Invalid operation in journal: {journal_data['op']}")
+    op = journal_data["op"]
+    if op not in OP_ALLOWED_STATES:
+        raise JournalValidationError(f"Invalid operation in journal: {op}")
 
-    if journal_data["state"] not in VALID_STATES:
-        raise JournalValidationError(f"Invalid state in journal: {journal_data['state']}")
+    state = journal_data["state"]
+    if state not in OP_ALLOWED_STATES[op]:
+        raise JournalValidationError(f"Invalid state '{state}' for operation '{op}'")
+
+    ts = journal_data["timestamp"]
+    if not isinstance(ts, (str, int, float)) or (isinstance(ts, str) and not ts.strip()):
+        raise JournalValidationError(f"Invalid timestamp in journal: {ts}")
+
+    if "transaction_id" in journal_data:
+        tid = journal_data["transaction_id"]
+        if not isinstance(tid, str) or not tid.strip():
+            raise JournalValidationError(f"Invalid transaction_id in journal: {tid}")
 
     return True
 

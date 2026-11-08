@@ -122,29 +122,17 @@ verify_node_mtls_health() {
     local secret_b64="$1"
     local node_port="${2:-$DEFAULT_NODE_PORT}"
     local host="${3:-127.0.0.1}"
+    local mode="${4:-full}"
 
-    echo "Verifying mTLS 1.3 handshake with HKDF-derived SNI..."
-    python3 -c "
-import base64
-import json
-import ssl
-import sys
-import urllib.request
+    echo "Verifying mTLS 1.3 handshake with HKDF-derived SNI on $host:$node_port..."
+    local verifier_py="$SCRIPT_DIR/modules/verify_node_mtls.py"
+    if [[ ! -f "$verifier_py" ]]; then
+        verifier_py="$(dirname "${BASH_SOURCE[0]}")/verify_node_mtls.py"
+    fi
 
-secret_b64 = '$secret_b64'
-try:
-    decoded = json.loads(base64.b64decode(secret_b64).decode('utf-8'))
-except Exception as e:
-    # Check if raw or nested
-    sys.exit(0) # In mock/testing environment, accept validation
-
-# Verify payload contains required cryptographic fields
-for k in ('caCertPem', 'jwtPublicKey', 'nodeCertPem', 'nodeKeyPem'):
-    if k not in decoded:
-        print(f'Error: Missing {k} in secret key payload', file=sys.stderr)
-        sys.exit(1)
-
-print('Secret key payload contains valid mTLS certificates and JWT public key.')
-"
-    return 0
+    # Pass secret key strictly over standard input (zero-leak argv compliance)
+    printf '%s' "$secret_b64" | python3 "$verifier_py" \
+        --host "$host" \
+        --port "$node_port" \
+        --mode "$mode"
 }

@@ -144,22 +144,47 @@ server {
     }
 }
 EOF
-    nginx -t -q && systemctl reload nginx || systemctl restart nginx || true
+    nginx -t
+    systemctl reload nginx || systemctl restart nginx
+    systemctl is-active --quiet nginx || { echo "Fatal: NGINX failed to activate bootstrap ACME config" >&2; return 1; }
 
+    echo "Acquiring Let's Encrypt TLS certificate for Worker ($WORKER_DOMAIN)..."
     certbot certonly --webroot -w /var/www/gowave-acme \
         -d "$WORKER_DOMAIN" --cert-name "$WORKER_DOMAIN" \
-        --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring || true
+        --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring
 
+    echo "Acquiring Let's Encrypt TLS certificate for REALITY decoy ($REALITY_DOMAIN)..."
     certbot certonly --webroot -w /var/www/gowave-acme \
         -d "$REALITY_DOMAIN" --cert-name "$REALITY_DOMAIN" \
-        --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring || true
+        --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring
 
     rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf
+
+    # Verify both certificates exist and are non-empty
+    [[ -s "/etc/letsencrypt/live/$WORKER_DOMAIN/fullchain.pem" ]] || { echo "Fatal: $WORKER_DOMAIN certificate missing" >&2; return 1; }
+    [[ -s "/etc/letsencrypt/live/$WORKER_DOMAIN/privkey.pem" ]] || { echo "Fatal: $WORKER_DOMAIN private key missing" >&2; return 1; }
+    [[ -s "/etc/letsencrypt/live/$REALITY_DOMAIN/fullchain.pem" ]] || { echo "Fatal: $REALITY_DOMAIN certificate missing" >&2; return 1; }
+    [[ -s "/etc/letsencrypt/live/$REALITY_DOMAIN/privkey.pem" ]] || { echo "Fatal: $REALITY_DOMAIN private key missing" >&2; return 1; }
+
+    # Configure automated ACME reload hook for Worker
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+    cat > /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh <<'EOF'
+#!/bin/sh
+if nginx -t -q; then
+    systemctl reload nginx
+fi
+EOF
+    chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh
 
     # Hook top-level stream if missing
     if ! grep -q 'stream-enabled' /etc/nginx/nginx.conf; then
         sed -i '/events {/i stream { include /etc/nginx/stream-enabled/*.conf; }' /etc/nginx/nginx.conf || \
         echo "stream { include /etc/nginx/stream-enabled/*.conf; }" >> /etc/nginx/nginx.conf
+    fi
+
+    local listen_v6=""
+    if [[ -f /proc/net/if_inet6 ]] && [[ -s /proc/net/if_inet6 ]]; then
+        listen_v6="listen [::]:443 so_keepalive=on;"
     fi
 
     # Stream SNI Preread on 443
@@ -173,6 +198,7 @@ map \$ssl_preread_server_name \$worker_dest {
 
 server {
     listen 443 so_keepalive=on;
+    $listen_v6
     ssl_preread on;
     proxy_protocol on;
     proxy_timeout 1h;
@@ -263,7 +289,9 @@ server {
 }
 EOF
 
-    nginx -t -q && systemctl reload nginx || systemctl restart nginx || true
+    nginx -t
+    systemctl reload nginx || systemctl restart nginx
+    systemctl is-active --quiet nginx || { echo "Fatal: NGINX failed to activate production configuration" >&2; return 1; }
 }
 
 run_upstream_node_installer() {
