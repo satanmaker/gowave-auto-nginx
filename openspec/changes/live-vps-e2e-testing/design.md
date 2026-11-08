@@ -81,7 +81,10 @@ that expand the attack surface. Shell `source` — rejected per AGENTS.md zero-l
 
 **Chosen:**
 1. **Positive verification** runs `modules/verify_node_mtls.py` on Master (the allowed source address),
-   with the base64 `SECRET_KEY` payload supplied over stdin. The runner records the verifier exit code,
+   with the already-Base64-encoded `SECRET_KEY` value returned by `modules/node.sh:extract_secret_key`
+   supplied unchanged over stdin. The existing extractor returns the encoded value consumed by the verifier;
+   `verify_node_mtls.py` performs exactly one `base64.b64decode()` before parsing the JSON payload. The runner
+   MUST NOT Base64-encode this value a second time. The runner records the verifier exit code,
    negotiated TLS version and HTTP status as separate observations. It MUST NOT parse synthetic markers that
    the current verifier does not emit. The existing verifier prints `Handshake SUCCESS`, `Node response`,
    and `mTLS 1.3 control plane verification PASSED`; it treats both `200 OK` and `401 Unauthorized` as
@@ -183,11 +186,30 @@ ordering. The total run time is dominated by installation and certificate issuan
 
 ### D8: Run-Level Locking
 
-**Chosen:** A per-(MASTER_IP, WORKER_IP) lock file at `/tmp/gowave-e2e-<hash>.lock` using `fcntl.flock`
-with `LOCK_EX | LOCK_NB`. Failure to acquire → immediate exit with clear message.
+**Chosen:** Use both a local process lock and authoritative remote locks; a local-only lock is not sufficient
+to protect a shared VPS pair from two different Control Machines.
 
-**Rationale:** Concurrent tests on the same VPS pair would corrupt state, duplicate API objects, and produce
-unreliable results. The lock is released on process exit (normal or signal).
+1. The Control Machine acquires a per-target local `fcntl.flock(LOCK_EX | LOCK_NB)` in a private runtime
+   directory owned by the runner user (directory mode `0700`, lock file mode `0600`, opened without following
+   symlinks). This prevents duplicate runner processes on one Control Machine.
+2. Before any deployment or fault-injection mutation, acquire an authoritative kernel `flock` on both
+   target VPS hosts at `/run/lock/gowave-live-vps.lock`. Acquire the two host locks in deterministic
+   address order; if either acquisition fails, release the first and abort before remote modification.
+   Hold each lock through a dedicated non-PTY SSH session for the complete run/partial operation. The
+   remote SSH session is the lock holder; use bounded SSH keepalives and treat loss of either lock-holder
+   session as loss of exclusivity.
+3. The remote lock file may remain after release: lock ownership is determined by the kernel `flock`, not
+   file existence. Never remove a lock file to force acquisition. A contender that cannot acquire either
+   lock fails closed. The lock owner metadata (run ID, Control Machine identity, start time) is informational
+   only and MUST NOT override a held kernel lock.
+4. If either remote lock-holder session is lost during a run, stop starting new mutating phases, record
+   `INCOMPLETE`, attempt only bounded safe diagnostics/cleanup, and do not silently reconnect and continue
+   without reacquiring both locks and validating the saved run state.
+
+**Rationale:** A lock under `/tmp` on the Control Machine only serializes processes on that one machine.
+Two operators or CI runners on different hosts could otherwise mutate the same Master or Worker at once.
+Authoritative locks on both VPS hosts coordinate all controllers that use the target machines; deterministic
+acquisition order prevents lock-order deadlocks. The local lock remains a cheap first-line guard.
 
 ---
 
@@ -414,7 +436,9 @@ tools/
 ```
 Phase 0: Preflight
   0.1  Config load + validate (whitelist parser, reserved IP rejection)
-  0.2  Run-level lock acquire
+  0.2  Acquire the local per-target `fcntl.flock` in the private runtime directory
+  0.9  Acquire and hold authoritative `flock` sessions on both VPS hosts in deterministic address order;
+       preflight-only runs release them on exit; all mutating phases require both locks
   0.3  Control Machine tool check (python3, ssh, openssl, curl, dig, xray, mihomo)
   0.4  SSH trust check (both VPS, StrictHostKeyChecking=yes)
   0.5  DNS verification (4 domains, A/AAAA, 2+ resolvers)
@@ -443,8 +467,8 @@ Phase 2: Worker Deployment
 Phase 3: Public mTLS Verification (execute allowed-source probes from Master)
   3.1  On Master, run `/opt/gowave/gowave-server rescue --print-secret-key-raw` via the existing
        `modules/node.sh:extract_secret_key` contract; capture stdout in memory only (not state.json or credentials)
-  3.2  Base64-encode the payload as required by `verify_node_mtls.py`, feed it to verifier stdin, and run
-       the verifier on Master against Worker:3002; retain raw output only in memory
+  3.2  Feed the already-Base64-encoded extractor output unchanged to verifier stdin (do NOT encode it again);
+       the verifier performs one base64 decode. Run it on Master against Worker:3002 and retain raw output only in memory
   3.3  Parse only actual verifier output: `Payload cryptographic verification PASSED`,
        `Handshake SUCCESS: TLSv1.3 negotiated`, `Node response: <status line>`, and exit code;
        never persist derived SNI or payload
@@ -473,7 +497,9 @@ Phase 6: Firewall
   6.1  Master: loopback 127.0.0.1:3002 reachable; Control Machine public probe blocked
   6.2  Worker: establish positive mTLS probe from Master first; record actual Master source IP seen by Worker
   6.3  Compare observed source IP with the effective UFW allow rule; do not trust a separately queried egress IP alone
-  6.4  Control Machine negative probe must be paired with listener-positive and Master-positive controls
+  6.4  Observe the actual Control Machine probe source address on the target VPS and compare it with the
+       Master source address allowed by UFW; if they are equal, the Worker negative probe cannot prove
+       isolation and MUST be `INCOMPLETE` (use a distinct external probe vantage for PASS)
   6.5  Confirm DROP evidence on the target host: Master evidence for Master external probes; Worker evidence for Control Machine → Worker probes
   6.6  Repeat equivalent checks over IPv6 when ENABLE_IPV6=true
 
@@ -502,11 +528,17 @@ Phase 8: Data Plane E2E (8 logical endpoints × 2 client runtimes = 16 required 
        eight cases SKIP and overall status INCOMPLETE. A syntax-only validation is not a runtime traffic pass.
 
 Phase 9: Negative Tests (NEG-01 .. NEG-15)
-  Executed on disposable VPS; fault states cleaned up before next test where possible
+  NEG-01..NEG-04 are isolated preflight contract tests using temporary known_hosts/config fixtures and
+  mocked SSH/DNS responses; never mutate the operator's real known_hosts file, public DNS, or SSH firewall.
+  NEG-05 uses an isolated Certbot failure fixture/failpoint (or an explicitly isolated staging test domain)
+  with guaranteed cleanup; it MUST NOT damage the active control domains or production lineages.
+  NEG-06..NEG-15 run only against confirmed disposable VPS state, with per-case cleanup and baseline checks;
+  any case that cannot restore its required preconditions is INCOMPLETE and stops dependent cases.
   If TEST_NEGATIVE_SUITE=false, record all 15 as SKIP and force overall INCOMPLETE (never PASS)
 
 Phase 10: Diagnostics Collection
-  SSH dump: OS, packages, systemd, listeners, firewall, nginx -t, cert metadata, API summaries
+  SSH dump: OS, packages, systemd, listeners, firewall, nginx -t, cert metadata, API summaries, and the
+  full version/digest inventory required by the result.json schema (Control Machine, Master, Worker).
   All written via redact-on-write; no plaintext secrets in any file
 
 Phase 11: Teardown
