@@ -82,8 +82,9 @@ cmd_health() {
         echo "[PASS] GoWave Panel listener (127.0.0.1:3000) is healthy."
     fi
 
-    if ! curl -k -s -o /dev/null "https://127.0.0.1:3002/" 2>/dev/null; then
-        echo "[WARN] GoWave Node listener (127.0.0.1:3002) did not return standard response." >&2
+    if ! ss -Hltn "sport = :3002" 2>/dev/null | grep -q "3002" && \
+       ! (: < /dev/tcp/127.0.0.1/3002) 2>/dev/null; then
+        echo "[WARN] GoWave Node listener (127.0.0.1:3002) is not listening." >&2
     else
         echo "[PASS] GoWave Node listener (127.0.0.1:3002) is active."
     fi
