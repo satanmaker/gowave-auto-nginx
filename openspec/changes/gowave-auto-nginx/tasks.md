@@ -99,7 +99,7 @@
 - [x] 11.3 Implement exclusive file locking (`/run/lock/gowave-auto.lock`) preventing concurrent conflicting operations
 - [x] 11.4 Implement installation progress checkpoints allowing resumed execution or safe rollback on interrupted initial setups
 - [x] 11.5 Implement atomic domain change with DNS preflight validation and rollback to old domain if ACME challenge fails
-- [x] 11.6 Implement safe uninstall inspecting `# Managed by GoWave Auto NGINX` ownership markers, cleanly removing project vhosts, `/opt/gowave`, `/opt/gowave-node`, and the stream block in `/etc/nginx/nginx.conf` without purging system packages
+- [x] 11.6 Implement conservative uninstall of managed services and project vhosts without purging system packages; preserve application data, Worker binaries, certificates, and recovery state by default when ownership cannot be proven.
 
 ## 12. 5-Suite Testing Architecture & Verification
 
@@ -110,18 +110,18 @@
 - [x] 12.5 Implement Suite `services` (unprivileged EUID != 0): live userland daemon execution, client REALITY handshake, scanner fallback to 9443 cover site, XHTTP bidirectional streaming, WebSocket upgrade, live Trojan gRPC handshake over HTTP/2, separate retrieval of Xray JSON and Mihomo YAML with User-Agent positive and negative tests, client parser validation via official Xray (`v24.11.30`+ / `v25.x`) and Mihomo (`v1.19.22`+) binaries, assertion that `acceptProxyProtocol` is absent on inbounds 10001-10003, and outbound SSRF loopback/metadata blocking checks
 - [x] 12.6 Implement Suite `root` (EUID 0): user/group creation (`gowave:gowave`), sticky bit permissions (1770), service install verification, zero-leak secret delivery verification, Fail2ban syntax check, NGINX Stream 443 SNI demultiplexing, disabled IPv6 Stream fallback test (`test_ipv6_disabled_stream`), worker direct edge tunneling, UFW external port 3002 isolation with active fail-closed verification, `certbot renew --dry-run` with NGINX online (using local Pebble ACME fixture in container CI), decoy TLS 1.3 / h2 negotiation, backup 15-point preflight validation, backup under strict umask 077 (`test_backup_strict_umask`), runtime environment and swap verification (`test_gomemlimit_applied`), journal schema validation (`test_journal_schema_validation`), and sequential multi-node add verification
 - [x] 12.7 Integrate GoWave Node upstream test suite: run `go test ./...`, `go vet`, ShellCheck, `python3 tests/test_scripts.py`, and `gowave-node status --wait-ready` CLI verification
-- [x] 12.8 Implement Suite `systemd` QEMU TCG runner (`tests/systemd/boot.sh`): verify PID 1 systemd cold boot, All-in-One port bindings, service persistence across reboot, power cut journal recovery, and backup/restore across Ubuntu 24.04, 26.04, Debian 12, and Debian 13
+- [ ] 12.8 Complete and execute genuine Suite `systemd` QEMU TCG acceptance across all four target OSs. `tests/systemd/boot.sh` is a separate strict runner requiring a prepared distro-specific `rootfs.tar`; GitHub Actions currently runs static systemd-unit contract tests, not QEMU cold boots.
 - [x] 12.9 Implement `tests/podman_testbed.sh` compiling systemd-enabled testbed images via `tests/Containerfile.testbed` (installing systemd, systemd-sysv, dbus, python3-systemd, openssh-server, openssh-client), automating container lifecycle (`--systemd=always --privileged` without hazardous host `/sys/fs/cgroup` mount), workspace mounting, 8-stage test execution, and cleanup across Ubuntu 24.04, Ubuntu 26.04, Debian 12, and Debian 13
-- [x] 12.10 Enforce mandatory local Podman pre-flight validation gate: require passing testbed runs across all 4 target operating systems prior to production VPS deployment
-- [x] 12.11 Implement multi-node E2E test target in `tests/podman_testbed.sh` (`multi-node`): provision 3-container Podman bridge network (`gowave-panel` at `10.89.0.10`, `gowave-worker` at `10.89.0.20`, and `gowave-untrusted` at `10.89.0.30`), deploy remote worker via `gowave-node-auto.sh` over SSH stdin, verify UFW drops traffic from untrusted peer while allowing panel IP, validate mTLS 1.3 handshake, push inbounds/users, and verify direct edge VPN client traffic
+- [ ] 12.10 Enforce a mandatory local Podman pre-flight gate before production deployment. The current repository does not enforce this gate automatically.
+- [ ] 12.11 Implement real multi-node E2E. The current `multi-node` target only provisions a scaffold and does not invoke `remote_payload`, register the worker through GoWave API, verify mTLS, or send client traffic; it now exits 77 so the scaffold cannot be mistaken for a passed E2E test.
 
 ## 13. CI/CD Workflows and Acceptance
 
 - [x] 13.1 Implement GitHub Actions workflow `lint-and-nonroot.yml` running ShellCheck, actionlint, completeness check, and Suite `nonroot`
 - [x] 13.2 Implement GitHub Actions workflow `root-integration.yml` running Suite `root` (as EUID 0) and Suite `integration` (under unprivileged container user `--user 1001:1001` with EUID != 0)
-- [x] 13.3 Implement GitHub Actions workflow `systemd-acceptance.yml` executing Suite `services` and Suite `systemd` QEMU tests across all 4 target OSs
+- [x] 13.3 Implement GitHub Actions workflow `systemd-acceptance.yml` for Suite `services` and static systemd-unit contract checks. Actual QEMU cold-boot acceptance across four OSs remains tracked in 12.8.
 - [x] 13.4 Implement `tools/prepare_release.py` generating reproducible release archives with pinned commit SHAs and SHA256 checksum sidecars
-- [x] 13.5 Execute full end-to-end acceptance install, domain change, update with simulated crash, and backup/restore verification on a clean VM
+- [ ] 13.5 Execute full end-to-end acceptance install, domain change, update with simulated crash, and backup/restore verification on a clean VM.
 
 ## 14. Static Audit P0/P1 Hardening Fixes
 
@@ -136,3 +136,21 @@
 - [x] 14.9 Add HTTP retry backoff (exponential delay on 429 and 5xx) and strict 404 user check in `modules/api_client.py` (M-08)
 - [x] 14.10 Enforce operation-to-state mapping schema validation (`OP_ALLOWED_STATES`) and timestamp verification in `modules/recovery.py` (M-09)
 - [x] 14.11 Add conditional IPv6 stream listener (`listen [::]:443`) in worker node NGINX configuration (M-17)
+
+
+## 15. Follow-up from 2026-11-08 Static Audit
+
+- [x] 15.1 Worker deployment validates source IPs, applies default-deny UFW policy, opens only the actual SSH/HTTP/HTTPS ports and Panel-sourced Node API port, and fails when UFW is not active.
+- [x] 15.2 Worker and central swap creation avoid overwriting unmanaged files, handle Btrfs separately, and persist fstab entries only after successful activation.
+- [x] 15.3 Worker certificate SAN, expiry and certificate/private-key match are verified; upstream installer is fetched from a pinned commit.
+- [x] 15.4 SSH worker deployment requires a pre-pinned host key and uses StrictHostKeyChecking=yes; host keys must be obtained and fingerprint-verified out of band.
+- [x] 15.5 Panel binary and frontend archives require SHA256SUMS entries with valid 64-character digests; restore archives require checksums for every regular file and reject duplicate archive paths.
+- [x] 15.6 Recovery journal timestamps and provisioning action snapshots are validated; invalid/legacy UUID-only journals refuse destructive rollback; failed API rollback propagates a non-zero exit.
+- [x] 15.7 Domain change records APPLYING/VERIFYING/COMMITTED and restores the previous NGINX/ACME state on failure; NGINX/service/TLS verification is fail-closed.
+- [x] 15.8 Uninstall preserves application data and recovery state by default.
+- [x] 15.9 CI ShellCheck/OpenSpec steps are mandatory and PR workflow triggers include feature/** base branches.
+- [x] 15.10 QEMU runner fails when prerequisites/rootfs are missing; systemd suite is labelled as static contract coverage until VM cold boot is integrated.
+- [x] 15.11 Podman test targets return 77 when unavailable; multi-node scaffold is explicitly marked incomplete and does not report false E2E success.
+- [ ] 15.12 Implement compensating rollback of remote Worker host-level changes (packages, UFW, NGINX, swap and systemd) when a Panel-side node-add transaction fails after dispatch.
+- [ ] 15.13 Implement and execute real multi-node Panel-to-Worker mTLS and data-plane E2E tests.
+- [ ] 15.14 Execute ShellCheck, Python suites, OpenSpec validation, Podman four-distro testbed, and QEMU cold-boot acceptance on supported runners; this connector-only edit session cannot execute them locally.

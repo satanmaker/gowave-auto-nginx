@@ -4,6 +4,8 @@ Adheres to Decision 5 of design.md and Section 9 tasks.
 """
 import json
 import os
+from datetime import datetime
+import math
 from pathlib import Path
 import shutil
 import sqlite3
@@ -42,16 +44,65 @@ def validate_journal(journal_data):
             raise JournalValidationError(f"Missing required journal field: {field}")
 
     op = journal_data["op"]
+    state = journal_data["state"]
+    if not isinstance(op, str) or not isinstance(state, str):
+        raise JournalValidationError("Journal op and state must be strings")
     if op not in OP_ALLOWED_STATES:
         raise JournalValidationError(f"Invalid operation in journal: {op}")
-
-    state = journal_data["state"]
     if state not in OP_ALLOWED_STATES[op]:
         raise JournalValidationError(f"Invalid state '{state}' for operation '{op}'")
 
     ts = journal_data["timestamp"]
-    if not isinstance(ts, (str, int, float)) or (isinstance(ts, str) and not ts.strip()):
+    if isinstance(ts, str):
+        try:
+            parsed_ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if parsed_ts.tzinfo is None:
+                raise ValueError("timestamp must include a timezone")
+        except ValueError as exc:
+            raise JournalValidationError(f"Invalid ISO-8601 timestamp in journal: {ts}") from exc
+    elif isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        if not math.isfinite(ts) or ts <= 0:
+            raise JournalValidationError(f"Invalid numeric timestamp in journal: {ts}")
+    else:
         raise JournalValidationError(f"Invalid timestamp in journal: {ts}")
+
+    if op in ("provision", "node_add") and "entities" in journal_data:
+        entities = journal_data["entities"]
+        if not isinstance(entities, (dict, list)):
+            raise JournalValidationError("Provisioning entities must be a list or a legacy object")
+        if isinstance(entities, list):
+            for index, item in enumerate(entities):
+                if not isinstance(item, dict):
+                    raise JournalValidationError(f"Invalid entity entry at index {index}")
+                if item.get("type") not in {"profile", "node", "squad", "host", "user", "token"}:
+                    raise JournalValidationError(f"Unsupported entity type at index {index}")
+                if item.get("action") not in {"created", "updated", "adopted"}:
+                    raise JournalValidationError(f"Unsupported entity action at index {index}")
+                if not isinstance(item.get("uuid"), str) or not item["uuid"].strip():
+                    raise JournalValidationError(f"Missing entity UUID at index {index}")
+                if item["action"] == "updated":
+                    before = item.get("before")
+                    if not isinstance(before, dict) or not before:
+                        raise JournalValidationError(f"Missing rollback snapshot for updated entity at index {index}")
+                    required_before = {
+                        "profile": {"name", "config"},
+                        "node": {"name", "address", "port", "configProfile"},
+                        "squad": {"name", "inbounds"},
+                        "host": {
+                            "inbound", "nodes", "remark", "address", "port", "sni",
+                            "path", "host", "alpn", "fingerprint", "securityLayer",
+                            "internalSquads", "isDisabled",
+                        },
+                    }.get(item["type"])
+                    if required_before is None or not required_before.issubset(before):
+                        raise JournalValidationError(f"Incomplete rollback before-image for {item['type']} at index {index}")
+
+    if op in ("update", "restore", "channel_switch") and state in {
+        "APPLYING", "VERIFYING", "ROLLBACK_REQUIRED"
+    }:
+        snapshot_dir = journal_data.get("snapshot_dir")
+        if not isinstance(snapshot_dir, str) or not snapshot_dir.startswith("/"):
+            raise JournalValidationError(f"Missing absolute recovery snapshot path for state {state}")
 
     if "transaction_id" in journal_data:
         tid = journal_data["transaction_id"]

@@ -5,20 +5,28 @@ set -Eeuo pipefail
 WORK_DIR="${WORK_DIR:-/work}"
 REPO_DIR="${REPO_DIR:-/repo}"
 
+mkdir -p "$WORK_DIR"
+[[ -s "$WORK_DIR/rootfs.tar" ]] || { echo "ERROR: $WORK_DIR/rootfs.tar is required; refusing to treat a skipped VM as passed." >&2; exit 2; }
+command -v qemu-system-x86_64 >/dev/null 2>&1 || { echo "ERROR: qemu-system-x86_64 is required." >&2; exit 2; }
+command -v cpio >/dev/null 2>&1 || { echo "ERROR: cpio is required." >&2; exit 2; }
+command -v gzip >/dev/null 2>&1 || { echo "ERROR: gzip is required." >&2; exit 2; }
+command -v timeout >/dev/null 2>&1 || { echo "ERROR: timeout is required." >&2; exit 2; }
+[[ -d "$REPO_DIR" ]] || { echo "ERROR: REPO_DIR does not exist: $REPO_DIR" >&2; exit 2; }
+
 rm -f "${WORK_DIR}/reboot-policy.tar" "${WORK_DIR}/pre-boot-id" "${WORK_DIR}/reboot.cpio.gz"
 rm -rf "${WORK_DIR}/root"
 mkdir -p "${WORK_DIR}/root"
 
-if [[ -f "${WORK_DIR}/rootfs.tar" ]]; then
-    tar -xf "${WORK_DIR}/rootfs.tar" -C "${WORK_DIR}/root"
-fi
+tar -xf "${WORK_DIR}/rootfs.tar" -C "${WORK_DIR}/root"
+[[ -x "${WORK_DIR}/root/sbin/init" ]] || { echo "ERROR: rootfs does not contain executable /sbin/init." >&2; exit 2; }
 
 if [[ -d /lib/modules ]]; then
-    cp -a /lib/modules "${WORK_DIR}/root/usr/lib/" 2>/dev/null || true
+    mkdir -p "${WORK_DIR}/root/usr/lib"
+    cp -a /lib/modules "${WORK_DIR}/root/usr/lib/"
 fi
 
 mkdir -p "${WORK_DIR}/root/repo"
-cp -a "${REPO_DIR}/." "${WORK_DIR}/root/repo/" 2>/dev/null || true
+cp -a "${REPO_DIR}/." "${WORK_DIR}/root/repo/"
 
 rm -f "${WORK_DIR}/root/.dockerenv" "${WORK_DIR}/root/etc/machine-id"
 
@@ -60,17 +68,19 @@ ln -sf ../gowave-ci.service "${WORK_DIR}/root/etc/systemd/system/multi-user.targ
 
 echo "Building initramfs cpio archive..."
 cd "${WORK_DIR}/root"
-find . -xdev -print0 | cpio --null -o --format=newc 2>"${WORK_DIR}/cpio.log" | gzip -1 > "${WORK_DIR}/rootfs.cpio.gz" || true
+find . -xdev -print0 | cpio --null -o --format=newc 2>"${WORK_DIR}/cpio.log" | gzip -1 > "${WORK_DIR}/rootfs.cpio.gz"
 
-kernel=$(find /boot -maxdepth 1 -name 'vmlinuz-*' -type f 2>/dev/null | sort -V | tail -1 || echo "")
+kernel=$(find /boot -maxdepth 1 -name 'vmlinuz-*' -type f 2>/dev/null | sort -V | tail -1)
+[[ -n "$kernel" ]] || { echo "ERROR: host kernel image not found under /boot." >&2; exit 2; }
 
-if [[ -n "$kernel" ]] && command -v qemu-system-x86_64 >/dev/null 2>&1; then
-    echo "Booting QEMU TCG guest with kernel $kernel..."
-    timeout 15m qemu-system-x86_64 -machine accel=tcg -m 2048 -smp 2 -nodefaults \
-        -no-reboot -display none -serial stdio -monitor none -nic none \
-        -kernel "$kernel" -initrd "${WORK_DIR}/rootfs.cpio.gz" \
-        -append 'console=ttyS0 panic=1 quiet rdinit=/init systemd.show_status=false' \
-        | tee "${WORK_DIR}/systemd.log" || true
-else
-    echo "QEMU or kernel not available in current environment; rootfs verification completed."
-fi
+echo "Booting QEMU TCG guest with kernel $kernel..."
+timeout 15m qemu-system-x86_64 -machine accel=tcg -m 2048 -smp 2 -nodefaults \
+    -no-reboot -display none -serial stdio -monitor none -nic none \
+    -kernel "$kernel" -initrd "${WORK_DIR}/rootfs.cpio.gz" \
+    -append 'console=ttyS0 panic=1 quiet rdinit=/init systemd.show_status=false' \
+    | tee "${WORK_DIR}/systemd.log"
+
+grep -q 'GOWAVE_SYSTEMD_TEST_PASS' "${WORK_DIR}/systemd.log" || {
+    echo "ERROR: Guest did not complete the systemd suite successfully." >&2
+    exit 1
+}

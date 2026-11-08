@@ -109,44 +109,54 @@ except Exception:
     }
 
     if [[ -z "$bin_source" ]]; then
-        fetch_panel_asset "gowave-linux-$arch" "$tmp_dir/gowave-server"
-        fetch_panel_asset "gowave-frontend.tar.gz" "$tmp_dir/gowave-frontend.tar.gz"
-        fetch_panel_asset "SHA256SUMS" "$tmp_dir/SHA256SUMS" || true
+        fetch_panel_asset "gowave-linux-$arch" "$tmp_dir/gowave-server" || {
+            echo "Error: failed to download GoWave Panel binary." >&2
+            return 1
+        }
+        fetch_panel_asset "gowave-frontend.tar.gz" "$tmp_dir/gowave-frontend.tar.gz" || {
+            echo "Error: failed to download GoWave frontend archive." >&2
+            return 1
+        }
+        fetch_panel_asset "SHA256SUMS" "$tmp_dir/SHA256SUMS" || {
+            echo "Error: release SHA256SUMS is required; refusing unverified artifacts." >&2
+            return 1
+        }
     else
         cp "$bin_source" "$tmp_dir/gowave-server"
         cp "$frontend_source" "$tmp_dir/gowave-frontend.tar.gz"
         [[ -n "$sums_source" ]] && cp "$sums_source" "$tmp_dir/SHA256SUMS"
     fi
 
-    # Verify SHA256 if SHA256SUMS exists
-    if [[ -f "$tmp_dir/SHA256SUMS" ]]; then
-        echo "Verifying SHA256 checksums..."
-        (
-            cd "$tmp_dir"
-            # Extract expected hashes for our files
-            local expected_bin expected_front
-            expected_bin=$(grep "gowave-linux-$arch" SHA256SUMS | awk '{print $1}' || true)
-            expected_front=$(grep "gowave-frontend.tar.gz" SHA256SUMS | awk '{print $1}' || true)
-
-            if [[ -n "$expected_bin" ]]; then
-                local actual_bin
-                actual_bin=$(sha256sum gowave-server | awk '{print $1}')
-                if [[ "$actual_bin" != "$expected_bin" ]]; then
-                    echo "Error: Checksum mismatch for gowave-server: expected $expected_bin, got $actual_bin" >&2
-                    return 1
-                fi
-            fi
-
-            if [[ -n "$expected_front" ]]; then
-                local actual_front
-                actual_front=$(sha256sum gowave-frontend.tar.gz | awk '{print $1}')
-                if [[ "$actual_front" != "$expected_front" ]]; then
-                    echo "Error: Checksum mismatch for gowave-frontend.tar.gz: expected $expected_front, got $actual_front" >&2
-                    return 1
-                fi
-            fi
-        )
-    fi
+    # Checksums are mandatory for downloaded and explicitly supplied artifacts.
+    [[ -s "$tmp_dir/SHA256SUMS" ]] || {
+        echo "Error: SHA256SUMS is missing or empty; refusing unverified artifacts." >&2
+        return 1
+    }
+    echo "Verifying mandatory SHA256 checksums..."
+    (
+        cd "$tmp_dir"
+        local expected_bin expected_front actual_bin actual_front
+        expected_bin=$(awk -v name="gowave-linux-$arch" '$2 == name || $2 == "*" name {print $1}' SHA256SUMS)
+        expected_front=$(awk '$2 == "gowave-frontend.tar.gz" || $2 == "*gowave-frontend.tar.gz" {print $1}' SHA256SUMS)
+        [[ "$expected_bin" =~ ^[[:xdigit:]]{64}$ ]] || {
+            echo "Error: SHA256SUMS must contain exactly one valid checksum for gowave-linux-$arch." >&2
+            exit 1
+        }
+        [[ "$expected_front" =~ ^[[:xdigit:]]{64}$ ]] || {
+            echo "Error: SHA256SUMS must contain exactly one valid checksum for gowave-frontend.tar.gz." >&2
+            exit 1
+        }
+        actual_bin=$(sha256sum gowave-server | awk '{print $1}')
+        actual_front=$(sha256sum gowave-frontend.tar.gz | awk '{print $1}')
+        if [[ "$actual_bin" != "$expected_bin" ]]; then
+            echo "Error: Checksum mismatch for gowave-server: expected $expected_bin, got $actual_bin" >&2
+            exit 1
+        fi
+        if [[ "$actual_front" != "$expected_front" ]]; then
+            echo "Error: Checksum mismatch for gowave-frontend.tar.gz: expected $expected_front, got $actual_front" >&2
+            exit 1
+        fi
+    )
 
     # Install files
     cp "$tmp_dir/gowave-server" "$target_dir/gowave-server"
@@ -272,12 +282,9 @@ EOF
         systemctl enable --no-ask-password gowave.service gowave-recover.service gowave-recover-provision.service
     fi
 
-    # 4. Invoke native gowave-server service install if binary exists and is executable
-    if [[ -x "$target_dir/gowave-server" ]]; then
-        echo "Executing upstream service installation..."
-        "$target_dir/gowave-server" service install "$target_dir" || true
-    fi
-    echo "Panel systemd units registered successfully."
+    # The managed gowave.service unit above is authoritative. Do not invoke the
+    # upstream "service install" command here: it may rewrite the hardened unit.
+    echo "Managed Panel and recovery systemd units registered successfully."
 }
 
 verify_panel_startup() {

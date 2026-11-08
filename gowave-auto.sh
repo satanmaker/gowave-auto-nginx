@@ -17,6 +17,22 @@ source "$SCRIPT_DIR/modules/node.sh"
 source "$SCRIPT_DIR/modules/nginx.sh"
 source "$SCRIPT_DIR/modules/recovery.sh"
 
+reload_nginx_strict() {
+    command -v nginx >/dev/null 2>&1 || { echo "Fatal: NGINX binary is unavailable." >&2; return 1; }
+    nginx -t
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl reload nginx || systemctl restart nginx
+        systemctl is-active --quiet nginx
+    fi
+}
+
+verify_public_tls_sni() {
+    local domain="$1"
+    command -v timeout >/dev/null 2>&1 || { echo "Fatal: timeout is required for TLS verification." >&2; return 1; }
+    timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$domain" \
+        -verify_return_error -verify_hostname "$domain" -CApath /etc/ssl/certs -brief </dev/null
+}
+
 acquire_lock() {
     mkdir -p "$(dirname "$LOCK_FILE")"
     exec 9>>"$LOCK_FILE"
@@ -104,10 +120,36 @@ cmd_install() {
     local reality_domain="${2:-}"
     local admin_email="${3:-}"
 
-    if [[ -z "$panel_domain" || -z "$reality_domain" ]]; then
+    if [[ -z "$panel_domain" ]]; then
         read -r -p "Enter GoWave Panel domain (e.g. vpn.example.com): " panel_domain
+    fi
+    if [[ -z "$reality_domain" ]]; then
         read -r -p "Enter REALITY camouflage domain (e.g. cdn.example.com): " reality_domain
+    fi
+    if [[ -z "$admin_email" ]]; then
         read -r -p "Enter Let's Encrypt admin email: " admin_email
+    fi
+    python3 - "$panel_domain" "$reality_domain" <<'PY'
+import re, sys
+panel, reality = sys.argv[1:]
+def validate_domain(domain):
+    if len(domain) > 253:
+        raise SystemExit(f"Invalid DNS hostname (too long): {domain}")
+    labels = domain.rstrip(".").split(".")
+    if len(labels) < 2 or any(
+        not label or len(label) > 63 or
+        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label)
+        for label in labels
+    ):
+        raise SystemExit(f"Invalid DNS hostname: {domain}")
+validate_domain(panel)
+validate_domain(reality)
+if panel.lower().rstrip(".") == reality.lower().rstrip("."):
+    raise SystemExit("Panel and REALITY domains must be different.")
+PY
+    if [[ ! "$admin_email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+        echo "Error: a valid Let's Encrypt email address is required." >&2
+        return 2
     fi
 
     echo "==> Starting GoWave Auto NGINX All-in-One Deployment..."
@@ -132,9 +174,7 @@ cmd_install() {
 
     # Step 4: Webroot ACME TLS Acquisition
     generate_bootstrap_acme_vhost "$panel_domain" "$reality_domain"
-    if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
-        systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
-    fi
+    reload_nginx_strict
 
     if ! command -v certbot >/dev/null 2>&1; then
         echo "Error: certbot is required for production TLS certificate acquisition but not installed." >&2
@@ -165,18 +205,18 @@ cmd_install() {
     generate_decoy_vhost "$reality_domain"
     configure_certbot_deploy_hook
 
-    if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
-        systemctl reload --no-ask-password nginx || systemctl restart --no-ask-password nginx || true
-    fi
+    reload_nginx_strict
 
     # Step 6: GoWave Panel Native Installation
     download_panel_release "$GOWAVE_DIR"
     generate_panel_env "$GOWAVE_DIR" "$panel_domain" "$panel_domain/api/sub"
     configure_panel_systemd "$GOWAVE_DIR"
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
-        systemctl restart --no-ask-password gowave.service || true
+        systemctl restart --no-ask-password gowave.service
+        systemctl is-active --quiet gowave.service
     fi
     verify_panel_startup 127.0.0.1 3000 30
+    verify_public_tls_sni "$panel_domain"
 
     # Step 7: Local Node Installation
     local secret_key
@@ -194,92 +234,118 @@ cmd_install() {
     admin_pass=$(openssl rand -hex 16)
     save_credentials "$admin_user" "$admin_pass" "https://$panel_domain" "" "$CREDENTIALS_FILE"
 
-    python3 -c "
-import sys, os, json, time
-for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+    if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+        "$SCRIPT_DIR" "$panel_domain" "$reality_domain" "$admin_user" \
+        "$JOURNAL_FILE" "$STATE_FILE" "$CREDENTIALS_FILE" 3<<< "$admin_pass" <<'PY'
+import json
+import os
+import sys
+import time
+
+(script_dir, panel_domain, reality_domain, admin_user,
+ journal_path, state_path, credentials_path) = sys.argv[1:]
+admin_password = os.fdopen(3, "r", encoding="utf-8").read().rstrip("\n")
+
+sys.path.insert(0, script_dir)
 from modules.api_client import GoWaveClient, atomic_write_state, save_credentials
 from modules.recovery import write_journal_atomically
 
-# 1. Initialize provisioning in journal
-jdata = {
-    'transaction_id': f'provision_{int(time.time())}',
-    'op': 'provision',
-    'state': 'PROVISION_PREPARED',
-    'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-    'entities': {}
+journal = {
+    "transaction_id": f"provision_{int(time.time())}",
+    "op": "provision",
+    "state": "PROVISION_PREPARED",
+    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "entities": {},
 }
-write_journal_atomically('$JOURNAL_FILE', jdata)
+write_journal_atomically(journal_path, journal)
 
-client = GoWaveClient('http://127.0.0.1:3000')
-client.register_initial_admin('$admin_user', '$admin_pass')
-client.login('$admin_user', '$admin_pass')
+client = GoWaveClient("http://127.0.0.1:3000")
+client.register_initial_admin(admin_user, admin_password)
+client.login(admin_user, admin_password)
 
-jdata['state'] = 'PROVISION_APPLYING'
-write_journal_atomically('$JOURNAL_FILE', jdata)
+journal["state"] = "PROVISION_APPLYING"
+write_journal_atomically(journal_path, journal)
 
+def persist_transaction_entities(entities):
+    journal["entities"] = list(entities)
+    write_journal_atomically(journal_path, journal)
+
+client.transaction_callback = persist_transaction_entities
 x25519 = client.generate_x25519()
-raw_cfg = client.compile_config_profile('local-node', '$reality_domain', x25519['privateKey'])
-prof_info = client.provision_config_profile('GoWave MVP Unified Profile - local-node', raw_cfg)
-prof_uuid = prof_info['profile_uuid']
-inbounds = prof_info['inbounds']
-inb_uuids = [inb['uuid'] for inb in inbounds]
-jdata['entities']['profile_uuid'] = prof_uuid
-write_journal_atomically('$JOURNAL_FILE', jdata)
+raw_config = client.compile_config_profile("local-node", reality_domain, x25519["privateKey"])
+profile = client.provision_config_profile("GoWave MVP Unified Profile - local-node", raw_config)
+profile_uuid = profile["profile_uuid"]
+inbounds = profile["inbounds"]
+inbound_uuids = [item["uuid"] for item in inbounds]
+journal["entities"] = client.transaction_entities
+write_journal_atomically(journal_path, journal)
 
-node_uuid = client.associate_node('local-node', '127.0.0.1', 3002, prof_uuid, inb_uuids)
-jdata['entities']['node_uuid'] = node_uuid
-write_journal_atomically('$JOURNAL_FILE', jdata)
+node_uuid = client.associate_node("local-node", "127.0.0.1", 3002, profile_uuid, inbound_uuids)
+journal["entities"] = client.transaction_entities
+write_journal_atomically(journal_path, journal)
 
-squad_uuid = client.provision_internal_squad('Default MVP Squad', inb_uuids)
-jdata['entities']['squad_uuid'] = squad_uuid
-write_journal_atomically('$JOURNAL_FILE', jdata)
+squad_uuid = client.provision_internal_squad("Default MVP Squad", inbound_uuids)
+journal["entities"] = client.transaction_entities
+write_journal_atomically(journal_path, journal)
 
-hosts = client.provision_hosts(prof_uuid, inbounds, node_uuid, squad_uuid, '$panel_domain', '$reality_domain')
-jdata['entities']['host_uuids'] = hosts
-write_journal_atomically('$JOURNAL_FILE', jdata)
+client.provision_hosts(
+    profile_uuid, inbounds, node_uuid, squad_uuid,
+    panel_domain, reality_domain
+)
+journal["entities"] = client.transaction_entities
+write_journal_atomically(journal_path, journal)
 
-short_uuid = client.provision_user('default-user', squad_uuid)
-
+short_uuid = client.provision_user("default-user", squad_uuid)
 token_info = client.issue_api_token()
-jdata['entities']['token_id'] = token_info.get('id')
-write_journal_atomically('$JOURNAL_FILE', jdata)
+journal["entities"] = client.transaction_entities
+write_journal_atomically(journal_path, journal)
 
-save_credentials('$admin_user', '$admin_pass', 'https://$panel_domain', token_info['token'], '$CREDENTIALS_FILE')
+save_credentials(admin_user, admin_password, f"https://{panel_domain}",
+                 token_info["token"], credentials_path)
 
-existing_cc = 'bbr'
-if os.path.exists('$STATE_FILE'):
+existing_cc = "bbr"
+if os.path.exists(state_path):
     try:
-        existing_cc = json.load(open('$STATE_FILE')).get('congestionControl', 'bbr')
+        with open(state_path, encoding="utf-8") as state_file:
+            existing_cc = json.load(state_file).get("congestionControl", "bbr")
     except Exception:
         pass
 
 state = {
-    'schemaVersion': 2,
-    'installationMode': 'all-in-one',
-    'panelDomain': '$panel_domain',
-    'realityDomain': '$reality_domain',
-    'congestionControl': existing_cc,
-    'nodePort': 3002,
-    'localNodeUuid': node_uuid,
-    'profileUuid': prof_uuid,
-    'squadUuid': squad_uuid,
-    'defaultUserShortUuid': short_uuid,
-    'nodes': [{
-        'name': 'local-node',
-        'address': '127.0.0.1',
-        'port': 3002,
-        'uuid': node_uuid
-    }]
+    "schemaVersion": 2,
+    "installationMode": "all-in-one",
+    "panelDomain": panel_domain,
+    "realityDomain": reality_domain,
+    "congestionControl": existing_cc,
+    "nodePort": 3002,
+    "localNodeUuid": node_uuid,
+    "profileUuid": profile_uuid,
+    "squadUuid": squad_uuid,
+    "defaultUserShortUuid": short_uuid,
+    "nodes": [{
+        "name": "local-node",
+        "address": "127.0.0.1",
+        "port": 3002,
+        "uuid": node_uuid,
+    }],
 }
-atomic_write_state(state, '$STATE_FILE')
+atomic_write_state(state, state_path)
 
-# Commit provisioning transaction
-jdata['state'] = 'PROVISION_COMMITTED'
-jdata['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-write_journal_atomically('$JOURNAL_FILE', jdata)
-"
+journal["state"] = "PROVISION_COMMITTED"
+journal["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+write_journal_atomically(journal_path, journal)
+PY
+    then
+        echo "Initial API provisioning failed; attempting action-aware rollback." >&2
+        if [[ -f "$JOURNAL_FILE" ]] && ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from modules.api_client import rollback_provisioning
+import sys
+sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE') else 1)
+"; then
+            echo "CRITICAL: API rollback incomplete; recovery journal requires operator attention." >&2
+        fi
+        return 1
+    fi
     # Read shortUuid
     local user_short_uuid
     user_short_uuid=$(python3 -c "import json; print(json.load(open('$STATE_FILE')).get('defaultUserShortUuid', ''))" 2>/dev/null || echo "default-user")
@@ -321,8 +387,13 @@ cmd_node() {
                 return 1
             fi
 
-            local panel_ip
-            panel_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org || echo "127.0.0.1")
+            local panel_ip panel_ipv6
+            panel_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org || true)
+            panel_ipv6=$(curl -s6 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s6 --connect-timeout 5 --max-time 10 https://api64.ipify.org || true)
+            if [[ -z "$panel_ip" && -z "$panel_ipv6" ]]; then
+                echo "Error: unable to determine a public Panel IP address; refusing an untrusted firewall fallback." >&2
+                return 1
+            fi
             local node_port=3002
 
             if [[ "$ip" == "$panel_ip" || "$ip" == "127.0.0.1" ]]; then
@@ -339,68 +410,181 @@ cmd_node() {
             fi
 
             # 2. Authenticate and register node via API
+            # Validate SSH target and pin before mutating the GoWave API.
+            if [[ ! "$ssh_port" =~ ^[0-9]+$ ]] || (( ssh_port < 1 || ssh_port > 65535 )); then
+                echo "Error: SSH port must be between 1 and 65535." >&2
+                return 2
+            fi
+            if [[ ! "$ssh_user" =~ ^[A-Za-z_][A-Za-z0-9._-]{0,31}$ ]]; then
+                echo "Error: invalid SSH username." >&2
+                return 2
+            fi
+            python3 - "$ip" <<'PY'
+import ipaddress, sys
+try:
+    ipaddress.ip_address(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit(f"Invalid Worker IP address: {exc}")
+PY
+            local known_hosts="${SSH_KNOWN_HOSTS:-/root/.ssh/known_hosts}"
+            local host_key="$ip"
+            if [[ "$ssh_port" != "22" ]]; then
+                host_key="[$ip]:$ssh_port"
+            fi
+            if [[ ! -s "$known_hosts" ]] || ! ssh-keygen -F "$host_key" -f "$known_hosts" >/dev/null 2>&1; then
+                echo "Error: SSH host key for $host_key is not pre-pinned in $known_hosts." >&2
+                echo "Verify the fingerprint out of band and add the host key before retrying." >&2
+                return 1
+            fi
+
+            # 2. Register the node using argv for data and FD 3 for the password.
+            # User-controlled values are never interpolated into Python source.
+            if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+                "$SCRIPT_DIR" "$name" "$ip" "$worker_domain" "$reality_domain" \
+                "$node_port" "$admin_user" "$JOURNAL_FILE" "$STATE_FILE" 3<<< "$admin_pass" <<'PY'
+import ipaddress
+import json
+import os
+import re
+import sys
+import time
+
+(script_dir, name, address, worker_domain, reality_domain, port, admin_user,
+ journal_path, state_path) = sys.argv[1:]
+admin_password = os.fdopen(3, "r", encoding="utf-8").read().rstrip("\n")
+
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
+    raise SystemExit("Invalid node name; use 1-64 ASCII letters, digits, dot, underscore or hyphen.")
+try:
+    ipaddress.ip_address(address)
+except ValueError as exc:
+    raise SystemExit(f"Invalid worker IP address: {exc}") from exc
+
+def validate_domain(value):
+    if len(value) > 253:
+        raise SystemExit(f"Invalid DNS hostname (too long): {value}")
+    labels = value.rstrip(".").split(".")
+    if len(labels) < 2 or any(
+        not label or len(label) > 63 or
+        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label)
+        for label in labels
+    ):
+        raise SystemExit(f"Invalid DNS hostname: {value}")
+
+validate_domain(worker_domain)
+validate_domain(reality_domain)
+if worker_domain.lower().rstrip(".") == reality_domain.lower().rstrip("."):
+    raise SystemExit("Worker and REALITY domains must be different.")
+if not port.isdigit() or not 1 <= int(port) <= 65535:
+    raise SystemExit("Invalid Node API port.")
+if not admin_password:
+    raise SystemExit("Panel admin password is missing; refusing node registration.")
+
+sys.path.insert(0, script_dir)
+from modules.api_client import GoWaveClient, atomic_write_state
+from modules.recovery import write_journal_atomically
+
+state_data = json.loads(open(state_path, encoding="utf-8").read())
+nodes = state_data.get("nodes", [])
+if not isinstance(nodes, list):
+    raise SystemExit("state.json nodes must be an array.")
+if any(isinstance(item, dict) and item.get("name") == name for item in nodes):
+    raise SystemExit(f"Worker name is already registered in state.json: {name}")
+
+client = GoWaveClient("http://127.0.0.1:3000")
+client.login(admin_user, admin_password)
+
+journal = {
+    "transaction_id": f"node_add_{name}",
+    "op": "node_add",
+    "state": "NODE_ADD_PREPARED",
+    "node_name": name,
+    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "entities": {},
+}
+write_journal_atomically(journal_path, journal)
+
+def persist_transaction_entities(entities):
+    journal["entities"] = list(entities)
+    write_journal_atomically(journal_path, journal)
+
+client.transaction_callback = persist_transaction_entities
+x25519 = client.generate_x25519()
+raw_config = client.compile_config_profile(f"GoWave Worker {name} Profile", reality_domain, x25519["privateKey"])
+profile = client.provision_config_profile(f"GoWave Worker {name} Profile", raw_config)
+profile_uuid = profile["profile_uuid"]
+inbounds = profile["inbounds"]
+inbound_uuids = [item["uuid"] for item in inbounds]
+journal["state"] = "NODE_ADD_APPLYING"
+journal["entities"] = client.transaction_entities
+write_journal_atomically(journal_path, journal)
+
+node_uuid = client.associate_node(name, address, int(port), profile_uuid, inbound_uuids)
+journal["entities"] = client.transaction_entities
+write_journal_atomically(journal_path, journal)
+
+squad_uuid = state_data.get("squadUuid")
+client.provision_internal_squad("Default MVP Squad", inbound_uuids)
+client.provision_hosts(
+    profile_uuid, inbounds, node_uuid, squad_uuid,
+    worker_domain, reality_domain, name
+)
+journal["entities"] = client.transaction_entities
+write_journal_atomically(journal_path, journal)
+
+nodes.append({
+    "name": name,
+    "address": address,
+    "port": int(port),
+    "workerDomain": worker_domain,
+    "realityDomain": reality_domain,
+    "uuid": node_uuid,
+})
+state_data["nodes"] = nodes
+atomic_write_state(state_data, state_path)
+PY
+            then
+                echo "Worker API registration failed; attempting action-aware API rollback." >&2
+                if [[ -f "$JOURNAL_FILE" ]] && ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from modules.api_client import rollback_provisioning
+import sys
+sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE') else 1)
+"; then
+                    echo "CRITICAL: API rollback incomplete; recovery journal requires operator attention." >&2
+                fi
+                return 1
+            fi
+
+
+            # Mark remote side effects as in-flight before dispatch.
             python3 -c "
 import sys, json, time
 for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
     if p not in sys.path:
         sys.path.insert(0, p)
-from modules.api_client import GoWaveClient, atomic_write_state
 from modules.recovery import write_journal_atomically
-
-client = GoWaveClient('http://127.0.0.1:3000')
-client.login('$admin_user', '$admin_pass')
-
-# Track in journal
-jdata = {
-    'transaction_id': 'node_add_$name',
-    'op': 'node_add',
-    'state': 'NODE_ADD_PREPARED',
-    'node_name': '$name',
-    'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-    'entities': {}
-}
+jdata = json.load(open('$JOURNAL_FILE'))
+jdata['state'] = 'NODE_ADD_VERIFYING'
+jdata['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 write_journal_atomically('$JOURNAL_FILE', jdata)
-
-x25519 = client.generate_x25519()
-raw_cfg = client.compile_config_profile('$name', '$reality_domain', x25519['privateKey'])
-prof_info = client.provision_config_profile('GoWave Worker $name Profile', raw_cfg)
-prof_uuid = prof_info['profile_uuid']
-inbounds = prof_info['inbounds']
-inb_uuids = [inb['uuid'] for inb in inbounds]
-jdata['state'] = 'NODE_ADD_APPLYING'
-jdata['entities']['profile_uuid'] = prof_uuid
-jdata['entities']['inbound_uuids'] = inb_uuids
-write_journal_atomically('$JOURNAL_FILE', jdata)
-
-node_uuid = client.associate_node('$name', '$ip', $node_port, prof_uuid, inb_uuids)
-jdata['entities']['node_uuid'] = node_uuid
-write_journal_atomically('$JOURNAL_FILE', jdata)
-
-state_data = json.load(open('$STATE_FILE'))
-squad_uuid = state_data.get('squadUuid')
-client.provision_internal_squad('Default MVP Squad', inb_uuids)
-hosts = client.provision_hosts(prof_uuid, inbounds, node_uuid, squad_uuid, '$worker_domain', '$reality_domain', '$name')
-jdata['entities']['host_uuids'] = hosts
-write_journal_atomically('$JOURNAL_FILE', jdata)
-
-state_data.setdefault('nodes', []).append({
-    'name': '$name',
-    'address': '$ip',
-    'port': $node_port,
-    'workerDomain': '$worker_domain',
-    'realityDomain': '$reality_domain',
-    'uuid': node_uuid
-})
-atomic_write_state(state_data, '$STATE_FILE')
 "
-
-            # 3. Dispatch remote deployment strictly via SSH stdin
+            # 4. Dispatch remote deployment strictly via SSH stdin
             local secret_key
             secret_key=$(extract_secret_key "$GOWAVE_DIR")
-            PANEL_IP="$panel_ip" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
-                "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"
+            if ! PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
+                SSH_KNOWN_HOSTS="$known_hosts" "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
+                echo "Remote Worker deployment failed; rolling back Panel API entities." >&2
+                if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from modules.api_client import rollback_provisioning
+import sys
+sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE') else 1)
+"; then
+                    echo "CRITICAL: API rollback incomplete; recovery journal requires operator attention." >&2
+                fi
+                return 1
+            fi
 
-            # 4. Commit transaction
+            # 5. Commit transaction
             python3 -c "
 import sys, json, time
 for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
@@ -435,64 +619,125 @@ for n in data.get('nodes', []):
 
 cmd_domain_change() {
     acquire_lock
-    local new_panel_domain="$1"
-    local new_reality_domain="$2"
+    local new_panel_domain="${1:-}"
+    local new_reality_domain="${2:-}"
+    if [[ -z "$new_panel_domain" || -z "$new_reality_domain" ]]; then
+        echo "Usage: gowave-auto.sh domain-change <panel-domain> <reality-domain>" >&2
+        return 2
+    fi
+
+    if [[ "$new_panel_domain" == "$new_reality_domain" ]]; then
+        echo "Error: panel and REALITY domains must be different." >&2
+        return 2
+    fi
+    python3 - "$new_panel_domain" "$new_reality_domain" <<'PY'
+import re, sys
+for domain in sys.argv[1:]:
+    if len(domain) > 253:
+        raise SystemExit(f"Invalid domain name (too long): {domain}")
+    labels = domain.rstrip(".").split(".")
+    if len(labels) < 2 or any(
+        not label or len(label) > 63 or
+        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label)
+        for label in labels
+    ):
+        raise SystemExit(f"Invalid DNS hostname: {domain}")
+PY
 
     echo "Changing domains to: $new_panel_domain / $new_reality_domain..."
 
-    # Preflight DNS validation
     local srv_ip
     srv_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org || echo "")
     if [[ -n "$srv_ip" ]] && command -v getent >/dev/null 2>&1; then
         local resolved_ip
-        resolved_ip=$(getent ahosts "$new_panel_domain" 2>/dev/null | awk '{print $1}' | head -n1 || true)
+        resolved_ip=$(getent ahostsv4 "$new_panel_domain" 2>/dev/null | awk 'NR==1 {print $1}' || true)
         if [[ -n "$resolved_ip" && "$resolved_ip" != "$srv_ip" ]]; then
             echo "Error: DNS resolution for $new_panel_domain ($resolved_ip) does not match server IP ($srv_ip)." >&2
-            echo "Please update your DNS records before changing domains." >&2
             return 1
         fi
     fi
 
-    # Snapshot current NGINX and .env
     local snap_dir
     snap_dir=$(prepare_update_snapshot "domain-change")
-
-    # Generate bootstrap ACME config and request certificates
-    generate_bootstrap_acme_vhost "$new_panel_domain" "$new_reality_domain"
-    if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
-        systemctl reload nginx 2>/dev/null || true
-    fi
-
-    local acme_ok=false
-    if certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_panel_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring && \
-       certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_reality_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring; then
-        acme_ok=true
-    fi
-    rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
-
-    if [[ "$acme_ok" != "true" ]] || \
-       ! verify_acme_certificate "$new_panel_domain" || \
-       ! verify_acme_certificate "$new_reality_domain"; then
-        echo "ACME certificate acquisition or validation failed! Rolling back to previous domain configuration..." >&2
-        execute_file_rollback "$snap_dir"
+    rollback_domain_change() {
+        local reason="$1"
+        echo "Domain change failed: $reason. Restoring previous files, NGINX and certificates..." >&2
+        if execute_file_rollback "$snap_dir"; then
+            PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$JOURNAL_FILE" "$reason" <<'PY'
+import json, sys, time
+from pathlib import Path
+p = Path(sys.argv[1])
+data = json.loads(p.read_text())
+data["state"] = "ROLLED_BACK"
+data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+data["error"] = sys.argv[2]
+from modules.recovery import write_journal_atomically
+write_journal_atomically(str(p), data)
+PY
+        else
+            echo "CRITICAL: rollback did not complete; journal remains recoverable." >&2
+        fi
         return 1
-    fi
+    }
 
-    # Deploy new NGINX vhosts
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$JOURNAL_FILE" <<'PY'
+import json, sys, time
+from pathlib import Path
+p=Path(sys.argv[1]); data=json.loads(p.read_text())
+data["state"]="APPLYING"
+data["timestamp"]=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+from modules.recovery import write_journal_atomically
+write_journal_atomically(str(p), data)
+PY
+
+    generate_bootstrap_acme_vhost "$new_panel_domain" "$new_reality_domain"
+    reload_nginx_strict || { rollback_domain_change "bootstrap NGINX activation failed"; return 1; }
+
+    if ! certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_panel_domain" --cert-name "$new_panel_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring; then
+        rollback_domain_change "ACME issuance failed for panel domain"; return 1
+    fi
+    if ! certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_reality_domain" --cert-name "$new_reality_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring; then
+        rollback_domain_change "ACME issuance failed for REALITY domain"; return 1
+    fi
+    verify_acme_certificate "$new_panel_domain" || { rollback_domain_change "invalid panel certificate"; return 1; }
+    verify_acme_certificate "$new_reality_domain" || { rollback_domain_change "invalid REALITY certificate"; return 1; }
+
+    rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
     generate_stream_config "$new_panel_domain" "$new_reality_domain"
     generate_production_http_vhost "$new_panel_domain" "$new_reality_domain"
     generate_panel_https_vhost "$new_panel_domain"
     generate_decoy_vhost "$new_reality_domain"
-
-    # Update .env
     sed -i "s/^PANEL_DOMAIN=.*/PANEL_DOMAIN=$new_panel_domain/" "$GOWAVE_DIR/.env"
     sed -i "s|^SUB_PUBLIC_DOMAIN=.*|SUB_PUBLIC_DOMAIN=$new_panel_domain/api/sub|" "$GOWAVE_DIR/.env"
 
-    if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
-        systemctl restart --no-ask-password gowave.service nginx.service || true
+    python3 - "$JOURNAL_FILE" <<'PY'
+import json, sys, time
+from pathlib import Path
+p=Path(sys.argv[1]); data=json.loads(p.read_text())
+data["state"]="VERIFYING"
+data["timestamp"]=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+from modules.recovery import write_journal_atomically
+write_journal_atomically(str(p), data)
+PY
+    reload_nginx_strict || { rollback_domain_change "production NGINX configuration failed"; return 1; }
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart --no-ask-password gowave.service || { rollback_domain_change "Panel restart failed"; return 1; }
+        systemctl is-active --quiet gowave.service || { rollback_domain_change "Panel service is not active"; return 1; }
     fi
+    verify_panel_startup 127.0.0.1 3000 30 || { rollback_domain_change "Panel healthcheck failed"; return 1; }
+    verify_public_tls_sni "$new_panel_domain" || { rollback_domain_change "Panel TLS/SNI verification failed"; return 1; }
 
-    echo "Domain change completed successfully."
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$JOURNAL_FILE" "$RECOVERY_DIR" <<'PY'
+import json, sys, time
+from pathlib import Path
+p=Path(sys.argv[1]); data=json.loads(p.read_text())
+data["state"]="COMMITTED"
+data["timestamp"]=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+from modules.recovery import write_journal_atomically, prune_snapshots
+write_journal_atomically(str(p), data)
+prune_snapshots(sys.argv[2])
+PY
+    echo "Domain change completed and verified successfully."
 }
 
 cmd_uninstall() {
@@ -547,9 +792,15 @@ with open('/etc/nginx/nginx.conf', 'w') as f:
         fi
     fi
 
-    # 4. Remove directories
-    rm -rf /opt/gowave /opt/gowave-node /var/lib/gowave-auto-nginx /var/www/gowave-auto-nginx /var/www/gowave-acme
-    echo "Uninstallation complete. System packages (nginx, certbot, etc.) were preserved."
+    # Preserve application data and recovery state by default. Without a
+    # verified installer ownership marker, recursive deletion is unsafe.
+    echo "Managed service/config removal completed. Application data, node binaries, backups, and state were preserved:"
+    echo "  $GOWAVE_DIR"
+    echo "  /opt/gowave-node"
+    echo "  /var/lib/gowave-auto-nginx"
+    echo "  /var/www/gowave-auto-nginx"
+    echo "  /var/www/gowave-acme"
+    echo "Review and remove these paths manually only after checking their contents."
 }
 
 cmd_user_links() {

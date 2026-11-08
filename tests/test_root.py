@@ -149,6 +149,27 @@ Environment="GOMEMLIMIT=250MiB"
         with self.assertRaises(JournalValidationError):
             validate_journal(invalid_state)
 
+        # Timestamps must be ISO-8601 with an explicit timezone.
+        invalid_timestamp = {**valid_journal, "timestamp": "yesterday"}
+        with self.assertRaises(JournalValidationError):
+            validate_journal(invalid_timestamp)
+
+        # Active file transactions require a durable recovery snapshot path.
+        active_without_snapshot = {**valid_journal, "state": "APPLYING"}
+        with self.assertRaises(JournalValidationError):
+            validate_journal(active_without_snapshot)
+
+        # Updated provisioning entities must include a before-image.
+        invalid_entity_journal = {
+            "transaction_id": "provision-invalid-entity",
+            "op": "provision",
+            "state": "PROVISION_APPLYING",
+            "timestamp": "2026-11-08T00:00:00Z",
+            "entities": [{"type": "profile", "uuid": "profile-1", "action": "updated"}],
+        }
+        with self.assertRaises(JournalValidationError):
+            validate_journal(invalid_entity_journal)
+
     def test_sequential_multi_node_add(self):
         """Sequential worker node addition to state.json schemaVersion 2."""
         state = {

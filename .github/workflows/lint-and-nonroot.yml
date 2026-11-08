@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, "feature/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "feature/**"]
   workflow_dispatch:
 
 permissions:
@@ -31,17 +31,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends shellcheck sqlite3 tar gzip openssl curl
-          npm install -g @fission-ai/openspec || true
+          npm install -g @fission-ai/openspec
 
       - name: ShellCheck validation
         run: |
-          shellcheck gowave-auto.sh gowave-node-auto.sh assets/backup/gowave-backup.sh modules/*.sh tests/*.sh || true
+          shellcheck --severity=error gowave-auto.sh gowave-node-auto.sh assets/backup/gowave-backup.sh modules/*.sh tests/*.sh
 
       - name: OpenSpec validation
         run: |
-          if command -v openspec >/dev/null 2>&1; then
-            openspec validate --all --strict
-          fi
+          command -v openspec
+          openspec validate --all --strict
 
       - name: Test completeness check
         run: |

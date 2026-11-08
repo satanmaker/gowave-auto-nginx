@@ -354,20 +354,24 @@ gowave-auto.sh node add <node-name> <node-ip> <worker-domain> <reality-domain> [
 ### 5.3 Provisioning Rollback & Resource Deletion Contracts
 
 #### 5.3.1 Initial Panel Provisioning Rollback Contract (`PROVISION_*`)
-If any stage of initial panel provisioning fails or is aborted before `PROVISION_COMMITTED`, the orchestrator cleans up entities in strict reverse dependency order:
-1. `DELETE /api/tokens/{id}` (revokes provisioned API tokens)
-2. `DELETE /api/users/{uuid}` (removes created users)
-3. `DELETE /api/hosts/{uuid}` (removes created host endpoints)
-4. `DELETE /api/internal-squads/{uuid}` (removes internal squad)
-5. `DELETE /api/nodes/{uuid}` (unlinks and deletes registered local node)
-6. `DELETE /api/config-profiles/{uuid}` (removes config profile)
-7. Transition journal state to `PROVISION_ROLLED_BACK`.
+Every API mutation is written to the transaction journal immediately after the API response using an action ledger entry:
+
+```json
+{"type":"profile","uuid":"<uuid>","action":"created"}
+{"type":"node","uuid":"<uuid>","action":"updated","before":{"name":"...","address":"...","port":3002,"configProfile":{}}}
+{"type":"user","uuid":"<uuid>","action":"adopted"}
+```
+
+Rollback traverses the ledger in reverse order:
+- `created`: delete only that UUID using the corresponding resource endpoint.
+- `updated`: PATCH the stored `before` image to restore pre-transaction state.
+- `adopted`: preserve the pre-existing resource; do not delete or modify it during rollback.
+
+The journal is validated before rollback. A missing or incomplete `before` image, unknown action/type, missing UUID, or legacy UUID-only journal causes a non-destructive `PROVISION_ROLLBACK_REQUIRED` result. The implementation MUST NOT perform global name scans or delete shared resources based only on names. An empty PREPARED ledger is safe to close as rolled back because no API mutations were recorded.
 
 #### 5.3.2 Worker Node Addition Rollback Contract (`NODE_ADD_*`)
-If worker node provisioning or remote edge deployment fails during `gowave-auto.sh node add`, the orchestrator executes isolated rollback for worker resources without affecting central panel state:
-1. `DELETE /api/hosts/{uuid}` for all worker hosts matching canonical remark `<PROTO>@<worker-name>`.
-2. `PATCH /api/internal-squads` with `{"uuid": squad_uuid, "name": squad_name, "inbounds": updated_inbounds}` removing the 4 worker inbound UUIDs from `inbounds`.
-3. `DELETE /api/nodes/{worker-node-uuid}` (deletes the worker node).
-4. `DELETE /api/config-profiles/{worker-profile-uuid}` (deletes the worker config profile).
-5. Strictly FORBIDS deleting internal squads, panel users, or panel API tokens.
-6. Transition journal state to `NODE_ADD_ROLLED_BACK`.
+The Panel-side API transaction uses the same action-aware ledger. It may delete newly created Worker hosts/node/profile, restore a pre-existing resource that was updated, and preserve adopted shared resources (including the default squad). Failure of remote SSH deployment triggers Panel API rollback and records whether that rollback completed.
+
+**Current limitation (not yet implemented):** a Worker deployment can fail after host-level changes have begun (packages, UFW, NGINX, certificates, swap, and systemd). The Panel cannot currently compensate those remote system changes. This is tracked separately and MUST NOT be described as a complete distributed transaction. A remote deployment failure may leave the Worker host partially configured; operator inspection is required before retrying.
+
+`NODE_ADD_ROLLBACK_REQUIRED` is retained when any API compensation step fails; the command returns non-zero and leaves the journal for operator reconciliation.
