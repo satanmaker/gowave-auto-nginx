@@ -7,9 +7,9 @@ if [[ -f "$SCRIPT_DIR/modules/os.sh" ]]; then
     source "$SCRIPT_DIR/modules/os.sh"
 fi
 
-ACME_WEBROOT="/var/www/gowave-acme"
-COVER_REALITY_ROOT="/var/www/gowave-auto-nginx/cover-reality"
-DECOY_ACCESS_LOG="/var/log/nginx/gowave-decoy-access.log"
+ACME_WEBROOT="${ACME_WEBROOT:-/var/www/gowave-acme}"
+COVER_REALITY_ROOT="${COVER_REALITY_ROOT:-/var/www/gowave-auto-nginx/cover-reality}"
+DECOY_ACCESS_LOG="${DECOY_ACCESS_LOG:-/var/log/nginx/gowave-decoy-access.log}"
 
 ensure_nginx_stream_block() {
     local nginx_conf="${1:-/etc/nginx/nginx.conf}"
@@ -268,10 +268,15 @@ generate_decoy_vhost() {
     local reality_domain="$1"
     local out_file="${2:-/etc/nginx/conf.d/gowave-decoy.conf}"
     local nginx_bin="${3:-nginx}"
+    local cover_root="${4:-$COVER_REALITY_ROOT}"
 
     mkdir -p "$(dirname "$out_file")"
-    if [[ "$(id -u)" -eq 0 ]] || [[ -w "/var/www" ]]; then
-        mkdir -p "$COVER_REALITY_ROOT"
+    if [[ "$(id -u)" -eq 0 ]] || [[ -w "/var/www" ]] || [[ -w "$(dirname "$cover_root")" ]] || [[ -d "$cover_root" && -w "$cover_root" ]]; then
+        mkdir -p "$cover_root" 2>/dev/null || true
+        if [[ -d "$cover_root" && -w "$cover_root" && -d "$SCRIPT_DIR/assets/cover-sites/cover-reality" ]]; then
+            cp -r "$SCRIPT_DIR/assets/cover-sites/cover-reality/." "$cover_root/"
+            chmod -R 0755 "$cover_root" 2>/dev/null || true
+        fi
     fi
     local listen_directive
     listen_directive=$(render_nginx_listen_ssl_http2 "127.0.0.1:9443" "proxy_protocol" "$nginx_bin")
@@ -289,7 +294,7 @@ server {
     ssl_certificate /etc/letsencrypt/live/$reality_domain/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$reality_domain/privkey.pem;
 
-    root $COVER_REALITY_ROOT;
+    root $cover_root;
     index index.html;
 
     # Dedicated probe security audit log recording PROXY-restored remote_addr
