@@ -777,7 +777,15 @@ Worker node addition (`gowave-auto.sh node add`) operates under an independent t
    - Preserve entries recorded as `adopted`, including shared internal squads.
    - Strictly FORBIDS deleting unrelated panel users or API tokens.
 
-   **Not yet implemented:** compensating cleanup of remote Worker host-level side effects after a partially completed SSH deployment. Packages, UFW, NGINX, ACME state, swap, and systemd changes may remain after Panel API rollback. This remains an open acceptance item.
+   **Compensating Worker Rollback**:
+   If worker deployment or verification fails, the orchestrator executes automated compensating rollback on the Worker (`compensate_remote_worker` via in-process `ERR` trap and `gowave-node-auto.sh remote_rollback` via SSH stdin):
+   - Stops and disables `gowave-node.service` and `xray.service`, removes systemd drop-ins (`/etc/systemd/system/gowave-node.service.d/10-port.conf`), reloads daemon, and purges `/opt/gowave-node` and `/run/gowave-node`.
+   - Removes NGINX virtual hosts (`gowave-worker-https.conf`, `gowave-worker-decoy.conf`, `gowave-worker-stream.conf`, `00-bootstrap-worker-acme.conf`), reverts `stream` include if added, and reloads NGINX.
+   - Revokes and deletes ACME certificates via Certbot for `$WORKER_DOMAIN` and `$REALITY_DOMAIN`.
+   - Reverts UFW firewall changes (disabling UFW if originally inactive, or deleting source-scoped Control Plane rules).
+   - Deactivates and deletes `/swapfile` (and removes `/etc/fstab` entry) if created during the session.
+   - Removes `/etc/sysctl.d/99-gowave-node.conf` and reloads sysctl.
+   - Securely wipes secrets and `/tmp/gowave-*` scratch files.
 
 ---
 

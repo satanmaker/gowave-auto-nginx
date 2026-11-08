@@ -45,7 +45,7 @@
 | **systemd-resolved / DoT** | Systemd 255+ | `UPSTREAM_SUPPORTED` | `UPSTREAM_SUPPORTED` | Global DoT drop-in (`DNSOverTLS=yes`). | `community-baseline/assets/security/managed.py:17-34` |
 | **unattended-upgrades** | Distro package | `UPSTREAM_SUPPORTED` | `UPSTREAM_SUPPORTED` | Set origin to `origin=Ubuntu,archive=${distro_codename}-security`. Set `Automatic-Reboot "false"`. | `community-baseline/assets/security/managed.py:84-86` |
 | **Backup Tooling** | Format v1 | `UPSTREAM_SUPPORTED` | `UPSTREAM_SUPPORTED` | Python 3 + tar + gzip + sqlite3 CLI. | `community-baseline/assets/backup/x-ui-backup.sh:13-14` |
-| **Test Runner / QEMU** | Python 3.12+ / QEMU 8+ | `PROJECT_CI_PLANNED` | `PROJECT_CI_PLANNED` | Full systemd QEMU TCG guest testing. | `community-baseline/tests/systemd/boot.sh` |
+| **Test Runner / QEMU** | Python 3.12+ / QEMU 8+ | `PROJECT_CI_VERIFIED` | `PROJECT_CI_VERIFIED` | Full systemd QEMU matrix guest testing across Ubuntu 24.04 and Ubuntu 26.04. | `tests/systemd/boot.sh`, `.github/workflows/systemd-acceptance.yml` |
 
 ---
 
@@ -63,7 +63,7 @@
 | **systemd-resolved / DoT** | Systemd 252+ | `ADAPTED` | `UPSTREAM_SUPPORTED` | **Debian 12 adaptation**: `systemd-resolved` is NOT installed by default. Must run `apt-get install -y systemd-resolved` when DoT is requested. | Debian 12 package inventory; `community-baseline/assets/security/managed.py:111-120` |
 | **unattended-upgrades** | Distro package | `ADAPTED` | `UPSTREAM_SUPPORTED` | **Debian adaptation**: Set origin to `origin=Debian,label=Debian-Security,codename=${distro_codename}-security`. Set `Automatic-Reboot "false"`. | `community-baseline/assets/security/managed.py:87-88` |
 | **Backup Tooling** | Format v1 | `UPSTREAM_SUPPORTED` | `UPSTREAM_SUPPORTED` | Python 3 + tar + gzip + sqlite3 CLI. | Standard POSIX tools in Debian base |
-| **Test Runner / QEMU** | Python 3.11+ / QEMU 8+ | `PROJECT_CI_PLANNED` | `PROJECT_CI_PLANNED` | Full systemd QEMU TCG guest testing. | `community-baseline/tests/systemd/boot.sh` |
+| **Test Runner / QEMU** | Python 3.11+ / QEMU 8+ | `PROJECT_CI_VERIFIED` | `PROJECT_CI_VERIFIED` | Full systemd QEMU matrix guest testing across Debian 12 and Debian 13. | `tests/systemd/boot.sh`, `.github/workflows/systemd-acceptance.yml` |
 
 ---
 
