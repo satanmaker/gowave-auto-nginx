@@ -52,8 +52,9 @@ subscription delivery, and actual Data Plane tunnel traffic — on disposable re
 
 - **New files**: `tools/test_live_vps.py`, `tools/live_vps/` package, `tools/live_vps_config.env.example`,
   `.github/workflows/live-vps-e2e.yml`, `docs/LIVE_VPS_TESTING.md`.
-- **Modified files**: `gowave-auto.sh` (ACME mode mapping, Vision domain propagation), `gowave-node-auto.sh` (ACME
-  propagation, Vision domain support, plus configurable commit/SHA256 verification of the remote installer),
+- **Modified files**: `gowave-auto.sh` (ACME mode mapping, Master/Worker Vision domain-pair validation and
+  propagation), `gowave-node-auto.sh` (ACME propagation, optional Worker Vision certificate/inbound and NGINX
+  routing support, plus configurable commit/SHA256 verification of the remote installer),
   `modules/node.sh` (SHA-verified bundled installer gate), `modules/api_client.py` (backward-compatible
   SSLContext/timeout injection), `.gitignore`.
 - **Vendored input**: `sources/gowave-node/install.sh` at the configured immutable commit with a verified

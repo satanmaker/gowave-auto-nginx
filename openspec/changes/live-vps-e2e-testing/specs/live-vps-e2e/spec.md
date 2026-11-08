@@ -70,6 +70,44 @@ command.
 
 ---
 
+### Requirement: Optional Vision Domain Pair and Activation
+
+The runner SHALL accept `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` only as an all-or-none pair. A
+one-sided configuration SHALL fail local preflight before any remote command. When both are configured, the
+runner SHALL require a valid Vision certificate, active Vision inbound, matching Panel host, NGINX SNI route,
+and fallback on both VPS. Vision certificate issuance or validation failure MUST fail the relevant install
+phase; it MUST NOT be suppressed or reported as an optional skip. When both are absent, the default four-inbound
+per-node topology remains unchanged.
+
+#### Scenario: One-sided Vision domain configuration is rejected
+
+- **GIVEN** exactly one of `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` is non-empty
+- **WHEN** the whitelist configuration parser validates the E2E config
+- **THEN** preflight fails before SSH, certificate issuance, or any remote modification
+
+#### Scenario: Vision is fully provisioned on Master and Worker
+
+- **GIVEN** both Vision domains are configured and valid DNS records resolve to their respective VPS addresses
+- **WHEN** Master and Worker installation and Panel provisioning complete
+- **THEN** each VPS has a valid certificate for its Vision domain, each node has five inbounds, the Panel has
+  five matching hosts per node with correct node/inbound associations, and NGINX routes Vision SNI to 8444
+  with the non-VLESS HTTP fallback on 9444
+
+#### Scenario: Vision certificate failure aborts the relevant host installation
+
+- **GIVEN** Vision is enabled but issuance, ACME-lineage validation, certificate hostname validation, or
+  certificate/key verification fails on Master or Worker
+- **WHEN** that host's installation stage executes
+- **THEN** the stage fails and rolls back; no profile, host, or NGINX route may be left advertising an
+  unusable Vision endpoint
+
+#### Scenario: Vision disabled preserves the four-inbound topology
+
+- **GIVEN** both Vision domain fields are absent
+- **WHEN** Master and Worker are installed
+- **THEN** each node has exactly four inbounds and four hosts, no Vision certificate or route is created, and
+  the mandatory Data Plane matrix contains sixteen runtime cases
+
 ### Requirement: Pinned Version Fidelity
 
 Every test run SHALL record and verify the exact version of each software component: repository commit,
@@ -694,11 +732,17 @@ and `TEARDOWN_FAILED`. Overall `PASS` requires all mandatory phases completed, a
 runtime cases verified, and the declared teardown policy completed. `SKIP` and `NOT_RUN` are non-passing.
 `shortUuid` SHALL NOT appear in JUnit XML or any CI-published artifact.
 
-#### Scenario: PASS requires all sixteen Data Plane runtime cases
+#### Scenario: PASS requires all active Data Plane runtime cases
 
-- **GIVEN** all installation, API, subscription, firewall, and NGINX phases are `PASS`
+- **GIVEN** Vision is disabled and all installation, API, subscription, firewall, and NGINX phases are `PASS`
 - **WHEN** only fourteen of sixteen runtime cases pass (two fail)
 - **THEN** overall status is `FAIL`, not `PASS`; the failing protocol/client cases are identified individually in `result.json`
+
+#### Scenario: Vision-enabled PASS requires all twenty runtime cases
+
+- **GIVEN** both Vision domains are configured and all installation, API, subscription, firewall, and NGINX phases are `PASS`
+- **WHEN** only eighteen of twenty runtime cases pass (two fail)
+- **THEN** overall status is `FAIL`, not `PASS`; both failed Vision or core protocol/client cases are identified individually in `result.json` and JUnit XML
 
 #### Scenario: result.json schema fields present
 
