@@ -677,7 +677,13 @@ before-image.
    backend state. Either require a provably pristine supported firewall baseline or restore the exact
    before-image. Deleting a few rules added by the script is not an equivalent rollback because it can
    leave changed default policies or remove a pre-existing duplicate rule.
-6. On compensation, restore a pre-existing resource only if its current state is still attributable to this
+6. Include package-manager side effects in the baseline and transaction record: package
+   versions installed/upgraded, apt source configuration changed, service units/drop-ins and defaults created
+   by package post-install scripts, and relevant package state. The normal compensation path MUST NOT blindly
+   purge dependencies because that can remove unrelated shared packages. Under PRESERVE, such package
+   changes are explicit retained residuals; report them in the result and never claim the original OS
+   baseline was restored. A later run requires the re-image or verified RESTORE_SNAPSHOT path from D11.
+7. On compensation, restore a pre-existing resource only if its current state is still attributable to this
    transaction; if an external actor changed/replaced it, preserve the current object and report incomplete
    recovery. Verify the restored bytes, link targets, metadata, firewall policy, service state and effective
    sysctl values before reporting cleanup PASS. Do not use an ownership flag that records created-by-us
@@ -716,6 +722,9 @@ evidence that cleanup completed.
    status. An EXIT handler performs final secret/temp-file cleanup and invokes recovery only when the
    journal is still uncommitted and compensation has not completed. Do not assume an ERR trap covers
    signals, ignored-error contexts (if, OR-list), function boundaries or an abruptly killed remote process.
+   SIGKILL, kernel panic and power loss are not catchable: on the next authenticated Worker management or
+   recovery invocation, inspect the durable journal and reconcile every uncommitted transaction before
+   allowing a new mutation. A stale journal is never silently ignored or overwritten.
 3. Make remote_rollback transaction-scoped: it consumes the matching host-local journal and the D19
    ownership manifest. Without a matching uncommitted transaction and validated target identity it fails
    closed. It MUST NOT act as a generic set of unconditional rm -rf commands against fixed system paths.
@@ -734,10 +743,13 @@ evidence that cleanup completed.
    compensation result.
 
 **Required tests:** interrupt the remote payload with HUP, INT and TERM after each mutation boundary;
-simulate SSH loss and process termination; make each cleanup operation fail in turn (including Certbot,
-NGINX validation/reload, systemd, UFW and sysctl); force Worker rollback success/API rollback failure and
-the inverse; corrupt or mismatch the journal/run identity; rerun compensation after partial completion.
-Only a fully verified, idempotent rollback may return zero and permit a rolled-back terminal state.
+send SIGKILL after a write-ahead journal update and prove the next invocation recovers before new mutation;
+simulate SSH loss, kernel/process termination and reboot; make each cleanup operation fail in turn (including
+Certbot, NGINX validation/reload, systemd, UFW and sysctl); force Worker rollback success/API rollback failure
+and the inverse; corrupt or mismatch the journal/run identity; rerun compensation after partial completion.
+Only a fully verified, idempotent compensation may return zero. The report must separately state whether the
+managed transaction was compensated and whether the complete original OS baseline was restored; retained
+package-manager side effects under PRESERVE MUST NOT be represented as baseline restoration.
 
 **Rationale:** The E2E runner uses destructive fault injection on disposable hosts. It must distinguish
 rollback attempted from original state restored; otherwise it can produce a false-clean result immediately
@@ -1005,7 +1017,7 @@ The runner executes 15 negative scenarios in Phase 9 (and during isolated test p
 | **NEG-01**  | Preflight SSH    | Host key absent or corrupted in `known_hosts` | Preflight terminates before any remote command |
 | **NEG-02**  | Preflight SSH    | Target SSH port closed / unreachable | Preflight terminates with connection timeout |
 | **NEG-03**  | Preflight DNS    | Domain resolves to IP other than target VPS | Preflight terminates before SSH connection |
-| **NEG-04**  | Preflight DNS    | Missing AAAA record when `ENABLE_IPV6=true` | Preflight terminates before remote execution |
+| **NEG-04**  | Preflight DNS    | Missing/incorrect/extra AAAA when `ENABLE_IPV6=true`, or any published AAAA when `ENABLE_IPV6=false` | Preflight terminates before remote execution; no remote mutation |
 | **NEG-05**  | ACME Install     | Certbot challenge failure (NXDOMAIN / blocked port 80) | Installation aborts; services not marked healthy |
 | **NEG-06**  | NGINX Config     | Syntax error in `/etc/nginx/conf.d/*.conf` | `nginx -t` fails; runner blocks config activation |
 | **NEG-07**  | Worker Node      | `systemctl stop gowave-node` on Worker | Panel detects offline; `isConnected` becomes `false` |
