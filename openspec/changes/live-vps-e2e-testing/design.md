@@ -195,8 +195,10 @@ unreliable results. The lock is released on process exit (normal or signal).
 
 **Chosen:** When `ACME_MODE=staging`, the runner manages trust for Let's Encrypt Staging CA chains without
 mutating system-wide `/etc/ssl/certs` on the Control Machine:
-1. `tools/live_vps/tls.py` bundles or downloads the Let's Encrypt Staging Root/Intermediate certificates
-   (`(STAGING) Pretend Pear X1` / `Artificial Strawberry Root X1`).
+1. `tools/live_vps/tls.py` uses a repository-reviewed staging CA bundle or downloads certificates only from
+   an explicitly allowlisted official source and verifies pinned SHA256 fingerprints before use. The bundle
+   identifies the applicable Let's Encrypt Staging Root/Intermediate certificates; certificate names alone
+   are not accepted as a trust anchor.
 2. For Python Panel API calls (`panel_api.py`), the staging CA is loaded into a dedicated `ssl.create_default_context(cafile=...)`.
 3. For curl calls, `--cacert <staging-ca-path>` is passed.
 4. For Xray and Mihomo temporary client configs, the staging CA certificate is referenced in `tlsSettings`
@@ -469,7 +471,7 @@ the following strict schema:
 | `API_TIMEOUT` | Integer seconds | No | `15` | Panel REST API call timeout |
 | `TRAFFIC_TIMEOUT` | Integer seconds | No | `30` | SOCKS5 tunnel request timeout |
 | `TEST_TRAFFIC_VERIFICATION` | Boolean | No | `true` | Verify Data Plane traffic (`false` yields `INCOMPLETE`) |
-| `TEST_MIHOMO_TRAFFIC` | Boolean | No | `true` | Verify traffic with real Mihomo client process |
+| `TEST_MIHOMO_TRAFFIC` | Boolean | No | `true` | Verify traffic with real Mihomo client process; false skips eight mandatory cases and makes overall status INCOMPLETE |
 | `TEST_NEGATIVE_SUITE` | Boolean | No | `true` | Execute NEG-01 through NEG-15 |
 | `TEST_KEEP_VPS_ON_FAILURE` | Boolean | No | `true` | Teardown policy: preserve VPS on failure |
 | `TEST_RESTORE_SNAPSHOT` | Boolean | No | `false` | Teardown policy: restore snapshot if supported |
