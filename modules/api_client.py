@@ -305,7 +305,7 @@ class GoWaveClient:
         all_inbounds = list(dict.fromkeys(existing_inbounds + inbound_uuids))
 
         if squad_uuid:
-            self.request("PATCH", f"/api/internal-squads/{squad_uuid}", {"name": squad_name, "inbounds": all_inbounds})
+            self.request("PATCH", "/api/internal-squads", {"uuid": squad_uuid, "name": squad_name, "inbounds": all_inbounds})
         else:
             res = self.request("POST", "/api/internal-squads", {"name": squad_name, "inbounds": all_inbounds})
             data = res.get("response", res)
@@ -768,7 +768,8 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
                     cur_inbounds = [inb.get("uuid") if isinstance(inb, dict) else inb for inb in s.get("inbounds", [])]
                     updated_inbounds = [ib for ib in cur_inbounds if ib not in worker_inbound_uuids]
                     if len(updated_inbounds) != len(cur_inbounds):
-                        client.request("PATCH", f"/api/internal-squads/{s.get('uuid')}", {
+                        client.request("PATCH", "/api/internal-squads", {
+                            "uuid": s.get("uuid"),
                             "name": s.get("name"),
                             "inbounds": updated_inbounds
                         })
