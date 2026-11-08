@@ -2,31 +2,38 @@
 
 ## ADDED Requirements
 
-### Requirement: ACME Staging/Production Mode Parameter
+### Requirement: Explicit ACME Endpoint Selection and Certificate Lineage Isolation
 
-The installer and distributed orchestrator SHALL accept an ACME server mode parameter switching certbot between
-Let's Encrypt staging and production endpoints. When active, certbot SHALL be invoked with `--server <staging-url>`.
-The orchestrator SHALL propagate this parameter across Master and Worker via SSH stdin. Valid certificates SHALL be
-reused without reissuing.
+The installer and distributed orchestrator SHALL accept an explicit ACME directory URL, defaulting to the existing Let's Encrypt production endpoint when unset. The selected endpoint SHALL be propagated from Master to Worker over the existing SSH stdin payload. The installer SHALL use a certificate lineage that is unambiguously associated with that ACME directory; a staging certificate MUST NOT be reused as a production certificate, and a production certificate MUST NOT satisfy a staging acceptance run.
 
-#### Scenario: Staging certificate issued during E2E test run on Master
+The current NGINX configuration consumes certificate files from `/etc/letsencrypt/live/<domain>/`. The implementation MUST preserve that path contract for the active deployment or update every dependent NGINX path atomically. It MUST NOT silently point production services at a staging lineage. Reuse is permitted only when the existing lineage's renewal configuration identifies the same ACME directory and the certificate is valid for the requested domain.
 
-- **GIVEN** `ACME_MODE=staging` is configured for the E2E run
-- **WHEN** `gowave-auto.sh install` is called with the staging parameter
-- **THEN** certbot is invoked with `--server https://acme-staging-v02.api.letsencrypt.org/directory`,
-  a staging certificate is issued for the domain, and the installation proceeds to completion without
-  contacting the Let's Encrypt production endpoint
+#### Scenario: Staging certificate issued on a clean disposable Master
 
-#### Scenario: Staging parameter propagated to Worker during node add
+- **GIVEN** `GOWAVE_ACME_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory` and a clean disposable Master
+- **WHEN** `gowave-auto.sh install` provisions the Panel and REALITY certificates
+- **THEN** every Certbot issuance call uses the staging directory; the resulting certificate chain is staging-issued; no production ACME endpoint is contacted
 
-- **GIVEN** `ACME_MODE=staging` is active on Master
-- **WHEN** `gowave-auto.sh node add worker-1 ...` executes
-- **THEN** `GOWAVE_ACME_SERVER` is transmitted over SSH stdin to Worker, and Worker certbot calls execute
-  with `--server https://acme-staging-v02.api.letsencrypt.org/directory` without hitting production rate limits
+#### Scenario: Staging parameter propagated to Worker
 
-#### Scenario: Existing valid production certificate reused
+- **GIVEN** the Master installation uses the staging directory
+- **WHEN** `gowave-auto.sh node add` invokes the remote Worker deployment
+- **THEN** the exact ACME directory URL is serialized through SSH stdin and every Worker Certbot issuance call uses that URL
 
-- **GIVEN** `ACME_MODE=production` and a valid certificate already exists for the domain
-- **WHEN** `gowave-auto.sh install` or `node add` is invoked again for the same domain
-- **THEN** certbot's `--keep-until-expiring` or equivalent flag causes the existing certificate to be
-  reused without issuing a new one, respecting production rate limits
+#### Scenario: Existing certificate is reused only for the same ACME directory
+
+- **GIVEN** a valid certificate lineage exists for the requested domain
+- **WHEN** installation is repeated with the same ACME directory URL
+- **THEN** Certbot may reuse the lineage without unnecessary issuance, after validating its renewal configuration and certificate SAN/expiry
+
+#### Scenario: ACME directory changes between staging and production
+
+- **GIVEN** the domain has a certificate lineage issued by the other ACME directory
+- **WHEN** the operator changes `GOWAVE_ACME_SERVER`
+- **THEN** the installer MUST NOT treat the old lineage as a valid reusable certificate; it MUST require a fresh disposable baseline or create a separately named lineage and atomically update all consumers; it MUST never mix staging and production certificates
+
+#### Scenario: ACME parameter is unset
+
+- **GIVEN** `GOWAVE_ACME_SERVER` is unset
+- **WHEN** the existing installer is run
+- **THEN** the production endpoint and existing certificate behavior remain backward-compatible
