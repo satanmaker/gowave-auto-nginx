@@ -77,7 +77,7 @@ The runner SHALL target two distinct public VPS IPv4 addresses and SHALL reject 
 
 #### Scenario: Master and Worker target addresses must differ
 
-- **GIVEN** `MASTER_IP` and `WORKER_IP` resolve to the same IPv4 address
+- **GIVEN** `MASTER_IP` and `WORKER_IP` contain the same IPv4 address
 - **WHEN** configuration preflight validates target identity
 - **THEN** preflight fails before SSH mutation or lock acquisition; the runner does not treat two ports on one public address as two independently verified VPS instances
 
@@ -654,7 +654,7 @@ Teardown is reported separately from test outcome; overall `PASS` requires the s
 - **WHEN** the test run completes with any test outcome
 - **THEN** diagnostics are collected, the actual test outcome is retained, and teardown is recorded separately as
   `PASS`; `PRESERVE` itself does not uninstall, restore, reimage, or destroy either VPS, so all mutations made by
-the test run remain in place and the next run requires operator re-image or verified snapshot restoration
+  the test run remain in place and the next run requires operator re-image or verified snapshot restoration
 
 #### Scenario: Snapshot restore hook configuration and protocol are validated
 

@@ -448,9 +448,13 @@ When the pair is configured:
    Panel and REALITY certificates before compiling/provisioning the Master profile. The current best-effort
    suppression of Vision Certbot/certificate-verification failures (`|| true`) MUST be removed for this E2E
    path. A missing, wrong-ACME-lineage, expired, or hostname-invalid Vision certificate fails Master
-   installation; implementation MUST provide an install cleanup/rollback path and test that no partial Vision
-   profile, certificate consumer, or NGINX route remains active. The runner MUST NOT report a partial
-   four-inbound Master as successful Vision-enabled installation.
+   installation; implementation MUST record which requested-domain lineages existed before the transaction.
+   Cleanup may remove only lineages created by the failed transaction. If Certbot changes a pre-existing
+   lineage, the implementation MUST restore its pre-install certificate, key, and renewal configuration from
+   a securely permissioned transaction snapshot; if safe restoration cannot be guaranteed, fail before
+   issuance. The rollback test MUST prove that no pre-existing lineage or unrelated certificate is lost and
+   no partial Vision profile, certificate consumer, or NGINX route remains active. The runner MUST NOT report
+   a partial four-inbound Master as successful Vision-enabled installation.
 2. `gowave-auto.sh node add` MUST receive the Worker Vision domain through an explicit named
    `--vision-domain` option (not by shifting the existing optional SSH-user/SSH-port positional arguments).
    It validates the domain, includes it in the Worker API profile via `compile_config_profile(...,
@@ -465,15 +469,17 @@ When the pair is configured:
    create a loopback-only cleartext HTTP decoy vhost on `127.0.0.1:9444` with `proxy_protocol` enabled,
    serving the managed cover-reality content and never the GoWave Panel/API. `nginx -t` MUST pass before
    activation/reload. Any requested Vision prerequisite failure fails the Worker phase.
-4. Worker failure compensation MUST account for all Vision artifacts: the HTTP-01 bootstrap name, certificate
-   lineage, renewal metadata, stream-map entry, 9444 vhost, generated inbound/profile/host state and deploy
-   hook effects. Rollback MUST remove artifacts created by the failed transaction and restore a valid NGINX
-   configuration before reload. It MUST NOT delete a pre-existing certificate/lineage or unrelated resource
-   not owned by the transaction; if ownership cannot be proven, fail closed and report cleanup incomplete.
-4. Panel API acceptance MUST verify five inbounds and five corresponding hosts per node, including each
+4. Worker failure compensation MUST account for all Worker certificate and Vision artifacts: record the
+   pre-transaction presence/identity of the Worker, REALITY and optional Vision lineages; remove only lineages
+   created by this transaction, and restore any pre-existing lineage changed by Certbot from a secure snapshot.
+   The same ownership rule applies to bootstrap names, renewal metadata, stream-map entries, the 9444 vhost,
+   generated inbound/profile/host state and deploy-hook effects. Rollback MUST restore a valid NGINX
+   configuration before reload and MUST NOT delete unrelated resources. If ownership or restoration cannot
+   be proven, fail closed and report cleanup incomplete.
+5. Panel API acceptance MUST verify five inbounds and five corresponding hosts per node, including each
    Vision inbound/host association. The subscription MUST expose one Vision proxy per VPS, and Xray and
    Mihomo MUST each execute the two Vision endpoints as independent runtime cases.
-5. When both Vision domains are absent, the default four-inbound topology remains unchanged: no Vision
+6. When both Vision domains are absent, the default four-inbound topology remains unchanged: no Vision
    certificate issuance, no Vision SNI route/fallback, and no Vision subscription endpoint.
 
 **Rationale:** The current Master installer suppresses Vision certificate issuance/verification errors, while
