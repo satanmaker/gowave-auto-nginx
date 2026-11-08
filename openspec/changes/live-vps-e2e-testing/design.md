@@ -144,8 +144,8 @@ is not guaranteed to be a complete standalone config.
 
 **Chosen:** Each endpoint test is executed sequentially with a bounded observation window:
 1. Record baseline packet/byte counters (or start a bounded `tcpdump` capture) on the target VPS public
-   transport listener. In the current NGINX stream topology this is TCP/443; do not assume the four logical
-   protocols have four distinct public TCP ports. Use the exact configured listener and record the capture
+   transport listener. In the current NGINX stream topology this is TCP/443; do not assume the four or five
+   logical protocols have distinct public TCP ports. Use the exact configured listener and record the capture
    filter and interface.
 2. Execute one tunnel request through the selected endpoint and record the client-observed egress IP.
    Compare it with `EXPECTED_MASTER_EGRESS_IP` or `EXPECTED_WORKER_EGRESS_IP` when configured. If no expected
@@ -461,10 +461,10 @@ Phase 0: Preflight
   0.2  Acquire the local per-target `fcntl.flock` in the private runtime directory
   0.3  Control Machine tool check (python3, ssh, openssl, curl, dig, xray, mihomo)
   0.4  SSH trust check (both VPS, StrictHostKeyChecking=yes)
-  0.5  DNS verification (4 domains, A/AAAA, 2+ resolvers)
+  0.5  DNS verification (4 domains required: Panel, Reality for Master/Worker; plus optional 2 Vision domains when configured, A/AAAA, 2+ resolvers)
   0.6  Baseline snapshot (systemd, listeners, firewall, GoWave dirs)
   0.7  Disposable gate (reject if GoWave present or ports occupied)
-  0.8  Port hygiene (11+ required ports checked as free)
+  0.8  Port hygiene (11+ required ports checked as free: 80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, 10003; plus 8444 and 9444 when vision domain is enabled)
   0.9  Acquire and hold authoritative `flock` sessions on both VPS hosts in deterministic address order;
        preflight-only runs release them on exit; all mutating phases require both locks
   0.10 Re-collect the read-only baseline/disposable gate on both hosts while both locks are held; if any
@@ -475,7 +475,8 @@ Phase 1: Master Installation
        stored preflight baseline before the first remote mutation; stale or changed baseline → fail closed
   1.2  Copy pinned repo commit to Master /opt/gowave-auto-nginx
   1.3  Run gowave-auto.sh install with `GOWAVE_ACME_SERVER` derived from `ACME_MODE`; set
-       `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1` and provide the pinned Node installer commit + SHA256
+       `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1` and provide the pinned Node installer commit + SHA256;
+       pass `--vision-domain` if `MASTER_VISION_DOMAIN` is configured
   1.4  Verify service states, listeners, TLS certs
   1.5  Verify credentials file (mode, owner, keys present — values not logged)
   1.6  Retrieve shortUuid (state.json + API cross-check)
@@ -487,7 +488,8 @@ Phase 1: Master Installation
 
 Phase 2: Worker Deployment
   2.1  Run `gowave-auto.sh node add worker-1` on Master with the same validated ACME directory and the
-       same Node-installer commit + SHA256 explicitly supplied again for the Worker dispatch
+       same Node-installer commit + SHA256 explicitly supplied again for the Worker dispatch;
+       pass `--vision-domain` if `WORKER_VISION_DOMAIN` is configured
   2.2  Verify exit code, state.json, process argv observation (SECRET_KEY not in Master-side argv)
   2.3  Verify Worker services, listeners, certs, deploy hook, cover-reality SHA256
   2.4  Poll Panel API isConnected until true (bounded NODE_READY_TIMEOUT)
@@ -506,17 +508,17 @@ Phase 3: Public mTLS Verification (execute allowed-source probes from Master)
   3.7  Run wrong-key local client-load test and wrong-server-CA client-verification test separately
 
 Phase 4: Panel API Audit
-  4.1  GET /api/nodes — 2 nodes, correct addresses, 4 inbounds each, isConnected
-  4.2  GET /api/config-profiles — 2 profiles, 4 inbounds each, computed-config valid JSON
-  4.3  GET /api/internal-squads — Default MVP Squad, 8 inbound UUIDs, set equality
-  4.4  GET /api/hosts — 8 hosts, all fields verified, correct node/inbound associations
+  4.1  GET /api/nodes — 2 nodes, correct addresses, 4 inbounds each (or 5 with vision), isConnected
+  4.2  GET /api/config-profiles — 2 profiles, 4 inbounds each (or 5 with vision), computed-config valid JSON
+  4.3  GET /api/internal-squads — Default MVP Squad, 8 inbound UUIDs (or 10 with vision), set equality
+  4.4  GET /api/hosts — 8 hosts (or 10 with vision), all fields verified, fingerprint="firefox", correct node/inbound associations
 
 Phase 5: Subscriptions
   5.1  GET /api/users/by-username/default-user → shortUuid
   5.2  User-Agent policy (empty, absent, Xray UA, Mihomo UA → check actual Panel response)
-  5.3  Fetch Xray JSON (Xray UA), verify 8 proxy outbounds, headers, no server secrets
+  5.3  Fetch Xray JSON (Xray UA), verify 8 proxy outbounds (or 10 with vision), fingerprint="firefox", headers, no server secrets
   5.4  Validate with xray run -test (temporary wrapper config)
-  5.5  Fetch Mihomo YAML (Mihomo UA), verify 8 proxies, GEOIP rule, headers
+  5.5  Fetch Mihomo YAML (Mihomo UA), verify 8 proxies (or 10 with vision), client-fingerprint="firefox", GEOIP rule, headers
   5.6  Validate with mihomo -t
   5.7  Verify Mihomo runtime copy binds all local listeners to 127.0.0.1 on collision-free per-run ports;
        preserve proxy/rule semantics and reject externally exposed or non-loopback controllers
@@ -531,19 +533,20 @@ Phase 6: Firewall
   6.5  Confirm DROP evidence on the target host: Master evidence for Master external probes; Worker evidence for Control Machine → Worker probes
   6.6  Repeat equivalent checks over IPv6 when ENABLE_IPV6=true
 
-Phase 7: NGINX SNI + REALITY Decoy
+Phase 7: NGINX SNI + REALITY Decoy (+ Optional Vision)
   7.1  Panel HTTPS with correct SNI (TLS cert valid, Panel API responds)
   7.2  Worker HTTPS with correct SNI
-  7.3  REALITY fallback with REALITY SNI + invalid REALITY params (decoy content, not GoWave API)
+  7.3  REALITY fallback with REALITY SNI + invalid REALITY params (decoy content on 9443, not GoWave API)
   7.4  Unknown SNI routing (matches NGINX + Xray REALITY fallback behavior)
-  7.5  nginx -t on both VPS configs
-  7.6  cover-reality unique marker file accessible
-  7.7  PROXY protocol integrity (inferred from correct Panel and Worker HTTPS responses)
+  7.5  Optional Vision SNI routing to 8444 and non-VLESS HTTP fallback to decoy on 9444 when configured
+  7.6  nginx -t on both VPS configs
+  7.7  cover-reality unique marker file accessible
+  7.8  PROXY protocol integrity (inferred from correct Panel, Worker, REALITY, and Vision responses)
 
-Phase 8: Data Plane E2E (8 logical endpoints × 2 client runtimes = 16 required cases)
-  8.1  Logical endpoint matrix: Master × {VLESS REALITY, VLESS XHTTP, VLESS WS, Trojan gRPC}
-       and Worker × the same four protocols
-  8.2  For each logical endpoint, run a real Xray client case and a real Mihomo client case:
+Phase 8: Data Plane E2E (8 or 10 logical endpoints × 2 client runtimes = 16 or 20 required cases)
+  8.1  Logical endpoint matrix: Master × {VLESS REALITY, VLESS XHTTP, VLESS WS, Trojan gRPC, and optional VLESS XTLS-Vision when Vision domain is configured}
+       and Worker × the same protocols (8 endpoints by default; 10 when Vision domain is configured)
+  8.2  For each logical endpoint, run a real Xray client case and a real Mihomo client case (with firefox fingerprint):
        - Extract the corresponding proxy from the real subscription
        - Build/validate a temporary Xray wrapper config; for Mihomo, create a per-run sanitized copy of
          the real YAML preserving proxy definitions/rules but assigning free loopback-only mixed/SOCKS/
@@ -552,8 +555,8 @@ Phase 8: Data Plane E2E (8 logical endpoints × 2 client runtimes = 16 required 
        - Send HTTPS request through the selected proxy; verify HTTP response and observed egress IP
        - Verify target VPS ingress evidence in an isolated observation window
        - Stop client and remove temporary configuration
-  8.3  All 16 cases are mandatory for overall PASS. If a client runtime is intentionally disabled, mark its
-       eight cases SKIP and overall status INCOMPLETE. A syntax-only validation is not a runtime traffic pass.
+  8.3  All 16 (or 20) cases are mandatory for overall PASS. If a client runtime is intentionally disabled, mark its
+       cases SKIP and overall status INCOMPLETE. A syntax-only validation is not a runtime traffic pass.
 
 Phase 9: Negative Tests (NEG-01 .. NEG-15)
   NEG-01..NEG-04 are isolated preflight contract tests using temporary known_hosts/config fixtures and
@@ -675,11 +678,13 @@ the following strict schema:
 | `MASTER_IP` | IPv4 address | Yes | — | Public IPv4 of Master VPS (disallowed: RFC-1918, loopback, docs) |
 | `MASTER_PANEL_DOMAIN` | FQDN | Yes | — | Domain pointing to Master Panel NGINX HTTPS |
 | `MASTER_REALITY_DOMAIN` | FQDN | Yes | — | Camouflage decoy domain pointing to Master REALITY SNI |
+| `MASTER_VISION_DOMAIN` | FQDN | No | — | Optional dedicated domain for Master VLESS+XTLS Vision |
 | `MASTER_SSH_PORT` | Integer 1–65535 | No | `22` | Master SSH management port |
 | `MASTER_SSH_USER` | String | No | `root` | Master SSH login user |
 | `WORKER_IP` | IPv4 address | Yes | — | Public IPv4 of Worker VPS |
 | `WORKER_DOMAIN` | FQDN | Yes | — | Domain pointing to Worker NGINX HTTPS |
 | `WORKER_REALITY_DOMAIN` | FQDN | Yes | — | Camouflage decoy domain pointing to Worker REALITY SNI |
+| `WORKER_VISION_DOMAIN` | FQDN | No | — | Optional dedicated domain for Worker VLESS+XTLS Vision |
 | `WORKER_SSH_PORT` | Integer 1–65535 | No | `22` | Worker SSH management port |
 | `WORKER_SSH_USER` | String | No | `root` | Worker SSH login user |
 | `SSH_KEY_PATH` | File path | Yes | — | Path to private SSH key for authentication |
@@ -701,7 +706,7 @@ the following strict schema:
 | `API_TIMEOUT` | Integer seconds | No | `15` | Panel REST API call timeout |
 | `TRAFFIC_TIMEOUT` | Integer seconds | No | `30` | SOCKS5 tunnel request timeout |
 | `TEST_TRAFFIC_VERIFICATION` | Boolean | No | `true` | Verify Data Plane traffic (`false` yields `INCOMPLETE`) |
-| `TEST_MIHOMO_TRAFFIC` | Boolean | No | `true` | Verify traffic with real Mihomo client process; false skips eight mandatory cases and makes overall status INCOMPLETE |
+| `TEST_MIHOMO_TRAFFIC` | Boolean | No | `true` | Verify traffic with real Mihomo client process; false skips mandatory Mihomo cases and makes overall status INCOMPLETE |
 | `TEST_NEGATIVE_SUITE` | Boolean | No | `true` | Execute NEG-01 through NEG-15; false marks all 15 SKIP and overall INCOMPLETE (never PASS) |
 | `TEST_TEARDOWN_POLICY` | Enum: `PRESERVE`, `RESTORE_SNAPSHOT` | No | `PRESERVE` | Mutually exclusive teardown policy; `DESTROY` is rejected in v1 |
 | `MASTER_SNAPSHOT_ID` | String | Conditional | — | Required for RESTORE_SNAPSHOT; operator-managed Master snapshot identifier |

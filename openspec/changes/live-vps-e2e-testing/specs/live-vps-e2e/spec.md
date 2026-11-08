@@ -267,18 +267,18 @@ The runner SHALL verify the complete Panel API object graph against the real GoW
 REST API calls. On a clean test environment the runner SHALL confirm node count, inbound count, config profile
 correctness, Internal Squad membership by set equality, and all Host record fields — with no duplicates.
 
-#### Scenario: Eight Hosts present with correct node and inbound associations
+#### Scenario: Hosts present with correct node and inbound associations
 
 - **GIVEN** Master installed and Worker deployed on a clean test environment
 - **WHEN** runner queries `GET /api/hosts`
-- **THEN** exactly eight Host records exist; four reference `local-node` UUID and four reference `worker-1`
-  UUID; each Host's `inbound UUID` matches one of the four inbounds in the corresponding node's config profile
+- **THEN** exactly eight (or ten when vision domains are configured) Host records exist; four (or five) reference `local-node` UUID and four (or five) reference `worker-1`
+  UUID; each Host's `inbound UUID` matches one of the inbounds in the corresponding node's config profile; all hosts configure `fingerprint: firefox`
 
-#### Scenario: Internal Squad contains all eight inbound UUIDs
+#### Scenario: Internal Squad contains all provisioned inbound UUIDs
 
-- **GIVEN** both nodes are registered with four inbounds each
+- **GIVEN** both nodes are registered with four (or five) inbounds each
 - **WHEN** runner queries `GET /api/internal-squads` for `Default MVP Squad`
-- **THEN** the squad's inbound list contains exactly the eight UUIDs (four from Master profile, four from
+- **THEN** the squad's inbound list contains exactly the eight (or ten) UUIDs (four or five from Master profile, four or five from
   Worker profile) with no duplicates — verified by set equality
 
 #### Scenario: Two nodes and two config profiles with correct structure
@@ -286,7 +286,7 @@ correctness, Internal Squad membership by set equality, and all Host record fiel
 - **GIVEN** Master installed and Worker deployed on a clean test environment
 - **WHEN** runner queries `GET /api/nodes` and `GET /api/config-profiles`
 - **THEN** exactly two nodes exist (`local-node` at `127.0.0.1:3002` and `worker-1` at `WORKER_IP:3002`),
-  each with four active inbounds and unique UUIDs; two config profiles each have four inbounds and valid
+  each with four (or five with vision) active inbounds and unique UUIDs; two config profiles each have four (or five) inbounds and valid
   computed JSON config; Node API address for Worker is `WORKER_IP` and VPN client address is `WORKER_DOMAIN`
 
 ---
@@ -306,12 +306,12 @@ against the real Panel; actual HTTP response codes SHALL be used (not mock assum
   installed GoWave version; if that is 403, the runner records a pass; if the Panel behavior differs, the
   runner records the actual response and fails the assertion
 
-#### Scenario: Eight proxy-capable outbounds in Xray JSON
+#### Scenario: Proxy-capable outbounds in Xray JSON
 
 - **GIVEN** subscription fetched with valid Xray User-Agent
 - **WHEN** runner parses the JSON and counts proxy-capable outbounds
-- **THEN** exactly eight outbounds are identified by protocol/transport tag (VLESS REALITY Vision, VLESS XHTTP
-  TLS, VLESS WS TLS, Trojan gRPC TLS) for Master and Worker; `direct`, `block`, and routing-only entries
+- **THEN** exactly eight (or ten when vision is configured) outbounds are identified by protocol/transport tag (VLESS REALITY, VLESS XHTTP
+  TLS, VLESS WS TLS, Trojan gRPC TLS, and optional VLESS XTLS Vision TLS) for Master and Worker; `fingerprint: "firefox"` is verified; `direct`, `block`, and routing-only entries
   are excluded from the count
 
 #### Scenario: Xray JSON subscription headers and content verified
@@ -326,8 +326,8 @@ against the real Panel; actual HTTP response codes SHALL be used (not mock assum
 
 - **GIVEN** subscription fetched with valid Mihomo User-Agent
 - **WHEN** runner validates HTTP response and parses YAML
-- **THEN** HTTP 200 is returned with correct Content-Type; eight proxy entries with correct protocol and
-  transport parameters are present; `GEOIP,private,DIRECT,no-resolve` rule is present; no duplicates; real
+- **THEN** HTTP 200 is returned with correct Content-Type; eight (or ten when vision is configured) proxy entries with correct protocol and
+  transport parameters and `client-fingerprint: "firefox"` are present; `GEOIP,private,DIRECT,no-resolve` rule is present; no duplicates; real
   `mihomo -t` validates the config
 
 ---
@@ -365,9 +365,9 @@ The runner SHALL verify isolation of TCP/3002 on Master and Worker. A timeout al
 ### Requirement: NGINX SNI Routing and REALITY Decoy Verification
 
 The runner SHALL verify NGINX Stream routing behavior on port 443 for both Master and Worker. Expected
-routing: Panel/Worker SNI → `127.0.0.1:7443`; Reality SNI → `127.0.0.1:8443`; default (unknown SNI) →
-`127.0.0.1:8443`. Generated NGINX config SHALL pass `nginx -t`. Cover-reality assets SHALL be present and
-PROXY protocol SHALL be correctly forwarded.
+routing: Panel/Worker SNI → `127.0.0.1:7443`; Reality SNI → `127.0.0.1:8443`; optional Vision SNI →
+`127.0.0.1:8444`; default (unknown SNI) → `127.0.0.1:8443`. Generated NGINX config SHALL pass `nginx -t`.
+Cover-reality assets and fallbacks SHALL be present and PROXY protocol SHALL be correctly forwarded.
 
 #### Scenario: Panel HTTPS accessible with correct SNI
 
@@ -388,20 +388,27 @@ PROXY protocol SHALL be correctly forwarded.
 - **THEN** REALITY fallback returns a decoy site response; a unique cover-reality site marker file is accessible;
   unknown SNI routes per NGINX + Xray REALITY fallback logic without returning GoWave API content
 
+#### Scenario: Optional Vision SNI routing and decoy fallback
+
+- **GIVEN** vision domain is configured and NGINX Stream is active
+- **WHEN** runner connects with vision domain SNI using a non-VLESS HTTP probe
+- **THEN** traffic routes to loopback port 8444 and falls back to loopback port 9444 returning decoy site content via PROXY protocol
+
 ---
 
-### Requirement: Data Plane E2E Traffic Through All Eight VPN Endpoints
+### Requirement: Data Plane E2E Traffic Through All VPN Endpoints
 
-The runner SHALL verify eight logical endpoints (four protocols on Master and four on Worker). Each endpoint MUST
-be exercised independently by both a real Xray client process and a real Mihomo client process, yielding sixteen
-mandatory runtime cases. All tests SHALL use actual subscription data and verify client-observed egress plus target-VPS
-ingress evidence; syntax-only checks do not count as traffic verification.
+The runner SHALL verify all logical endpoints (four core protocols on Master and Worker by default; plus optional
+VLESS XTLS Vision when configured). Each active endpoint MUST be exercised independently by both a real Xray
+client process and a real Mihomo client process with Firefox fingerprint, yielding sixteen or twenty mandatory
+runtime cases. All tests SHALL use actual subscription data and verify client-observed egress plus target-VPS
+ingress evidence; syntax checks do not count.
 
-#### Scenario: Eight logical endpoints are exercised by both clients
+#### Scenario: All active logical endpoints are exercised by both clients
 
-- **GIVEN** the real Xray JSON and Mihomo YAML subscriptions each contain four Master and four Worker proxy entries
+- **GIVEN** the real Xray JSON and Mihomo YAML subscriptions each contain four or five Master and four or five Worker proxy entries
 - **WHEN** the runner executes the Data Plane phase
-- **THEN** it runs Xray and Mihomo independently against each of the eight logical endpoints (16 cases total); all cases must pass for overall `PASS`
+- **THEN** it runs Xray and Mihomo independently against each of the active logical endpoints (16 or 20 cases total); all cases must pass for overall `PASS`
 
 #### Scenario: Xray runtime request traverses the selected Master endpoint
 
@@ -474,7 +481,7 @@ ingress evidence; syntax-only checks do not count as traffic verification.
 
 #### Scenario: One or more mandatory runtime cases fail
 
-- **GIVEN** the sixteen-case runtime matrix is required
+- **GIVEN** the sixteen-case (or twenty-case when vision is configured) runtime matrix is required
 - **WHEN** any Xray or Mihomo case fails
 - **THEN** the corresponding case is `FAIL` and overall status is `FAIL`
 
@@ -683,9 +690,9 @@ token, raw `shortUuid`, or subscription content containing private parameters.
 ### Requirement: Result Status Semantics
 
 The runner SHALL use exactly the status values: `PASS`, `FAIL`, `SKIP`, `NOT_RUN`, `PARTIAL`, `INCOMPLETE`,
-and `TEARDOWN_FAILED`. Overall `PASS` requires all mandatory phases completed, all sixteen Data Plane runtime
-cases verified, and the declared teardown policy completed. `SKIP` and `NOT_RUN` are non-passing. `shortUuid`
-SHALL NOT appear in JUnit XML or any CI-published artifact.
+and `TEARDOWN_FAILED`. Overall `PASS` requires all mandatory phases completed, all sixteen or twenty Data Plane
+runtime cases verified, and the declared teardown policy completed. `SKIP` and `NOT_RUN` are non-passing.
+`shortUuid` SHALL NOT appear in JUnit XML or any CI-published artifact.
 
 #### Scenario: PASS requires all sixteen Data Plane runtime cases
 
@@ -705,6 +712,7 @@ SHALL NOT appear in JUnit XML or any CI-published artifact.
   commit and SHA256, Node-managed Xray/rw-core version, NGINX/OpenSSL versions, egress IP and installed-binary
   SHA256 values. `trust` records ACME mode and, for staging, the public CA bundle SHA256, Staging pin-manifest
   SHA256 and validated root subjects. `results` contains all mandatory phase keys; `traffic` contains
-  Master/Worker sub-objects for each of four protocols and separate Xray/Mihomo case results per protocol;
+  Master/Worker sub-objects for each of the provisioned protocols (four core protocols, plus optional VLESS Vision)
+  and separate Xray/Mihomo case results per protocol;
   `overall` is the status string. All version and digest values are required to satisfy Pinned Version Fidelity;
   no secret, raw shortUuid, subscription content or private key is included.
