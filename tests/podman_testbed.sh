@@ -36,6 +36,7 @@ run_container_pipeline() {
     podman build -t "$tag" -f "$SCRIPT_DIR/Containerfile.testbed" --build-arg "BASE_IMAGE=$base_image" "$SCRIPT_DIR"
 
     echo "==> Starting PID 1 Systemd Container: $cname"
+    mkdir -p "/tmp/gowave-testbed-$cname"
     podman run -d --name "$cname" \
         --systemd=always \
         --privileged \
@@ -43,7 +44,10 @@ run_container_pipeline() {
         -v "/tmp/gowave-testbed-$cname:/work:rw" \
         "$tag"
 
-    trap 'echo "Cleaning up $cname..."; podman rm -f "$cname" 2>/dev/null || true' EXIT
+    trap "echo 'Cleaning up $cname...'; podman rm -f '$cname' 2>/dev/null || true; rm -rf '/tmp/gowave-testbed-$cname'" EXIT
+
+    # Ensure unprivileged test user exists for non-root / services test stages
+    podman exec "$cname" bash -c "id -u testuser >/dev/null 2>&1 || useradd -m -s /bin/bash testuser"
 
     echo "==> Executing 8-Stage Test Pipeline inside $cname..."
 
@@ -74,7 +78,7 @@ run_container_pipeline() {
 
     # Stage 7: Subscription UA Rule Verification
     echo "[Stage 7/8] Testing User-Agent subscription filtering..."
-    podman exec "$cname" python3 -m unittest discover -s /repo/tests -p test_services.py
+    podman exec --user testuser "$cname" python3 -m unittest discover -s /repo/tests -p test_services.py
 
     # Stage 8: Update Crash & Journal Rollback
     echo "[Stage 8/8] Testing journal schema validation and recovery..."
@@ -84,6 +88,7 @@ JSON
 
     echo "==> 8-Stage Pipeline PASSED for $base_image!"
     podman rm -f "$cname"
+    rm -rf "/tmp/gowave-testbed-$cname"
     trap - EXIT
 }
 

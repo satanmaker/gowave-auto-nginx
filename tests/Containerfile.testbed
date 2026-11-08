@@ -39,5 +39,8 @@ RUN rm -f /lib/systemd/system/sysinit.target.wants/systemd-udevd.service \
 RUN mkdir -p /var/run/sshd /root/.ssh && chmod 0700 /root/.ssh && \
     ssh-keygen -A 2>/dev/null || true
 
+# Create unprivileged test user for privilege separation tests
+RUN id -u testuser >/dev/null 2>&1 || useradd -m -s /bin/bash testuser
+
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
