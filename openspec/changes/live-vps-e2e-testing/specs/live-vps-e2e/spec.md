@@ -517,6 +517,12 @@ Teardown is reported separately from test outcome; overall `PASS` requires the s
 - **WHEN** configuration preflight validates the teardown policy
 - **THEN** preflight fails before any remote modification and reports the missing or invalid input
 
+#### Scenario: Snapshot restore hook success requires baseline verification
+
+- **GIVEN** the restore hook returns valid `RESTORED` JSON with matching IDs and both VPS are reachable again
+- **WHEN** the runner recollects the Phase 0 baseline manifest
+- **THEN** the required clean-baseline invariants match the pre-install manifest; only then may teardown be `PASS`
+
 #### Scenario: Snapshot restore hook does not restore both hosts
 
 - **GIVEN** preflight accepted the SHA256-pinned restore hook and both snapshot IDs
