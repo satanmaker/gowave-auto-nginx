@@ -17,7 +17,7 @@ class TestNginxRouting(unittest.TestCase):
 
             cmd = f'source "{NGINX_SH}" && ensure_nginx_stream_block "{conf}"'
             res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
-            self.assertEqual(res.returncode, 0)
+            self.assertEqual(res.returncode, 0, res.stderr)
 
             content = conf.read_text()
             self.assertIn("stream {", content)
@@ -26,7 +26,7 @@ class TestNginxRouting(unittest.TestCase):
 
             # Running a second time should not duplicate
             res2 = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
-            self.assertEqual(res2.returncode, 0)
+            self.assertEqual(res2.returncode, 0, res2.stderr)
             self.assertEqual(conf.read_text().count("stream {"), 1)
 
     def test_generate_stream_config(self):
@@ -38,7 +38,7 @@ class TestNginxRouting(unittest.TestCase):
             # Case 1: IPv6 disabled
             cmd1 = f'source "{NGINX_SH}" && generate_stream_config "panel.example.com" "reality.example.com" "{out}" "{inet6}"'
             res1 = subprocess.run(["bash", "-c", cmd1], capture_output=True, text=True)
-            self.assertEqual(res1.returncode, 0)
+            self.assertEqual(res1.returncode, 0, res1.stderr)
             c1 = out.read_text()
             self.assertIn("listen 443 so_keepalive=on;", c1)
             self.assertNotIn("listen [::]:443", c1)
@@ -51,7 +51,7 @@ class TestNginxRouting(unittest.TestCase):
             # Case 2: IPv6 enabled
             inet6.write_text("00000000000000000000000000000001 01 80 10 80 lo\n")
             res2 = subprocess.run(["bash", "-c", cmd1], capture_output=True, text=True)
-            self.assertEqual(res2.returncode, 0)
+            self.assertEqual(res2.returncode, 0, res2.stderr)
             c2 = out.read_text()
             self.assertIn("listen [::]:443 so_keepalive=on;", c2)
 
@@ -62,7 +62,7 @@ class TestNginxRouting(unittest.TestCase):
 
             cmd = f'source "{NGINX_SH}" && generate_panel_https_vhost "panel.example.com" "{out}"'
             res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
-            self.assertEqual(res.returncode, 0)
+            self.assertEqual(res.returncode, 0, res.stderr)
 
             c = out.read_text()
             self.assertIn("server_name panel.example.com;", c)
@@ -87,7 +87,7 @@ class TestNginxRouting(unittest.TestCase):
 
             cmd = f'source "{NGINX_SH}" && generate_decoy_vhost "reality.example.com" "{out}" nginx "{cover_dir}"'
             res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
-            self.assertEqual(res.returncode, 0)
+            self.assertEqual(res.returncode, 0, res.stderr)
 
             c = out.read_text()
             self.assertIn("server_name reality.example.com;", c)
