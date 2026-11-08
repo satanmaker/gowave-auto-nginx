@@ -136,21 +136,31 @@ After `gowave-auto.sh node add worker-1`, the runner SHALL verify successful reg
 pinned SSH host identity, active Worker services, valid certificates, passing `nginx -t`, and absence of
 `SECRET_KEY` from a complete process-tree argv trace covering both `execve` and `execveat`.
 
-#### Scenario: SECRET_KEY not in complete process argv trace
+#### Scenario: SECRET_KEY is absent from a complete process argv trace
 
 - **GIVEN** `gowave-auto.sh node add` is executing the SSH remote deployment on Master
-- **WHEN** the runner traces the entire descendant process tree with `strace -f -s N -e trace=execve,execveat`,
-  where `N=32 * os.sysconf("SC_PAGE_SIZE")`
-- **THEN** the observer exits successfully, every exec record is complete, the scanner parses escaped argv
-  bytes and finds no exact or known encoded `SECRET_KEY` value; only this complete observation can PASS
+- **WHEN** the runner traces the entire descendant process tree with
+  `strace -f -v -s N -e trace=execve,execveat`, where `N=32 * os.sysconf("SC_PAGE_SIZE")`
+- **THEN** the observer exits successfully, every `argv` vector and string is complete, the scanner parses
+  escaped argv bytes and finds no exact or known encoded `SECRET_KEY` value; only this complete observation
+  can PASS. The raw `envp` emitted by `-v` is discarded and MUST NOT enter reports or logs.
 
-#### Scenario: Long argv sentinel proves observer string completeness
+#### Scenario: Long argv string is not truncated
 
-- **GIVEN** a test helper performs both `execve` and `execveat` with a sentinel embedded after the first 32
-  bytes of an argument
-- **WHEN** the argv observer acceptance test runs
-- **THEN** the complete sentinel is present in each corresponding trace record with no truncation marker; a
-  missing or truncated sentinel makes the observer acceptance test FAIL and the live observation INCOMPLETE
+- **GIVEN** a test helper performs both `execve` and `execveat` with a sentinel embedded after byte 32
+  of an argument
+- **WHEN** the argv observer acceptance test runs with the computed positive `-s` limit
+- **THEN** the complete sentinel is present in each corresponding parsed argument; a missing or truncated
+  sentinel makes observer acceptance FAIL and the live observation INCOMPLETE
+
+#### Scenario: Later argv elements are not abbreviated
+
+- **GIVEN** a test helper performs both `execve` and `execveat` with at least 128 argv elements and places
+  a sentinel only in the final element
+- **WHEN** the argv observer runs with `-v` / `--no-abbrev`
+- **THEN** the parser receives all 128 or more argv elements in order, including the complete final sentinel,
+  and no strace omission marker. Any omitted element or ambiguous parse makes acceptance FAIL and the live
+  observation INCOMPLETE
 
 #### Scenario: Worker node registered and connected in Panel
 
@@ -393,6 +403,16 @@ ingress evidence; syntax-only checks do not count as traffic verification.
 - **THEN** each client validates both a Let's Encrypt Staging endpoint and an ordinary public-CA endpoint
   (including the public HTTPS egress probe); an untrusted test CA is rejected; `allowInsecure` and
   `skip-cert-verify` are prohibited
+
+#### Scenario: Staging CA material is pinned and reproducible
+
+- **GIVEN** `ACME_MODE=staging`
+- **WHEN** TLS preflight loads `tools/certs/letsencrypt-staging/`
+- **THEN** exactly the four official self-signed Staging roots identified in design D9 are present and
+  individually match the DER SHA-256 values in `pins.json`; no intermediate is treated as a trust anchor,
+  no certificate is downloaded at runtime, and a missing or mismatched pin fails preflight before any
+  remote modification
+
 
 #### Scenario: Ingress evidence is ambiguous
 

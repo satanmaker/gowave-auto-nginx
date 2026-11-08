@@ -191,53 +191,107 @@ unreliable results. The lock is released on process exit (normal or signal).
 
 ---
 
-### D9: ACME Staging CA Trust Management on Control Machine
+### D9: Reproducible ACME Staging CA Trust on Control Machine
 
-**Chosen:** When `ACME_MODE=staging`, the runner creates one per-run CA bundle without
-mutating system-wide `/etc/ssl/certs` on the Control Machine:
-1. `tools/live_vps/tls.py` starts from the Control Machine's complete default public CA bundle, appends the
-   applicable Let's Encrypt Staging Root/Intermediate certificates, and verifies pinned SHA256 fingerprints
-   for every staging certificate before use. Certificate names alone are not accepted as trust anchors. If the
-   complete public-root bundle cannot be located or read, preflight fails; a staging-only bundle is forbidden.
-2. Python Panel API calls use `ssl.create_default_context(cafile=<combined-bundle>)`.
-3. Every curl call that performs TLS verification (including the HTTPS egress probe to a public site) passes
-   `--cacert <combined-bundle>`; this preserves trust in ordinary public CAs as well as the staging chain.
-4. Xray and Mihomo child processes receive `SSL_CERT_FILE=<combined-bundle>` in their process environment.
-   Verify this behavior against the exact pinned client binaries before use; never set `allowInsecure`,
-   `skip-cert-verify`, or any equivalent verification bypass.
-5. The bundle is private to the run directory, mode `0600`, and removed during local cleanup. It contains
-   public certificates only and does not modify the host trust store.
+**Chosen:** When `ACME_MODE=staging`, the runner builds a per-run CA bundle from the Control Machine's
+complete default public CA bundle plus a version-controlled set of Let's Encrypt Staging self-signed root
+certificates. Staging roots are test-only trust anchors: they MUST NOT be installed in or appended to the
+Control Machine's system-wide trust store, a browser trust store, or any non-E2E client.
 
-**Rationale:** In staging mode, standard HTTPS requests to the Panel and TLS proxy tunnels fail with
-`certificate verify failed` if the staging CA is not explicitly trusted by the client. This scoped approach
-allows strict verification without polluting the host machine's root store.
+1. The repository MUST vendor exactly the four active Staging root certificates listed by the official
+   Let's Encrypt Staging Environment documentation
+   (`https://letsencrypt.org/docs/staging-environment/`, page last updated 2026-04-10), under
+   `tools/certs/letsencrypt-staging/`:
 
----
+   | File | Official source URL | Expected subject CN |
+   |---|---|---|
+   | `pretend-pear-x1.pem` | `https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem` | `(STAGING) Pretend Pear X1` |
+   | `bogus-broccoli-x2.pem` | `https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x2.pem` | `(STAGING) Bogus Broccoli X2` |
+   | `yearning-yucca-root-ye.pem` | `https://letsencrypt.org/certs/staging/gen-y/root-ye.pem` | `(STAGING) Yearning Yucca Root YE` |
+   | `yonder-yam-root-yr.pem` | `https://letsencrypt.org/certs/staging/gen-y/root-yr.pem` | `(STAGING) Yonder Yam Root YR` |
 
-### D10: Process argv Observation During Worker Registration
+2. `tools/certs/letsencrypt-staging/pins.json` MUST contain a versioned entry for each file: exact
+   official source URL, expected subject, and a 64-hex SHA-256 fingerprint calculated over the DER-encoded
+   X.509 certificate (not the PEM text and not the SPKI). No placeholder, dynamically learned, or
+   trust-on-first-use fingerprint is permitted. A runtime load MUST reject a missing, extra, duplicate,
+   malformed, expired, not-yet-valid, non-CA, non-self-signed, wrong-subject, or fingerprint-mismatched
+   certificate and MUST fail preflight before remote modification.
+
+3. Only the four self-signed Staging roots are vendored as trust anchors. Staging intermediates MUST NOT be
+   pinned or added as trust anchors: Let's Encrypt documents that the intermediate set changes and must not
+   be pinned or trusted as a system root. The TLS peer must present the required intermediate chain; a missing
+   or invalid chain fails normal certificate verification. Root updates are never downloaded automatically
+   during a test run.
+
+4. The update procedure is review-gated: compare the official Let's Encrypt Staging Environment page with the
+   current four-root manifest; retrieve changed material only from the exact official URLs above or their
+   replacement links on that official page; verify subject, CA constraints, self-signature and validity;
+   calculate the DER SHA-256 with OpenSSL; update the vendored PEM and `pins.json` together in a PR; and run
+   positive staging-chain plus negative untrusted-CA tests. Retired roots are removed only after the official
+   page no longer lists them as active. A changed source URL or root set requires an explicit design/manifest
+   review, never an automatic fallback.
+
+5. `tools/live_vps/tls.py` MUST verify the vendored roots against `pins.json`, then construct one private
+   per-run bundle containing the Control Machine's complete default public CA bundle and the four verified
+   Staging roots. If the default public bundle cannot be resolved and read in full, preflight fails; a
+   Staging-only bundle is forbidden. Record the source public bundle path and SHA-256, the Staging pin
+   manifest SHA-256, and the selected certificate subjects in the redacted result metadata.
+
+6. Python Panel API calls use `ssl.create_default_context(cafile=<combined-bundle>)`. Every curl request
+   that performs TLS verification, including the HTTPS public egress probe, passes
+   `--cacert <combined-bundle>`. Xray and Mihomo child processes receive
+   `SSL_CERT_FILE=<combined-bundle>` only in their process environment. The exact pinned binaries MUST
+   pass a staging endpoint, an ordinary public-CA endpoint, and an untrusted-CA rejection test before use.
+   `allowInsecure`, `skip-cert-verify`, and equivalent verification bypasses are prohibited.
+
+7. The combined bundle is mode `0600`, private to the current run, contains public certificates only, and is
+   removed during local cleanup. It MUST NOT be installed in a host-wide trust directory or reused by
+   unrelated processes.
+
+**Rationale:** Let's Encrypt explicitly warns that Staging roots are not audited for ordinary trust and must
+only be added to test-only trust stores. Vendoring the documented roots and pinning their DER fingerprints
+makes the test trust reproducible, reviewable, and independent of a mutable network download while preserving
+ordinary public trust for the E2E clients.
+
+### D10: Complete Process argv Observation During Worker Registration
 
 **Chosen:** Do not use periodic `/proc/*/cmdline` sampling or a Bash DEBUG trap as proof: both can miss
 short-lived processes, and shell tracing can itself disclose expanded secrets. On Master, derive a positive
 string-print limit as `STRACE_STRING_LIMIT = 32 * os.sysconf("SC_PAGE_SIZE")`. Linux limits each individual
-`execve` argument/environment string to 32 pages, including its terminating NUL; a positive strace limit at
-that bound is therefore sufficient to print every legal individual argv string. Do not use `-s 0`: strace
-interprets zero as a zero-character limit, not unlimited output. Run the exact `gowave-auto.sh node add`
-process tree under `strace -f -s "$STRACE_STRING_LIMIT" -e trace=execve,execveat` (or an equivalent
-kernel-level observer that captures both syscall forms with the same completeness guarantee). If page size
-cannot be determined, the computed limit is invalid, or the installed strace cannot accept it, record
-`INCOMPLETE` and do not run a weaker observer as a fallback. Write raw output to a mode-0600 file inside a private `/run` tmpfs directory (mode `0700`), never persist it
-or stream it to the Control Machine, parse the strace-quoted argv including escaped bytes, scan locally for
-the exact `SECRET_KEY` and known encoded forms, then unlink the raw trace and remove the private tmpfs
-directory. Do not claim secure overwrite on SSD or journaled storage. The observer must exit successfully, follow all descendants, and contain no truncated or unfinished exec records or observer errors.
-The acceptance test MUST place a sentinel secret after byte 32 in arguments passed through both `execve` and
-`execveat`, then prove both complete values are present in the trace. The report stores only `PASS`/`FAIL`,
-observer version, effective string limit, coverage limitations and timestamps.
+`execve` argument/environment string to 32 pages, including its terminating NUL; a positive strace limit
+at that bound is sufficient to print every legal individual string. Do not use `-s 0`: strace interprets
+zero as a zero-character limit, not unlimited output.
 
-**Rationale:** Process polling is inherently racy. A kernel-level exec observer gives a bounded observation
-of process creation. The raw trace contains sensitive argv and therefore must never become a normal diagnostic
-artifact. This verifies argv only; it does not prove absence from process environment, stdin, memory or files.
+Run the exact `gowave-auto.sh node add` process tree with both string and array abbreviation disabled:
+`strace -f -v -s "$STRACE_STRING_LIMIT" -e trace=execve,execveat -o "$RAW_TRACE" -- ...`.
+The `-v` / `--no-abbrev` option is mandatory: it is equivalent to `-e abbrev=none` and prevents
+strace's default structure/array abbreviation from replacing later `argv` elements with an omission marker.
+The positive `-s` limit independently prevents individual argument strings from being truncated. The observer
+MUST capture both `execve` and `execveat` for all descendants. If page size cannot be determined, the
+computed limit is invalid, the installed strace does not support either option, or the complete output cannot
+be parsed, record `INCOMPLETE`; do not use a weaker observer as fallback.
 
----
+Because `-v` also expands the `envp` vector, the raw trace MUST be treated as containing arbitrary
+environment secrets as well as argv values. Store it only in a mode-`0600` file inside a private `/run`
+tmpfs directory (mode `0700`), never stream it to the Control Machine, console, logs, or artifacts. Parse the
+`argv` and `envp` fields separately; inspect `argv` for the exact `SECRET_KEY` and known encoded forms,
+and discard `envp` without publishing or logging it. If the parser cannot unambiguously separate both
+vectors or establish that every `argv` element was decoded, record `INCOMPLETE`. Unlink the raw trace and
+remove the private directory in a guaranteed cleanup path; do not claim secure overwrite on SSD or
+journaled storage. The observer must exit successfully, follow all descendants, and contain no truncated,
+abbreviated, unfinished or unparseable exec records, nor observer errors.
+
+The acceptance tests MUST cover both independent completeness dimensions for both syscall forms:
+(a) a sentinel after byte 32 of a long argument, and (b) a sentinel in the final element of an argv vector
+containing at least 128 arguments. The parsed trace MUST contain the complete sentinel and every argv
+element, with no strace omission marker. A trace that only passes the long-string test but omits later array
+elements MUST fail acceptance and can never produce a live `PASS`. The report stores only `PASS`/`FAIL`,
+observer version, effective string limit, selected options, coverage limitations and timestamps.
+
+**Rationale:** `-s` controls the maximum printed size of each string, while `-v` disables strace's
+default abbreviation of structured syscall arguments. Both are required for a complete `argv` observation.
+The expanded raw trace can contain environment secrets, so it is strictly ephemeral. This verifies argv only;
+it does not prove absence from process environment, stdin, memory or files.
 
 ### D11: Operational Lifecycle and Disposable Baseline Policy in v1
 
