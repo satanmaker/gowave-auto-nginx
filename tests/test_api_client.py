@@ -65,13 +65,13 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/api/system/tools/x25519/generate":
-            self.send_json(200, {"response": {"privateKey": "priv-key-base64", "publicKey": "pub-key-base64"}})
+            self.send_json(200, {"response": {"keypairs": [{"privateKey": "priv-key-base64", "publicKey": "pub-key-base64"}]}})
         elif self.path == "/api/config-profiles":
-            self.send_json(200, {"response": [{"uuid": k, **v} for k, v in self.profiles.items()]})
+            self.send_json(200, {"response": {"configProfiles": [{"uuid": k, **v} for k, v in self.profiles.items()]}})
         elif self.path.startswith("/api/config-profiles/") and self.path.endswith("/computed-config"):
             uuid = self.path.split("/")[3]
             cfg_str = self.profiles.get(uuid, {}).get("config", "{}")
-            self.send_json(200, {"response": json.loads(cfg_str)})
+            self.send_json(200, {"response": {"uuid": uuid, "name": "profile", "config": cfg_str}})
         elif self.path.startswith("/api/config-profiles/") and self.path.endswith("/inbounds"):
             inbounds = [
                 {"uuid": "inb-1", "tag": "vless-reality-local-node", "port": 8443, "protocol": "vless"},
@@ -81,18 +81,20 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
             ]
             self.send_json(200, {"response": inbounds})
         elif self.path == "/api/nodes":
-            self.send_json(200, {"response": [{"uuid": k, **v} for k, v in self.nodes.items()]})
+            self.send_json(200, {"response": {"nodes": [{"uuid": k, **v} for k, v in self.nodes.items()]}})
         elif self.path == "/api/internal-squads":
-            self.send_json(200, {"response": [{"uuid": k, **v} for k, v in self.squads.items()]})
+            self.send_json(200, {"response": {"internalSquads": [{"uuid": k, **v} for k, v in self.squads.items()]}})
         elif self.path == "/api/hosts":
-            self.send_json(200, {"response": [{"uuid": k, **v} for k, v in self.hosts.items()]})
+            self.send_json(200, {"response": {"hosts": [{"uuid": k, **v} for k, v in self.hosts.items()]}})
         elif self.path.startswith("/api/users/by-username/"):
             username = self.path.split("/")[-1]
             if username in self.users:
                 self.send_json(200, {"response": self.users[username]})
             else:
+                self.close_connection = True
                 self.send_json(404, {"error": "User not found"})
         else:
+            self.close_connection = True
             self.send_json(404, {"error": "Not found"})
 
     def do_PATCH(self):

@@ -206,16 +206,19 @@ EOF
         python3 -c "
 import json, os
 path = '$state_file'
-data = {}
+data = {'schemaVersion': 2}
 if os.path.exists(path):
     try:
         with open(path) as f:
             data = json.load(f)
     except Exception:
         pass
+data['schemaVersion'] = 2
 data['congestionControl'] = '$selected_cc'
 with open(path + '.tmp', 'w') as f:
     json.dump(data, f, indent=2)
+    f.flush()
+    os.fsync(f.fileno())
 os.replace(path + '.tmp', path)
 " 2>/dev/null || true
     fi

@@ -126,13 +126,22 @@ class GoWaveClient:
 
     def generate_x25519(self):
         res = self.request("GET", "/api/system/tools/x25519/generate")
-        data = res.get("response", res)
-        if "keypairs" in data and isinstance(data["keypairs"], list) and len(data["keypairs"]) > 0:
-            private_key = data["keypairs"][0].get("privateKey")
-            public_key = data["keypairs"][0].get("publicKey")
-        else:
-            private_key = data.get("privateKey")
-            public_key = data.get("publicKey")
+        data = res.get("response", res) if isinstance(res, dict) else res
+        private_key = None
+        public_key = None
+
+        if isinstance(data, dict):
+            keypairs = data.get("keypairs")
+            if isinstance(keypairs, list) and len(keypairs) > 0 and isinstance(keypairs[0], dict):
+                private_key = keypairs[0].get("privateKey")
+                public_key = keypairs[0].get("publicKey")
+            else:
+                private_key = data.get("privateKey")
+                public_key = data.get("publicKey")
+        elif isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+            private_key = data[0].get("privateKey")
+            public_key = data[0].get("publicKey")
+
         if not private_key or not public_key:
             raise GoWaveAPIError(f"Invalid x25519 response: {res}")
         return {"privateKey": private_key, "publicKey": public_key}
@@ -221,13 +230,16 @@ class GoWaveClient:
 
         # 5-point verification checklist on computed-config
         computed = self.request("GET", f"/api/config-profiles/{profile_uuid}/computed-config")
-        computed_data = computed.get("response", computed)
-        if isinstance(computed_data, str):
+        computed_data = computed.get("response", computed) if isinstance(computed, dict) else computed
+        if isinstance(computed_data, dict) and "config" in computed_data:
+            config_val = computed_data["config"]
+            computed_json = json.loads(config_val) if isinstance(config_val, str) else config_val
+        elif isinstance(computed_data, str):
             computed_json = json.loads(computed_data)
         else:
             computed_json = computed_data
 
-        inbounds = computed_json.get("inbounds", [])
+        inbounds = computed_json.get("inbounds", []) if isinstance(computed_json, dict) else []
         if len(inbounds) != 4:
             raise GoWaveAPIError(f"5-point checklist failure: expected 4 inbounds, got {len(inbounds)}")
 
@@ -331,7 +343,7 @@ class GoWaveClient:
                 "sni": panel_domain,
                 "path": "/ws",
                 "securityLayer": "TLS",
-                "alpn": "h2,http/1.1",
+                "alpn": "http/1.1",
                 "fingerprint": "chrome",
             },
             "trojan-grpc": {

@@ -98,6 +98,7 @@ class MockGoWaveServer(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"token": "long-token-123", "id": 1}).encode())
         else:
+            self.close_connection = True
             self.send_response(404)
             self.end_headers()
 
@@ -106,36 +107,47 @@ class MockGoWaveServer(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps([]).encode())
+            self.wfile.write(json.dumps({"response": {"configProfiles": []}}).encode())
         elif self.path == "/api/nodes":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps([]).encode())
+            self.wfile.write(json.dumps({"response": {"nodes": []}}).encode())
         elif self.path == "/api/internal-squads":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps([]).encode())
+            self.wfile.write(json.dumps({"response": {"internalSquads": []}}).encode())
         elif self.path == "/api/system/tools/x25519/generate":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({
-                "privateKey": "dGVzdC1wcml2YXRlLWtleS0zMi1ieXRlcw==",
-                "publicKey": "dGVzdC1wdWJsaWMta2V5LTMyLWJ5dGVzCg=="
+                "response": {
+                    "keypairs": [{
+                        "privateKey": "dGVzdC1wcml2YXRlLWtleS0zMi1ieXRlcw==",
+                        "publicKey": "dGVzdC1wdWJsaWMta2V5LTMyLWJ5dGVzCg=="
+                    }]
+                }
             }).encode())
         elif self.path.startswith("/api/config-profiles/") and self.path.endswith("/computed-config"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({
+            cfg_obj = {
                 "inbounds": [
                     {"port": 8443, "streamSettings": {"security": "reality", "realitySettings": {}}},
                     {"port": 10001, "streamSettings": {"security": "none"}},
                     {"port": 10002, "streamSettings": {"security": "none"}},
                     {"port": 10003, "streamSettings": {"security": "none"}},
                 ]
+            }
+            self.wfile.write(json.dumps({
+                "response": {
+                    "uuid": "prof-uuid-test",
+                    "name": "mock-profile",
+                    "config": json.dumps(cfg_obj)
+                }
             }).encode())
         elif self.path.startswith("/api/config-profiles/") and self.path.endswith("/inbounds"):
             self.send_response(200)
@@ -160,6 +172,7 @@ class MockGoWaveServer(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(squad).encode())
         else:
+            self.close_connection = True
             self.send_response(404)
             self.end_headers()
 

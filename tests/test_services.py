@@ -30,6 +30,7 @@ class MockSubscriptionServer(BaseHTTPRequestHandler):
         
         # GoWave Response Rule: Require non-empty User-Agent
         if not user_agent:
+            self.close_connection = True
             self.send_response(403)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
@@ -94,6 +95,7 @@ rules:
 """
             self.wfile.write(mihomo_yaml.encode())
         else:
+            self.close_connection = True
             self.send_response(404)
             self.end_headers()
 

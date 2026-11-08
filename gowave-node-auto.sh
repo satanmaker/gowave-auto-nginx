@@ -174,12 +174,23 @@ server {
 }
 EOF
 
+    # Detect NGINX version for HTTP/2 syntax compatibility (< 1.25.1 vs >= 1.25.1)
+    local listen_7443="listen 127.0.0.1:7443 ssl http2 proxy_protocol;"
+    local listen_9443="listen 127.0.0.1:9443 ssl http2 proxy_protocol;"
+    local ngx_ver=""
+    ngx_ver=$(nginx -v 2>&1 | grep -oP 'nginx/\K[0-9.]+' || echo "1.24.0")
+    if [[ "$(printf '%s\n1.25.1\n' "$ngx_ver" | sort -V | head -n1)" == "1.25.1" ]]; then
+        listen_7443="listen 127.0.0.1:7443 ssl proxy_protocol;
+    http2 on;"
+        listen_9443="listen 127.0.0.1:9443 ssl proxy_protocol;
+    http2 on;"
+    fi
+
     # Edge HTTPS listener on 7443
     cat > /etc/nginx/conf.d/gowave-worker-https.conf <<EOF
 # Managed by GoWave Auto NGINX: Worker Edge HTTPS
 server {
-    listen 127.0.0.1:7443 ssl proxy_protocol;
-    http2 on;
+    $listen_7443
     server_name $WORKER_DOMAIN;
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
@@ -230,8 +241,7 @@ EOF
     cat > /etc/nginx/conf.d/gowave-worker-decoy.conf <<EOF
 # Managed by GoWave Auto NGINX: Worker Edge Decoy
 server {
-    listen 127.0.0.1:9443 ssl proxy_protocol;
-    http2 on;
+    $listen_9443
     server_name $REALITY_DOMAIN;
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
