@@ -49,8 +49,12 @@ subscription delivery, and actual Data Plane tunnel traffic — on disposable re
 
 - **New files**: `tools/test_live_vps.py`, `tools/live_vps/` package, `tools/live_vps_config.env.example`,
   `.github/workflows/live-vps-e2e.yml`, `docs/LIVE_VPS_TESTING.md`.
-- **Modified files**: `gowave-auto.sh` (ACME server parameter propagation), `gowave-node-auto.sh` (ACME server
-  parameter propagation), `modules/node.sh` (SHA-verified bundled installer gate), `.gitignore`.
+- **Modified files**: `gowave-auto.sh` (ACME mode mapping and propagation), `gowave-node-auto.sh` (ACME
+  propagation plus configurable commit/SHA256 verification of the remote installer), `modules/node.sh`
+  (SHA-verified bundled installer gate), `modules/api_client.py` (backward-compatible SSLContext/timeout
+  injection), `.gitignore`.
+- **Vendored input**: `sources/gowave-node/install.sh` at the configured immutable commit with a verified
+  `GOWAVE_NODE_INSTALLER_SHA256`.
 - **Dependencies introduced**: Xray client binary, Mihomo binary (pinned versions on Control Machine).
 - **No upstream source changes**: GoWave Panel and GoWave Node treated as immutable upstream binaries.
 - **No production installation impact**: runner operates only on declared disposable test VPS confirmed by

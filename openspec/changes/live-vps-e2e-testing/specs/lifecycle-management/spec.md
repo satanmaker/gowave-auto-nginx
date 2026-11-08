@@ -4,9 +4,17 @@
 
 ### Requirement: Explicit ACME Endpoint Selection and Certificate Lineage Isolation
 
-The installer and distributed orchestrator SHALL accept an explicit ACME directory URL, defaulting to Let's Encrypt
-production when unset. Only official Let's Encrypt production and staging URLs are allowed in v1. The URL SHALL be
+The installer and distributed orchestrator SHALL accept `GOWAVE_ACME_SERVER`, defaulting to Let's Encrypt
+production when unset. Only these exact URLs are allowed in v1: `https://acme-staging-v02.api.letsencrypt.org/directory`
+and `https://acme-v02.api.letsencrypt.org/directory`. The E2E runner exposes only `ACME_MODE=staging|production`
+and maps it to the corresponding exact URL; arbitrary directory URLs are rejected. The selected URL SHALL be
 propagated from Master to Worker over SSH stdin. A staging lineage MUST NOT be reused as production, nor production as staging.
+
+#### Scenario: Runner maps ACME mode to the official staging directory
+
+- **GIVEN** E2E config has `ACME_MODE=staging`
+- **WHEN** the runner invokes Master installation and subsequent `node add`
+- **THEN** it passes exactly `https://acme-staging-v02.api.letsencrypt.org/directory` as `GOWAVE_ACME_SERVER`; for `ACME_MODE=production` it passes exactly `https://acme-v02.api.letsencrypt.org/directory`; no arbitrary URL is accepted
 
 #### Scenario: Staging certificate issued on a clean disposable Master
 
@@ -19,6 +27,13 @@ propagated from Master to Worker over SSH stdin. A staging lineage MUST NOT be r
 - **GIVEN** the Master installation uses the staging directory
 - **WHEN** `gowave-auto.sh node add` invokes the remote Worker deployment
 - **THEN** the exact ACME directory URL is serialized through SSH stdin and every Worker Certbot issuance call uses that URL
+
+#### Scenario: Missing or unknown renewal directory fails closed
+
+- **GIVEN** an existing Certbot lineage has no readable `server` field or an unrecognized ACME directory URL
+- **WHEN** installation checks whether that lineage can be reused
+- **THEN** the installer MUST NOT infer the directory from the generic Let's Encrypt issuer; it fails closed or
+  provisions a separately named lineage with all consumers and renewal hooks migrated atomically
 
 #### Scenario: Existing certificate is reused only for the same ACME directory
 
