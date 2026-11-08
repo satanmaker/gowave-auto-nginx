@@ -32,6 +32,14 @@ propagated from Master to Worker over SSH stdin. A staging lineage MUST NOT be r
 - **WHEN** the operator changes `GOWAVE_ACME_SERVER`
 - **THEN** the installer MUST NOT treat the old lineage as a valid reusable certificate; it MUST require a fresh disposable baseline or create a separately named lineage and atomically update all consumers; it MUST never mix staging and production certificates
 
+#### Scenario: Existing NGINX certificate path contract is preserved
+
+- **GIVEN** Master or Worker has NGINX consumers referencing `/etc/letsencrypt/live/<domain>/`
+- **WHEN** a staging or production lineage is issued or migrated
+- **THEN** every consumer continues to resolve the expected certificate and private-key paths; any isolated
+  lineage migration updates all consumers and renewal hooks atomically before reload, or fails without
+  replacing the active certificate
+
 #### Scenario: ACME parameter is unset
 
 - **GIVEN** `GOWAVE_ACME_SERVER` is unset
