@@ -199,8 +199,9 @@ authenticated Panel connectivity using existing verifier markers.
 #### Scenario: Existing verifier succeeds with valid credentials
 
 - **GIVEN** Worker is deployed and `gowave-node.service` is active
-- **WHEN** Master runs `modules/verify_node_mtls.py --host WORKER_IP --port 3002 --mode full` with the base64 payload on stdin
-- **THEN** the verifier emits the existing `Payload cryptographic verification PASSED` line before the socket attempt, then (on a successful handshake) `Handshake SUCCESS: TLSv1.3 negotiated` and `Node response: <status line>`; the runner records these exact observations without logging the payload or derived SNI
+- **WHEN** Master obtains the already-Base64-encoded value from `modules/node.sh:extract_secret_key` and runs
+  `modules/verify_node_mtls.py --host WORKER_IP --port 3002 --mode full` with that value unchanged on stdin
+- **THEN** the verifier performs exactly one Base64 decode and emits `Payload cryptographic verification PASSED` before the socket attempt, then (on a successful handshake) `Handshake SUCCESS: TLSv1.3 negotiated` and `Node response: <status line>`; the runner MUST NOT Base64-encode the extractor output again and records these exact observations without logging the payload or derived SNI
 
 #### Scenario: HTTP 200 is distinguished from HTTP 401
 
@@ -339,7 +340,7 @@ The runner SHALL verify isolation of TCP/3002 on Master and Worker. A timeout al
 
 - **GIVEN** Worker Node is active and a positive mTLS probe from Master succeeds
 - **WHEN** the runner records the source address seen by Worker for that successful connection and then probes Worker:3002 from Control Machine
-- **THEN** the observed Master source address matches the effective UFW allow rule; the Control Machine probe is blocked; and Worker-side UFW rule/counter or packet trace confirms the DROP path
+- **THEN** the observed Master source address matches the effective UFW allow rule; the Control Machine probe is blocked; and Worker-side UFW rule/counter or packet trace confirms the DROP path. The Worker MUST also observe the actual source address of the Control Machine probe and prove it differs from the allowed Master source. If the two source addresses are equal, this negative probe is `INCOMPLETE`, not a firewall PASS; a distinct external probe vantage is required
 
 #### Scenario: Negative probe is not misclassified
 
@@ -472,9 +473,13 @@ ingress evidence; syntax-only checks do not count as traffic verification.
 
 ### Requirement: Negative Scenario and Fault Injection Tests
 
-The runner SHALL execute 15 negative scenarios (NEG-01 through NEG-15) on the disposable test VPS and verify
-each expected outcome. Fault injection that may disrupt server state is permitted only on confirmed disposable
-VPS.
+The runner SHALL execute 15 negative scenarios (NEG-01 through NEG-15) and verify each expected outcome.
+NEG-01 through NEG-04 are preflight contract tests against isolated local fixtures (temporary known_hosts and
+configuration files plus mocked SSH/DNS responses); they MUST NOT modify public DNS, the operator's real
+known_hosts, or a live VPS firewall. NEG-05 uses an isolated Certbot failure fixture/failpoint or a separately
+isolated staging test domain with guaranteed cleanup. NEG-06 through NEG-15 may use the confirmed disposable
+VPS only; every fault MUST have a cleanup path and a post-case baseline check. If a case cannot restore the
+preconditions required by the next case, it is `INCOMPLETE` and dependent cases do not proceed.
 
 #### Scenario: Matrix of fifteen fault scenarios verified (NEG-01..NEG-15)
 
@@ -591,6 +596,28 @@ Teardown is reported separately from test outcome; overall `PASS` requires the s
 
 ---
 
+### Requirement: Pair-Wide Run Locking
+
+The runner SHALL prevent concurrent mutating runs against either target VPS, including runs started from
+different Control Machines. It SHALL use a local process lock as a fast guard and authoritative kernel locks
+on both Master and Worker, held for the complete mutating operation. Remote locks SHALL be acquired in
+deterministic address order and MUST be held through dedicated SSH lock-holder sessions.
+
+#### Scenario: A second Control Machine cannot acquire an occupied VPS
+
+- **GIVEN** one runner holds the authoritative remote lock on either target VPS
+- **WHEN** another runner attempts a run against the same Master or Worker from another Control Machine
+- **THEN** it fails before remote modification; a lock-file's mere existence is not treated as ownership
+
+#### Scenario: Loss of a remote lock-holder session fails closed
+
+- **GIVEN** a mutating run holds both remote locks
+- **WHEN** either SSH lock-holder session is lost
+- **THEN** the runner stops starting mutating phases, records `INCOMPLETE`, and MUST NOT resume until it has
+  reacquired both locks and revalidated the saved run state
+
+---
+
 ### Requirement: Durable Run State for Partial CLI Modes
 
 The runner SHALL persist an atomic mode-`0600` `run-state.json` under `artifacts/live-vps/<TEST_RUN_ID>/`
@@ -652,6 +679,14 @@ SHALL NOT appear in JUnit XML or any CI-published artifact.
 
 - **GIVEN** a completed test run (any outcome)
 - **WHEN** `result.json` is written
-- **THEN** it contains: `test_run_id`, `repository_commit`, `started_at`, `finished_at`, `master` object
-  (os, panel_version, node_version, xray_version, egress_ip), `worker` object (os, node_version,
-  xray_version, egress_ip), `results` object with all mandatory phase keys, `traffic` object with master/worker sub-objects for each of four protocols and separate `xray`/`mihomo` case results per protocol, and `overall` status string
+- **THEN** it contains: `test_run_id`, `repository_commit`, `started_at`, `finished_at`, `control_machine`, `master`,
+  `worker`, `trust`, `results`, `traffic`, and `overall`. `control_machine` records OS/kernel, Python, OpenSSL,
+  Xray client and Mihomo versions plus installed-binary SHA256 values. `master` records OS/kernel, Panel and Node
+  versions, Node installer commit and SHA256, Node-managed Xray/rw-core version, NGINX/OpenSSL versions,
+  egress IP and installed-binary SHA256 values. `worker` records OS/kernel, Node version, the same Node installer
+  commit and SHA256, Node-managed Xray/rw-core version, NGINX/OpenSSL versions, egress IP and installed-binary
+  SHA256 values. `trust` records ACME mode and, for staging, the public CA bundle SHA256, Staging pin-manifest
+  SHA256 and validated root subjects. `results` contains all mandatory phase keys; `traffic` contains
+  Master/Worker sub-objects for each of four protocols and separate Xray/Mihomo case results per protocol;
+  `overall` is the status string. All version and digest values are required to satisfy Pinned Version Fidelity;
+  no secret, raw shortUuid, subscription content or private key is included.
