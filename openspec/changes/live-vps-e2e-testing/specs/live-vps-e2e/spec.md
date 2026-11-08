@@ -162,41 +162,55 @@ recorded in `state.json`; Panel API entity created; SSH deployment used pre-pinn
 
 ### Requirement: Public mTLS Control Plane Verification (Master → Worker)
 
-The runner SHALL initiate a live mTLS 1.3 connection from Master to `WORKER_IP:3002` using credentials
-extracted from Master state. The HKDF-SHA256-derived SNI SHALL be computed as implemented in
-`modules/verify_node_mtls.py`. The verification SHALL report four distinct outcomes and SHALL also verify
-five negative mTLS scenarios — each MUST result in handshake failure before the HTTP handler executes.
+The runner SHALL verify the public mTLS 1.3 control-plane connection from Master to Worker:3002 using credentials extracted from Master state. Probes requiring access to Worker:3002 MUST originate from Master because Worker UFW allowlists Master's actual source address. The runner SHALL report cryptographic input validation, TLS handshake, HTTP response, and authenticated Panel connectivity as distinct observations; it SHALL NOT invent output markers absent from the existing verifier.
 
-#### Scenario: Successful public mTLS handshake Master to Worker
+#### Scenario: Existing verifier succeeds with valid credentials
 
 - **GIVEN** Worker is deployed and `gowave-node.service` is active
-- **WHEN** the runner connects from Master's public IP to `WORKER_IP:3002` using correct mTLS credentials
-- **THEN** TLS 1.3 is negotiated, server certificate is validated against the CA, client certificate is
-  accepted, and the health endpoint returns a response — `MTLS_HANDSHAKE_PASS` and
-  `MTLS_CERTIFICATE_VALIDATION_PASS` are set
+- **WHEN** Master runs `modules/verify_node_mtls.py --host WORKER_IP --port 3002 --mode full` with the base64 payload on stdin
+- **THEN** the verifier exits 0, reports a successful TLS 1.3 handshake and prints the HTTP status line; the runner records the exact observations without logging credentials
 
-#### Scenario: Authorized Panel-to-Worker control plane exchange
+#### Scenario: HTTP 200 is distinguished from HTTP 401
 
-- **GIVEN** mTLS handshake succeeded
-- **WHEN** Panel authenticates to the Worker Node health endpoint with a valid JWT
-- **THEN** the Node returns `200 OK` and `PANEL_WORKER_AUTH_PASS` is set; a `401` response sets
-  `MTLS_HANDSHAKE_PASS` but NOT `PANEL_WORKER_AUTH_PASS`
+- **GIVEN** TLS 1.3 and the HKDF-derived SNI handshake succeeded
+- **WHEN** the Node health endpoint responds
+- **THEN** HTTP 200 sets `WORKER_HTTP_HEALTH_PASS`; HTTP 401 records `MTLS_HANDSHAKE_PASS` but does NOT set HTTP health or authenticated control-plane success
 
-#### Scenario: Wrong client certificate rejected
+#### Scenario: Panel-to-Worker authenticated connectivity is independently verified
 
-- **GIVEN** a self-signed certificate not signed by the GoWave CA
-- **WHEN** an mTLS connection to `WORKER_IP:3002` is attempted using the wrong certificate
-- **THEN** the TLS handshake fails and no HTTP handler is reached
+- **GIVEN** the local mTLS verifier completed
+- **WHEN** the runner checks the real Panel's node state and authenticated connectivity through the documented Panel API
+- **THEN** `PANEL_WORKER_AUTH_PASS` is set only when the Panel reports the Worker connected; a local 401 response MUST NOT be treated as proof of Panel authentication
 
-#### Scenario: Negative mTLS scenarios all fail before HTTP handler
+#### Scenario: Untrusted client certificate rejected by Worker
 
-- **GIVEN** Worker Node is active and accepting mTLS connections
-- **WHEN** the runner attempts connections with: wrong client certificate, wrong private key, mismatched SNI,
-  wrong CA, and absent client certificate — five separate attempts
-- **THEN** each of the five attempts results in TLS handshake failure or connection rejection before the HTTP
-  handler executes; `MTLS_HANDSHAKE_PASS` is NOT set for any negative case
+- **GIVEN** Worker Node is active and Master can reach Worker:3002
+- **WHEN** Master attempts TLS 1.3 with a self-signed client certificate not issued by the GoWave CA
+- **THEN** Worker rejects the client certificate during handshake and no HTTP handler is reached
 
----
+#### Scenario: Absent client certificate rejected by Worker
+
+- **GIVEN** Worker Node requires mTLS
+- **WHEN** Master attempts TLS 1.3 without presenting a client certificate
+- **THEN** Worker rejects the handshake before the HTTP handler
+
+#### Scenario: Mismatched client certificate and private key is classified as local failure
+
+- **GIVEN** the runner pairs a valid client certificate with a different private key
+- **WHEN** the client TLS library loads the identity
+- **THEN** local certificate/key loading fails; this is recorded as a client-side validation test, not a remote Worker handshake rejection
+
+#### Scenario: Untrusted Worker CA is classified as client-side server verification failure
+
+- **GIVEN** the runner uses a trust store that does not contain the GoWave CA
+- **WHEN** Master connects to Worker:3002 with otherwise valid client credentials
+- **THEN** Master rejects the Worker certificate during server-certificate validation; this is not reported as Worker rejecting the client
+
+#### Scenario: Wrong SNI routing is measured without assuming a TLS alert
+
+- **GIVEN** the valid derived SNI and normal connection pass
+- **WHEN** Master connects using a deliberately incorrect SNI
+- **THEN** the runner records the actual NGINX/default-route and TLS outcome; it MUST NOT assume that every wrong SNI necessarily produces a TLS handshake failure
 
 ### Requirement: Panel API Cluster Structure Audit
 
@@ -271,32 +285,31 @@ against the real Panel; actual HTTP response codes SHALL be used (not mock assum
 
 ### Requirement: UFW Firewall Isolation Verification
 
-The runner SHALL verify port `3002` isolation on both VPS. For Master, loopback connections succeed and
-external connections are rejected (DROP). For Worker, connections from Master's actual egress IP succeed and
-connections from the Control Machine are rejected (DROP). `Connection refused` alone is insufficient — DROP
-MUST be confirmed via TCP timeout and optionally UFW counter inspection.
+The runner SHALL verify isolation of TCP/3002 on Master and Worker. A timeout alone is not sufficient evidence of UFW DROP. Each negative probe MUST be paired with a known-good positive probe to establish that the listener and route are functional. The runner SHALL inspect the effective UFW rules and, where available, rule counters or packet capture evidence on the target VPS.
 
-#### Scenario: Control Machine blocked from Worker:3002
+#### Scenario: Worker allows Master and blocks Control Machine
 
-- **GIVEN** Worker Node is active and Master can successfully connect to `WORKER_IP:3002` via mTLS
-- **WHEN** Control Machine attempts TCP connection to `WORKER_IP:3002`
-- **THEN** the connection times out without TCP RST, confirming DROP rather than REJECT; UFW counters on
-  Worker show the rule was hit
+- **GIVEN** Worker Node is active and a positive mTLS probe from Master succeeds
+- **WHEN** the runner records the source address seen by Worker for that successful connection and then probes Worker:3002 from Control Machine
+- **THEN** the observed Master source address matches the effective UFW allow rule; the Control Machine probe is blocked; and Worker-side UFW rule/counter or packet trace confirms the DROP path
 
-#### Scenario: Master egress IP confirmed against UFW allowlist
+#### Scenario: Negative probe is not misclassified
 
-- **GIVEN** Worker UFW allows only the Master egress IP on port 3002
-- **WHEN** runner determines the actual source IP of Master → Worker connections
-- **THEN** that IP matches the UFW allow rule; if it does not, the firewall test is marked FAIL
+- **GIVEN** a Control Machine connection to Worker:3002 fails
+- **WHEN** the runner evaluates the result
+- **THEN** `Connection refused`, route failure, DNS failure, or timeout without a successful Master control probe and Worker-side firewall evidence MUST NOT count as firewall PASS; ambiguous evidence is `INCOMPLETE`
+
+#### Scenario: Master local and external access are distinguished
+
+- **GIVEN** Master Node is listening on loopback port 3002 and external isolation is configured
+- **WHEN** the runner probes loopback from Master and the public endpoint from Control Machine
+- **THEN** loopback succeeds and the external probe is blocked with the same positive-control and firewall-evidence requirements
 
 #### Scenario: IPv6 firewall isolation checked when enabled
 
-- **GIVEN** `ENABLE_IPV6=true` is configured
-- **WHEN** runner performs port 3002 isolation checks on both Master and Worker
-- **THEN** all isolation verifications (loopback, Master egress allow, Control Machine DROP) are repeated on
-  IPv6 interfaces and must pass with the same DROP semantics as IPv4
-
----
+- **GIVEN** `ENABLE_IPV6=true` and valid AAAA routing are configured
+- **WHEN** runner repeats the positive and negative probes over IPv6
+- **THEN** the observed IPv6 source address matches the allowlist, the allowed Master probe succeeds, and the Control Machine probe is blocked with Worker-side evidence
 
 ### Requirement: NGINX SNI Routing and REALITY Decoy Verification
 
@@ -328,42 +341,61 @@ PROXY protocol SHALL be correctly forwarded.
 
 ### Requirement: Data Plane E2E Traffic Through All Eight VPN Endpoints
 
-The runner SHALL verify that real user VPN traffic passes through each of the eight endpoints independently.
-For each endpoint: select the outbound from the real subscription, build a minimal temporary Xray client
-config, start Xray as a subprocess, execute an HTTPS request via SOCKS5, verify egress IP and server-side
-traffic evidence, then stop Xray and delete the temporary config. `TEST_TRAFFIC_VERIFICATION=false` SHALL
-produce status `INCOMPLETE`, never `PASS`.
+The runner SHALL verify eight logical endpoints: four protocols on Master and the same four protocols on Worker. Each logical endpoint MUST be exercised independently by both a real Xray client process and a real Mihomo client process, yielding sixteen mandatory runtime cases. Syntax validation (`xray run -test` or `mihomo -t`) is necessary but does not count as runtime traffic verification. All endpoint tests SHALL use the actual subscription data and shall record client-observed egress plus target-VPS ingress evidence.
 
-#### Scenario: Worker VLESS REALITY Vision tunnel carries user traffic
+#### Scenario: Eight logical endpoints are exercised by both clients
 
-- **GIVEN** Worker is deployed, subscription is retrieved, Worker VLESS REALITY endpoint config extracted
-- **WHEN** Xray client is started with that outbound and an HTTPS request is sent via SOCKS5 proxy
-- **THEN** the request succeeds, egress IP matches expected Worker egress, and server-side traffic evidence
-  (verified via iptables/nftables packet counters or tcpdump packet capture on the target inbound listener port)
-  confirms ingress on Worker; Master inbound traffic counters do NOT increase (no Master relay)
+- **GIVEN** the real Xray JSON and Mihomo YAML subscriptions each contain four Master and four Worker proxy entries
+- **WHEN** the runner executes the Data Plane phase
+- **THEN** it runs Xray and Mihomo independently against each of the eight logical endpoints (16 cases total); all cases must pass for overall `PASS`
 
-#### Scenario: ACME staging CA handled during TLS tunnel traffic
+#### Scenario: Xray runtime request traverses the selected Master endpoint
 
-- **GIVEN** `ACME_MODE=staging` is active and Xray/Mihomo clients execute traffic checks for the six TLS endpoints
-- **WHEN** client processes initiate TLS handshakes against Master and Worker HTTPS/Xray endpoints
-- **THEN** the client configuration trusts the Let's Encrypt Staging CA chain (or configures `allowInsecure: true`
-  for the disposable test client runtime) preventing `x509: certificate signed by unknown authority` failures
+- **GIVEN** a Master endpoint outbound has been extracted from the real Xray subscription
+- **WHEN** a real Xray process exposes a local SOCKS5 listener and the runner sends an HTTPS request through that selected outbound
+- **THEN** the request succeeds, egress matches the configured Master expectation (or documented direct-egress baseline), and isolated packet evidence increases on Master during the request window
 
-#### Scenario: Skipped Data Plane results in INCOMPLETE
+#### Scenario: Mihomo runtime request traverses the selected Master endpoint
 
-- **GIVEN** `TEST_TRAFFIC_VERIFICATION=false` is set
-- **WHEN** the full run completes all other phases
-- **THEN** overall status is `INCOMPLETE`, not `PASS`; JUnit XML marks all Data Plane test cases as SKIP
+- **GIVEN** a Master proxy has been selected from the real Mihomo subscription
+- **WHEN** a real Mihomo process is running and the runner selects that proxy through its supported controller/API or a dedicated generated config
+- **THEN** the HTTPS request succeeds through the selected proxy, egress is verified, and Master ingress evidence increases during the isolated window
 
-#### Scenario: Mihomo data plane verifies all eight endpoints
+#### Scenario: Xray runtime request traverses the selected Worker endpoint
 
-- **GIVEN** `TEST_MIHOMO_TRAFFIC=true` is configured and all eight Xray endpoint checks have passed
-- **WHEN** runner loads the actual Mihomo subscription and repeats the eight traffic checks using a real
-  Mihomo process
-- **THEN** each of the eight endpoints passes; egress IP matches expected VPS egress for each; overall `PASS`
-  requires all eight endpoints verified by both Xray and Mihomo runtime
+- **GIVEN** a Worker endpoint outbound has been extracted from the real Xray subscription
+- **WHEN** a real Xray process sends an HTTPS request through the selected Worker outbound
+- **THEN** the request succeeds, egress matches the configured Worker expectation (or documented direct-egress baseline), Worker ingress evidence increases, and Master ingress evidence does not increase for that controlled request
 
----
+#### Scenario: Mihomo runtime request traverses the selected Worker endpoint
+
+- **GIVEN** a Worker proxy has been selected from the real Mihomo subscription
+- **WHEN** a real Mihomo process sends an HTTPS request through the selected Worker proxy
+- **THEN** the request succeeds, egress is verified, Worker ingress evidence increases, and Master ingress evidence does not increase for that controlled request
+
+#### Scenario: Staging certificates are verified without disabling TLS validation
+
+- **GIVEN** `ACME_MODE=staging` and a proxy transport terminates TLS with a Let's Encrypt Staging certificate
+- **WHEN** Xray or Mihomo performs the transport TLS handshake
+- **THEN** the client trusts the staging CA through a scoped trust bundle; `allowInsecure: true` is prohibited
+
+#### Scenario: Ingress evidence is ambiguous
+
+- **GIVEN** unrelated background traffic changes the same listener counters during the test window
+- **WHEN** the runner cannot attribute ingress evidence to the controlled request
+- **THEN** that case is `INCOMPLETE`, not `PASS`
+
+#### Scenario: Data Plane is explicitly disabled
+
+- **GIVEN** `TEST_TRAFFIC_VERIFICATION=false` or Mihomo runtime testing is disabled
+- **WHEN** the full run completes the remaining phases
+- **THEN** the skipped cases are recorded as `SKIP` and overall status is `INCOMPLETE`, never `PASS`
+
+#### Scenario: One or more mandatory runtime cases fail
+
+- **GIVEN** the sixteen-case runtime matrix is required
+- **WHEN** any Xray or Mihomo case fails
+- **THEN** the corresponding case is `FAIL` and overall status is `FAIL`
 
 ### Requirement: Negative Scenario and Fault Injection Tests
 
@@ -444,14 +476,14 @@ SHALL be idempotent and scoped to resources proven to belong to the current test
 
 - **GIVEN** `TEST_KEEP_VPS_ON_FAILURE=true` and the test run fails at any phase
 - **WHEN** teardown executes
-- **THEN** full diagnostics are collected, `result.json` is written with status `FAILED_PRESERVED`, and the
+- **THEN** full diagnostics are collected, `result.json` is written with status `PARTIAL`, and the
   VPS is not destroyed
 
 #### Scenario: Snapshot restore policy when snapshot absent
 
 - **GIVEN** `TEST_RESTORE_SNAPSHOT=true` and the provider does not support snapshot API or snapshot is absent
 - **WHEN** teardown attempts to restore the VPS to its pre-modification snapshot
-- **THEN** teardown status is set to `TEARDOWN_UNAVAILABLE` rather than simulating success
+- **THEN** teardown status is set to `NOT_RUN` rather than simulating success
 
 ---
 
@@ -486,12 +518,11 @@ The runner SHALL use exactly the status values: `PASS`, `FAIL`, `SKIP`, `NOT_RUN
 mandatory phases completed, all eight Data Plane endpoints verified, and teardown matching the declared policy.
 `shortUuid` SHALL NOT appear in JUnit XML or any CI-published artifact.
 
-#### Scenario: PASS requires all eight Data Plane checks
+#### Scenario: PASS requires all sixteen Data Plane runtime cases
 
 - **GIVEN** all installation, API, subscription, firewall, and NGINX phases are `PASS`
-- **WHEN** only six of eight Data Plane endpoints pass (two fail)
-- **THEN** overall status is `FAIL`, not `PASS`; `xray_data_plane` and `mihomo_data_plane` results are `FAIL`
-  in `result.json`
+- **WHEN** only fourteen of sixteen runtime cases pass (two fail)
+- **THEN** overall status is `FAIL`, not `PASS`; the failing protocol/client cases are identified individually in `result.json`
 
 #### Scenario: result.json schema fields present
 
