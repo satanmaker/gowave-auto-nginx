@@ -61,8 +61,8 @@ run_container_pipeline() {
 
     # Stage 4: Systemd Service Bootstrap & Port 3002 Isolation
     echo "[Stage 4/8] Verifying systemd readiness and port 3002 firewall isolation..."
-    podman exec "$cname" bash -c "state=$(systemctl is-system-running --wait 2>/dev/null || true)
-    case "$state" in running|degraded) ;; *) echo "Systemd did not reach running/degraded state (reported: $state)." >&2; exit 1 ;; esac"
+    podman exec "$cname" bash -c 'state=$(systemctl is-system-running --wait 2>/dev/null || true)
+    case "$state" in running|degraded) ;; *) echo "Systemd did not reach running/degraded state (reported: $state)." >&2; exit 1 ;; esac'
 
     # Stage 5: REST API Provisioning Simulation
     echo "[Stage 5/8] Running API client tests..."
@@ -78,7 +78,9 @@ run_container_pipeline() {
 
     # Stage 8: Update Crash & Journal Rollback
     echo "[Stage 8/8] Testing journal schema validation and recovery..."
-    podman exec "$cname" python3 /repo/modules/recovery.py --validate-journal <(echo '{"op":"update","state":"PREPARED","timestamp":"2026-11-08T00:00:00Z"}')
+    podman exec -i "$cname" bash -c 'cat > /tmp/gowave-test-journal.json && python3 /repo/modules/recovery.py --validate-journal /tmp/gowave-test-journal.json' <<'JSON'
+{"op":"update","state":"PREPARED","timestamp":"2026-11-08T00:00:00Z"}
+JSON
 
     echo "==> 8-Stage Pipeline PASSED for $base_image!"
     podman rm -f "$cname"
