@@ -96,6 +96,12 @@ command.
 - **WHEN** DNS preflight check is performed
 - **THEN** the runner terminates before connecting to any VPS and records the DNS mismatch in the report
 
+#### Scenario: Published AAAA is rejected when IPv6 testing is disabled
+
+- **GIVEN** any configured FQDN returns one or more AAAA records while ENABLE_IPV6=false
+- **WHEN** DNS preflight validates the complete A/AAAA/CNAME answers
+- **THEN** preflight rejects the configuration before remote mutation; the runner MUST NOT silently ignore IPv6 addresses because IPv6 traffic checks are disabled
+
 #### Scenario: Private or reserved IP rejected
 
 - **GIVEN** `MASTER_IP` or `WORKER_IP` is set to a loopback, RFC-1918 private, link-local, multicast,
@@ -713,6 +719,19 @@ while its recorded identity and digest still match. Unverifiable ownership requi
 - **GIVEN** the hook path was absent at preflight and the current transaction creates the managed hook
 - **WHEN** a later installation failure triggers compensation
 - **THEN** rollback removes the hook only if the journal proves transaction ownership and the current identity/digest still match; a modified/replaced path is preserved and cleanup is marked incomplete
+
+#### Scenario: Uncatchable Worker termination is recovered before the next mutation
+
+- **GIVEN** a previous Worker deployment was terminated by SIGKILL, kernel panic or power loss after writing an uncommitted transaction journal
+- **WHEN** the next authenticated Worker management or recovery entrypoint is invoked
+- **THEN** it discovers and reconciles the uncommitted journal before accepting any new mutation; if recovery cannot be fully verified, it rejects the new operation, retains the journal and reports INCOMPLETE
+
+#### Scenario: PRESERVE reports package-manager residuals without claiming OS baseline restoration
+
+- **GIVEN** the installation transaction has installed or upgraded OS packages and package post-install scripts have created service defaults
+- **WHEN** compensation or teardown completes under TEST_TEARDOWN_POLICY=PRESERVE
+- **THEN** the report records the package changes as retained residual state and distinguishes transaction compensation from restoration of the original OS baseline; the VPS is not eligible for another clean-baseline run until re-imaged or restored through the verified snapshot procedure
+
 
 ### Requirement: Signal-Safe and Verifiable Transaction Compensation
 
