@@ -128,6 +128,24 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertIn("sport = :3002", content)
             self.assertNotIn("curl -k", content)
 
+    def test_worker_payload_contains_automated_compensation(self):
+        """Worker deployment must include automated compensating rollback on error."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        self.assertIn("compensate_remote_worker", worker_script)
+        self.assertIn("trap 'exit_code=$?; compensate_remote_worker \"$exit_code\"; exit \"$exit_code\"' ERR", worker_script)
+        self.assertIn("systemctl stop gowave-node.service", worker_script)
+        self.assertIn("rm -rf /etc/systemd/system/gowave-node.service.d", worker_script)
+        self.assertIn("certbot delete --cert-name \"$WORKER_DOMAIN\"", worker_script)
+        self.assertIn("swapoff /swapfile", worker_script)
+        self.assertIn("ufw delete allow proto tcp from \"$PANEL_IP\"", worker_script)
+
+    def test_worker_standalone_remote_rollback_defined(self):
+        """gowave-node-auto.sh must provide standalone remote_rollback command."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        self.assertIn("remote_rollback()", worker_script)
+        self.assertIn("remote_rollback|rollback)", worker_script)
+        self.assertIn("SSH host key for $host_key is not pre-pinned", worker_script)
+
 
 if __name__ == "__main__":
     unittest.main()
