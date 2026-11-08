@@ -83,8 +83,9 @@ class TestNginxRouting(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             out = tmp / "gowave-decoy.conf"
+            cover_dir = tmp / "cover-reality"
 
-            cmd = f'source "{NGINX_SH}" && generate_decoy_vhost "reality.example.com" "{out}"'
+            cmd = f'source "{NGINX_SH}" && generate_decoy_vhost "reality.example.com" "{out}" nginx "{cover_dir}"'
             res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
             self.assertEqual(res.returncode, 0)
 
@@ -92,7 +93,12 @@ class TestNginxRouting(unittest.TestCase):
             self.assertIn("server_name reality.example.com;", c)
             self.assertIn("ssl_protocols TLSv1.3;", c)
             self.assertIn("access_log /var/log/nginx/gowave-decoy-access.log combined;", c)
-            self.assertIn("root /var/www/gowave-auto-nginx/cover-reality;", c)
+            self.assertIn(f"root {cover_dir};", c)
+
+            # Verify static assets copied
+            self.assertTrue((cover_dir / "index.html").exists())
+            self.assertTrue((cover_dir / "robots.txt").exists())
+            self.assertTrue((cover_dir / "404.html").exists())
 
 
 if __name__ == "__main__":
