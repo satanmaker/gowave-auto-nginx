@@ -38,7 +38,7 @@ The orchestration system SHALL utilize the upstream `gowave-node/install.sh` ins
 - **THEN** the upstream installer validates the numeric port, writes `NODE_PORT=3002` to `/opt/gowave-node/.env`, the orchestrator writes systemd drop-in `10-port.conf` with `Environment="NODE_PORT=3002"`, and `gowave-node` binds to port 3002.
 
 ### Requirement: Remote Worker Node Deployment with Firewall Whitelisting
-The installer SHALL provide an independent automated worker script (`gowave-node-auto.sh`) that provisions `gowave-node` on remote edge servers using upstream installer routines, configures `NODE_PORT` (default 3000), and whitelists access strictly from the Control Plane IP (both IPv4 and IPv6).
+The installer SHALL provide an independent automated worker script (`gowave-node-auto.sh`) that provisions `gowave-node` on remote edge servers using upstream installer routines, configures `NODE_PORT` (recommended default 3002), and whitelists access strictly from the Control Plane IP (both IPv4 and IPv6).
 
 #### Scenario: Remote worker installation and firewall lockdown
 - **GIVEN** an edge server designated as a remote worker and a Control Plane `PANEL_IP`
@@ -63,7 +63,7 @@ The installer SHALL provide an independent automated worker script (`gowave-node
 #### Scenario: Automated worker registration via CLI node add command
 - **GIVEN** an active GoWave Panel and an accessible remote worker host
 - **WHEN** `gowave-auto.sh node add <name> <ip> <worker-domain> <reality-domain> [user] [port]` is executed
-- **THEN** it creates a dedicated worker profile (`GoWave Worker <name> Profile`) with unique node-scoped inbound tags (`*-<name>`), registers the node via `POST /api/nodes`, links inbounds to the managed squad, provisions worker Host records with canonical remarks (`<PROTO>@<name>`), streams payload via `remote_payload` over SSH stdin with zero secrets in `argv`, and persists worker state in `state.json` schemaVersion 2.
+- **THEN** it validates that if worker IP matches PANEL_IP or 127.0.0.1, NODE_PORT=3002 is enforced, creates a dedicated worker profile with unique tags (`*-<name>`), registers the node via `POST /api/nodes`, links inbounds to squad, provisions worker Host records, streams payload via `remote_payload` over SSH stdin, and persists worker state in `state.json` schemaVersion 2.
 
 ### Requirement: Mutual TLS 1.3 Control Plane Protocol with Strict SNI Verification
 All panel-to-node management communication SHALL use TLS 1.3 with mutual certificate verification, derived HKDF SNI (`rw-v1`), RS256 JWT bearer token authentication, and strict SNI enforcement.

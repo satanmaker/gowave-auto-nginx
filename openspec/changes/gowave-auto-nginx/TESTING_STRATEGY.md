@@ -115,6 +115,10 @@ flowchart TD
   - `test_decoy_tls13_h2`: Verify via `openssl s_client -tls1_3 -alpn h2 -connect 127.0.0.1:9443` that the fallback decoy vhost negotiates TLS 1.3 and ALPN HTTP/2.
   - `test_backup_restore_preflight_security`: Feed malicious tar archives to the 15-point preflight validator: including traversal (`../`), broad directories (`etc/letsencrypt/renewal-hooks/deploy/evil.sh`, `etc/nginx/modules-enabled/evil.conf`, `etc/systemd/system/gowave-node.service.d/evil.conf`), shell scripts, unauthorized binaries (`opt/gowave/gowave-server`, `opt/gowave-node/*`), SUID binaries, and oversized manifests; assert immediate fatal rejection before extracting any files.
   - `test_multi_node_sequential_add`: Execute sequential `gowave-auto.sh node add` operations; assert dedicated worker profiles and canonical remarks (`<PROTO>@<node-name>`) are created without modifying or overwriting existing node hosts.
+  - `test_backup_strict_umask`: Execute backup procedure when system umask is `077`; verify backup destination is created with explicit mode `0640` ownership `gowave:gowave` without EACCES.
+  - `test_gomemlimit_applied`: Verify `gowave.service` has `GOMEMLIMIT=250MiB` applied in runtime via `systemctl show gowave.service -p Environment | grep GOMEMLIMIT=250MiB`.
+  - `test_stream_ipv6_conditional`: Verify NGINX Stream 443 omits `[::]:443` when `/proc/net/if_inet6` is absent, and binds both `443` and `[::]:443` when active.
+  - `test_journal_schema_validation`: Feed malformed and corrupted `journal.json` to `gowave-auto.sh recover`; verify immediate abort without destructive rollbacks, followed by read-only API audit.
 
 ### Suite 5: `systemd` (L5 Genuine PID 1 Systemd in QEMU TCG Guest)
 - **Privilege**: Root (`id -u == 0`) inside QEMU virtual machine.
@@ -252,12 +256,12 @@ To test `gowave-node-auto.sh` and multi-node orchestration prior to VPS deployme
 flowchart LR
     client["Client Simulator (Test Runner)"]
     panel["Container: gowave-panel (10.89.0.10)<br/>GoWave Panel API :3000<br/>NGINX Reverse Proxy :7443"]
-    worker["Container: gowave-worker (10.89.0.20)<br/>gowave-node :3000 (UFW allows 10.89.0.10)<br/>Worker NGINX Stream :443<br/>Worker Xray Inbounds :8443, :10001-:10003"]
+    worker["Container: gowave-worker (10.89.0.20)<br/>gowave-node :3002 (UFW allows 10.89.0.10)<br/>Worker NGINX Stream :443<br/>Worker Xray Inbounds :8443, :10001-:10003"]
     untrusted["Container: gowave-untrusted (10.89.0.30)<br/>Non-whitelisted peer"]
 
     panel -- "1. mTLS 1.3 Handshake (rw-v1)<br/>2. Profile & User Sync" --> worker
     client -- "3. Direct VPN Tunnel (Port 443)<br/>VLESS REALITY / XHTTP / WS / Trojan" --> worker
-    untrusted -- "4. Probes port 3000 -> Dropped by UFW" --> worker
+    untrusted -- "4. Probes port 3002 -> Dropped by UFW" --> worker
     client -. "Fetch Subscriptions" .-> panel
 ```
 
@@ -269,12 +273,12 @@ The multi-node test executes the following 6 stages:
    - Installs GoWave Panel on `gowave-panel`, verifies API listening on `127.0.0.1:3000` and NGINX on `10.89.0.10:7443`.
    - Bootstraps admin user, single unified Config Profile, and Host records.
 3. **Remote Worker Deployment over SSH Stdin**:
-   - Dispatches `gowave-node-auto.sh` to `gowave-worker` (`10.89.0.20`) via the SSH stdin pipeline (`remote_payload`), passing `NODE_PORT=3000`, `SECRET_KEY`, `PANEL_IP=10.89.0.10`, `WORKER_DOMAIN`, and `REALITY_DOMAIN` without file transfer dependencies.
+   - Dispatches `gowave-node-auto.sh` to `gowave-worker` (`10.89.0.20`) via the SSH stdin pipeline (`remote_payload`), passing `NODE_PORT=3002` (standardized production port preventing host-level collisions), `SECRET_KEY`, `PANEL_IP=10.89.0.10`, `WORKER_DOMAIN`, and `REALITY_DOMAIN` without file transfer dependencies.
 4. **Worker Firewall Lockdown Verification**:
-   - Verifies UFW rule on Worker: `ufw allow proto tcp from 10.89.0.10 to any port 3000`.
-   - Confirms that probes from `10.89.0.10` succeed, while probes from `gowave-untrusted` (`10.89.0.30`) to port 3000 are dropped.
+   - Verifies UFW rule on Worker: `ufw allow proto tcp from 10.89.0.10 to any port 3002`.
+   - Confirms that probes from `10.89.0.10` succeed, while probes from `gowave-untrusted` (`10.89.0.30`) to port 3002 are dropped.
 5. **Panel-to-Node mTLS 1.3 Association & Config Push**:
-   - Registers Worker node in Panel API via `POST /api/nodes` (`address: "10.89.0.20"`, `port: 3000`).
+   - Registers Worker node in Panel API via `POST /api/nodes` (`address: "10.89.0.20"`, `port: 3002`).
    - Initiates mTLS 1.3 handshake with HKDF-derived SNI (`rw-v1`), pushes inbounds, and syncs users via `syncUserToSingleNode`.
    - Verifies `gowave-node` receives configuration and supervises Xray core.
 6. **Direct Edge Client Traffic & Camouflage Fallback**:

@@ -75,7 +75,7 @@ In Topology B, the Central Server acts as the Control Plane, while one or more r
 1. **Central Server (Control Plane)**:
    - Hosts GoWave Panel (`127.0.0.1:3000`), NGINX reverse proxy (`panel_domain:443`), and SQLite database.
    - Publishes user subscriptions containing the public addresses/ports of Worker Nodes.
-   - Connects to remote Worker Nodes over mTLS 1.3 on `NODE_PORT` (default 3000) using derived HKDF SNI (`rw-v1`).
+   - Connects to remote Worker Nodes over mTLS 1.3 on `NODE_PORT` (default 3002) using derived HKDF SNI (`rw-v1`).
 2. **Worker Server (Edge Gateway & Complete Traffic Plane)**:
    - Has its own public IPv4/IPv6 address and dedicated worker FQDN (`worker_domain`).
    - Runs `gowave-node` (installed via upstream `install.sh`) and Xray core, orchestrated via `gowave-node-auto.sh`.
@@ -83,7 +83,7 @@ In Topology B, the Central Server acts as the Control Plane, while one or more r
      - NGINX Stream on public port 443 (`ssl_preread on; proxy_protocol on;`) demultiplexing incoming connections: `worker_domain` SNI to local NGINX HTTPS listener (`127.0.0.1:7443`), camouflage SNI to local Xray REALITY inbound (`127.0.0.1:8443`), and unrecognized/scanner probes to 8443 (which fall back to local decoy vhost on 9443).
      - NGINX HTTPS listener on `127.0.0.1:7443` terminating Let's Encrypt TLS for `worker_domain`, with reverse proxy locations for XHTTP (`127.0.0.1:10001` with `proxy_buffering off;`), WebSocket upgrade (`127.0.0.1:10002`), and Trojan gRPC (`127.0.0.1:10003` via `grpc_pass`).
      - Certbot automated ACME HTTP-01 challenge on port 80 with deployment reload hook for NGINX.
-   - UFW firewall permits public ports 80 and 443, and strictly whitelists `PANEL_IP` for `NODE_PORT` (default 3000) across both IPv4 and IPv6.
+   - UFW firewall permits public ports 80 and 443, and strictly whitelists `PANEL_IP` for `NODE_PORT` (recommended default 3002, matching All-in-One to prevent host-level collisions) across both IPv4 and IPv6.
    - Clients connect **directly to the Worker Server** on port 443 for all 4 MVP VPN transports. Client VPN data does NOT pass through the Central Panel.
 3. **Central Edge Proxying (Topology C) is Formally Rejected**:
    - Proxying all client VPN data through the central panel introduces a fatal latency bottleneck, doubles bandwidth costs, and creates a single point of failure.
@@ -124,7 +124,7 @@ sequenceDiagram
 | **9443** | TCP (TLS 1.3 + HTTP/2, HTTP/1.1) | Loopback (`127.0.0.1`) | NGINX Decoy Vhost | In: **PROXY v1** / Out: None | Terminates TLS 1.3/H2 for `reality_domain`; serves static camouflage website (`cover-reality`) |
 | **3000** | TCP (Cleartext HTTP) | Loopback (`127.0.0.1`) | GoWave Panel Backend | In: None / Out: None | Panel REST API and static frontend assets (`APP_PORT=3000`) |
 | **3001** | TCP (Cleartext HTTP) | Loopback (`127.0.0.1`) | GoWave Panel Metrics | In: None / Out: None | Prometheus metrics endpoint (optional, loopback only) |
-| **3002** | TCP (mTLS 1.3) | Wildcard (`:3002`) isolated via UFW (fail-closed) | Local GoWave Node | In: None / Out: None | Local Node control plane (`NODE_PORT=3002`); UFW denies external; verified fail-closed |
+| **3002** | TCP (mTLS 1.3) | Wildcard (`:3002`) isolated via UFW (fail-closed) | GoWave Node (Local / Worker) | In: None / Out: None | Node control plane (`NODE_PORT=3002` recommended for both Local and Worker); UFW whitelists Panel IP / loopback; verified fail-closed |
 | **10001**| TCP (Cleartext HTTP/1.1)| Loopback (`127.0.0.1`) | Xray XHTTP Inbound | In: None / Out: None | Internal backend inbound for VLESS-XHTTP |
 | **10002**| TCP (Cleartext HTTP/WS) | Loopback (`127.0.0.1`) | Xray WS Inbound | In: None / Out: None | Internal backend inbound for VLESS-WS |
 | **10003**| TCP (Cleartext gRPC) | Loopback (`127.0.0.1`) | Xray gRPC Inbound | In: None / Out: None | Internal backend inbound for Trojan-gRPC |
@@ -200,7 +200,7 @@ The system provides verified templates and testing for exactly 4 native protocol
 5. **Panel API, Subscriptions & Web UI Reverse Proxying (Port 7443)**:
    - For all non-transport HTTP traffic destined to `panel_domain`, NGINX on 7443 terminates TLS and proxies to GoWave's internal loopback listener at `127.0.0.1:3000`:
      ```nginx
-     # Subscriptions caching disabled, headers preserved
+     # Subscriptions caching disabled, headers preserved, User-Agent preserved
      location ^~ /api/sub/ {
          proxy_pass http://127.0.0.1:3000;
          proxy_http_version 1.1;
@@ -208,6 +208,7 @@ The system provides verified templates and testing for exactly 4 native protocol
          proxy_set_header X-Real-IP $remote_addr;
          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
          proxy_set_header X-Forwarded-Proto $scheme;
+         proxy_set_header User-Agent $http_user_agent;
          add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0";
      }
 
@@ -276,10 +277,10 @@ To resolve the classic chicken-and-egg bootstrap deadlock while guaranteeing per
    ```
    Both certificate lineages (`/etc/letsencrypt/live/$PANEL_DOMAIN/` and `/etc/letsencrypt/live/$REALITY_DOMAIN/`) are validated with `openssl x509 -noout -ext subjectAltName` ensuring `fullchain.pem` and `privkey.pem` exist. Crucially, this ensures Certbot unconditionally stores `authenticator = webroot` in `/etc/letsencrypt/renewal/<domain>.conf`, preventing the renewal deadlocks inherent in standalone mode.
 2. **Stage 2 (Production Configuration & Non-Conflicting Port 80 Redirects)**: Once both certificates exist on disk, the installer deploys production configurations:
-   - NGINX Stream 443 with `proxy_timeout 1h; proxy_connect_timeout 5s; listen 443 so_keepalive=on;` demultiplexing to `127.0.0.1:7443` and `127.0.0.1:8443`. Global NGINX tuning sets `worker_rlimit_nofile 65535; worker_connections 8192;`.
+   - NGINX Stream 443 with `proxy_timeout 1h; proxy_connect_timeout 5s; listen 443 so_keepalive=on;` (with conditional `listen [::]:443 so_keepalive=on;` included ONLY when `/proc/net/if_inet6` is present and active, omitting `[::]` if IPv6 is disabled in the kernel to prevent fatal `Address family not supported` socket errors) demultiplexing to `127.0.0.1:7443` and `127.0.0.1:8443`. Global NGINX tuning sets `worker_rlimit_nofile 65535; worker_connections 8192;`.
    - NGINX HTTP port 80 with selective redirect: preserves `location /.well-known/acme-challenge/ { root /var/www/gowave-acme; }`, redirects known domains to HTTPS (`return 301 https://$host$request_uri;`), and returns 444 for unmanaged hostnames/IP scanners.
    - NGINX HTTPS listener at `127.0.0.1:7443` with `ssl_certificate /etc/letsencrypt/live/$PANEL_DOMAIN/fullchain.pem`.
-   - NGINX Decoy listener at `127.0.0.1:9443` with `ssl_protocols TLSv1.3;`, runtime version-detected HTTP/2 syntax (`listen 127.0.0.1:9443 ssl http2 proxy_protocol;` on NGINX < 1.25.1; `listen 127.0.0.1:9443 ssl proxy_protocol; http2 on;` on NGINX >= 1.25.1), and `ssl_certificate /etc/letsencrypt/live/$REALITY_DOMAIN/fullchain.pem`.
+   - NGINX Decoy listener at `127.0.0.1:9443` with `ssl_protocols TLSv1.3;`, runtime version-detected HTTP/2 syntax (`listen 127.0.0.1:9443 ssl http2 proxy_protocol;` on NGINX < 1.25.1; `listen 127.0.0.1:9443 ssl proxy_protocol; http2 on;` on NGINX >= 1.25.1), `ssl_certificate /etc/letsencrypt/live/$REALITY_DOMAIN/fullchain.pem`, and a dedicated security audit log `access_log /var/log/nginx/gowave-decoy-access.log combined;` recording PROXY-restored scanner IP, timestamp, SNI, and HTTP request line with logrotate rotation, without logging VPN payload content.
 3. **Stage 3 (Validation, Reload & Renewal Dry-Run)**: The installer removes the temporary bootstrap config `00-bootstrap-acme.conf`, tests syntax via `nginx -t -q`, reloads NGINX (`systemctl reload nginx`), establishes automated renewal hooks in `/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` (`nginx -t -q && systemctl reload nginx`), and immediately verifies renewal safety via:
    ```bash
    certbot renew --dry-run
@@ -300,6 +301,14 @@ Direct VLESS + TLS + Vision (without REALITY) requires Xray itself to terminate 
   ```
   This ensures real client IPs are preserved across the entire 443 -> 8443 -> 9443 chain, logged in access logs, rate-limited accurately, and made available to Fail2ban.
 - Any external attempt to inject fake PROXY protocol headers from non-loopback addresses is discarded.
+
+#### Client IP Preservation for HTTP & WebSocket Transports (7443 -> 10001/10002)
+Because NGINX HTTPS listener on 7443 receives PROXY protocol v1 from Stream 443 and restores the authentic client IP into `$remote_addr` via `real_ip_header proxy_protocol;`, reverse proxy locations for XHTTP (`^~ /xhttp-down/`) and WebSocket (`= /ws`) explicitly pass this authentic IP to Xray's loopback HTTP inbounds:
+```nginx
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+```
+Internal Xray inbounds (10001 XHTTP, 10002 WS, 10003 Trojan gRPC) strictly omit `acceptProxyProtocol`, avoiding framing and parsing crashes while guaranteeing that genuine client IPs are preserved across the entire edge chain for audit logging and Fail2ban integration.
 
 ---
 
@@ -441,6 +450,15 @@ In `backend-go/internal/subtpl/resolve.go`, `resolveSecurity()` resolves client 
 | **VLESS WebSocket TLS** | `none` | `TLS` | `tls` | NGINX terminates TLS; Host must force `"TLS"`. |
 | **Trojan gRPC TLS** | `none` | `TLS` | `tls` | NGINX terminates TLS; Host must force `"TLS"`. |
 
+#### GoWave Response Rules Contract & Mandatory User-Agent
+Upstream GoWave (`backend-go/internal/server/response_rules.go`) strictly requires a non-empty `User-Agent` header for client subscription requests, responding with HTTP 403 Forbidden if absent.
+- The installer completion summary and CLI helper command `gowave-auto-nginx user links` explicitly document this requirement and provide copy-paste `curl` verification commands with client headers:
+  ```bash
+  curl -fsSL -H "User-Agent: v2rayN/6.0" "https://$PANEL_DOMAIN/api/sub/<shortUuid>/v2ray-json"
+  curl -fsSL -H "User-Agent: ClashMeta/1.19" "https://$PANEL_DOMAIN/api/sub/<shortUuid>/mihomo"
+  ```
+- NGINX on 7443 preserves client User-Agent headers transparently to GoWave Panel via `proxy_set_header User-Agent $http_user_agent;`.
+
 #### Web Panel UI vs. CLI Subscription Delivery (Scope Boundary)
 - Upstream GoWave React frontend natively displays `user.subscriptionUrl` (the base subscription URL `https://<subPublicDomain>/<shortUuid>`).
 - GoWave Auto NGINX explicitly **does NOT fork, rebuild, or patch the upstream React frontend bundle** in the MVP, avoiding frontend compilation fragility and maintenance divergence.
@@ -506,7 +524,7 @@ To guarantee recovery resilience, administrative credentials (username, strong 2
 - `gowave-node-auto.sh` utilizes the official upstream `gowave-node/install.sh` installer as its foundation.
 - The orchestrator sets environment variables:
   ```bash
-  export NODE_PORT=3002 # (or 3000 for remote workers)
+  export NODE_PORT=3002 # (recommended default for both local node and remote workers)
   export GOWAVE_NODE_VERSION=latest
   export SECRET_KEY="<base64-payload>"
   ```
@@ -540,7 +558,7 @@ To deploy remote worker nodes over SSH without depending on `scp`, creating mess
            # Safely serialize environment variables strictly over stdin with export (NEVER in ssh argv)
            printf 'export PANEL_IP=%q\n' "$PANEL_IP"
            printf 'export PANEL_IPV6=%q\n' "${PANEL_IPV6:-}"
-           printf 'export NODE_PORT=%q\n' "${NODE_PORT:-3000}"
+           printf 'export NODE_PORT=%q\n' "${NODE_PORT:-3002}"
            printf 'export GOWAVE_NODE_VERSION=%q\n' "${GOWAVE_NODE_VERSION:-latest}"
            printf 'export WORKER_DOMAIN=%q\n' "$worker_domain"
            printf 'export REALITY_DOMAIN=%q\n' "$reality_domain"
@@ -612,7 +630,7 @@ To eliminate manual REST API calls and provide a complete all-in-one UX for regi
    - Creates corresponding worker Host records via `POST /api/hosts` (`address: <worker-domain>`, `port: 443`, linked to `node-uuid` and Internal Squad).
    - If `ssh-user` is supplied (or configured), initiates remote worker deployment using the canonical `remote_payload` function (zero secrets in `ssh` argv):
      ```bash
-     PANEL_IP="$PANEL_IP" NODE_PORT=3000 SECRET_KEY="$SECRET_KEY" GOWAVE_NODE_VERSION=latest \
+     PANEL_IP="$PANEL_IP" NODE_PORT=3002 SECRET_KEY="$SECRET_KEY" GOWAVE_NODE_VERSION=latest \
        remote_payload "$node_ip" "${ssh_port:-22}" "$worker_domain" "$reality_domain"
      ```
    - Records the provisioned worker node metadata into `/var/lib/gowave-auto-nginx/state.json` via atomic write with parent directory fsync.
@@ -640,7 +658,7 @@ GoWave Auto NGINX implements a dedicated subcommand `gowave-auto.sh channel [sta
    - Execute `PRAGMA wal_checkpoint(TRUNCATE);` with a 5-second busy timeout.
    - Capture a consistent database snapshot using staged SQLite Online Backup executing under service user privileges:
      ```bash
-     # 1. Root pre-creates empty destination file with service user ownership and mode 0640
+     # 1. Root pre-creates empty destination file with service user ownership and explicit mode 0640 (bypassing any strict system umask such as 077)
      install -o gowave -g gowave -m 0640 /dev/null "/opt/gowave/.backup-<ts>.db"
      # 2. Service user executes online SQLite backup into the pre-created file
      runuser -u gowave -- sqlite3 /opt/gowave/gowave.db ".backup /opt/gowave/.backup-<ts>.db"
@@ -675,6 +693,13 @@ GoWave Auto NGINX implements a dedicated subcommand `gowave-auto.sh channel [sta
 6. **Commit & Snapshot Pruning**:
    - Upon successful healthcheck, update journal state to `"COMMITTED"`.
    - Retain the last 3 recovery snapshots (enforcing a 5 GB maximum storage ceiling), pruning older snapshots safely.
+
+#### Journal Schema Validation & Integrity Guard
+Prior to executing any recovery action, `gowave-auto.sh recover` performs strict schema and structural validation of `/var/lib/gowave-auto-nginx/recovery/journal.json` (verifying required fields: `op`, `state`, `timestamp`, and expected entity arrays).
+- If `journal.json` is corrupted, truncated, or structurally invalid:
+  1. The recovery unit immediately aborts without executing destructive rollbacks, logging a critical alert: `CRITICAL: journal.json validation failed; aborting automated rollback`.
+  2. It performs a non-destructive read-only consistency audit via Panel API (`GET /api/nodes`, `GET /api/config-profiles`, `GET /api/hosts`) against `/var/lib/gowave-auto-nginx/state.json`.
+  3. It requires manual operator confirmation (`gowave-auto.sh recover --force-reconcile`) to proceed, preventing cascading corruption from malformed journal state.
 
 #### Reboot & Power Loss Recovery Architecture (Split Recovery Units)
 If the server suffers a sudden power loss or kernel panic during an active update, restore, or provisioning transaction, rollback requires two distinct execution stages:
@@ -799,7 +824,9 @@ Multi-distribution compatibility across target systems is achieved via three tar
      [Install]
      WantedBy=sysinit.target
      ```
-   - Enabled via `systemctl enable bbr-load.service`. The `-` prefix ensures graceful fallback on kernels or virtualized environments without `tcp_bbr`, preserving system startup and defaulting to `cubic` without service failure.
+   - Enabled via `systemctl enable bbr-load.service`. The `-` prefix ensures graceful fallback on kernels or virtualized environments without `tcp_bbr` (e.g. OpenVZ, LXC), preserving system startup, logging `BBR unavailable, falling back to CUBIC`, persisting `"congestionControl": "cubic"` in `state.json`, and defaulting to `cubic` without service failure.
+   - Runtime drop-in verification: installer confirms `GOMEMLIMIT=250MiB` is active in service runtime:
+     `systemctl show gowave.service -p Environment | grep -q "GOMEMLIMIT=250MiB"`.
    - Enables Packetization Layer Path MTU Discovery (`net.ipv4.tcp_mtu_probing = 1`) in `/etc/sysctl.d/99-gowave.conf` to significantly reduce the risk of PMTU blackholing across non-1500 MTU cloud networks (e.g. Hetzner vSwitch 1450, GCP 1460, PPPoE).
 5. **Fail2ban Modern Systemd Journal & Socket Activation**:
    - Installs `python3-systemd` prerequisite, configures `backend = systemd` in `/etc/fail2ban/jail.d/90-gowave-auto-nginx.local`:
@@ -920,7 +947,7 @@ Passing all 8 stages across all 4 distributions is enforced as a mandatory requi
 #### Multi-Node Distributed Edge E2E Testbed (Panel + Remote Worker)
 In addition to All-in-One tests, `tests/podman_testbed.sh multi-node` deploys two interconnected containers on an isolated Podman bridge network (`gowave-net`):
 1. **`gowave-panel` (Control Plane)**: Hosts GoWave Panel, SQLite database, and NGINX reverse proxy.
-2. **`gowave-worker` (Edge Gateway)**: Deployed automatically via `gowave-node-auto.sh` using the SSH stdin pipeline (`remote_payload`), receiving `NODE_PORT=3000`, `SECRET_KEY`, and `PANEL_IP`.
+2. **`gowave-worker` (Edge Gateway)**: Deployed automatically via `gowave-node-auto.sh` using the SSH stdin pipeline (`remote_payload`), receiving `NODE_PORT=3002`, `SECRET_KEY`, and `PANEL_IP`.
 
 The multi-node testbed verifies:
 - Remote worker deployment without copying files via `scp`.

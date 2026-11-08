@@ -18,6 +18,15 @@
 - **NOT_SUPPORTED**: Incompatible, broken, or explicitly excluded from support scope.
 - **UNKNOWN**: Insufficient evidence to determine compatibility without further testing.
 
+### Minimum Hardware & Resource Requirements
+
+| Deployment Topology | Minimum vCPU | Minimum RAM | Recommended Swap | Minimum Storage | Notes & Degradation Strategy |
+|---|---|---|---|---|---|
+| **All-in-One (Panel + Node + Xray + NGINX)** | 1 vCPU | 1 GB RAM | 1 GB swapfile | 10 GB NVMe/SSD | 512 MB RAM is insufficient for full stack with Vite/Go migrations; 1 GB is hard minimum. GOMEMLIMIT=250MiB. |
+| **Distributed Edge Worker (Node + Xray + NGINX)** | 1 vCPU | 512 MB RAM | 1 GB swapfile | 5 GB SSD | 512 MB RAM is fully supported for Worker edge gateways running without the React/Panel backend. |
+
+*Kernel Congestion Fallback*: Full BBR is deployed on kernels supporting `tcp_bbr`. On restricted virtualization environments (e.g. OpenVZ, LXC, custom cloud kernels lacking `tcp_bbr`), the installer gracefully falls back to `cubic`, logs `BBR unavailable, falling back to CUBIC`, records `"congestionControl": "cubic"` in `state.json`, and completes deployment successfully.
+
 ---
 
 ## 2. Component Compatibility Matrix by Operating System

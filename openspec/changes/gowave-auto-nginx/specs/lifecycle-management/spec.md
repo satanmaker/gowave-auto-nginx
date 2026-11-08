@@ -76,6 +76,11 @@ The update module SHALL execute SQLite Online Backup, capture a persistent snaps
 - **WHEN** the orchestrator triggers worker rollback
 - **THEN** it deletes worker hosts (`DELETE /api/hosts/{uuid}`), disassociates worker inbounds via `PATCH /api/internal-squads/{uuid}`, and deletes worker node and worker config profile, strictly preserving central panel users, tokens, and squads.
 
+#### Scenario: Corrupted journal validation before recovery
+- **GIVEN** an uncommitted transaction where `journal.json` is truncated, corrupted, or violates schema
+- **WHEN** `gowave-auto.sh recover` executes
+- **THEN** it aborts without deleting entities, logs a fatal schema error, performs a read-only API consistency audit, and requires manual operator confirmation before modifying state.
+
 ### Requirement: Recovery Snapshot Retention Ceiling
 The lifecycle manager SHALL enforce a retention policy keeping the last 3 recovery snapshots and capping total snapshot storage at 5 GB, forbidding deletion of snapshots for active in-flight transactions.
 

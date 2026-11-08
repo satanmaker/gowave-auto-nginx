@@ -236,11 +236,21 @@ The file is written with mode `0600` owned by `root:root`:
     "uuid": "018d9f12-3456-7890-abcd-ef0123456795",
     "issuedAt": "2026-11-07T21:00:00Z"
   },
+  "congestionControl": "bbr",
   "lastReconciledAt": "2026-11-07T21:00:00Z"
 }
 ```
 
-### 4.2 Reconciliation & Adoption Algorithm
+#### Mandatory Field Constraints in `state.json`:
+- `nodes[].port` (integer, mandatory): the mTLS control plane listener port for the node. Defaults to `3002` for both local node and worker edge nodes. On any single host, `port` must be unique to prevent socket collisions.
+- `congestionControl` (string, mandatory): either `"bbr"` or `"cubic"` (fallback when `tcp_bbr` kernel module is unavailable).
+
+### 4.2 Schema and Integrity Verification of `journal.json`
+Before executing crash recovery via `gowave-recover.service` or `gowave-recover-provision.service`, the orchestrator validates `/var/lib/gowave-auto-nginx/recovery/journal.json`:
+- Must be valid JSON containing mandatory fields: `op` (one of `"provision"`, `"update"`, `"node_add"`), `state` (string matching transaction taxonomy), `timestamp` (ISO-8601).
+- If `journal.json` is corrupted, truncated, or invalid, automated recovery halts with a fatal alert, initiates a read-only audit against GoWave Panel API (`GET /api/nodes`, `GET /api/config-profiles`, `GET /api/hosts`), and prompts the operator for manual confirmation (`gowave-auto.sh recover --force-reconcile`).
+
+### 4.3 Reconciliation & Adoption Algorithm
 
 ```mermaid
 flowchart TD
@@ -331,11 +341,12 @@ gowave-auto.sh node add <node-name> <node-ip> <worker-domain> <reality-domain> [
 7. **Zero-Leak Remote Worker Deployment via Canonical `remote_payload`**:
    - Dispatches configuration over SSH stdin (zero secrets in `argv`):
      ```bash
-     PANEL_IP="$PANEL_IP" PANEL_IPV6="${PANEL_IPV6:-}" NODE_PORT=3000 SECRET_KEY="$SECRET_KEY" \
+     PANEL_IP="$PANEL_IP" PANEL_IPV6="${PANEL_IPV6:-}" NODE_PORT="${NODE_PORT:-3002}" SECRET_KEY="$SECRET_KEY" \
      GOWAVE_NODE_VERSION=latest ADMIN_EMAIL="$ADMIN_EMAIL" \
        remote_payload "$node_ip" "${ssh_port:-22}" "$worker_domain" "$reality_domain" "${ssh_user:-root}"
      ```
-   - The remote runner executes via `bash -s` from stdin, runs `main() </dev/null` preventing stdin theft, applies UFW rule (`ufw allow from $PANEL_IP to any port 3000 proto tcp`), sets up NGINX Stream 443, obtains Let's Encrypt certificates for both `$WORKER_DOMAIN` and `$REALITY_DOMAIN`, installs `gowave-node`, unsets `SECRET_KEY`, and initiates daemon supervision.
+   - Worker node validation: If `$node_ip` matches `$PANEL_IP` or `127.0.0.1`, `gowave-auto.sh node add` enforces `NODE_PORT=3002` (and logs a warning if port 3000 was requested) to eliminate port collisions with the Central Panel API.
+   - The remote runner executes via `bash -s` from stdin, runs `main() </dev/null` preventing stdin theft, applies UFW rule (`ufw allow from $PANEL_IP to any port ${NODE_PORT:-3002} proto tcp`), sets up NGINX Stream 443, obtains Let's Encrypt certificates for both `$WORKER_DOMAIN` and `$REALITY_DOMAIN`, installs `gowave-node`, unsets `SECRET_KEY`, and initiates daemon supervision.
 8. **State Persistence**:
    - Appends node entry into `/var/lib/gowave-auto-nginx/state.json` via `atomic_write_state()`.
 

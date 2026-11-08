@@ -48,23 +48,23 @@ The routing subsystem SHALL serve an authentic static camouflage website on loop
 #### Scenario: Scanner probe fallback to static cover
 - **GIVEN** an unauthenticated client or scanner connecting to `127.0.0.1:8443`
 - **WHEN** Xray REALITY fails to authenticate the handshake
-- **THEN** Xray forwards the connection with PROXY protocol v1 (`dest: "127.0.0.1:9443", xver: 1`) to `127.0.0.1:9443`, where NGINX terminates TLS 1.3 using runtime-adaptive HTTP/2 syntax (`listen ... ssl http2 proxy_protocol;` on < 1.25.1; `listen ... ssl proxy_protocol; http2 on;` on >= 1.25.1), restores the real client IP via `real_ip_header proxy_protocol;`, and serves the multi-asset decoy website.
+- **THEN** Xray forwards the connection with PROXY protocol v1 (`dest: "127.0.0.1:9443", xver: 1`) to `127.0.0.1:9443`, where NGINX terminates TLS 1.3 using runtime-adaptive HTTP/2 syntax (`listen ... ssl http2 proxy_protocol;` on < 1.25.1; `listen ... ssl proxy_protocol; http2 on;` on >= 1.25.1), restores the real client IP via `real_ip_header proxy_protocol;`, serves the multi-asset decoy website, and logs the probe to a dedicated fallback security log (`/var/log/nginx/gowave-decoy-access.log`).
 
 ### Requirement: XHTTP Inbound Reverse Proxy
-The NGINX HTTPS listener at 7443 SHALL terminate TLS for `panel_domain` and reverse proxy configured XHTTP path prefixes to local Xray inbounds using HTTP/1.1 with buffering disabled.
+The NGINX HTTPS listener at 7443 SHALL terminate TLS for `panel_domain` and reverse proxy configured XHTTP path prefixes to local Xray inbounds using HTTP/1.1 with buffering disabled, passing the PROXY-restored client IP via HTTP headers.
 
 #### Scenario: Client XHTTP streaming session
 - **GIVEN** an authenticated client sending HTTP POST or GET requests to `https://<panel_domain>/<xhttp_path>/`
 - **WHEN** NGINX processes the request at 7443
-- **THEN** NGINX forwards the request to `http://127.0.0.1:10001` with `proxy_buffering off; proxy_request_buffering off; proxy_http_version 1.1;`, `access_log off;`, and `Cache-Control "no-store, no-transform"`.
+- **THEN** NGINX forwards the request to `http://127.0.0.1:10001` with `proxy_buffering off; proxy_request_buffering off; proxy_http_version 1.1;`, `access_log off;`, `proxy_set_header X-Real-IP $remote_addr;`, and `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`.
 
 ### Requirement: WebSocket and gRPC Inbound Proxying
-The NGINX HTTPS listener at 7443 SHALL proxy WebSocket and gRPC inbounds to designated loopback ports with protocol headers intact.
+The NGINX HTTPS listener at 7443 SHALL proxy WebSocket and gRPC inbounds to designated loopback ports with protocol headers and PROXY-restored client IP headers intact.
 
 #### Scenario: WebSocket inbound upgrade
 - **GIVEN** an incoming request to `https://<panel_domain>/<ws_path>` with `Upgrade: websocket` and `Connection: Upgrade`
 - **WHEN** NGINX evaluates the location block
-- **THEN** NGINX proxies the connection to `http://127.0.0.1:10002` with upgrade headers preserved.
+- **THEN** NGINX proxies the connection to `http://127.0.0.1:10002` with upgrade headers, `proxy_set_header X-Real-IP $remote_addr;`, and `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` preserved.
 
 #### Scenario: gRPC inbound pass-through
 - **GIVEN** an incoming HTTP/2 gRPC connection to the designated gRPC service path
