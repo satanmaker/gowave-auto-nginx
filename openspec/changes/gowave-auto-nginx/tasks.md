@@ -122,3 +122,17 @@
 - [x] 13.3 Implement GitHub Actions workflow `systemd-acceptance.yml` executing Suite `services` and Suite `systemd` QEMU tests across all 4 target OSs
 - [x] 13.4 Implement `tools/prepare_release.py` generating reproducible release archives with pinned commit SHAs and SHA256 checksum sidecars
 - [x] 13.5 Execute full end-to-end acceptance install, domain change, update with simulated crash, and backup/restore verification on a clean VM
+
+## 14. Static Audit P0/P1 Hardening Fixes
+
+- [x] 14.1 Implement genuine mutual TLS 1.3 cryptographic verification in `modules/verify_node_mtls.py` (`verify_node_mtls_health`), verifying X.509 CA, client certificate matching EC private key, RSA public key format, deriving upstream HKDF-SHA256 SNI (`rw-v1`), executing mTLS 1.3 client handshake against the node daemon, and querying `/node/xray/healthcheck` with fail-fast non-zero exit on any error (C-01)
+- [x] 14.2 Eliminate self-signed fallback certificates from production installation and domain change paths in `gowave-auto.sh` and `modules/nginx.sh`, implementing `verify_acme_certificate` (checking fullchain/privkey existence, >24h validity, key-cert match) and failing fast on ACME errors (C-02)
+- [x] 14.3 Implement safe entity rollback in `modules/api_client.py` distinguishing `created` (delete by UUID), `updated` (restore `before` state), and `adopted` (preserve without mutation), completely eliminating destructive global name-based scans (C-03)
+- [x] 14.4 Implement transactional SQLite restore in `assets/backup/gowave-backup.sh`: verify staged database `PRAGMA integrity_check` before modifying live files, suspend `gowave.service` to prevent dirty WAL, take pre-restore snapshot via `sqlite_online_backup`, atomically replace files via `.restoring` siblings, delete obsolete WAL/SHM, restore NGINX configs and Let's Encrypt certificates, enforce `0640 gowave:gowave`, and execute automated rollback on healthcheck failure (C-04)
+- [x] 14.5 Remove error suppressions (`|| true`) from worker deployment in `gowave-node-auto.sh`, enforce certificate verification, deploy hook setup, and active NGINX listener check (C-05)
+- [x] 14.6 Deploy automated Certbot renewal deploy hook `/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` testing config and reloading NGINX upon successful renewal (M-03)
+- [x] 14.7 Fix domain change variable scoping (`new_panel_domain` and `new_reality_domain`) in `gowave-auto.sh` (M-05)
+- [x] 14.8 Fix symlink validator in `assets/backup/gowave-backup.sh` to allow canonical relative symlinks within Certbot lineage (`../../archive/...`) matching allowlist and restore NGINX/Certbot files (M-06)
+- [x] 14.9 Add HTTP retry backoff (exponential delay on 429 and 5xx) and strict 404 user check in `modules/api_client.py` (M-08)
+- [x] 14.10 Enforce operation-to-state mapping schema validation (`OP_ALLOWED_STATES`) and timestamp verification in `modules/recovery.py` (M-09)
+- [x] 14.11 Add conditional IPv6 stream listener (`listen [::]:443`) in worker node NGINX configuration (M-17)

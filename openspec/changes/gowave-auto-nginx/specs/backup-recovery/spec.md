@@ -44,9 +44,9 @@ The restore subsystem SHALL inspect tarball headers using a dedicated Python pre
 - **THEN** the archive is rejected before extraction, and no host filesystem state is modified.
 
 #### Scenario: Rejection of symlinks escaping managed roots
-- **GIVEN** a crafted archive containing a symlink pointing outside designated managed roots
+- **GIVEN** an archive containing symbolic links
 - **WHEN** restore preflight validation is performed
-- **THEN** the validator flags the unsafe symlink target and halts extraction.
+- **THEN** relative symlinks resolving within the archive boundary (such as Certbot relative symlinks `../../archive/domain/fullchain1.pem` matching allowlist) are explicitly permitted, while absolute symlinks or relative symlinks escaping `files/` (e.g. `../../../../etc/shadow`) are strictly rejected before extraction.
 
 #### Scenario: Decompression bomb and device node protection
 - **GIVEN** an archive containing character/block devices, FIFOs, more than 5,000 files, or an unpacked size exceeding 1 GB
@@ -59,9 +59,9 @@ The restore subsystem SHALL inspect tarball headers using a dedicated Python pre
 - **THEN** the validator clears SUID/SGID bits (`04000`, `02000`) and enforces managed permissions on destination paths.
 
 ### Requirement: Persistent Pre-Restore Recovery Snapshotting
-The restore subsystem SHALL create a persistent recovery snapshot of current host state in `/var/lib/gowave-auto-nginx/recovery/restore-<timestamp>/` before modifying any files, tracking operations in `journal.json`.
+The restore subsystem SHALL create a persistent recovery snapshot of current host state in `/var/lib/gowave-auto-nginx/recovery/restore-<timestamp>/` before modifying any files, tracking operations in `journal.json` across states `PREPARED`, `APPLYING`, `VERIFYING`, `COMMITTED`, and rolling back upon verification failure.
 
-#### Scenario: Persistent recovery snapshot and automatic rollback
-- **GIVEN** a restore operation where archive extraction succeeds but GoWave Panel fails post-restore healthcheck
-- **WHEN** health verification times out after 30 seconds
-- **THEN** the restore subsystem automatically halts the failed services, restores files and service configurations from `/var/lib/gowave-auto-nginx/recovery/restore-<timestamp>/`, restarts original services, and reports the failure.
+#### Scenario: Transactional restore lifecycle and automatic rollback
+- **GIVEN** an archive passed to `gowave-backup.sh restore <archive>`
+- **WHEN** restore execution begins
+- **THEN** it validates archive integrity, runs `PRAGMA integrity_check` on the staged database before stopping services or modifying host files, stops `gowave.service` to prevent dirty WAL mutations, captures a pre-restore snapshot via `sqlite_online_backup`, transitions `journal.json` to `APPLYING`, atomically replaces files using temporary `.restoring` siblings and fsync, deletes obsolete WAL/SHM files, restores NGINX configs and Let's Encrypt certificates, sets permissions `0640 gowave:gowave`, transitions to `VERIFYING`, starts the service, and verifies health via HTTP probe; if health verification fails, it transitions to `ROLLBACK_REQUIRED`, restores files from the pre-restore snapshot, restarts the service, marks journal `ROLLED_BACK`, and exits non-zero.
