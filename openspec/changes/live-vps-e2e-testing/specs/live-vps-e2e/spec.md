@@ -96,6 +96,12 @@ command.
 - **WHEN** DNS preflight check is performed
 - **THEN** the runner terminates before connecting to any VPS and records the DNS mismatch in the report
 
+#### Scenario: Published AAAA is rejected when IPv6 testing is disabled
+
+- **GIVEN** any configured FQDN returns one or more AAAA records while ENABLE_IPV6=false
+- **WHEN** DNS preflight validates the complete A/AAAA/CNAME answers
+- **THEN** preflight rejects the configuration before remote mutation; the runner MUST NOT silently ignore IPv6 addresses because IPv6 traffic checks are disabled
+
 #### Scenario: Private or reserved IP rejected
 
 - **GIVEN** `MASTER_IP` or `WORKER_IP` is set to a loopback, RFC-1918 private, link-local, multicast,
