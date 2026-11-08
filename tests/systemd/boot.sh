@@ -71,11 +71,6 @@ boot_single_distro() {
         exit 2
     fi
 
-    if [[ -d /lib/modules ]]; then
-        mkdir -p "${work_dir}/root/usr/lib"
-        cp -a /lib/modules "${work_dir}/root/usr/lib/"
-    fi
-
     mkdir -p "${work_dir}/root/repo"
     cp -a "${REPO_DIR}/." "${work_dir}/root/repo/"
 
@@ -142,7 +137,7 @@ UNIT
     fi
 
     echo "Booting QEMU guest with kernel $kernel (accel: ${accel_args[*]})..."
-    timeout 15m qemu-system-x86_64 "${accel_args[@]}" -m 2048 -smp 2 -nodefaults \
+    timeout 15m qemu-system-x86_64 "${accel_args[@]}" -m 3072 -smp 2 -nodefaults \
         -no-reboot -display none -serial stdio -monitor none -nic none \
         -kernel "$kernel" -initrd "${work_dir}/rootfs.cpio.gz" \
         -append 'console=ttyS0 panic=1 quiet rdinit=/init systemd.show_status=false' \
