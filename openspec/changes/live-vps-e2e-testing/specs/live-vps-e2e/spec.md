@@ -469,15 +469,14 @@ SHALL be idempotent and scoped to resources proven to belong to the current test
 
 - **GIVEN** `TEST_DESTROY_VPS_ON_SUCCESS=true` and VPS were manually provisioned (not created by Provider Adapter)
 - **WHEN** the test run completes successfully
-- **THEN** the runner does NOT issue any destroy API call; it sets teardown status to `NOT_RUN` or logs that
+- **THEN** the runner does NOT issue any destroy API call; it sets teardown status to `NOT_RUN` and records that
   destruction of pre-existing VPS is prohibited
 
 #### Scenario: Preserve policy on failure
 
 - **GIVEN** `TEST_KEEP_VPS_ON_FAILURE=true` and the test run fails at any phase
 - **WHEN** teardown executes
-- **THEN** full diagnostics are collected, `result.json` is written with status `PARTIAL`, and the
-  VPS is not destroyed
+- **THEN** full diagnostics are collected, `result.json` retains the actual test outcome (`FAIL`, `INCOMPLETE`, or other applicable status), teardown is separately recorded as `PASS` for the completed PRESERVE action, and the VPS is not destroyed
 
 #### Scenario: Snapshot restore policy when snapshot absent
 
@@ -514,8 +513,7 @@ token, raw `shortUuid`, or subscription content containing private parameters.
 ### Requirement: Result Status Semantics
 
 The runner SHALL use exactly the status values: `PASS`, `FAIL`, `SKIP`, `NOT_RUN`, `PARTIAL`, `INCOMPLETE`,
-`TEARDOWN_FAILED`. `SKIP` and `NOT_RUN` SHALL NOT be treated as passing states. Overall `PASS` requires all
-mandatory phases completed, all eight Data Plane endpoints verified, and teardown matching the declared policy.
+`TEARDOWN_FAILED`. `SKIP` and `NOT_RUN` SHALL NOT be treated as passing states. Overall `PASS` requires all mandatory phases completed, all sixteen Data Plane runtime cases (eight logical endpoints × Xray and Mihomo) verified, and the declared teardown policy completed or explicitly satisfied. `PRESERVE` is a valid completed teardown policy; it does not mean the VPS was reset.
 `shortUuid` SHALL NOT appear in JUnit XML or any CI-published artifact.
 
 #### Scenario: PASS requires all sixteen Data Plane runtime cases
@@ -530,5 +528,4 @@ mandatory phases completed, all eight Data Plane endpoints verified, and teardow
 - **WHEN** `result.json` is written
 - **THEN** it contains: `test_run_id`, `repository_commit`, `started_at`, `finished_at`, `master` object
   (os, panel_version, node_version, xray_version, egress_ip), `worker` object (os, node_version,
-  xray_version, egress_ip), `results` object with all mandatory phase keys, `traffic` object with
-  master/worker sub-objects for each of four protocols, and `overall` status string
+  xray_version, egress_ip), `results` object with all mandatory phase keys, `traffic` object with master/worker sub-objects for each of four protocols and separate `xray`/`mihomo` case results per protocol, and `overall` status string
