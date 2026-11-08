@@ -281,7 +281,7 @@ To resolve the classic chicken-and-egg bootstrap deadlock while guaranteeing per
      -d "$REALITY_DOMAIN" --cert-name "$REALITY_DOMAIN" \
      --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring
    ```
-   Both certificate lineages (`/etc/letsencrypt/live/$PANEL_DOMAIN/` and `/etc/letsencrypt/live/$REALITY_DOMAIN/`) are validated with `openssl x509 -noout -ext subjectAltName` ensuring `fullchain.pem` and `privkey.pem` exist. Crucially, this ensures Certbot unconditionally stores `authenticator = webroot` in `/etc/letsencrypt/renewal/<domain>.conf`, preventing the renewal deadlocks inherent in standalone mode.
+   Both certificate lineages (`/etc/letsencrypt/live/$PANEL_DOMAIN/` and `/etc/letsencrypt/live/$REALITY_DOMAIN/`) are validated with `verify_acme_certificate` ensuring `fullchain.pem` and `privkey.pem` exist, match cryptographically, and have >24h validity. Self-signed fallback generation is strictly prohibited in the production path: any ACME issuance failure results in an immediate fail-fast termination before production vhosts are deployed. Crucially, this ensures Certbot unconditionally stores `authenticator = webroot` in `/etc/letsencrypt/renewal/<domain>.conf`, preventing the renewal deadlocks inherent in standalone mode.
 2. **Stage 2 (Production Configuration & Non-Conflicting Port 80 Redirects)**: Once both certificates exist on disk, the installer deploys production configurations:
    - NGINX Stream 443 with `proxy_timeout 1h; proxy_connect_timeout 5s; listen 443 so_keepalive=on;` (with conditional `listen [::]:443 so_keepalive=on;` included ONLY when `/proc/net/if_inet6` is present and active, omitting `[::]` if IPv6 is disabled in the kernel to prevent fatal `Address family not supported` socket errors) demultiplexing to `127.0.0.1:7443` and `127.0.0.1:8443`. Global NGINX tuning sets `worker_rlimit_nofile 65535; worker_connections 8192;`.
    - NGINX HTTP port 80 with selective redirect: preserves `location /.well-known/acme-challenge/ { root /var/www/gowave-acme; }`, redirects known domains to HTTPS (`return 301 https://$host$request_uri;`), and returns 444 for unmanaged hostnames/IP scanners.
@@ -549,7 +549,7 @@ To guarantee recovery resilience, administrative credentials (username, strong 2
   Environment="NODE_PORT=3002"
   ExecStartPost=/usr/bin/env bash -c 'for i in {1..30}; do if ss -Hltn "sport = :$node_port" 2>/dev/null | grep -q "$node_port" || (: < /dev/tcp/127.0.0.1/$node_port) 2>/dev/null; then exit 0; fi; sleep 0.5; done; exit 1'
   ```
-  This guarantees that the node daemon unconditionally binds to port 3002 on All-in-One deployments, and systemd fails closed if the TCP listener does not come online within 15 seconds. Note that reachability is verified strictly via kernel socket / TCP connect (`ss` and `/dev/tcp`) rather than HTTP/TLS requests (`curl -k`), because `gowave-node` runs with `SNI_VERIFICATION=true` and rejects any TLS handshake lacking dynamic HKDF-derived SNI with `http: TLS handshake error: unknown sni`.
+  This guarantees that the node daemon unconditionally binds to port 3002 on All-in-One deployments, and systemd fails closed if the TCP listener does not come online within 15 seconds. Note that systemd drop-in reachability is verified via kernel socket / TCP connect (`ss` and `/dev/tcp`) rather than unauthenticated HTTP/TLS requests (`curl -k`), because `gowave-node` runs with `SNI_VERIFICATION=true` and rejects any TLS handshake lacking dynamic HKDF-derived SNI with `http: TLS handshake error: unknown sni`. Furthermore, comprehensive mutual TLS 1.3 health verification is executed via `modules/verify_node_mtls.py` (`verify_node_mtls_health`), validating the X.509 client certificate and EC private key match, deriving upstream HKDF-SHA256 SNI (`rw-v1`), performing a full client mTLS 1.3 handshake, and querying `/node/xray/healthcheck`.
 
 #### Remote Worker SSH Stdin Pipeline Orchestration (`remote_payload`)
 To deploy remote worker nodes over SSH without depending on `scp`, creating messy file transfers, or leaving orphaned scripts or credentials on target machines:
@@ -702,7 +702,7 @@ GoWave Auto NGINX implements a dedicated subcommand `gowave-auto.sh channel [sta
    - Retain the last 3 recovery snapshots (enforcing a 5 GB maximum storage ceiling), pruning older snapshots safely.
 
 #### Journal Schema Validation & Integrity Guard
-Prior to executing any recovery action, `gowave-auto.sh recover` performs strict schema and structural validation of `/var/lib/gowave-auto-nginx/recovery/journal.json` (verifying required fields: `op`, `state`, `timestamp`, and expected entity arrays).
+Prior to executing any recovery action, `gowave-auto.sh recover` performs strict schema and structural validation of `/var/lib/gowave-auto-nginx/recovery/journal.json` (verifying required fields: `op`, `state`, `timestamp`, mapping `state` strictly to `OP_ALLOWED_STATES[op]`, and validating timestamp format).
 - If `journal.json` is corrupted, truncated, or structurally invalid:
   1. The recovery unit immediately aborts without executing destructive rollbacks, logging a critical alert: `CRITICAL: journal.json validation failed; aborting automated rollback`.
   2. It performs a non-destructive read-only consistency audit via Panel API (`GET /api/nodes`, `GET /api/config-profiles`, `GET /api/hosts`) against `/var/lib/gowave-auto-nginx/state.json`.
@@ -758,13 +758,11 @@ To eliminate dirty partial setups and guarantee complete atomicity during initia
    - `PROVISION_ROLLBACK_REQUIRED`: Any step failed or verification timed out.
    - `PROVISION_ROLLED_BACK`: Cleanup completed, system reverted to clean state.
 2. **Deterministic Initial Provisioning Rollback Actions on Failure**:
-   If an error occurs or verification fails during initial panel provisioning, the orchestrator parses the recorded UUIDs from `state.json.tmp` and executes deletion in strict reverse order:
-   - If API Token was created: `DELETE /api/tokens/{id}`
-   - If User was created: `DELETE /api/users/{uuid}`
-   - If Hosts were created: `DELETE /api/hosts/{uuid}` for each provisioned host
-   - If Squad was created: `DELETE /api/internal-squads/{uuid}`
-   - If Node was created: `DELETE /api/nodes/{uuid}`
-   - If Config Profile was created: `DELETE /api/config-profiles/{uuid}`
+   If an error occurs or verification fails during initial panel provisioning, the orchestrator parses the recorded entities from `journal.json` and distinguishes resource action:
+   - For `created`: deletes only the resources created in this transaction by UUID (`DELETE /api/tokens/{id}`, `DELETE /api/users/{uuid}`, `DELETE /api/hosts/{uuid}`, `DELETE /api/internal-squads/{uuid}`, `DELETE /api/nodes/{uuid}`, `DELETE /api/config-profiles/{uuid}`).
+   - For `updated`: restores pre-transaction state (`before`).
+   - For `adopted`: preserves existing entities untouched.
+   - Destructive global scans by name are strictly eliminated.
    - Remove temporary files, update journal state to `PROVISION_ROLLED_BACK`, and halt with exit code 1.
 
 #### Dedicated Worker Node Addition Transaction & Isolated Rollback
@@ -912,7 +910,7 @@ Before extracting any archive, a dedicated Python validator inspects all tar mem
    - Node (`--type node`): strictly restricted to `opt/gowave-node/.env`.
    - Explicitly rejects: `etc/letsencrypt/renewal-hooks/`, `etc/nginx/modules-enabled/`, `etc/systemd/system/gowave-node.service.d/`, any shell scripts (`*.sh`), shared objects (`*.so`), and executable binaries (`opt/gowave/gowave-server`, `opt/gowave-node/*`). Binaries are NEVER restored from archives (they are freshly downloaded and verified via upstream `SHA256SUMS`). Unmanaged locations (`etc/cron.d/`, `etc/systemd/system/*.service`, `root/.ssh/`, `bin/`) are rejected with fatal error.
 4. Clears SUID, SGID, and executable sticky bits (`04000`, `02000`, `01000`) on all extracted files; ignores tar header owner/group attributes and applies target restore permission policy.
-5. Rejects symbolic links pointing outside designated managed roots.
+5. Validates symbolic links: permits relative symbolic links whose normalized path resolves within the archive root hierarchy (`files/etc/letsencrypt`) and matches the allowlist (such as Certbot `../../archive/<domain>/fullchain1.pem`); strictly rejects absolute symlinks or relative symlinks escaping `files/`.
 6. Rejects hard links pointing to non-regular files.
 7. Rejects FIFO, socket, block, or character device nodes.
 8. Rejects archives with member counts exceeding 5,000 files.
@@ -923,6 +921,17 @@ Before extracting any archive, a dedicated Python validator inspects all tar mem
 13. Restricts extraction strictly to a private staging directory (`mode 0700`).
 14. Restores files atomically using temporary siblings and renames.
 15. Displays prominent security warning: archives contain unencrypted master CA, JWT signing keys, and TLS certificates.
+
+#### Transactional Restore Execution Lifecycle
+The restore process in `gowave-backup.sh restore` executes an 8-stage transactional lifecycle with automated crash recovery:
+1. **Pre-extraction 15-Point Preflight**: Extract to private temporary staging directory (`mode 0700`).
+2. **Preflight Staged Database Integrity Check**: Verifies `PRAGMA integrity_check` on staged `gowave.db` before stopping any running services or touching live files. Corrupted archives are rejected immediately.
+3. **Pre-Restore Snapshot & Service Suspension**: Stops `gowave.service` to prevent active SQLite WAL transactions, captures consistent pre-restore snapshot via `sqlite_online_backup`, and snapshots `.env` and `state.json`.
+4. **Journal Initialized to PREPARED**: Recovery journal records `{"op": "restore", "state": "PREPARED", "snapshot_dir": "..."}`.
+5. **Atomic File Replacement (APPLYING)**: Restores `gowave.db`, `.env`, and `state.json` via `.restoring` temporary files with `fsync`, clears obsolete WAL/SHM, restores NGINX configs and Let's Encrypt certificates, and enforces ownership `gowave:gowave` and mode `0640`.
+6. **Service Start & Verification (VERIFYING)**: Starts `gowave.service` and executes HTTP health probe against `/api/system/health`.
+7. **Automated Rollback on Failure**: If service fails to start or healthcheck fails, journal transitions to `ROLLBACK_REQUIRED`, previous snapshot files are restored, `gowave.service` is restarted, journal is marked `ROLLED_BACK`, and restore exits non-zero.
+8. **Commit (COMMITTED)**: Upon verified health, journal is marked `COMMITTED` and old snapshots are pruned.
 
 ### Decision 9: Local Multi-Distribution Podman Testbed (Pre-Deployment VPS Gate)
 

@@ -73,6 +73,11 @@ All panel-to-node management communication SHALL use TLS 1.3 with mutual certifi
 - **WHEN** the GoWave Panel issues an authenticated GET request to `/node/xray/node-health-check` using HKDF-derived SNI and a valid client certificate signed by the panel CA
 - **THEN** the node accepts the connection and returns HTTP 200 with Xray core status and inbound statistics.
 
+#### Scenario: Cryptographic verification of node mTLS payload and health check handshake
+- **GIVEN** a base64-encoded mTLS payload (`SECRET_KEY`) streamed via standard input containing `caCertPem`, `jwtPublicKey`, `nodeCertPem`, and `nodeKeyPem`
+- **WHEN** node health verification executes via `verify_node_mtls_health`
+- **THEN** it validates JSON structure, confirms the client certificate matches the EC private key, validates X.509 CA certificate, verifies RSA public key format, computes the exact upstream HKDF-SHA256 SNI (`rw-v1`, salt=32 zeros, okm 22 bytes), performs a mutual TLS 1.3 client handshake against the node daemon, queries `/node/xray/healthcheck`, and halts with a non-zero exit code on any cryptographic, handshake, or HTTP failure.
+
 #### Scenario: Reject mismatched SNI or unauthorized client certificate
 - **GIVEN** a running GoWave Node with `SNI_VERIFICATION=true`
 - **WHEN** a client connects with an invalid certificate or an SNI hostname differing from the HKDF derivation

@@ -69,17 +69,17 @@ The update module SHALL execute SQLite Online Backup, capture a persistent snaps
 #### Scenario: Initial provisioning failure rollback
 - **GIVEN** an initial installation where provisioning fails midway while creating Host records or binding nodes
 - **WHEN** the orchestrator detects an unhandled error or verification failure
-- **THEN** it reads the partial entity UUIDs recorded in `state.json.tmp`, invokes deletion APIs in strict reverse order (`DELETE /api/tokens`, `DELETE /api/users`, `DELETE /api/hosts`, `DELETE /api/internal-squads`, `DELETE /api/nodes`, `DELETE /api/config-profiles`), marks `journal.json` state as `PROVISION_ROLLED_BACK`, and leaves the system in a clean, re-runnable state.
+- **THEN** it reads the partial entity records from `journal.json`, deletes ONLY resources created in this transaction (`"action": "created"`), restores prior states for updated resources (`"action": "updated"`), preserves existing resources adopted during idempotent reconciliation (`"action": "adopted"`), avoids global name-based deletions, marks `journal.json` state as `PROVISION_ROLLED_BACK`, and leaves the system in a clean, re-runnable state.
 
 #### Scenario: Worker node addition failure rollback
 - **GIVEN** an active panel where `gowave-auto.sh node add` fails during edge deployment or verification
 - **WHEN** the orchestrator triggers worker rollback
-- **THEN** it deletes worker hosts (`DELETE /api/hosts/{uuid}`), disassociates worker inbounds via `PATCH /api/internal-squads/{uuid}`, and deletes worker node and worker config profile, strictly preserving central panel users, tokens, and squads.
+- **THEN** it deletes worker hosts (`DELETE /api/hosts/{uuid}`), disassociates worker inbounds via `PATCH /api/internal-squads` with the remaining inbound union array, deletes worker node and worker config profile by explicit UUID, prunes the worker entry from `state.json`, and strictly preserves central panel users, tokens, and squads.
 
 #### Scenario: Corrupted journal validation before recovery
 - **GIVEN** an uncommitted transaction where `journal.json` is truncated, corrupted, or violates schema
 - **WHEN** `gowave-auto.sh recover` executes
-- **THEN** it aborts without deleting entities, logs a fatal schema error, performs a read-only API consistency audit, and requires manual operator confirmation before modifying state.
+- **THEN** it validates that `op` is supported, `state` belongs strictly to `OP_ALLOWED_STATES[op]`, and timestamps are valid; if validation fails, it aborts without deleting entities, logs a fatal schema error, and requires manual operator confirmation before modifying state.
 
 ### Requirement: Recovery Snapshot Retention Ceiling
 The lifecycle manager SHALL enforce a retention policy keeping the last 3 recovery snapshots and capping total snapshot storage at 5 GB, forbidding deletion of snapshots for active in-flight transactions.
@@ -90,7 +90,7 @@ The lifecycle manager SHALL enforce a retention policy keeping the last 3 recove
 - **THEN** the oldest snapshot is safely removed, keeping exactly 3 snapshots, and free disk space is verified.
 
 ### Requirement: Atomic Domain Reconfiguration with Rollback
-The manager SHALL support changing the panel domain or REALITY domain with DNS preflight validation, rolling back cleanly if certificate issuance fails.
+The manager SHALL support changing the panel domain or REALITY domain with DNS preflight validation, proper variable scoping (`new_panel_domain` and `new_reality_domain`), rolling back cleanly if certificate issuance fails.
 
 #### Scenario: Failed domain change rollback
 - **GIVEN** an operator requesting a domain change to `new.example.com`

@@ -80,7 +80,7 @@ The NGINX HTTPS listener at 7443 SHALL proxy WebSocket and gRPC inbounds to desi
 The routing subsystem SHALL bind port 443 (Stream) and port 80 (HTTP) on IPv6 only after confirming an active global IPv6 address and default route on the host.
 
 #### Scenario: Dual-stack binding on confirmed IPv6 host
-- **GIVEN** a host with a global unicast IPv6 address and default IPv6 route (`ip -6 route show default`)
+- **GIVEN** a host (central panel or edge worker) with a global unicast IPv6 address and default IPv6 route (`ip -6 route show default`)
 - **WHEN** NGINX configuration is generated
 - **THEN** listeners include both `listen 443;` and `listen [::]:443;` in stream, and `listen 80;` and `listen [::]:80;` in HTTP block.
 
@@ -96,3 +96,13 @@ The installer SHALL resolve the initial TLS bootstrap deadlock using a 3-stage s
 - **GIVEN** a clean host without pre-existing Let's Encrypt certificates
 - **WHEN** the installer initiates TLS provisioning
 - **THEN** it deploys temporary port 80 webroot vhost `/var/www/gowave-acme` (binding `[::]:80` conditionally only when host IPv6 is active), starts NGINX, issues certificates via `certbot certonly --webroot` for both `PANEL_DOMAIN` and `REALITY_DOMAIN`, deploys production Stream and HTTPS configurations referencing both certificates, verifies `certbot renew --dry-run` succeeds with NGINX online, and drops scanner traffic on unmanaged domains.
+
+#### Scenario: Prohibition of self-signed fallback certificates and fail-fast validation
+- **GIVEN** an installer or domain-change process issuing certificates via Certbot ACME
+- **WHEN** certificate issuance fails or produces an error
+- **THEN** the process halts immediately with exit code 1 (fail-fast), strictly prohibiting self-signed fallback generation in production, and verifies certificate existence, validity exceeding 24 hours, and private-public key consistency via `verify_acme_certificate` before deploying production virtual hosts.
+
+#### Scenario: Automated Certbot renewal deploy hook
+- **GIVEN** an active installation with deployed Let's Encrypt certificates
+- **WHEN** background ACME renewal succeeds via `certbot.timer`
+- **THEN** deployment hook `/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` executes `nginx -t -q` and reloads NGINX (`nginx -s reload`) without manual intervention.
