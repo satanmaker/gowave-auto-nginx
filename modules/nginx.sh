@@ -174,9 +174,13 @@ verify_acme_certificate() {
         return 1
     fi
 
-    # Check certificate validity (at least 24 hours remaining)
+    # Check certificate validity, hostname/SAN and remaining lifetime.
     if ! openssl x509 -checkend 86400 -noout -in "$fullchain" >/dev/null 2>&1; then
         echo "Error: Certificate $fullchain is expired or not valid within 24 hours" >&2
+        return 1
+    fi
+    if ! openssl x509 -checkhost "$domain" -noout -in "$fullchain" >/dev/null 2>&1; then
+        echo "Error: Certificate SAN/CN does not cover $domain." >&2
         return 1
     fi
 

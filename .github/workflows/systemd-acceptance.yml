@@ -1,10 +1,10 @@
-name: Systemd Acceptance and Services
+name: Systemd Contract Checks and Services
 
 on:
   push:
     branches: [main, "feature/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "feature/**"]
   workflow_dispatch:
 
 permissions:
@@ -32,15 +32,9 @@ jobs:
           python3 tests/run_ci.py --suite services
 
   systemd-qemu-acceptance:
-    name: Systemd Acceptance Matrix
+    name: Systemd Contract Suite (no VM boot)
     runs-on: ubuntu-24.04
     timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        distro:
-          - ubuntu-24.04
-          - debian-12
     steps:
       - uses: actions/checkout@v4
 
@@ -49,11 +43,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install QEMU and dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 cpio gzip
-
-      - name: Run Systemd Suite
+      - name: Run systemd contract tests (not a cold-boot acceptance test)
         run: |
           sudo python3 tests/run_ci.py --suite systemd

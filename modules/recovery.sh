@@ -23,8 +23,8 @@ take_preflight_db_snapshot() {
     mkdir -p "$target_snapshot_dir"
     chmod 0700 "$target_snapshot_dir" 2>/dev/null || true
 
-    echo "Executing transactional SQLite Online Backup..."
-    python3 -c "
+    echo "Executing transactional SQLite Online Backup..." >&2
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
 import sys
 for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
     if p not in sys.path:
@@ -32,7 +32,7 @@ for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
 from modules.recovery import sqlite_online_backup
 sqlite_online_backup('$db_path', '$target_snapshot_dir/gowave.db')
 "
-    echo "Database snapshot saved to $target_snapshot_dir/gowave.db."
+    echo "Database snapshot saved to $target_snapshot_dir/gowave.db." >&2
 }
 
 prepare_update_snapshot() {
@@ -45,10 +45,10 @@ prepare_update_snapshot() {
     mkdir -p "$snap_dir"
     chmod 0700 "$snap_dir" 2>/dev/null || true
 
-    echo "Capturing pre-update persistent recovery snapshot in $snap_dir..."
+    echo "Capturing pre-update persistent recovery snapshot in $snap_dir..." >&2
 
     # 1. Database snapshot
-    take_preflight_db_snapshot "$snap_dir" "$GOWAVE_DIR/gowave.db"
+    take_preflight_db_snapshot "$snap_dir" "$GOWAVE_DIR/gowave.db" >&2
 
     # 2. Copy current binaries and configuration
     if [[ -f "$GOWAVE_DIR/.env" ]]; then
@@ -58,7 +58,22 @@ prepare_update_snapshot() {
         cp "$GOWAVE_DIR/gowave-server" "$snap_dir/gowave-server"
     fi
     if [[ -d "$GOWAVE_DIR/frontend" ]]; then
-        cp -r "$GOWAVE_DIR/frontend" "$snap_dir/frontend"
+        cp -a "$GOWAVE_DIR/frontend" "$snap_dir/frontend"
+    fi
+
+    # Domain/channel operations also mutate NGINX and ACME state.
+    if [[ "$(id -u)" -eq 0 ]]; then
+        if [[ -d /etc/nginx ]]; then
+            mkdir -p "$snap_dir/etc"
+            cp -a /etc/nginx "$snap_dir/etc/nginx"
+        fi
+        if [[ -d /etc/letsencrypt ]]; then
+            mkdir -p "$snap_dir/etc"
+            cp -a /etc/letsencrypt "$snap_dir/etc/letsencrypt"
+        fi
+    fi
+    if [[ -f "$STATE_FILE" ]]; then
+        cp -p "$STATE_FILE" "$snap_dir/state.json"
     fi
 
     # 3. Write durable state journal
@@ -78,38 +93,65 @@ data = {
 }
 write_journal_atomically('$JOURNAL_FILE', data)
 "
-    echo "Recovery snapshot and PREPARED journal written."
+    echo "Recovery snapshot and PREPARED journal written." >&2
     echo "$snap_dir"
 }
 
 execute_file_rollback() {
     local snap_dir="$1"
-    echo "Rolling back GoWave files from snapshot $snap_dir..."
+    echo "Rolling back GoWave files from snapshot $snap_dir..." >&2
+    [[ -d "$snap_dir" ]] || { echo "Recovery snapshot does not exist: $snap_dir" >&2; return 1; }
 
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
-        systemctl stop --no-ask-password gowave.service || true
+        systemctl stop --no-ask-password gowave.service
     fi
 
     if [[ -f "$snap_dir/gowave.db" ]]; then
-        cp "$snap_dir/gowave.db" "$GOWAVE_DIR/gowave.db"
+        local db_tmp="$GOWAVE_DIR/.gowave.db.rollback"
+        cp -p "$snap_dir/gowave.db" "$db_tmp"
+        chmod 0640 "$db_tmp"
+        if id -u gowave >/dev/null 2>&1; then
+            chown gowave:gowave "$db_tmp"
+        fi
         rm -f "$GOWAVE_DIR/gowave.db-wal" "$GOWAVE_DIR/gowave.db-shm"
+        mv -f "$db_tmp" "$GOWAVE_DIR/gowave.db"
     fi
     if [[ -f "$snap_dir/.env" ]]; then
-        cp "$snap_dir/.env" "$GOWAVE_DIR/.env"
+        install -m 0640 "$snap_dir/.env" "$GOWAVE_DIR/.env"
+        if id -u gowave >/dev/null 2>&1; then chown root:gowave "$GOWAVE_DIR/.env"; fi
     fi
     if [[ -f "$snap_dir/gowave-server" ]]; then
-        cp "$snap_dir/gowave-server" "$GOWAVE_DIR/gowave-server"
-        chmod 0755 "$GOWAVE_DIR/gowave-server"
+        install -m 0755 "$snap_dir/gowave-server" "$GOWAVE_DIR/gowave-server"
     fi
     if [[ -d "$snap_dir/frontend" ]]; then
         rm -rf "$GOWAVE_DIR/frontend"
-        cp -r "$snap_dir/frontend" "$GOWAVE_DIR/frontend"
+        cp -a "$snap_dir/frontend" "$GOWAVE_DIR/frontend"
+    fi
+    if [[ -f "$snap_dir/state.json" ]]; then
+        install -m 0600 "$snap_dir/state.json" "$STATE_FILE"
+    fi
+
+    if [[ -d "$snap_dir/etc/nginx" ]]; then
+        [[ "$(id -u)" -eq 0 ]] || { echo "Root is required to restore NGINX configuration." >&2; return 1; }
+        cp -a "$snap_dir/etc/nginx/." /etc/nginx/
+        nginx -t
+    fi
+    if [[ -d "$snap_dir/etc/letsencrypt" ]]; then
+        [[ "$(id -u)" -eq 0 ]] || { echo "Root is required to restore ACME certificates." >&2; return 1; }
+        mkdir -p /etc/letsencrypt
+        cp -a "$snap_dir/etc/letsencrypt/." /etc/letsencrypt/
     fi
 
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
-        systemctl restart --no-ask-password gowave.service || true
+        systemctl restart --no-ask-password gowave.service
+        systemctl is-active --quiet gowave.service
+        if command -v nginx >/dev/null 2>&1 && [[ -d "$snap_dir/etc/nginx" ]]; then
+            nginx -t
+            systemctl reload nginx
+            systemctl is-active --quiet nginx
+        fi
     fi
-    echo "File rollback completed."
+    echo "File rollback completed and services verified." >&2
 }
 
 recover_boot_files() {
@@ -131,20 +173,32 @@ recover_boot_files() {
 
     if [[ "$state" == "APPLYING" || "$state" == "VERIFYING" || "$state" == "ROLLBACK_REQUIRED" ]]; then
         echo "Detected interrupted update/restore in state $state. Performing file rollback..."
-        if [[ -d "$snap_dir" ]]; then
-            execute_file_rollback "$snap_dir"
-            python3 -c "
-import json, sys
-for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+        if ! python3 - "$snap_dir" "$RECOVERY_DIR" <<'PY'
+import sys
+from pathlib import Path
+snapshot = Path(sys.argv[1]).resolve()
+root = Path(sys.argv[2]).resolve()
+if snapshot == root or root not in snapshot.parents:
+    raise SystemExit("snapshot path is not a child of RECOVERY_DIR")
+PY
+        then
+            echo "CRITICAL: snapshot path is outside RECOVERY_DIR; refusing rollback." >&2
+            return 1
+        fi
+        if [[ -z "$snap_dir" || ! -d "$snap_dir" ]]; then
+            echo "CRITICAL: recovery snapshot is missing; refusing to report successful recovery." >&2
+            return 1
+        fi
+        execute_file_rollback "$snap_dir"
+        PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+import json, sys, time
 from modules.recovery import write_journal_atomically
 data = json.load(open('$JOURNAL_FILE'))
 data['state'] = 'ROLLED_BACK'
+data['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 write_journal_atomically('$JOURNAL_FILE', data)
 "
-            echo "Interrupted transaction rolled back successfully."
-        fi
+        echo "Interrupted transaction rolled back successfully."
     fi
 }
 
@@ -153,8 +207,13 @@ recover_boot_provision() {
         return 0
     fi
 
+    if ! python3 "$RECOVERY_PY" --validate-journal "$JOURNAL_FILE"; then
+        echo "CRITICAL: provisioning journal is invalid; refusing API rollback." >&2
+        return 1
+    fi
+
     local state
-    state=$(python3 -c "import json; print(json.load(open('$JOURNAL_FILE')).get('state', ''))" 2>/dev/null || echo "")
+    state=$(python3 -c "import json; print(json.load(open('$JOURNAL_FILE')).get('state', ''))")
 
     if [[ "$state" =~ ^PROVISION_ || "$state" =~ ^NODE_ADD_ ]]; then
         if [[ "$state" != "PROVISION_COMMITTED" && "$state" != "NODE_ADD_COMMITTED" && "$state" != "PROVISION_ROLLED_BACK" && "$state" != "NODE_ADD_ROLLED_BACK" ]]; then
@@ -168,14 +227,15 @@ recover_boot_provision() {
             done
 
             echo "Cleaning up partial API entities in reverse order..."
-            python3 -c "
-import sys
-for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+            if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
 from modules.api_client import rollback_provisioning
-rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE')
-"
+import sys
+ok = rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE')
+sys.exit(0 if ok else 1)
+"; then
+                echo "CRITICAL: API rollback incomplete; journal remains in ROLLBACK_REQUIRED state." >&2
+                return 1
+            fi
             echo "API cleanup completed."
         fi
     fi
@@ -211,13 +271,29 @@ switch_channel() {
     local snap_dir
     snap_dir=$(prepare_update_snapshot "$target_channel")
 
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$JOURNAL_FILE" "APPLYING" <<'PY'
+import json, sys, time
+from modules.recovery import write_journal_atomically
+p=sys.argv[1]; d=json.load(open(p)); d["state"]=sys.argv[2]
+d["timestamp"]=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+write_journal_atomically(p,d)
+PY
     echo "Updating channel to $target_channel in $env_file..."
     sed -i "s/^GOWAVE_CHANNEL=.*/GOWAVE_CHANNEL=$target_channel/" "$env_file"
 
     # Restart and verify health
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
-        systemctl restart --no-ask-password gowave.service || true
+        systemctl restart --no-ask-password gowave.service
+        systemctl is-active --quiet gowave.service
     fi
+
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$JOURNAL_FILE" "VERIFYING" <<'PY'
+import json, sys, time
+from modules.recovery import write_journal_atomically
+p=sys.argv[1]; d=json.load(open(p)); d["state"]=sys.argv[2]
+d["timestamp"]=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+write_journal_atomically(p,d)
+PY
 
     local healthy=false
     for i in {1..15}; do
@@ -232,17 +308,22 @@ switch_channel() {
     if [[ "$healthy" != "true" ]]; then
         echo "Healthcheck failed after channel switch! Initiating rollback..." >&2
         execute_file_rollback "$snap_dir"
+        PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$JOURNAL_FILE" <<'PY'
+import json, sys, time
+from modules.recovery import write_journal_atomically
+p=sys.argv[1]; d=json.load(open(p)); d["state"]="ROLLED_BACK"
+d["timestamp"]=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+write_journal_atomically(p,d)
+PY
         return 1
     fi
 
-    python3 -c "
-import json, sys
-for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
-    if p not in sys.path:
-        sys.path.insert(0, p)
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+import json, sys, time
 from modules.recovery import write_journal_atomically, prune_snapshots
 data = json.load(open('$JOURNAL_FILE'))
 data['state'] = 'COMMITTED'
+data['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 write_journal_atomically('$JOURNAL_FILE', data)
 prune_snapshots('$RECOVERY_DIR')
 "
