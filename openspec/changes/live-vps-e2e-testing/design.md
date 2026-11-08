@@ -193,18 +193,20 @@ unreliable results. The lock is released on process exit (normal or signal).
 
 ### D9: ACME Staging CA Trust Management on Control Machine
 
-**Chosen:** When `ACME_MODE=staging`, the runner manages trust for Let's Encrypt Staging CA chains without
+**Chosen:** When `ACME_MODE=staging`, the runner creates one per-run CA bundle without
 mutating system-wide `/etc/ssl/certs` on the Control Machine:
-1. `tools/live_vps/tls.py` uses a repository-reviewed staging CA bundle or downloads certificates only from
-   an explicitly allowlisted official source and verifies pinned SHA256 fingerprints before use. The bundle
-   identifies the applicable Let's Encrypt Staging Root/Intermediate certificates; certificate names alone
-   are not accepted as a trust anchor.
-2. For Python Panel API calls (`panel_api.py`), the staging CA is loaded into a dedicated `ssl.create_default_context(cafile=...)`.
-3. For curl calls, `--cacert <staging-ca-path>` is passed.
-4. Xray and Mihomo are Go-based clients. Build a per-run CA bundle containing the Control Machine's
-   existing public roots plus the pinned Staging CA chain, then set `SSL_CERT_FILE=<bundle>` only in each
-   client process environment. Verify this behavior against the exact pinned client binaries before use;
-   never set `allowInsecure`, `skip-cert-verify`, or any equivalent verification bypass.
+1. `tools/live_vps/tls.py` starts from the Control Machine's complete default public CA bundle, appends the
+   applicable Let's Encrypt Staging Root/Intermediate certificates, and verifies pinned SHA256 fingerprints
+   for every staging certificate before use. Certificate names alone are not accepted as trust anchors. If the
+   complete public-root bundle cannot be located or read, preflight fails; a staging-only bundle is forbidden.
+2. Python Panel API calls use `ssl.create_default_context(cafile=<combined-bundle>)`.
+3. Every curl call that performs TLS verification (including the HTTPS egress probe to a public site) passes
+   `--cacert <combined-bundle>`; this preserves trust in ordinary public CAs as well as the staging chain.
+4. Xray and Mihomo child processes receive `SSL_CERT_FILE=<combined-bundle>` in their process environment.
+   Verify this behavior against the exact pinned client binaries before use; never set `allowInsecure`,
+   `skip-cert-verify`, or any equivalent verification bypass.
+5. The bundle is private to the run directory, mode `0600`, and removed during local cleanup. It contains
+   public certificates only and does not modify the host trust store.
 
 **Rationale:** In staging mode, standard HTTPS requests to the Panel and TLS proxy tunnels fail with
 `certificate verify failed` if the staging CA is not explicitly trusted by the client. This scoped approach
@@ -215,16 +217,21 @@ allows strict verification without polluting the host machine's root store.
 ### D10: Process argv Observation During Worker Registration
 
 **Chosen:** Do not use periodic `/proc/*/cmdline` sampling or a Bash DEBUG trap as proof: both can miss
-short-lived processes, and shell tracing can itself disclose expanded secrets. For the acceptance test,
-run the exact `gowave-auto.sh node add` invocation under a local `strace -f -s 0 -e trace=execve` observer
-on Master (or an equivalent kernel-level exec event collector with documented completeness). The explicit
-`-s 0` disables strace's default 32-byte string limit so long argv values are not silently truncated. Write raw
-observer output to an ephemeral mode-0600 file, never stream it to the Control Machine, scan it locally for the
-exact `SECRET_KEY` value and known encoded forms, then securely remove it. Verify the trace is complete: strace
-must exit successfully, all descendants must remain traced, and no truncated/unfinished execve records or
-observer errors may be present. The report stores only `PASS`/`FAIL`, observer version, coverage limitations
-and timestamps. If the observer is unavailable, cannot attach to all child processes, or its output is
-truncated/incomplete, record `INCOMPLETE`; do not infer PASS from absence in a sampled process list.
+short-lived processes, and shell tracing can itself disclose expanded secrets. On Master, derive a positive
+string-print limit as `STRACE_STRING_LIMIT = 32 * os.sysconf("SC_PAGE_SIZE")`. Linux limits each individual
+`execve` argument/environment string to 32 pages, including its terminating NUL; a positive strace limit at
+that bound is therefore sufficient to print every legal individual argv string. Do not use `-s 0`: strace
+interprets zero as a zero-character limit, not unlimited output. Run the exact `gowave-auto.sh node add`
+process tree under `strace -f -s "$STRACE_STRING_LIMIT" -e trace=execve,execveat` (or an equivalent
+kernel-level observer that captures both syscall forms with the same completeness guarantee). If page size
+cannot be determined, the computed limit is invalid, or the installed strace cannot accept it, record
+`INCOMPLETE` and do not run a weaker observer as a fallback. Write raw output to an ephemeral mode-0600 file,
+never stream it to the Control Machine, parse the strace-quoted argv including escaped bytes, scan locally for
+the exact `SECRET_KEY` and known encoded forms, then securely remove the raw trace. The observer must exit
+successfully, follow all descendants, and contain no truncated or unfinished exec records or observer errors.
+The acceptance test MUST place a sentinel secret after byte 32 in arguments passed through both `execve` and
+`execveat`, then prove both complete values are present in the trace. The report stores only `PASS`/`FAIL`,
+observer version, effective string limit, coverage limitations and timestamps.
 
 **Rationale:** Process polling is inherently racy. A kernel-level exec observer gives a bounded observation
 of process creation. The raw trace contains sensitive argv and therefore must never become a normal diagnostic
@@ -234,16 +241,29 @@ artifact. This verifies argv only; it does not prove absence from process enviro
 
 ### D11: Operational Lifecycle and Disposable Baseline Policy in v1
 
-**Chosen:** v1 accepts only operator-provisioned disposable VPS instances; it has no cloud provider adapter.
-The runner accepts one mutually exclusive `TEST_TEARDOWN_POLICY` value: `PRESERVE` (default) or
-`RESTORE_SNAPSHOT`. Boolean policy combinations are not accepted. `PRESERVE` leaves both VPS running and
-retains diagnostics after both successful and failed runs; no uninstall is implied. `RESTORE_SNAPSHOT` is
-allowed only when an externally managed snapshot identifier and restore procedure are supplied and independently
-verified; otherwise teardown is `NOT_RUN`. `DESTROY` is invalid and rejected during preflight in v1 because
-all VPS are operator-provisioned and no Provider Adapter/ownership record exists. The runner does not claim
-that project uninstall restores OS packages, UFW, sysctl, swap/fstab, certificates or unrelated host state.
-A clean baseline gate is mandatory before installation. After `PRESERVE`, the next run requires operator
-re-image or a separately verified restore; running `gowave-auto.sh uninstall` is not an acceptable reset.
+**Chosen:** v1 accepts only operator-provisioned disposable VPS instances and has no built-in cloud
+provider adapter. The runner accepts one mutually exclusive `TEST_TEARDOWN_POLICY` value: `PRESERVE`
+(default) or `RESTORE_SNAPSHOT`; `DESTROY` is rejected during preflight before any remote modification.
+`PRESERVE` leaves both VPS running and retains diagnostics after both successful and failed runs; no uninstall
+is implied.
+
+`RESTORE_SNAPSHOT` is supported only through an explicit operator-supplied restore hook on the Control Machine.
+It requires `MASTER_SNAPSHOT_ID`, `WORKER_SNAPSHOT_ID`, an absolute `SNAPSHOT_RESTORE_HOOK` path, and a
+matching `SNAPSHOT_RESTORE_HOOK_SHA256`. Preflight verifies that the hook is a regular executable file owned
+by the runner user or root, is not group/world-writable, and matches the pinned SHA256; the digest is checked
+again immediately before execution. The runner invokes it directly with `shell=False`, sends a versioned JSON
+request containing `TEST_RUN_ID`, VPS addresses and snapshot IDs on stdin, and enforces `RESTORE_TIMEOUT`.
+The hook must exit zero and return valid JSON with `status=RESTORED` and matching snapshot IDs for both hosts.
+The runner then reconnects to both VPS, recollects the Phase 0 baseline manifest, and verifies the required
+clean-baseline invariants before recording teardown `PASS`. Missing/invalid hook configuration is a preflight
+`FAIL`; hook timeout, nonzero exit, invalid/mismatched response, failed reconnection or baseline mismatch
+produces `TEARDOWN_FAILED`, never a simulated restore success. The hook may use operator-managed provider
+credentials but must not print them.
+
+Boolean policy combinations are not accepted. The runner does not claim that `gowave-auto.sh uninstall`
+restores OS packages, UFW, sysctl, swap/fstab, certificates or unrelated host state. A clean baseline gate is
+mandatory before installation. After `PRESERVE`, the next run requires operator re-image or this verified
+external restore procedure.
 
 **Rationale:** Attempting in-place uninstallation leaves residual files, modified kernel sysctl, and firewall
 state that invalidate clean-room acceptance testing. Clear documentation of this operational cycle prevents
@@ -367,8 +387,8 @@ Phase 10: Diagnostics Collection
   All written via redact-on-write; no plaintext secrets in any file
 
 Phase 11: Teardown
-  Apply configured policy (PRESERVE / RESTORE_SNAPSHOT; DESTROY rejected in v1)
-  v1: DESTROY is prohibited for operator-provisioned VPS; RESTORE_SNAPSHOT requires operator-supplied snapshot ID + verified external restore procedure
+  Apply configured policy (PRESERVE / RESTORE_SNAPSHOT via the verified external restore hook; DESTROY rejected in v1)
+  v1: RESTORE_SNAPSHOT requires both per-host snapshot IDs and a SHA256-pinned external restore hook; post-restore baseline verification is mandatory
   Record test outcome separately from teardown outcome; uninstall is not OS baseline restoration
   Write final result.json, junit.xml, summary.txt
   Release run-level lock
@@ -481,6 +501,11 @@ the following strict schema:
 | `TEST_MIHOMO_TRAFFIC` | Boolean | No | `true` | Verify traffic with real Mihomo client process; false skips eight mandatory cases and makes overall status INCOMPLETE |
 | `TEST_NEGATIVE_SUITE` | Boolean | No | `true` | Execute NEG-01 through NEG-15 |
 | `TEST_TEARDOWN_POLICY` | Enum: `PRESERVE`, `RESTORE_SNAPSHOT` | No | `PRESERVE` | Mutually exclusive teardown policy; `DESTROY` is rejected in v1 |
+| `MASTER_SNAPSHOT_ID` | String | Conditional | — | Required for RESTORE_SNAPSHOT; operator-managed Master snapshot identifier |
+| `WORKER_SNAPSHOT_ID` | String | Conditional | — | Required for RESTORE_SNAPSHOT; operator-managed Worker snapshot identifier |
+| `SNAPSHOT_RESTORE_HOOK` | Absolute file path | Conditional | — | Required for RESTORE_SNAPSHOT; external Control Machine restore executable |
+| `SNAPSHOT_RESTORE_HOOK_SHA256` | 64-hex SHA256 | Conditional | — | Required digest pin for the external restore hook |
+| `RESTORE_TIMEOUT` | Integer seconds | No | `900` | Maximum runtime for external restore hook and post-restore readiness checks |
 | `ADMIN_EMAIL` | Email address | No | `admin@example.com` | Email for ACME certificate registration |
 
 ---
