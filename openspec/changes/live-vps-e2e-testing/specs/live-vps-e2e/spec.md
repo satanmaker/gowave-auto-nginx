@@ -35,6 +35,47 @@ first remote modification and report the disqualifying evidence.
 
 ---
 
+
+### Requirement: Complete Mutation-Target Baseline and Resource Ownership
+
+The runner SHALL inventory every host resource that the exact pinned Master or Worker install, failure
+compensation, manual rollback, or teardown path may write, replace, enable, disable or remove. Absence of
+a running GoWave service or a listening port is not proof that a system path is unowned. Unknown, unreadable,
+or non-restorable pre-existing state SHALL fail the disposable gate before the first remote mutation.
+
+#### Scenario: Existing Worker system configuration is not overwritten
+
+- **GIVEN** /etc/sysctl.d/99-gowave-node.conf exists with unrelated sentinel content, while no GoWave
+  service is running and the required ports are free
+- **WHEN** disposable-baseline validation runs
+- **THEN** it rejects the target or captures a complete same-host restorable before-image before any write;
+  Worker configuration MUST NOT truncate the file and later treat it as transaction-created
+
+#### Scenario: Existing Worker service or binary paths are not removed
+
+- **GIVEN** one or more of the Worker systemd unit/drop-in paths, /usr/local/bin/xray,
+  /usr/local/bin/gowave-node, or managed NGINX/webroot paths exist but GoWave services are inactive
+- **WHEN** the runner validates rollback targets
+- **THEN** it rejects those paths unless a complete ownership record and tested restore operation proves
+  they belong to this run; rollback MUST preserve the unrelated object
+
+#### Scenario: Existing firewall policy is preserved
+
+- **GIVEN** UFW is active or contains non-default IPv4/IPv6 rules or default policies
+- **WHEN** preflight evaluates the supported disposable baseline
+- **THEN** the runner either rejects the baseline or records a complete restorable firewall before-image;
+  after an injected failure, all original rules, default policies and enabled state are restored, not merely
+  a selected subset of rules deleted
+
+#### Scenario: Failure restores every transaction-owned resource
+
+- **GIVEN** the runner has modified one or more inventoried resources and a later deployment step fails
+- **WHEN** compensation completes
+- **THEN** every transaction-created object is removed only while its identity/digest still match, every
+  supported pre-existing object is restored to its recorded content and metadata, and any externally
+  modified or unverifiable object is preserved with cleanup reported as incomplete
+
+
 ### Requirement: Preflight SSH Trust and DNS Verification
 
 The runner SHALL verify SSH connectivity and DNS correctness for all required domains before the first
@@ -68,6 +109,14 @@ command.
 - **WHEN** DNS verification checks AAAA records for each required domain
 - **THEN** every domain has an AAAA record resolving to the expected VPS IPv6 address; any missing or wrong
   AAAA record causes preflight failure before any remote command
+
+#### Scenario: Published AAAA records cannot bypass IPv6 verification
+
+- **GIVEN** any configured Panel, REALITY or paired Vision FQDN publishes an AAAA record
+- **WHEN** preflight validates DNS and the listener/firewall policy
+- **THEN** with ENABLE_IPV6=false preflight fails before remote modification; with ENABLE_IPV6=true,
+  every AAAA answer from each independent resolver matches only the configured VPS IPv6 address and the
+  corresponding listener/firewall checks are mandatory. Extra or conflicting address answers fail preflight.
 
 ---
 
@@ -665,6 +714,34 @@ while its recorded identity and digest still match. Unverifiable ownership requi
 - **WHEN** a later installation failure triggers compensation
 - **THEN** rollback removes the hook only if the journal proves transaction ownership and the current identity/digest still match; a modified/replaced path is preserved and cleanup is marked incomplete
 
+### Requirement: Signal-Safe and Verifiable Transaction Compensation
+
+Worker deployment and Master orchestration SHALL provide crash/signal-safe, transaction-scoped compensation.
+A cleanup attempt SHALL NOT be considered successful until each required resource has been verified against
+the ownership journal and pre-install baseline.
+
+#### Scenario: Worker deployment is interrupted by a signal
+
+- **GIVEN** remote Worker deployment has mutated at least one resource and has not committed
+- **WHEN** the remote shell receives HUP, INT or TERM
+- **THEN** it stops starting new mutations, persists interruption state, executes compensation exactly once,
+  verifies the result, and exits nonzero; secret/temp-file cleanup alone is not sufficient
+
+#### Scenario: Remote rollback cannot claim success after a failed cleanup step
+
+- **GIVEN** the Worker rollback encounters a Certbot, filesystem, NGINX, systemd, UFW or sysctl cleanup error
+- **WHEN** the compensator reports its result to Master
+- **THEN** it returns a versioned per-resource result with status INCOMPLETE, nonzero exit and retained
+  recovery journal; exit zero and ROLLED_BACK are permitted only after all required final states are verified
+
+#### Scenario: Worker and Panel API rollback results are both required
+
+- **GIVEN** Worker compensation succeeds but Panel API rollback fails, or vice versa
+- **WHEN** Master finalizes the failed node add transaction
+- **THEN** it retains both recovery records, reports the overall operation as INCOMPLETE, and MUST NOT
+  mark the transaction rolled back or committed until both sides are verified
+
+
 ### Requirement: Teardown Policy Enforcement
 
 The runner SHALL accept one mutually exclusive `TEST_TEARDOWN_POLICY`: `PRESERVE` (default) or
@@ -750,6 +827,37 @@ deterministic address order and MUST be held through dedicated SSH lock-holder s
   reacquired both locks and revalidated the saved run state
 
 ---
+
+### Requirement: Shared Mutation Lock Across All Management Entry Points
+
+The runner SHALL coordinate with every supported GoWave mutation command on both VPS through the same
+host-wide kernel lock protocol. A separate E2E-only lock does not provide exclusivity against ordinary
+operator commands.
+
+#### Scenario: Existing management command is blocked while the E2E run owns the host
+
+- **GIVEN** the E2E runner holds the pair-wide lock on Master and Worker
+- **WHEN** another session invokes gowave-auto.sh install, node add/rollback, domain-change,
+  channel switch, uninstall, backup restore, or Worker remote_payload/remote_rollback without the
+  active run's re-entrant lease
+- **THEN** the command fails before its first mutation; it cannot bypass the E2E lock by using a separate
+  lock file or by not acquiring a lock
+
+#### Scenario: Runner-owned nested command does not release exclusivity
+
+- **GIVEN** the E2E runner holds both remote locks and supplies a valid run-bound lease through stdin to a
+  child deployment/rollback command
+- **WHEN** that child performs its authorized mutations
+- **THEN** it is accepted only while the original kernel lock holder and lease remain valid; another
+  controller still fails to acquire either host lock, and a stale/replayed lease is rejected after holder loss
+
+#### Scenario: Unsafe remote lock path is rejected
+
+- **GIVEN** the remote lock file or any parent directory is a symlink, non-regular object, wrong-owner
+  file, or has unsafe permissions
+- **WHEN** the runner acquires the pair-wide lock
+- **THEN** it fails closed before any remote modification and does not follow, replace or unlink the object
+
 
 ### Requirement: Durable Run State for Partial CLI Modes
 
