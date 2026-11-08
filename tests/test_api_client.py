@@ -11,7 +11,7 @@ import urllib.parse
 REPO_ROOT = Path(__file__).resolve().parent.parent
 import sys
 sys.path.insert(0, str(REPO_ROOT))
-from modules.api_client import GoWaveClient, atomic_write_state, save_credentials, rollback_provisioning
+from modules.api_client import GoWaveClient, atomic_write_state, save_credentials, rollback_provisioning, _extract_list
 
 
 class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
@@ -73,12 +73,22 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
             cfg_str = self.profiles.get(uuid, {}).get("config", "{}")
             self.send_json(200, {"response": {"uuid": uuid, "name": "profile", "config": cfg_str}})
         elif self.path.startswith("/api/config-profiles/") and self.path.endswith("/inbounds"):
-            inbounds = [
-                {"uuid": "inb-1", "tag": "vless-reality-local-node", "port": 8443, "protocol": "vless"},
-                {"uuid": "inb-2", "tag": "vless-xhttp-local-node", "port": 10001, "protocol": "vless"},
-                {"uuid": "inb-3", "tag": "vless-ws-local-node", "port": 10002, "protocol": "vless"},
-                {"uuid": "inb-4", "tag": "trojan-grpc-local-node", "port": 10003, "protocol": "trojan"},
-            ]
+            uuid = self.path.split("/")[3]
+            cfg_raw = self.profiles.get(uuid, {}).get("config", "{}")
+            cfg = json.loads(cfg_raw) if isinstance(cfg_raw, str) else cfg_raw
+            cfg_inbs = cfg.get("inbounds", []) if isinstance(cfg, dict) else []
+            if cfg_inbs:
+                inbounds = [
+                    {"uuid": f"inb-{uuid}-{i+1}", "tag": inb.get("tag", f"inb-{i+1}"), "port": inb.get("port", 8443), "protocol": inb.get("protocol", "vless")}
+                    for i, inb in enumerate(cfg_inbs)
+                ]
+            else:
+                inbounds = [
+                    {"uuid": "inb-1", "tag": "vless-reality-local-node", "port": 8443, "protocol": "vless"},
+                    {"uuid": "inb-2", "tag": "vless-xhttp-local-node", "port": 10001, "protocol": "vless"},
+                    {"uuid": "inb-3", "tag": "vless-ws-local-node", "port": 10002, "protocol": "vless"},
+                    {"uuid": "inb-4", "tag": "trojan-grpc-local-node", "port": 10003, "protocol": "trojan"},
+                ]
             self.send_json(200, {"response": inbounds})
         elif self.path == "/api/nodes":
             self.send_json(200, {"response": {"nodes": [{"uuid": k, **v} for k, v in self.nodes.items()]}})
@@ -104,6 +114,14 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
     def do_PATCH(self):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+        if self.path == "/api/internal-squads":
+            s_uuid = body.get("uuid")
+            if s_uuid and s_uuid in self.squads:
+                self.squads[s_uuid].update(body)
+        elif self.path.startswith("/api/nodes/"):
+            n_uuid = self.path.split("/")[-1]
+            if n_uuid in self.nodes:
+                self.nodes[n_uuid].update(body)
         self.send_json(200, {"response": {"status": "updated", **body}})
 
     def do_DELETE(self):
@@ -243,6 +261,85 @@ class TestAPIClient(unittest.TestCase):
         # 8. Issue API Token
         token_info = self.client.issue_api_token()
         self.assertEqual(token_info["token"], "gowave-scoped-api-token-xyz")
+
+    def test_panel_discovers_master_and_worker_nodes(self):
+        """Test that Panel registers and discovers both master node and worker node via GET /api/nodes."""
+        # 1. Login
+        self.client.login("admin", "admin-pass-12345")
+
+        # 2. Step A: Provision Master Node (local-node)
+        x25519_master = self.client.generate_x25519()
+        raw_master = self.client.compile_config_profile("local-node", "reality.example.com", x25519_master["privateKey"])
+        master_prof = self.client.provision_config_profile("GoWave MVP Unified Profile - local-node", raw_master)
+        master_prof_uuid = master_prof["profile_uuid"]
+        master_inbounds = master_prof["inbounds"]
+        master_inb_uuids = [inb["uuid"] for inb in master_inbounds]
+
+        master_node_uuid = self.client.associate_node("local-node", "127.0.0.1", 3002, master_prof_uuid, master_inb_uuids)
+        self.assertIsNotNone(master_node_uuid)
+
+        squad_uuid = self.client.provision_internal_squad("Default MVP Squad", master_inb_uuids)
+        master_hosts = self.client.provision_hosts(master_prof_uuid, master_inbounds, master_node_uuid, squad_uuid, "vpn.example.com", "reality.example.com", "local-node")
+        self.assertEqual(len(master_hosts), 4)
+
+        # 3. Step B: Provision Worker Node (worker-1) on separate address
+        x25519_worker = self.client.generate_x25519()
+        raw_worker = self.client.compile_config_profile("worker-1", "worker-reality.example.com", x25519_worker["privateKey"])
+        worker_prof = self.client.provision_config_profile("GoWave Worker worker-1 Profile", raw_worker)
+        worker_prof_uuid = worker_prof["profile_uuid"]
+        worker_inbounds = worker_prof["inbounds"]
+        worker_inb_uuids = [inb["uuid"] for inb in worker_inbounds]
+
+        worker_node_uuid = self.client.associate_node("worker-1", "10.89.0.20", 3002, worker_prof_uuid, worker_inb_uuids)
+        self.assertIsNotNone(worker_node_uuid)
+        self.assertNotEqual(master_node_uuid, worker_node_uuid)
+
+        # Link worker inbounds to squad
+        updated_squad_uuid = self.client.provision_internal_squad("Default MVP Squad", worker_inb_uuids)
+        self.assertEqual(squad_uuid, updated_squad_uuid)
+
+        worker_hosts = self.client.provision_hosts(worker_prof_uuid, worker_inbounds, worker_node_uuid, squad_uuid, "worker.example.com", "worker-reality.example.com", "worker-1")
+        self.assertEqual(len(worker_hosts), 4)
+
+        # 4. Step C: Query GoWave Panel API GET /api/nodes and assert panel sees BOTH nodes
+        nodes_res = self.client.request("GET", "/api/nodes")
+        nodes_list = _extract_list(nodes_res, "nodes")
+        self.assertGreaterEqual(len(nodes_list), 2)
+
+        nodes_by_name = {n["name"]: n for n in nodes_list}
+        self.assertIn("local-node", nodes_by_name)
+        self.assertIn("worker-1", nodes_by_name)
+
+        # Verify master node contracts
+        node_local = nodes_by_name["local-node"]
+        self.assertEqual(node_local["address"], "127.0.0.1")
+        self.assertEqual(node_local["port"], 3002)
+        self.assertEqual(node_local["configProfile"]["activeConfigProfileUuid"], master_prof_uuid)
+        self.assertEqual(set(node_local["configProfile"]["activeInbounds"]), set(master_inb_uuids))
+
+        # Verify worker node contracts
+        node_worker = nodes_by_name["worker-1"]
+        self.assertEqual(node_worker["address"], "10.89.0.20")
+        self.assertEqual(node_worker["port"], 3002)
+        self.assertEqual(node_worker["configProfile"]["activeConfigProfileUuid"], worker_prof_uuid)
+        self.assertEqual(set(node_worker["configProfile"]["activeInbounds"]), set(worker_inb_uuids))
+
+        # Verify Internal Squad contains inbounds from BOTH nodes
+        squads_res = self.client.request("GET", "/api/internal-squads")
+        squads_list = _extract_list(squads_res, "internalSquads")
+        mvp_squad = next(s for s in squads_list if s.get("name") == "Default MVP Squad")
+        squad_inbs = set(mvp_squad.get("inbounds", []))
+        self.assertTrue(set(master_inb_uuids).issubset(squad_inbs))
+        self.assertTrue(set(worker_inb_uuids).issubset(squad_inbs))
+
+        # Verify Host entities in GET /api/hosts include both nodes
+        hosts_res = self.client.request("GET", "/api/hosts")
+        hosts_list = _extract_list(hosts_res, "hosts")
+        master_host_remarks = {f"{p}@local-node" for p in ["VLESS-REALITY-Vision", "VLESS-XHTTP-TLS", "VLESS-WS-TLS", "Trojan-gRPC-TLS"]}
+        worker_host_remarks = {f"{p}@worker-1" for p in ["VLESS-REALITY-Vision", "VLESS-XHTTP-TLS", "VLESS-WS-TLS", "Trojan-gRPC-TLS"]}
+        all_remarks = {h.get("remark") for h in hosts_list}
+        self.assertTrue(master_host_remarks.issubset(all_remarks))
+        self.assertTrue(worker_host_remarks.issubset(all_remarks))
 
     def test_rollback_provisioning_flow(self):
         MockGoWaveServer.registered_users["admin"] = "securepass1234567890"
