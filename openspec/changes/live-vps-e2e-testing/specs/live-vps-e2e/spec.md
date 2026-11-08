@@ -720,6 +720,19 @@ while its recorded identity and digest still match. Unverifiable ownership requi
 - **WHEN** a later installation failure triggers compensation
 - **THEN** rollback removes the hook only if the journal proves transaction ownership and the current identity/digest still match; a modified/replaced path is preserved and cleanup is marked incomplete
 
+#### Scenario: Uncatchable Worker termination is recovered before the next mutation
+
+- **GIVEN** a previous Worker deployment was terminated by SIGKILL, kernel panic or power loss after writing an uncommitted transaction journal
+- **WHEN** the next authenticated Worker management or recovery entrypoint is invoked
+- **THEN** it discovers and reconciles the uncommitted journal before accepting any new mutation; if recovery cannot be fully verified, it rejects the new operation, retains the journal and reports INCOMPLETE
+
+#### Scenario: PRESERVE reports package-manager residuals without claiming OS baseline restoration
+
+- **GIVEN** the installation transaction has installed or upgraded OS packages and package post-install scripts have created service defaults
+- **WHEN** compensation or teardown completes under TEST_TEARDOWN_POLICY=PRESERVE
+- **THEN** the report records the package changes as retained residual state and distinguishes transaction compensation from restoration of the original OS baseline; the VPS is not eligible for another clean-baseline run until re-imaged or restored through the verified snapshot procedure
+
+
 ### Requirement: Signal-Safe and Verifiable Transaction Compensation
 
 Worker deployment and Master orchestration SHALL provide crash/signal-safe, transaction-scoped compensation.
