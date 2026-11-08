@@ -374,7 +374,7 @@ In upstream GoWave (`backend-go/internal/nodes/service.go`), `GetUserResolvedInb
 Subsequently, `syncUserToSingleNode()` sends user credentials to the Node only for inbounds linked through the squads of which the user is an active member. If a user is not in an Internal Squad or the squad has no inbound links, the Node receives ZERO user credentials for those inbounds.
 
 To provision a unified user experience:
-1. **Managed Internal Squad Provisioning**: The installer creates a managed Internal Squad (`POST /api/internal-squads`) named `"Default MVP Squad"`. It links all 4 inbound UUIDs from the local node profile, and whenever a worker node is added, links the worker's 4 inbound UUIDs into this same squad via `PATCH /api/internal-squads/{uuid}`.
+1. **Managed Internal Squad Provisioning**: The installer creates a managed Internal Squad (`POST /api/internal-squads`) named `"Default MVP Squad"`. It links all 4 inbound UUIDs from the local node profile, and whenever a worker node is added, links the worker's 4 inbound UUIDs into this same squad via `PATCH /api/internal-squads` with `{"uuid": squad_uuid, "name": squad_name, "inbounds": all_inbounds}` (calling GoWave's `UpdateInternalSquadCommand`, avoiding 405 Method Not Allowed on path-based PATCH).
 2. **Initial User Provisioning**: The installer provisions an initial active user via `POST /api/users` adhering to GoWave's strict schema (`username` and `expireAt` are mandatory):
    ```json
    {
@@ -632,7 +632,7 @@ To eliminate manual REST API calls and provide a complete all-in-one UX for regi
    ```
 2. **Automated Provisioning Sequence**:
    - Authenticates against local Panel REST API (`POST /api/auth/login`) retrieving JWT bearer token.
-   - Issues `POST /api/nodes` with `name`, `address: <node-ip>`, `port: 3000`, and links `activeConfigProfileUuid` and `activeInbounds` from the unified profile.
+   - Issues `POST /api/nodes` with `name`, `address: <node-ip>`, `port: 3000`, and links `activeConfigProfileUuid` and `activeInbounds` from the unified profile. Note that GoWave enforces a database UNIQUE constraint on `nodes.address` (`UNIQUE(address)`); each registered node must possess a distinct network address. Furthermore, `gowave-node` binds runtime socket `/run/gowave-node/xray.sock` and is strictly scoped to one daemon instance per host OS.
    - Extracts assigned `node-uuid` and retrieves node `SECRET_KEY` payload (`caCertPem`, `jwtPublicKey`, `nodeCertPem`, `nodeKeyPem`).
    - Creates corresponding worker Host records via `POST /api/hosts` (`address: <worker-domain>`, `port: 443`, linked to `node-uuid` and Internal Squad).
    - If `ssh-user` is supplied (or configured), initiates remote worker deployment using the canonical `remote_payload` function (zero secrets in `ssh` argv):
@@ -778,7 +778,7 @@ Worker node addition (`gowave-auto.sh node add`) operates under an independent t
 2. **Isolated Worker Rollback Actions**:
    If worker deployment or verification fails, the orchestrator executes strictly scoped rollback:
    - Delete worker hosts: `DELETE /api/hosts/{uuid}` for all worker hosts created for this node (`remark == "<PROTO>@<worker-name>"`).
-   - Disassociate worker inbounds: `PATCH /api/internal-squads/{squad-uuid}` removing the worker's 4 inbound UUIDs from `inbounds`.
+   - Disassociate worker inbounds: `PATCH /api/internal-squads` with `{"uuid": squad_uuid, "name": squad_name, "inbounds": updated_inbounds}` removing the worker's 4 inbound UUIDs from `inbounds`.
    - Delete worker node: `DELETE /api/nodes/{worker_node_uuid}`.
    - Delete worker config profile: `DELETE /api/config-profiles/{worker_profile_uuid}`.
    - Strictly FORBIDS deleting internal squads, panel users, or panel API tokens.
