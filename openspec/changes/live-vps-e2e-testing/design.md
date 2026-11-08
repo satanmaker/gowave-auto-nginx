@@ -434,8 +434,8 @@ Phase 1: Master Installation
        Mihomo, NGINX, OpenSSL, OS/kernel); an unpinned/mismatched component cannot PASS
 
 Phase 2: Worker Deployment
-  2.1  Run `gowave-auto.sh node add worker-1` on Master with the same validated ACME directory and pinned
-       Node-installer commit + SHA256 used by Phase 1
+  2.1  Run `gowave-auto.sh node add worker-1` on Master with the same validated ACME directory and the
+       same Node-installer commit + SHA256 explicitly supplied again for the Worker dispatch
   2.2  Verify exit code, state.json, process argv observation (SECRET_KEY not in Master-side argv)
   2.3  Verify Worker services, listeners, certs, deploy hook, cover-reality SHA256
   2.4  Poll Panel API isConnected until true (bounded NODE_READY_TIMEOUT)
@@ -581,8 +581,6 @@ is set. When the variable is unset outside the runner, existing production-defau
 
 ---
 
-## Negative Scenario Matrix (NEG-01 — NEG-15)---
-
 ## Negative Scenario Matrix (NEG-01 — NEG-15)
 
 The runner executes 15 negative scenarios in Phase 9 (and during isolated test phases) to assert error handling boundaries:
@@ -663,13 +661,21 @@ content-digest check. The config's `GOWAVE_NODE_INSTALLER_COMMIT` therefore does
 installation paths, and a commit pin alone is not the documented commit-plus-content-integrity contract.
 
 **Solution:** Vendor `sources/gowave-node/install.sh` from the exact configured 40-hex commit and record its
-real SHA256 in `GOWAVE_NODE_INSTALLER_SHA256`. The Master-local installer path MUST verify the bundled file
-against both the configured commit provenance and digest. The remote Worker path MUST use the same configured
-commit and digest, fetch only the immutable commit URL, verify the downloaded file's SHA256 before execution,
-and fail closed on any mismatch. `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1` disables the local floating-`main`
-fallback for E2E. The remote script MUST NOT keep an independent hard-coded commit that can drift from the
-runner configuration. The actual digest is computed from the vendored upstream file during implementation;
-no guessed or placeholder digest is allowed.
+real SHA256 in `GOWAVE_NODE_INSTALLER_SHA256`. The Master-local installer path MUST verify the bundled file against the configured SHA256; the commit
+provenance is established by fetching the upstream file at the configured immutable commit during vendoring
+and recording that source commit alongside the vendored artifact. The remote Worker path MUST use the same
+configured commit and digest, fetch only the immutable commit URL, verify the downloaded file's SHA256 before
+execution, and fail closed on any mismatch. `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1` disables the local
+floating-`main` fallback for E2E. The remote script MUST NOT keep an independent hard-coded commit that can
+drift from runner configuration. The actual digest is computed from the vendored upstream file during
+implementation; no guessed or placeholder digest is allowed.
+
+**Required propagation chain:** the runner supplies `GOWAVE_NODE_INSTALLER_COMMIT` and
+`GOWAVE_NODE_INSTALLER_SHA256` to the Master for both `gowave-auto.sh install` and the later
+`gowave-auto.sh node add` invocation. `gowave-auto.sh node add` MUST pass both values to
+`gowave-node-auto.sh remote_payload`; that function MUST serialize both into the SSH-stdin Worker script.
+The Worker MUST validate the commit format and digest, fetch the exact commit URL, verify the bytes, and only
+then execute the installer. Supplying the variables only to the initial Master install is insufficient.
 
 ---
 
