@@ -202,7 +202,7 @@ to protect a shared VPS pair from two different Control Machines.
    directory owned by the runner user (directory mode `0700`, lock file mode `0600`, opened without following
    symlinks). This prevents duplicate runner processes on one Control Machine.
 2. Before any deployment or fault-injection mutation, acquire an authoritative kernel `flock` on both
-   target VPS hosts at `/run/lock/gowave-live-vps.lock`. Acquire the two host locks in deterministic
+   target VPS hosts at `/run/lock/gowave-managed-mutation.lock`. Acquire the two host locks in deterministic
    address order; if either acquisition fails, release the first and abort before remote modification.
    Hold each lock through a dedicated non-PTY SSH session for the complete run/partial operation. The
    remote SSH session is the lock holder; use bounded SSH keepalives and treat loss of either lock-holder
@@ -591,6 +591,180 @@ not cover this shared hook. Treating the hook as lineage state would miss a glob
 silently disable an unrelated renewal workflow.
 
 ---
+
+
+### D18: One Shared Mutation Lock for the Runner and Lifecycle Commands
+
+**Problem:** D8's remote lock currently uses a separate path from the existing lifecycle manager. The
+current gowave-auto.sh acquires /run/lock/gowave-auto.lock, while the E2E design acquires a different
+lock; gowave-node-auto.sh remote_payload and remote_rollback do not participate in the E2E lock at
+all. A normal operator command can therefore mutate the same VPS while the E2E runner believes it has
+exclusive access. A pair of locks only coordinates processes that actually honour the same lock contract.
+
+**Chosen:**
+
+1. Use one canonical host-wide mutation lock on both VPS:
+   /run/lock/gowave-managed-mutation.lock. The existing Master lifecycle commands, Worker remote
+   entrypoints, E2E runner, recovery and restore paths MUST all use this same kernel flock; a second
+   lock file is not an equivalent substitute.
+2. All host-mutating entrypoints MUST participate, including gowave-auto.sh install, node add,
+   node rollback/remove, domain-change, channel switching, uninstall, backup restore and recovery,
+   plus gowave-node-auto.sh remote_payload and remote_rollback. Read-only status commands need not
+   acquire the exclusive lock. New mutation entrypoints inherit this requirement.
+3. The E2E runner MUST retain the original kernel lock holders throughout the run. It MUST NOT release
+   the lock merely to invoke a child installer or rollback command. Define a narrowly scoped re-entrant
+   operation lease for runner-owned child commands: the lease is generated only while the holder owns the
+   kernel lock, is bound to the run ID, target host and live holder identity, is stored root-only under
+   /run, and is delivered to the child through stdin (never argv, environment dumps, logs or artifacts).
+   The common lock helper validates both the live holder and the lease before allowing the nested command.
+   A run ID or environment flag alone is not authorization; there MUST NOT be a general --force or
+   environment-variable bypass. Ordinary operator invocations without the matching live lease fail before
+   their first mutation.
+4. Open the lock path without following symlinks and validate with lstat/fstat that it is a regular
+   root-owned file with mode 0600, beneath a root-owned non-symlink lock directory. Reject hard-link or
+   path substitution, unsafe parent directories, and unexpected owner/mode/type. Never unlink the lock
+   file to reset a lock; kernel lock ownership, not file existence, determines exclusivity.
+5. Losing either holder or invalidating its owner lease stops all new mutations. The runner cannot resume
+   until it reacquires both locks and validates the saved run identity and baseline.
+
+**Required tests:** while an E2E pair lock is held, invoke each representative Master and Worker mutation
+entrypoint from a second process/session and prove it fails before mutation; prove the E2E child lease can
+run the intended nested command without releasing the lock; prove a second Control Machine still cannot
+acquire either host; reject symlink, wrong-owner, wrong-mode and non-regular lock paths; test holder
+disconnect and lease replay after holder termination.
+
+**Rationale:** A lock held only by the E2E runner does not stop the existing installer, a manual rollback,
+or another administrative path. The test's claim of exclusive host ownership is valid only when every
+supported mutation path participates in the same lock protocol.
+
+
+### D19: Complete Baseline and Ownership for Every Mutated Host Resource
+
+**Problem:** The disposable gate inventories GoWave directories, services and ports, but rollback also
+writes/removes system paths and host policy that are not implied by those checks. For example, Worker
+configure_host_security() tests whether /etc/sysctl.d/99-gowave-node.conf exists to set an ownership
+flag, then redirects output to that path unconditionally. If the file already exists, its bytes are
+overwritten while the flag remains false, so the trap does not restore it. Worker rollback also removes
+systemd units/drop-ins, Xray binaries, NGINX files, the global Certbot hook and the sysctl file without
+proving that the current transaction owns each object. UFW defaults/rules are mutated without a complete
+before-image.
+
+**Chosen:**
+
+1. Before any remote mutation, build a host-local baseline inventory for every path, directory, symlink,
+   service/unit, binary, certificate lineage, NGINX include, firewall rule/policy and kernel setting that
+   the selected Master/Worker install or rollback path can write, replace, enable, disable or remove.
+   Derive and review this inventory against the exact pinned repository commit; it is not sufficient to
+   check only that GoWave is not currently running or that its expected ports are free.
+2. At minimum, cover the actual Master and Worker targets, including the managed NGINX bootstrap/vhost/
+   stream files and nginx.conf include mutation; /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh
+   and all requested live/archive/renewal lineages; Worker
+   /etc/sysctl.d/99-gowave-node.conf, systemd units and drop-ins
+   (gowave-node.service, remnanode.service), /opt/gowave-node, /run/gowave-node,
+   /opt/remnanode, /usr/local/bin/gowave-node, /usr/local/bin/xray,
+   /var/www/gowave-acme, /var/www/gowave-auto-nginx/cover-reality, /swapfile and /etc/fstab,
+   and UFW enabled state, default policies and complete rule set.
+3. Inspect paths with no-follow metadata operations, including broken symlinks and non-regular objects.
+   For each target, record one of: ABSENT (the transaction may create it and then records identity/digest),
+   PREEXISTING_SNAPSHOT (a complete same-host before-image is captured and can be restored), or
+   REJECTED (the runner cannot safely own or restore it). Unknown or unreadable state fails preflight.
+   A pre-existing file MUST NOT be overwritten merely because its corresponding service is inactive.
+4. Use write-ahead ownership records before the first mutation. Capture bytes or recursive content as
+   appropriate, symlink targets, file type, inode/device identity, owner, group, mode, ACL/xattrs where
+   applicable, and digest. Create new files atomically. If a resource is pre-existing and exact restoration
+   is not implemented and tested, reject the baseline rather than proceeding.
+5. Snapshot complete UFW state: enabled/disabled status, IPv4/IPv6 rule sets, default policies and relevant
+   backend state. Either require a provably pristine supported firewall baseline or restore the exact
+   before-image. Deleting a few rules added by the script is not an equivalent rollback because it can
+   leave changed default policies or remove a pre-existing duplicate rule.
+6. On compensation, restore a pre-existing resource only if its current state is still attributable to this
+   transaction; if an external actor changed/replaced it, preserve the current object and report incomplete
+   recovery. Verify the restored bytes, link targets, metadata, firewall policy, service state and effective
+   sysctl values before reporting cleanup PASS. Do not use an ownership flag that records created-by-us
+   while still truncating an existing file.
+
+**Required tests:** seed sentinels at each class of target path (including the existing sysctl filename,
+systemd unit/drop-in, Xray symlink/binary, NGINX include, webroot, and deploy hook); verify preflight rejects
+or records a full restorable pre-image before any write. Seed custom UFW defaults/rules and prove they are
+either rejected or restored byte-for-byte/effectively. Inject failure after each write and verify exact
+baseline restoration; replace a transaction-owned path during rollback and verify it is preserved with
+incomplete recovery. Include broken symlinks and directories at file targets.
+
+**Rationale:** A VPS may have no running GoWave service and still contain unrelated system configuration.
+A disposable check based only on services, ports and familiar application directories cannot justify broad
+rm, redirection, firewall or systemd cleanup.
+
+
+### D20: Signal-Safe and Verifiable Remote Compensation
+
+**Problem:** The Worker payload installs an ERR trap for compensation, but its EXIT/HUP/INT/TERM
+trap currently only unsets secret variables and removes temporary verifier/installer files. It does not
+invoke compensation or explicitly terminate on a signal. A disconnect or operator interrupt can therefore
+leave a partially mutated Worker without the normal rollback path. In addition, the standalone Worker
+rollback uses broad path deletion and best-effort commands, and the Master dispatch currently suppresses
+the remote rollback exit status with an unconditional success fallback. An attempted cleanup is not
+evidence that cleanup completed.
+
+**Chosen:**
+
+1. Create a root-only host-local transaction journal before the first Worker mutation. It includes the
+   E2E run ID, transaction ID, target identity, ownership/pre-image references and a write-ahead record for
+   each resource/action. The journal is durable and independently recoverable after the Control Machine or
+   SSH connection disappears.
+2. Define explicit handlers for HUP, INT and TERM: stop starting new mutations, persist the interruption
+   and invoke the same idempotent compensator exactly once, then exit with a non-zero signal-derived
+   status. An EXIT handler performs final secret/temp-file cleanup and invokes recovery only when the
+   journal is still uncommitted and compensation has not completed. Do not assume an ERR trap covers
+   signals, ignored-error contexts (if, OR-list), function boundaries or an abruptly killed remote process.
+3. Make remote_rollback transaction-scoped: it consumes the matching host-local journal and the D19
+   ownership manifest. Without a matching uncommitted transaction and validated target identity it fails
+   closed. It MUST NOT act as a generic set of unconditional rm -rf commands against fixed system paths.
+   A deliberate standalone deprovision operation must use its own explicit, validated deployment-ownership
+   record and confirmation contract.
+4. Record each compensation step as attempted, exit status, observed final state and verification result.
+   Return a sanitized versioned result to Master containing schema_version, run_id, transaction_id,
+   status (ROLLED_BACK or INCOMPLETE) and per-resource results. Exit zero only when every required
+   action is verified; any failed deletion/restoration, failed nginx -t/reload, systemd state mismatch,
+   firewall/sysctl mismatch or unknown ownership returns non-zero and retains the journal/snapshots.
+   Best-effort diagnostics may continue after an error, but MUST NOT convert that error into rollback PASS.
+5. Master orchestration MUST collect and independently validate both the Worker compensation result and the
+   Panel API rollback result. It MUST retain both recovery records if either side is incomplete, set the
+   overall deployment/teardown state to INCOMPLETE, and MUST NOT write a rolled-back/committed terminal
+   state based on only one side succeeding. No unconditional success fallback may suppress a required
+   compensation result.
+
+**Required tests:** interrupt the remote payload with HUP, INT and TERM after each mutation boundary;
+simulate SSH loss and process termination; make each cleanup operation fail in turn (including Certbot,
+NGINX validation/reload, systemd, UFW and sysctl); force Worker rollback success/API rollback failure and
+the inverse; corrupt or mismatch the journal/run identity; rerun compensation after partial completion.
+Only a fully verified, idempotent rollback may return zero and permit a rolled-back terminal state.
+
+**Rationale:** The E2E runner uses destructive fault injection on disposable hosts. It must distinguish
+rollback attempted from original state restored; otherwise it can produce a false-clean result immediately
+before the VPS is reused.
+
+
+### D21: IPv6 DNS Must Match the Effective Listener Policy
+
+**Problem:** The runner's current plan checks AAAA records only when ENABLE_IPV6=true, but both current
+installers decide whether to add an IPv6 NGINX listener from the host's /proc/net/if_inet6 state, not
+from the runner's ENABLE_IPV6 setting. A published AAAA record can therefore be served or selected by
+clients/ACME even when the runner silently skips IPv6 verification.
+
+**Chosen:** Resolve and record A, AAAA and CNAME chains for every configured Panel, REALITY and optional
+Vision FQDN through at least two independent resolvers. All published address records must be accounted
+for. With ENABLE_IPV6=true, each FQDN's complete AAAA set must resolve only to its configured target
+MASTER_IPV6 or WORKER_IPV6, and those addresses/listeners/firewall paths must be verified. With
+ENABLE_IPV6=false, any published AAAA record is a preflight failure; the operator must remove it or
+explicitly enable and validate IPv6. Never ignore an AAAA record merely because the test flag is false.
+Reject CDN/proxy CNAME chains and unexpected extra A/AAAA answers under either mode.
+
+**Required tests:** correct and incorrect AAAA sets in both modes, mixed correct+foreign A/AAAA answers,
+resolver disagreement, CNAME-to-proxy responses, and proof that no remote mutation occurs on a DNS
+mismatch.
+
+**Rationale:** DNS and the actual NGINX listener policy must describe the same public surface. An untested
+IPv6 route invalidates the claim that the endpoint set and firewall surface are fully verified.
 
 ## Runner Module Structure
 
