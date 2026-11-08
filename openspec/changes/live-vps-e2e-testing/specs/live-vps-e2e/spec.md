@@ -593,17 +593,21 @@ Teardown is reported separately from test outcome; overall `PASS` requires the s
 ### Requirement: Durable Run State for Partial CLI Modes
 
 The runner SHALL persist an atomic mode-`0600` `run-state.json` under
-`artifacts/live-vps/<TEST_RUN_ID>/`. It SHALL contain only the repository commit, non-secret target/config
-identity, baseline-manifest reference, phase statuses and timestamps. It SHALL NOT contain credentials,
-tokens, `SECRET_KEY`, `shortUuid`, subscription bodies, or hashes of secret values. `--mode full` creates a
-new run state; an existing run ID MUST NOT be silently overwritten. Every partial mode except a fresh
-`preflight` requires `--run-id` and a matching run-state record.
+`artifacts/live-vps/<TEST_RUN_ID>/`. A fresh `--mode preflight` without `--run-id` generates a unique run ID;
+it may accept an explicitly supplied unused ID. Preflight is read-only with respect to both VPS and creates
+the initial state record plus baseline-manifest reference locally. It MUST print the generated run ID so the
+operator can pass it to the next partial mode. `--mode full` also creates a new run ID and executes all phases
+in one invocation; an existing run directory MUST NOT be overwritten. The state SHALL contain only the
+repository commit, non-secret target/config identity, baseline-manifest reference, phase statuses and
+timestamps. It SHALL NOT contain credentials, tokens, `SECRET_KEY`, `shortUuid`, subscription bodies, or
+hashes of secret values. Every partial mode after `preflight` requires `--run-id` and a matching run-state
+record.
 
 #### Scenario: Partial mode cannot resume a different run or repeat completed installation
 
-- **GIVEN** a stored run state for a specific repository commit, Master/Worker addresses and non-secret config
-  identity
-- **WHEN** `install`, `verify`, `traffic`, `negative`, or `teardown` is invoked with that run ID
+- **GIVEN** preflight has created a stored run state for a specific repository commit, Master/Worker addresses
+  and non-secret config identity
+- **WHEN** `install`, `verify`, `traffic`, `negative`, or `teardown` is invoked with the printed run ID
 - **THEN** the runner verifies the matching state and prerequisite phase statuses before remote modification;
   completed phases are not repeated implicitly; missing state, mismatched identity or unmet prerequisites fail
   closed. `install` requires preflight PASS, `verify` requires install PASS, `traffic` requires verification

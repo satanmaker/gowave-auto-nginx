@@ -269,8 +269,8 @@ Run the exact `gowave-auto.sh node add` process tree with both string and array 
 The `-v` / `--no-abbrev` option is mandatory: it is equivalent to `-e abbrev=none` and prevents
 strace's default structure/array abbreviation from replacing later `argv` elements with an omission marker.
 The positive `-s` limit independently prevents individual argument strings from being truncated. The observer
-MUST capture both `execve` and `execveat` for all descendants of the local `gowave-auto.sh
-node add` process on Master, including the local SSH client process. This is a Master-side observation only:
+MUST capture both `execve` and `execveat` for all descendants of the local `gowave-auto.sh node add`
+process on Master, including the local SSH client process. This is a Master-side observation only:
 it does not trace the remote Worker shell/process tree after the SSH boundary and MUST NOT be represented as
 proof about Worker-side argv. If page size cannot be determined, the computed limit is invalid, the installed
 strace does not support either option, or the complete output cannot be parsed, record `INCOMPLETE`; do not
@@ -358,15 +358,21 @@ cannot be claimed by simply instantiating the current class unchanged.
 
 ### D13: Partial Run State and Optional Negative Suite Semantics
 
-**Chosen:** `--mode full` creates a new `TEST_RUN_ID` and an atomic mode-`0600` `run-state.json` under
-`artifacts/live-vps/<TEST_RUN_ID>/`. It records only non-secret target/config identity, repository commit,
-baseline-manifest reference, phase statuses and timestamps. It MUST NOT contain passwords, tokens, `SECRET_KEY`,
-`shortUuid`, or subscription contents. Partial modes require an existing run ID and matching run-state record;
-they verify target addresses, pinned repository commit, and non-secret configuration identity before resuming.
-`install` requires a successful preflight record; `verify` requires successful install records; `traffic`
-requires successful verification; `negative` requires an installed disposable environment; `teardown` requires
-an existing run and diagnostics/baseline record. A completed phase is not repeated implicitly. A mismatch or
-missing state record fails closed before remote modification.
+**Chosen:** A fresh `--mode preflight` without `--run-id` generates a new `TEST_RUN_ID`; it may also accept
+an explicitly supplied unused ID. Preflight performs read-only SSH inspection, stores the baseline manifest,
+and atomically creates a mode-`0600` `run-state.json` under
+`artifacts/live-vps/<TEST_RUN_ID>/run-state.json`. It prints the generated ID for the subsequent command.
+`--mode full` also generates a new ID and executes all phases in one run; it MUST reject an already existing
+run directory rather than overwrite it. The state records only non-secret target/config identity, repository
+commit, baseline-manifest reference, phase statuses and timestamps. It MUST NOT contain passwords, tokens,
+`SECRET_KEY`, `shortUuid`, subscription contents, or hashes of secret values.
+
+Every later partial mode (`install`, `verify`, `traffic`, `negative`, `teardown`) requires `--run-id` and an
+existing matching run-state record. It verifies target addresses, pinned repository commit and non-secret
+configuration identity before proceeding. `install` requires a successful preflight record; `verify` requires
+successful install records; `traffic` requires verification PASS; `negative` requires an installed disposable
+environment; `teardown` requires an existing run and diagnostics/baseline record. A completed phase is not
+repeated implicitly. A mismatch or missing state record fails closed before remote modification.
 
 `TEST_NEGATIVE_SUITE` defaults to `true`. When explicitly false, all 15 negative scenarios are `SKIP` and the
 overall result is at least `INCOMPLETE`; disabling the suite can never yield overall `PASS`.
