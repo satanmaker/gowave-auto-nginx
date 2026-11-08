@@ -362,7 +362,9 @@ Phase 10: Diagnostics Collection
   All written via redact-on-write; no plaintext secrets in any file
 
 Phase 11: Teardown
-  Apply configured policy (Preserve / Snapshot Restore / Destroy)
+  Apply configured policy (PRESERVE / RESTORE_SNAPSHOT / DESTROY)
+  v1: DESTROY is prohibited for operator-provisioned VPS; RESTORE_SNAPSHOT requires operator-supplied snapshot ID + verified external restore procedure
+  Record test outcome separately from teardown outcome; uninstall is not OS baseline restoration
   Write final result.json, junit.xml, summary.txt
   Release run-level lock
 ```
