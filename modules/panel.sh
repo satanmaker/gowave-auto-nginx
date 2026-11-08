@@ -164,6 +164,7 @@ except Exception:
 
     mkdir -p "$target_dir/frontend"
     tar -xzf "$tmp_dir/gowave-frontend.tar.gz" -C "$target_dir/frontend"
+    ln -sfn "$target_dir/frontend" "$target_dir/dist"
 
     # Set ownership if root
     ensure_gowave_user
