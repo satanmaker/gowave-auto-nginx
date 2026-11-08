@@ -249,10 +249,10 @@ is implied.
 
 `RESTORE_SNAPSHOT` is supported only through an explicit operator-supplied restore hook on the Control Machine.
 It requires `MASTER_SNAPSHOT_ID`, `WORKER_SNAPSHOT_ID`, an absolute `SNAPSHOT_RESTORE_HOOK` path, and a
-matching `SNAPSHOT_RESTORE_HOOK_SHA256`. Preflight verifies that the hook is a regular executable file owned
-by the runner user or root, is not group/world-writable, and matches the pinned SHA256; the digest is checked
-again immediately before execution. The hook path must not be a symlink; it must be a regular executable owned by the runner user or root and not
-group/world-writable. The runner invokes it directly with `shell=False` and sends this versioned JSON request
+matching `SNAPSHOT_RESTORE_HOOK_SHA256`. Preflight verifies that the absolute hook path is not a
+symlink, resolves to a regular executable owned by the runner user or root, is not group/world-writable, and
+matches the pinned SHA256; the digest is checked again immediately before execution. The runner invokes it
+directly with `shell=False` and sends this versioned JSON request
 on stdin:
 ```json
 {"schema_version":1,"action":"restore","test_run_id":"...","master":{"address":"...","snapshot_id":"..."},"worker":{"address":"...","snapshot_id":"..."}}
