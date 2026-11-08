@@ -367,7 +367,7 @@ Phase 10: Diagnostics Collection
   All written via redact-on-write; no plaintext secrets in any file
 
 Phase 11: Teardown
-  Apply configured policy (PRESERVE / RESTORE_SNAPSHOT / DESTROY)
+  Apply configured policy (PRESERVE / RESTORE_SNAPSHOT; DESTROY rejected in v1)
   v1: DESTROY is prohibited for operator-provisioned VPS; RESTORE_SNAPSHOT requires operator-supplied snapshot ID + verified external restore procedure
   Record test outcome separately from teardown outcome; uninstall is not OS baseline restoration
   Write final result.json, junit.xml, summary.txt
@@ -480,9 +480,7 @@ the following strict schema:
 | `TEST_TRAFFIC_VERIFICATION` | Boolean | No | `true` | Verify Data Plane traffic (`false` yields `INCOMPLETE`) |
 | `TEST_MIHOMO_TRAFFIC` | Boolean | No | `true` | Verify traffic with real Mihomo client process; false skips eight mandatory cases and makes overall status INCOMPLETE |
 | `TEST_NEGATIVE_SUITE` | Boolean | No | `true` | Execute NEG-01 through NEG-15 |
-| `TEST_KEEP_VPS_ON_FAILURE` | Boolean | No | `true` | Teardown policy: preserve VPS on failure |
-| `TEST_RESTORE_SNAPSHOT` | Boolean | No | `false` | Teardown policy: restore snapshot if supported |
-| `TEST_DESTROY_VPS_ON_SUCCESS` | Boolean | No | `false` | Teardown policy: destroy VPS on success (gated) |
+| `TEST_TEARDOWN_POLICY` | Enum: `PRESERVE`, `RESTORE_SNAPSHOT` | No | `PRESERVE` | Mutually exclusive teardown policy; `DESTROY` is rejected in v1 |
 | `ADMIN_EMAIL` | Email address | No | `admin@example.com` | Email for ACME certificate registration |
 
 ---
