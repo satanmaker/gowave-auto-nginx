@@ -4,6 +4,7 @@ import io
 import os
 from pathlib import Path
 import py_compile
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -42,6 +43,8 @@ class TestNonrootLint(unittest.TestCase):
 
     def test_openspec_validation(self):
         """OpenSpec validation command must pass across all specs."""
+        if shutil.which("openspec") is None:
+            self.skipTest("openspec CLI is not installed in the environment")
         res = subprocess.run(["openspec", "validate", "--all", "--strict"],
                              cwd=str(REPO_ROOT), capture_output=True, text=True)
         self.assertEqual(res.returncode, 0, f"OpenSpec validation failed:\n{res.stdout}\n{res.stderr}")
