@@ -96,6 +96,7 @@ generate_bootstrap_acme_vhost() {
     local reality_domain="$2"
     local out_file="${3:-/etc/nginx/conf.d/00-bootstrap-acme.conf}"
     local if_inet6="${4:-/proc/net/if_inet6}"
+    local vision_domain="${5:-}"
 
     mkdir -p "$(dirname "$out_file")"
     if [[ "$(id -u)" -eq 0 ]] || [[ -w "/var/www" ]]; then
@@ -108,12 +109,17 @@ generate_bootstrap_acme_vhost() {
         listen_v6="listen [::]:80;"
     fi
 
+    local server_names="$panel_domain $reality_domain"
+    if [[ -n "$vision_domain" ]]; then
+        server_names="$server_names $vision_domain"
+    fi
+
     cat > "$out_file" <<EOF
 # Managed by GoWave Auto NGINX: Bootstrap ACME
 server {
     listen 80;
     $listen_v6
-    server_name $panel_domain $reality_domain;
+    server_name $server_names;
 
     location /.well-known/acme-challenge/ {
         root $ACME_WEBROOT;
@@ -131,6 +137,7 @@ generate_production_http_vhost() {
     local reality_domain="$2"
     local out_file="${3:-/etc/nginx/conf.d/gowave-http.conf}"
     local if_inet6="${4:-/proc/net/if_inet6}"
+    local vision_domain="${5:-}"
 
     mkdir -p "$(dirname "$out_file")"
     if [[ "$(id -u)" -eq 0 ]] || [[ -w "/var/www" ]]; then
@@ -143,19 +150,26 @@ generate_production_http_vhost() {
         listen_v6="listen [::]:80;"
     fi
 
+    local server_names="$panel_domain $reality_domain"
+    local redirect_regex="${panel_domain}|${reality_domain}"
+    if [[ -n "$vision_domain" ]]; then
+        server_names="$server_names $vision_domain"
+        redirect_regex="${redirect_regex}|${vision_domain}"
+    fi
+
     cat > "$out_file" <<EOF
 # Managed by GoWave Auto NGINX: Port 80 ACME Challenge & Redirects
 server {
     listen 80 default_server;
     $listen_v6
-    server_name $panel_domain $reality_domain;
+    server_name $server_names;
 
     location /.well-known/acme-challenge/ {
         root $ACME_WEBROOT;
     }
 
     location / {
-        if (\$host ~* ^(${panel_domain}|${reality_domain})\$) {
+        if (\$host ~* ^(${redirect_regex})\$) {
             return 301 https://\$host\$request_uri;
         }
         return 444;

@@ -107,6 +107,50 @@ class TestNginxRouting(unittest.TestCase):
             self.assertTrue((cover_dir / "robots.txt").exists())
             self.assertTrue((cover_dir / "404.html").exists())
 
+    def test_generate_bootstrap_acme_vhost(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "00-bootstrap-acme.conf"
+            inet6 = tmp / "if_inet6"
+
+            # Case 1: Without vision domain
+            cmd1 = f'source "{NGINX_SH}" && generate_bootstrap_acme_vhost "panel.example.com" "reality.example.com" "{out}" "{inet6}"'
+            res1 = subprocess.run(["bash", "-c", cmd1], capture_output=True, text=True)
+            self.assertEqual(res1.returncode, 0, res1.stderr)
+            c1 = out.read_text()
+            self.assertIn("server_name panel.example.com reality.example.com;", c1)
+            self.assertNotIn("vision.example.com", c1)
+
+            # Case 2: With vision domain
+            cmd2 = f'source "{NGINX_SH}" && generate_bootstrap_acme_vhost "panel.example.com" "reality.example.com" "{out}" "{inet6}" "vision.example.com"'
+            res2 = subprocess.run(["bash", "-c", cmd2], capture_output=True, text=True)
+            self.assertEqual(res2.returncode, 0, res2.stderr)
+            c2 = out.read_text()
+            self.assertIn("server_name panel.example.com reality.example.com vision.example.com;", c2)
+
+    def test_generate_production_http_vhost(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "gowave-http.conf"
+            inet6 = tmp / "if_inet6"
+
+            # Case 1: Without vision domain
+            cmd1 = f'source "{NGINX_SH}" && generate_production_http_vhost "panel.example.com" "reality.example.com" "{out}" "{inet6}"'
+            res1 = subprocess.run(["bash", "-c", cmd1], capture_output=True, text=True)
+            self.assertEqual(res1.returncode, 0, res1.stderr)
+            c1 = out.read_text()
+            self.assertIn("server_name panel.example.com reality.example.com;", c1)
+            self.assertIn("if ($host ~* ^(panel.example.com|reality.example.com)$)", c1)
+            self.assertNotIn("vision.example.com", c1)
+
+            # Case 2: With vision domain
+            cmd2 = f'source "{NGINX_SH}" && generate_production_http_vhost "panel.example.com" "reality.example.com" "{out}" "{inet6}" "vision.example.com"'
+            res2 = subprocess.run(["bash", "-c", cmd2], capture_output=True, text=True)
+            self.assertEqual(res2.returncode, 0, res2.stderr)
+            c2 = out.read_text()
+            self.assertIn("server_name panel.example.com reality.example.com vision.example.com;", c2)
+            self.assertIn("if ($host ~* ^(panel.example.com|reality.example.com|vision.example.com)$)", c2)
+
     def test_generate_vision_fallback_vhost(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

@@ -43,8 +43,21 @@ The system SHALL support Trojan protocol over gRPC transport with TLS multiplexe
 - **WHEN** the client sends gRPC calls over HTTP/2 to the Trojan service path
 - **THEN** NGINX routes gRPC frames to Xray port 10003 and authenticates user traffic.
 
+### Requirement: Optional Native VLESS XTLS Vision Profile
+The system SHALL support an optional VLESS with direct XTLS-Vision flow (`xtls-rprx-vision`) routed through NGINX Stream port 443 into Xray port 8444 when a dedicated 3rd domain/subdomain (`vision_domain`) is provided.
+
+#### Scenario: Optional VLESS XTLS Vision provisioning with 3rd domain
+- **GIVEN** a deployment invocation with a valid `vision_domain`
+- **WHEN** provisioning executes
+- **THEN** Let's Encrypt issues certificates for `vision_domain`, Xray terminates TLS on port 8444 with `acceptProxyProtocol: true`, NGINX stream multiplexes `vision_domain` to 8444, non-VLESS HTTP fallback routes to loopback 9444, and a 5th inbound and Host record are provisioned.
+
+#### Scenario: Default provisioning without optional Vision
+- **GIVEN** a deployment invocation without `vision_domain`
+- **WHEN** provisioning executes
+- **THEN** exactly 4 core inbounds (`vless-reality`, `vless-xhttp`, `vless-ws`, `trojan-grpc`) and 4 Host records are provisioned, skipping Vision certificate acquisition, stream route, and fallback vhost.
+
 ### Requirement: Automated Profile Provisioning via GoWave API
-The installer SHALL provision the 5 MVP protocol profiles by creating a single unified Config Profile via `POST /api/config-profiles`, associating the profile and its 5 inbounds to active nodes, and verifying `GET /api/config-profiles/{uuid}/computed-config`.
+The installer SHALL provision the protocol profiles (4 core profiles by default; 5 profiles when optional Vision is enabled with a dedicated 3rd domain) by creating a single unified Config Profile via `POST /api/config-profiles`, associating the profile and its inbounds to active nodes, and verifying `GET /api/config-profiles/{uuid}/computed-config`.
 
 #### Scenario: Single unified Config Profile provisioning with 5 inbounds
 - **GIVEN** a newly installed GoWave Panel and registered Node
@@ -147,9 +160,9 @@ The system SHALL support issuing long-lived API tokens via `POST /api/tokens` wi
 - **THEN** GoWave generates a persistent API token, returns the bearer token, and the installer records the token and panel endpoint into `/root/gowave-credentials.txt` with mode `0600`.
 
 ### Requirement: Formal Scope Boundaries for Auxiliary Protocols
-The installer SHALL NOT configure direct VLESS-TLS-Vision (without REALITY), Hysteria 2, or AmneziaWG in the MVP release.
+The installer SHALL NOT configure Hysteria 2 or AmneziaWG in the MVP release.
 
-#### Scenario: Rejection of non-MVP protocol options
+#### Scenario: Rejection of deferred non-MVP protocol options
 - **GIVEN** an MVP deployment
 - **WHEN** protocol profile configuration is evaluated
-- **THEN** only the 4 native profiles are provisioned, and direct TLS Vision, Hysteria 2, and AmneziaWG are documented as deferred non-goals.
+- **THEN** only the 4 core profiles (and optional 5th VLESS-Vision profile if a 3rd domain is provided) are provisioned, and Hysteria 2 and AmneziaWG are documented as deferred non-goals.

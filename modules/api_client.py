@@ -179,10 +179,6 @@ class GoWaveClient:
         if short_ids is None:
             short_ids = [secrets.token_hex(8) for _ in range(8)]
 
-        v_domain = vision_domain or (f"vision.{panel_domain}" if panel_domain else "vision.example.com")
-        cert_file = f"/etc/letsencrypt/live/{v_domain}/fullchain.pem"
-        key_file = f"/etc/letsencrypt/live/{v_domain}/privkey.pem"
-
         # 1. Inbound REALITY
         reality_template = json.loads((XRAY_ASSETS_DIR / "vless-reality.json").read_text())
         reality_template["tag"] = f"vless-reality-{node_name}"
@@ -192,32 +188,43 @@ class GoWaveClient:
         if public_key:
             reality_template["streamSettings"]["realitySettings"].setdefault("settings", {})["publicKey"] = public_key
 
-        # 2. Inbound Vision (VLESS + XTLS Vision)
-        vision_template = json.loads((XRAY_ASSETS_DIR / "vless-vision.json").read_text())
-        vision_template["tag"] = f"vless-vision-{node_name}"
-        if "fallbacks" in vision_template.get("settings", {}):
-            for fb in vision_template["settings"]["fallbacks"]:
-                if fb.get("name") == "DOMAIN_PLACEHOLDER":
-                    fb["name"] = v_domain
-        tls_settings = vision_template["streamSettings"]["tlsSettings"]
-        tls_settings["serverName"] = v_domain
-        for cert in tls_settings.get("certificates", []):
-            if cert.get("certificateFile") == "CERT_FILE_PLACEHOLDER":
-                cert["certificateFile"] = cert_file
-            if cert.get("keyFile") == "KEY_FILE_PLACEHOLDER":
-                cert["keyFile"] = key_file
+        inbounds = [reality_template]
+
+        # 2. Optional Inbound Vision (VLESS + XTLS Vision) - only compiled when a dedicated 3rd domain is provided
+        if vision_domain:
+            v_domain = vision_domain
+            cert_file = f"/etc/letsencrypt/live/{v_domain}/fullchain.pem"
+            key_file = f"/etc/letsencrypt/live/{v_domain}/privkey.pem"
+
+            vision_template = json.loads((XRAY_ASSETS_DIR / "vless-vision.json").read_text())
+            vision_template["tag"] = f"vless-vision-{node_name}"
+            if "fallbacks" in vision_template.get("settings", {}):
+                for fb in vision_template["settings"]["fallbacks"]:
+                    if fb.get("name") == "DOMAIN_PLACEHOLDER":
+                        fb["name"] = v_domain
+            tls_settings = vision_template["streamSettings"]["tlsSettings"]
+            tls_settings["serverName"] = v_domain
+            for cert in tls_settings.get("certificates", []):
+                if cert.get("certificateFile") == "CERT_FILE_PLACEHOLDER":
+                    cert["certificateFile"] = cert_file
+                if cert.get("keyFile") == "KEY_FILE_PLACEHOLDER":
+                    cert["keyFile"] = key_file
+            inbounds.append(vision_template)
 
         # 3. Inbound XHTTP
         xhttp_template = json.loads((XRAY_ASSETS_DIR / "vless-xhttp.json").read_text())
         xhttp_template["tag"] = f"vless-xhttp-{node_name}"
+        inbounds.append(xhttp_template)
 
         # 4. Inbound WS
         ws_template = json.loads((XRAY_ASSETS_DIR / "vless-ws.json").read_text())
         ws_template["tag"] = f"vless-ws-{node_name}"
+        inbounds.append(ws_template)
 
         # 5. Inbound Trojan gRPC
         trojan_template = json.loads((XRAY_ASSETS_DIR / "trojan-grpc.json").read_text())
         trojan_template["tag"] = f"trojan-grpc-{node_name}"
+        inbounds.append(trojan_template)
 
         # Authoritative routing block preserving node API management rule before SSRF blocking
         routing_block = {
@@ -247,13 +254,7 @@ class GoWaveClient:
         }
 
         raw_xray = {
-            "inbounds": [
-                reality_template,
-                vision_template,
-                xhttp_template,
-                ws_template,
-                trojan_template,
-            ],
+            "inbounds": inbounds,
             "routing": routing_block,
         }
         return json.dumps(raw_xray, indent=2)
@@ -296,8 +297,10 @@ class GoWaveClient:
             computed_json = computed_data
 
         inbounds = computed_json.get("inbounds", []) if isinstance(computed_json, dict) else []
-        if len(inbounds) != 5:
-            raise GoWaveAPIError(f"5-point checklist failure: expected 5 inbounds, got {len(inbounds)}")
+        expected_raw = json.loads(raw_config_json) if isinstance(raw_config_json, str) else raw_config_json
+        expected_count = len(expected_raw.get("inbounds", [])) if isinstance(expected_raw, dict) else 4
+        if len(inbounds) != expected_count:
+            raise GoWaveAPIError(f"5-point checklist failure: expected {expected_count} inbounds, got {len(inbounds)}")
 
         # Retrieve inbounds list
         inbounds_res = self.request("GET", f"/api/config-profiles/{profile_uuid}/inbounds")
