@@ -249,11 +249,10 @@ class GoWaveClient:
 
         if target_uuid:
             existing = next(p for p in profiles_list if p.get("uuid") == target_uuid)
-            full_before = self.request("GET", f"/api/config-profiles/{target_uuid}")
-            full_before = full_before.get("response", full_before) if isinstance(full_before, dict) else full_before
-            if not isinstance(full_before, dict) or "config" not in full_before:
-                raise GoWaveAPIError(f"Cannot safely update profile {target_uuid}: rollback configuration snapshot is incomplete")
-            before = {k: full_before[k] for k in ("name", "config") if k in full_before}
+            existing = next((p for p in profiles_list if p.get("uuid") == target_uuid), None)
+            if not isinstance(existing, dict) or not all(k in existing for k in ("name", "config")):
+                raise GoWaveAPIError(f"Cannot safely update profile {target_uuid}: profile list has no complete rollback configuration snapshot")
+            before = {"name": existing["name"], "config": existing["config"]}
             self._record_transaction_entity("profile", target_uuid, "updated", before)
             self.request("PATCH", f"/api/config-profiles/{target_uuid}", {"name": profile_name, "config": raw_config_json})
             profile_uuid = target_uuid
