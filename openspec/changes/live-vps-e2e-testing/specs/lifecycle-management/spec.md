@@ -4,9 +4,9 @@
 
 ### Requirement: Explicit ACME Endpoint Selection and Certificate Lineage Isolation
 
-The installer and distributed orchestrator SHALL accept an explicit ACME directory URL, defaulting to the existing Let's Encrypt production endpoint when unset. v1 SHALL allow only the exact Let's Encrypt production and staging directory URLs; arbitrary ACME URLs MUST be rejected. The selected endpoint SHALL be propagated from Master to Worker over the existing SSH stdin payload. The installer SHALL use a certificate lineage that is unambiguously associated with that ACME directory; a staging certificate MUST NOT be reused as a production certificate, and a production certificate MUST NOT satisfy a staging acceptance run.
-
-The current NGINX configuration consumes certificate files from `/etc/letsencrypt/live/<domain>/`. The implementation MUST preserve that path contract for the active deployment or update every dependent NGINX path atomically. It MUST NOT silently point production services at a staging lineage. Reuse is permitted only when the existing lineage's renewal configuration identifies the same ACME directory and the certificate is valid for the requested domain.
+The installer and distributed orchestrator SHALL accept an explicit ACME directory URL, defaulting to Let's Encrypt
+production when unset. Only official Let's Encrypt production and staging URLs are allowed in v1. The URL SHALL be
+propagated from Master to Worker over SSH stdin. A staging lineage MUST NOT be reused as production, nor production as staging.
 
 #### Scenario: Staging certificate issued on a clean disposable Master
 

@@ -341,7 +341,10 @@ PROXY protocol SHALL be correctly forwarded.
 
 ### Requirement: Data Plane E2E Traffic Through All Eight VPN Endpoints
 
-The runner SHALL verify eight logical endpoints: four protocols on Master and the same four protocols on Worker. Each logical endpoint MUST be exercised independently by both a real Xray client process and a real Mihomo client process, yielding sixteen mandatory runtime cases. Syntax validation (`xray run -test` or `mihomo -t`) is necessary but does not count as runtime traffic verification. All endpoint tests SHALL use the actual subscription data and shall record client-observed egress plus target-VPS ingress evidence.
+The runner SHALL verify eight logical endpoints (four protocols on Master and four on Worker). Each endpoint MUST
+be exercised independently by both a real Xray client process and a real Mihomo client process, yielding sixteen
+mandatory runtime cases. All tests SHALL use actual subscription data and verify client-observed egress plus target-VPS
+ingress evidence; syntax-only checks do not count as traffic verification.
 
 #### Scenario: Eight logical endpoints are exercised by both clients
 
@@ -513,8 +516,9 @@ token, raw `shortUuid`, or subscription content containing private parameters.
 ### Requirement: Result Status Semantics
 
 The runner SHALL use exactly the status values: `PASS`, `FAIL`, `SKIP`, `NOT_RUN`, `PARTIAL`, `INCOMPLETE`,
-`TEARDOWN_FAILED`. `SKIP` and `NOT_RUN` SHALL NOT be treated as passing states. Overall `PASS` requires all mandatory phases completed, all sixteen Data Plane runtime cases (eight logical endpoints × Xray and Mihomo) verified, and the declared teardown policy completed or explicitly satisfied. `PRESERVE` is a valid completed teardown policy; it does not mean the VPS was reset.
-`shortUuid` SHALL NOT appear in JUnit XML or any CI-published artifact.
+and `TEARDOWN_FAILED`. Overall `PASS` requires all mandatory phases completed, all sixteen Data Plane runtime
+cases verified, and the declared teardown policy completed. `SKIP` and `NOT_RUN` are non-passing. `shortUuid`
+SHALL NOT appear in JUnit XML or any CI-published artifact.
 
 #### Scenario: PASS requires all sixteen Data Plane runtime cases
 
