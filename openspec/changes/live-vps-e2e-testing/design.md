@@ -215,9 +215,15 @@ to protect a shared VPS pair from two different Control Machines.
    silently reconnect and continue without reacquiring both locks and validating the saved run state. Outside
    an already executing `RESTORE_SNAPSHOT` teardown, this is a terminal `INCOMPLETE` condition. During that
    declared teardown only, loss caused by snapshot reboot is an expected interruption: keep teardown
-   non-passing, wait for the restore hook to confirm both resources, reacquire both locks in deterministic
-   order, and validate the saved run identity plus clean baseline before finalizing teardown. Failed
-   reacquisition or validation remains `TEARDOWN_FAILED`; no other phase may resume.
+   non-passing and wait for the restore hook to confirm both resources. Because the hook may reboot only one
+   VPS, the other host's original SSH holder may still own its kernel lock. Before reacquiring the pair, the
+   runner MUST explicitly close/release **both** original holder sessions (including any surviving session),
+   confirm their termination, and then acquire a fresh pair in deterministic address order. It MUST NOT open
+   a replacement holder on a host while its previous holder from the same run may still hold that lock.
+   If another controller acquires either lock during this release/reacquisition window, release any lock
+   already reacquired and fail teardown closed as `TEARDOWN_FAILED`; do not bypass or steal the contender's
+   lock. Validate saved run identity and clean baseline while the new pair is held before finalizing teardown.
+   Failed reacquisition or validation remains `TEARDOWN_FAILED`; no other phase may resume.
 
 **Rationale:** A lock under `/tmp` on the Control Machine only serializes processes on that one machine.
 Two operators or CI runners on different hosts could otherwise mutate the same Master or Worker at once.
@@ -368,13 +374,17 @@ The hook must exit zero and return valid JSON:
 ```
 Both returned snapshot IDs must exactly match the request. Hook stdout/stderr are captured in memory and MUST
 NOT be published verbatim; the operation is bounded by `RESTORE_TIMEOUT`.
-The runner then reconnects to both VPS and reacquires both authoritative remote `flock` sessions in the same
-deterministic address order used by preflight. It verifies the saved run identity and recollects the Phase 0
-baseline while both locks are held; only then may teardown be recorded `PASS`. Snapshot restoration may reboot
-either VPS and terminate the original lock-holder sessions, so the runner MUST NOT treat the hook's
-`RESTORED` response alone as teardown success or continue baseline verification without reacquiring both locks.
-If either lock cannot be reacquired, the saved run identity differs, or the baseline differs, teardown is
-`TEARDOWN_FAILED`; no further mutating phase may start. Keep both replacement locks through final reporting
+After the hook confirms both resources, the runner reconnects to both VPS. Snapshot restoration may reboot
+only one VPS; therefore, the original holder session on the non-rebooted host may still own its kernel lock.
+The runner MUST close/release both original lock-holder sessions, including a surviving session, and confirm
+that neither remains active before opening replacement holders. It then reacquires the complete pair in the
+same deterministic address order used by preflight. It MUST NOT try to acquire a second lock on a host while
+the first holder from the same run is still alive. If another controller wins either lock during this
+intentional release/reacquisition window, release any lock already reacquired and fail teardown as
+`TEARDOWN_FAILED`; never bypass a contender. It verifies the saved run identity and recollects the Phase 0
+baseline while both replacement locks are held; only then may teardown be recorded `PASS`. The hook's
+`RESTORED` response alone is never teardown success. If either lock cannot be reacquired, the saved run
+identity differs, or the baseline differs, teardown is `TEARDOWN_FAILED`; no further mutating phase may start. Keep both replacement locks through final reporting
 and release them only after the final result is durably written. Missing/invalid hook configuration is a
 preflight `FAIL`; hook timeout, nonzero exit, invalid/mismatched response or failed reconnection also produces
 `TEARDOWN_FAILED`, never a simulated restore success. The hook may use operator-managed provider credentials
@@ -483,12 +493,14 @@ When the pair is configured:
    pre-transaction presence/identity of the Worker, REALITY and optional Vision lineages; remove only lineages
    created by this transaction, and restore any pre-existing lineage changed by Certbot from a secure snapshot.
    The same ownership rule applies to bootstrap names, renewal metadata, stream-map entries, the 9444 vhost,
-   generated inbound/profile/host state and deploy-hook effects. Rollback MUST restore a valid NGINX
-   configuration before reload and MUST NOT delete unrelated resources. If ownership or restoration cannot
-   be proven, fail closed and report cleanup incomplete. The Master orchestrator MUST check and record both
-   remote Worker rollback and Panel API rollback results; it MUST NOT suppress a failed `remote_rollback` with
-   `|| true`. If either compensation fails, preserve the recovery journal, mark rollback incomplete and force
-   the E2E run to `INCOMPLETE`; only verified success of both sides is rollback PASS.
+   generated inbound/profile/host state and deploy-hook effects. The host-global
+   `gowave-nginx.sh` deploy hook MUST follow D17 ownership checks: a pre-existing hook blocks the disposable
+   run; rollback may remove only a hook created by and still matching this transaction. Rollback MUST restore
+   a valid NGINX configuration before reload and MUST NOT delete unrelated resources. If ownership or
+   restoration cannot be proven, fail closed and report cleanup incomplete. The Master orchestrator MUST
+   check and record both remote Worker rollback and Panel API rollback results; it MUST NOT suppress a failed
+   `remote_rollback` with `|| true`. If either compensation fails, preserve the recovery journal, mark
+   rollback incomplete and force the E2E run to `INCOMPLETE`; only verified success of both sides is rollback PASS.
 5. Panel API acceptance MUST verify five inbounds and five corresponding hosts per node, including each
    Vision inbound/host association. The subscription MUST expose one Vision proxy per VPS, and Xray and
    Mihomo MUST each execute the two Vision endpoints as independent runtime cases.
@@ -543,6 +555,40 @@ public-CA bundle; staging mode uses the same bundle plus the four validated Stag
 **Rationale:** Master installation calls `verify_public_tls_sni` after certificate issuance, and domain change
 calls it after certificate replacement. Without a scoped trust override, a valid staging certificate fails
 that local OpenSSL probe because the staging roots are intentionally absent from system trust.
+
+---
+
+### D17: Ownership of the Host-Global Certbot Deploy Hook
+
+**Chosen:** `/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` is a host-global Certbot deploy hook,
+not a per-domain ACME lineage file. Certbot may execute it after renewal of any certificate on that host.
+The current Master and Worker installers write to this fixed path, while Worker rollback removes it
+unconditionally. It therefore MUST be handled as a separately owned host resource on both VPS.
+
+1. Before the first remote mutation, inspect the exact hook path on Master and Worker. If the path exists
+   (including a symlink, directory, or non-regular object), fail the disposable-baseline gate unless the
+   runner can prove that the object was created and is still owned by the same active E2E transaction.
+   Do not overwrite, follow, or delete an unowned object. Validate the parent directory and its permissions
+   before writing.
+2. When the current transaction creates the hook, record in the host-local recovery journal that the path
+   was absent and that this transaction owns the new file. Create it atomically in the same directory with
+   root ownership and mode `0755`; do not follow symlinks. Record the resulting file identity and SHA-256
+   so cleanup can distinguish the transaction's file from a later replacement.
+3. On failed installation or compensation, remove the hook only when the journal proves this transaction
+   created it and the current regular file still matches the recorded identity and digest. If it was replaced,
+   modified, or cannot be safely inspected, preserve it, retain recovery state, and report cleanup incomplete.
+   Never issue an unconditional `rm -f` for this shared path.
+4. On successful commit, retain the newly installed GoWave hook as an owned deployment resource. Any later
+   managed removal may delete it only after validating the same ownership record and current identity/digest.
+   A pre-existing unrelated hook is never replaced or removed. The same rules apply independently on Master
+   and Worker.
+5. Tests MUST cover a pre-existing sentinel hook (preflight rejects without changing bytes, mode, owner, or
+   symlink target), a transaction-created hook removed after a later injected failure, a modified/replaced hook
+   preserved during rollback with an incomplete-recovery result, and successful commit retaining the new hook.
+
+**Rationale:** The ACME lineage snapshot in D15 captures per-domain renewal/certificate material, but it does
+not cover this shared hook. Treating the hook as lineage state would miss a global side effect and could
+silently disable an unrelated renewal workflow.
 
 ---
 
