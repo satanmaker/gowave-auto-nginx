@@ -647,6 +647,29 @@ execute guaranteed cleanup and post-case baseline verification.
 
 ---
 
+### Requirement: Global Certbot Deploy Hook Ownership
+
+The runner and installers SHALL treat
+`/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` as a host-global resource, independent of the
+per-domain lineage snapshots. Before mutation on either VPS, an existing hook path (including a symlink or
+non-regular object) SHALL cause preflight failure unless ownership by the same active transaction is proven.
+A transaction-created hook SHALL be recorded in the host-local recovery journal, created atomically, and
+removed during failed compensation only when its recorded identity and digest still match. A replaced or
+modified hook SHALL be preserved and recovery SHALL be reported incomplete. Successful commit retains the
+new managed hook; unowned pre-existing hooks are never overwritten or deleted.
+
+#### Scenario: Pre-existing global deploy hook blocks installation safely
+
+- **GIVEN** Master or Worker already has a deploy hook at the managed path, including a symlink or non-regular object
+- **WHEN** the runner performs disposable-baseline and hook-ownership preflight
+- **THEN** it fails before remote mutation and preserves the original path, target, bytes, owner, group, and mode
+
+#### Scenario: Transaction-created hook is cleaned up only while still owned
+
+- **GIVEN** the hook path was absent at preflight and the current transaction creates the managed hook
+- **WHEN** a later installation failure triggers compensation
+- **THEN** rollback removes the hook only if the journal proves transaction ownership and the current identity/digest still match; a modified/replaced path is preserved and cleanup is marked incomplete
+
 ### Requirement: Teardown Policy Enforcement
 
 The runner SHALL accept one mutually exclusive `TEST_TEARDOWN_POLICY`: `PRESERVE` (default) or
@@ -687,9 +710,15 @@ Teardown is reported separately from test outcome; overall `PASS` requires the s
 
 #### Scenario: Snapshot restore reacquires the remote lock pair before baseline verification
 
-- **GIVEN** snapshot restoration has rebooted one or both VPS and terminated the original remote lock-holder sessions
+- **GIVEN** snapshot restoration has rebooted one or both VPS; the original lock-holder session on a non-rebooted host may still be alive
 - **WHEN** both restored VPS become reachable again
-- **THEN** the runner reacquires both authoritative locks in deterministic address order, validates the saved run identity, and only then checks the clean baseline; failure to reacquire either lock or a baseline mismatch yields `TEARDOWN_FAILED`, never `PASS`
+- **THEN** the runner explicitly closes/releases both original holder sessions (including any surviving session), confirms termination, then reacquires a fresh pair in deterministic address order before validating saved run identity and the clean baseline. It never acquires a replacement lock while its own previous holder may still own that host lock. If another controller acquires either lock during the release/reacquisition window, any lock already reacquired is released and teardown becomes `TEARDOWN_FAILED`; failure to reacquire, identity mismatch, or baseline mismatch also yields `TEARDOWN_FAILED`, never `PASS`
+
+#### Scenario: Single-host snapshot reboot does not self-deadlock lock reacquisition
+
+- **GIVEN** only Master (or only Worker) is rebooted by the restore hook and the other VPS remains online with its original SSH lock-holder session
+- **WHEN** both hosts become reachable and the runner prepares the post-restore baseline check
+- **THEN** it closes/releases the surviving old holder before acquiring the pair again; the test proves no self-deadlock, both locks are held during baseline verification, and a competing controller winning either lock causes safe `TEARDOWN_FAILED`
 
 #### Scenario: Snapshot restore hook success requires baseline verification
 
