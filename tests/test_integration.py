@@ -8,8 +8,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
+import socket
 import sqlite3
 import ssl
+import subprocess
 import sys
 import tempfile
 import threading
@@ -304,11 +306,92 @@ class TestIntegration(unittest.TestCase):
         self.assertIn("squad-uuid-test", created_user["activeInternalSquads"])
 
     def test_mtls_handshake_mock(self):
-        """Verify mTLS connection behavior and TLS 1.3 requirements."""
-        # Create an SSL context enforcing TLS 1.3
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-        self.assertEqual(ctx.minimum_version, ssl.TLSVersion.TLSv1_3)
+        """Verify mutual TLS 1.3 handshake with HKDF-derived SNI and client certificate verification."""
+        from modules.verify_node_mtls import derive_sni, perform_mtls_handshake
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            ca_key = tmp / "ca.key"
+            ca_crt = tmp / "ca.crt"
+            node_key = tmp / "node.key"
+            node_csr = tmp / "node.csr"
+            node_crt = tmp / "node.crt"
+            jwt_key = tmp / "jwt.key"
+            jwt_pub = tmp / "jwt.pub"
+
+            # Generate CA (ECDSA P-256)
+            subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(ca_key)],
+                           check=True, stderr=subprocess.DEVNULL)
+            subprocess.run(["openssl", "req", "-x509", "-new", "-key", str(ca_key), "-out", str(ca_crt),
+                            "-days", "365", "-subj", "/CN=IntegrationCA"], check=True, stderr=subprocess.DEVNULL)
+
+            # Generate Node cert signed by CA
+            subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(node_key)],
+                           check=True, stderr=subprocess.DEVNULL)
+            subprocess.run(["openssl", "req", "-new", "-key", str(node_key), "-out", str(node_csr),
+                            "-subj", "/CN=IntegrationNode"], check=True, stderr=subprocess.DEVNULL)
+            subprocess.run(["openssl", "x509", "-req", "-in", str(node_csr), "-CA", str(ca_crt),
+                            "-CAkey", str(ca_key), "-CAcreateserial", "-out", str(node_crt), "-days", "365"],
+                           check=True, stderr=subprocess.DEVNULL)
+
+            # Generate RSA JWT public key
+            subprocess.run(["openssl", "genrsa", "-out", str(jwt_key), "2048"], check=True, stderr=subprocess.DEVNULL)
+            subprocess.run(["openssl", "rsa", "-in", str(jwt_key), "-pubout", "-out", str(jwt_pub)],
+                           check=True, stderr=subprocess.DEVNULL)
+
+            ca_pem = ca_crt.read_text()
+            jwt_pub_pem = jwt_pub.read_text()
+            node_cert_pem = node_crt.read_text()
+            node_key_pem = node_key.read_text()
+
+            # Derive exact HKDF SNI
+            expected_sni = derive_sni(ca_pem, jwt_pub_pem)
+            self.assertTrue(expected_sni.endswith((".com", ".net", ".org", ".io", ".dev", ".app")))
+
+            # Start real TLS 1.3 server requiring client certificate and verifying SNI
+            server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            server_ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+            server_ctx.load_cert_chain(str(node_crt), str(node_key))
+            server_ctx.load_verify_locations(str(ca_crt))
+            server_ctx.verify_mode = ssl.CERT_REQUIRED
+
+            sni_seen = []
+            def sni_callback(ssl_sock, server_name, initial_context):
+                sni_seen.append(server_name)
+                if server_name != expected_sni:
+                    return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+                return None
+            server_ctx.sni_callback = sni_callback
+
+            server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_sock.bind(("127.0.0.1", 0))
+            server_sock.listen(1)
+            port = server_sock.getsockname()[1]
+
+            def run_server():
+                try:
+                    raw_conn, _ = server_sock.accept()
+                    conn = server_ctx.wrap_socket(raw_conn, server_side=True)
+                    data = conn.recv(1024)
+                    if b"GET /node/xray/healthcheck" in data:
+                        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 22\r\n\r\n{\"response\":{\"ok\":true}}")
+                    conn.close()
+                except Exception:
+                    pass
+                finally:
+                    server_sock.close()
+
+            t = threading.Thread(target=run_server)
+            t.daemon = True
+            t.start()
+
+            # Execute real mTLS 1.3 handshake with perform_mtls_handshake
+            res = perform_mtls_handshake("127.0.0.1", port, expected_sni, ca_pem, node_cert_pem, node_key_pem)
+            self.assertEqual(res["tls_version"], "TLSv1.3")
+            self.assertIn("200 OK", res["status_line"])
+            self.assertEqual(sni_seen, [expected_sni])
+            t.join(timeout=2.0)
 
 
 if __name__ == "__main__":

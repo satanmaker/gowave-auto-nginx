@@ -5,10 +5,11 @@ set -euo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BACKUP_STORE="/var/backups/gowave"
-RECOVERY_STORE="/var/lib/gowave-auto-nginx/recovery"
-DEFAULT_GOWAVE_DIR="/opt/gowave"
-DEFAULT_NODE_DIR="/opt/gowave-node"
+BACKUP_STORE="${BACKUP_STORE:-/var/backups/gowave}"
+RECOVERY_STORE="${RECOVERY_STORE:-/var/lib/gowave-auto-nginx/recovery}"
+JOURNAL_FILE="${JOURNAL_FILE:-${RECOVERY_STORE}/journal.json}"
+DEFAULT_GOWAVE_DIR="${GOWAVE_DIR:-/opt/gowave}"
+DEFAULT_NODE_DIR="${NODE_DIR:-/opt/gowave-node}"
 
 log_info() { printf '[INFO] %s\n' "$*"; }
 log_warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -177,8 +178,20 @@ with tarfile.open(archive_path, "r:gz") as tar:
         # 5. Symbolic links check
         if m.issym():
             link_target = m.linkname
-            if link_target.startswith("/") or ".." in link_target.split("/"):
+            if link_target.startswith("/") or link_target.startswith("\\"):
+                fail(f"Absolute symbolic link rejected in member {clean_name} -> {link_target}")
+            link_dir = posixpath.dirname(clean_name)
+            resolved_target = posixpath.normpath(posixpath.join(link_dir, link_target))
+            if resolved_target.startswith("../") or resolved_target == ".." or not resolved_target.startswith("files/"):
                 fail(f"Symbolic link escape detected in member {clean_name} -> {link_target}")
+            rel_resolved = resolved_target[6:]
+            matched_target = False
+            for pattern in allowlist:
+                if fnmatch.fnmatch(rel_resolved, pattern):
+                    matched_target = True
+                    break
+            if not matched_target:
+                fail(f"Symbolic link target '{rel_resolved}' is outside allowlist for member {clean_name}")
 
         # 11. Checksum validation against meta.json
         if m.isreg():
@@ -273,7 +286,7 @@ sqlite_online_backup('$gowave_dir/gowave.db', '$tmp_staging/files/opt/gowave/gow
         mkdir -p "$tmp_staging/files/etc/letsencrypt"
         for dir in archive live renewal; do
             if [[ -d "/etc/letsencrypt/$dir" ]]; then
-                cp -r "/etc/letsencrypt/$dir" "$tmp_staging/files/etc/letsencrypt/"
+                cp -a "/etc/letsencrypt/$dir" "$tmp_staging/files/etc/letsencrypt/"
             fi
         done
         # Record certificate files
@@ -361,28 +374,6 @@ cmd_restore() {
 
     echo "==> Initiating Restore from $archive (type: $expected_type)..."
 
-    local ts
-    ts=$(date +%s)
-    local restore_snap="${RECOVERY_STORE}/restore-${ts}"
-    mkdir -p "$restore_snap"
-    chmod 0700 "$restore_snap" 2>/dev/null || true
-
-    # Step 1: Pre-restore persistent snapshotting
-    echo "Capturing pre-restore snapshot in $restore_snap..."
-    if [[ "$expected_type" == "panel" ]]; then
-        if [[ -f "$DEFAULT_GOWAVE_DIR/gowave.db" ]]; then
-            cp "$DEFAULT_GOWAVE_DIR/gowave.db" "$restore_snap/gowave.db"
-        fi
-        if [[ -f "$DEFAULT_GOWAVE_DIR/.env" ]]; then
-            cp "$DEFAULT_GOWAVE_DIR/.env" "$restore_snap/.env"
-        fi
-    else
-        if [[ -f "$DEFAULT_NODE_DIR/.env" ]]; then
-            cp "$DEFAULT_NODE_DIR/.env" "$restore_snap/.env"
-        fi
-    fi
-
-    # Step 2: 15-point preflight validation & extraction to staging directory
     local staging_dir
     staging_dir=$(mktemp -d "/tmp/gowave-restore-staging-XXXXXX")
     trap 'rm -rf "$staging_dir"' RETURN
@@ -390,40 +381,279 @@ cmd_restore() {
     echo "Running 15-point preflight archive security validation..."
     validate_archive_py "$archive" "$expected_type" "$staging_dir"
 
-    # Step 3: Atomic file restoration
-    echo "Applying restored files..."
+    # Pre-check: verify SQLite integrity of staged database before stopping services or modifying live files
+    if [[ "$expected_type" == "panel" ]] && [[ -f "$staging_dir/files/opt/gowave/gowave.db" ]]; then
+        echo "Verifying staged SQLite database integrity..."
+        local integrity_ok
+        integrity_ok=$(python3 -c "
+import sqlite3, sys
+try:
+    conn = sqlite3.connect('$staging_dir/files/opt/gowave/gowave.db')
+    res = conn.execute('PRAGMA integrity_check;').fetchall()
+    conn.close()
+    if res and res[0][0] == 'ok':
+        print('ok')
+    else:
+        print(f'corrupt: {res}')
+        sys.exit(1)
+except Exception as e:
+    print(f'error: {e}')
+    sys.exit(1)
+" 2>/dev/null || echo "failed")
+        if [[ "$integrity_ok" != "ok" ]]; then
+            die "Pre-restore check failed: staged database integrity check returned: $integrity_ok"
+        fi
+        echo "Staged database integrity check PASSED."
+    fi
+
+    local ts
+    ts=$(date +%s)
+    local restore_snap="${RECOVERY_STORE}/restore-${ts}"
+    mkdir -p "$restore_snap"
+    chmod 0700 "$restore_snap" 2>/dev/null || true
+
+    # Helper function to write journal atomically
+    update_restore_journal() {
+        local j_state="$1"
+        local j_snap="${2:-$restore_snap}"
+        local j_err="${3:-}"
+
+        python3 -c "
+import sys, time
+for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+from modules.recovery import write_journal_atomically
+
+jdata = {
+    'transaction_id': 'restore-$ts',
+    'op': 'restore',
+    'state': '$j_state',
+    'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    'snapshot_dir': '$j_snap'
+}
+if '$j_err':
+    jdata['error'] = '$j_err'
+write_journal_atomically('$JOURNAL_FILE', jdata)
+" 2>/dev/null || true
+    }
+
+    # Step 1: Initialize PREPARED journal state
+    update_restore_journal "PREPARED"
+
+    # Stop service prior to live database snapshot / replacement to avoid dirty WAL
+    local gowave_was_active=false
+    local gowave_node_was_active=false
+    if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
+        if [[ "$expected_type" == "panel" ]]; then
+            if systemctl is-active --quiet gowave.service 2>/dev/null; then
+                gowave_was_active=true
+                echo "Stopping gowave.service before snapshot and database restoration..."
+                systemctl stop gowave.service
+            fi
+        else
+            if systemctl is-active --quiet gowave-node.service 2>/dev/null; then
+                gowave_node_was_active=true
+                echo "Stopping gowave-node.service before restoration..."
+                systemctl stop gowave-node.service
+            fi
+        fi
+    fi
+
+    # Step 2: Capture consistent pre-restore snapshot
+    echo "Capturing pre-restore snapshot in $restore_snap..."
     if [[ "$expected_type" == "panel" ]]; then
-        if [[ -f "$staging_dir/files/opt/gowave/gowave.db" ]]; then
-            cp "$staging_dir/files/opt/gowave/gowave.db" "$DEFAULT_GOWAVE_DIR/gowave.db"
-            rm -f "$DEFAULT_GOWAVE_DIR/gowave.db-wal" "$DEFAULT_GOWAVE_DIR/gowave.db-shm"
-            chmod 0640 "$DEFAULT_GOWAVE_DIR/gowave.db"
+        if [[ -f "$DEFAULT_GOWAVE_DIR/gowave.db" ]]; then
+            echo "Taking snapshot of existing gowave.db..."
+            python3 -c "
+import sys
+for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+from modules.recovery import sqlite_online_backup
+sqlite_online_backup('$DEFAULT_GOWAVE_DIR/gowave.db', '$restore_snap/gowave.db')
+" 2>/dev/null || cp -p "$DEFAULT_GOWAVE_DIR/gowave.db" "$restore_snap/gowave.db"
+
+            [[ -f "$DEFAULT_GOWAVE_DIR/gowave.db-wal" ]] && cp -p "$DEFAULT_GOWAVE_DIR/gowave.db-wal" "$restore_snap/" 2>/dev/null || true
+            [[ -f "$DEFAULT_GOWAVE_DIR/gowave.db-shm" ]] && cp -p "$DEFAULT_GOWAVE_DIR/gowave.db-shm" "$restore_snap/" 2>/dev/null || true
         fi
-        if [[ -f "$staging_dir/files/opt/gowave/.env" ]]; then
-            cp "$staging_dir/files/opt/gowave/.env" "$DEFAULT_GOWAVE_DIR/.env"
-            chmod 0640 "$DEFAULT_GOWAVE_DIR/.env"
+        if [[ -f "$DEFAULT_GOWAVE_DIR/.env" ]]; then
+            cp -p "$DEFAULT_GOWAVE_DIR/.env" "$restore_snap/.env"
         fi
-        if [[ -f "$staging_dir/files/var/lib/gowave-auto-nginx/state.json" ]]; then
-            mkdir -p /var/lib/gowave-auto-nginx
-            cp "$staging_dir/files/var/lib/gowave-auto-nginx/state.json" /var/lib/gowave-auto-nginx/state.json
-            chmod 0600 /var/lib/gowave-auto-nginx/state.json
+        if [[ -f "/var/lib/gowave-auto-nginx/state.json" ]]; then
+            cp -p "/var/lib/gowave-auto-nginx/state.json" "$restore_snap/state.json"
         fi
     else
+        if [[ -f "$DEFAULT_NODE_DIR/.env" ]]; then
+            cp -p "$DEFAULT_NODE_DIR/.env" "$restore_snap/.env"
+        fi
+    fi
+
+    # Prune recovery snapshots
+    python3 -c "
+import sys
+for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+from modules.recovery import prune_snapshots
+prune_snapshots('$RECOVERY_STORE')
+" 2>/dev/null || true
+
+    # Rollback function on failure
+    rollback_restore() {
+        local reason="${1:-Unknown error}"
+        log_err "Restore failed: $reason. Triggering automatic rollback to pre-restore snapshot..."
+        update_restore_journal "ROLLBACK_REQUIRED" "$restore_snap" "$reason"
+
+        if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
+            systemctl stop gowave.service 2>/dev/null || true
+            systemctl stop gowave-node.service 2>/dev/null || true
+        fi
+
+        if [[ "$expected_type" == "panel" ]]; then
+            if [[ -f "$restore_snap/gowave.db" ]]; then
+                cp -p "$restore_snap/gowave.db" "$DEFAULT_GOWAVE_DIR/gowave.db"
+                rm -f "$DEFAULT_GOWAVE_DIR/gowave.db-wal" "$DEFAULT_GOWAVE_DIR/gowave.db-shm"
+                [[ -f "$restore_snap/gowave.db-wal" ]] && cp -p "$restore_snap/gowave.db-wal" "$DEFAULT_GOWAVE_DIR/" 2>/dev/null || true
+                [[ -f "$restore_snap/gowave.db-shm" ]] && cp -p "$restore_snap/gowave.db-shm" "$DEFAULT_GOWAVE_DIR/" 2>/dev/null || true
+                chmod 0640 "$DEFAULT_GOWAVE_DIR/gowave.db" 2>/dev/null || true
+                if [[ "$(id -u)" -eq 0 ]] && id -u gowave >/dev/null 2>&1; then
+                    chown gowave:gowave "$DEFAULT_GOWAVE_DIR/gowave.db" 2>/dev/null || true
+                fi
+            fi
+            if [[ -f "$restore_snap/.env" ]]; then
+                cp -p "$restore_snap/.env" "$DEFAULT_GOWAVE_DIR/.env"
+                chmod 0640 "$DEFAULT_GOWAVE_DIR/.env" 2>/dev/null || true
+                if [[ "$(id -u)" -eq 0 ]] && id -u gowave >/dev/null 2>&1; then
+                    chown root:gowave "$DEFAULT_GOWAVE_DIR/.env" 2>/dev/null || true
+                fi
+            fi
+            if [[ -f "$restore_snap/state.json" ]]; then
+                cp -p "$restore_snap/state.json" "/var/lib/gowave-auto-nginx/state.json" 2>/dev/null || true
+            fi
+            if [[ "$gowave_was_active" == "true" ]] && [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
+                systemctl start gowave.service 2>/dev/null || true
+            fi
+        else
+            if [[ -f "$restore_snap/.env" ]]; then
+                cp -p "$restore_snap/.env" "$DEFAULT_NODE_DIR/.env"
+                chmod 0600 "$DEFAULT_NODE_DIR/.env" 2>/dev/null || true
+            fi
+            if [[ "$gowave_node_was_active" == "true" ]] && [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
+                systemctl start gowave-node.service 2>/dev/null || true
+            fi
+        fi
+
+        update_restore_journal "ROLLED_BACK" "$restore_snap" "$reason"
+        die "Restore failed: $reason. Previous state restored."
+    }
+
+    # Step 3: Transition to APPLYING
+    update_restore_journal "APPLYING"
+    echo "Applying restored files atomically..."
+
+    if [[ "$expected_type" == "panel" ]]; then
+        # Restore gowave.db
+        if [[ -f "$staging_dir/files/opt/gowave/gowave.db" ]]; then
+            mkdir -p "$DEFAULT_GOWAVE_DIR"
+            cp "$staging_dir/files/opt/gowave/gowave.db" "$DEFAULT_GOWAVE_DIR/gowave.db.restoring"
+            sync -d "$DEFAULT_GOWAVE_DIR/gowave.db.restoring" 2>/dev/null || sync "$DEFAULT_GOWAVE_DIR/gowave.db.restoring" 2>/dev/null || true
+            rm -f "$DEFAULT_GOWAVE_DIR/gowave.db-wal" "$DEFAULT_GOWAVE_DIR/gowave.db-shm"
+            mv -f "$DEFAULT_GOWAVE_DIR/gowave.db.restoring" "$DEFAULT_GOWAVE_DIR/gowave.db"
+            chmod 0640 "$DEFAULT_GOWAVE_DIR/gowave.db"
+            if [[ "$(id -u)" -eq 0 ]] && id -u gowave >/dev/null 2>&1; then
+                chown gowave:gowave "$DEFAULT_GOWAVE_DIR/gowave.db"
+            fi
+            sync "$DEFAULT_GOWAVE_DIR" 2>/dev/null || true
+        fi
+
+        # Restore .env
+        if [[ -f "$staging_dir/files/opt/gowave/.env" ]]; then
+            mkdir -p "$DEFAULT_GOWAVE_DIR"
+            cp "$staging_dir/files/opt/gowave/.env" "$DEFAULT_GOWAVE_DIR/.env.restoring"
+            sync -d "$DEFAULT_GOWAVE_DIR/.env.restoring" 2>/dev/null || sync "$DEFAULT_GOWAVE_DIR/.env.restoring" 2>/dev/null || true
+            mv -f "$DEFAULT_GOWAVE_DIR/.env.restoring" "$DEFAULT_GOWAVE_DIR/.env"
+            chmod 0640 "$DEFAULT_GOWAVE_DIR/.env"
+            if [[ "$(id -u)" -eq 0 ]] && id -u gowave >/dev/null 2>&1; then
+                chown root:gowave "$DEFAULT_GOWAVE_DIR/.env"
+            fi
+            sync "$DEFAULT_GOWAVE_DIR" 2>/dev/null || true
+        fi
+
+        # Restore state.json
+        if [[ -f "$staging_dir/files/var/lib/gowave-auto-nginx/state.json" ]]; then
+            mkdir -p /var/lib/gowave-auto-nginx
+            cp "$staging_dir/files/var/lib/gowave-auto-nginx/state.json" /var/lib/gowave-auto-nginx/state.json.restoring
+            mv -f /var/lib/gowave-auto-nginx/state.json.restoring /var/lib/gowave-auto-nginx/state.json
+            chmod 0600 /var/lib/gowave-auto-nginx/state.json
+        fi
+
+        # Restore NGINX configurations if present
+        if [[ -d "$staging_dir/files/etc/nginx" ]] && { [[ "$(id -u)" -eq 0 ]] || [[ -w /etc/nginx ]]; }; then
+            echo "Restoring NGINX configurations..."
+            if [[ -d "$staging_dir/files/etc/nginx/conf.d" ]]; then
+                mkdir -p /etc/nginx/conf.d
+                cp -a "$staging_dir"/files/etc/nginx/conf.d/* /etc/nginx/conf.d/ 2>/dev/null || true
+            fi
+            if [[ -d "$staging_dir/files/etc/nginx/stream-enabled" ]]; then
+                mkdir -p /etc/nginx/stream-enabled
+                cp -a "$staging_dir"/files/etc/nginx/stream-enabled/* /etc/nginx/stream-enabled/ 2>/dev/null || true
+            fi
+            if command -v nginx >/dev/null 2>&1; then
+                nginx -t || log_warn "Restored NGINX configuration test failed"
+            fi
+        fi
+
+        # Restore Let's Encrypt certificates if present
+        if [[ -d "$staging_dir/files/etc/letsencrypt" ]] && [[ "$(id -u)" -eq 0 ]]; then
+            echo "Restoring Let's Encrypt certificates..."
+            mkdir -p /etc/letsencrypt
+            cp -a "$staging_dir"/files/etc/letsencrypt/* /etc/letsencrypt/ 2>/dev/null || true
+        fi
+    else
+        # Worker node restore
         if [[ -f "$staging_dir/files/opt/gowave-node/.env" ]]; then
             mkdir -p "$DEFAULT_NODE_DIR"
-            cp "$staging_dir/files/opt/gowave-node/.env" "$DEFAULT_NODE_DIR/.env"
+            cp "$staging_dir/files/opt/gowave-node/.env" "$DEFAULT_NODE_DIR/.env.restoring"
+            mv -f "$DEFAULT_NODE_DIR/.env.restoring" "$DEFAULT_NODE_DIR/.env"
             chmod 0600 "$DEFAULT_NODE_DIR/.env"
         fi
     fi
 
-    # Restart services if root
+    # Step 4: Transition to VERIFYING & Health check
+    update_restore_journal "VERIFYING"
+    echo "Verifying service health after restoration..."
+
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
         if [[ "$expected_type" == "panel" ]]; then
-            systemctl restart --no-ask-password gowave.service || true
+            systemctl start --no-ask-password gowave.service || rollback_restore "gowave.service failed to start"
+
+            local healthy=false
+            for _ in {1..15}; do
+                if curl -fsSL -o /dev/null http://127.0.0.1:3000/api/system/health 2>/dev/null || \
+                   curl -fsSL -o /dev/null http://127.0.0.1:3000/ 2>/dev/null; then
+                    healthy=true
+                    break
+                fi
+                sleep 1
+            done
+
+            if [[ "$healthy" != "true" ]]; then
+                rollback_restore "Panel health check failed on http://127.0.0.1:3000 after restore"
+            fi
+            echo "GoWave Panel health check PASSED."
         else
-            systemctl restart --no-ask-password gowave-node.service || true
+            systemctl start --no-ask-password gowave-node.service || rollback_restore "gowave-node.service failed to start"
+            if ! systemctl is-active --quiet gowave-node.service; then
+                rollback_restore "gowave-node.service is not active after restore"
+            fi
+            echo "GoWave Node service active PASSED."
         fi
     fi
-    echo "Restore completed successfully."
+
+    # Step 5: Transition to COMMITTED
+    update_restore_journal "COMMITTED"
+    echo "Restore completed and verified successfully."
 }
 
 # CLI routing
@@ -434,13 +664,15 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             if [[ "${2:-}" == "--type" ]]; then
                 btype="${3:-panel}"
                 out="${4:-$BACKUP_STORE/gowave-backup-$btype-$(date +%s).tar.gz}"
+                dir="${5:-}"
             else
                 out="${2:-$BACKUP_STORE/gowave-backup-panel-$(date +%s).tar.gz}"
+                dir="${3:-}"
             fi
             if [[ "$btype" == "panel" ]]; then
-                create_panel_backup "$out"
+                create_panel_backup "$out" "${dir:-$DEFAULT_GOWAVE_DIR}"
             else
-                create_node_backup "$out"
+                create_node_backup "$out" "${dir:-$DEFAULT_NODE_DIR}"
             fi
             ;;
         restore)

@@ -444,6 +444,117 @@ class TestAPIClient(unittest.TestCase):
             self.assertEqual(len(updated_sdata["nodes"]), 1)
             self.assertEqual(updated_sdata["nodes"][0]["name"], "local-node")
 
+    def test_rollback_preserves_adopted_entities(self):
+        """Rollback never deletes entities adopted from prior configurations (C-03)."""
+        MockGoWaveServer.registered_users["admin"] = "securepass1234567890"
+        MockGoWaveServer.squads["adopted-squad-uuid"] = {"name": "Default MVP Squad", "uuid": "adopted-squad-uuid"}
+        MockGoWaveServer.profiles["adopted-prof-uuid"] = {"name": "GoWave MVP Unified Profile", "uuid": "adopted-prof-uuid"}
+        MockGoWaveServer.hosts["created-host-uuid"] = {"remark": "VLESS_REALITY@local-node", "uuid": "created-host-uuid"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            sfile = Path(tmpdir) / "state.json"
+            cfile = Path(tmpdir) / "credentials.txt"
+            save_credentials("admin", "securepass1234567890", "https://panel.example.com", "token-xyz", str(cfile))
+
+            jdata = {
+                "transaction_id": "provision_test_c03",
+                "op": "provision",
+                "state": "PROVISION_APPLYING",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": [
+                    {"type": "profile", "uuid": "adopted-prof-uuid", "action": "adopted"},
+                    {"type": "squad", "uuid": "adopted-squad-uuid", "action": "adopted"},
+                    {"type": "host", "uuid": "created-host-uuid", "action": "created"},
+                ]
+            }
+            jfile.write_text(json.dumps(jdata))
+            sfile.write_text(json.dumps({"schemaVersion": 2}))
+
+            res = rollback_provisioning(str(jfile), str(sfile), str(cfile), base_url=f"http://127.0.0.1:{self.port}")
+            self.assertTrue(res)
+
+            # Verified: created host was deleted
+            self.assertNotIn("created-host-uuid", MockGoWaveServer.hosts)
+            # Verified: adopted entities were NOT deleted
+            self.assertIn("adopted-squad-uuid", MockGoWaveServer.squads)
+            self.assertIn("adopted-prof-uuid", MockGoWaveServer.profiles)
+
+    def test_rollback_restores_updated_entities(self):
+        """Rollback restores before state for updated entities (C-03)."""
+        MockGoWaveServer.registered_users["admin"] = "securepass1234567890"
+        MockGoWaveServer.squads["squad-target"] = {
+            "name": "Default MVP Squad",
+            "uuid": "squad-target",
+            "inbounds": ["inb-1", "inb-2", "inb-3"]
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            sfile = Path(tmpdir) / "state.json"
+            cfile = Path(tmpdir) / "credentials.txt"
+            save_credentials("admin", "securepass1234567890", "https://panel.example.com", "token-xyz", str(cfile))
+
+            jdata = {
+                "transaction_id": "provision_test_restore",
+                "op": "provision",
+                "state": "PROVISION_APPLYING",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": [
+                    {
+                        "type": "squad",
+                        "uuid": "squad-target",
+                        "action": "updated",
+                        "before": {"name": "Default MVP Squad", "inbounds": ["inb-1"]}
+                    }
+                ]
+            }
+            jfile.write_text(json.dumps(jdata))
+            sfile.write_text(json.dumps({"schemaVersion": 2}))
+
+            res = rollback_provisioning(str(jfile), str(sfile), str(cfile), base_url=f"http://127.0.0.1:{self.port}")
+            self.assertTrue(res)
+
+            # Verify squad inbounds were rolled back to before state
+            self.assertEqual(MockGoWaveServer.squads["squad-target"]["inbounds"], ["inb-1"])
+
+    def test_rollback_never_deletes_by_global_name_scan(self):
+        """Entities sharing standard names are never deleted if they were not created in transaction (C-03)."""
+        MockGoWaveServer.registered_users["admin"] = "securepass1234567890"
+        MockGoWaveServer.profiles["unrelated-prof"] = {
+            "name": "GoWave MVP Unified Profile",
+            "uuid": "unrelated-prof"
+        }
+        MockGoWaveServer.nodes["unrelated-node"] = {
+            "name": "local-node",
+            "uuid": "unrelated-node"
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            sfile = Path(tmpdir) / "state.json"
+            cfile = Path(tmpdir) / "credentials.txt"
+            save_credentials("admin", "securepass1234567890", "https://panel.example.com", "token-xyz", str(cfile))
+
+            jdata = {
+                "transaction_id": "provision_test_namescan",
+                "op": "provision",
+                "state": "PROVISION_APPLYING",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": {
+                    "token_id": "token-only"
+                }
+            }
+            jfile.write_text(json.dumps(jdata))
+            sfile.write_text(json.dumps({"schemaVersion": 2}))
+
+            res = rollback_provisioning(str(jfile), str(sfile), str(cfile), base_url=f"http://127.0.0.1:{self.port}")
+            self.assertTrue(res)
+
+            # Unrelated profile and node must remain untouched
+            self.assertIn("unrelated-prof", MockGoWaveServer.profiles)
+            self.assertIn("unrelated-node", MockGoWaveServer.nodes)
+
 
 if __name__ == "__main__":
     unittest.main()

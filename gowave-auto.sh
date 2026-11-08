@@ -136,18 +136,26 @@ cmd_install() {
         systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
     fi
 
-    if command -v certbot >/dev/null 2>&1; then
-        certbot certonly --webroot -w "$ACME_WEBROOT" \
-            -d "$panel_domain" --cert-name "$panel_domain" \
-            --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring || true
-
-        certbot certonly --webroot -w "$ACME_WEBROOT" \
-            -d "$reality_domain" --cert-name "$reality_domain" \
-            --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring || true
+    if ! command -v certbot >/dev/null 2>&1; then
+        echo "Error: certbot is required for production TLS certificate acquisition but not installed." >&2
+        return 1
     fi
+
+    echo "Acquiring Let's Encrypt TLS certificate for Panel ($panel_domain)..."
+    certbot certonly --webroot -w "$ACME_WEBROOT" \
+        -d "$panel_domain" --cert-name "$panel_domain" \
+        --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring
+
+    echo "Acquiring Let's Encrypt TLS certificate for REALITY decoy ($reality_domain)..."
+    certbot certonly --webroot -w "$ACME_WEBROOT" \
+        -d "$reality_domain" --cert-name "$reality_domain" \
+        --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring
+
     rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
-    ensure_tls_cert "$panel_domain"
-    ensure_tls_cert "$reality_domain"
+
+    # Verify certificates cryptographically (refuse to proceed with invalid or missing certificates)
+    verify_acme_certificate "$panel_domain"
+    verify_acme_certificate "$reality_domain"
 
     # Step 5: NGINX Configuration
     ensure_nginx_stream_block
@@ -461,11 +469,11 @@ cmd_domain_change() {
         acme_ok=true
     fi
     rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
-    ensure_tls_cert "$panel_domain"
-    ensure_tls_cert "$reality_domain"
 
-    if [[ "$acme_ok" != "true" ]]; then
-        echo "ACME certificate acquisition failed! Rolling back to previous domain configuration..." >&2
+    if [[ "$acme_ok" != "true" ]] || \
+       ! verify_acme_certificate "$new_panel_domain" || \
+       ! verify_acme_certificate "$new_reality_domain"; then
+        echo "ACME certificate acquisition or validation failed! Rolling back to previous domain configuration..." >&2
         execute_file_rollback "$snap_dir"
         return 1
     fi

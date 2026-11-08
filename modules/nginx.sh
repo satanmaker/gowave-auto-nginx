@@ -158,11 +158,48 @@ EOF
     echo "Generated $out_file."
 }
 
+verify_acme_certificate() {
+    local domain="$1"
+    local live_dir="${2:-/etc/letsencrypt/live/$domain}"
+
+    local fullchain="$live_dir/fullchain.pem"
+    local privkey="$live_dir/privkey.pem"
+
+    if [[ ! -s "$fullchain" ]]; then
+        echo "Error: Certificate fullchain missing or empty: $fullchain" >&2
+        return 1
+    fi
+    if [[ ! -s "$privkey" ]]; then
+        echo "Error: Private key missing or empty: $privkey" >&2
+        return 1
+    fi
+
+    # Check certificate validity (at least 24 hours remaining)
+    if ! openssl x509 -checkend 86400 -noout -in "$fullchain" >/dev/null 2>&1; then
+        echo "Error: Certificate $fullchain is expired or not valid within 24 hours" >&2
+        return 1
+    fi
+
+    # Check certificate cryptographically matches private key
+    local cert_pk
+    local key_pk
+    cert_pk=$(openssl x509 -noout -pubkey -in "$fullchain" 2>/dev/null || true)
+    key_pk=$(openssl pkey -pubout -in "$privkey" 2>/dev/null || true)
+    if [[ -z "$cert_pk" || "$cert_pk" != "$key_pk" ]]; then
+        echo "Error: Certificate and private key do not cryptographically match for $domain" >&2
+        return 1
+    fi
+
+    echo "ACME certificate verification PASSED for $domain."
+    return 0
+}
+
+# Retained strictly for mock / offline testing harness environments
 ensure_tls_cert() {
     local domain="$1"
-    local live_dir="/etc/letsencrypt/live/$domain"
+    local live_dir="${2:-/etc/letsencrypt/live/$domain}"
     if [[ ! -f "$live_dir/fullchain.pem" || ! -f "$live_dir/privkey.pem" ]]; then
-        echo "Creating self-signed fallback TLS certificate for $domain..."
+        echo "Creating self-signed test TLS certificate for mock environment: $domain..."
         mkdir -p "$live_dir"
         openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
             -keyout "$live_dir/privkey.pem" \

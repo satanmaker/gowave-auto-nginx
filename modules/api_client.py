@@ -91,6 +91,19 @@ class GoWaveClient:
                     req = urllib.request.Request(url, data=encoded_data, headers=req_headers, method=method)
                     continue
 
+                # Handle HTTP 429 Rate Limiting with exponential backoff 2, 4, 8s (or Retry-After header)
+                if e.code == 429 and attempt < max_retries - 1:
+                    retry_after = e.headers.get("Retry-After")
+                    delay = int(retry_after) if retry_after and retry_after.isdigit() else 2 ** (attempt + 1)
+                    time.sleep(delay)
+                    continue
+
+                # Handle HTTP 5xx Server Errors (500, 502, 503, 504) with backoff 1, 2, 4s
+                if e.code in (500, 502, 503, 504) and attempt < max_retries - 1:
+                    delay = 2 ** attempt
+                    time.sleep(delay)
+                    continue
+
                 # Parse JSON error if available
                 error_msg = f"HTTP {e.code} on {method} {endpoint}: {err_body}"
                 raise GoWaveAPIError(error_msg, status_code=e.code, response_body=err_body) from e
@@ -424,8 +437,9 @@ class GoWaveClient:
             user_data = users_res.get("response", users_res)
             if user_data and user_data.get("shortUuid"):
                 return user_data.get("shortUuid")
-        except GoWaveAPIError:
-            pass
+        except GoWaveAPIError as e:
+            if e.status_code != 404:
+                raise
 
         payload = {
             "username": username,
@@ -627,84 +641,95 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
 
     # Branch 1: PROVISION_* rollback
     if op == "provision" or state.startswith("PROVISION_"):
-        # 1. Tokens
-        token_id = journal_data.get("entities", {}).get("token_id")
-        if token_id:
-            client.delete_token(token_id)
-        try:
-            tokens_res = client.request("GET", "/api/tokens")
-            tokens_list = _extract_list(tokens_res, "tokens")
-            for t in tokens_list:
-                if t.get("name") == "gowave-auto-sub-token":
-                    client.delete_token(t.get("id") or t.get("uuid"))
-        except Exception as e:
-            print(f"Rollback note (tokens): {e}", file=sys.stderr)
+        entities = journal_data.get("entities", {})
 
-        # 2. Users
-        user_uuid = journal_data.get("entities", {}).get("user_uuid") or state_data.get("defaultUserUuid")
-        if user_uuid:
-            client.delete_user(user_uuid)
-        try:
-            users_res = client.request("GET", "/api/users")
-            users_list = _extract_list(users_res, "users")
-            for u in users_list:
-                if u.get("username") == "default-user":
-                    client.delete_user(u.get("uuid"))
-        except Exception as e:
-            print(f"Rollback note (users): {e}", file=sys.stderr)
+        # Structured list format: [{"type": "...", "uuid": "...", "action": "created|updated|adopted", "before": ...}]
+        if isinstance(entities, list):
+            for item in reversed(entities):
+                action = item.get("action", "created")
+                etype = item.get("type", "")
+                uuid = item.get("uuid", "")
+                if action == "adopted" or not uuid:
+                    continue
+                if action == "updated":
+                    before = item.get("before", {})
+                    try:
+                        if etype == "squad":
+                            client.request("PATCH", "/api/internal-squads", {"uuid": uuid, **before})
+                        elif etype == "profile":
+                            client.request("PATCH", f"/api/config-profiles/{uuid}", before)
+                        elif etype == "node":
+                            client.request("PATCH", f"/api/nodes/{uuid}", before)
+                    except Exception as e:
+                        print(f"Rollback note (restore {etype} {uuid}): {e}", file=sys.stderr)
+                elif action == "created":
+                    try:
+                        if etype == "token":
+                            client.delete_token(uuid)
+                        elif etype == "user":
+                            client.delete_user(uuid)
+                        elif etype == "host":
+                            client.delete_host(uuid)
+                        elif etype == "squad":
+                            client.delete_internal_squad(uuid)
+                        elif etype == "node":
+                            client.delete_node(uuid)
+                        elif etype == "profile":
+                            client.delete_config_profile(uuid)
+                    except Exception as e:
+                        print(f"Rollback note (delete {etype} {uuid}): {e}", file=sys.stderr)
 
-        # 3. Hosts
-        host_uuids = journal_data.get("entities", {}).get("host_uuids", [])
-        for hid in reversed(host_uuids):
-            client.delete_host(hid)
-        try:
-            hosts_res = client.request("GET", "/api/hosts")
-            hosts_list = _extract_list(hosts_res, "hosts")
-            for h in hosts_list:
-                remark = h.get("remark", "")
-                if "@local-node" in remark or remark.endswith("local-node"):
-                    client.delete_host(h.get("uuid"))
-        except Exception as e:
-            print(f"Rollback note (hosts): {e}", file=sys.stderr)
+        # Dictionary format (strictly deletes UUIDs created by this transaction without global name scans)
+        elif isinstance(entities, dict):
+            actions = entities.get("actions", {})
 
-        # 4. Internal Squads
-        squad_uuid = journal_data.get("entities", {}).get("squad_uuid") or state_data.get("squadUuid")
-        if squad_uuid:
-            client.delete_internal_squad(squad_uuid)
-        try:
-            squads_res = client.request("GET", "/api/internal-squads")
-            squads_list = _extract_list(squads_res, "internalSquads")
-            for s in squads_list:
-                if s.get("name") == "Default MVP Squad":
-                    client.delete_internal_squad(s.get("uuid"))
-        except Exception as e:
-            print(f"Rollback note (squads): {e}", file=sys.stderr)
+            # 1. Tokens
+            token_id = entities.get("token_id")
+            if token_id and actions.get("token_id") != "adopted":
+                try:
+                    client.delete_token(token_id)
+                except Exception as e:
+                    print(f"Rollback note (tokens): {e}", file=sys.stderr)
 
-        # 5. Nodes
-        node_uuid = journal_data.get("entities", {}).get("node_uuid") or state_data.get("localNodeUuid")
-        if node_uuid:
-            client.delete_node(node_uuid)
-        try:
-            nodes_res = client.request("GET", "/api/nodes")
-            nodes_list = _extract_list(nodes_res, "nodes")
-            for n in nodes_list:
-                if n.get("name") == "local-node":
-                    client.delete_node(n.get("uuid"))
-        except Exception as e:
-            print(f"Rollback note (nodes): {e}", file=sys.stderr)
+            # 2. Users
+            user_uuid = entities.get("user_uuid") or state_data.get("defaultUserUuid")
+            if user_uuid and actions.get("user_uuid") != "adopted":
+                try:
+                    client.delete_user(user_uuid)
+                except Exception as e:
+                    print(f"Rollback note (users): {e}", file=sys.stderr)
 
-        # 6. Config Profiles
-        prof_uuid = journal_data.get("entities", {}).get("profile_uuid") or state_data.get("profileUuid")
-        if prof_uuid:
-            client.delete_config_profile(prof_uuid)
-        try:
-            profs_res = client.request("GET", "/api/config-profiles")
-            profs_list = _extract_list(profs_res, "configProfiles")
-            for p in profs_list:
-                if p.get("name") in ("GoWave MVP Unified Profile - local-node", "GoWave MVP Unified Profile"):
-                    client.delete_config_profile(p.get("uuid"))
-        except Exception as e:
-            print(f"Rollback note (config-profiles): {e}", file=sys.stderr)
+            # 3. Hosts
+            host_uuids = entities.get("host_uuids", [])
+            for hid in reversed(host_uuids):
+                try:
+                    client.delete_host(hid)
+                except Exception as e:
+                    print(f"Rollback note (hosts): {e}", file=sys.stderr)
+
+            # 4. Internal Squads
+            squad_uuid = entities.get("squad_uuid") or state_data.get("squadUuid")
+            if squad_uuid and actions.get("squad_uuid") != "adopted":
+                try:
+                    client.delete_internal_squad(squad_uuid)
+                except Exception as e:
+                    print(f"Rollback note (squads): {e}", file=sys.stderr)
+
+            # 5. Nodes
+            node_uuid = entities.get("node_uuid") or state_data.get("localNodeUuid")
+            if node_uuid and actions.get("node_uuid") != "adopted":
+                try:
+                    client.delete_node(node_uuid)
+                except Exception as e:
+                    print(f"Rollback note (nodes): {e}", file=sys.stderr)
+
+            # 6. Config Profiles
+            prof_uuid = entities.get("profile_uuid") or state_data.get("profileUuid")
+            if prof_uuid and actions.get("profile_uuid") != "adopted":
+                try:
+                    client.delete_config_profile(prof_uuid)
+                except Exception as e:
+                    print(f"Rollback note (config-profiles): {e}", file=sys.stderr)
 
         # Cleanup state.json.tmp
         if tmp_state.exists():
@@ -730,36 +755,16 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
         worker_prof_uuid = journal_data.get("entities", {}).get("profile_uuid")
         worker_node_uuid = journal_data.get("entities", {}).get("node_uuid")
         worker_inbound_uuids = journal_data.get("entities", {}).get("inbound_uuids", [])
+        worker_host_uuids = journal_data.get("entities", {}).get("host_uuids", [])
 
-        # 1. Delete worker hosts matching <PROTO>@<worker-name>
-        try:
-            hosts_res = client.request("GET", "/api/hosts")
-            hosts_list = _extract_list(hosts_res, "hosts")
-            for h in hosts_list:
-                remark = h.get("remark", "")
-                if worker_name and remark.endswith(f"@{worker_name}"):
-                    client.delete_host(h.get("uuid"))
-        except Exception as e:
-            print(f"Rollback note (worker hosts): {e}", file=sys.stderr)
-
-        # If worker profile is known, get inbounds if not stored
-        if not worker_inbound_uuids:
+        # 1. Delete worker hosts by UUID strictly
+        for hid in reversed(worker_host_uuids):
             try:
-                profs_res = client.request("GET", "/api/config-profiles")
-                profs_list = _extract_list(profs_res, "configProfiles")
-                for p in profs_list:
-                    if p.get("name") == f"GoWave Worker {worker_name} Profile":
-                        worker_prof_uuid = p.get("uuid")
-                        break
-                if worker_prof_uuid:
-                    inb_res = client.request("GET", f"/api/config-profiles/{worker_prof_uuid}/inbounds")
-                    inb_data = inb_res.get("response", inb_res) if isinstance(inb_res, dict) else inb_res
-                    worker_inbounds = inb_data.get("inbounds", []) if isinstance(inb_data, dict) else inb_data
-                    worker_inbound_uuids = [inb.get("uuid") if isinstance(inb, dict) else inb for inb in worker_inbounds]
+                client.delete_host(hid)
             except Exception as e:
-                print(f"Rollback note (worker inbounds): {e}", file=sys.stderr)
+                print(f"Rollback note (worker host {hid}): {e}", file=sys.stderr)
 
-        # 2. Unbind worker inbounds from internal squad
+        # 2. Unbind worker inbounds from internal squad (restores previous squad state)
         squad_uuid = state_data.get("squadUuid")
         try:
             squads_res = client.request("GET", "/api/internal-squads")
@@ -778,24 +783,19 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
         except Exception as e:
             print(f"Rollback note (unbind squad): {e}", file=sys.stderr)
 
-        # 3. Delete worker node
-        if not worker_node_uuid and worker_name:
-            try:
-                nodes_res = client.request("GET", "/api/nodes")
-                nodes_list = _extract_list(nodes_res, "nodes")
-                for n in nodes_list:
-                    if n.get("name") == worker_name:
-                        worker_node_uuid = n.get("uuid")
-                        break
-            except Exception as e:
-                print(f"Rollback note (find worker node): {e}", file=sys.stderr)
-
+        # 3. Delete worker node by explicit UUID
         if worker_node_uuid:
-            client.delete_node(worker_node_uuid)
+            try:
+                client.delete_node(worker_node_uuid)
+            except Exception as e:
+                print(f"Rollback note (worker node {worker_node_uuid}): {e}", file=sys.stderr)
 
-        # 4. Delete worker profile
+        # 4. Delete worker profile by explicit UUID
         if worker_prof_uuid:
-            client.delete_config_profile(worker_prof_uuid)
+            try:
+                client.delete_config_profile(worker_prof_uuid)
+            except Exception as e:
+                print(f"Rollback note (worker profile {worker_prof_uuid}): {e}", file=sys.stderr)
 
         # Update state.json: remove worker from nodes array if present
         if state_data and "nodes" in state_data:
