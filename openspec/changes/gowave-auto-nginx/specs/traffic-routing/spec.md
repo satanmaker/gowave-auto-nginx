@@ -50,6 +50,11 @@ The routing subsystem SHALL serve an authentic static camouflage website on loop
 - **WHEN** Xray REALITY fails to authenticate the handshake
 - **THEN** Xray forwards the connection with PROXY protocol v1 (`dest: "127.0.0.1:9443", xver: 1`) to `127.0.0.1:9443`, where NGINX terminates TLS 1.3 using runtime-adaptive HTTP/2 syntax (`listen ... ssl http2 proxy_protocol;` on < 1.25.1; `listen ... ssl proxy_protocol; http2 on;` on >= 1.25.1), restores the real client IP via `real_ip_header proxy_protocol;`, serves the multi-asset decoy website, and logs the probe to `/var/log/nginx/gowave-decoy-access.log` recording `remote_addr`, `ssl_server_name`, and timestamp.
 
+#### Scenario: Automated camouflage decoy site assets deployment
+- **GIVEN** the orchestrator configuring the REALITY fallback camouflage decoy vhost via `generate_decoy_vhost`
+- **WHEN** the decoy vhost is generated
+- **THEN** the orchestrator provisions directory `/var/www/gowave-auto-nginx/cover-reality`, copies the static multi-asset decoy files (HTML, CSS, JS, assets) from `assets/cover-sites/cover-reality/` with permissions `0755`, ensuring HTTP 200 OK responses for fallback probes without 403 Forbidden directory index errors.
+
 ### Requirement: XHTTP Inbound Reverse Proxy
 The NGINX HTTPS listener at 7443 SHALL terminate TLS for `panel_domain` and reverse proxy configured XHTTP path prefixes to local Xray inbounds using HTTP/1.1 with buffering disabled, passing the PROXY-restored client IP via HTTP headers.
 
