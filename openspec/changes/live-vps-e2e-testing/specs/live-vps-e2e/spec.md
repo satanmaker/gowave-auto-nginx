@@ -130,6 +130,12 @@ remains unchanged.
   9444 fallback vhost, or deploy-hook side effect may be left advertising or serving an unusable Vision endpoint;
   pre-existing certificate lineages and unrelated resources MUST NOT be deleted by rollback
 
+#### Scenario: Incomplete Vision compensation is reported, not hidden
+
+- **GIVEN** Worker remote rollback or Panel API rollback fails after a Vision provisioning failure
+- **WHEN** the orchestrator performs compensation
+- **THEN** it checks both rollback results, returns nonzero, retains the recovery journal and records rollback/run status as incomplete; it MUST NOT suppress the remote rollback error or report cleanup PASS
+
 #### Scenario: Vision disabled preserves the four-inbound topology
 
 - **GIVEN** both Vision domain fields are absent

@@ -475,7 +475,10 @@ When the pair is configured:
    The same ownership rule applies to bootstrap names, renewal metadata, stream-map entries, the 9444 vhost,
    generated inbound/profile/host state and deploy-hook effects. Rollback MUST restore a valid NGINX
    configuration before reload and MUST NOT delete unrelated resources. If ownership or restoration cannot
-   be proven, fail closed and report cleanup incomplete.
+   be proven, fail closed and report cleanup incomplete. The Master orchestrator MUST check and record both
+   remote Worker rollback and Panel API rollback results; it MUST NOT suppress a failed `remote_rollback` with
+   `|| true`. If either compensation fails, preserve the recovery journal, mark rollback incomplete and force
+   the E2E run to `INCOMPLETE`; only verified success of both sides is rollback PASS.
 5. Panel API acceptance MUST verify five inbounds and five corresponding hosts per node, including each
    Vision inbound/host association. The subscription MUST expose one Vision proxy per VPS, and Xray and
    Mihomo MUST each execute the two Vision endpoints as independent runtime cases.
