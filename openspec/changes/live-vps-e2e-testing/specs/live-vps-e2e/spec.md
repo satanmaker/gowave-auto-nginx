@@ -132,12 +132,9 @@ check succeeds; and `gowave-auto.sh health` returns `HEALTHY`.
 
 ### Requirement: Distributed Worker VPS Deployment Verification
 
-After running `gowave-auto.sh node add worker-1` from Master, the runner SHALL verify: exit code 0; Worker
-recorded in `state.json`; Panel API entity created; SSH deployment used pre-pinned host key with
-`StrictHostKeyChecking=yes`; `SECRET_KEY` was not passed via process argv; `gowave-node.service` and
-`nginx.service` are active on Worker; certificates are valid; and NGINX config passes `nginx -t`.
-The argv assertion MUST use a complete descendant-following exec observer for both `execve` and `execveat`,
-with a positive string limit at least `32 * PAGE_SIZE`; sampling `/proc` is not acceptable evidence.
+After `gowave-auto.sh node add worker-1`, the runner SHALL verify successful registration,
+pinned SSH host identity, active Worker services, valid certificates, passing `nginx -t`, and absence of
+`SECRET_KEY` from a complete process-tree argv trace covering both `execve` and `execveat`.
 
 #### Scenario: SECRET_KEY not in complete process argv trace
 
@@ -478,21 +475,9 @@ VPS.
 
 ### Requirement: Teardown Policy Enforcement
 
-The runner SHALL accept one `TEST_TEARDOWN_POLICY` enum: `PRESERVE` (default) or
-`RESTORE_SNAPSHOT`. `DESTROY` is rejected in v1 during configuration preflight before remote modification.
-Policy values are mutually exclusive; cleanup is idempotent and scoped to the current run.
-
-For `RESTORE_SNAPSHOT`, preflight SHALL require `MASTER_SNAPSHOT_ID`, `WORKER_SNAPSHOT_ID`, an absolute
-`SNAPSHOT_RESTORE_HOOK` executable path and a matching `SNAPSHOT_RESTORE_HOOK_SHA256`. The hook SHALL be a
-regular executable owned by the runner user or root, not group/world-writable, and its SHA256 SHALL be checked
-both during preflight and immediately before execution. The runner SHALL invoke the hook directly (no shell),
-send a versioned JSON request with the run ID, VPS addresses and snapshot IDs on stdin, and enforce
-`RESTORE_TIMEOUT`. A successful hook response SHALL be valid JSON with `status=RESTORED` and matching
-snapshot IDs for both hosts. The runner SHALL reconnect to both VPS and verify the required clean-baseline
-invariants against the pre-install manifest before teardown can PASS. Missing or invalid hook configuration
-fails preflight before remote modification. A timeout, nonzero exit, malformed/mismatched response, failed
-reconnection or baseline mismatch SHALL set teardown status to `TEARDOWN_FAILED`; it MUST NOT be reported
-as a successful restore.
+The runner SHALL accept one mutually exclusive `TEST_TEARDOWN_POLICY`: `PRESERVE` (default) or
+`RESTORE_SNAPSHOT`. `DESTROY` and invalid restore configurations fail preflight before remote modification.
+Teardown is reported separately from test outcome; overall `PASS` requires the selected policy to complete.
 
 #### Scenario: Destroy policy rejected before the run starts
 
@@ -506,6 +491,24 @@ as a successful restore.
 - **WHEN** the test run completes with any test outcome
 - **THEN** diagnostics are collected, the actual test outcome is retained, teardown is recorded separately as
   `PASS`, and neither VPS is modified or destroyed
+
+#### Scenario: Snapshot restore hook configuration and protocol are validated
+
+- **GIVEN** `TEST_TEARDOWN_POLICY=RESTORE_SNAPSHOT`
+- **WHEN** configuration preflight validates the teardown policy
+- **THEN** both `MASTER_SNAPSHOT_ID` and `WORKER_SNAPSHOT_ID`, an absolute `SNAPSHOT_RESTORE_HOOK` path,
+  and `SNAPSHOT_RESTORE_HOOK_SHA256` MUST be supplied; the hook MUST be a regular executable owned by the
+  runner user or root, not group/world-writable, and its digest MUST match. Missing or invalid values fail
+  preflight before remote modification.
+
+#### Scenario: Restore hook receives a versioned request and returns both restored resources
+
+- **GIVEN** preflight accepted both snapshot IDs and the SHA256-pinned external restore hook
+- **WHEN** teardown invokes the hook directly without a shell, passing JSON on stdin
+- **THEN** the request contains `schema_version: 1`, `action: "restore"`, `test_run_id`, and
+  `master`/`worker` objects containing `address` and `snapshot_id`; the hook exits zero and returns valid
+  JSON with `schema_version: 1`, `status: "RESTORED"`, and matching `snapshot_id` plus `restored: true`
+  for both hosts. Hook execution is bounded by `RESTORE_TIMEOUT`.
 
 #### Scenario: Snapshot restore hook configuration is incomplete
 
