@@ -519,12 +519,9 @@ To guarantee recovery resilience, administrative credentials (username, strong 2
   WantedBy=multi-user.target
   ```
 - Executes `systemctl daemon-reload && systemctl enable gowave.service` to register the base unit.
-- Executes the native upstream command:
-  ```bash
-  /opt/gowave/gowave-server service install /opt/gowave
-  ```
-- This upstream command sets sticky bit permissions (`1770 root:gowave`), writes `/etc/systemd/system/gowave.service.d/90-unprivileged.conf` with full systemd sandboxing (`ProtectSystem=strict`, `NoNewPrivileges=true`, `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`), and sets up `gowave-update.path` and `gowave-update.service`.
-- Writing the base unit first eliminates the `Unit gowave.service not found` failure on minimal OS images while letting upstream manage the drop-in.
+- The installer registers the project-managed unit using the explicit `User=gowave`, `Group=gowave`, `WorkingDirectory=/opt/gowave`, and `ExecStart=/opt/gowave/gowave-server` contract above.
+- It deliberately does **not** invoke `gowave-server service install`: that upstream helper can rewrite the managed unit and drop-ins outside the installer ownership/recovery contract. Required hardening is applied explicitly by this project and validated against its own service-unit template.
+- This avoids silently replacing the managed service definition with a second unit-generation path.
 
 #### GoWave Node Upstream Installer Orchestration
 - `gowave-node-auto.sh` utilizes the official upstream `gowave-node/install.sh` installer as its foundation.
@@ -774,12 +771,13 @@ Worker node addition (`gowave-auto.sh node add`) operates under an independent t
    - `NODE_ADD_COMMITTED`: Atomic commit merging worker into `state.json`.
    - `NODE_ADD_ROLLBACK_REQUIRED` / `NODE_ADD_ROLLED_BACK`: Automated cleanup on failure.
 2. **Isolated Worker Rollback Actions**:
-   If worker deployment or verification fails, the orchestrator executes strictly scoped rollback:
-   - Delete worker hosts: `DELETE /api/hosts/{uuid}` for all worker hosts created for this node (`remark == "<PROTO>@<worker-name>"`).
-   - Disassociate worker inbounds: `PATCH /api/internal-squads` with `{"uuid": squad_uuid, "name": squad_name, "inbounds": updated_inbounds}` removing the worker's 4 inbound UUIDs from `inbounds`.
-   - Delete worker node: `DELETE /api/nodes/{worker_node_uuid}`.
-   - Delete worker config profile: `DELETE /api/config-profiles/{worker_profile_uuid}`.
-   - Strictly FORBIDS deleting internal squads, panel users, or panel API tokens.
+   If worker deployment or verification fails, the orchestrator compensates the **Panel API transaction** using its action ledger:
+   - Delete only Worker hosts/node/profile entries recorded as `created`.
+   - Restore a pre-existing resource from its `before` image when recorded as `updated`.
+   - Preserve entries recorded as `adopted`, including shared internal squads.
+   - Strictly FORBIDS deleting unrelated panel users or API tokens.
+
+   **Not yet implemented:** compensating cleanup of remote Worker host-level side effects after a partially completed SSH deployment. Packages, UFW, NGINX, ACME state, swap, and systemd changes may remain after Panel API rollback. This remains an open acceptance item.
 
 ---
 
@@ -962,14 +960,11 @@ The testbed script executes an 8-stage verification pipeline inside each contain
 Passing all 8 stages across all 4 distributions is enforced as a mandatory requirement prior to any VPS deployment.
 
 #### Multi-Node Distributed Edge E2E Testbed (Panel + Remote Worker)
-In addition to All-in-One tests, `tests/podman_testbed.sh multi-node` deploys two interconnected containers on an isolated Podman bridge network (`gowave-net`):
-1. **`gowave-panel` (Control Plane)**: Hosts GoWave Panel, SQLite database, and NGINX reverse proxy.
-2. **`gowave-worker` (Edge Gateway)**: Deployed automatically via `gowave-node-auto.sh` using the SSH stdin pipeline (`remote_payload`), receiving `NODE_PORT=3002`, `SECRET_KEY`, and `PANEL_IP`.
+**Current status (2026-11-08):** `tests/podman_testbed.sh multi-node` is deliberately marked unavailable (exit 77). The previous script was only a three-container/SSH scaffold; it did not call `remote_payload`, register the Worker through the real GoWave API, complete mTLS, or send client data-plane traffic. It must not be described as an E2E test or a passed release gate.
 
-The multi-node testbed verifies:
-- Remote worker deployment without copying files via `scp`.
-- Worker UFW firewall configuration strictly whitelisting the panel IP for port 3000 while dropping unauthorized ingress.
-- Mutual TLS 1.3 control plane handshake between panel and worker node using HKDF-derived SNI (`rw-v1`).
-- GoWave user synchronization (`syncUserToSingleNode`) and unified Config Profile distribution.
-- Direct edge client VPN traffic tunneling to the worker's port 443 across all 4 MVP protocols without passing through the central panel.
-- Worker PROXY protocol fallback to decoy website on port 9443 for scanner probes.
+The following remain required before multi-node E2E can be claimed:
+- Deploy a real Panel and Worker through the same orchestration path used in production.
+- Verify source-scoped UFW rules from an authorized Panel and an unauthorized peer.
+- Complete a protocol-level TLS 1.3 mTLS handshake using the HKDF-derived SNI (`rw-v1`).
+- Verify API resource synchronization and direct client traffic to the Worker across supported transports.
+- Verify the Worker REALITY fallback/decoy path.

@@ -45,6 +45,22 @@ class GoWaveClient:
         self.token_expiry = 0
         self.username = None
         self.password = None
+        # Transaction journal entries are appended before each API call is
+        # considered complete, and are serialized by the orchestration layer.
+        self.transaction_entities = []
+        self.transaction_callback = None
+
+    def _record_transaction_entity(self, resource_type, uuid, action, before=None):
+        if not uuid:
+            raise GoWaveAPIError(f"Cannot journal {resource_type}: API response has no UUID")
+        entry = {"type": resource_type, "uuid": str(uuid), "action": action}
+        if action == "updated":
+            if not isinstance(before, dict) or not before:
+                raise GoWaveAPIError(f"Refusing to update {resource_type} without a rollback snapshot")
+            entry["before"] = before
+        self.transaction_entities.append(entry)
+        if self.transaction_callback is not None:
+            self.transaction_callback(self.transaction_entities)
 
     def request(self, method, endpoint, data=None, headers=None, authenticate=True):
         url = f"{self.base_url}{endpoint}"
@@ -232,14 +248,20 @@ class GoWaveClient:
                     break
 
         if target_uuid:
-            # Update existing
+            existing = next(p for p in profiles_list if p.get("uuid") == target_uuid)
+            full_before = self.request("GET", f"/api/config-profiles/{target_uuid}")
+            full_before = full_before.get("response", full_before) if isinstance(full_before, dict) else full_before
+            if not isinstance(full_before, dict) or "config" not in full_before:
+                raise GoWaveAPIError(f"Cannot safely update profile {target_uuid}: rollback configuration snapshot is incomplete")
+            before = {k: full_before[k] for k in ("name", "config") if k in full_before}
+            self._record_transaction_entity("profile", target_uuid, "updated", before)
             self.request("PATCH", f"/api/config-profiles/{target_uuid}", {"name": profile_name, "config": raw_config_json})
             profile_uuid = target_uuid
         else:
-            # Create new
             res = self.request("POST", "/api/config-profiles", {"name": profile_name, "config": raw_config_json})
             data = res.get("response", res)
             profile_uuid = data.get("uuid")
+            self._record_transaction_entity("profile", profile_uuid, "created")
 
         # 5-point verification checklist on computed-config
         computed = self.request("GET", f"/api/config-profiles/{profile_uuid}/computed-config")
@@ -279,26 +301,42 @@ class GoWaveClient:
         }
 
         if existing_node_uuid:
-            res = self.request("PATCH", f"/api/nodes/{existing_node_uuid}", payload)
+            nodes_res = self.request("GET", "/api/nodes")
+            nodes_list = _extract_list(nodes_res, "nodes")
+            existing_node = next((n for n in nodes_list if n.get("uuid") == existing_node_uuid), None)
+            required_before = ("name", "address", "port", "configProfile")
+            if not isinstance(existing_node, dict) or not all(k in existing_node for k in required_before):
+                raise GoWaveAPIError(f"Cannot safely update node {existing_node_uuid}: rollback snapshot is incomplete")
+            before = {k: existing_node[k] for k in required_before}
+            self._record_transaction_entity("node", existing_node_uuid, "updated", before)
+            self.request("PATCH", f"/api/nodes/{existing_node_uuid}", payload)
             node_uuid = existing_node_uuid
         else:
             # Check if node exists by name
             nodes_res = self.request("GET", "/api/nodes")
             nodes_list = _extract_list(nodes_res, "nodes")
             found_uuid = None
+            existing_node = None
             if isinstance(nodes_list, list):
                 for n in nodes_list:
                     if n.get("name") == node_name:
+                        existing_node = n
                         found_uuid = n.get("uuid")
                         break
 
             if found_uuid:
+                required_before = ("name", "address", "port", "configProfile")
+                if not all(k in existing_node for k in required_before):
+                    raise GoWaveAPIError(f"Cannot safely update node {found_uuid}: rollback snapshot is incomplete")
+                before = {k: existing_node[k] for k in required_before}
+                self._record_transaction_entity("node", found_uuid, "updated", before)
                 res = self.request("PATCH", f"/api/nodes/{found_uuid}", payload)
                 node_uuid = found_uuid
             else:
                 res = self.request("POST", "/api/nodes", payload)
                 data = res.get("response", res)
                 node_uuid = data.get("uuid")
+                self._record_transaction_entity("node", node_uuid, "created")
 
         return node_uuid
 
@@ -318,11 +356,14 @@ class GoWaveClient:
         all_inbounds = list(dict.fromkeys(existing_inbounds + inbound_uuids))
 
         if squad_uuid:
+            before = {"name": squad_name, "inbounds": existing_inbounds}
+            self._record_transaction_entity("squad", squad_uuid, "updated", before)
             self.request("PATCH", "/api/internal-squads", {"uuid": squad_uuid, "name": squad_name, "inbounds": all_inbounds})
         else:
             res = self.request("POST", "/api/internal-squads", {"name": squad_name, "inbounds": all_inbounds})
             data = res.get("response", res)
             squad_uuid = data.get("uuid")
+            self._record_transaction_entity("squad", squad_uuid, "created")
 
         return squad_uuid
 
@@ -377,7 +418,7 @@ class GoWaveClient:
         existing_by_remark = {}
         if isinstance(existing_hosts, list):
             for h in existing_hosts:
-                existing_by_remark[h.get("remark")] = h.get("uuid")
+                existing_by_remark[h.get("remark")] = h
 
         created_host_uuids = []
         for inb in inbounds_list:
@@ -418,13 +459,24 @@ class GoWaveClient:
             }
 
             if remark in existing_by_remark:
-                host_uuid = existing_by_remark[remark]
+                existing = existing_by_remark[remark]
+                host_uuid = existing.get("uuid")
+                before_fields = (
+                    "inbound", "nodes", "remark", "address", "port", "sni",
+                    "path", "host", "alpn", "fingerprint", "securityLayer",
+                    "internalSquads", "isDisabled",
+                )
+                if not all(k in existing for k in before_fields):
+                    raise GoWaveAPIError(f"Cannot safely update host {host_uuid}: rollback snapshot is incomplete")
+                before = {k: existing[k] for k in before_fields}
+                self._record_transaction_entity("host", host_uuid, "updated", before)
                 payload["uuid"] = host_uuid
                 self.request("PATCH", "/api/hosts", payload)
             else:
                 res = self.request("POST", "/api/hosts", payload)
                 data = res.get("response", res)
                 host_uuid = data.get("uuid")
+                self._record_transaction_entity("host", host_uuid, "created")
 
             created_host_uuids.append(host_uuid)
 
@@ -436,6 +488,9 @@ class GoWaveClient:
             users_res = self.request("GET", f"/api/users/by-username/{username}")
             user_data = users_res.get("response", users_res)
             if user_data and user_data.get("shortUuid"):
+                existing_uuid = user_data.get("uuid") or user_data.get("id")
+                if existing_uuid:
+                    self._record_transaction_entity("user", existing_uuid, "adopted")
                 return user_data.get("shortUuid")
         except GoWaveAPIError as e:
             if e.status_code != 404:
@@ -451,6 +506,7 @@ class GoWaveClient:
         res = self.request("POST", "/api/users", payload)
         data = res.get("response", res)
         short_uuid = data.get("shortUuid")
+        self._record_transaction_entity("user", data.get("uuid") or data.get("id"), "created")
         return short_uuid
 
     def issue_api_token(self, token_name="gowave-auto-sub-token"):
@@ -471,6 +527,7 @@ class GoWaveClient:
         data = res.get("response", res)
         token_str = data.get("token")
         token_id = data.get("id") or data.get("uuid")
+        self._record_transaction_entity("token", token_id, "created")
         return {"token": token_str, "id": token_id}
 
     def delete_token(self, token_id):
@@ -579,12 +636,43 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
         print(f"Warning: Failed to load journal {journal_file}: {e}", file=sys.stderr)
         return False
 
+    try:
+        from modules.recovery import validate_journal
+        validate_journal(journal_data)
+    except Exception as e:
+        print(f"Refusing API rollback because journal validation failed: {e}", file=sys.stderr)
+        return False
+
     op = journal_data.get("op", "")
     state = journal_data.get("state", "")
 
-    # If already committed or rolled back, skip
+    # If already committed or rolled back, skip.
     if state in ("PROVISION_COMMITTED", "NODE_ADD_COMMITTED", "PROVISION_ROLLED_BACK", "NODE_ADD_ROLLED_BACK"):
         return True
+
+    if op not in ("provision", "node_add"):
+        print(f"Refusing provisioning rollback for unsupported operation: {op}", file=sys.stderr)
+        return False
+
+    entities = journal_data.get("entities")
+    if entities == {} or entities == []:
+        journal_data["state"] = "PROVISION_ROLLED_BACK" if op == "provision" else "NODE_ADD_ROLLED_BACK"
+        journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        write_journal_atomically(str(journal_file), journal_data)
+        return True
+    if not isinstance(entities, list):
+        required_state = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
+        journal_data["state"] = required_state
+        journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        journal_data["rollback_error"] = "Legacy UUID-only journal has no action snapshots; automatic deletion refused."
+        write_journal_atomically(str(journal_file), journal_data)
+        print(journal_data["rollback_error"], file=sys.stderr)
+        return False
+
+    # Continue with API authentication only when there are recorded side effects.
+    if op not in ("provision", "node_add"):
+        print(f"Refusing provisioning rollback for unsupported operation: {op}", file=sys.stderr)
+        return False
 
     # Read credentials
     username = "admin"
@@ -610,6 +698,9 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
             for line in env_file.read_text().splitlines():
                 if line.startswith("ADMIN_PASSWORD="):
                     password = line.split("=", 1)[1].strip()
+    if not password:
+        print("Refusing API rollback: no admin password is available.", file=sys.stderr)
+        return False
 
     client = GoWaveClient(base_url)
     if username and password:
@@ -639,174 +730,95 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
         except Exception:
             pass
 
-    # Branch 1: PROVISION_* rollback
-    if op == "provision" or state.startswith("PROVISION_"):
-        entities = journal_data.get("entities", {})
+    # Both initial provisioning and worker addition use the same action-aware
+    # transaction ledger. Legacy UUID-only journals are deliberately non-destructive.
+    if op in ("provision", "node_add"):
+        entities = journal_data.get("entities")
+        # An empty initial dictionary means the transaction crashed before its
+        # first API mutation; it is safe to treat this as an empty action ledger.
+        if entities == {}:
+            entities = []
+        if not isinstance(entities, list):
+            required_state = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
+            journal_data["state"] = required_state
+            journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            journal_data["rollback_error"] = "Legacy journal has no created/updated/adopted action snapshots; automatic deletion refused."
+            write_journal_atomically(str(journal_file), journal_data)
+            print(journal_data["rollback_error"], file=sys.stderr)
+            return False
 
-        # Structured list format: [{"type": "...", "uuid": "...", "action": "created|updated|adopted", "before": ...}]
-        if isinstance(entities, list):
-            for item in reversed(entities):
-                action = item.get("action", "created")
-                etype = item.get("type", "")
-                uuid = item.get("uuid", "")
-                if action == "adopted" or not uuid:
-                    continue
+        rollback_errors = []
+        for item in reversed(entities):
+            if not isinstance(item, dict):
+                rollback_errors.append("Invalid entity entry in transaction journal")
+                continue
+            action = item.get("action")
+            etype = item.get("type")
+            uuid = item.get("uuid")
+            if action not in ("created", "updated", "adopted"):
+                rollback_errors.append(f"Invalid action for entity {etype}: {action}")
+                continue
+            if action == "adopted":
+                continue
+            if not isinstance(uuid, str) or not uuid:
+                rollback_errors.append(f"Missing UUID for {etype} action {action}")
+                continue
+
+            try:
                 if action == "updated":
-                    before = item.get("before", {})
-                    try:
-                        if etype == "squad":
-                            client.request("PATCH", "/api/internal-squads", {"uuid": uuid, **before})
-                        elif etype == "profile":
-                            client.request("PATCH", f"/api/config-profiles/{uuid}", before)
-                        elif etype == "node":
-                            client.request("PATCH", f"/api/nodes/{uuid}", before)
-                    except Exception as e:
-                        print(f"Rollback note (restore {etype} {uuid}): {e}", file=sys.stderr)
+                    before = item.get("before")
+                    if not isinstance(before, dict) or not before:
+                        raise GoWaveAPIError(f"Missing rollback snapshot for updated {etype} {uuid}")
+                    if etype == "profile":
+                        client.request("PATCH", f"/api/config-profiles/{uuid}", before)
+                    elif etype == "node":
+                        client.request("PATCH", f"/api/nodes/{uuid}", before)
+                    elif etype == "squad":
+                        client.request("PATCH", "/api/internal-squads", {"uuid": uuid, **before})
+                    elif etype == "host":
+                        client.request("PATCH", "/api/hosts", {"uuid": uuid, **before})
+                    else:
+                        raise GoWaveAPIError(f"Unsupported updated entity type: {etype}")
                 elif action == "created":
-                    try:
-                        if etype == "token":
-                            client.delete_token(uuid)
-                        elif etype == "user":
-                            client.delete_user(uuid)
-                        elif etype == "host":
-                            client.delete_host(uuid)
-                        elif etype == "squad":
-                            client.delete_internal_squad(uuid)
-                        elif etype == "node":
-                            client.delete_node(uuid)
-                        elif etype == "profile":
-                            client.delete_config_profile(uuid)
-                    except Exception as e:
-                        print(f"Rollback note (delete {etype} {uuid}): {e}", file=sys.stderr)
-
-        # Dictionary format (strictly deletes UUIDs created by this transaction without global name scans)
-        elif isinstance(entities, dict):
-            actions = entities.get("actions", {})
-
-            # 1. Tokens
-            token_id = entities.get("token_id")
-            if token_id and actions.get("token_id") != "adopted":
-                try:
-                    client.delete_token(token_id)
-                except Exception as e:
-                    print(f"Rollback note (tokens): {e}", file=sys.stderr)
-
-            # 2. Users
-            user_uuid = entities.get("user_uuid") or state_data.get("defaultUserUuid")
-            if user_uuid and actions.get("user_uuid") != "adopted":
-                try:
-                    client.delete_user(user_uuid)
-                except Exception as e:
-                    print(f"Rollback note (users): {e}", file=sys.stderr)
-
-            # 3. Hosts
-            host_uuids = entities.get("host_uuids", [])
-            for hid in reversed(host_uuids):
-                try:
-                    client.delete_host(hid)
-                except Exception as e:
-                    print(f"Rollback note (hosts): {e}", file=sys.stderr)
-
-            # 4. Internal Squads
-            squad_uuid = entities.get("squad_uuid") or state_data.get("squadUuid")
-            if squad_uuid and actions.get("squad_uuid") != "adopted":
-                try:
-                    client.delete_internal_squad(squad_uuid)
-                except Exception as e:
-                    print(f"Rollback note (squads): {e}", file=sys.stderr)
-
-            # 5. Nodes
-            node_uuid = entities.get("node_uuid") or state_data.get("localNodeUuid")
-            if node_uuid and actions.get("node_uuid") != "adopted":
-                try:
-                    client.delete_node(node_uuid)
-                except Exception as e:
-                    print(f"Rollback note (nodes): {e}", file=sys.stderr)
-
-            # 6. Config Profiles
-            prof_uuid = entities.get("profile_uuid") or state_data.get("profileUuid")
-            if prof_uuid and actions.get("profile_uuid") != "adopted":
-                try:
-                    client.delete_config_profile(prof_uuid)
-                except Exception as e:
-                    print(f"Rollback note (config-profiles): {e}", file=sys.stderr)
-
-        # Cleanup state.json.tmp
-        if tmp_state.exists():
-            try:
-                tmp_state.unlink()
-            except Exception:
-                pass
-
-        # Update journal to PROVISION_ROLLED_BACK
-        journal_data["state"] = "PROVISION_ROLLED_BACK"
-        journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        write_journal_atomically(str(journal_file), journal_data)
-        return True
-
-    # Branch 2: NODE_ADD_* rollback
-    elif op == "node_add" or state.startswith("NODE_ADD_"):
-        worker_name = journal_data.get("node_name", "")
-        if not worker_name and "transaction_id" in journal_data:
-            tid = journal_data["transaction_id"]
-            if tid.startswith("node_add_"):
-                worker_name = tid[len("node_add_"):]
-
-        worker_prof_uuid = journal_data.get("entities", {}).get("profile_uuid")
-        worker_node_uuid = journal_data.get("entities", {}).get("node_uuid")
-        worker_inbound_uuids = journal_data.get("entities", {}).get("inbound_uuids", [])
-        worker_host_uuids = journal_data.get("entities", {}).get("host_uuids", [])
-
-        # 1. Delete worker hosts by UUID strictly
-        for hid in reversed(worker_host_uuids):
-            try:
-                client.delete_host(hid)
+                    if etype == "token":
+                        client.delete_token(uuid)
+                    elif etype == "user":
+                        client.delete_user(uuid)
+                    elif etype == "host":
+                        client.delete_host(uuid)
+                    elif etype == "squad":
+                        client.delete_internal_squad(uuid)
+                    elif etype == "node":
+                        client.delete_node(uuid)
+                    elif etype == "profile":
+                        client.delete_config_profile(uuid)
+                    else:
+                        raise GoWaveAPIError(f"Unsupported created entity type: {etype}")
             except Exception as e:
-                print(f"Rollback note (worker host {hid}): {e}", file=sys.stderr)
+                message = f"Rollback failed for {action} {etype} {uuid}: {e}"
+                rollback_errors.append(message)
+                print(message, file=sys.stderr)
 
-        # 2. Unbind worker inbounds from internal squad (restores previous squad state)
-        squad_uuid = state_data.get("squadUuid")
-        try:
-            squads_res = client.request("GET", "/api/internal-squads")
-            squads_list = _extract_list(squads_res, "internalSquads")
-            for s in squads_list:
-                if (squad_uuid and s.get("uuid") == squad_uuid) or s.get("name") == "Default MVP Squad":
-                    cur_inbounds = [inb.get("uuid") if isinstance(inb, dict) else inb for inb in s.get("inbounds", [])]
-                    updated_inbounds = [ib for ib in cur_inbounds if ib not in worker_inbound_uuids]
-                    if len(updated_inbounds) != len(cur_inbounds):
-                        client.request("PATCH", "/api/internal-squads", {
-                            "uuid": s.get("uuid"),
-                            "name": s.get("name"),
-                            "inbounds": updated_inbounds
-                        })
-                    break
-        except Exception as e:
-            print(f"Rollback note (unbind squad): {e}", file=sys.stderr)
-
-        # 3. Delete worker node by explicit UUID
-        if worker_node_uuid:
-            try:
-                client.delete_node(worker_node_uuid)
-            except Exception as e:
-                print(f"Rollback note (worker node {worker_node_uuid}): {e}", file=sys.stderr)
-
-        # 4. Delete worker profile by explicit UUID
-        if worker_prof_uuid:
-            try:
-                client.delete_config_profile(worker_prof_uuid)
-            except Exception as e:
-                print(f"Rollback note (worker profile {worker_prof_uuid}): {e}", file=sys.stderr)
-
-        # Update state.json: remove worker from nodes array if present
-        if state_data and "nodes" in state_data:
-            orig_len = len(state_data["nodes"])
-            state_data["nodes"] = [n for n in state_data["nodes"] if n.get("name") != worker_name]
-            if len(state_data["nodes"]) != orig_len:
+        if not rollback_errors and op == "node_add":
+            worker_name = journal_data.get("node_name", "")
+            if not worker_name:
+                tid = journal_data.get("transaction_id", "")
+                if isinstance(tid, str) and tid.startswith("node_add_"):
+                    worker_name = tid[len("node_add_"):]
+            if state_data and "nodes" in state_data and worker_name:
+                state_data["nodes"] = [n for n in state_data["nodes"] if n.get("name") != worker_name]
                 atomic_write_state(state_data, str(state_file))
 
-        # 6. Update journal to NODE_ADD_ROLLED_BACK
-        journal_data["state"] = "NODE_ADD_ROLLED_BACK"
+        if rollback_errors:
+            journal_data["state"] = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
+            journal_data["rollback_errors"] = rollback_errors
+            journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            write_journal_atomically(str(journal_file), journal_data)
+            return False
+
+        journal_data["state"] = "PROVISION_ROLLED_BACK" if op == "provision" else "NODE_ADD_ROLLED_BACK"
         journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        journal_data.pop("rollback_errors", None)
         write_journal_atomically(str(journal_file), journal_data)
         return True
 

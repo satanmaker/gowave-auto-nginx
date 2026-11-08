@@ -131,7 +131,10 @@ class TestPanelDeployment(unittest.TestCase):
 
             # 2. Corrupt checksum detection
             sums_corrupt = art_dir / "SHA256SUMS.bad"
-            sums_corrupt.write_text(f"0000000000000000000000000000000000000000000000000000000000000000  gowave-linux-{arch}\n")
+            sums_corrupt.write_text(
+                f"0000000000000000000000000000000000000000000000000000000000000000  gowave-linux-{arch}\n"
+                "0000000000000000000000000000000000000000000000000000000000000000  gowave-frontend.tar.gz\n"
+            )
             env["GOWAVE_SHA256SUMS"] = str(sums_corrupt)
             res_bad = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env)
             self.assertNotEqual(res_bad.returncode, 0)
