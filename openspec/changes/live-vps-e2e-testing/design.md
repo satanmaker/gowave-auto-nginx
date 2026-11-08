@@ -278,9 +278,10 @@ Control Machine's system-wide trust store, a browser trust store, or any non-E2E
    trusting a Staging-only root. `allowInsecure`, `skip-cert-verify`, and equivalent verification bypasses
    are prohibited.
 
-7. The combined bundle is mode `0600`, private to the current run, contains public certificates only, and is
-   removed during local cleanup. It MUST NOT be installed in a host-wide trust directory or reused by
-   unrelated processes.
+7. The mode-specific per-run bundle (whether production or staging) is mode `0600`, private to the current
+   run, contains public certificates only, and is removed during local cleanup. In production it contains the
+   complete public CA roots only; in staging it additionally contains only the four verified Staging roots.
+   It MUST NOT be installed in a host-wide trust directory or reused by unrelated processes.
 
 **Rationale:** Let's Encrypt explicitly warns that Staging roots are not audited for ordinary trust and must
 only be added to test-only trust stores. Vendoring the documented roots and pinning their DER fingerprints
@@ -299,7 +300,7 @@ at that bound is sufficient to print every legal individual string. Do not use `
 zero as a zero-character limit, not unlimited output.
 
 Run the exact `gowave-auto.sh node add` process tree on the Master VPS with both string and array abbreviation
- disabled:
+disabled:
 `strace -f -v -s "$STRACE_STRING_LIMIT" -e trace=execve,execveat -o "$RAW_TRACE" -- ...`.
 The `-v` / `--no-abbrev` option is mandatory: it is equivalent to `-e abbrev=none` and prevents
 strace's default structure/array abbreviation from replacing later `argv` elements with an omission marker.
@@ -383,8 +384,9 @@ unexpected Phase 0.7 failures.
 **Chosen:** Extend `modules/api_client.py`'s `GoWaveClient` constructor compatibly with optional `ssl_context`
 and `timeout` parameters (defaults preserve existing callers). Its `urlopen` call passes the configured timeout
 and SSL context; `panel_api.py` constructs a client for `https://MASTER_PANEL_DOMAIN` with an SSL context built
-from the per-run combined CA bundle when staging is selected. Do not use `allowInsecure`, disable hostname
-verification, or silently fall back to system roots if the scoped bundle cannot be built. API timeout applies
+from the per-run mode-specific CA bundle (public roots only in production, public plus verified Staging roots
+in staging). Do not use `allowInsecure`, disable hostname verification, or silently fall back to system roots if
+the mode-specific bundle cannot be built. API timeout applies
 to each HTTP attempt; `NODE_READY_TIMEOUT` remains the separate overall polling deadline.
 
 **Rationale:** The current `GoWaveClient` hard-codes `urlopen(..., timeout=15)` and exposes no SSL-context
@@ -410,6 +412,11 @@ configuration identity before proceeding. `install` requires a successful prefli
 successful install records; `traffic` requires verification PASS; `negative` requires an installed disposable
 environment; `teardown` requires an existing run and diagnostics/baseline record. A completed phase is not
 repeated implicitly. A mismatch or missing state record fails closed before remote modification.
+
+`install` requires a successful preflight record and, after reacquiring both remote locks, MUST re-collect the
+baseline/disposable-gate invariants and compare them with the saved preflight manifest before its first remote
+mutation. A stale run-state record or any baseline drift fails closed; it is not enough that the original
+preflight phase once passed.
 
 `TEST_NEGATIVE_SUITE` defaults to `true`. When explicitly false, all 15 negative scenarios are `SKIP` and the
 overall result is at least `INCOMPLETE`; disabling the suite can never yield overall `PASS`.
@@ -469,11 +476,13 @@ Phase 1: Master Installation
   1.2  Copy pinned repo commit to Master /opt/gowave-auto-nginx
   1.3  Run gowave-auto.sh install with `GOWAVE_ACME_SERVER` derived from `ACME_MODE`; set
        `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1` and provide the pinned Node installer commit + SHA256
-  1.3  Verify service states, listeners, TLS certs
-  1.4  Verify credentials file (mode, owner, keys present — values not logged)
-  1.5  Retrieve shortUuid (state.json + API cross-check)
-  1.6  Verify Panel locally and from Control Machine
-  1.7  Record and compare versions (Panel, Node, Node installer commit/hash, Xray server and client,
+  1.4  Verify service states, listeners, TLS certs
+  1.5  Verify credentials file (mode, owner, keys present — values not logged)
+  1.6  Retrieve shortUuid (state.json + API cross-check)
+  1.7  Verify Panel locally and from Control Machine
+  1.8  Install/verify the distribution `strace` package on Master, record `strace -V`, and prove the
+       installed build supports `-f`, `-v`, `-s` and `execveat`; fail before Worker dispatch if unavailable
+  1.9  Record and compare versions (Panel, Node, Node installer commit/hash, Xray server and client,
        Mihomo, NGINX, OpenSSL, OS/kernel); an unpinned/mismatched component cannot PASS
 
 Phase 2: Worker Deployment
