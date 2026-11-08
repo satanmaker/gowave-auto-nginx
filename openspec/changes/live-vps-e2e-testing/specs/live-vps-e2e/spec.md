@@ -649,14 +649,9 @@ execute guaranteed cleanup and post-case baseline verification.
 
 ### Requirement: Global Certbot Deploy Hook Ownership
 
-The runner and installers SHALL treat
-`/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` as a host-global resource, independent of the
-per-domain lineage snapshots. Before mutation on either VPS, an existing hook path (including a symlink or
-non-regular object) SHALL cause preflight failure unless ownership by the same active transaction is proven.
-A transaction-created hook SHALL be recorded in the host-local recovery journal, created atomically, and
-removed during failed compensation only when its recorded identity and digest still match. A replaced or
-modified hook SHALL be preserved and recovery SHALL be reported incomplete. Successful commit retains the
-new managed hook; unowned pre-existing hooks are never overwritten or deleted.
+Installers SHALL protect the shared Certbot deploy hook through explicit transaction ownership.
+A pre-existing unowned hook blocks mutation; a transaction-created hook is journaled and may be removed only
+while its recorded identity and digest still match. Unverifiable ownership requires incomplete recovery.
 
 #### Scenario: Pre-existing global deploy hook blocks installation safely
 
