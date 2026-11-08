@@ -4,11 +4,10 @@
 
 ### Requirement: Explicit ACME Endpoint Selection and Certificate Lineage Isolation
 
-The installer and distributed orchestrator SHALL accept `GOWAVE_ACME_SERVER`, defaulting to Let's Encrypt
-production when unset. Only these exact URLs are allowed in v1: `https://acme-staging-v02.api.letsencrypt.org/directory`
-and `https://acme-v02.api.letsencrypt.org/directory`. The E2E runner exposes only `ACME_MODE=staging|production`
-and maps it to the corresponding exact URL; arbitrary directory URLs are rejected. The selected URL SHALL be
-propagated from Master to Worker over SSH stdin. A staging lineage MUST NOT be reused as production, nor production as staging.
+The installer and distributed orchestrator SHALL accept `GOWAVE_ACME_SERVER` (defaulting to Let's Encrypt
+production when unset) restricted to official Let's Encrypt staging and production directory URLs. The runner
+SHALL map `ACME_MODE` to the matching URL, propagate it over SSH stdin to Worker, and prevent cross-lineage
+staging and production reuse.
 
 #### Scenario: Runner maps ACME mode to the official staging directory
 
