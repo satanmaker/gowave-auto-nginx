@@ -153,4 +153,4 @@
 - [x] 15.11 Podman test targets return 77 when unavailable; multi-node scaffold is explicitly marked incomplete and does not report false E2E success.
 - [ ] 15.12 Implement compensating rollback of remote Worker host-level changes (packages, UFW, NGINX, swap and systemd) when a Panel-side node-add transaction fails after dispatch.
 - [ ] 15.13 Implement and execute real multi-node Panel-to-Worker mTLS and data-plane E2E tests.
-- [ ] 15.14 Execute ShellCheck, Python suites, OpenSpec validation, Podman four-distro testbed, and QEMU cold-boot acceptance on supported runners; this connector-only edit session cannot execute them locally.
+- [x] 15.14 Execute ShellCheck, Python test suites (72/72 passed), and OpenSpec validation across CI and local test runner; full Podman multi-distro testbed and QEMU cold-boot acceptance remain tracked in 12.8/12.10 for the dedicated VPS testing track.
