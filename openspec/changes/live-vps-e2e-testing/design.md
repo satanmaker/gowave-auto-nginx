@@ -437,14 +437,14 @@ tools/
 Phase 0: Preflight
   0.1  Config load + validate (whitelist parser, reserved IP rejection)
   0.2  Acquire the local per-target `fcntl.flock` in the private runtime directory
-  0.9  Acquire and hold authoritative `flock` sessions on both VPS hosts in deterministic address order;
-       preflight-only runs release them on exit; all mutating phases require both locks
   0.3  Control Machine tool check (python3, ssh, openssl, curl, dig, xray, mihomo)
   0.4  SSH trust check (both VPS, StrictHostKeyChecking=yes)
   0.5  DNS verification (4 domains, A/AAAA, 2+ resolvers)
   0.6  Baseline snapshot (systemd, listeners, firewall, GoWave dirs)
   0.7  Disposable gate (reject if GoWave present or ports occupied)
   0.8  Port hygiene (11+ required ports checked as free)
+  0.9  Acquire and hold authoritative `flock` sessions on both VPS hosts in deterministic address order;
+       preflight-only runs release them on exit; all mutating phases require both locks
 
 Phase 1: Master Installation
   1.1  Copy pinned repo commit to Master /opt/gowave-auto-nginx
