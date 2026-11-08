@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Unified CI Test Runner for GoWave Auto NGINX.
+Manages 5 distinct test suites (nonroot, root, integration, services, systemd),
+enforces strict EUID privilege boundaries, and provides completeness validation.
+"""
+import argparse
+import importlib
+import inspect
+import os
+from pathlib import Path
+import sys
+import unittest
+
+SUITES = {
+    "nonroot": (
+        "test_os_detection.TestOSDetection",
+        "test_security.TestSecurityModule",
+        "test_panel_deployment.TestPanelDeployment",
+        "test_node_integration.TestNodeIntegration",
+        "test_nginx_routing.TestNginxRouting",
+        "test_nonroot_lint.TestNonrootLint",
+        "test_backup_format_v1.TestBackupFormatV1",
+    ),
+    "integration": (
+        "test_api_client.TestAPIClient",
+        "test_integration.TestIntegration",
+    ),
+    "services": (
+        "test_services.TestServices",
+    ),
+    "root": (
+        "test_root.TestRoot",
+    ),
+    "systemd": (
+        "test_systemd_runner.TestSystemdRunner",
+    ),
+}
+
+
+def collect():
+    directory = Path(__file__).resolve().parent
+    sys.path.insert(0, str(directory))
+    modules = sorted(directory.glob("test_*.py"))
+    classes = {}
+
+    for path in modules:
+        module = importlib.import_module(path.stem)
+        for _, cls in inspect.getmembers(module, inspect.isclass):
+            if issubclass(cls, unittest.TestCase) and cls.__module__ == module.__name__:
+                classes[f"{module.__name__}.{cls.__qualname__}"] = cls
+
+    assignments = {}
+    for suite, names in SUITES.items():
+        for name in names:
+            if name in assignments:
+                raise ValueError(f"Duplicate suite assignment: {name}")
+            assignments[name] = suite
+
+    unassigned = sorted(classes.keys() - assignments.keys())
+    stale = sorted(assignments.keys() - classes.keys())
+    if unassigned or stale:
+        raise ValueError(f"Unassigned TestCase classes: {unassigned}; stale registry entries: {stale}")
+
+    loader = unittest.TestLoader()
+    suites = {name: [] for name in SUITES}
+    test_ids = set()
+
+    for name, cls in sorted(classes.items()):
+        if not loader.getTestCaseNames(cls):
+            raise ValueError(f"TestCase has no test methods: {name}")
+        tests = list(loader.loadTestsFromTestCase(cls))
+        for test in tests:
+            if test.id() in test_ids:
+                raise ValueError(f"Duplicate test ID: {test.id()}")
+            test_ids.add(test.id())
+        suites[assignments[name]].extend(tests)
+
+    if loader.errors:
+        raise ValueError("Test collection errors: " + "\n".join(loader.errors))
+
+    for name, tests in suites.items():
+        if not tests:
+            raise ValueError(f"Empty suite: {name}")
+
+    print("CI TEST INVENTORY")
+    print(f"Modules:          {len(modules)}")
+    print(f"TestCase classes: {len(classes)}")
+    print(f"Unique tests:     {len(test_ids)}")
+    for name, tests in suites.items():
+        print(f"{name:15}: {len(tests)}")
+    print("COMPLETENESS: PASS", flush=True)
+    return suites
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check-completeness", action="store_true", help="Validate test class registry completeness")
+    mode.add_argument("--suite", choices=SUITES.keys(), help="Target test suite to execute")
+    args = parser.parse_args()
+
+    # Enforce EUID privilege separation:
+    # nonroot, integration, services require os.geteuid() != 0
+    # root, systemd require os.geteuid() == 0
+    if args.suite and ((args.suite in ("root", "systemd")) != (os.geteuid() == 0)):
+        required_euid = "EUID 0" if args.suite in ("root", "systemd") else "EUID != 0"
+        print(f"PRIVILEGE: FAIL — {args.suite} requires {required_euid}", file=sys.stderr)
+        return 1
+
+    try:
+        suites = collect()
+    except (Exception, SystemExit) as error:
+        print(f"COMPLETENESS: FAIL — {error}", file=sys.stderr)
+        return 1
+
+    if args.check_completeness:
+        return 0
+
+    suite_to_run = unittest.TestSuite(suites[args.suite])
+    result = unittest.TextTestRunner(verbosity=2).run(suite_to_run)
+    return 0 if result.wasSuccessful() else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
