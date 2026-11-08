@@ -72,19 +72,22 @@ command.
 
 ### Requirement: Optional Vision Domain Pair and Activation
 
-The runner SHALL accept `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` only as an all-or-none, pairwise-distinct FQDN set. A
-one-sided configuration SHALL fail local preflight before any remote command; each Vision domain MUST differ
-from the other Vision domain and all four mandatory Panel/REALITY domains. When both are configured, the
-runner SHALL require a valid Vision certificate, active Vision inbound, matching Panel host, NGINX SNI route,
-and fallback on both VPS. Vision certificate issuance or validation failure MUST fail the relevant install
-phase; it MUST NOT be suppressed or reported as an optional skip. When both are absent, the default four-inbound
-per-node topology remains unchanged.
+The runner SHALL accept Vision domains only as a pair of distinct FQDNs. When enabled, it SHALL provision
+and verify the Vision certificate, inbound, Panel host, NGINX route, and fallback on both VPS. A Vision
+installation failure SHALL fail the relevant install phase. When disabled, the default four-inbound topology
+remains unchanged.
 
 #### Scenario: One-sided Vision domain configuration is rejected
 
 - **GIVEN** exactly one of `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` is non-empty
 - **WHEN** the whitelist configuration parser validates the E2E config
 - **THEN** preflight fails before SSH, certificate issuance, or any remote modification
+
+#### Scenario: Vision domains are unique
+
+- **GIVEN** both `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` are configured
+- **WHEN** the whitelist configuration parser validates the E2E config
+- **THEN** the two Vision domains MUST differ from each other and from all four mandatory Panel/REALITY domains; duplicates fail preflight before SSH or remote modification
 
 #### Scenario: Vision is fully provisioned on Master and Worker
 
