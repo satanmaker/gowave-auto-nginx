@@ -55,6 +55,7 @@ generate_stream_config() {
     local reality_domain="$2"
     local out_file="${3:-/etc/nginx/stream-enabled/gowave-stream.conf}"
     local if_inet6="${4:-/proc/net/if_inet6}"
+    local vision_domain="${5:-${VISION_DOMAIN:-}}"
 
     mkdir -p "$(dirname "$out_file")"
 
@@ -63,11 +64,17 @@ generate_stream_config() {
         listen_v6="listen [::]:443 so_keepalive=on;"
     fi
 
+    local vision_entry=""
+    if [[ -n "$vision_domain" ]]; then
+        vision_entry="    $vision_domain 127.0.0.1:8444;"
+    fi
+
     cat > "$out_file" <<EOF
 # Managed by GoWave Auto NGINX: Port 443 Stream SNI Router
 map \$ssl_preread_server_name \$sni_backend {
     $panel_domain 127.0.0.1:7443;
     $reality_domain 127.0.0.1:8443;
+$vision_entry
     default 127.0.0.1:8443;
 }
 
@@ -344,6 +351,41 @@ server {
 
     # Dedicated probe security audit log recording PROXY-restored remote_addr
     access_log $DECOY_ACCESS_LOG combined;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+    echo "Generated $out_file."
+}
+
+generate_vision_fallback_vhost() {
+    local vision_domain="$1"
+    local out_file="${2:-/etc/nginx/conf.d/gowave-vision-fallback.conf}"
+    local cover_root="${3:-$COVER_REALITY_ROOT}"
+
+    mkdir -p "$(dirname "$out_file")"
+    if [[ "$(id -u)" -eq 0 ]] || [[ -w "/var/www" ]] || [[ -w "$(dirname "$cover_root")" ]] || [[ -d "$cover_root" && -w "$cover_root" ]]; then
+        mkdir -p "$cover_root" 2>/dev/null || true
+        if [[ -d "$cover_root" && -w "$cover_root" && -d "$SCRIPT_DIR/assets/cover-sites/cover-reality" ]]; then
+            cp -r "$SCRIPT_DIR/assets/cover-sites/cover-reality/." "$cover_root/"
+            chmod -R 0755 "$cover_root" 2>/dev/null || true
+        fi
+    fi
+
+    cat > "$out_file" <<EOF
+# Managed by GoWave Auto NGINX: VLESS XTLS Vision Fallback Cover Site
+server {
+    listen 127.0.0.1:9444 proxy_protocol;
+    server_name $vision_domain;
+    server_tokens off;
+
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
+
+    root $cover_root;
+    index index.html;
 
     location / {
         try_files \$uri \$uri/ =404;

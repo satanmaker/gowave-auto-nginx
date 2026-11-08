@@ -5,18 +5,25 @@
   "protocol": "vless",
   "settings": {
     "clients": [],
-    "decryption": "none"
+    "decryption": "none",
+    "encryption": "none",
+    "fallbacks": []
   },
   "streamSettings": {
     "network": "xhttp",
     "security": "none",
     "xhttpSettings": {
       "path": "/xhttp-down/",
-      "mode": "packet-up"
+      "mode": "stream-up"
+    },
+    "sockopt": {
+      "trustedXForwardedFor": ["X-Forwarded-For"]
     }
   },
   "sniffing": {
     "enabled": true,
-    "destOverride": ["http", "tls", "quic"]
+    "destOverride": ["http", "tls", "quic", "fakedns"],
+    "metadataOnly": false,
+    "routeOnly": false
   }
 }

@@ -37,7 +37,18 @@ proxies:
     reality-opts:
       public-key: "1111111111111111111111111111111111111111111="
       short-id: "0123456789abcdef"
-    client-fingerprint: "chrome"
+    client-fingerprint: "firefox"
+
+  - name: "VLESS-Vision-TLS"
+    type: vless
+    server: "vision.example.com"
+    port: 443
+    uuid: "018d9f12-3456-7890-abcd-ef0123456789"
+    network: tcp
+    tls: true
+    flow: "xtls-rprx-vision"
+    servername: "vision.example.com"
+    client-fingerprint: "firefox"
 
   - name: "VLESS-XHTTP-TLS"
     type: vless
@@ -50,7 +61,7 @@ proxies:
     xhttp-opts:
       path: "/xhttp-down/"
       mode: "auto"
-    client-fingerprint: "chrome"
+    client-fingerprint: "firefox"
 
   - name: "VLESS-WS-TLS"
     type: vless
@@ -64,7 +75,7 @@ proxies:
       path: "/ws"
       headers:
         Host: "vpn.example.com"
-    client-fingerprint: "chrome"
+    client-fingerprint: "firefox"
 
   - name: "Trojan-gRPC-TLS"
     type: trojan
@@ -76,13 +87,14 @@ proxies:
     servername: "vpn.example.com"
     grpc-opts:
       grpc-service-name: "trojan-grpc"
-    client-fingerprint: "chrome"
+    client-fingerprint: "firefox"
 
 proxy-groups:
   - name: "→ GoWave"
     type: select
     proxies:
       - "VLESS-REALITY-Vision"
+      - "VLESS-Vision-TLS"
       - "VLESS-XHTTP-TLS"
       - "VLESS-WS-TLS"
       - "Trojan-gRPC-TLS"
@@ -98,4 +110,4 @@ rules:
   - IP-CIDR6,fc00::/7,DIRECT,no-resolve
   - IP-CIDR6,fe80::/10,DIRECT,no-resolve
   - GEOIP,private,DIRECT,no-resolve
-  - MATCH,→ GoWave
+  - MATCH,DIRECT

@@ -4,7 +4,8 @@
   "listen": "127.0.0.1",
   "protocol": "trojan",
   "settings": {
-    "clients": []
+    "clients": [],
+    "fallbacks": []
   },
   "streamSettings": {
     "network": "grpc",
@@ -16,6 +17,8 @@
   },
   "sniffing": {
     "enabled": true,
-    "destOverride": ["http", "tls", "quic"]
+    "destOverride": ["http", "tls", "quic", "fakedns"],
+    "metadataOnly": false,
+    "routeOnly": false
   }
 }

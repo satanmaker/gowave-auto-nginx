@@ -5,17 +5,23 @@
   "protocol": "vless",
   "settings": {
     "clients": [],
-    "decryption": "none"
+    "decryption": "none",
+    "encryption": "none",
+    "fallbacks": []
   },
   "streamSettings": {
     "network": "ws",
     "security": "none",
     "wsSettings": {
-      "path": "/ws"
+      "acceptProxyProtocol": false,
+      "path": "/ws",
+      "headers": {}
     }
   },
   "sniffing": {
     "enabled": true,
-    "destOverride": ["http", "tls", "quic"]
+    "destOverride": ["http", "tls", "quic", "fakedns"],
+    "metadataOnly": false,
+    "routeOnly": false
   }
 }

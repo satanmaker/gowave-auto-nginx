@@ -431,7 +431,7 @@ Client subscription links are generated from `Host` entities in GoWave. For each
   "path": null,
   "host": null,
   "alpn": "h2,http/1.1",
-  "fingerprint": "chrome",
+  "fingerprint": "firefox",
   "securityLayer": "DEFAULT",
   "internalSquads": {
     "mode": "ALLOW_ONLY",
@@ -452,6 +452,7 @@ In `backend-go/internal/subtpl/resolve.go`, `resolveSecurity()` resolves client 
 | MVP Protocol Host | Inbound `streamSettings.security` | Host `securityLayer` | Resolved Client Security | Rationale |
 |---|---|---|---|---|
 | **VLESS REALITY Vision** | `reality` | `DEFAULT` | `reality` | Inherits `reality` from Xray inbound. `"REALITY"` is invalid enum; must be `"DEFAULT"`. |
+| **VLESS XTLS Vision** | `tls` | `TLS` | `tls` | Directly terminates TLS in Xray with Let's Encrypt certificates; uses flow `xtls-rprx-vision`. |
 | **VLESS XHTTP TLS** | `none` | `TLS` | `tls` | NGINX terminates TLS on 443/7443; Xray listens with `none`. Host must force `"TLS"` so client connects with TLS. |
 | **VLESS WebSocket TLS** | `none` | `TLS` | `tls` | NGINX terminates TLS; Host must force `"TLS"`. |
 | **Trojan gRPC TLS** | `none` | `TLS` | `tls` | NGINX terminates TLS; Host must force `"TLS"`. |

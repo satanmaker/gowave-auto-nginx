@@ -143,7 +143,7 @@ The request payload for `POST /api/hosts` MUST strictly follow this exact struct
   "path": null,
   "host": null,
   "alpn": "h2,http/1.1",
-  "fingerprint": "chrome",
+  "fingerprint": "firefox",
   "securityLayer": "DEFAULT",
   "internalSquads": {
     "mode": "ALLOW_ONLY",
@@ -158,19 +158,19 @@ The request payload for `POST /api/hosts` MUST strictly follow this exact struct
 
 #### Protocol-Specific Field Matrix for `POST /api/hosts`
 
-| Field | VLESS REALITY Vision | VLESS XHTTP TLS | VLESS WebSocket TLS | Trojan gRPC TLS |
-|---|---|---|---|---|
-| `remark` | `"VLESS-REALITY-Vision@<node-name>"` | `"VLESS-XHTTP-TLS@<node-name>"` | `"VLESS-WS-TLS@<node-name>"` | `"Trojan-gRPC-TLS@<node-name>"` |
-| `address` | `<public_fqdn_or_ip>` | `<public_fqdn_or_ip>` | `<public_fqdn_or_ip>` | `<public_fqdn_or_ip>` |
-| `port` | `443` | `443` | `443` | `443` |
-| `sni` | `<reality_camouflage_sni>` (Mode A: `cdn.example.com`; Mode B: `gateway.icloud.com`) | `<panel_or_worker_domain>` | `<panel_or_worker_domain>` | `<panel_or_worker_domain>` |
-| `path` | `null` | `"/xhttp-down/"` | `"/ws"` | `"trojan-grpc"` |
-| `host` | `null` | `"<panel_or_worker_domain>"` | `"<panel_or_worker_domain>"` | `null` |
-| `alpn` | `"h2,http/1.1"` | `"h2,http/1.1"` | `"http/1.1"` | `"h2"` |
-| `fingerprint`| `"chrome"` | `"chrome"` | `"chrome"` | `"chrome"` |
-| `securityLayer` | `"DEFAULT"` | `"TLS"` | `"TLS"` | `"TLS"` |
-| `nodes` | `["<node-uuid>"]` | `["<node-uuid>"]` | `["<node-uuid>"]` | `["<node-uuid>"]` |
-| `internalSquads` | `{"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}` | `{"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}` | `{"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}` | `{"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}` |
+| Field | VLESS REALITY Vision | VLESS XTLS Vision | VLESS XHTTP TLS | VLESS WebSocket TLS | Trojan gRPC TLS |
+|---|---|---|---|---|---|
+| `remark` | `"VLESS-REALITY-Vision@<node-name>"` | `"VLESS-Vision-TLS@<node-name>"` | `"VLESS-XHTTP-TLS@<node-name>"` | `"VLESS-WS-TLS@<node-name>"` | `"Trojan-gRPC-TLS@<node-name>"` |
+| `address` | `<public_fqdn_or_ip>` | `<vision_domain_or_panel_fqdn>` | `<public_fqdn_or_ip>` | `<public_fqdn_or_ip>` | `<public_fqdn_or_ip>` |
+| `port` | `443` | `443` | `443` | `443` | `443` |
+| `sni` | `<reality_camouflage_sni>` (Mode A: `cdn.example.com`; Mode B: `gateway.icloud.com`) | `<vision_domain_or_panel_domain>` | `<panel_or_worker_domain>` | `<panel_or_worker_domain>` | `<panel_or_worker_domain>` |
+| `path` | `null` | `null` | `"/xhttp-down/"` | `"/ws"` | `"trojan-grpc"` |
+| `host` | `null` | `null` | `"<panel_or_worker_domain>"` | `"<panel_or_worker_domain>"` | `null` |
+| `alpn` | `"h2,http/1.1"` | `"http/1.1"` | `"h2,http/1.1"` | `"http/1.1"` | `"h2"` |
+| `fingerprint`| `"firefox"` | `"firefox"` | `"firefox"` | `"firefox"` | `"firefox"` |
+| `securityLayer` | `"DEFAULT"` | `"TLS"` | `"TLS"` | `"TLS"` | `"TLS"` |
+| `nodes` | `["<node-uuid>"]` | `["<node-uuid>"]` | `["<node-uuid>"]` | `["<node-uuid>"]` | `["<node-uuid>"]` |
+| `internalSquads` | `{"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}` | `{"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}` | `{"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}` | `{"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}` | `{"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}` |
 
 ---
 

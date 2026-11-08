@@ -55,6 +55,13 @@ class TestNginxRouting(unittest.TestCase):
             c2 = out.read_text()
             self.assertIn("listen [::]:443 so_keepalive=on;", c2)
 
+            # Case 3: Vision domain routing to 8444
+            cmd3 = f'source "{NGINX_SH}" && generate_stream_config "panel.example.com" "reality.example.com" "{out}" "{inet6}" "vision.example.com"'
+            res3 = subprocess.run(["bash", "-c", cmd3], capture_output=True, text=True)
+            self.assertEqual(res3.returncode, 0, res3.stderr)
+            c3 = out.read_text()
+            self.assertIn("vision.example.com 127.0.0.1:8444;", c3)
+
     def test_generate_panel_https_vhost(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -96,6 +103,24 @@ class TestNginxRouting(unittest.TestCase):
             self.assertIn(f"root {cover_dir};", c)
 
             # Verify static assets copied
+            self.assertTrue((cover_dir / "index.html").exists())
+            self.assertTrue((cover_dir / "robots.txt").exists())
+            self.assertTrue((cover_dir / "404.html").exists())
+
+    def test_generate_vision_fallback_vhost(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "gowave-vision-fallback.conf"
+            cover_dir = tmp / "cover-reality"
+
+            cmd = f'source "{NGINX_SH}" && generate_vision_fallback_vhost "vision.example.com" "{out}" "{cover_dir}"'
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+
+            c = out.read_text()
+            self.assertIn("server_name vision.example.com;", c)
+            self.assertIn("listen 127.0.0.1:9444 proxy_protocol;", c)
+            self.assertIn(f"root {cover_dir};", c)
             self.assertTrue((cover_dir / "index.html").exists())
             self.assertTrue((cover_dir / "robots.txt").exists())
             self.assertTrue((cover_dir / "404.html").exists())

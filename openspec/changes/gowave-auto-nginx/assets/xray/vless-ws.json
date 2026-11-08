@@ -1,30 +1,27 @@
 {
-  "tag": "vless-ws-{{NODE_NAME}}",
+  "tag": "vless-ws-TEMPLATE",
   "port": 10002,
   "listen": "127.0.0.1",
   "protocol": "vless",
   "settings": {
     "clients": [],
-    "decryption": "none"
+    "decryption": "none",
+    "encryption": "none",
+    "fallbacks": []
   },
   "streamSettings": {
     "network": "ws",
     "security": "none",
     "wsSettings": {
+      "acceptProxyProtocol": false,
       "path": "/ws",
-      "headers": {
-        "Host": ""
-      }
+      "headers": {}
     }
   },
   "sniffing": {
     "enabled": true,
-    "destOverride": [
-      "http",
-      "tls",
-      "quic"
-    ],
+    "destOverride": ["http", "tls", "quic", "fakedns"],
     "metadataOnly": false,
-    "routeOnly": true
+    "routeOnly": false
   }
 }

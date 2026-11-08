@@ -1,29 +1,29 @@
 {
-  "tag": "vless-xhttp-{{NODE_NAME}}",
+  "tag": "vless-xhttp-TEMPLATE",
   "port": 10001,
   "listen": "127.0.0.1",
   "protocol": "vless",
   "settings": {
     "clients": [],
-    "decryption": "none"
+    "decryption": "none",
+    "encryption": "none",
+    "fallbacks": []
   },
   "streamSettings": {
     "network": "xhttp",
     "security": "none",
     "xhttpSettings": {
       "path": "/xhttp-down/",
-      "host": "",
-      "mode": "packet-up"
+      "mode": "stream-up"
+    },
+    "sockopt": {
+      "trustedXForwardedFor": ["X-Forwarded-For"]
     }
   },
   "sniffing": {
     "enabled": true,
-    "destOverride": [
-      "http",
-      "tls",
-      "quic"
-    ],
+    "destOverride": ["http", "tls", "quic", "fakedns"],
     "metadataOnly": false,
-    "routeOnly": true
+    "routeOnly": false
   }
 }

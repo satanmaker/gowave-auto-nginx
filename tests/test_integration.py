@@ -56,9 +56,10 @@ class MockGoWaveServer(BaseHTTPRequestHandler):
             p_uuid = "prof-uuid-test"
             inbs = [
                 {"uuid": "inb-1", "tag": "vless-reality-local-node", "port": 8443},
-                {"uuid": "inb-2", "tag": "vless-xhttp-local-node", "port": 10001},
-                {"uuid": "inb-3", "tag": "vless-ws-local-node", "port": 10002},
-                {"uuid": "inb-4", "tag": "trojan-grpc-local-node", "port": 10003},
+                {"uuid": "inb-2", "tag": "vless-vision-local-node", "port": 8444},
+                {"uuid": "inb-3", "tag": "vless-xhttp-local-node", "port": 10001},
+                {"uuid": "inb-4", "tag": "vless-ws-local-node", "port": 10002},
+                {"uuid": "inb-5", "tag": "trojan-grpc-local-node", "port": 10003},
             ]
             MockGoWaveServer.state["profiles"][p_uuid] = {"name": body.get("name"), "inbounds": inbs}
             self.send_response(200)
@@ -139,6 +140,7 @@ class MockGoWaveServer(BaseHTTPRequestHandler):
             cfg_obj = {
                 "inbounds": [
                     {"port": 8443, "streamSettings": {"security": "reality", "realitySettings": {}}},
+                    {"port": 8444, "streamSettings": {"security": "tls"}},
                     {"port": 10001, "streamSettings": {"security": "none"}},
                     {"port": 10002, "streamSettings": {"security": "none"}},
                     {"port": 10003, "streamSettings": {"security": "none"}},
@@ -157,9 +159,10 @@ class MockGoWaveServer(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps([
                 {"uuid": "inb-1", "tag": "vless-reality-local-node", "port": 8443},
-                {"uuid": "inb-2", "tag": "vless-xhttp-local-node", "port": 10001},
-                {"uuid": "inb-3", "tag": "vless-ws-local-node", "port": 10002},
-                {"uuid": "inb-4", "tag": "trojan-grpc-local-node", "port": 10003},
+                {"uuid": "inb-2", "tag": "vless-vision-local-node", "port": 8444},
+                {"uuid": "inb-3", "tag": "vless-xhttp-local-node", "port": 10001},
+                {"uuid": "inb-4", "tag": "vless-ws-local-node", "port": 10002},
+                {"uuid": "inb-5", "tag": "trojan-grpc-local-node", "port": 10003},
             ]).encode())
         elif self.path == "/api/hosts":
             self.send_response(200)
@@ -264,7 +267,7 @@ class TestIntegration(unittest.TestCase):
         prof = client.provision_config_profile("GoWave MVP Unified Profile - local-node", raw_cfg)
 
         self.assertIn("profile_uuid", prof)
-        self.assertEqual(len(prof["inbounds"]), 4)
+        self.assertEqual(len(prof["inbounds"]), 5)
 
         inb_uuids = [inb["uuid"] for inb in prof["inbounds"]]
         node_uuid = client.associate_node("local-node", "127.0.0.1", 3002, prof["profile_uuid"], inb_uuids)
@@ -274,25 +277,30 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(squad_uuid, "squad-uuid-test")
 
     def test_host_entity_creation_with_readback(self):
-        """Host entity creation for 4 MVP protocols, with securityLayer checks."""
+        """Host entity creation for 5 MVP protocols, with securityLayer checks."""
         client = GoWaveClient(f"http://127.0.0.1:{self.port}")
         client.token = MockGoWaveServer.state["token"]
 
         inbounds = [
             {"uuid": "inb-1", "tag": "vless-reality-local-node", "port": 8443},
-            {"uuid": "inb-2", "tag": "vless-xhttp-local-node", "port": 10001},
-            {"uuid": "inb-3", "tag": "vless-ws-local-node", "port": 10002},
-            {"uuid": "inb-4", "tag": "trojan-grpc-local-node", "port": 10003},
+            {"uuid": "inb-2", "tag": "vless-vision-local-node", "port": 8444},
+            {"uuid": "inb-3", "tag": "vless-xhttp-local-node", "port": 10001},
+            {"uuid": "inb-4", "tag": "vless-ws-local-node", "port": 10002},
+            {"uuid": "inb-5", "tag": "trojan-grpc-local-node", "port": 10003},
         ]
         host_uuids = client.provision_hosts("prof-uuid-test", inbounds, "node-uuid-test", "squad-uuid-test", "vpn.example.com", "camou.example.com")
-        self.assertEqual(len(host_uuids), 4)
+        self.assertEqual(len(host_uuids), 5)
 
         # Check securityLayer contracts: DEFAULT for reality, TLS for others
         hosts_by_remark = {h["remark"]: h for h in MockGoWaveServer.state["hosts"].values()}
         self.assertEqual(hosts_by_remark["VLESS-REALITY-Vision@local-node"]["securityLayer"], "DEFAULT")
+        self.assertEqual(hosts_by_remark["VLESS-Vision-TLS@local-node"]["securityLayer"], "TLS")
         self.assertEqual(hosts_by_remark["VLESS-XHTTP-TLS@local-node"]["securityLayer"], "TLS")
         self.assertEqual(hosts_by_remark["VLESS-WS-TLS@local-node"]["securityLayer"], "TLS")
         self.assertEqual(hosts_by_remark["Trojan-gRPC-TLS@local-node"]["securityLayer"], "TLS")
+
+        for h in hosts_by_remark.values():
+            self.assertEqual(h["fingerprint"], "firefox")
 
     def test_user_provisioning_with_squad_assignment(self):
         """User lifecycle creation assigned to Internal Squad with mandatory expireAt."""
