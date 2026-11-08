@@ -334,7 +334,7 @@ Phase 6: Firewall
   6.2  Worker: establish positive mTLS probe from Master first; record actual Master source IP seen by Worker
   6.3  Compare observed source IP with the effective UFW allow rule; do not trust a separately queried egress IP alone
   6.4  Control Machine negative probe must be paired with listener-positive and Master-positive controls
-  6.5  Confirm UFW DROP rule/counter or packet trace on Worker; TCP timeout alone is insufficient
+  6.5  Confirm DROP evidence on the target host: Master evidence for Master external probes; Worker evidence for Control Machine → Worker probes
   6.6  Repeat equivalent checks over IPv6 when ENABLE_IPV6=true
 
 Phase 7: NGINX SNI + REALITY Decoy
