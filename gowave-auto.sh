@@ -130,6 +130,13 @@ cmd_install() {
     if [[ -z "$admin_email" ]]; then
         read -r -p "Enter Let's Encrypt admin email: " admin_email
     fi
+    if [[ -z "$vision_domain" ]] && [[ -t 0 ]] && [[ -z "${1:-}" ]]; then
+        local enable_vision="n"
+        read -r -p "Configure optional VLESS + XTLS Vision? (requires a dedicated 3rd domain/subdomain) [y/N]: " enable_vision
+        if [[ "$enable_vision" =~ ^[Yy]$ ]]; then
+            read -r -p "Enter Vision domain (e.g. vision.example.com): " vision_domain
+        fi
+    fi
     python3 - "$panel_domain" "$reality_domain" "$vision_domain" <<'PY'
 import re, sys
 panel, reality, *extra = sys.argv[1:]
@@ -161,6 +168,11 @@ PY
     echo "==> Starting GoWave Auto NGINX All-in-One Deployment..."
     echo "Panel Domain:   $panel_domain"
     echo "Reality Domain: $reality_domain"
+    if [[ -n "$vision_domain" ]]; then
+        echo "Vision Domain:  $vision_domain (Optional VLESS + XTLS Vision enabled)"
+    else
+        echo "Vision Domain:  Disabled (default 4-inbound configuration)"
+    fi
 
     # Step 1: Preflight Environment Inspection
     check_os
@@ -179,7 +191,7 @@ PY
     configure_log_rotation
 
     # Step 4: Webroot ACME TLS Acquisition
-    generate_bootstrap_acme_vhost "$panel_domain" "$reality_domain"
+    generate_bootstrap_acme_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/00-bootstrap-acme.conf" "/proc/net/if_inet6" "$vision_domain"
     reload_nginx_strict
 
     if ! command -v certbot >/dev/null 2>&1; then
@@ -216,7 +228,7 @@ PY
     # Step 5: NGINX Configuration
     ensure_nginx_stream_block
     generate_stream_config "$panel_domain" "$reality_domain" "/etc/nginx/stream-enabled/gowave-stream.conf" "/proc/net/if_inet6" "$vision_domain"
-    generate_production_http_vhost "$panel_domain" "$reality_domain"
+    generate_production_http_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/gowave-http.conf" "/proc/net/if_inet6" "$vision_domain"
     generate_panel_https_vhost "$panel_domain"
     generate_decoy_vhost "$reality_domain"
     if [[ -n "$vision_domain" ]]; then

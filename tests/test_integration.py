@@ -54,14 +54,14 @@ class MockGoWaveServer(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"accessToken": MockGoWaveServer.state["token"]}).encode())
         elif self.path == "/api/config-profiles":
             p_uuid = "prof-uuid-test"
+            cfg_raw = body.get("config", "{}")
+            cfg = json.loads(cfg_raw) if isinstance(cfg_raw, str) else cfg_raw
+            cfg_inbs = cfg.get("inbounds", []) if isinstance(cfg, dict) else []
             inbs = [
-                {"uuid": "inb-1", "tag": "vless-reality-local-node", "port": 8443},
-                {"uuid": "inb-2", "tag": "vless-vision-local-node", "port": 8444},
-                {"uuid": "inb-3", "tag": "vless-xhttp-local-node", "port": 10001},
-                {"uuid": "inb-4", "tag": "vless-ws-local-node", "port": 10002},
-                {"uuid": "inb-5", "tag": "trojan-grpc-local-node", "port": 10003},
+                {"uuid": f"inb-{i+1}", "tag": inb.get("tag", f"inb-{i+1}"), "port": inb.get("port", 8443)}
+                for i, inb in enumerate(cfg_inbs)
             ]
-            MockGoWaveServer.state["profiles"][p_uuid] = {"name": body.get("name"), "inbounds": inbs}
+            MockGoWaveServer.state["profiles"][p_uuid] = {"name": body.get("name"), "inbounds": inbs, "config": cfg_raw}
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -82,7 +82,7 @@ class MockGoWaveServer(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"uuid": s_uuid, "inbounds": body.get("inbounds", [])}).encode())
         elif self.path == "/api/hosts":
             h_uuid = f"host-{len(MockGoWaveServer.state['hosts']) + 1}"
-            MockGoWaveServer.state["hosts"][h_uuid] = body
+            MockGoWaveServer.state["hosts"][h_uuid] = {"uuid": h_uuid, **body}
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -104,6 +104,22 @@ class MockGoWaveServer(BaseHTTPRequestHandler):
             self.close_connection = True
             self.send_response(404)
             self.end_headers()
+
+    def do_PATCH(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length).decode()) if length > 0 else {}
+        if self.path == "/api/hosts":
+            h_uuid = body.get("uuid")
+            if h_uuid and h_uuid in MockGoWaveServer.state["hosts"]:
+                MockGoWaveServer.state["hosts"][h_uuid].update(body)
+        elif self.path == "/api/internal-squads":
+            s_uuid = body.get("uuid")
+            if s_uuid and s_uuid in MockGoWaveServer.state["squads"]:
+                MockGoWaveServer.state["squads"][s_uuid].update(body)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps({"response": {"status": "updated", **body}}).encode())
 
     def do_GET(self):
         if self.path == "/api/config-profiles":
@@ -137,33 +153,22 @@ class MockGoWaveServer(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            cfg_obj = {
-                "inbounds": [
-                    {"port": 8443, "streamSettings": {"security": "reality", "realitySettings": {}}},
-                    {"port": 8444, "streamSettings": {"security": "tls"}},
-                    {"port": 10001, "streamSettings": {"security": "none"}},
-                    {"port": 10002, "streamSettings": {"security": "none"}},
-                    {"port": 10003, "streamSettings": {"security": "none"}},
-                ]
-            }
+            prof_data = MockGoWaveServer.state["profiles"].get("prof-uuid-test", {})
+            cfg_raw = prof_data.get("config", "{}")
             self.wfile.write(json.dumps({
                 "response": {
                     "uuid": "prof-uuid-test",
                     "name": "mock-profile",
-                    "config": json.dumps(cfg_obj)
+                    "config": cfg_raw
                 }
             }).encode())
         elif self.path.startswith("/api/config-profiles/") and self.path.endswith("/inbounds"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps([
-                {"uuid": "inb-1", "tag": "vless-reality-local-node", "port": 8443},
-                {"uuid": "inb-2", "tag": "vless-vision-local-node", "port": 8444},
-                {"uuid": "inb-3", "tag": "vless-xhttp-local-node", "port": 10001},
-                {"uuid": "inb-4", "tag": "vless-ws-local-node", "port": 10002},
-                {"uuid": "inb-5", "tag": "trojan-grpc-local-node", "port": 10003},
-            ]).encode())
+            prof_data = MockGoWaveServer.state["profiles"].get("prof-uuid-test", {})
+            inbs = prof_data.get("inbounds", [])
+            self.wfile.write(json.dumps(inbs).encode())
         elif self.path == "/api/hosts":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -267,7 +272,7 @@ class TestIntegration(unittest.TestCase):
         prof = client.provision_config_profile("GoWave MVP Unified Profile - local-node", raw_cfg)
 
         self.assertIn("profile_uuid", prof)
-        self.assertEqual(len(prof["inbounds"]), 5)
+        self.assertEqual(len(prof["inbounds"]), 4)
 
         inb_uuids = [inb["uuid"] for inb in prof["inbounds"]]
         node_uuid = client.associate_node("local-node", "127.0.0.1", 3002, prof["profile_uuid"], inb_uuids)
