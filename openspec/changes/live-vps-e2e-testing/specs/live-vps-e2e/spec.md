@@ -188,6 +188,12 @@ check succeeds; and `gowave-auto.sh health` returns `HEALTHY`.
 - **THEN** `gowave.service` is active, Panel responds to an authenticated API call at `127.0.0.1:3000`,
   and the same HTTPS endpoint is reachable from the Control Machine through NGINX on port 443
 
+#### Scenario: Installer TLS/SNI probe trusts only the per-run CA bundle
+
+- **GIVEN** `ACME_MODE=staging` and the runner has validated the D9 mode-specific CA bundle
+- **WHEN** `gowave-auto.sh install` runs `verify_public_tls_sni` on Master
+- **THEN** the runner stages that bundle in a root-only `/run` file and supplies `GOWAVE_TLS_CA_FILE`; the probe uses `-CAfile`, `-verify_return_error`, and `-verify_hostname`, so the staging certificate succeeds without adding Staging roots to `/etc/ssl/certs`; an untrusted test CA fails; the temporary bundle is removed on success or failure
+
 #### Scenario: Credentials file has correct permissions and content
 
 - **GIVEN** install completed successfully
@@ -586,15 +592,14 @@ execute guaranteed cleanup and post-case baseline verification.
 | **NEG-11**  | Backup Restore   | Corrupted archive header / invalid tar format | Preflight check rejects before mutating live files |
 | **NEG-12**  | Backup Restore   | SQLite DB file in archive corrupted | SQLite integrity check fails before replacing live DB |
 | **NEG-13**  | Worker Deploy    | SSH pipeline interrupted mid-execution | Master recovery journal does NOT enter `COMMITTED` |
-| **NEG-14**  | Worker Deploy    | Duplicate `node add` invocation for same node | Idempotent; no duplicate DB entities or hosts created |
+| **NEG-14**  | Worker Deploy    | Duplicate `node add` when the worker name is already in `state.json` | Explicit fail-fast rejection before API mutation; no duplicate DB entities or hosts |
 | **NEG-15**  | Panel API Auth   | API request with expired or forged JWT | Panel returns 401 Unauthorized |
 
-#### Scenario: Duplicate Worker re-registration is idempotent (NEG-14)
+#### Scenario: Duplicate Worker registration is rejected without mutation (NEG-14)
 
-- **GIVEN** `worker-1` is already registered and all associated API objects exist
-- **WHEN** `gowave-auto.sh node add worker-1` is executed again with the same parameters
-- **THEN** `GET /api/nodes` still shows exactly one node named `worker-1`; no duplicate config profiles,
-  hosts, or inbounds appear
+- **GIVEN** `worker-1` is already present in Master `state.json` and all associated API objects exist
+- **WHEN** `gowave-auto.sh node add worker-1` is invoked again with the same parameters
+- **THEN** the command exits nonzero with the existing-name rejection before constructing `GoWaveClient` or issuing any Panel API request; `state.json` is unchanged and the existing single node, profile, hosts, and inbounds remain unchanged
 
 #### Scenario: Partial SSH deployment leaves no false COMMITTED journal state (NEG-13)
 
@@ -680,10 +685,16 @@ Teardown is reported separately from test outcome; overall `PASS` requires the s
   JSON with `schema_version: 1`, `status: "RESTORED"`, and matching `snapshot_id` plus `restored: true`
   for both hosts. Hook execution is bounded by `RESTORE_TIMEOUT`.
 
+#### Scenario: Snapshot restore reacquires the remote lock pair before baseline verification
+
+- **GIVEN** snapshot restoration has rebooted one or both VPS and terminated the original remote lock-holder sessions
+- **WHEN** both restored VPS become reachable again
+- **THEN** the runner reacquires both authoritative locks in deterministic address order, validates the saved run identity, and only then checks the clean baseline; failure to reacquire either lock or a baseline mismatch yields `TEARDOWN_FAILED`, never `PASS`
+
 #### Scenario: Snapshot restore hook success requires baseline verification
 
-- **GIVEN** the restore hook returns valid `RESTORED` JSON with matching IDs and both VPS are reachable again
-- **WHEN** the runner recollects the Phase 0 baseline manifest
+- **GIVEN** the restore hook returns valid `RESTORED` JSON with matching IDs and the runner has reacquired both remote locks
+- **WHEN** the runner recollects the Phase 0 baseline manifest while holding both locks
 - **THEN** the required clean-baseline invariants match the pre-install manifest; only then may teardown be `PASS`
 
 #### Scenario: Snapshot restore hook does not restore both hosts
