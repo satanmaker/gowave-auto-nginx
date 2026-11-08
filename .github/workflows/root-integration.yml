@@ -1,0 +1,41 @@
+name: Root and Integration Verification
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  root-and-integration:
+    name: Root Suite & Unprivileged Integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nginx libnginx-mod-stream sqlite3 openssl curl ufw fail2ban certbot tar gzip
+
+      - name: Run Suite Root (EUID 0)
+        run: |
+          sudo python3 tests/run_ci.py --suite root
+
+      - name: Run Suite Integration (Unprivileged EUID != 0)
+        run: |
+          python3 tests/run_ci.py --suite integration

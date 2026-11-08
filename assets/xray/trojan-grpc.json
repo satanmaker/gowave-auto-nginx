@@ -1,0 +1,21 @@
+{
+  "tag": "trojan-grpc-TEMPLATE",
+  "port": 10003,
+  "listen": "127.0.0.1",
+  "protocol": "trojan",
+  "settings": {
+    "clients": []
+  },
+  "streamSettings": {
+    "network": "grpc",
+    "security": "none",
+    "grpcSettings": {
+      "serviceName": "trojan-grpc",
+      "multiMode": false
+    }
+  },
+  "sniffing": {
+    "enabled": true,
+    "destOverride": ["http", "tls", "quic"]
+  }
+}

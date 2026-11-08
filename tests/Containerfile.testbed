@@ -1,0 +1,43 @@
+ARG BASE_IMAGE=docker.io/library/ubuntu:24.04
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV container=docker
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    systemd \
+    systemd-sysv \
+    dbus \
+    python3 \
+    python3-systemd \
+    curl \
+    tar \
+    gzip \
+    openssl \
+    sqlite3 \
+    ufw \
+    fail2ban \
+    openssh-server \
+    openssh-client \
+    iproute2 \
+    ca-certificates \
+    sudo \
+    nginx-full \
+    libnginx-mod-stream \
+    certbot \
+    systemd-resolved \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clean masks on systemd units
+RUN rm -f /lib/systemd/system/sysinit.target.wants/systemd-udevd.service \
+    /lib/systemd/system/multi-user.target.wants/systemd-logind.service \
+    /lib/systemd/system/sockets.target.wants/*udev* \
+    /lib/systemd/system/sockets.target.wants/*initctl*
+
+# SSH server setup for remote node testing
+RUN mkdir -p /var/run/sshd /root/.ssh && chmod 0700 /root/.ssh && \
+    ssh-keygen -A 2>/dev/null || true
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

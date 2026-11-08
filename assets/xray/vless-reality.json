@@ -1,0 +1,28 @@
+{
+  "tag": "vless-reality-TEMPLATE",
+  "port": 8443,
+  "protocol": "vless",
+  "settings": {
+    "clients": [],
+    "decryption": "none"
+  },
+  "streamSettings": {
+    "network": "tcp",
+    "security": "reality",
+    "realitySettings": {
+      "show": false,
+      "dest": "127.0.0.1:9443",
+      "xver": 1,
+      "serverNames": ["REALITY_DOMAIN_PLACEHOLDER"],
+      "privateKey": "PRIVATE_KEY_PLACEHOLDER",
+      "shortIds": ["SHORT_ID_PLACEHOLDER"]
+    },
+    "tcpSettings": {
+      "acceptProxyProtocol": true
+    }
+  },
+  "sniffing": {
+    "enabled": true,
+    "destOverride": ["http", "tls", "quic"]
+  }
+}

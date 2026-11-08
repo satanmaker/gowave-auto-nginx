@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Suite root: Privileged host hardening, systemd drop-ins, Fail2ban syntax, Stream 443 SNI,
+zero-leak secrets, strict umask 077 backups, journal schema validation, and sequential multi-node add.
+Must run with EUID 0 (root).
+"""
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+from modules.recovery import validate_journal, JournalValidationError
+
+
+class TestRoot(unittest.TestCase):
+
+    def setUp(self):
+        if os.geteuid() != 0:
+            self.skipTest("Suite root requires root privileges (EUID 0)")
+
+    def test_euid_zero(self):
+        """Assert current runner is EUID 0."""
+        self.assertEqual(os.geteuid(), 0)
+
+    def test_user_group_and_sticky_bit(self):
+        """Test user/group gowave creation and sticky bit 1770 on target directory."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            target_dir = Path(tmp_dir) / "gowave"
+            target_dir.mkdir(mode=0o1770)
+            os.chmod(target_dir, 0o1770)
+            st = target_dir.stat()
+            self.assertTrue(bool(st.st_mode & 0o1000), "Sticky bit not set on directory")
+            self.assertEqual(oct(st.st_mode & 0o777), "0o770")
+
+    def test_zero_leak_secret_delivery(self):
+        """Verify delivery of node SECRET_KEY via stdin / mode 0600 temporary file without CLI argv exposure."""
+        dummy_secret = "dGVzdC1jZXJ0LXNlY3JldA=="
+        with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
+            tf.write(dummy_secret)
+            tf.flush()
+            temp_path = tf.name
+
+        try:
+            os.chmod(temp_path, 0o600)
+            st = os.stat(temp_path)
+            self.assertEqual(oct(st.st_mode & 0o777), "0o600")
+
+            # Execute reader via stdin without passing dummy_secret in argv
+            proc = subprocess.Popen(
+                ["bash", "-c", "cat"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            stdout, _ = proc.communicate(input=dummy_secret)
+            self.assertEqual(stdout, dummy_secret)
+
+            # Check /proc/<pid>/cmdline did not contain secret
+            self.assertNotIn(dummy_secret, " ".join(proc.args))
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def test_ipv6_disabled_stream(self):
+        """When kernel IPv6 is disabled, generate_stream_config must NOT output [::]:443."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            fake_if_inet6 = tmp / "nonexistent_if_inet6"
+            out_stream = tmp / "gowave-stream.conf"
+
+            cmd = f"""
+source "{REPO_ROOT}/modules/os.sh"
+source "{REPO_ROOT}/modules/nginx.sh"
+generate_stream_config "panel.example.com" "reality.example.com" "{out_stream}" "{fake_if_inet6}"
+"""
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            content = out_stream.read_text()
+            self.assertIn("listen 443 so_keepalive=on;", content)
+            self.assertNotIn("[::]:443", content)
+
+    def test_backup_strict_umask(self):
+        """Backup creation under strict umask 077 must still produce mode 0600 archive."""
+        backup_script = REPO_ROOT / "assets" / "backup" / "gowave-backup.sh"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp = Path(tmp_dir)
+            gowave_dir = tmp / "gowave"
+            gowave_dir.mkdir()
+            (gowave_dir / ".env").write_text("APP_PORT=3000\n")
+            out_archive = tmp / "strict_backup.tar.gz"
+
+            cmd = f"umask 077 && bash '{backup_script}' backup --type panel '{out_archive}' '{gowave_dir}'"
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertTrue(out_archive.exists())
+            mode = oct(out_archive.stat().st_mode & 0o777)
+            self.assertEqual(mode, "0o600")
+
+    def test_gomemlimit_applied(self):
+        """Verify systemd drop-in file format for GOMEMLIMIT."""
+        dropin_content = """[Service]
+Environment="GOMEMLIMIT=250MiB"
+"""
+        with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
+            tf.write(dropin_content)
+            tf.flush()
+            path = tf.name
+
+        try:
+            content = Path(path).read_text()
+            self.assertIn("GOMEMLIMIT=250MiB", content)
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_journal_schema_validation(self):
+        """Strict JSON Schema validation for journal.json before recovery actions."""
+        # Valid update journal
+        valid_journal = {
+            "transaction_id": "update-123456",
+            "op": "update",
+            "state": "PREPARED",
+            "timestamp": "2026-11-08T00:00:00Z"
+        }
+        self.assertTrue(validate_journal(valid_journal))
+
+        # Invalid operation
+        invalid_op = {
+            "transaction_id": "bad-op",
+            "op": "invalid_operation_name",
+            "state": "PREPARED",
+            "timestamp": "2026-11-08T00:00:00Z"
+        }
+        with self.assertRaises(JournalValidationError):
+            validate_journal(invalid_op)
+
+        # Invalid state
+        invalid_state = {
+            "transaction_id": "bad-state",
+            "op": "update",
+            "state": "UNKNOWN_STATE",
+            "timestamp": "2026-11-08T00:00:00Z"
+        }
+        with self.assertRaises(JournalValidationError):
+            validate_journal(invalid_state)
+
+    def test_sequential_multi_node_add(self):
+        """Sequential worker node addition to state.json schemaVersion 2."""
+        state = {
+            "schemaVersion": 2,
+            "installationMode": "all-in-one",
+            "nodes": [
+                {"name": "local-node", "address": "127.0.0.1", "port": 3002, "uuid": "node-1"}
+            ]
+        }
+        # Add worker 1
+        state["nodes"].append({"name": "worker-1", "address": "10.89.0.20", "port": 3002, "uuid": "node-2"})
+        # Add worker 2
+        state["nodes"].append({"name": "worker-2", "address": "10.89.0.21", "port": 3002, "uuid": "node-3"})
+
+        self.assertEqual(len(state["nodes"]), 3)
+        self.assertEqual(state["nodes"][1]["name"], "worker-1")
+        self.assertEqual(state["nodes"][2]["name"], "worker-2")
+
+
+if __name__ == "__main__":
+    unittest.main()

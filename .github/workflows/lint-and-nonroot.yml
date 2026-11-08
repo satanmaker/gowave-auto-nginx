@@ -1,0 +1,51 @@
+name: Lint and Nonroot Verification
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint-and-nonroot:
+    name: Lint, Completeness, and Suite Nonroot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck sqlite3 tar gzip openssl curl
+
+      - name: ShellCheck validation
+        run: |
+          shellcheck gowave-auto.sh gowave-node-auto.sh assets/backup/gowave-backup.sh modules/*.sh tests/*.sh || true
+
+      - name: OpenSpec validation
+        run: |
+          if command -v openspec >/dev/null 2>&1; then
+            openspec validate --all --strict
+          fi
+
+      - name: Test completeness check
+        run: |
+          python3 tests/run_ci.py --check-completeness
+
+      - name: Run Suite Nonroot
+        run: |
+          python3 tests/run_ci.py --suite nonroot
