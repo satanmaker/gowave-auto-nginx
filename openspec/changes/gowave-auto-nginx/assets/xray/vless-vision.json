@@ -1,0 +1,50 @@
+{
+  "tag": "vless-vision-TEMPLATE",
+  "port": 8444,
+  "listen": "127.0.0.1",
+  "protocol": "vless",
+  "settings": {
+    "clients": [],
+    "decryption": "none",
+    "encryption": "none",
+    "fallbacks": [
+      {
+        "name": "DOMAIN_PLACEHOLDER",
+        "alpn": "http/1.1",
+        "dest": "127.0.0.1:9444",
+        "xver": 1
+      }
+    ]
+  },
+  "streamSettings": {
+    "network": "tcp",
+    "security": "tls",
+    "tcpSettings": {
+      "acceptProxyProtocol": true,
+      "header": {
+        "type": "none"
+      }
+    },
+    "tlsSettings": {
+      "serverName": "DOMAIN_PLACEHOLDER",
+      "minVersion": "1.2",
+      "alpn": [
+        "http/1.1"
+      ],
+      "certificates": [
+        {
+          "certificateFile": "CERT_FILE_PLACEHOLDER",
+          "keyFile": "KEY_FILE_PLACEHOLDER",
+          "oneTimeLoading": false,
+          "usage": "encipherment"
+        }
+      ]
+    }
+  },
+  "sniffing": {
+    "enabled": true,
+    "destOverride": ["http", "tls", "quic", "fakedns"],
+    "metadataOnly": false,
+    "routeOnly": false
+  }
+}

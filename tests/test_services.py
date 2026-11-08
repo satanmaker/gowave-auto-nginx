@@ -151,17 +151,20 @@ class TestServices(unittest.TestCase):
             self.assertIn("VLESS-REALITY", yaml_content)
 
     def test_xray_template_proxy_protocol_isolation(self):
-        """Only REALITY inbound (8443) must have acceptProxyProtocol: true; 10001-10003 must NOT."""
+        """Only public edge inbounds (REALITY 8443, Vision 8444) must have acceptProxyProtocol: true; 10001-10003 must NOT."""
         templates_dir = REPO_ROOT / "assets" / "xray"
 
         reality_cfg = json.loads((templates_dir / "vless-reality.json").read_text())
+        vision_cfg = json.loads((templates_dir / "vless-vision.json").read_text())
         xhttp_cfg = json.loads((templates_dir / "vless-xhttp.json").read_text())
         ws_cfg = json.loads((templates_dir / "vless-ws.json").read_text())
         trojan_cfg = json.loads((templates_dir / "trojan-grpc.json").read_text())
 
-        # REALITY on 8443 must have acceptProxyProtocol true in tcpSettings
+        # REALITY on 8443 and Vision on 8444 must have acceptProxyProtocol true in tcpSettings
         self.assertEqual(reality_cfg["port"], 8443)
         self.assertTrue(reality_cfg.get("streamSettings", {}).get("tcpSettings", {}).get("acceptProxyProtocol"))
+        self.assertEqual(vision_cfg["port"], 8444)
+        self.assertTrue(vision_cfg.get("streamSettings", {}).get("tcpSettings", {}).get("acceptProxyProtocol"))
 
         # Inbounds behind NGINX (10001-10003) must NOT have acceptProxyProtocol
         for cfg, expected_port in [(xhttp_cfg, 10001), (ws_cfg, 10002), (trojan_cfg, 10003)]:

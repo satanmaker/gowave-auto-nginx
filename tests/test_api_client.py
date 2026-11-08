@@ -93,9 +93,10 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
             else:
                 inbounds = [
                     {"uuid": "inb-1", "tag": "vless-reality-local-node", "port": 8443, "protocol": "vless"},
-                    {"uuid": "inb-2", "tag": "vless-xhttp-local-node", "port": 10001, "protocol": "vless"},
-                    {"uuid": "inb-3", "tag": "vless-ws-local-node", "port": 10002, "protocol": "vless"},
-                    {"uuid": "inb-4", "tag": "trojan-grpc-local-node", "port": 10003, "protocol": "trojan"},
+                    {"uuid": "inb-2", "tag": "vless-vision-local-node", "port": 8444, "protocol": "vless"},
+                    {"uuid": "inb-3", "tag": "vless-xhttp-local-node", "port": 10001, "protocol": "vless"},
+                    {"uuid": "inb-4", "tag": "vless-ws-local-node", "port": 10002, "protocol": "vless"},
+                    {"uuid": "inb-5", "tag": "trojan-grpc-local-node", "port": 10003, "protocol": "trojan"},
                 ]
             self.send_json(200, {"response": inbounds})
         elif self.path == "/api/nodes":
@@ -216,18 +217,19 @@ class TestAPIClient(unittest.TestCase):
         profile_json = self.client.compile_config_profile("local-node", "reality.example.com", "private-key-123")
         parsed = json.loads(profile_json)
         inbounds = parsed["inbounds"]
-        self.assertEqual(len(inbounds), 4)
+        self.assertEqual(len(inbounds), 5)
 
         # Check unique node-scoped tags
         tags = [inb["tag"] for inb in inbounds]
         self.assertIn("vless-reality-local-node", tags)
+        self.assertIn("vless-vision-local-node", tags)
         self.assertIn("vless-xhttp-local-node", tags)
         self.assertIn("vless-ws-local-node", tags)
         self.assertIn("trojan-grpc-local-node", tags)
 
-        # Check acceptProxyProtocol is ONLY on REALITY 8443
+        # Check acceptProxyProtocol is on REALITY 8443 and Vision 8444
         for inb in inbounds:
-            if inb["port"] == 8443:
+            if inb["port"] in (8443, 8444):
                 self.assertTrue(inb["streamSettings"]["tcpSettings"]["acceptProxyProtocol"])
             else:
                 self.assertNotIn("acceptProxyProtocol", inb["streamSettings"])
@@ -254,7 +256,7 @@ class TestAPIClient(unittest.TestCase):
         profile_info = self.client.provision_config_profile("GoWave MVP Unified Profile - local-node", raw_cfg)
         prof_uuid = profile_info["profile_uuid"]
         inbounds = profile_info["inbounds"]
-        self.assertEqual(len(inbounds), 4)
+        self.assertEqual(len(inbounds), 5)
 
         # 4. Associate Node
         inb_uuids = [inb["uuid"] for inb in inbounds]
@@ -267,7 +269,11 @@ class TestAPIClient(unittest.TestCase):
 
         # 6. Provision Hosts
         hosts = self.client.provision_hosts(prof_uuid, inbounds, node_uuid, squad_uuid, "vpn.example.com", "cdn.example.com")
-        self.assertEqual(len(hosts), 4)
+        self.assertEqual(len(hosts), 5)
+
+        # Check that all hosts strictly use firefox fingerprint
+        for h in MockGoWaveServer.hosts.values():
+            self.assertEqual(h.get("fingerprint"), "firefox")
 
         # 7. Provision User
         short_uuid = self.client.provision_user("default-user", squad_uuid)
@@ -288,7 +294,7 @@ class TestAPIClient(unittest.TestCase):
 
         # Initial creation (POST /api/hosts)
         hosts1 = self.client.provision_hosts(prof_uuid, inbounds, "node-patch-test", "squad-patch-test", "vpn.example.com", "cdn.example.com", "patch-test-node")
-        self.assertEqual(len(hosts1), 4)
+        self.assertEqual(len(hosts1), 5)
 
         # Re-provisioning with same remark (triggers PATCH /api/hosts with uuid in body)
         hosts2 = self.client.provision_hosts(prof_uuid, inbounds, "node-patch-test", "squad-patch-test", "vpn.example.com", "cdn.example.com", "patch-test-node")
@@ -312,7 +318,7 @@ class TestAPIClient(unittest.TestCase):
 
         squad_uuid = self.client.provision_internal_squad("Default MVP Squad", master_inb_uuids)
         master_hosts = self.client.provision_hosts(master_prof_uuid, master_inbounds, master_node_uuid, squad_uuid, "vpn.example.com", "reality.example.com", "local-node")
-        self.assertEqual(len(master_hosts), 4)
+        self.assertEqual(len(master_hosts), 5)
 
         # 3. Step B: Provision Worker Node (worker-1) on separate address
         x25519_worker = self.client.generate_x25519()
@@ -331,7 +337,7 @@ class TestAPIClient(unittest.TestCase):
         self.assertEqual(squad_uuid, updated_squad_uuid)
 
         worker_hosts = self.client.provision_hosts(worker_prof_uuid, worker_inbounds, worker_node_uuid, squad_uuid, "worker.example.com", "worker-reality.example.com", "worker-1")
-        self.assertEqual(len(worker_hosts), 4)
+        self.assertEqual(len(worker_hosts), 5)
 
         # 4. Step C: Query GoWave Panel API GET /api/nodes and assert panel sees BOTH nodes
         nodes_res = self.client.request("GET", "/api/nodes")
@@ -367,8 +373,8 @@ class TestAPIClient(unittest.TestCase):
         # Verify Host entities in GET /api/hosts include both nodes
         hosts_res = self.client.request("GET", "/api/hosts")
         hosts_list = _extract_list(hosts_res, "hosts")
-        master_host_remarks = {f"{p}@local-node" for p in ["VLESS-REALITY-Vision", "VLESS-XHTTP-TLS", "VLESS-WS-TLS", "Trojan-gRPC-TLS"]}
-        worker_host_remarks = {f"{p}@worker-1" for p in ["VLESS-REALITY-Vision", "VLESS-XHTTP-TLS", "VLESS-WS-TLS", "Trojan-gRPC-TLS"]}
+        master_host_remarks = {f"{p}@local-node" for p in ["VLESS-REALITY-Vision", "VLESS-Vision-TLS", "VLESS-XHTTP-TLS", "VLESS-WS-TLS", "Trojan-gRPC-TLS"]}
+        worker_host_remarks = {f"{p}@worker-1" for p in ["VLESS-REALITY-Vision", "VLESS-Vision-TLS", "VLESS-XHTTP-TLS", "VLESS-WS-TLS", "Trojan-gRPC-TLS"]}
         all_remarks = {h.get("remark") for h in hosts_list}
         self.assertTrue(master_host_remarks.issubset(all_remarks))
         self.assertTrue(worker_host_remarks.issubset(all_remarks))

@@ -1,43 +1,41 @@
 {
-  "tag": "vless-reality-{{NODE_NAME}}",
+  "tag": "vless-reality-TEMPLATE",
   "port": 8443,
-  "listen": "127.0.0.1",
   "protocol": "vless",
   "settings": {
     "clients": [],
-    "decryption": "none"
+    "decryption": "none",
+    "encryption": "none",
+    "fallbacks": []
   },
   "streamSettings": {
     "network": "tcp",
     "security": "reality",
-    "tcpSettings": {
-      "acceptProxyProtocol": true
-    },
     "realitySettings": {
       "show": false,
       "dest": "127.0.0.1:9443",
       "xver": 1,
-      "serverNames": [
-        "cdn.example.com"
-      ],
-      "privateKey": "",
-      "shortIds": [
-        "__SHORT_ID_1__",
-        "__SHORT_ID_2__"
-      ],
-      "minClientVer": "",
-      "maxClientVer": "",
-      "maxTimeDiff": 0
+      "serverNames": ["REALITY_DOMAIN_PLACEHOLDER"],
+      "privateKey": "PRIVATE_KEY_PLACEHOLDER",
+      "shortIds": ["SHORT_ID_PLACEHOLDER"],
+      "settings": {
+        "publicKey": "PUBLIC_KEY_PLACEHOLDER",
+        "fingerprint": "firefox",
+        "serverName": "",
+        "spiderX": "/"
+      }
+    },
+    "tcpSettings": {
+      "acceptProxyProtocol": true,
+      "header": {
+        "type": "none"
+      }
     }
   },
   "sniffing": {
     "enabled": true,
-    "destOverride": [
-      "http",
-      "tls",
-      "quic"
-    ],
+    "destOverride": ["http", "tls", "quic", "fakedns"],
     "metadataOnly": false,
-    "routeOnly": true
+    "routeOnly": false
   }
 }

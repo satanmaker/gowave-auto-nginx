@@ -44,12 +44,12 @@ The system SHALL support Trojan protocol over gRPC transport with TLS multiplexe
 - **THEN** NGINX routes gRPC frames to Xray port 10003 and authenticates user traffic.
 
 ### Requirement: Automated Profile Provisioning via GoWave API
-The installer SHALL provision the 4 MVP protocol profiles by creating a single unified Config Profile via `POST /api/config-profiles`, associating the profile and its 4 inbounds to active nodes, and verifying `GET /api/config-profiles/{uuid}/computed-config`.
+The installer SHALL provision the 5 MVP protocol profiles by creating a single unified Config Profile via `POST /api/config-profiles`, associating the profile and its 5 inbounds to active nodes, and verifying `GET /api/config-profiles/{uuid}/computed-config`.
 
-#### Scenario: Single unified Config Profile provisioning with 4 inbounds
+#### Scenario: Single unified Config Profile provisioning with 5 inbounds
 - **GIVEN** a newly installed GoWave Panel and registered Node
 - **WHEN** the provisioning script executes
-- **THEN** it creates one managed Config Profile embedding all 4 inbounds with unique node-scoped tags (`*-<node-name>`), `acceptProxyProtocol: true` strictly on REALITY 8443, outbound routing rules blocking loopback and cloud metadata, and random shortIds, retrieves the 4 generated inbound UUIDs, links them to the Node, and verifies the compiled Xray config via `GET /api/config-profiles/{uuid}/computed-config`.
+- **THEN** it creates one managed Config Profile embedding all 5 inbounds with unique node-scoped tags (`*-<node-name>`), `acceptProxyProtocol: true` strictly on REALITY 8443 and Vision 8444, outbound routing rules blocking loopback and cloud metadata, and random shortIds, retrieves the 5 generated inbound UUIDs, links them to the Node, and verifies the compiled Xray config via `GET /api/config-profiles/{uuid}/computed-config`.
 
 #### Scenario: Cross-profile inbound association rejection (negative test)
 - **GIVEN** an active GoWave Node associated with a primary Config Profile
@@ -57,12 +57,12 @@ The installer SHALL provision the 4 MVP protocol profiles by creating a single u
 - **THEN** GoWave rejects the transaction with an error indicating the inbound does not belong to the active config profile, and leaves the Node's active profile and inbounds unmutated.
 
 ### Requirement: Managed Internal Squad and User Lifecycle Provisioning
-The system SHALL manage user inbound access and credential propagation through GoWave Internal Squads, linking all 4 MVP inbound UUIDs to a managed squad and provisioning an active user assigned to this squad.
+The system SHALL manage user inbound access and credential propagation through GoWave Internal Squads, linking all 5 MVP inbound UUIDs to a managed squad and provisioning an active user assigned to this squad.
 
 #### Scenario: Automated Internal Squad creation linking all MVP inbounds
-- **GIVEN** a provisioned unified Config Profile with 4 inbound UUIDs
+- **GIVEN** a provisioned unified Config Profile with 5 inbound UUIDs
 - **WHEN** Internal Squad provisioning executes
-- **THEN** `POST /api/internal-squads` creates a managed squad containing all 4 inbound UUIDs, and read-back via `GET /api/internal-squads/{uuid}` confirms the squad and its inbound associations.
+- **THEN** `POST /api/internal-squads` creates a managed squad containing all 5 inbound UUIDs, and read-back via `GET /api/internal-squads/{uuid}` confirms the squad and its inbound associations.
 
 #### Scenario: Initial active user provisioning and squad assignment
 - **GIVEN** an active GoWave Panel with a managed Internal Squad
@@ -72,25 +72,25 @@ The system SHALL manage user inbound access and credential propagation through G
 #### Scenario: User credential sync to Node for all active inbounds
 - **GIVEN** a newly created active user assigned to the managed Internal Squad
 - **WHEN** GoWave's user synchronization worker executes `syncUserToSingleNode()`
-- **THEN** GoWave resolves all 4 inbounds for the user via squad membership and dispatches the user's VLESS UUID and Trojan password to `gowave-node`, enabling client authentication across all 4 inbounds.
+- **THEN** GoWave resolves all 5 inbounds for the user via squad membership and dispatches the user's VLESS UUID and Trojan password to `gowave-node`, enabling client authentication across all 5 inbounds.
 
 ### Requirement: Automatic GoWave Host Record Provisioning
-For each provisioned MVP protocol profile, the provisioning system SHALL automatically create and verify a corresponding Host entity via GoWave API (`POST /api/hosts`) with public endpoints, node associations, and squad permissions.
+For each provisioned MVP protocol profile, the provisioning system SHALL automatically create and verify a corresponding Host entity via GoWave API (`POST /api/hosts`) with public endpoints, node associations, squad permissions, and `fingerprint: "firefox"`.
 
 #### Scenario: Automated creation of Host entities with Node and Squad links
 - **GIVEN** an active GoWave Panel with provisioned Config Profiles, Inbounds, and Node
-- **WHEN** Host provisioning executes for each of the 4 MVP protocols
-- **THEN** `POST /api/hosts` is invoked with `inbound.configProfileUuid`, `inbound.configProfileInboundUuid`, canonical `remark` (`<PROTO>@<node-name>`), `address` set to the public hostname, `port` set to 443, `sni`, `path`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy, and appropriate `securityLayer` (`DEFAULT` for REALITY, `TLS` for XHTTP, WS, and Trojan gRPC), and the created hosts are confirmed via `GET /api/hosts`.
+- **WHEN** Host provisioning executes for each of the 5 MVP protocols
+- **THEN** `POST /api/hosts` is invoked with `inbound.configProfileUuid`, `inbound.configProfileInboundUuid`, canonical `remark` (`<PROTO>@<node-name>`), `address` set to the public hostname, `port` set to 443, `sni`, `path`, `"fingerprint": "firefox"`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy, and appropriate `securityLayer` (`DEFAULT` for REALITY, `TLS` for Vision, XHTTP, WS, and Trojan gRPC), and the created hosts are confirmed via `GET /api/hosts`.
 
 #### Scenario: Host securityLayer resolution verification
 - **GIVEN** provisioned Host records in GoWave
 - **WHEN** Host records are retrieved via `GET /api/hosts` and subscription configurations are rendered
-- **THEN** the REALITY Host record has `securityLayer: "DEFAULT"` resolving to client `security: reality`, while XHTTP, WS, and Trojan gRPC Host records have `securityLayer: "TLS"` resolving to client `security: tls`, with invalid values like `"REALITY"` strictly absent.
+- **THEN** the REALITY Host record has `securityLayer: "DEFAULT"` resolving to client `security: reality`, while Vision, XHTTP, WS, and Trojan gRPC Host records have `securityLayer: "TLS"` resolving to client `security: tls`, with all hosts configured with `fingerprint: "firefox"`.
 
 #### Scenario: Host record presence in subscription output
-- **GIVEN** provisioned Host records for VLESS-REALITY, VLESS-XHTTP, VLESS-WS, and Trojan-gRPC
+- **GIVEN** provisioned Host records for VLESS-REALITY, VLESS-Vision, VLESS-XHTTP, VLESS-WS, and Trojan-gRPC
 - **WHEN** subscription endpoints are queried for an active user belonging to the managed squad
-- **THEN** all 4 configured Host endpoints appear in the generated client configurations with correct public hostnames, port 443, and paths.
+- **THEN** all 5 configured Host endpoints appear in the generated client configurations with correct public hostnames, port 443, paths, and `client-fingerprint: "firefox"`.
 
 #### Scenario: Idempotent Host provisioning and atomic rollback
 - **GIVEN** a provisioning operation that experiences an interruption or failure while creating Host records

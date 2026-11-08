@@ -100,7 +100,7 @@ The installer SHALL provision `SECRET_KEY` to `gowave-node` strictly via standar
 The system SHALL link Config Profiles and active inbounds to GoWave nodes using the exact API structure required by GoWave backend (`activeConfigProfileUuid` and `activeInbounds`), enforcing that all active inbounds assigned to the Node belong to that single active Config Profile.
 
 #### Scenario: Successful node profile association
-- **GIVEN** an active GoWave Node and a provisioned unified Config Profile containing all 4 MVP inbounds
+- **GIVEN** an active GoWave Node and a provisioned unified Config Profile containing all 5 MVP inbounds
 - **WHEN** `POST /api/nodes` or `PATCH /api/nodes/{uuid}` is sent with `configProfile.activeConfigProfileUuid` and array `configProfile.activeInbounds` containing the 4 UUIDs belonging to that profile
 - **THEN** GoWave responds with HTTP 200/201 confirming `activeConfigProfileUuid` and `activeInbounds` are bound to the node, and the node receives the compiled Xray config.
 

@@ -119,6 +119,7 @@ cmd_install() {
     local panel_domain="${1:-}"
     local reality_domain="${2:-}"
     local admin_email="${3:-}"
+    local vision_domain="${4:-${VISION_DOMAIN:-}}"
 
     if [[ -z "$panel_domain" ]]; then
         read -r -p "Enter GoWave Panel domain (e.g. vpn.example.com): " panel_domain
@@ -129,9 +130,10 @@ cmd_install() {
     if [[ -z "$admin_email" ]]; then
         read -r -p "Enter Let's Encrypt admin email: " admin_email
     fi
-    python3 - "$panel_domain" "$reality_domain" <<'PY'
+    python3 - "$panel_domain" "$reality_domain" "$vision_domain" <<'PY'
 import re, sys
-panel, reality = sys.argv[1:]
+panel, reality, *extra = sys.argv[1:]
+vision = extra[0] if extra and extra[0] else None
 def validate_domain(domain):
     if len(domain) > 253:
         raise SystemExit(f"Invalid DNS hostname (too long): {domain}")
@@ -146,6 +148,10 @@ validate_domain(panel)
 validate_domain(reality)
 if panel.lower().rstrip(".") == reality.lower().rstrip("."):
     raise SystemExit("Panel and REALITY domains must be different.")
+if vision:
+    validate_domain(vision)
+    if vision.lower().rstrip(".") in (panel.lower().rstrip("."), reality.lower().rstrip(".")):
+        raise SystemExit("Vision domain must differ from Panel and REALITY domains.")
 PY
     if [[ ! "$admin_email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
         echo "Error: a valid Let's Encrypt email address is required." >&2
@@ -191,18 +197,31 @@ PY
         -d "$reality_domain" --cert-name "$reality_domain" \
         --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring
 
+    if [[ -n "$vision_domain" ]]; then
+        echo "Acquiring Let's Encrypt TLS certificate for VLESS Vision ($vision_domain)..."
+        certbot certonly --webroot -w "$ACME_WEBROOT" \
+            -d "$vision_domain" --cert-name "$vision_domain" \
+            --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring || true
+    fi
+
     rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
 
     # Verify certificates cryptographically (refuse to proceed with invalid or missing certificates)
     verify_acme_certificate "$panel_domain"
     verify_acme_certificate "$reality_domain"
+    if [[ -n "$vision_domain" ]]; then
+        verify_acme_certificate "$vision_domain" || true
+    fi
 
     # Step 5: NGINX Configuration
     ensure_nginx_stream_block
-    generate_stream_config "$panel_domain" "$reality_domain"
+    generate_stream_config "$panel_domain" "$reality_domain" "/etc/nginx/stream-enabled/gowave-stream.conf" "/proc/net/if_inet6" "$vision_domain"
     generate_production_http_vhost "$panel_domain" "$reality_domain"
     generate_panel_https_vhost "$panel_domain"
     generate_decoy_vhost "$reality_domain"
+    if [[ -n "$vision_domain" ]]; then
+        generate_vision_fallback_vhost "$vision_domain"
+    fi
     configure_certbot_deploy_hook
 
     reload_nginx_strict
@@ -236,14 +255,15 @@ PY
 
     if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - \
         "$SCRIPT_DIR" "$panel_domain" "$reality_domain" "$admin_user" \
-        "$JOURNAL_FILE" "$STATE_FILE" "$CREDENTIALS_FILE" 3<<< "$admin_pass" <<'PY'
+        "$JOURNAL_FILE" "$STATE_FILE" "$CREDENTIALS_FILE" "$vision_domain" 3<<< "$admin_pass" <<'PY'
 import json
 import os
 import sys
 import time
 
 (script_dir, panel_domain, reality_domain, admin_user,
- journal_path, state_path, credentials_path) = sys.argv[1:]
+ journal_path, state_path, credentials_path, *extra) = sys.argv[1:]
+vision_domain = extra[0] if extra and extra[0] else None
 admin_password = os.fdopen(3, "r", encoding="utf-8").read().rstrip("\n")
 
 sys.path.insert(0, script_dir)
@@ -272,7 +292,10 @@ def persist_transaction_entities(entities):
 
 client.transaction_callback = persist_transaction_entities
 x25519 = client.generate_x25519()
-raw_config = client.compile_config_profile("local-node", reality_domain, x25519["privateKey"])
+raw_config = client.compile_config_profile(
+    "local-node", reality_domain, x25519["privateKey"],
+    public_key=x25519.get("publicKey"), vision_domain=vision_domain, panel_domain=panel_domain
+)
 profile = client.provision_config_profile("GoWave MVP Unified Profile - local-node", raw_config)
 profile_uuid = profile["profile_uuid"]
 inbounds = profile["inbounds"]
@@ -290,7 +313,7 @@ write_journal_atomically(journal_path, journal)
 
 client.provision_hosts(
     profile_uuid, inbounds, node_uuid, squad_uuid,
-    panel_domain, reality_domain
+    panel_domain, reality_domain, vision_domain=vision_domain
 )
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)

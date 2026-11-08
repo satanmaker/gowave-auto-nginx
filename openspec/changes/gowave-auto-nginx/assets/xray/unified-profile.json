@@ -6,18 +6,16 @@
     {
       "tag": "vless-reality-{{NODE_NAME}}",
       "port": 8443,
-      "listen": "127.0.0.1",
       "protocol": "vless",
       "settings": {
         "clients": [],
-        "decryption": "none"
+        "decryption": "none",
+        "encryption": "none",
+        "fallbacks": []
       },
       "streamSettings": {
         "network": "tcp",
         "security": "reality",
-        "tcpSettings": {
-          "acceptProxyProtocol": true
-        },
         "realitySettings": {
           "show": false,
           "dest": "127.0.0.1:9443",
@@ -30,9 +28,18 @@
             "__SHORT_ID_1__",
             "__SHORT_ID_2__"
           ],
-          "minClientVer": "",
-          "maxClientVer": "",
-          "maxTimeDiff": 0
+          "settings": {
+            "publicKey": "",
+            "fingerprint": "firefox",
+            "serverName": "",
+            "spiderX": "/"
+          }
+        },
+        "tcpSettings": {
+          "acceptProxyProtocol": true,
+          "header": {
+            "type": "none"
+          }
         }
       },
       "sniffing": {
@@ -40,10 +47,66 @@
         "destOverride": [
           "http",
           "tls",
-          "quic"
+          "quic",
+          "fakedns"
         ],
         "metadataOnly": false,
-        "routeOnly": true
+        "routeOnly": false
+      }
+    },
+    {
+      "tag": "vless-vision-{{NODE_NAME}}",
+      "port": 8444,
+      "listen": "127.0.0.1",
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none",
+        "encryption": "none",
+        "fallbacks": [
+          {
+            "name": "vision.example.com",
+            "alpn": "http/1.1",
+            "dest": "127.0.0.1:9444",
+            "xver": 1
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tcpSettings": {
+          "acceptProxyProtocol": true,
+          "header": {
+            "type": "none"
+          }
+        },
+        "tlsSettings": {
+          "serverName": "vision.example.com",
+          "minVersion": "1.2",
+          "alpn": [
+            "http/1.1"
+          ],
+          "certificates": [
+            {
+              "certificateFile": "/etc/letsencrypt/live/vision.example.com/fullchain.pem",
+              "keyFile": "/etc/letsencrypt/live/vision.example.com/privkey.pem",
+              "oneTimeLoading": false,
+              "usage": "encipherment"
+            }
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic",
+          "fakedns"
+        ],
+        "metadataOnly": false,
+        "routeOnly": false
       }
     },
     {
@@ -53,15 +116,21 @@
       "protocol": "vless",
       "settings": {
         "clients": [],
-        "decryption": "none"
+        "decryption": "none",
+        "encryption": "none",
+        "fallbacks": []
       },
       "streamSettings": {
         "network": "xhttp",
         "security": "none",
         "xhttpSettings": {
           "path": "/xhttp-down/",
-          "host": "",
-          "mode": "packet-up"
+          "mode": "stream-up"
+        },
+        "sockopt": {
+          "trustedXForwardedFor": [
+            "X-Forwarded-For"
+          ]
         }
       },
       "sniffing": {
@@ -69,10 +138,11 @@
         "destOverride": [
           "http",
           "tls",
-          "quic"
+          "quic",
+          "fakedns"
         ],
         "metadataOnly": false,
-        "routeOnly": true
+        "routeOnly": false
       }
     },
     {
@@ -82,16 +152,17 @@
       "protocol": "vless",
       "settings": {
         "clients": [],
-        "decryption": "none"
+        "decryption": "none",
+        "encryption": "none",
+        "fallbacks": []
       },
       "streamSettings": {
         "network": "ws",
         "security": "none",
         "wsSettings": {
+          "acceptProxyProtocol": false,
           "path": "/ws",
-          "headers": {
-            "Host": ""
-          }
+          "headers": {}
         }
       },
       "sniffing": {
@@ -99,10 +170,11 @@
         "destOverride": [
           "http",
           "tls",
-          "quic"
+          "quic",
+          "fakedns"
         ],
         "metadataOnly": false,
-        "routeOnly": true
+        "routeOnly": false
       }
     },
     {
@@ -111,14 +183,15 @@
       "listen": "127.0.0.1",
       "protocol": "trojan",
       "settings": {
-        "clients": []
+        "clients": [],
+        "fallbacks": []
       },
       "streamSettings": {
         "network": "grpc",
         "security": "none",
         "grpcSettings": {
           "serviceName": "trojan-grpc",
-          "multiMode": true
+          "multiMode": false
         }
       },
       "sniffing": {
@@ -126,10 +199,11 @@
         "destOverride": [
           "http",
           "tls",
-          "quic"
+          "quic",
+          "fakedns"
         ],
         "metadataOnly": false,
-        "routeOnly": true
+        "routeOnly": false
       }
     }
   ],

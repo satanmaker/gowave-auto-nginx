@@ -175,9 +175,13 @@ class GoWaveClient:
             raise GoWaveAPIError(f"Invalid x25519 response: {res}")
         return {"privateKey": private_key, "publicKey": public_key}
 
-    def compile_config_profile(self, node_name, reality_domain, private_key, short_ids=None):
+    def compile_config_profile(self, node_name, reality_domain, private_key, short_ids=None, public_key=None, vision_domain=None, panel_domain=None):
         if short_ids is None:
-            short_ids = [secrets.token_hex(8)]
+            short_ids = [secrets.token_hex(8) for _ in range(8)]
+
+        v_domain = vision_domain or (f"vision.{panel_domain}" if panel_domain else "vision.example.com")
+        cert_file = f"/etc/letsencrypt/live/{v_domain}/fullchain.pem"
+        key_file = f"/etc/letsencrypt/live/{v_domain}/privkey.pem"
 
         # 1. Inbound REALITY
         reality_template = json.loads((XRAY_ASSETS_DIR / "vless-reality.json").read_text())
@@ -185,16 +189,33 @@ class GoWaveClient:
         reality_template["streamSettings"]["realitySettings"]["serverNames"] = [reality_domain]
         reality_template["streamSettings"]["realitySettings"]["privateKey"] = private_key
         reality_template["streamSettings"]["realitySettings"]["shortIds"] = short_ids
+        if public_key:
+            reality_template["streamSettings"]["realitySettings"].setdefault("settings", {})["publicKey"] = public_key
 
-        # 2. Inbound XHTTP
+        # 2. Inbound Vision (VLESS + XTLS Vision)
+        vision_template = json.loads((XRAY_ASSETS_DIR / "vless-vision.json").read_text())
+        vision_template["tag"] = f"vless-vision-{node_name}"
+        if "fallbacks" in vision_template.get("settings", {}):
+            for fb in vision_template["settings"]["fallbacks"]:
+                if fb.get("name") == "DOMAIN_PLACEHOLDER":
+                    fb["name"] = v_domain
+        tls_settings = vision_template["streamSettings"]["tlsSettings"]
+        tls_settings["serverName"] = v_domain
+        for cert in tls_settings.get("certificates", []):
+            if cert.get("certificateFile") == "CERT_FILE_PLACEHOLDER":
+                cert["certificateFile"] = cert_file
+            if cert.get("keyFile") == "KEY_FILE_PLACEHOLDER":
+                cert["keyFile"] = key_file
+
+        # 3. Inbound XHTTP
         xhttp_template = json.loads((XRAY_ASSETS_DIR / "vless-xhttp.json").read_text())
         xhttp_template["tag"] = f"vless-xhttp-{node_name}"
 
-        # 3. Inbound WS
+        # 4. Inbound WS
         ws_template = json.loads((XRAY_ASSETS_DIR / "vless-ws.json").read_text())
         ws_template["tag"] = f"vless-ws-{node_name}"
 
-        # 4. Inbound Trojan gRPC
+        # 5. Inbound Trojan gRPC
         trojan_template = json.loads((XRAY_ASSETS_DIR / "trojan-grpc.json").read_text())
         trojan_template["tag"] = f"trojan-grpc-{node_name}"
 
@@ -228,6 +249,7 @@ class GoWaveClient:
         raw_xray = {
             "inbounds": [
                 reality_template,
+                vision_template,
                 xhttp_template,
                 ws_template,
                 trojan_template,
@@ -274,8 +296,8 @@ class GoWaveClient:
             computed_json = computed_data
 
         inbounds = computed_json.get("inbounds", []) if isinstance(computed_json, dict) else []
-        if len(inbounds) != 4:
-            raise GoWaveAPIError(f"5-point checklist failure: expected 4 inbounds, got {len(inbounds)}")
+        if len(inbounds) != 5:
+            raise GoWaveAPIError(f"5-point checklist failure: expected 5 inbounds, got {len(inbounds)}")
 
         # Retrieve inbounds list
         inbounds_res = self.request("GET", f"/api/config-profiles/{profile_uuid}/inbounds")
@@ -366,7 +388,8 @@ class GoWaveClient:
 
         return squad_uuid
 
-    def provision_hosts(self, profile_uuid, inbounds_list, node_uuid, squad_uuid, panel_domain, reality_domain, node_name="local-node"):
+    def provision_hosts(self, profile_uuid, inbounds_list, node_uuid, squad_uuid, panel_domain, reality_domain, node_name="local-node", vision_domain=None):
+        v_domain = vision_domain or (f"vision.{panel_domain}" if panel_domain else panel_domain)
         # Protocol to config mapping
         proto_map = {
             "vless-reality": {
@@ -377,7 +400,17 @@ class GoWaveClient:
                 "path": None,
                 "securityLayer": "DEFAULT",
                 "alpn": "h2,http/1.1",
-                "fingerprint": "chrome",
+                "fingerprint": "firefox",
+            },
+            "vless-vision": {
+                "remark": f"VLESS-Vision-TLS@{node_name}",
+                "address": v_domain,
+                "port": 443,
+                "sni": v_domain,
+                "path": None,
+                "securityLayer": "TLS",
+                "alpn": "http/1.1",
+                "fingerprint": "firefox",
             },
             "vless-xhttp": {
                 "remark": f"VLESS-XHTTP-TLS@{node_name}",
@@ -387,7 +420,7 @@ class GoWaveClient:
                 "path": "/xhttp-down/",
                 "securityLayer": "TLS",
                 "alpn": "h2,http/1.1",
-                "fingerprint": "chrome",
+                "fingerprint": "firefox",
             },
             "vless-ws": {
                 "remark": f"VLESS-WS-TLS@{node_name}",
@@ -397,7 +430,7 @@ class GoWaveClient:
                 "path": "/ws",
                 "securityLayer": "TLS",
                 "alpn": "http/1.1",
-                "fingerprint": "chrome",
+                "fingerprint": "firefox",
             },
             "trojan-grpc": {
                 "remark": f"Trojan-gRPC-TLS@{node_name}",
@@ -407,7 +440,7 @@ class GoWaveClient:
                 "path": "trojan-grpc",
                 "securityLayer": "TLS",
                 "alpn": "h2",
-                "fingerprint": "chrome",
+                "fingerprint": "firefox",
             },
         }
 

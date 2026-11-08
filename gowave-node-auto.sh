@@ -301,11 +301,16 @@ EOF
     fi
 
     # Stream SNI Preread on 443
+    local worker_vision=""
+    if [[ -n "${VISION_DOMAIN:-}" ]]; then
+        worker_vision="    $VISION_DOMAIN 127.0.0.1:8444;"
+    fi
     cat > /etc/nginx/stream-enabled/gowave-worker-stream.conf <<EOF
 # Managed by GoWave Auto NGINX: Worker Edge Stream
 map \$ssl_preread_server_name \$worker_dest {
     $WORKER_DOMAIN 127.0.0.1:7443;
     $REALITY_DOMAIN 127.0.0.1:8443;
+$worker_vision
     default 127.0.0.1:8443;
 }
 
