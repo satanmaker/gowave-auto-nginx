@@ -31,6 +31,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends shellcheck sqlite3 tar gzip openssl curl
+          sudo npm install -g @fission-ai/openspec || true
 
       - name: ShellCheck validation
         run: |
