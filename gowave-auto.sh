@@ -209,10 +209,19 @@ short_uuid = client.provision_user('default-user', squad_uuid)
 token_info = client.issue_api_token()
 save_credentials('$admin_user', '$admin_pass', 'https://$panel_domain', token_info['token'], '$CREDENTIALS_FILE')
 
+existing_cc = 'bbr'
+if os.path.exists('$STATE_FILE'):
+    try:
+        existing_cc = json.load(open('$STATE_FILE')).get('congestionControl', 'bbr')
+    except Exception:
+        pass
+
 state = {
+    'schemaVersion': 2,
     'installationMode': 'all-in-one',
     'panelDomain': '$panel_domain',
     'realityDomain': '$reality_domain',
+    'congestionControl': existing_cc,
     'nodePort': 3002,
     'localNodeUuid': node_uuid,
     'profileUuid': prof_uuid,
@@ -236,8 +245,7 @@ atomic_write_state(state, '$STATE_FILE')
     echo "================================================================================"
     echo "Panel Web UI:        https://$panel_domain"
     echo "Admin Username:      $admin_user"
-    echo "Admin Password:      $admin_pass"
-    echo "Saved Credentials:   $CREDENTIALS_FILE"
+    echo "Saved Credentials:   $CREDENTIALS_FILE (mode 0600)"
     echo ""
     echo "--- Client Subscription Links for 'default-user' ---"
     echo "Xray JSON:           https://$panel_domain/api/sub/$user_short_uuid/v2ray-json"
@@ -270,7 +278,7 @@ cmd_node() {
             fi
 
             local panel_ip
-            panel_ip=$(curl -s4 https://ifconfig.me || curl -s4 https://api.ipify.org || echo "127.0.0.1")
+            panel_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org || echo "127.0.0.1")
             local node_port=3002
 
             if [[ "$ip" == "$panel_ip" || "$ip" == "127.0.0.1" ]]; then
@@ -283,7 +291,7 @@ cmd_node() {
             # 1. Read admin credentials
             local admin_user="admin" admin_pass=""
             if [[ -f "$CREDENTIALS_FILE" ]]; then
-                admin_pass=$(grep '^ADMIN_PASSWORD=' "$CREDENTIALS_FILE" | cut -d= -f2 || true)
+                admin_pass=$(grep '^ADMIN_PASSWORD=' "$CREDENTIALS_FILE" | cut -d= -f2- || true)
             fi
 
             # 2. Authenticate and register node via API
@@ -376,7 +384,7 @@ cmd_domain_change() {
 
     # Preflight DNS validation
     local srv_ip
-    srv_ip=$(curl -s4 https://ifconfig.me || curl -s4 https://api.ipify.org || echo "")
+    srv_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org || echo "")
     if [[ -n "$srv_ip" ]] && command -v getent >/dev/null 2>&1; then
         local resolved_ip
         resolved_ip=$(getent ahosts "$new_panel_domain" 2>/dev/null | awk '{print $1}' | head -n1 || true)
@@ -467,7 +475,7 @@ with open('/etc/nginx/nginx.conf') as f:
 new_lines = []
 skip = False
 for line in lines:
-    if '# Managed by GoWave Auto NGINX: Stream SNI Multiplexer' in line or 'stream {' in line and 'stream-enabled' in line:
+    if '# Managed by GoWave Auto NGINX: Stream SNI Multiplexer' in line:
         skip = True
     if not skip:
         new_lines.append(line)
