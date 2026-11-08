@@ -695,7 +695,7 @@ Teardown is reported separately from test outcome; overall `PASS` requires the s
 
 - **GIVEN** the restore hook returns valid `RESTORED` JSON with matching IDs and the runner has reacquired both remote locks
 - **WHEN** the runner recollects the Phase 0 baseline manifest while holding both locks
-- **THEN** the required clean-baseline invariants match the pre-install manifest; only then may teardown be `PASS
+- **THEN** the required clean-baseline invariants match the pre-install manifest; only then may teardown be `PASS`
 
 #### Scenario: Snapshot restore hook does not restore both hosts
 
