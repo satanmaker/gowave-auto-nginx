@@ -58,12 +58,12 @@ The installer SHALL provide an independent automated worker script (`gowave-node
 #### Scenario: Remote worker orchestration via SSH stdin streaming
 - **GIVEN** an operator running `gowave-node-auto.sh` targeting a remote edge server over SSH
 - **WHEN** the deployment begins
-- **THEN** environment variables and deployment functions are packed and piped directly over SSH stdin via `remote_payload`, executing inside a temporary remote script without copying files via `scp`, and cleaning up temporary files upon completion.
+- **THEN** environment variables, functions, and base64-encoded `cover-reality` payload are streamed over SSH stdin directly to `bash -s` without temporary files or `scp`, unpacking `cover-reality` with SHA256 verification, and scoping `SECRET_KEY` strictly to upstream installer execution.
 
 #### Scenario: Automated worker registration via CLI node add command
 - **GIVEN** an active GoWave Panel and an accessible remote worker host
 - **WHEN** `gowave-auto.sh node add <name> <ip> <worker-domain> <reality-domain> [user] [port]` is executed
-- **THEN** it creates a dedicated worker profile (`GoWave Worker <name> Profile`), registers the node via `POST /api/nodes`, links inbounds to the managed squad, provisions worker Host records with canonical remarks (`<PROTO>@<name>`), streams payload via `remote_payload` over SSH stdin with zero secrets in `argv`, and persists worker state in `state.json` schemaVersion 2.
+- **THEN** it creates a dedicated worker profile (`GoWave Worker <name> Profile`) with unique node-scoped inbound tags (`*-<name>`), registers the node via `POST /api/nodes`, links inbounds to the managed squad, provisions worker Host records with canonical remarks (`<PROTO>@<name>`), streams payload via `remote_payload` over SSH stdin with zero secrets in `argv`, and persists worker state in `state.json` schemaVersion 2.
 
 ### Requirement: Mutual TLS 1.3 Control Plane Protocol with Strict SNI Verification
 All panel-to-node management communication SHALL use TLS 1.3 with mutual certificate verification, derived HKDF SNI (`rw-v1`), RS256 JWT bearer token authentication, and strict SNI enforcement.

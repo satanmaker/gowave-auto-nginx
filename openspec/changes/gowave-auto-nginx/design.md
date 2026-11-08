@@ -124,7 +124,7 @@ sequenceDiagram
 | **9443** | TCP (TLS 1.3 + HTTP/2, HTTP/1.1) | Loopback (`127.0.0.1`) | NGINX Decoy Vhost | In: **PROXY v1** / Out: None | Terminates TLS 1.3/H2 for `reality_domain`; serves static camouflage website (`cover-reality`) |
 | **3000** | TCP (Cleartext HTTP) | Loopback (`127.0.0.1`) | GoWave Panel Backend | In: None / Out: None | Panel REST API and static frontend assets (`APP_PORT=3000`) |
 | **3001** | TCP (Cleartext HTTP) | Loopback (`127.0.0.1`) | GoWave Panel Metrics | In: None / Out: None | Prometheus metrics endpoint (optional, loopback only) |
-| **3002** | TCP (mTLS 1.3) | Wildcard (`:3002`) isolated via UFW | Local GoWave Node | In: None / Out: None | Local Node control plane (`NODE_PORT=3002`); UFW denies external; zero collision |
+| **3002** | TCP (mTLS 1.3) | Wildcard (`:3002`) isolated via UFW (fail-closed) | Local GoWave Node | In: None / Out: None | Local Node control plane (`NODE_PORT=3002`); UFW denies external; verified fail-closed |
 | **10001**| TCP (Cleartext HTTP/1.1)| Loopback (`127.0.0.1`) | Xray XHTTP Inbound | In: None / Out: None | Internal backend inbound for VLESS-XHTTP |
 | **10002**| TCP (Cleartext HTTP/WS) | Loopback (`127.0.0.1`) | Xray WS Inbound | In: None / Out: None | Internal backend inbound for VLESS-WS |
 | **10003**| TCP (Cleartext gRPC) | Loopback (`127.0.0.1`) | Xray gRPC Inbound | In: None / Out: None | Internal backend inbound for Trojan-gRPC |
@@ -210,7 +210,7 @@ The system provides verified templates and testing for exactly 4 native protocol
          proxy_set_header X-Forwarded-Proto $scheme;
          add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0";
      }
-     ```nginx
+
      # Panel REST API and Deterministic Client Subscriptions
      location ^~ /api/ {
          proxy_pass http://127.0.0.1:3000;
@@ -249,11 +249,12 @@ To prevent conflation between camouflage sites, management panels, and public VP
 
 #### 3-Stage Dual-Lineage Let's Encrypt TLS Bootstrapping
 To resolve the classic chicken-and-egg bootstrap deadlock while guaranteeing permanent, non-deadlocking automated renewals via `certbot.timer`:
-1. **Stage 1 (Webroot Port 80 Bootstrap Vhost)**: The installer creates `/var/www/gowave-acme` (`chmod 755`), unlinks default distribution vhosts (`/etc/nginx/sites-enabled/default`), and writes temporary bootstrap vhost `/etc/nginx/conf.d/00-bootstrap-acme.conf` listening exclusively on HTTP port 80:
+1. **Stage 1 (Webroot Port 80 Bootstrap Vhost)**: The installer creates `/var/www/gowave-acme` (`chmod 755`), unlinks default distribution vhosts (`/etc/nginx/sites-enabled/default`), and writes temporary bootstrap vhost `/etc/nginx/conf.d/00-bootstrap-acme.conf` listening on HTTP port 80 (with dynamic IPv6 detection: `listen [::]:80;` is included ONLY when IPv6 is active on the host, omitting it if IPv6 is disabled in the kernel to prevent fatal `Address family not supported` socket errors):
    ```nginx
    server {
        listen 80;
-       listen [::]:80;
+       # Included conditionally only if IPv6 is supported ([ -f /proc/net/if_inet6 ])
+       # listen [::]:80;
        server_name _;
        location /.well-known/acme-challenge/ {
            root /var/www/gowave-acme;
@@ -278,7 +279,7 @@ To resolve the classic chicken-and-egg bootstrap deadlock while guaranteeing per
    - NGINX Stream 443 with `proxy_timeout 1h; proxy_connect_timeout 5s; listen 443 so_keepalive=on;` demultiplexing to `127.0.0.1:7443` and `127.0.0.1:8443`. Global NGINX tuning sets `worker_rlimit_nofile 65535; worker_connections 8192;`.
    - NGINX HTTP port 80 with selective redirect: preserves `location /.well-known/acme-challenge/ { root /var/www/gowave-acme; }`, redirects known domains to HTTPS (`return 301 https://$host$request_uri;`), and returns 444 for unmanaged hostnames/IP scanners.
    - NGINX HTTPS listener at `127.0.0.1:7443` with `ssl_certificate /etc/letsencrypt/live/$PANEL_DOMAIN/fullchain.pem`.
-   - NGINX Decoy listener at `127.0.0.1:9443` with `ssl_protocols TLSv1.3; http2 on;` and `ssl_certificate /etc/letsencrypt/live/$REALITY_DOMAIN/fullchain.pem`.
+   - NGINX Decoy listener at `127.0.0.1:9443` with `ssl_protocols TLSv1.3;`, runtime version-detected HTTP/2 syntax (`listen 127.0.0.1:9443 ssl http2 proxy_protocol;` on NGINX < 1.25.1; `listen 127.0.0.1:9443 ssl proxy_protocol; http2 on;` on NGINX >= 1.25.1), and `ssl_certificate /etc/letsencrypt/live/$REALITY_DOMAIN/fullchain.pem`.
 3. **Stage 3 (Validation, Reload & Renewal Dry-Run)**: The installer removes the temporary bootstrap config `00-bootstrap-acme.conf`, tests syntax via `nginx -t -q`, reloads NGINX (`systemctl reload nginx`), establishes automated renewal hooks in `/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` (`nginx -t -q && systemctl reload nginx`), and immediately verifies renewal safety via:
    ```bash
    certbot renew --dry-run
@@ -314,7 +315,12 @@ if inbound.ProfileUUID != profileID {
 A GoWave Node can have exactly ONE `activeConfigProfileUuid`, and **all active inbounds assigned to the node must belong to this single active profile**. Furthermore, Xray REALITY strictly validates that the client TLS ClientHello SNI matches an entry in `realitySettings.serverNames`. Because each distributed node (the Central Panel and remote edge workers) uses its own distinct camouflage domain (`reality_domain`), **each node receives its own dedicated Config Profile**:
 1. **Central Panel Profile**: Named `"GoWave MVP Unified Profile - local-node"` via `POST /api/config-profiles`, with `realitySettings.serverNames: ["$LOCAL_REALITY_DOMAIN"]`, native x25519 keypair, and randomly generated 8-byte shortIds (`openssl rand -hex 8`).
 2. **Worker Node Profiles**: Created during `gowave-auto.sh node add` as `"GoWave Worker <name> Profile"`, embedding the worker's unique `REALITY_DOMAIN` in `serverNames`, its own distinct x25519 keypair, and unique shortIds.
-3. **Mandatory Outbound Routing Rules (SSRF & Loopback Isolation)**:
+3. **Global Inbound Tag Uniqueness**:
+   Upstream GoWave database schema enforces a global UNIQUE constraint across all profiles via index `idx_config_profile_inbounds_tag` on table `config_profile_inbounds(tag)`. Attempting to register multiple profiles with identical tags (e.g. static `vless-reality`) causes a fatal database collision. Therefore, all inbound tags are deterministically node-scoped:
+   - Central Panel local node: `vless-reality-local-node`, `vless-xhttp-local-node`, `vless-ws-local-node`, `trojan-grpc-local-node`.
+   - Worker nodes: `vless-reality-<node-name>`, `vless-xhttp-<node-name>`, `vless-ws-<node-name>`, `trojan-grpc-<node-name>`.
+4. **Mandatory Outbound Routing Rules & Node API Precedence**:
+   In `gowave-node/internal/xray/config.go:GenerateApiConfig()`, the node daemon prepends the node management API routing rule (`{"inboundTag": ["GOWAVE_NODE_API_INBOUND"], "outboundTag": "GOWAVE_NODE_API"}`) before user profile rules. Because Xray processes routing rules on a first-match-wins basis, internal node management over loopback is routed to the API handler before evaluating our outbound SSRF block rule (`127.0.0.0/8`), ensuring loopback node management is never impaired by the SSRF security policy.
    Every generated Config Profile raw Xray JSON contains an authoritative `"routing"` block:
    ```json
    "routing": {
@@ -535,27 +541,33 @@ To deploy remote worker nodes over SSH without depending on `scp`, creating mess
            printf 'export PANEL_IP=%q\n' "$PANEL_IP"
            printf 'export PANEL_IPV6=%q\n' "${PANEL_IPV6:-}"
            printf 'export NODE_PORT=%q\n' "${NODE_PORT:-3000}"
-           printf 'export SECRET_KEY=%q\n' "$SECRET_KEY"
            printf 'export GOWAVE_NODE_VERSION=%q\n' "${GOWAVE_NODE_VERSION:-latest}"
            printf 'export WORKER_DOMAIN=%q\n' "$worker_domain"
            printf 'export REALITY_DOMAIN=%q\n' "$reality_domain"
            printf 'export ADMIN_EMAIL=%q\n' "$ADMIN_EMAIL"
+           # Stream base64 cover-reality tarball and expected checksum
+           printf 'COVER_REALITY_B64=%q\n' "$cover_reality_b64"
+           printf 'COVER_REALITY_SHA256=%q\n' "$cover_reality_sha256"
+           # Scoped node secret variable (NOT exported to environment)
+           printf '_NODE_SECRET_KEY=%q\n' "$SECRET_KEY"
            # Safely serialize modular installer and hardening functions
-           declare -f log_info log_warn log_err setup_system_prereqs configure_host_security configure_firewall configure_edge_nginx run_upstream_node_installer
+           declare -f log_info log_warn log_err setup_system_prereqs configure_host_security configure_firewall configure_edge_nginx run_upstream_node_installer unpack_cover_reality
            # Stream inline remote runner entrypoint wrapped in main function to prevent stdin hijacking
            cat <<'REMOTE_EOF'
    set -euo pipefail
    main() {
        umask 077
-       trap 'unset SECRET_KEY' EXIT HUP INT TERM
+       trap 'unset _NODE_SECRET_KEY SECRET_KEY' EXIT HUP INT TERM
        setup_system_prereqs </dev/null
        configure_host_security </dev/null
        configure_firewall </dev/null
        umask 022
+       unpack_cover_reality </dev/null
        configure_edge_nginx </dev/null
        umask 077
-       run_upstream_node_installer </dev/null
-       unset SECRET_KEY
+       # Pass secret strictly scoped to upstream installer execution only
+       SECRET_KEY="$_NODE_SECRET_KEY" run_upstream_node_installer </dev/null
+       unset _NODE_SECRET_KEY SECRET_KEY
    }
    main "$@" </dev/null
    REMOTE_EOF
@@ -664,26 +676,45 @@ GoWave Auto NGINX implements a dedicated subcommand `gowave-auto.sh channel [sta
    - Upon successful healthcheck, update journal state to `"COMMITTED"`.
    - Retain the last 3 recovery snapshots (enforcing a 5 GB maximum storage ceiling), pruning older snapshots safely.
 
-#### Reboot & Power Loss Recovery (`gowave-recover.service`)
-If the server suffers a sudden power loss or kernel panic during an active update or provisioning transaction:
-1. To prevent `gowave.service` from starting with half-migrated databases or mismatched binary assets, the installer registers an early-boot systemd oneshot unit `/etc/systemd/system/gowave-recover.service`:
+#### Reboot & Power Loss Recovery Architecture (Split Recovery Units)
+If the server suffers a sudden power loss or kernel panic during an active update, restore, or provisioning transaction, rollback requires two distinct execution stages:
+1. **File/DB Early Recovery (`gowave-recover.service`)**:
+   Runs BEFORE `gowave.service` to prevent GoWave from booting with half-migrated SQLite databases, mismatched binaries, or corrupted configuration files:
    ```ini
    [Unit]
-   Description=GoWave Auto NGINX journal recovery
+   Description=GoWave Auto NGINX early boot file/DB recovery
    ConditionPathExists=/var/lib/gowave-auto-nginx/recovery/journal.json
    Before=gowave.service gowave-node.service
    After=local-fs.target
 
    [Service]
    Type=oneshot
-   ExecStart=/usr/local/sbin/gowave-auto.sh recover --boot
+   ExecStart=/usr/local/sbin/gowave-auto.sh recover --boot-files
 
    [Install]
    WantedBy=multi-user.target
    ```
-2. On boot, `gowave-auto.sh recover --boot` takes the exclusive file lock `/run/lock/gowave-auto.lock` and inspects `journal.json`:
-   - If the journal state is `APPLYING`, `VERIFYING`, or `ROLLBACK_REQUIRED` (or hanging in `PREPARED`), the manager detects an interrupted update transaction and automatically executes rollback to the pre-update snapshot, restoring service stability before `gowave.service` is unblocked.
-   - If the journal state is `PROVISION_APPLYING`, `PROVISION_VERIFYING`, `PROVISION_ROLLBACK_REQUIRED`, or `PROVISION_PREPARED`, the manager detects an interrupted initial setup and invokes automated reverse-order entity cleanup from `state.json.tmp`, transitioning state to `PROVISION_ROLLED_BACK`.
+   On boot, `recover --boot-files` acquires `/run/lock/gowave-auto.lock` and checks `journal.json`:
+   - If the journal state is `APPLYING`, `VERIFYING`, or `ROLLBACK_REQUIRED` (update or restore), it restores the pre-transaction database, `.env`, and binaries from the snapshot, transitions journal state to `ROLLED_BACK`, and unblocks service startup.
+2. **API Entity Cleanup Recovery (`gowave-recover-provision.service`)**:
+   API-driven entity rollbacks (such as deleting half-provisioned users, hosts, or nodes) require `gowave.service` to be actively running and serving HTTP REST API requests. An early unit ordered `Before=gowave.service` cannot perform HTTP API rollbacks. Therefore, API rollback is delegated to a post-startup unit:
+   ```ini
+   [Unit]
+   Description=GoWave Auto NGINX post-boot API provision cleanup
+   ConditionPathExists=/var/lib/gowave-auto-nginx/recovery/journal.json
+   After=gowave.service
+   Wants=gowave.service
+
+   [Service]
+   Type=oneshot
+   ExecStart=/usr/local/sbin/gowave-auto.sh recover --boot-provision
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+   On boot, `recover --boot-provision` waits for `GET http://127.0.0.1:3000/api/system/health` to return HTTP 200:
+   - If journal state is `PROVISION_*` (uncommitted initial setup), it executes API deletion of tracked partial entities in reverse order, cleans up `state.json.tmp`, and marks journal `PROVISION_ROLLED_BACK`.
+   - If journal state is `NODE_ADD_*` (uncommitted worker addition), it executes worker-specific isolated API cleanup, and marks journal `NODE_ADD_ROLLED_BACK`.
 
 #### Initial Provisioning Transaction Lifecycle & Rollback (AUD-05)
 To eliminate dirty partial setups and guarantee complete atomicity during initial installation, the initial provisioning phase (Config Profile, Node, Squad, Hosts, User, API Token) is tracked inside `/var/lib/gowave-auto-nginx/recovery/journal.json`:
@@ -694,8 +725,8 @@ To eliminate dirty partial setups and guarantee complete atomicity during initia
    - `PROVISION_COMMITTED`: Atomic rename of `state.json.tmp` -> `state.json` with parent directory fsync. Journal marked `COMMITTED`.
    - `PROVISION_ROLLBACK_REQUIRED`: Any step failed or verification timed out.
    - `PROVISION_ROLLED_BACK`: Cleanup completed, system reverted to clean state.
-2. **Deterministic Rollback Actions on Failure**:
-   If an error occurs or verification fails during provisioning, the orchestrator parses the recorded UUIDs from `state.json.tmp` and executes deletion in strict reverse order:
+2. **Deterministic Initial Provisioning Rollback Actions on Failure**:
+   If an error occurs or verification fails during initial panel provisioning, the orchestrator parses the recorded UUIDs from `state.json.tmp` and executes deletion in strict reverse order:
    - If API Token was created: `DELETE /api/tokens/{id}`
    - If User was created: `DELETE /api/users/{uuid}`
    - If Hosts were created: `DELETE /api/hosts/{uuid}` for each provisioned host
@@ -703,6 +734,22 @@ To eliminate dirty partial setups and guarantee complete atomicity during initia
    - If Node was created: `DELETE /api/nodes/{uuid}`
    - If Config Profile was created: `DELETE /api/config-profiles/{uuid}`
    - Remove temporary files, update journal state to `PROVISION_ROLLED_BACK`, and halt with exit code 1.
+
+#### Dedicated Worker Node Addition Transaction & Isolated Rollback
+Worker node addition (`gowave-auto.sh node add`) operates under an independent transaction lifecycle to ensure failures during worker deployment NEVER delete existing central panel users, tokens, or squad entities:
+1. **Worker Addition Journal States**:
+   - `{"op": "node_add", "name": "<worker-name>", "state": "NODE_ADD_PREPARED"}`
+   - `NODE_ADD_APPLYING`: Worker profile, node registration, squad association, and worker hosts recorded in `state.json.tmp`.
+   - `NODE_ADD_VERIFYING`: Worker edge connectivity and computed config validated.
+   - `NODE_ADD_COMMITTED`: Atomic commit merging worker into `state.json`.
+   - `NODE_ADD_ROLLBACK_REQUIRED` / `NODE_ADD_ROLLED_BACK`: Automated cleanup on failure.
+2. **Isolated Worker Rollback Actions**:
+   If worker deployment or verification fails, the orchestrator executes strictly scoped rollback:
+   - Delete worker hosts: `DELETE /api/hosts/{uuid}` for all worker hosts created for this node (`remark == "<PROTO>@<worker-name>"`).
+   - Disassociate worker inbounds: `PATCH /api/internal-squads/{squad-uuid}` removing the worker's 4 inbound UUIDs from `inbounds`.
+   - Delete worker node: `DELETE /api/nodes/{worker_node_uuid}`.
+   - Delete worker config profile: `DELETE /api/config-profiles/{worker_profile_uuid}`.
+   - Strictly FORBIDS deleting internal squads, panel users, or panel API tokens.
 
 ---
 
@@ -825,10 +872,10 @@ The archive format is formally designated as **GoWave Auto NGINX Backup Format v
 Before extracting any archive, a dedicated Python validator inspects all tar members:
 1. Rejects member names containing directory traversal sequences (`..`).
 2. Rejects absolute path member names (leading `/`).
-3. Rejects member paths outside designated allowlist matching archive `--type`:
-   - Panel (`--type panel`): strictly restricted to `opt/gowave/`, `etc/nginx/`, `etc/letsencrypt/`, `var/lib/gowave-auto-nginx/`.
-   - Node (`--type node`): strictly restricted to `opt/gowave-node/`, `etc/nginx/`, `etc/letsencrypt/`, `etc/systemd/system/gowave-node.service.d/`.
-   - Unmanaged locations (`etc/cron.d/`, `etc/systemd/system/*.service`, `root/.ssh/`, `bin/`) are rejected with fatal error.
+3. Rejects member paths outside strict file-level allowlists:
+   - Panel (`--type panel`): strictly restricted to explicit safe configuration and database files: `opt/gowave/gowave.db`, `opt/gowave/.env`, `etc/nginx/conf.d/gowave-*.conf`, `etc/nginx/stream-enabled/gowave-*.conf`, `etc/letsencrypt/{archive,live,renewal}/<domains-from-meta>/**`, and `var/lib/gowave-auto-nginx/state.json`.
+   - Node (`--type node`): strictly restricted to `opt/gowave-node/.env`.
+   - Explicitly rejects: `etc/letsencrypt/renewal-hooks/`, `etc/nginx/modules-enabled/`, `etc/systemd/system/gowave-node.service.d/`, any shell scripts (`*.sh`), shared objects (`*.so`), and executable binaries (`opt/gowave/gowave-server`, `opt/gowave-node/*`). Binaries are NEVER restored from archives (they are freshly downloaded and verified via upstream `SHA256SUMS`). Unmanaged locations (`etc/cron.d/`, `etc/systemd/system/*.service`, `root/.ssh/`, `bin/`) are rejected with fatal error.
 4. Clears SUID, SGID, and executable sticky bits (`04000`, `02000`, `01000`) on all extracted files; ignores tar header owner/group attributes and applies target restore permission policy.
 5. Rejects symbolic links pointing outside designated managed roots.
 6. Rejects hard links pointing to non-regular files.

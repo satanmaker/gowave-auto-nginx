@@ -39,7 +39,7 @@ The backup tool SHALL support separate backup scopes for Central Panel servers a
 The restore subsystem SHALL inspect tarball headers using a dedicated Python preflight validator before extraction, rejecting malicious archives containing traversal attacks, paths outside managed roots, SUID binaries, or resource exhaustion vectors.
 
 #### Scenario: Rejection of path traversal and unmanaged root paths
-- **GIVEN** a malformed archive containing path members with `..`, leading `/`, or paths outside managed roots (`etc/cron.d/`, `root/.ssh/`)
+- **GIVEN** a malformed archive containing path members with `..`, leading `/`, or paths outside the strict file allowlist (or containing `renewal-hooks/`, `modules-enabled/`, `.service.d/`, shell scripts, or binaries)
 - **WHEN** restore preflight validation is performed
 - **THEN** the archive is rejected before extraction, and no host filesystem state is modified.
 

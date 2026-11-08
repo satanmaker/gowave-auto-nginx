@@ -48,7 +48,7 @@ The routing subsystem SHALL serve an authentic static camouflage website on loop
 #### Scenario: Scanner probe fallback to static cover
 - **GIVEN** an unauthenticated client or scanner connecting to `127.0.0.1:8443`
 - **WHEN** Xray REALITY fails to authenticate the handshake
-- **THEN** Xray forwards the connection with PROXY protocol v1 (`dest: "127.0.0.1:9443", xver: 1`) to `127.0.0.1:9443`, where NGINX terminates TLS with `reality_domain` certificate, restores the real client IP via `set_real_ip_from 127.0.0.1; real_ip_header proxy_protocol;`, and serves the authentic multi-asset decoy website (retained from `community-baseline` `cover-reality` under `/var/www/gowave-auto-nginx/cover-reality`), rejecting minimal single-file HTML stubs.
+- **THEN** Xray forwards the connection with PROXY protocol v1 (`dest: "127.0.0.1:9443", xver: 1`) to `127.0.0.1:9443`, where NGINX terminates TLS 1.3 using runtime-adaptive HTTP/2 syntax (`listen ... ssl http2 proxy_protocol;` on < 1.25.1; `listen ... ssl proxy_protocol; http2 on;` on >= 1.25.1), restores the real client IP via `real_ip_header proxy_protocol;`, and serves the multi-asset decoy website.
 
 ### Requirement: XHTTP Inbound Reverse Proxy
 The NGINX HTTPS listener at 7443 SHALL terminate TLS for `panel_domain` and reverse proxy configured XHTTP path prefixes to local Xray inbounds using HTTP/1.1 with buffering disabled.
@@ -90,4 +90,4 @@ The installer SHALL resolve the initial TLS bootstrap deadlock using a 3-stage s
 #### Scenario: Bootstrap certificates on fresh host
 - **GIVEN** a clean host without pre-existing Let's Encrypt certificates
 - **WHEN** the installer initiates TLS provisioning
-- **THEN** it deploys temporary port 80 webroot vhost `/var/www/gowave-acme`, starts NGINX, issues certificates via `certbot certonly --webroot` for both `PANEL_DOMAIN` and `REALITY_DOMAIN`, deploys production Stream and HTTPS configurations referencing both certificates, verifies `certbot renew --dry-run` succeeds with NGINX online, and drops scanner traffic on unmanaged domains.
+- **THEN** it deploys temporary port 80 webroot vhost `/var/www/gowave-acme` (binding `[::]:80` conditionally only when host IPv6 is active), starts NGINX, issues certificates via `certbot certonly --webroot` for both `PANEL_DOMAIN` and `REALITY_DOMAIN`, deploys production Stream and HTTPS configurations referencing both certificates, verifies `certbot renew --dry-run` succeeds with NGINX online, and drops scanner traffic on unmanaged domains.

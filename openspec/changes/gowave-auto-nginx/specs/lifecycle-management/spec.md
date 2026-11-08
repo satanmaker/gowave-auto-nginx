@@ -59,12 +59,22 @@ The update module SHALL execute SQLite Online Backup, capture a persistent snaps
 #### Scenario: Interrupted update recovery after reboot
 - **GIVEN** a host that rebooted or lost power while `journal.json` was in `APPLYING` or `VERIFYING` state
 - **WHEN** the host boots and systemd executes early oneshot `gowave-recover.service` before `gowave.service`
-- **THEN** `gowave-auto.sh recover --boot` acquires the exclusive lock `/run/lock/gowave-auto.lock`, detects the uncommitted transaction, executes automated rollback to the persistent snapshot, restores service stability, and transitions journal state to `ROLLED_BACK`.
+- **THEN** `gowave-auto.sh recover --boot-files` acquires the exclusive lock `/run/lock/gowave-auto.lock`, detects uncommitted update or restore files, restores the pre-transaction snapshot, transitions state to `ROLLED_BACK`, and unblocks service startup.
+
+#### Scenario: Interrupted provisioning recovery after reboot
+- **GIVEN** a host that lost power while `journal.json` was in `PROVISION_*` or `NODE_ADD_*` state
+- **WHEN** systemd starts `gowave.service` and executes `gowave-recover-provision.service`
+- **THEN** `gowave-auto.sh recover --boot-provision` confirms panel health, executes reverse-order API cleanup of partial entities from `state.json.tmp`, and transitions journal state to `ROLLED_BACK`.
 
 #### Scenario: Initial provisioning failure rollback
 - **GIVEN** an initial installation where provisioning fails midway while creating Host records or binding nodes
 - **WHEN** the orchestrator detects an unhandled error or verification failure
 - **THEN** it reads the partial entity UUIDs recorded in `state.json.tmp`, invokes deletion APIs in strict reverse order (`DELETE /api/tokens`, `DELETE /api/users`, `DELETE /api/hosts`, `DELETE /api/internal-squads`, `DELETE /api/nodes`, `DELETE /api/config-profiles`), marks `journal.json` state as `PROVISION_ROLLED_BACK`, and leaves the system in a clean, re-runnable state.
+
+#### Scenario: Worker node addition failure rollback
+- **GIVEN** an active panel where `gowave-auto.sh node add` fails during edge deployment or verification
+- **WHEN** the orchestrator triggers worker rollback
+- **THEN** it deletes worker hosts (`DELETE /api/hosts/{uuid}`), disassociates worker inbounds via `PATCH /api/internal-squads/{uuid}`, and deletes worker node and worker config profile, strictly preserving central panel users, tokens, and squads.
 
 ### Requirement: Recovery Snapshot Retention Ceiling
 The lifecycle manager SHALL enforce a retention policy keeping the last 3 recovery snapshots and capping total snapshot storage at 5 GB, forbidding deletion of snapshots for active in-flight transactions.

@@ -1,5 +1,5 @@
 {
-  "tag": "vless-ws",
+  "tag": "vless-ws-{{NODE_NAME}}",
   "port": 10002,
   "listen": "127.0.0.1",
   "protocol": "vless",

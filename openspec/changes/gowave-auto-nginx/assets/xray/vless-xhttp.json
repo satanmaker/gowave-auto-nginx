@@ -1,5 +1,5 @@
 {
-  "tag": "vless-xhttp",
+  "tag": "vless-xhttp-{{NODE_NAME}}",
   "port": 10001,
   "listen": "127.0.0.1",
   "protocol": "vless",
@@ -13,7 +13,7 @@
     "xhttpSettings": {
       "path": "/xhttp-down/",
       "host": "",
-      "mode": "auto"
+      "mode": "packet-up"
     }
   },
   "sniffing": {

@@ -4,7 +4,7 @@
   },
   "inbounds": [
     {
-      "tag": "vless-reality",
+      "tag": "vless-reality-{{NODE_NAME}}",
       "port": 8443,
       "listen": "127.0.0.1",
       "protocol": "vless",
@@ -47,7 +47,7 @@
       }
     },
     {
-      "tag": "vless-xhttp",
+      "tag": "vless-xhttp-{{NODE_NAME}}",
       "port": 10001,
       "listen": "127.0.0.1",
       "protocol": "vless",
@@ -61,7 +61,7 @@
         "xhttpSettings": {
           "path": "/xhttp-down/",
           "host": "",
-          "mode": "auto"
+          "mode": "packet-up"
         }
       },
       "sniffing": {
@@ -76,7 +76,7 @@
       }
     },
     {
-      "tag": "vless-ws",
+      "tag": "vless-ws-{{NODE_NAME}}",
       "port": 10002,
       "listen": "127.0.0.1",
       "protocol": "vless",
@@ -106,7 +106,7 @@
       }
     },
     {
-      "tag": "trojan-grpc",
+      "tag": "trojan-grpc-{{NODE_NAME}}",
       "port": 10003,
       "listen": "127.0.0.1",
       "protocol": "trojan",

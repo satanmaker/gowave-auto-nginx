@@ -49,7 +49,7 @@ The installer SHALL provision the 4 MVP protocol profiles by creating a single u
 #### Scenario: Single unified Config Profile provisioning with 4 inbounds
 - **GIVEN** a newly installed GoWave Panel and registered Node
 - **WHEN** the provisioning script executes
-- **THEN** it creates one managed Config Profile embedding all 4 inbounds (REALITY, XHTTP, WS, Trojan gRPC) with `acceptProxyProtocol: true` strictly on REALITY 8443, outbound routing rules blocking loopback and cloud metadata (`169.254.169.254`), and random shortIds in raw Xray JSON, retrieves the 4 generated inbound UUIDs, links the profile and all 4 inbound UUIDs to the Node, and verifies the compiled Xray config via `GET /api/config-profiles/{uuid}/computed-config`.
+- **THEN** it creates one managed Config Profile embedding all 4 inbounds with unique node-scoped tags (`*-<node-name>`), `acceptProxyProtocol: true` strictly on REALITY 8443, outbound routing rules blocking loopback and cloud metadata, and random shortIds, retrieves the 4 generated inbound UUIDs, links them to the Node, and verifies the compiled Xray config via `GET /api/config-profiles/{uuid}/computed-config`.
 
 #### Scenario: Cross-profile inbound association rejection (negative test)
 - **GIVEN** an active GoWave Node associated with a primary Config Profile
@@ -80,7 +80,7 @@ For each provisioned MVP protocol profile, the provisioning system SHALL automat
 #### Scenario: Automated creation of Host entities with Node and Squad links
 - **GIVEN** an active GoWave Panel with provisioned Config Profiles, Inbounds, and Node
 - **WHEN** Host provisioning executes for each of the 4 MVP protocols
-- **THEN** `POST /api/hosts` is invoked with `inbound.configProfileUuid`, `inbound.configProfileInboundUuid`, `remark`, `address` set to the public hostname, `port` set to 443, `sni`, `path`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy, and appropriate `securityLayer` (`DEFAULT` for REALITY, `TLS` for XHTTP, WS, and Trojan gRPC), and the created hosts are confirmed via `GET /api/hosts`.
+- **THEN** `POST /api/hosts` is invoked with `inbound.configProfileUuid`, `inbound.configProfileInboundUuid`, canonical `remark` (`<PROTO>@<node-name>`), `address` set to the public hostname, `port` set to 443, `sni`, `path`, `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy, and appropriate `securityLayer` (`DEFAULT` for REALITY, `TLS` for XHTTP, WS, and Trojan gRPC), and the created hosts are confirmed via `GET /api/hosts`.
 
 #### Scenario: Host securityLayer resolution verification
 - **GIVEN** provisioned Host records in GoWave

@@ -1,5 +1,5 @@
 {
-  "tag": "vless-reality",
+  "tag": "vless-reality-{{NODE_NAME}}",
   "port": 8443,
   "listen": "127.0.0.1",
   "protocol": "vless",

@@ -1,5 +1,5 @@
 {
-  "tag": "trojan-grpc",
+  "tag": "trojan-grpc-{{NODE_NAME}}",
   "port": 10003,
   "listen": "127.0.0.1",
   "protocol": "trojan",
