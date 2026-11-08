@@ -215,11 +215,18 @@ if os.path.exists(path):
         pass
 data['schemaVersion'] = 2
 data['congestionControl'] = '$selected_cc'
-with open(path + '.tmp', 'w') as f:
+tmp_path = path + '.tmp'
+with open(tmp_path, 'w') as f:
     json.dump(data, f, indent=2)
     f.flush()
     os.fsync(f.fileno())
-os.replace(path + '.tmp', path)
+os.chmod(tmp_path, 0o600)
+os.replace(tmp_path, path)
+dir_fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_DIRECTORY)
+try:
+    os.fsync(dir_fd)
+finally:
+    os.close(dir_fd)
 " 2>/dev/null || true
     fi
 }

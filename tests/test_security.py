@@ -110,10 +110,11 @@ class TestSecurityModule(unittest.TestCase):
             self.assertIn("Before=systemd-sysctl.service", service_content)
             self.assertIn("ConditionVirtualization=!container", service_content)
 
-            # Check state.json records congestionControl
+            # Check state.json records congestionControl and has mode 0600
             if state_file.exists():
                 data = json.loads(state_file.read_text())
                 self.assertIn(data.get("congestionControl"), ("bbr", "cubic"))
+                self.assertEqual(oct(state_file.stat().st_mode & 0o777), "0o600")
 
     def test_log_rotation_and_journal_cap(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -186,13 +186,29 @@ cmd_install() {
     save_credentials "$admin_user" "$admin_pass" "https://$panel_domain" "" "$CREDENTIALS_FILE"
 
     python3 -c "
-import sys
-sys.path.insert(0, '$SCRIPT_DIR')
+import sys, os, json, time
+for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 from modules.api_client import GoWaveClient, atomic_write_state, save_credentials
+from modules.recovery import write_journal_atomically
+
+# 1. Initialize provisioning in journal
+jdata = {
+    'transaction_id': f'provision_{int(time.time())}',
+    'op': 'provision',
+    'state': 'PROVISION_PREPARED',
+    'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    'entities': {}
+}
+write_journal_atomically('$JOURNAL_FILE', jdata)
 
 client = GoWaveClient('http://127.0.0.1:3000')
 client.register_initial_admin('$admin_user', '$admin_pass')
 client.login('$admin_user', '$admin_pass')
+
+jdata['state'] = 'PROVISION_APPLYING'
+write_journal_atomically('$JOURNAL_FILE', jdata)
 
 x25519 = client.generate_x25519()
 raw_cfg = client.compile_config_profile('local-node', '$reality_domain', x25519['privateKey'])
@@ -200,13 +216,27 @@ prof_info = client.provision_config_profile('GoWave MVP Unified Profile - local-
 prof_uuid = prof_info['profile_uuid']
 inbounds = prof_info['inbounds']
 inb_uuids = [inb['uuid'] for inb in inbounds]
+jdata['entities']['profile_uuid'] = prof_uuid
+write_journal_atomically('$JOURNAL_FILE', jdata)
 
 node_uuid = client.associate_node('local-node', '127.0.0.1', 3002, prof_uuid, inb_uuids)
+jdata['entities']['node_uuid'] = node_uuid
+write_journal_atomically('$JOURNAL_FILE', jdata)
+
 squad_uuid = client.provision_internal_squad('Default MVP Squad', inb_uuids)
+jdata['entities']['squad_uuid'] = squad_uuid
+write_journal_atomically('$JOURNAL_FILE', jdata)
+
 hosts = client.provision_hosts(prof_uuid, inbounds, node_uuid, squad_uuid, '$panel_domain', '$reality_domain')
+jdata['entities']['host_uuids'] = hosts
+write_journal_atomically('$JOURNAL_FILE', jdata)
+
 short_uuid = client.provision_user('default-user', squad_uuid)
 
 token_info = client.issue_api_token()
+jdata['entities']['token_id'] = token_info.get('id')
+write_journal_atomically('$JOURNAL_FILE', jdata)
+
 save_credentials('$admin_user', '$admin_pass', 'https://$panel_domain', token_info['token'], '$CREDENTIALS_FILE')
 
 existing_cc = 'bbr'
@@ -235,6 +265,11 @@ state = {
     }]
 }
 atomic_write_state(state, '$STATE_FILE')
+
+# Commit provisioning transaction
+jdata['state'] = 'PROVISION_COMMITTED'
+jdata['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+write_journal_atomically('$JOURNAL_FILE', jdata)
 "
     # Read shortUuid
     local user_short_uuid
@@ -296,11 +331,12 @@ cmd_node() {
 
             # 2. Authenticate and register node via API
             python3 -c "
-import sys
-sys.path.insert(0, '$SCRIPT_DIR')
+import sys, json, time
+for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 from modules.api_client import GoWaveClient, atomic_write_state
 from modules.recovery import write_journal_atomically
-import json, time
 
 client = GoWaveClient('http://127.0.0.1:3000')
 client.login('$admin_user', '$admin_pass')
@@ -311,7 +347,8 @@ jdata = {
     'op': 'node_add',
     'state': 'NODE_ADD_PREPARED',
     'node_name': '$name',
-    'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+    'entities': {}
 }
 write_journal_atomically('$JOURNAL_FILE', jdata)
 
@@ -321,13 +358,21 @@ prof_info = client.provision_config_profile('GoWave Worker $name Profile', raw_c
 prof_uuid = prof_info['profile_uuid']
 inbounds = prof_info['inbounds']
 inb_uuids = [inb['uuid'] for inb in inbounds]
+jdata['state'] = 'NODE_ADD_APPLYING'
+jdata['entities']['profile_uuid'] = prof_uuid
+jdata['entities']['inbound_uuids'] = inb_uuids
+write_journal_atomically('$JOURNAL_FILE', jdata)
 
 node_uuid = client.associate_node('$name', '$ip', $node_port, prof_uuid, inb_uuids)
+jdata['entities']['node_uuid'] = node_uuid
+write_journal_atomically('$JOURNAL_FILE', jdata)
 
 state_data = json.load(open('$STATE_FILE'))
 squad_uuid = state_data.get('squadUuid')
 client.provision_internal_squad('Default MVP Squad', inb_uuids)
 hosts = client.provision_hosts(prof_uuid, inbounds, node_uuid, squad_uuid, '$worker_domain', '$reality_domain', '$name')
+jdata['entities']['host_uuids'] = hosts
+write_journal_atomically('$JOURNAL_FILE', jdata)
 
 state_data.setdefault('nodes', []).append({
     'name': '$name',
@@ -348,10 +393,14 @@ atomic_write_state(state_data, '$STATE_FILE')
 
             # 4. Commit transaction
             python3 -c "
+import sys, json, time
+for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 from modules.recovery import write_journal_atomically
-import json
 jdata = json.load(open('$JOURNAL_FILE'))
 jdata['state'] = 'NODE_ADD_COMMITTED'
+jdata['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 write_journal_atomically('$JOURNAL_FILE', jdata)
 "
             echo "Worker '$name' successfully added and deployed."

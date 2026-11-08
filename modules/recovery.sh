@@ -4,9 +4,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RECOVERY_PY="${SCRIPT_DIR}/modules/recovery.py"
-RECOVERY_DIR="/var/lib/gowave-auto-nginx/recovery"
-JOURNAL_FILE="${RECOVERY_DIR}/journal.json"
-GOWAVE_DIR="/opt/gowave"
+RECOVERY_DIR="${RECOVERY_DIR:-/var/lib/gowave-auto-nginx/recovery}"
+JOURNAL_FILE="${JOURNAL_FILE:-${RECOVERY_DIR}/journal.json}"
+STATE_FILE="${STATE_FILE:-/var/lib/gowave-auto-nginx/state.json}"
+CREDENTIALS_FILE="${CREDENTIALS_FILE:-/root/gowave-credentials.txt}"
+GOWAVE_DIR="${GOWAVE_DIR:-/opt/gowave}"
 
 ensure_recovery_dir() {
     mkdir -p "$RECOVERY_DIR"
@@ -24,6 +26,9 @@ take_preflight_db_snapshot() {
     echo "Executing transactional SQLite Online Backup..."
     python3 -c "
 import sys
+for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 from modules.recovery import sqlite_online_backup
 sqlite_online_backup('$db_path', '$target_snapshot_dir/gowave.db')
 "
@@ -58,8 +63,11 @@ prepare_update_snapshot() {
 
     # 3. Write durable state journal
     python3 -c "
+import sys, time
+for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 from modules.recovery import write_journal_atomically
-import time
 data = {
     'transaction_id': 'update-$ts',
     'op': 'update',
@@ -126,7 +134,10 @@ recover_boot_files() {
         if [[ -d "$snap_dir" ]]; then
             execute_file_rollback "$snap_dir"
             python3 -c "
-import json
+import json, sys
+for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 from modules.recovery import write_journal_atomically
 data = json.load(open('$JOURNAL_FILE'))
 data['state'] = 'ROLLED_BACK'
@@ -157,16 +168,13 @@ recover_boot_provision() {
             done
 
             echo "Cleaning up partial API entities in reverse order..."
-            # Mark rolled back
             python3 -c "
-import json
-from modules.recovery import write_journal_atomically
-data = json.load(open('$JOURNAL_FILE'))
-if data.get('op') == 'provision':
-    data['state'] = 'PROVISION_ROLLED_BACK'
-elif data.get('op') == 'node_add':
-    data['state'] = 'NODE_ADD_ROLLED_BACK'
-write_journal_atomically('$JOURNAL_FILE', data)
+import sys
+for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+from modules.api_client import rollback_provisioning
+rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE')
 "
             echo "API cleanup completed."
         fi
@@ -228,7 +236,10 @@ switch_channel() {
     fi
 
     python3 -c "
-import json
+import json, sys
+for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 from modules.recovery import write_journal_atomically, prune_snapshots
 data = json.load(open('$JOURNAL_FILE'))
 data['state'] = 'COMMITTED'
