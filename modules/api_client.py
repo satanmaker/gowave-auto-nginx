@@ -39,12 +39,14 @@ def _extract_list(res, key):
 
 
 class GoWaveClient:
-    def __init__(self, base_url="http://127.0.0.1:3000", token=None):
+    def __init__(self, base_url="http://127.0.0.1:3000", token=None, ssl_context=None, timeout=15):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.token_expiry = 0
         self.username = None
         self.password = None
+        self.ssl_context = ssl_context
+        self.timeout = timeout
         # Transaction journal entries are appended before each API call is
         # considered complete, and are serialized by the orchestration layer.
         self.transaction_entities = []
@@ -89,7 +91,10 @@ class GoWaveClient:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                with urllib.request.urlopen(req, timeout=15) as resp:
+                urlopen_kwargs = {"timeout": self.timeout}
+                if self.ssl_context is not None:
+                    urlopen_kwargs["context"] = self.ssl_context
+                with urllib.request.urlopen(req, **urlopen_kwargs) as resp:
                     resp_body = resp.read().decode("utf-8")
                     content_type = resp.headers.get("Content-Type", "")
                     if "application/json" in content_type:

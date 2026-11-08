@@ -165,6 +165,14 @@ PY
         return 2
     fi
 
+    validate_acme_server "${GOWAVE_ACME_SERVER:-}" || return 1
+    local effective_acme_server="${GOWAVE_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
+    check_acme_lineage "$panel_domain" "$effective_acme_server" || return 1
+    check_acme_lineage "$reality_domain" "$effective_acme_server" || return 1
+    if [[ -n "$vision_domain" ]]; then
+        check_acme_lineage "$vision_domain" "$effective_acme_server" || return 1
+    fi
+
     echo "==> Starting GoWave Auto NGINX All-in-One Deployment..."
     echo "Panel Domain:   $panel_domain"
     echo "Reality Domain: $reality_domain"
@@ -199,21 +207,29 @@ PY
         return 1
     fi
 
+    local certbot_extra_args=()
+    if [[ -n "${GOWAVE_ACME_SERVER:-}" ]]; then
+        certbot_extra_args+=(--server "$GOWAVE_ACME_SERVER")
+    fi
+
     echo "Acquiring Let's Encrypt TLS certificate for Panel ($panel_domain)..."
     certbot certonly --webroot -w "$ACME_WEBROOT" \
         -d "$panel_domain" --cert-name "$panel_domain" \
-        --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring
+        --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring \
+        "${certbot_extra_args[@]}"
 
     echo "Acquiring Let's Encrypt TLS certificate for REALITY decoy ($reality_domain)..."
     certbot certonly --webroot -w "$ACME_WEBROOT" \
         -d "$reality_domain" --cert-name "$reality_domain" \
-        --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring
+        --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring \
+        "${certbot_extra_args[@]}"
 
     if [[ -n "$vision_domain" ]]; then
         echo "Acquiring Let's Encrypt TLS certificate for VLESS Vision ($vision_domain)..."
         certbot certonly --webroot -w "$ACME_WEBROOT" \
             -d "$vision_domain" --cert-name "$vision_domain" \
-            --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring || true
+            --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring \
+            "${certbot_extra_args[@]}" || true
     fi
 
     rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
@@ -422,6 +438,8 @@ cmd_node() {
                 return 1
             fi
 
+            validate_acme_server "${GOWAVE_ACME_SERVER:-}" || return 1
+
             local panel_ip panel_ipv6
             panel_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org || true)
             panel_ipv6=$(curl -s6 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s6 --connect-timeout 5 --max-time 10 https://api64.ipify.org || true)
@@ -607,6 +625,9 @@ write_journal_atomically('$JOURNAL_FILE', jdata)
             local secret_key
             secret_key=$(extract_secret_key "$GOWAVE_DIR")
             if ! PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
+                GOWAVE_ACME_SERVER="${GOWAVE_ACME_SERVER:-}" \
+                GOWAVE_NODE_INSTALLER_COMMIT="${GOWAVE_NODE_INSTALLER_COMMIT:-}" \
+                GOWAVE_NODE_INSTALLER_SHA256="${GOWAVE_NODE_INSTALLER_SHA256:-}" \
                 SSH_KNOWN_HOSTS="$known_hosts" "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
                 echo "Remote Worker deployment failed; rolling back Worker host configuration and Panel API entities." >&2
                 PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
@@ -714,6 +735,11 @@ PY
         fi
     fi
 
+    validate_acme_server "${GOWAVE_ACME_SERVER:-}" || return 1
+    local effective_acme_server="${GOWAVE_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
+    check_acme_lineage "$new_panel_domain" "$effective_acme_server" || return 1
+    check_acme_lineage "$new_reality_domain" "$effective_acme_server" || return 1
+
     local snap_dir
     snap_dir=$(prepare_update_snapshot "domain-change")
     rollback_domain_change() {
@@ -750,10 +776,15 @@ PY
     generate_bootstrap_acme_vhost "$new_panel_domain" "$new_reality_domain"
     reload_nginx_strict || { rollback_domain_change "bootstrap NGINX activation failed"; return 1; }
 
-    if ! certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_panel_domain" --cert-name "$new_panel_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring; then
+    local certbot_extra_args=()
+    if [[ -n "${GOWAVE_ACME_SERVER:-}" ]]; then
+        certbot_extra_args+=(--server "$GOWAVE_ACME_SERVER")
+    fi
+
+    if ! certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_panel_domain" --cert-name "$new_panel_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring "${certbot_extra_args[@]}"; then
         rollback_domain_change "ACME issuance failed for panel domain"; return 1
     fi
-    if ! certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_reality_domain" --cert-name "$new_reality_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring; then
+    if ! certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_reality_domain" --cert-name "$new_reality_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring "${certbot_extra_args[@]}"; then
         rollback_domain_change "ACME issuance failed for REALITY domain"; return 1
     fi
     verify_acme_certificate "$new_panel_domain" || { rollback_domain_change "invalid panel certificate"; return 1; }

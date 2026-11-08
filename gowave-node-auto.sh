@@ -17,6 +17,72 @@ if [[ -f "$SCRIPT_DIR/modules/security.sh" ]]; then
     source "$SCRIPT_DIR/modules/security.sh"
 fi
 
+validate_acme_server() {
+    local server="${1:-}"
+    if [[ -z "$server" ]]; then
+        return 0
+    fi
+    if [[ "$server" != "https://acme-staging-v02.api.letsencrypt.org/directory" && \
+          "$server" != "https://acme-v02.api.letsencrypt.org/directory" ]]; then
+        echo "Error: Invalid GOWAVE_ACME_SERVER: '$server'. Only 'https://acme-staging-v02.api.letsencrypt.org/directory' or 'https://acme-v02.api.letsencrypt.org/directory' are supported." >&2
+        return 1
+    fi
+    return 0
+}
+
+check_acme_lineage() {
+    local domain="$1"
+    local target_server="${2:-https://acme-v02.api.letsencrypt.org/directory}"
+    local renewal_conf="${3:-/etc/letsencrypt/renewal/${domain}.conf}"
+    local live_dir="${4:-/etc/letsencrypt/live/${domain}}"
+
+    if [[ -f "$renewal_conf" ]]; then
+        local existing_server=""
+        while IFS='=' read -r key val || [[ -n "$key" ]]; do
+            key=$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [[ "$key" == "server" ]]; then
+                existing_server=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                break
+            fi
+        done < "$renewal_conf"
+
+        if [[ -z "$existing_server" ]]; then
+            echo "Error: Existing renewal lineage for $domain has no readable 'server' field in $renewal_conf; failing closed to prevent cross-lineage staging/production reuse." >&2
+            return 1
+        fi
+
+        if [[ "$existing_server" != "https://acme-staging-v02.api.letsencrypt.org/directory" && \
+              "$existing_server" != "https://acme-v02.api.letsencrypt.org/directory" ]]; then
+            echo "Error: Existing renewal lineage for $domain uses unrecognized ACME directory: '$existing_server'." >&2
+            return 1
+        fi
+
+        if [[ "$existing_server" != "$target_server" ]]; then
+            echo "Error: ACME directory mismatch for $domain: existing lineage in $renewal_conf was issued by '$existing_server', but requested server is '$target_server'. Staging and production lineages cannot be mixed." >&2
+            return 1
+        fi
+    fi
+
+    local fullchain="$live_dir/fullchain.pem"
+    if [[ -s "$fullchain" ]]; then
+        local issuer
+        issuer=$(openssl x509 -in "$fullchain" -noout -issuer 2>/dev/null || true)
+        local is_staging_cert=0
+        if [[ "$issuer" =~ \(STAGING\) ]]; then
+            is_staging_cert=1
+        fi
+        if [[ "$target_server" == "https://acme-staging-v02.api.letsencrypt.org/directory" && "$is_staging_cert" -eq 0 ]]; then
+            echo "Error: Existing certificate for $domain was issued by production ($issuer), but requested ACME server is staging ($target_server)." >&2
+            return 1
+        elif [[ "$target_server" == "https://acme-v02.api.letsencrypt.org/directory" && "$is_staging_cert" -eq 1 ]]; then
+            echo "Error: Existing certificate for $domain was issued by staging ($issuer), but requested ACME server is production ($target_server)." >&2
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 # Function to pack cover-reality into base64 string
 pack_cover_reality() {
     local cover_dir="${1:-$SCRIPT_DIR/assets/cover-sites/cover-reality}"
@@ -40,6 +106,7 @@ remote_payload() {
     local panel_ipv6="${PANEL_IPV6:-}"
     local admin_email="${ADMIN_EMAIL:-admin@${worker_domain}}"
     local known_hosts="${SSH_KNOWN_HOSTS:-/root/.ssh/known_hosts}"
+    validate_acme_server "${GOWAVE_ACME_SERVER:-}" || return 1
     local host_key="$host"
     if [[ "$port" != "22" ]]; then
         host_key="[$host]:$port"
@@ -49,7 +116,16 @@ remote_payload() {
         log_err "Obtain the host key over a trusted channel, compare its fingerprint out-of-band, then add it to known_hosts."
         return 1
     fi
-    local installer_commit="7b3514d1ab8c674050597820d52d55525d4bece7"
+    local installer_commit="${GOWAVE_NODE_INSTALLER_COMMIT:-7b3514d1ab8c674050597820d52d55525d4bece7}"
+    local installer_sha256="${GOWAVE_NODE_INSTALLER_SHA256:-9a524f1383d3a6a8be42ac370699b0ec6725678ece4abe5b5bc61e8c2af682d0}"
+    if [[ ! "$installer_commit" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        log_err "GOWAVE_NODE_INSTALLER_COMMIT must be a 40-character hex commit SHA."
+        return 1
+    fi
+    if [[ ! "$installer_sha256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        log_err "GOWAVE_NODE_INSTALLER_SHA256 must be a 64-character hex SHA-256 digest."
+        return 1
+    fi
     local verifier_b64=""
     if [[ -f "$SCRIPT_DIR/modules/verify_node_mtls.py" ]]; then
         verifier_b64=$(base64 -w 0 "$SCRIPT_DIR/modules/verify_node_mtls.py")
@@ -80,11 +156,13 @@ remote_payload() {
         printf 'export NODE_PORT=%q\n' "$node_port"
         printf 'export GOWAVE_NODE_VERSION=%q\n' "${GOWAVE_NODE_VERSION:-latest}"
         printf 'export GOWAVE_NODE_INSTALLER_COMMIT=%q\n' "$installer_commit"
+        printf 'export GOWAVE_NODE_INSTALLER_SHA256=%q\n' "$installer_sha256"
         printf 'export SSH_PORT=%q\n' "$port"
         printf 'export VERIFY_NODE_MTLS_B64=%q\n' "$verifier_b64"
         printf 'export WORKER_DOMAIN=%q\n' "$worker_domain"
         printf 'export REALITY_DOMAIN=%q\n' "$reality_domain"
         printf 'export ADMIN_EMAIL=%q\n' "$admin_email"
+        printf 'export GOWAVE_ACME_SERVER=%q\n' "${GOWAVE_ACME_SERVER:-}"
         printf 'COVER_REALITY_B64=%q\n' "$cover_b64"
         printf 'COVER_REALITY_SHA256=%q\n' "$cover_sha256"
         # Secret strictly scoped, not exported globally
@@ -92,6 +170,72 @@ remote_payload() {
 
         # 2. Remote helper functions
         cat <<'RUNNER_FUNCS'
+validate_acme_server() {
+    local server="${1:-}"
+    if [[ -z "$server" ]]; then
+        return 0
+    fi
+    if [[ "$server" != "https://acme-staging-v02.api.letsencrypt.org/directory" && \
+          "$server" != "https://acme-v02.api.letsencrypt.org/directory" ]]; then
+        echo "Error: Invalid GOWAVE_ACME_SERVER: '$server'. Only 'https://acme-staging-v02.api.letsencrypt.org/directory' or 'https://acme-v02.api.letsencrypt.org/directory' are supported." >&2
+        return 1
+    fi
+    return 0
+}
+
+check_acme_lineage() {
+    local domain="$1"
+    local target_server="${2:-https://acme-v02.api.letsencrypt.org/directory}"
+    local renewal_conf="${3:-/etc/letsencrypt/renewal/${domain}.conf}"
+    local live_dir="${4:-/etc/letsencrypt/live/${domain}}"
+
+    if [[ -f "$renewal_conf" ]]; then
+        local existing_server=""
+        while IFS='=' read -r key val || [[ -n "$key" ]]; do
+            key=$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [[ "$key" == "server" ]]; then
+                existing_server=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                break
+            fi
+        done < "$renewal_conf"
+
+        if [[ -z "$existing_server" ]]; then
+            echo "Error: Existing renewal lineage for $domain has no readable 'server' field in $renewal_conf; failing closed to prevent cross-lineage staging/production reuse." >&2
+            return 1
+        fi
+
+        if [[ "$existing_server" != "https://acme-staging-v02.api.letsencrypt.org/directory" && \
+              "$existing_server" != "https://acme-v02.api.letsencrypt.org/directory" ]]; then
+            echo "Error: Existing renewal lineage for $domain uses unrecognized ACME directory: '$existing_server'." >&2
+            return 1
+        fi
+
+        if [[ "$existing_server" != "$target_server" ]]; then
+            echo "Error: ACME directory mismatch for $domain: existing lineage in $renewal_conf was issued by '$existing_server', but requested server is '$target_server'. Staging and production lineages cannot be mixed." >&2
+            return 1
+        fi
+    fi
+
+    local fullchain="$live_dir/fullchain.pem"
+    if [[ -s "$fullchain" ]]; then
+        local issuer
+        issuer=$(openssl x509 -in "$fullchain" -noout -issuer 2>/dev/null || true)
+        local is_staging_cert=0
+        if [[ "$issuer" =~ \(STAGING\) ]]; then
+            is_staging_cert=1
+        fi
+        if [[ "$target_server" == "https://acme-staging-v02.api.letsencrypt.org/directory" && "$is_staging_cert" -eq 0 ]]; then
+            echo "Error: Existing certificate for $domain was issued by production ($issuer), but requested ACME server is staging ($target_server)." >&2
+            return 1
+        elif [[ "$target_server" == "https://acme-v02.api.letsencrypt.org/directory" && "$is_staging_cert" -eq 1 ]]; then
+            echo "Error: Existing certificate for $domain was issued by staging ($issuer), but requested ACME server is production ($target_server)." >&2
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
 setup_system_prereqs() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
@@ -247,16 +391,23 @@ EOF
     systemctl reload nginx || systemctl restart nginx
     systemctl is-active --quiet nginx || { echo "Fatal: NGINX failed to activate bootstrap ACME config" >&2; return 1; }
 
+    local certbot_extra_args=()
+    if [[ -n "${GOWAVE_ACME_SERVER:-}" ]]; then
+        certbot_extra_args+=(--server "$GOWAVE_ACME_SERVER")
+    fi
+
     echo "Acquiring Let's Encrypt TLS certificate for Worker ($WORKER_DOMAIN)..."
     certbot certonly --webroot -w /var/www/gowave-acme \
         -d "$WORKER_DOMAIN" --cert-name "$WORKER_DOMAIN" \
-        --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring
+        --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring \
+        "${certbot_extra_args[@]}"
     _ACME_WORKER_ISSUED=1
 
     echo "Acquiring Let's Encrypt TLS certificate for REALITY decoy ($REALITY_DOMAIN)..."
     certbot certonly --webroot -w /var/www/gowave-acme \
         -d "$REALITY_DOMAIN" --cert-name "$REALITY_DOMAIN" \
-        --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring
+        --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring \
+        "${certbot_extra_args[@]}"
     _ACME_REALITY_ISSUED=1
 
     rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf
@@ -416,8 +567,13 @@ EOF
 run_upstream_node_installer() {
     local tmp_inst
     : "${GOWAVE_NODE_INSTALLER_COMMIT:?Pinned upstream installer commit is required}"
-    [[ "$GOWAVE_NODE_INSTALLER_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
-        echo "Fatal: invalid pinned upstream installer commit." >&2
+    : "${GOWAVE_NODE_INSTALLER_SHA256:?Pinned upstream installer SHA256 digest is required}"
+    [[ "$GOWAVE_NODE_INSTALLER_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]] || {
+        echo "Fatal: invalid pinned upstream installer commit: expected 40-hex SHA." >&2
+        return 1
+    }
+    [[ "$GOWAVE_NODE_INSTALLER_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || {
+        echo "Fatal: invalid pinned upstream installer SHA256: expected 64-hex digest." >&2
         return 1
     }
     tmp_inst=$(mktemp "/tmp/gowave-node-install-XXXXXX.sh")
@@ -427,12 +583,20 @@ run_upstream_node_installer() {
         echo "Fatal: failed to fetch the pinned GoWave Node installer." >&2
         return 1
     fi
+    local fetched_sha256
+    fetched_sha256=$(sha256sum "$tmp_inst" | awk '{print $1}')
+    if [[ "$fetched_sha256" != "$GOWAVE_NODE_INSTALLER_SHA256" ]]; then
+        rm -f "$tmp_inst"
+        echo "Fatal: upstream installer SHA256 mismatch: expected $GOWAVE_NODE_INSTALLER_SHA256, got $fetched_sha256." >&2
+        return 1
+    fi
     chmod 0700 "$tmp_inst"
     if bash "$tmp_inst" </dev/null; then
         rm -f "$tmp_inst"
     else
         local installer_rc=$?
         rm -f "$tmp_inst"
+        echo "Fatal: upstream installer failed with exit code $installer_rc" >&2
         return "$installer_rc"
     fi
 
@@ -579,6 +743,11 @@ main() {
 
     trap 'exit_code=$?; compensate_remote_worker "$exit_code"; exit "$exit_code"' ERR
     trap 'unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64; rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh' EXIT HUP INT TERM
+
+    validate_acme_server "${GOWAVE_ACME_SERVER:-}"
+    local effective_acme_server="${GOWAVE_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
+    check_acme_lineage "$WORKER_DOMAIN" "$effective_acme_server"
+    check_acme_lineage "$REALITY_DOMAIN" "$effective_acme_server"
 
     setup_system_prereqs </dev/null
     configure_host_security </dev/null

@@ -424,3 +424,69 @@ EOF
     chmod 0755 "$hook_file"
     echo "Configured ACME renewal hook in $hook_file."
 }
+
+validate_acme_server() {
+    local server="${1:-}"
+    if [[ -z "$server" ]]; then
+        return 0
+    fi
+    if [[ "$server" != "https://acme-staging-v02.api.letsencrypt.org/directory" && \
+          "$server" != "https://acme-v02.api.letsencrypt.org/directory" ]]; then
+        echo "Error: Invalid GOWAVE_ACME_SERVER: '$server'. Only 'https://acme-staging-v02.api.letsencrypt.org/directory' or 'https://acme-v02.api.letsencrypt.org/directory' are supported." >&2
+        return 1
+    fi
+    return 0
+}
+
+check_acme_lineage() {
+    local domain="$1"
+    local target_server="${2:-https://acme-v02.api.letsencrypt.org/directory}"
+    local renewal_conf="${3:-/etc/letsencrypt/renewal/${domain}.conf}"
+    local live_dir="${4:-/etc/letsencrypt/live/${domain}}"
+
+    if [[ -f "$renewal_conf" ]]; then
+        local existing_server=""
+        while IFS='=' read -r key val || [[ -n "$key" ]]; do
+            key=$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [[ "$key" == "server" ]]; then
+                existing_server=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                break
+            fi
+        done < "$renewal_conf"
+
+        if [[ -z "$existing_server" ]]; then
+            echo "Error: Existing renewal lineage for $domain has no readable 'server' field in $renewal_conf; failing closed to prevent cross-lineage staging/production reuse." >&2
+            return 1
+        fi
+
+        if [[ "$existing_server" != "https://acme-staging-v02.api.letsencrypt.org/directory" && \
+              "$existing_server" != "https://acme-v02.api.letsencrypt.org/directory" ]]; then
+            echo "Error: Existing renewal lineage for $domain uses unrecognized ACME directory: '$existing_server'." >&2
+            return 1
+        fi
+
+        if [[ "$existing_server" != "$target_server" ]]; then
+            echo "Error: ACME directory mismatch for $domain: existing lineage in $renewal_conf was issued by '$existing_server', but requested server is '$target_server'. Staging and production lineages cannot be mixed." >&2
+            return 1
+        fi
+    fi
+
+    local fullchain="$live_dir/fullchain.pem"
+    if [[ -s "$fullchain" ]]; then
+        local issuer
+        issuer=$(openssl x509 -in "$fullchain" -noout -issuer 2>/dev/null || true)
+        local is_staging_cert=0
+        if [[ "$issuer" =~ \(STAGING\) ]]; then
+            is_staging_cert=1
+        fi
+        if [[ "$target_server" == "https://acme-staging-v02.api.letsencrypt.org/directory" && "$is_staging_cert" -eq 0 ]]; then
+            echo "Error: Existing certificate for $domain was issued by production ($issuer), but requested ACME server is staging ($target_server)." >&2
+            return 1
+        elif [[ "$target_server" == "https://acme-v02.api.letsencrypt.org/directory" && "$is_staging_cert" -eq 1 ]]; then
+            echo "Error: Existing certificate for $domain was issued by staging ($issuer), but requested ACME server is production ($target_server)." >&2
+            return 1
+        fi
+    fi
+
+    return 0
+}
