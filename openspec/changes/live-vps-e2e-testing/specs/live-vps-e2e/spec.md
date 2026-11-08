@@ -72,8 +72,9 @@ command.
 
 ### Requirement: Optional Vision Domain Pair and Activation
 
-The runner SHALL accept `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` only as an all-or-none pair. A
-one-sided configuration SHALL fail local preflight before any remote command. When both are configured, the
+The runner SHALL accept `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` only as an all-or-none, pairwise-distinct FQDN set. A
+one-sided configuration SHALL fail local preflight before any remote command; each Vision domain MUST differ
+from the other Vision domain and all four mandatory Panel/REALITY domains. When both are configured, the
 runner SHALL require a valid Vision certificate, active Vision inbound, matching Panel host, NGINX SNI route,
 and fallback on both VPS. Vision certificate issuance or validation failure MUST fail the relevant install
 phase; it MUST NOT be suppressed or reported as an optional skip. When both are absent, the default four-inbound
@@ -309,7 +310,7 @@ correctness, Internal Squad membership by set equality, and all Host record fiel
 
 - **GIVEN** Master installed and Worker deployed on a clean test environment
 - **WHEN** runner queries `GET /api/hosts`
-- **THEN** exactly eight (or ten when vision domains are configured) Host records exist; four (or five) reference `local-node` UUID and four (or five) reference `worker-1`
+- **THEN** exactly eight (or ten when both Vision domains are configured) Host records exist; four (or five) reference `local-node` UUID and four (or five) reference `worker-1`
   UUID; each Host's `inbound UUID` matches one of the inbounds in the corresponding node's config profile; all hosts configure `fingerprint: firefox`
 
 #### Scenario: Internal Squad contains all provisioned inbound UUIDs
@@ -348,7 +349,7 @@ against the real Panel; actual HTTP response codes SHALL be used (not mock assum
 
 - **GIVEN** subscription fetched with valid Xray User-Agent
 - **WHEN** runner parses the JSON and counts proxy-capable outbounds
-- **THEN** exactly eight (or ten when vision is configured) outbounds are identified by protocol/transport tag (VLESS REALITY, VLESS XHTTP
+- **THEN** exactly eight (or ten when both Vision domains are configured) outbounds are identified by protocol/transport tag (VLESS REALITY, VLESS XHTTP
   TLS, VLESS WS TLS, Trojan gRPC TLS, and optional VLESS XTLS Vision TLS) for Master and Worker; `fingerprint: "firefox"` is verified; `direct`, `block`, and routing-only entries
   are excluded from the count
 
@@ -364,7 +365,7 @@ against the real Panel; actual HTTP response codes SHALL be used (not mock assum
 
 - **GIVEN** subscription fetched with valid Mihomo User-Agent
 - **WHEN** runner validates HTTP response and parses YAML
-- **THEN** HTTP 200 is returned with correct Content-Type; eight (or ten when vision is configured) proxy entries with correct protocol and
+- **THEN** HTTP 200 is returned with correct Content-Type; eight (or ten when both Vision domains are configured) proxy entries with correct protocol and
   transport parameters and `client-fingerprint: "firefox"` are present; `GEOIP,private,DIRECT,no-resolve` rule is present; no duplicates; real
   `mihomo -t` validates the config
 
@@ -428,7 +429,7 @@ Cover-reality assets and fallbacks SHALL be present and PROXY protocol SHALL be 
 
 #### Scenario: Optional Vision SNI routing and decoy fallback
 
-- **GIVEN** vision domain is configured and NGINX Stream is active
+- **GIVEN** both Vision domains are configured and NGINX Stream is active
 - **WHEN** runner connects with vision domain SNI using a non-VLESS HTTP probe
 - **THEN** traffic routes to loopback port 8444 and falls back to loopback port 9444 returning decoy site content via PROXY protocol
 
@@ -519,7 +520,7 @@ ingress evidence; syntax checks do not count.
 
 #### Scenario: One or more mandatory runtime cases fail
 
-- **GIVEN** the sixteen-case (or twenty-case when vision is configured) runtime matrix is required
+- **GIVEN** the sixteen-case (or twenty-case when both Vision domains are configured) runtime matrix is required
 - **WHEN** any Xray or Mihomo case fails
 - **THEN** the corresponding case is `FAIL` and overall status is `FAIL`
 
