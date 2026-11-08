@@ -11,7 +11,7 @@ import urllib.parse
 REPO_ROOT = Path(__file__).resolve().parent.parent
 import sys
 sys.path.insert(0, str(REPO_ROOT))
-from modules.api_client import GoWaveClient, atomic_write_state, save_credentials
+from modules.api_client import GoWaveClient, atomic_write_state, save_credentials, rollback_provisioning
 
 
 class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
@@ -86,6 +86,10 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"response": {"internalSquads": [{"uuid": k, **v} for k, v in self.squads.items()]}})
         elif self.path == "/api/hosts":
             self.send_json(200, {"response": {"hosts": [{"uuid": k, **v} for k, v in self.hosts.items()]}})
+        elif self.path == "/api/tokens":
+            self.send_json(200, {"response": {"tokens": []}})
+        elif self.path == "/api/users":
+            self.send_json(200, {"response": {"users": []}})
         elif self.path.startswith("/api/users/by-username/"):
             username = self.path.split("/")[-1]
             if username in self.users:
@@ -101,6 +105,32 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
         self.send_json(200, {"response": {"status": "updated", **body}})
+
+    def do_DELETE(self):
+        if self.path.startswith("/api/tokens/"):
+            token_id = self.path.split("/")[-1]
+            self.send_json(200, {"response": {"status": "deleted", "id": token_id}})
+        elif self.path.startswith("/api/users/"):
+            uid = self.path.split("/")[-1]
+            self.send_json(200, {"response": {"status": "deleted", "uuid": uid}})
+        elif self.path.startswith("/api/hosts/"):
+            hid = self.path.split("/")[-1]
+            self.hosts.pop(hid, None)
+            self.send_json(200, {"response": {"status": "deleted", "uuid": hid}})
+        elif self.path.startswith("/api/internal-squads/"):
+            sid = self.path.split("/")[-1]
+            self.squads.pop(sid, None)
+            self.send_json(200, {"response": {"status": "deleted", "uuid": sid}})
+        elif self.path.startswith("/api/nodes/"):
+            nid = self.path.split("/")[-1]
+            self.nodes.pop(nid, None)
+            self.send_json(200, {"response": {"status": "deleted", "uuid": nid}})
+        elif self.path.startswith("/api/config-profiles/"):
+            pid = self.path.split("/")[-1]
+            self.profiles.pop(pid, None)
+            self.send_json(200, {"response": {"status": "deleted", "uuid": pid}})
+        else:
+            self.send_json(404, {"error": "Not found"})
 
     def send_json(self, status, payload):
         self.send_response(status)
@@ -125,6 +155,7 @@ class TestAPIClient(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
+        cls.server.server_close()
 
     def test_save_credentials(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -212,6 +243,85 @@ class TestAPIClient(unittest.TestCase):
         # 8. Issue API Token
         token_info = self.client.issue_api_token()
         self.assertEqual(token_info["token"], "gowave-scoped-api-token-xyz")
+
+    def test_rollback_provisioning_flow(self):
+        MockGoWaveServer.registered_users["admin"] = "securepass1234567890"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            sfile = Path(tmpdir) / "state.json"
+            cfile = Path(tmpdir) / "credentials.txt"
+
+            save_credentials("admin", "securepass1234567890", "https://panel.example.com", "token-xyz", str(cfile))
+
+            # Simulate uncommitted initial provisioning
+            jdata = {
+                "transaction_id": "provision_12345",
+                "op": "provision",
+                "state": "PROVISION_APPLYING",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": {
+                    "token_id": "token-1",
+                    "user_uuid": "user-uuid-1",
+                    "host_uuids": ["host-1", "host-2"],
+                    "squad_uuid": "squad-1",
+                    "node_uuid": "node-1",
+                    "profile_uuid": "prof-1",
+                }
+            }
+            jfile.write_text(json.dumps(jdata))
+            sfile.write_text(json.dumps({"schemaVersion": 2, "squadUuid": "squad-1"}))
+
+            res = rollback_provisioning(str(jfile), str(sfile), str(cfile), base_url=f"http://127.0.0.1:{self.port}")
+            self.assertTrue(res)
+
+            # Check journal state transitioned to PROVISION_ROLLED_BACK
+            updated_jdata = json.loads(jfile.read_text())
+            self.assertEqual(updated_jdata["state"], "PROVISION_ROLLED_BACK")
+
+    def test_rollback_node_add_flow(self):
+        MockGoWaveServer.registered_users["admin"] = "securepass1234567890"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            sfile = Path(tmpdir) / "state.json"
+            cfile = Path(tmpdir) / "credentials.txt"
+
+            save_credentials("admin", "securepass1234567890", "https://panel.example.com", "token-xyz", str(cfile))
+
+            # Simulate uncommitted worker node addition
+            jdata = {
+                "transaction_id": "node_add_worker-1",
+                "op": "node_add",
+                "state": "NODE_ADD_APPLYING",
+                "node_name": "worker-1",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": {
+                    "profile_uuid": "prof-w1",
+                    "node_uuid": "node-w1",
+                    "inbound_uuids": ["inb-w1"],
+                    "host_uuids": ["host-w1"]
+                }
+            }
+            jfile.write_text(json.dumps(jdata))
+            sfile.write_text(json.dumps({
+                "schemaVersion": 2,
+                "squadUuid": "squad-1",
+                "nodes": [
+                    {"name": "local-node", "uuid": "node-1"},
+                    {"name": "worker-1", "uuid": "node-w1"}
+                ]
+            }))
+
+            res = rollback_provisioning(str(jfile), str(sfile), str(cfile), base_url=f"http://127.0.0.1:{self.port}")
+            self.assertTrue(res)
+
+            # Check journal state transitioned to NODE_ADD_ROLLED_BACK
+            updated_jdata = json.loads(jfile.read_text())
+            self.assertEqual(updated_jdata["state"], "NODE_ADD_ROLLED_BACK")
+
+            # Check worker-1 pruned from state.json nodes list
+            updated_sdata = json.loads(sfile.read_text())
+            self.assertEqual(len(updated_sdata["nodes"]), 1)
+            self.assertEqual(updated_sdata["nodes"][0]["name"], "local-node")
 
 
 if __name__ == "__main__":

@@ -84,8 +84,8 @@ class GoWaveClient:
                     return resp_body
             except urllib.error.HTTPError as e:
                 err_body = e.read().decode("utf-8", errors="replace")
-                # Handle 401 re-login
-                if e.code == 401 and self.username and self.password and attempt == 0:
+                # Handle 401 re-login (never re-login if the failing endpoint is login itself)
+                if e.code == 401 and self.username and self.password and attempt == 0 and endpoint != "/api/auth/login":
                     self.login(self.username, self.password)
                     req_headers["Authorization"] = f"Bearer {self.token}"
                     req = urllib.request.Request(url, data=encoded_data, headers=req_headers, method=method)
@@ -458,6 +458,54 @@ class GoWaveClient:
         token_id = data.get("id") or data.get("uuid")
         return {"token": token_str, "id": token_id}
 
+    def delete_token(self, token_id):
+        try:
+            return self.request("DELETE", f"/api/tokens/{token_id}")
+        except GoWaveAPIError as e:
+            if e.status_code == 404:
+                return None
+            raise
+
+    def delete_user(self, user_uuid):
+        try:
+            return self.request("DELETE", f"/api/users/{user_uuid}")
+        except GoWaveAPIError as e:
+            if e.status_code == 404:
+                return None
+            raise
+
+    def delete_host(self, host_uuid):
+        try:
+            return self.request("DELETE", f"/api/hosts/{host_uuid}")
+        except GoWaveAPIError as e:
+            if e.status_code == 404:
+                return None
+            raise
+
+    def delete_internal_squad(self, squad_uuid):
+        try:
+            return self.request("DELETE", f"/api/internal-squads/{squad_uuid}")
+        except GoWaveAPIError as e:
+            if e.status_code == 404:
+                return None
+            raise
+
+    def delete_node(self, node_uuid):
+        try:
+            return self.request("DELETE", f"/api/nodes/{node_uuid}")
+        except GoWaveAPIError as e:
+            if e.status_code == 404:
+                return None
+            raise
+
+    def delete_config_profile(self, profile_uuid):
+        try:
+            return self.request("DELETE", f"/api/config-profiles/{profile_uuid}")
+        except GoWaveAPIError as e:
+            if e.status_code == 404:
+                return None
+            raise
+
 
 def atomic_write_state(state_data, state_path="/var/lib/gowave-auto-nginx/state.json"):
     path = Path(state_path)
@@ -472,6 +520,7 @@ def atomic_write_state(state_data, state_path="/var/lib/gowave-auto-nginx/state.
         f.flush()
         os.fsync(f.fileno())
 
+    os.chmod(tmp_path, 0o600)
     os.replace(tmp_path, path)
 
     # Sync parent directory
@@ -480,6 +529,286 @@ def atomic_write_state(state_data, state_path="/var/lib/gowave-auto-nginx/state.
         os.fsync(dir_fd)
     finally:
         os.close(dir_fd)
+
+
+def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/journal.json",
+                          state_path="/var/lib/gowave-auto-nginx/state.json",
+                          credentials_path="/root/gowave-credentials.txt",
+                          base_url="http://127.0.0.1:3000"):
+    """Rolls back partial API entities created during uncommitted provisioning or worker additions.
+    Implements reverse-order deletion per API_CONTRACTS.md §5.3.
+    """
+    try:
+        from modules.recovery import write_journal_atomically
+    except ImportError:
+        try:
+            from recovery import write_journal_atomically
+        except ImportError:
+            def write_journal_atomically(p, d):
+                tmp = f"{p}.tmp"
+                with open(tmp, "w") as f:
+                    json.dump(d, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, p)
+
+    journal_file = Path(journal_path)
+    if not journal_file.exists():
+        return True
+
+    try:
+        with open(journal_file, "r") as f:
+            journal_data = json.load(f)
+    except Exception as e:
+        print(f"Warning: Failed to load journal {journal_file}: {e}", file=sys.stderr)
+        return False
+
+    op = journal_data.get("op", "")
+    state = journal_data.get("state", "")
+
+    # If already committed or rolled back, skip
+    if state in ("PROVISION_COMMITTED", "NODE_ADD_COMMITTED", "PROVISION_ROLLED_BACK", "NODE_ADD_ROLLED_BACK"):
+        return True
+
+    # Read credentials
+    username = "admin"
+    password = ""
+    creds_file = Path(credentials_path)
+    if creds_file.exists():
+        try:
+            for line in creds_file.read_text().splitlines():
+                if line.startswith("ADMIN_USERNAME="):
+                    username = line.split("=", 1)[1].strip()
+                elif line.startswith("ADMIN_PASSWORD="):
+                    password = line.split("=", 1)[1].strip()
+                elif line.startswith("Admin Username:"):
+                    username = line.split(":", 1)[1].strip()
+                elif line.startswith("Admin Password:"):
+                    password = line.split(":", 1)[1].strip()
+        except Exception as e:
+            print(f"Warning reading credentials file: {e}", file=sys.stderr)
+
+    if not password:
+        env_file = Path("/opt/gowave/.env")
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                if line.startswith("ADMIN_PASSWORD="):
+                    password = line.split("=", 1)[1].strip()
+
+    client = GoWaveClient(base_url)
+    if username and password:
+        try:
+            client.login(username, password)
+        except Exception as e:
+            print(f"Warning: Login failed during rollback: {e}", file=sys.stderr)
+            return False
+
+    # Check state data if exists
+    state_file = Path(state_path)
+    state_data = {}
+    if state_file.exists():
+        try:
+            with open(state_file, "r") as f:
+                state_data = json.load(f)
+        except Exception:
+            pass
+
+    tmp_state = state_file.parent / f"{state_file.name}.tmp"
+    if tmp_state.exists():
+        try:
+            with open(tmp_state, "r") as f:
+                tmp_data = json.load(f)
+                if not state_data:
+                    state_data = tmp_data
+        except Exception:
+            pass
+
+    # Branch 1: PROVISION_* rollback
+    if op == "provision" or state.startswith("PROVISION_"):
+        # 1. Tokens
+        token_id = journal_data.get("entities", {}).get("token_id")
+        if token_id:
+            client.delete_token(token_id)
+        try:
+            tokens_res = client.request("GET", "/api/tokens")
+            tokens_list = _extract_list(tokens_res, "tokens")
+            for t in tokens_list:
+                if t.get("name") == "gowave-auto-sub-token":
+                    client.delete_token(t.get("id") or t.get("uuid"))
+        except Exception as e:
+            print(f"Rollback note (tokens): {e}", file=sys.stderr)
+
+        # 2. Users
+        user_uuid = journal_data.get("entities", {}).get("user_uuid") or state_data.get("defaultUserUuid")
+        if user_uuid:
+            client.delete_user(user_uuid)
+        try:
+            users_res = client.request("GET", "/api/users")
+            users_list = _extract_list(users_res, "users")
+            for u in users_list:
+                if u.get("username") == "default-user":
+                    client.delete_user(u.get("uuid"))
+        except Exception as e:
+            print(f"Rollback note (users): {e}", file=sys.stderr)
+
+        # 3. Hosts
+        host_uuids = journal_data.get("entities", {}).get("host_uuids", [])
+        for hid in reversed(host_uuids):
+            client.delete_host(hid)
+        try:
+            hosts_res = client.request("GET", "/api/hosts")
+            hosts_list = _extract_list(hosts_res, "hosts")
+            for h in hosts_list:
+                remark = h.get("remark", "")
+                if "@local-node" in remark or remark.endswith("local-node"):
+                    client.delete_host(h.get("uuid"))
+        except Exception as e:
+            print(f"Rollback note (hosts): {e}", file=sys.stderr)
+
+        # 4. Internal Squads
+        squad_uuid = journal_data.get("entities", {}).get("squad_uuid") or state_data.get("squadUuid")
+        if squad_uuid:
+            client.delete_internal_squad(squad_uuid)
+        try:
+            squads_res = client.request("GET", "/api/internal-squads")
+            squads_list = _extract_list(squads_res, "internalSquads")
+            for s in squads_list:
+                if s.get("name") == "Default MVP Squad":
+                    client.delete_internal_squad(s.get("uuid"))
+        except Exception as e:
+            print(f"Rollback note (squads): {e}", file=sys.stderr)
+
+        # 5. Nodes
+        node_uuid = journal_data.get("entities", {}).get("node_uuid") or state_data.get("localNodeUuid")
+        if node_uuid:
+            client.delete_node(node_uuid)
+        try:
+            nodes_res = client.request("GET", "/api/nodes")
+            nodes_list = _extract_list(nodes_res, "nodes")
+            for n in nodes_list:
+                if n.get("name") == "local-node":
+                    client.delete_node(n.get("uuid"))
+        except Exception as e:
+            print(f"Rollback note (nodes): {e}", file=sys.stderr)
+
+        # 6. Config Profiles
+        prof_uuid = journal_data.get("entities", {}).get("profile_uuid") or state_data.get("profileUuid")
+        if prof_uuid:
+            client.delete_config_profile(prof_uuid)
+        try:
+            profs_res = client.request("GET", "/api/config-profiles")
+            profs_list = _extract_list(profs_res, "configProfiles")
+            for p in profs_list:
+                if p.get("name") in ("GoWave MVP Unified Profile - local-node", "GoWave MVP Unified Profile"):
+                    client.delete_config_profile(p.get("uuid"))
+        except Exception as e:
+            print(f"Rollback note (config-profiles): {e}", file=sys.stderr)
+
+        # Cleanup state.json.tmp
+        if tmp_state.exists():
+            try:
+                tmp_state.unlink()
+            except Exception:
+                pass
+
+        # Update journal to PROVISION_ROLLED_BACK
+        journal_data["state"] = "PROVISION_ROLLED_BACK"
+        journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        write_journal_atomically(str(journal_file), journal_data)
+        return True
+
+    # Branch 2: NODE_ADD_* rollback
+    elif op == "node_add" or state.startswith("NODE_ADD_"):
+        worker_name = journal_data.get("node_name", "")
+        if not worker_name and "transaction_id" in journal_data:
+            tid = journal_data["transaction_id"]
+            if tid.startswith("node_add_"):
+                worker_name = tid[len("node_add_"):]
+
+        worker_prof_uuid = journal_data.get("entities", {}).get("profile_uuid")
+        worker_node_uuid = journal_data.get("entities", {}).get("node_uuid")
+        worker_inbound_uuids = journal_data.get("entities", {}).get("inbound_uuids", [])
+
+        # 1. Delete worker hosts matching <PROTO>@<worker-name>
+        try:
+            hosts_res = client.request("GET", "/api/hosts")
+            hosts_list = _extract_list(hosts_res, "hosts")
+            for h in hosts_list:
+                remark = h.get("remark", "")
+                if worker_name and remark.endswith(f"@{worker_name}"):
+                    client.delete_host(h.get("uuid"))
+        except Exception as e:
+            print(f"Rollback note (worker hosts): {e}", file=sys.stderr)
+
+        # If worker profile is known, get inbounds if not stored
+        if not worker_inbound_uuids:
+            try:
+                profs_res = client.request("GET", "/api/config-profiles")
+                profs_list = _extract_list(profs_res, "configProfiles")
+                for p in profs_list:
+                    if p.get("name") == f"GoWave Worker {worker_name} Profile":
+                        worker_prof_uuid = p.get("uuid")
+                        break
+                if worker_prof_uuid:
+                    inb_res = client.request("GET", f"/api/config-profiles/{worker_prof_uuid}/inbounds")
+                    inb_data = inb_res.get("response", inb_res) if isinstance(inb_res, dict) else inb_res
+                    worker_inbounds = inb_data.get("inbounds", []) if isinstance(inb_data, dict) else inb_data
+                    worker_inbound_uuids = [inb.get("uuid") if isinstance(inb, dict) else inb for inb in worker_inbounds]
+            except Exception as e:
+                print(f"Rollback note (worker inbounds): {e}", file=sys.stderr)
+
+        # 2. Unbind worker inbounds from internal squad
+        squad_uuid = state_data.get("squadUuid")
+        try:
+            squads_res = client.request("GET", "/api/internal-squads")
+            squads_list = _extract_list(squads_res, "internalSquads")
+            for s in squads_list:
+                if (squad_uuid and s.get("uuid") == squad_uuid) or s.get("name") == "Default MVP Squad":
+                    cur_inbounds = [inb.get("uuid") if isinstance(inb, dict) else inb for inb in s.get("inbounds", [])]
+                    updated_inbounds = [ib for ib in cur_inbounds if ib not in worker_inbound_uuids]
+                    if len(updated_inbounds) != len(cur_inbounds):
+                        client.request("PATCH", f"/api/internal-squads/{s.get('uuid')}", {
+                            "name": s.get("name"),
+                            "inbounds": updated_inbounds
+                        })
+                    break
+        except Exception as e:
+            print(f"Rollback note (unbind squad): {e}", file=sys.stderr)
+
+        # 3. Delete worker node
+        if not worker_node_uuid and worker_name:
+            try:
+                nodes_res = client.request("GET", "/api/nodes")
+                nodes_list = _extract_list(nodes_res, "nodes")
+                for n in nodes_list:
+                    if n.get("name") == worker_name:
+                        worker_node_uuid = n.get("uuid")
+                        break
+            except Exception as e:
+                print(f"Rollback note (find worker node): {e}", file=sys.stderr)
+
+        if worker_node_uuid:
+            client.delete_node(worker_node_uuid)
+
+        # 4. Delete worker profile
+        if worker_prof_uuid:
+            client.delete_config_profile(worker_prof_uuid)
+
+        # Update state.json: remove worker from nodes array if present
+        if state_data and "nodes" in state_data:
+            orig_len = len(state_data["nodes"])
+            state_data["nodes"] = [n for n in state_data["nodes"] if n.get("name") != worker_name]
+            if len(state_data["nodes"]) != orig_len:
+                atomic_write_state(state_data, str(state_file))
+
+        # 6. Update journal to NODE_ADD_ROLLED_BACK
+        journal_data["state"] = "NODE_ADD_ROLLED_BACK"
+        journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        write_journal_atomically(str(journal_file), journal_data)
+        return True
+
+    return True
 
 
 def save_credentials(username, password, panel_url, token=None, creds_path="/root/gowave-credentials.txt"):

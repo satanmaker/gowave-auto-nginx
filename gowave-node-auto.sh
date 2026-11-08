@@ -116,7 +116,14 @@ configure_firewall() {
 
 unpack_cover_reality() {
     mkdir -p /var/www/gowave-auto-nginx/cover-reality
-    echo "$COVER_REALITY_B64" | base64 -d | tar -xzf - -C /var/www/gowave-auto-nginx/cover-reality
+    local actual_sha
+    actual_sha=$(echo -n "$COVER_REALITY_B64" | base64 -d | sha256sum | awk '{print $1}')
+    if [ "$actual_sha" != "$COVER_REALITY_SHA256" ]; then
+        echo "Error: Cover reality archive SHA-256 verification failed!" >&2
+        echo "Expected: $COVER_REALITY_SHA256, got: $actual_sha" >&2
+        exit 1
+    fi
+    echo -n "$COVER_REALITY_B64" | base64 -d | tar -xzf - -C /var/www/gowave-auto-nginx/cover-reality
     chmod -R 0755 /var/www/gowave-auto-nginx/cover-reality
 }
 

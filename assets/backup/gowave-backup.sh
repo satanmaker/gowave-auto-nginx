@@ -227,6 +227,10 @@ create_panel_backup() {
     if [[ -f "$gowave_dir/gowave.db" ]]; then
         echo "Staging SQLite Online Backup for $gowave_dir/gowave.db..."
         python3 -c "
+import sys
+for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 from modules.recovery import sqlite_online_backup
 sqlite_online_backup('$gowave_dir/gowave.db', '$tmp_staging/files/opt/gowave/gowave.db')
 "
