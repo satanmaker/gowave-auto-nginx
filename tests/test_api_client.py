@@ -114,10 +114,17 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
     def do_PATCH(self):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+        if self.path.startswith("/api/hosts/") or self.path.startswith("/api/internal-squads/"):
+            self.send_json(405, {"error": "Method Not Allowed"})
+            return
         if self.path == "/api/internal-squads":
             s_uuid = body.get("uuid")
             if s_uuid and s_uuid in self.squads:
                 self.squads[s_uuid].update(body)
+        elif self.path == "/api/hosts":
+            h_uuid = body.get("uuid")
+            if h_uuid and h_uuid in self.hosts:
+                self.hosts[h_uuid].update(body)
         elif self.path.startswith("/api/nodes/"):
             n_uuid = self.path.split("/")[-1]
             if n_uuid in self.nodes:
@@ -261,6 +268,23 @@ class TestAPIClient(unittest.TestCase):
         # 8. Issue API Token
         token_info = self.client.issue_api_token()
         self.assertEqual(token_info["token"], "gowave-scoped-api-token-xyz")
+
+    def test_provision_hosts_idempotent_patch(self):
+        """Re-provisioning existing hosts must execute PATCH /api/hosts with uuid in body without 405 error."""
+        self.client.login("admin", "admin-pass-12345")
+        x25519 = self.client.generate_x25519()
+        raw_cfg = self.client.compile_config_profile("patch-test-node", "cdn.example.com", x25519["privateKey"])
+        prof_info = self.client.provision_config_profile("GoWave MVP Unified Profile - patch-test", raw_cfg)
+        prof_uuid = prof_info["profile_uuid"]
+        inbounds = prof_info["inbounds"]
+
+        # Initial creation (POST /api/hosts)
+        hosts1 = self.client.provision_hosts(prof_uuid, inbounds, "node-patch-test", "squad-patch-test", "vpn.example.com", "cdn.example.com", "patch-test-node")
+        self.assertEqual(len(hosts1), 4)
+
+        # Re-provisioning with same remark (triggers PATCH /api/hosts with uuid in body)
+        hosts2 = self.client.provision_hosts(prof_uuid, inbounds, "node-patch-test", "squad-patch-test", "vpn.example.com", "cdn.example.com", "patch-test-node")
+        self.assertEqual(hosts1, hosts2)
 
     def test_panel_discovers_master_and_worker_nodes(self):
         """Test that Panel registers and discovers both master node and worker node via GET /api/nodes."""

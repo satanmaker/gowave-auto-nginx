@@ -406,7 +406,8 @@ class GoWaveClient:
 
             if remark in existing_by_remark:
                 host_uuid = existing_by_remark[remark]
-                self.request("PATCH", f"/api/hosts/{host_uuid}", payload)
+                payload["uuid"] = host_uuid
+                self.request("PATCH", "/api/hosts", payload)
             else:
                 res = self.request("POST", "/api/hosts", payload)
                 data = res.get("response", res)
