@@ -13,6 +13,7 @@
 - [ ] 1.2 Forward `GOWAVE_ACME_SERVER` in `gowave-auto.sh node add`: pass `GOWAVE_ACME_SERVER="${GOWAVE_ACME_SERVER:-}"` when invoking `gowave-node-auto.sh remote_payload`
 - [ ] 1.3 Add `GOWAVE_ACME_SERVER` env var support to `gowave-node-auto.sh`: serialize variable over SSH stdin in `remote_payload()`, and append `--server "$GOWAVE_ACME_SERVER"` to Worker `certbot certonly` calls; validate lineage directory and preserve the NGINX certificate path contract; verify with `bash -n` and `shellcheck --severity=error`
 - [ ] 1.4 Verify ACME staging delta backward-compat: when `GOWAVE_ACME_SERVER` is unset, certbot behavior is identical to current; confirm by grepping generated certbot commands in test output or unit test for the env var branch
+- [ ] 1.5 Add a pre-install ACME lineage guard: inspect `/etc/letsencrypt/renewal/*.conf` and certificate issuer/chain for every requested domain; if the existing lineage belongs to a different ACME directory, fail before changing NGINX or replacing certificates unless an explicit isolated lineage migration is implemented and all NGINX consumers are updated atomically; test staging→production and production→staging rejection
 
 ---
 
