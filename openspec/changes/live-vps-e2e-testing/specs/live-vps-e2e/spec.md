@@ -510,13 +510,6 @@ Teardown is reported separately from test outcome; overall `PASS` requires the s
   JSON with `schema_version: 1`, `status: "RESTORED"`, and matching `snapshot_id` plus `restored: true`
   for both hosts. Hook execution is bounded by `RESTORE_TIMEOUT`.
 
-#### Scenario: Snapshot restore hook configuration is incomplete
-
-- **GIVEN** `TEST_TEARDOWN_POLICY=RESTORE_SNAPSHOT` and one or more required snapshot IDs, hook path or SHA256
-  values are missing or invalid
-- **WHEN** configuration preflight validates the teardown policy
-- **THEN** preflight fails before any remote modification and reports the missing or invalid input
-
 #### Scenario: Snapshot restore hook success requires baseline verification
 
 - **GIVEN** the restore hook returns valid `RESTORED` JSON with matching IDs and both VPS are reachable again
