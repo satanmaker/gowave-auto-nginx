@@ -21,6 +21,12 @@ staging and production reuse.
 - **WHEN** `gowave-auto.sh install` provisions the Panel and REALITY certificates
 - **THEN** every Certbot issuance call uses the staging directory; the resulting certificate chain is staging-issued; no production ACME endpoint is contacted
 
+#### Scenario: Master installer TLS probe uses scoped staging trust
+
+- **GIVEN** the Master receives a staging-issued Panel certificate and the runner has built the D9 mode-specific CA bundle
+- **WHEN** `gowave-auto.sh install` invokes `verify_public_tls_sni`
+- **THEN** the runner supplies the bundle through `GOWAVE_TLS_CA_FILE`, the probe uses `-CAfile` with hostname and chain verification, and the staging certificate passes without installing Staging roots into system trust; an untrusted test certificate still fails. The same optional override applies to `domain-change`; with no override, legacy `-CApath` behavior is unchanged.
+
 #### Scenario: Staging parameter propagated to Worker
 
 - **GIVEN** the Master installation uses the staging directory
