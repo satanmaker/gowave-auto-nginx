@@ -473,13 +473,10 @@ ingress evidence; syntax-only checks do not count as traffic verification.
 
 ### Requirement: Negative Scenario and Fault Injection Tests
 
-The runner SHALL execute 15 negative scenarios (NEG-01 through NEG-15) and verify each expected outcome.
-NEG-01 through NEG-04 are preflight contract tests against isolated local fixtures (temporary known_hosts and
-configuration files plus mocked SSH/DNS responses); they MUST NOT modify public DNS, the operator's real
-known_hosts, or a live VPS firewall. NEG-05 uses an isolated Certbot failure fixture/failpoint or a separately
-isolated staging test domain with guaranteed cleanup. NEG-06 through NEG-15 may use the confirmed disposable
-VPS only; every fault MUST have a cleanup path and a post-case baseline check. If a case cannot restore the
-preconditions required by the next case, it is `INCOMPLETE` and dependent cases do not proceed.
+The runner SHALL execute fifteen negative scenarios (NEG-01 through NEG-15) and verify each designated failure
+boundary. Preflight tests NEG-01..NEG-04 SHALL use isolated local fixtures without mutating live host state,
+NEG-05 SHALL use an isolated Certbot failpoint or staging domain, and live VPS tests NEG-06..NEG-15 SHALL
+execute guaranteed cleanup and post-case baseline verification.
 
 #### Scenario: Matrix of fifteen fault scenarios verified (NEG-01..NEG-15)
 
