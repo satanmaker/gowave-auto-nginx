@@ -38,9 +38,9 @@ subscription delivery, and actual Data Plane tunnel traffic — on disposable re
 - `live-vps-e2e`: Live VPS E2E Test Runner — validates the complete GoWave Auto NGINX infrastructure lifecycle
   on real disposable servers: preflight safety, All-in-One Master installation, Distributed Worker deployment,
   public mTLS control plane, Panel API cluster structure, subscription delivery policy, UFW firewall isolation,
-  NGINX SNI routing and REALITY decoy, and Data Plane traffic through eight or ten logical VPN endpoints (four core
-  protocols on each VPS by default, plus optional VLESS XTLS Vision when both Vision domains are configured), each
-  exercised by both real Xray and Mihomo client processes with Firefox client fingerprint (sixteen to twenty runtime cases).
+  NGINX SNI routing and REALITY decoy, and Data Plane traffic through eight logical VPN endpoints by default (four core
+  protocols on each VPS), or ten when both Vision domains are configured; each endpoint is exercised by both real
+  Xray and Mihomo client processes with Firefox client fingerprint (sixteen or twenty runtime cases).
 
 ### Modified Capabilities
 

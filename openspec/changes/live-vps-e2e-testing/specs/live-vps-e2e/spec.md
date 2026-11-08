@@ -5,7 +5,8 @@
 Defines the observable behavior contract for the Live VPS E2E Test Runner — an automated acceptance tool that
 validates the complete GoWave Auto NGINX distributed infrastructure lifecycle on real disposable servers over the
 public internet, from bare OS through deployment, mTLS control plane, subscription delivery, and Data Plane VPN
-traffic through all eight protocol endpoints.
+traffic through eight logical endpoints by default (four core protocols on each VPS), or ten when the paired
+Master/Worker Vision domains are enabled.
 
 ---
 
@@ -70,6 +71,30 @@ command.
 
 ---
 
+### Requirement: Target Address, Domain, and SSH Identity Safety
+
+The runner SHALL target two distinct public VPS IPv4 addresses and SHALL reject duplicate mandatory Panel/REALITY FQDNs; when Vision is enabled, all six configured FQDNs SHALL be pairwise unique. E2E v1 SHALL connect to both VPS as `root`, because the current installer/orchestrator scripts do not provide a supported non-root `sudo` execution path. These checks SHALL complete before remote locks or any remote modification.
+
+#### Scenario: Master and Worker target addresses must differ
+
+- **GIVEN** `MASTER_IP` and `WORKER_IP` contain the same IPv4 address
+- **WHEN** configuration preflight validates target identity
+- **THEN** preflight fails before SSH mutation or lock acquisition; the runner does not treat two ports on one public address as two independently verified VPS instances
+
+#### Scenario: Mandatory domains are pairwise unique
+
+- **GIVEN** the four mandatory Master/Worker Panel and REALITY domains are configured
+- **WHEN** configuration preflight validates the FQDNs
+- **THEN** all four names are distinct; duplicates fail preflight before SSH
+
+#### Scenario: Non-root SSH account is rejected in v1
+
+- **GIVEN** either `MASTER_SSH_USER` or `WORKER_SSH_USER` is not `root`
+- **WHEN** configuration or read-only SSH preflight validates execution identity
+- **THEN** preflight fails before remote lock acquisition or any mutation; no implicit `sudo` fallback is attempted
+
+---
+
 ### Requirement: Optional Vision Domain Pair and Activation
 
 The runner SHALL accept Vision domains only as a pair of distinct FQDNs. When enabled, it SHALL provision
@@ -94,16 +119,22 @@ remains unchanged.
 - **GIVEN** both Vision domains are configured and valid DNS records resolve to their respective VPS addresses
 - **WHEN** Master and Worker installation and Panel provisioning complete
 - **THEN** each VPS has a valid certificate for its Vision domain, each node has five inbounds, the Panel has
-  five matching hosts per node with correct node/inbound associations, and NGINX routes Vision SNI to 8444
-  with the non-VLESS HTTP fallback on 9444
+  five matching hosts per node with correct node/inbound associations, and NGINX routes Vision SNI to 8444; Xray's `xver: 1` non-VLESS HTTP fallback reaches a loopback-only cleartext HTTP vhost on `127.0.0.1:9444` that accepts PROXY protocol and serves decoy content, not Panel/API content
 
 #### Scenario: Vision certificate failure aborts the relevant host installation
 
 - **GIVEN** Vision is enabled but issuance, ACME-lineage validation, certificate hostname validation, or
   certificate/key verification fails on Master or Worker
 - **WHEN** that host's installation stage executes
-- **THEN** the stage fails and rolls back; no profile, host, or NGINX route may be left advertising an
-  unusable Vision endpoint
+- **THEN** the stage fails and rolls back; no profile, host, certificate lineage created by the failed transaction, bootstrap name, stream-map entry,
+  9444 fallback vhost, or deploy-hook side effect may be left advertising or serving an unusable Vision endpoint;
+  pre-existing certificate lineages and unrelated resources MUST NOT be deleted by rollback
+
+#### Scenario: Incomplete Vision compensation is reported, not hidden
+
+- **GIVEN** Worker remote rollback or Panel API rollback fails after a Vision provisioning failure
+- **WHEN** the orchestrator performs compensation
+- **THEN** it checks both rollback results, returns nonzero, retains the recovery journal and records rollback/run status as incomplete; it MUST NOT suppress the remote rollback error or report cleanup PASS
 
 #### Scenario: Vision disabled preserves the four-inbound topology
 
@@ -627,8 +658,9 @@ Teardown is reported separately from test outcome; overall `PASS` requires the s
 
 - **GIVEN** `TEST_TEARDOWN_POLICY=PRESERVE`
 - **WHEN** the test run completes with any test outcome
-- **THEN** diagnostics are collected, the actual test outcome is retained, teardown is recorded separately as
-  `PASS`, and neither VPS is modified or destroyed
+- **THEN** diagnostics are collected, the actual test outcome is retained, and teardown is recorded separately as
+  `PASS`; `PRESERVE` itself does not uninstall, restore, reimage, or destroy either VPS, so all mutations made by
+  the test run remain in place and the next run requires operator re-image or verified snapshot restoration
 
 #### Scenario: Snapshot restore hook configuration and protocol are validated
 
@@ -690,6 +722,12 @@ The runner SHALL persist an atomic mode-`0600` `run-state.json` under `artifacts
 containing non-secret execution metadata, phase statuses, and timestamps. Partial modes following `preflight`
 SHALL require `--run-id` and a matching state record. The runner SHALL never overwrite existing run directories
 or persist credentials, tokens, or secret keys.
+
+#### Scenario: Run ID cannot escape the artifact root
+
+- **GIVEN** an operator supplies a `--run-id` containing `..`, a path separator, NUL, or a symlinked path component
+- **WHEN** the CLI validates the run ID and constructs its artifact directory
+- **THEN** the CLI rejects it before creating files or contacting either VPS; accepted IDs match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` and resolve strictly below `artifacts/live-vps/`
 
 #### Scenario: Partial mode cannot resume a different run or repeat completed installation
 
