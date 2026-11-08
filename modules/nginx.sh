@@ -18,8 +18,10 @@ ensure_nginx_stream_block() {
     fi
 
     # Remove default site if present to avoid port 80 default_server conflicts
-    if [[ -e /etc/nginx/sites-enabled/default ]]; then
-        rm -f /etc/nginx/sites-enabled/default
+    if [[ "$(id -u)" -eq 0 ]] || [[ -w "/etc/nginx/sites-enabled" ]]; then
+        if [[ -e /etc/nginx/sites-enabled/default ]]; then
+            rm -f /etc/nginx/sites-enabled/default
+        fi
     fi
 
     if [[ "$(id -u)" -eq 0 ]] || [[ -w "/etc/nginx" ]]; then
@@ -39,9 +41,11 @@ EOF
     fi
 
     # Ensure libnginx-mod-stream is loaded if dynamic modules are used
-    if [[ -d /etc/nginx/modules-enabled ]] && [[ ! -f /etc/nginx/modules-enabled/50-mod-stream.conf ]]; then
-        if [[ -f /usr/lib/nginx/modules/ngx_stream_module.so ]]; then
-            echo "load_module modules/ngx_stream_module.so;" > /etc/nginx/modules-enabled/50-mod-stream.conf
+    if [[ "$(id -u)" -eq 0 ]] || [[ -w "/etc/nginx/modules-enabled" ]]; then
+        if [[ -d /etc/nginx/modules-enabled ]] && [[ ! -f /etc/nginx/modules-enabled/50-mod-stream.conf ]]; then
+            if [[ -f /usr/lib/nginx/modules/ngx_stream_module.so ]]; then
+                echo "load_module modules/ngx_stream_module.so;" > /etc/nginx/modules-enabled/50-mod-stream.conf
+            fi
         fi
     fi
 }
