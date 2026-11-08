@@ -121,7 +121,9 @@ sequenceDiagram
 | **80** | TCP (HTTP) | Public (`0.0.0.0/0`, conditional `[::]` if IPv6 enabled) | NGINX HTTP | In: None / Out: None | ACME HTTP-01 challenge (`/var/www/gowave-acme`) & 301 redirect to HTTPS |
 | **7443** | TCP (TLS + HTTP/1.1, H2) | Loopback (`127.0.0.1`) | NGINX HTTPS | In: **PROXY v1** / Out: None | Terminates Let's Encrypt TLS for `panel_domain`; proxies web UI and inbounds |
 | **8443** | TCP (REALITY / TLS RAW) | Loopback (`127.0.0.1`) | Xray REALITY Inbound | In: **PROXY v1** / Out: **PROXY v1** (on fallback) | Terminated by Xray REALITY; valid clients tunnel VPN; scanners fallback to 9443 |
+| **8444** | TCP (TLS / XTLS-Vision) | Loopback (`127.0.0.1`) | Xray Vision Inbound (Optional) | In: **PROXY v1** / Out: None | Optional VLESS+XTLS Vision inbound (when 3rd domain configured); fallback to 9444 |
 | **9443** | TCP (TLS 1.3 + HTTP/2, HTTP/1.1) | Loopback (`127.0.0.1`) | NGINX Decoy Vhost | In: **PROXY v1** / Out: None | Terminates TLS 1.3/H2 for `reality_domain`; serves static camouflage website (`cover-reality`) |
+| **9444** | TCP (Cleartext HTTP) | Loopback (`127.0.0.1`) | NGINX Vision Decoy Vhost (Optional) | In: **PROXY v1** / Out: None | Fallback vhost for non-VLESS HTTP probes on Vision domain; serves decoy website |
 | **3000** | TCP (Cleartext HTTP) | Loopback (`127.0.0.1`) | GoWave Panel Backend | In: None / Out: None | Panel REST API and static frontend assets (`APP_PORT=3000`) |
 | **3001** | TCP (Cleartext HTTP) | Loopback (`127.0.0.1`) | GoWave Panel Metrics | In: None / Out: None | Prometheus metrics endpoint (optional, loopback only) |
 | **3002** | TCP (mTLS 1.3) | Wildcard (`:3002`) isolated via UFW (fail-closed) | GoWave Node (Local / Worker) | In: None / Out: None | Node control plane (`NODE_PORT=3002` recommended for both Local and Worker); UFW whitelists Panel IP / loopback; verified fail-closed |
@@ -131,7 +133,7 @@ sequenceDiagram
 
 #### Preflight Port & NGINX Configuration Conflict Inspection
 To guarantee collision-free deployment:
-1. **Socket Inspection**: The preflight module verifies active TCP listeners on ports 80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, and 10003 via `ss -Hltnp "sport = :<port>"`. If occupied by non-project processes, installation halts with conflicting process name and PID before mutating any system state.
+1. **Socket Inspection**: The preflight module verifies active TCP listeners on ports 80, 443, 3000, 3001, 3002, 7443, 8443, 8444, 9443, 9444, 10001, 10002, and 10003 via `ss -Hltnp "sport = :<port>"`. If occupied by non-project processes, installation halts with conflicting process name and PID before mutating any system state.
 2. **NGINX Configuration Inspection**: Port 443 is exclusively dedicated to the top-level NGINX `stream` block. The preflight module scans `/etc/nginx/` (excluding project-managed files) for conflicting `listen ... 443` directives:
    ```bash
    grep -rqsE --exclude="gowave-*.conf" --exclude="gowave-stream.conf" '^[[:space:]]*listen[[:space:]]+([^;]*:)?443[^0-9]' /etc/nginx/
@@ -197,7 +199,14 @@ The system provides verified templates and testing for exactly 4 native protocol
    - Inbound at `127.0.0.1:10003` does NOT accept PROXY protocol (`acceptProxyProtocol` MUST be omitted or `false`).
    - Location `/trojan-grpc` passes HTTP/2 frames via `grpc_pass grpc://127.0.0.1:10003;` with `grpc_read_timeout 1h; grpc_send_timeout 1h; client_body_timeout 1h;`.
    - Canonical Xray template: `assets/xray/trojan-grpc.json`.
-5. **Panel API, Subscriptions & Web UI Reverse Proxying (Port 7443)**:
+5. **Optional VLESS + XTLS Vision**:
+   - `protocol: "vless"`, `security: "tls"`, `flow: "xtls-rprx-vision"`.
+   - Enabled only when the operator provides a dedicated 3rd domain/subdomain (`vision_domain`).
+   - Incoming on port 443 Stream (`vision_domain`) -> NGINX Stream routes to `127.0.0.1:8444` with PROXY protocol v1.
+   - Inbound at `127.0.0.1:8444` accepts PROXY protocol (`acceptProxyProtocol: true`), terminates Let's Encrypt TLS for `vision_domain`, and routes unauthenticated non-VLESS HTTP fallback probes to `127.0.0.1:9444`.
+   - NGINX on `127.0.0.1:9444` serves the static decoy website (`cover-reality`).
+   - Canonical Xray template: `assets/xray/vless-vision.json`.
+6. **Panel API, Subscriptions & Web UI Reverse Proxying (Port 7443)**:
    - For all non-transport HTTP traffic destined to `panel_domain`, NGINX on 7443 terminates TLS and proxies to GoWave's internal loopback listener at `127.0.0.1:3000`:
      ```nginx
      # Subscriptions caching disabled, headers preserved, User-Agent preserved
@@ -246,9 +255,10 @@ To prevent conflation between camouflage sites, management panels, and public VP
    # listen [::]:443 so_keepalive=on;
    ```
    - Matches `reality_camouflage_sni` -> forwards via PROXY v1 to Xray REALITY inbound (`127.0.0.1:8443`).
+   - Matches `vision_domain` (if configured) -> forwards via PROXY v1 to Xray Vision inbound (`127.0.0.1:8444`).
    - Matches `panel_domain` (or `worker_domain`) -> forwards via PROXY v1 to NGINX HTTPS listener (`127.0.0.1:7443`).
    - Missing SNI or unrecognized scanner probe -> forwards to `127.0.0.1:8443`, triggering REALITY fallback.
-   - Loopback listeners (7443, 8443, 9443, 10001-10003) bind strictly to `127.0.0.1`, avoiding wildcard socket collisions and IPv6 socket failures.
+   - Loopback listeners (7443, 8443, 8444, 9443, 9444, 10001-10003) bind strictly to `127.0.0.1`, avoiding wildcard socket collisions and IPv6 socket failures.
 4. **Camouflage Architecture (Scope Constraint)**:
    - **Mode A: Owned Camouflage Domain with Local Decoy (Exclusive MVP Scope)**: Operator configures an owned secondary domain (`reality_domain`, e.g. `cdn.example.com`). Certbot issues an authentic Let's Encrypt certificate for it. NGINX on loopback port 9443 terminates TLS presenting this authentic certificate and serves `cover-reality`. Xray REALITY uses `serverNames: ["cdn.example.com"]` and `dest: "127.0.0.1:9443", xver: 1`. Active probes receive valid certificates matching the SNI.
    - **Mode B: Third-Party SNI Stealing (Deferred Post-MVP Non-Goal)**: Third-party SNI proxying (`dest: external:443`, `xver: 0`) requires dynamic upstream SNI matching, external network reachability without loopback proxy protocol, and external certificate dependency. To ensure deterministic local validation and eliminate external blocking risks, Mode B is formally deferred to post-MVP Non-Goals.
@@ -292,20 +302,22 @@ To resolve the classic chicken-and-egg bootstrap deadlock while guaranteeing per
    certbot renew --dry-run
    ```
 
-#### Direct VLESS + TLS + Vision Deferral
-Direct VLESS + TLS + Vision (without REALITY) requires Xray itself to terminate TLS, which requires Xray to directly read Let's Encrypt certificates. When Certbot renews the certificate, Xray must be reloaded/restarted across process boundaries. To keep the MVP reliable and avoid privilege boundary violations, direct VLESS + TLS + Vision is **deferred to post-MVP Non-Goals**.
+#### Optional Direct VLESS + TLS + Vision Architecture
+When an operator configures an optional 3rd domain (`vision_domain`), VLESS + XTLS Vision is provisioned on port 8444 with direct TLS termination in Xray:
+- **Certificates**: Let's Encrypt certificates for `vision_domain` are acquired during ACME bootstrap and read by Xray (`/etc/letsencrypt/live/<vision_domain>/fullchain.pem` and `privkey.pem`).
+- **Fallback**: Fallback for non-VLESS HTTP traffic on port 8444 is routed to loopback port 9444 (`gowave-vision-fallback`), where NGINX receives requests with PROXY protocol v1 and serves the decoy website (`cover-reality`).
 
-#### Strict PROXY Protocol Boundaries (443 -> 8443 -> 9443)
-- **Sender (NGINX Stream 443)**: NGINX Stream on port 443 sends PROXY protocol v1 (`proxy_protocol on;`) to `127.0.0.1:7443` and `127.0.0.1:8443`.
-- **Receiver (Xray 8443)**: Inbound at `127.0.0.1:8443` strictly specifies `"tcpSettings": {"acceptProxyProtocol": true}`. When NGINX prepends the PROXY v1 header, Xray consumes it, restores the genuine client IP, and passes it to REALITY handshakes and fallback destinations.
-- **Authoritative Fallback Sender (Xray -> NGINX 9443)**: `realitySettings.dest: "127.0.0.1:9443"` and `realitySettings.xver: 1` is the authoritative fallback mechanism for REALITY inbounds. This guarantees that Xray preserves and forwards the genuine client IP via PROXY protocol v1 to loopback port 9443 when unauthorized scanners probe port 8443.
-- **Receiver (NGINX Decoy 9443 & HTTPS 7443)**: Both loopback listeners configure `proxy_protocol` and restrict trust strictly to `127.0.0.1`:
+#### Strict PROXY Protocol Boundaries (443 -> 8443/8444 -> 9443/9444)
+- **Sender (NGINX Stream 443)**: NGINX Stream on port 443 sends PROXY protocol v1 (`proxy_protocol on;`) to `127.0.0.1:7443`, `127.0.0.1:8443`, and conditionally to `127.0.0.1:8444` (when optional Vision is enabled).
+- **Receiver (Xray 8443 & 8444)**: Inbounds at `127.0.0.1:8443` and `127.0.0.1:8444` strictly specify `"tcpSettings": {"acceptProxyProtocol": true}`. When NGINX prepends the PROXY v1 header, Xray consumes it, restores the genuine client IP, and passes it to REALITY/TLS handshakes and fallback destinations.
+- **Authoritative Fallback Sender (Xray -> NGINX 9443 & 9444)**: `realitySettings.dest: "127.0.0.1:9443"` with `xver: 1` (for REALITY) and `fallbacks` to `"127.0.0.1:9444"` with `xver: 1` (for Vision) guarantee that Xray preserves and forwards the genuine client IP via PROXY protocol v1 to loopback decoy ports when unauthorized scanners probe ports 8443 or 8444.
+- **Receiver (NGINX Decoy 9443/9444 & HTTPS 7443)**: All loopback listeners configure `proxy_protocol` and restrict trust strictly to `127.0.0.1`:
   ```nginx
   listen 127.0.0.1:9443 ssl proxy_protocol;
   set_real_ip_from 127.0.0.1;
   real_ip_header proxy_protocol;
   ```
-  This ensures real client IPs are preserved across the entire 443 -> 8443 -> 9443 chain, logged in access logs, rate-limited accurately, and made available to Fail2ban.
+  This ensures real client IPs are preserved across the entire 443 -> 8443/8444 -> 9443/9444 chain, logged in access logs, rate-limited accurately, and made available to Fail2ban.
 - Any external attempt to inject fake PROXY protocol headers from non-loopback addresses is discarded.
 
 #### Client IP Preservation for HTTP & WebSocket Transports (7443 -> 10001/10002)

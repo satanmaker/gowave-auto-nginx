@@ -24,6 +24,16 @@ The routing subsystem SHALL bind TCP port 443 exclusively via top-level NGINX St
 - **WHEN** NGINX Stream evaluates the preread SNI
 - **THEN** NGINX forwards the connection to `127.0.0.1:8443` where Xray handles it via REALITY fallback.
 
+#### Scenario: Route traffic for optional Vision domain
+- **GIVEN** an incoming TLS connection on public port 443 with SNI matching configured `vision_domain`
+- **WHEN** NGINX Stream evaluates the preread SNI
+- **THEN** NGINX forwards the stream with PROXY protocol v1 to Xray Vision inbound at `127.0.0.1:8444`.
+
+#### Scenario: Xray Vision loopback PROXY protocol and HTTP fallback
+- **GIVEN** NGINX Stream forwarding `vision_domain` traffic to `127.0.0.1:8444` with `proxy_protocol on;`
+- **WHEN** Xray receives unauthenticated non-VLESS HTTP requests on port 8444
+- **THEN** Xray consumes the PROXY protocol v1 header, terminates TLS, and forwards fallback requests to local NGINX Vision Decoy vhost at `127.0.0.1:9444`.
+
 #### Scenario: Worker edge NGINX Stream and HTTPS proxying
 - **GIVEN** an incoming connection to a remote Worker edge node on public port 443
 - **WHEN** NGINX Stream evaluates the preread SNI on the Worker node
@@ -90,12 +100,12 @@ The routing subsystem SHALL bind port 443 (Stream) and port 80 (HTTP) on IPv6 on
 - **THEN** listeners bind strictly to IPv4 (`listen 443;` and `listen 80;`), omitting `[::]` directives to prevent fatal `Address family not supported` socket errors.
 
 ### Requirement: 3-Stage Dual-Lineage Let's Encrypt TLS Bootstrap Sequence
-The installer SHALL resolve the initial TLS bootstrap deadlock using a 3-stage sequence: issue initial certificates for both PANEL_DOMAIN and REALITY_DOMAIN via temporary port 80 webroot vhost with webroot authenticator, deploy production Stream 443 and HTTPS 7443 configurations, verify automated renewal via dry-run, and maintain port 80 non-redirected ACME routes.
+The installer SHALL resolve the initial TLS bootstrap deadlock using a 3-stage sequence: issue initial certificates for PANEL_DOMAIN, REALITY_DOMAIN, and optional VISION_DOMAIN via temporary port 80 webroot vhost with webroot authenticator, deploy production Stream 443 and HTTPS 7443 configurations, verify automated renewal via dry-run, and maintain port 80 non-redirected ACME routes.
 
 #### Scenario: Bootstrap certificates on fresh host
 - **GIVEN** a clean host without pre-existing Let's Encrypt certificates
 - **WHEN** the installer initiates TLS provisioning
-- **THEN** it deploys temporary port 80 webroot vhost `/var/www/gowave-acme` (binding `[::]:80` conditionally only when host IPv6 is active), starts NGINX, issues certificates via `certbot certonly --webroot` for both `PANEL_DOMAIN` and `REALITY_DOMAIN`, deploys production Stream and HTTPS configurations referencing both certificates, verifies `certbot renew --dry-run` succeeds with NGINX online, and drops scanner traffic on unmanaged domains.
+- **THEN** it deploys temporary port 80 webroot vhost `/var/www/gowave-acme` (binding `[::]:80` conditionally only when host IPv6 is active), starts NGINX, issues certificates via `certbot certonly --webroot` for `PANEL_DOMAIN`, `REALITY_DOMAIN`, and optional `VISION_DOMAIN` (if configured), deploys production Stream and HTTPS configurations referencing the certificates, verifies `certbot renew --dry-run` succeeds with NGINX online, and drops scanner traffic on unmanaged domains.
 
 #### Scenario: Prohibition of self-signed fallback certificates and fail-fast validation
 - **GIVEN** an installer or domain-change process issuing certificates via Certbot ACME
