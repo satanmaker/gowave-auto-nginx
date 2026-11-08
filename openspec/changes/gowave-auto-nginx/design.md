@@ -83,7 +83,7 @@ In Topology B, the Central Server acts as the Control Plane, while one or more r
      - NGINX Stream on public port 443 (`ssl_preread on; proxy_protocol on;`) demultiplexing incoming connections: `worker_domain` SNI to local NGINX HTTPS listener (`127.0.0.1:7443`), camouflage SNI to local Xray REALITY inbound (`127.0.0.1:8443`), and unrecognized/scanner probes to 8443 (which fall back to local decoy vhost on 9443).
      - NGINX HTTPS listener on `127.0.0.1:7443` terminating Let's Encrypt TLS for `worker_domain`, with reverse proxy locations for XHTTP (`127.0.0.1:10001` with `proxy_buffering off;`), WebSocket upgrade (`127.0.0.1:10002`), and Trojan gRPC (`127.0.0.1:10003` via `grpc_pass`).
      - Certbot automated ACME HTTP-01 challenge on port 80 with deployment reload hook for NGINX.
-   - UFW firewall permits public ports 80 and 443, and strictly whitelists `PANEL_IP` for `NODE_PORT` (recommended default 3002, matching All-in-One to prevent host-level collisions) across both IPv4 and IPv6.
+   - UFW firewall permits public ports 80 and 443, and strictly whitelists `PANEL_IP` for `NODE_PORT` (recommended 3002 for All-in-One and default for distributed workers to prevent host-level collisions; 3000 supported only for isolated worker containers) across both IPv4 and IPv6.
    - Clients connect **directly to the Worker Server** on port 443 for all 4 MVP VPN transports. Client VPN data does NOT pass through the Central Panel.
 3. **Central Edge Proxying (Topology C) is Formally Rejected**:
    - Proxying all client VPN data through the central panel introduces a fatal latency bottleneck, doubles bandwidth costs, and creates a single point of failure.
@@ -94,7 +94,7 @@ sequenceDiagram
     actor Client as VPN Client
     participant Panel as GoWave Panel (Central Host)
     participant Worker as Worker Gateway (Remote VPS)
-    participant NodeDaemon as GoWave Node (:3000)
+    participant NodeDaemon as GoWave Node (:3002)
     participant WorkerXray as Worker Xray (:8443)
 
     Note over Panel,Worker: 1. Control Plane Orchestration
@@ -117,8 +117,8 @@ sequenceDiagram
 
 | Port | Protocol / Transport | Network Scope | Listener Process | PROXY Protocol In / Out | Purpose |
 |---|---|---|---|---|---|
-| **443** | TCP (TLS / Stream) | Public (`0.0.0.0/0`, `[::]`) | NGINX Stream | In: None / Out: **PROXY v1** | Public edge port; inspects SNI via `ssl_preread` |
-| **80** | TCP (HTTP) | Public (`0.0.0.0/0`, `[::]`) | NGINX HTTP | In: None / Out: None | ACME HTTP-01 challenge (`/var/www/gowave-acme`) & 301 redirect to HTTPS |
+| **443** | TCP (TLS / Stream) | Public (`0.0.0.0/0`, conditional `[::]` if IPv6 enabled) | NGINX Stream | In: None / Out: **PROXY v1** | Public edge port; inspects SNI via `ssl_preread` |
+| **80** | TCP (HTTP) | Public (`0.0.0.0/0`, conditional `[::]` if IPv6 enabled) | NGINX HTTP | In: None / Out: None | ACME HTTP-01 challenge (`/var/www/gowave-acme`) & 301 redirect to HTTPS |
 | **7443** | TCP (TLS + HTTP/1.1, H2) | Loopback (`127.0.0.1`) | NGINX HTTPS | In: **PROXY v1** / Out: None | Terminates Let's Encrypt TLS for `panel_domain`; proxies web UI and inbounds |
 | **8443** | TCP (REALITY / TLS RAW) | Loopback (`127.0.0.1`) | Xray REALITY Inbound | In: **PROXY v1** / Out: **PROXY v1** (on fallback) | Terminated by Xray REALITY; valid clients tunnel VPN; scanners fallback to 9443 |
 | **9443** | TCP (TLS 1.3 + HTTP/2, HTTP/1.1) | Loopback (`127.0.0.1`) | NGINX Decoy Vhost | In: **PROXY v1** / Out: None | Terminates TLS 1.3/H2 for `reality_domain`; serves static camouflage website (`cover-reality`) |
@@ -239,10 +239,16 @@ The system provides verified templates and testing for exactly 4 native protocol
 To prevent conflation between camouflage sites, management panels, and public VPN connection endpoints, exactly 5 distinct domain and SNI roles and a verified camouflage architecture are established:
 1. **Host Address (`address`)**: The public IPv4/IPv6 address or resolvable FQDN of the edge server (`vpn.example.com` or Worker IP). Clients send TCP SYN packets to this address on port 443.
 2. **REALITY Camouflage SNI (`reality_camouflage_sni` / `serverNames`)**: Domain configured in Xray `realitySettings.serverNames` and sent by the client in the TLS ClientHello SNI extension during REALITY handshakes.
-3. **NGINX `ssl_preread` SNI Router**: NGINX Stream on port 443 evaluates `$ssl_preread_server_name`:
+3. **NGINX `ssl_preread` SNI Router**: NGINX Stream on port 443 evaluates `$ssl_preread_server_name` using dynamic IPv6 environment detection:
+   ```nginx
+   listen 443 so_keepalive=on;
+   # Included ONLY when IPv6 is confirmed active ([ -f /proc/net/if_inet6 ]):
+   # listen [::]:443 so_keepalive=on;
+   ```
    - Matches `reality_camouflage_sni` -> forwards via PROXY v1 to Xray REALITY inbound (`127.0.0.1:8443`).
    - Matches `panel_domain` (or `worker_domain`) -> forwards via PROXY v1 to NGINX HTTPS listener (`127.0.0.1:7443`).
    - Missing SNI or unrecognized scanner probe -> forwards to `127.0.0.1:8443`, triggering REALITY fallback.
+   - Loopback listeners (7443, 8443, 9443, 10001-10003) bind strictly to `127.0.0.1`, avoiding wildcard socket collisions and IPv6 socket failures.
 4. **Camouflage Architecture (Scope Constraint)**:
    - **Mode A: Owned Camouflage Domain with Local Decoy (Exclusive MVP Scope)**: Operator configures an owned secondary domain (`reality_domain`, e.g. `cdn.example.com`). Certbot issues an authentic Let's Encrypt certificate for it. NGINX on loopback port 9443 terminates TLS presenting this authentic certificate and serves `cover-reality`. Xray REALITY uses `serverNames: ["cdn.example.com"]` and `dest: "127.0.0.1:9443", xver: 1`. Active probes receive valid certificates matching the SNI.
    - **Mode B: Third-Party SNI Stealing (Deferred Post-MVP Non-Goal)**: Third-party SNI proxying (`dest: external:443`, `xver: 0`) requires dynamic upstream SNI matching, external network reachability without loopback proxy protocol, and external certificate dependency. To ensure deterministic local validation and eliminate external blocking risks, Mode B is formally deferred to post-MVP Non-Goals.

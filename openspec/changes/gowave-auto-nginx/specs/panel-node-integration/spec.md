@@ -128,4 +128,4 @@ The verification harness SHALL provide an automated dual-container Podman testbe
 #### Scenario: Worker node firewall panel IP restriction and edge traffic routing in Podman testbed
 - **GIVEN** a running multi-node Podman testbed
 - **WHEN** client VPN connections are initiated to the worker container port 443
-- **THEN** client traffic is routed directly by the worker's NGINX Stream and Xray inbounds without passing through the panel container, while the worker's UFW denies external access to `NODE_PORT=3000` from IPs other than the panel.
+- **THEN** client traffic is routed directly by the worker's NGINX Stream and Xray inbounds without passing through the panel container, while the worker's UFW denies external access to `NODE_PORT=3002` from IPs other than the panel.

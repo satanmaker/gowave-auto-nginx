@@ -125,7 +125,7 @@ In addition to All-in-One single-container tests, the testbed executes an automa
 | Node Role | Target Container Image | Assigned IP / Port | Verified Services & Components | Verification Scope in Testbed |
 |---|---|---|---|---|
 | **Control Plane (Panel)** | `docker.io/library/ubuntu:24.04` (or Debian 12) | `10.89.0.10` / `:3000`, `:7443` | GoWave Panel, SQLite, NGINX reverse proxy, Certbot | REST API onboarding, mTLS CA issuance, Worker node registration (`POST /api/nodes`), user sync |
-| **Worker Node (Edge)** | `docker.io/library/debian:12` (or Ubuntu 24.04) | `10.89.0.20` / `:3000` (mTLS), `:443`, `:8443` | `gowave-node`, Xray core, NGINX Stream, UFW | SSH stdin deployment via `gowave-node-auto.sh`, UFW whitelist (`10.89.0.10` only), mTLS 1.3 handshake (`rw-v1`), direct client VPN data plane |
-| **Untrusted Client Peer** | `docker.io/library/debian:12` | `10.89.0.30` | Client utilities, curl, nmap/nc | Verifies firewall drops connections to `10.89.0.20:3000` from unauthorized IPs outside allowlist |
+| **Worker Node (Edge)** | `docker.io/library/debian:12` (or Ubuntu 24.04) | `10.89.0.20` / `:3002` (mTLS), `:443`, `:8443` | `gowave-node`, Xray core, NGINX Stream, UFW | SSH stdin deployment via `gowave-node-auto.sh`, UFW whitelist (`10.89.0.10` only), mTLS 1.3 handshake (`rw-v1`), direct client VPN data plane |
+| **Untrusted Client Peer** | `docker.io/library/debian:12` | `10.89.0.30` | Client utilities, curl, nmap/nc | Verifies firewall drops connections to `10.89.0.20:3002` from unauthorized IPs outside allowlist |
 
 

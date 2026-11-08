@@ -317,7 +317,7 @@ gowave-auto.sh node add <node-name> <node-ip> <worker-domain> <reality-domain> [
      {
        "name": "<node-name>",
        "address": "<node-ip>",
-       "port": 3000,
+       "port": 3002,
        "configProfile": {
          "activeConfigProfileUuid": "<worker-profile-uuid>",
          "activeInbounds": [
