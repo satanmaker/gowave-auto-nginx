@@ -62,7 +62,7 @@ staging and production reuse.
 
 - **GIVEN** a requested-domain certificate lineage existed before installation and is valid for the selected ACME directory
 - **WHEN** a later Master or Worker provisioning step fails and compensation runs
-- **THEN** rollback MUST NOT delete the pre-existing lineage; if Certbot changed its certificate, private key, or renewal configuration, the exact pre-install files are restored from a securely permissioned transaction snapshot. Only lineages proven to have been created by the failed transaction may be deleted. If safe restoration cannot be guaranteed, the install MUST fail before issuance or report cleanup incomplete rather than claim rollback success.
+- **THEN** rollback MUST NOT delete the pre-existing lineage; if Certbot changed it, restore and verify its certificate, private key, renewal configuration, live symlink targets, ownership and modes from the same-host snapshot under `/var/lib/gowave-auto-nginx/recovery/<transaction-id>/acme/<domain>/` (root-owned `0700` directories, root-owned `0600` private-key files). Snapshots MUST NOT be copied to runner/CI artifacts or logs. Only lineages proven to have been absent before the failed transaction may be deleted. Remove snapshots only after verified commit/rollback; retain them and report incomplete recovery if restoration fails. If safe restoration cannot be guaranteed, the install MUST fail before issuance or report cleanup incomplete rather than claim rollback success.
 
 #### Scenario: ACME directory changes between staging and production
 

@@ -490,6 +490,29 @@ fail-closed activation make the sixteen-versus-twenty test matrix deterministic.
 
 ---
 
+### D15: ACME Lineage Snapshot Ownership and Recovery
+
+**Chosen:** Before any Certbot command may reuse, renew, replace, or delete a requested-domain lineage, the
+installer records whether that lineage existed before the transaction. For an existing lineage, it snapshots
+the complete recoverable state on the same VPS under
+`/var/lib/gowave-auto-nginx/recovery/<transaction-id>/acme/<domain>/`: the renewal configuration, live symlink
+targets, archive certificate and private-key bytes, ownership, and file modes. Snapshot directories MUST be
+owned by root with mode `0700`; regular snapshot files containing private keys MUST be root-owned mode `0600`.
+The snapshot MUST NOT be copied to the Control Machine, runner artifacts, CI artifacts, logs, or reports.
+
+On successful installation, the snapshot is removed only after the transaction is committed and all certificate
+consumers, renewal configuration, and NGINX health checks have passed. On failure, rollback restores the complete
+pre-transaction state and verifies the restored bytes, symlink targets, ownership, and modes; only lineages
+recorded as absent before the transaction may be removed as transaction-created. If restoration cannot be
+verified, the snapshot is retained for operator recovery and the transaction/teardown is reported incomplete.
+The same ownership and recovery protocol applies to Master and Worker and to Panel, REALITY, and optional Vision
+domains.
+
+**Rationale:** Certbot can reuse an existing same-directory lineage, and a later failure must not cause broad
+rollback code to delete a certificate and private key that pre-dated the current deployment transaction.
+
+---
+
 ## Runner Module Structure
 
 ```
