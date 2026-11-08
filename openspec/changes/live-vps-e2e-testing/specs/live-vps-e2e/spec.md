@@ -303,13 +303,15 @@ The runner SHALL verify isolation of TCP/3002 on Master and Worker. A timeout al
 
 - **GIVEN** Master Node is listening on loopback port 3002 and external isolation is configured
 - **WHEN** the runner probes loopback from Master and the public endpoint from Control Machine
-- **THEN** loopback succeeds and the external probe is blocked with the same positive-control and firewall-evidence requirements
+- **THEN** loopback succeeds; the external probe is blocked; and the DROP rule/counter or packet trace is
+  collected on Master itself. Worker-side evidence MUST NOT be used to prove Master firewall behavior.
 
 #### Scenario: IPv6 firewall isolation checked when enabled
 
 - **GIVEN** `ENABLE_IPV6=true` and valid AAAA routing are configured
 - **WHEN** runner repeats the positive and negative probes over IPv6
-- **THEN** the observed IPv6 source address matches the allowlist, the allowed Master probe succeeds, and the Control Machine probe is blocked with Worker-side evidence
+- **THEN** the observed IPv6 source address matches the allowlist and the allowed Master probe succeeds;
+  the Control Machine probe is blocked with DROP evidence collected on the VPS being tested (Master or Worker).
 
 ### Requirement: NGINX SNI Routing and REALITY Decoy Verification
 
@@ -463,10 +465,9 @@ VPS.
 
 ### Requirement: Teardown Policy Enforcement
 
-The runner SHALL support three teardown policies: Preserve (`TEST_KEEP_VPS_ON_FAILURE=true`), Snapshot
-Restore (`TEST_RESTORE_SNAPSHOT=true`), and Destroy (`TEST_DESTROY_VPS_ON_SUCCESS=true`). Destruction is
-permitted only for VPS resources created by this runner in the current `TEST_RUN_ID`. Any cleanup action
-SHALL be idempotent and scoped to resources proven to belong to the current test run.
+The runner SHALL accept one `TEST_TEARDOWN_POLICY` enum: `PRESERVE` (default) or
+`RESTORE_SNAPSHOT`. `DESTROY` is rejected in v1 because VPS are operator-provisioned and no Provider Adapter
+exists. Policy values are mutually exclusive; cleanup is idempotent and scoped to the current run.
 
 #### Scenario: Pre-existing VPS not destroyed
 
@@ -475,17 +476,18 @@ SHALL be idempotent and scoped to resources proven to belong to the current test
 - **THEN** the runner does NOT issue any destroy API call; it sets teardown status to `NOT_RUN` and records that
   destruction of pre-existing VPS is prohibited
 
-#### Scenario: Preserve policy on failure
+#### Scenario: Preserve policy after success or failure
 
-- **GIVEN** `TEST_KEEP_VPS_ON_FAILURE=true` and the test run fails at any phase
-- **WHEN** teardown executes
-- **THEN** full diagnostics are collected, `result.json` retains the actual test outcome (`FAIL`, `INCOMPLETE`, or other applicable status), teardown is separately recorded as `PASS` for the completed PRESERVE action, and the VPS is not destroyed
+- **GIVEN** `TEST_TEARDOWN_POLICY=PRESERVE`
+- **WHEN** the test run completes with any test outcome
+- **THEN** diagnostics are collected, the actual test outcome is retained, teardown is recorded separately as
+  `PASS`, and neither VPS is modified or destroyed
 
 #### Scenario: Snapshot restore policy when snapshot absent
 
-- **GIVEN** `TEST_RESTORE_SNAPSHOT=true` and the provider does not support snapshot API or snapshot is absent
-- **WHEN** teardown attempts to restore the VPS to its pre-modification snapshot
-- **THEN** teardown status is set to `NOT_RUN` rather than simulating success
+- **GIVEN** `TEST_TEARDOWN_POLICY=RESTORE_SNAPSHOT` and no externally verified snapshot ID/procedure is supplied
+- **WHEN** teardown starts
+- **THEN** no restore is attempted and teardown status is `NOT_RUN` with a reason
 
 ---
 
@@ -495,6 +497,13 @@ The runner SHALL write per-run artifacts to `artifacts/live-vps/<TEST_RUN_ID>/` 
 `junit.xml`, `summary.txt`, and structured log files. The following data SHALL NOT appear in any artifact:
 credentials file content, `.env` file content, `SECRET_KEY`, private keys, admin password, scoped API
 token, raw `shortUuid`, or subscription content containing private parameters.
+
+#### Scenario: Destroy policy rejected in v1
+
+- **GIVEN** `TEST_TEARDOWN_POLICY=DESTROY`
+- **WHEN** configuration preflight runs
+- **THEN** preflight fails before remote modification and reports that destruction is unsupported for
+  operator-provisioned VPS
 
 #### Scenario: Redacted copy of credentials file
 
