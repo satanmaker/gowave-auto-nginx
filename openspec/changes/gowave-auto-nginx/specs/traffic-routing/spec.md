@@ -48,7 +48,7 @@ The routing subsystem SHALL serve an authentic static camouflage website on loop
 #### Scenario: Scanner probe fallback to static cover
 - **GIVEN** an unauthenticated client or scanner connecting to `127.0.0.1:8443`
 - **WHEN** Xray REALITY fails to authenticate the handshake
-- **THEN** Xray forwards the connection with PROXY protocol v1 (`dest: "127.0.0.1:9443", xver: 1`) to `127.0.0.1:9443`, where NGINX terminates TLS 1.3 using runtime-adaptive HTTP/2 syntax (`listen ... ssl http2 proxy_protocol;` on < 1.25.1; `listen ... ssl proxy_protocol; http2 on;` on >= 1.25.1), restores the real client IP via `real_ip_header proxy_protocol;`, serves the multi-asset decoy website, and logs the probe to a dedicated fallback security log (`/var/log/nginx/gowave-decoy-access.log`).
+- **THEN** Xray forwards the connection with PROXY protocol v1 (`dest: "127.0.0.1:9443", xver: 1`) to `127.0.0.1:9443`, where NGINX terminates TLS 1.3 using runtime-adaptive HTTP/2 syntax (`listen ... ssl http2 proxy_protocol;` on < 1.25.1; `listen ... ssl proxy_protocol; http2 on;` on >= 1.25.1), restores the real client IP via `real_ip_header proxy_protocol;`, serves the multi-asset decoy website, and logs the probe to `/var/log/nginx/gowave-decoy-access.log` recording `remote_addr`, `ssl_server_name`, and timestamp.
 
 ### Requirement: XHTTP Inbound Reverse Proxy
 The NGINX HTTPS listener at 7443 SHALL terminate TLS for `panel_domain` and reverse proxy configured XHTTP path prefixes to local Xray inbounds using HTTP/1.1 with buffering disabled, passing the PROXY-restored client IP via HTTP headers.

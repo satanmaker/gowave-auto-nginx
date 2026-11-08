@@ -45,7 +45,7 @@ PRIVILEGE: FAIL — <suite> requires EUID 0 (or EUID != 0)
 ```mermaid
 flowchart TD
     systemd["systemd (EUID 0 in QEMU VM): Genuine PID 1, Cold Boot, Crash Recovery"]
-    root["root (EUID 0 in Container): Users, File Permissions, Fail2ban Syntax, UFW Rules"]
+    root["root (EUID 0 in Container): Users, Strict Umask 077, GOMEMLIMIT, Fail2ban, UFW"]
     services["services (EUID != 0): Live Mock Daemon Handshakes, Client TLS Simulations"]
     integration["integration (EUID != 0): GoWave API Provisioning, SQLite WAL Online Backup"]
     nonroot["nonroot (EUID != 0): ShellCheck, Python Linting, Config Generators, Malicious Tarballs"]
@@ -245,7 +245,7 @@ Once the container reaches PID 1 `systemd` readiness, `podman_testbed.sh` execut
    - Confirms zero loopback leaks (`127.0.0.1`, `localhost`, internal ports) across all delivered client profiles.
 8. **Stage 8: Disaster Recovery & Rollback Simulation**:
    - Creates `GoWave Auto NGINX Backup Format v1` archive and verifies `0600` permissions.
-   - Verifies SQLite operations execute under `runuser -u gowave` and preserve file permissions (`0640 gowave:gowave`).
+   - Verifies SQLite operations execute under `runuser -u gowave`, pre-creates backup file with `install -m 0640` verifying success even under strict umask 077 (`test_backup_strict_umask`), and verifies systemd runtime environment application (`test_gomemlimit_applied`).
    - Injects simulated process failure into update transaction and asserts automatic rollback from `/var/lib/gowave-auto-nginx/recovery/` via `journal.json`.
 
 ### Multi-Node Distributed Edge E2E Pipeline (`tests/podman_testbed.sh multi-node`)
