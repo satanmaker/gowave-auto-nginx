@@ -70,6 +70,48 @@ command.
 
 ---
 
+### Requirement: Optional Vision Domain Pair and Activation
+
+The runner SHALL accept Vision domains only as a pair of distinct FQDNs. When enabled, it SHALL provision
+and verify the Vision certificate, inbound, Panel host, NGINX route, and fallback on both VPS. A Vision
+installation failure SHALL fail the relevant install phase. When disabled, the default four-inbound topology
+remains unchanged.
+
+#### Scenario: One-sided Vision domain configuration is rejected
+
+- **GIVEN** exactly one of `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` is non-empty
+- **WHEN** the whitelist configuration parser validates the E2E config
+- **THEN** preflight fails before SSH, certificate issuance, or any remote modification
+
+#### Scenario: Vision domains are unique
+
+- **GIVEN** both `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` are configured
+- **WHEN** the whitelist configuration parser validates the E2E config
+- **THEN** the two Vision domains MUST differ from each other and from all four mandatory Panel/REALITY domains; duplicates fail preflight before SSH or remote modification
+
+#### Scenario: Vision is fully provisioned on Master and Worker
+
+- **GIVEN** both Vision domains are configured and valid DNS records resolve to their respective VPS addresses
+- **WHEN** Master and Worker installation and Panel provisioning complete
+- **THEN** each VPS has a valid certificate for its Vision domain, each node has five inbounds, the Panel has
+  five matching hosts per node with correct node/inbound associations, and NGINX routes Vision SNI to 8444
+  with the non-VLESS HTTP fallback on 9444
+
+#### Scenario: Vision certificate failure aborts the relevant host installation
+
+- **GIVEN** Vision is enabled but issuance, ACME-lineage validation, certificate hostname validation, or
+  certificate/key verification fails on Master or Worker
+- **WHEN** that host's installation stage executes
+- **THEN** the stage fails and rolls back; no profile, host, or NGINX route may be left advertising an
+  unusable Vision endpoint
+
+#### Scenario: Vision disabled preserves the four-inbound topology
+
+- **GIVEN** both Vision domain fields are absent
+- **WHEN** Master and Worker are installed
+- **THEN** each node has exactly four inbounds and four hosts, no Vision certificate or route is created, and
+  the mandatory Data Plane matrix contains sixteen runtime cases
+
 ### Requirement: Pinned Version Fidelity
 
 Every test run SHALL record and verify the exact version of each software component: repository commit,
@@ -271,7 +313,7 @@ correctness, Internal Squad membership by set equality, and all Host record fiel
 
 - **GIVEN** Master installed and Worker deployed on a clean test environment
 - **WHEN** runner queries `GET /api/hosts`
-- **THEN** exactly eight (or ten when vision domains are configured) Host records exist; four (or five) reference `local-node` UUID and four (or five) reference `worker-1`
+- **THEN** exactly eight (or ten when both Vision domains are configured) Host records exist; four (or five) reference `local-node` UUID and four (or five) reference `worker-1`
   UUID; each Host's `inbound UUID` matches one of the inbounds in the corresponding node's config profile; all hosts configure `fingerprint: firefox`
 
 #### Scenario: Internal Squad contains all provisioned inbound UUIDs
@@ -310,7 +352,7 @@ against the real Panel; actual HTTP response codes SHALL be used (not mock assum
 
 - **GIVEN** subscription fetched with valid Xray User-Agent
 - **WHEN** runner parses the JSON and counts proxy-capable outbounds
-- **THEN** exactly eight (or ten when vision is configured) outbounds are identified by protocol/transport tag (VLESS REALITY, VLESS XHTTP
+- **THEN** exactly eight (or ten when both Vision domains are configured) outbounds are identified by protocol/transport tag (VLESS REALITY, VLESS XHTTP
   TLS, VLESS WS TLS, Trojan gRPC TLS, and optional VLESS XTLS Vision TLS) for Master and Worker; `fingerprint: "firefox"` is verified; `direct`, `block`, and routing-only entries
   are excluded from the count
 
@@ -326,7 +368,7 @@ against the real Panel; actual HTTP response codes SHALL be used (not mock assum
 
 - **GIVEN** subscription fetched with valid Mihomo User-Agent
 - **WHEN** runner validates HTTP response and parses YAML
-- **THEN** HTTP 200 is returned with correct Content-Type; eight (or ten when vision is configured) proxy entries with correct protocol and
+- **THEN** HTTP 200 is returned with correct Content-Type; eight (or ten when both Vision domains are configured) proxy entries with correct protocol and
   transport parameters and `client-fingerprint: "firefox"` are present; `GEOIP,private,DIRECT,no-resolve` rule is present; no duplicates; real
   `mihomo -t` validates the config
 
@@ -390,7 +432,7 @@ Cover-reality assets and fallbacks SHALL be present and PROXY protocol SHALL be 
 
 #### Scenario: Optional Vision SNI routing and decoy fallback
 
-- **GIVEN** vision domain is configured and NGINX Stream is active
+- **GIVEN** both Vision domains are configured and NGINX Stream is active
 - **WHEN** runner connects with vision domain SNI using a non-VLESS HTTP probe
 - **THEN** traffic routes to loopback port 8444 and falls back to loopback port 9444 returning decoy site content via PROXY protocol
 
@@ -481,7 +523,7 @@ ingress evidence; syntax checks do not count.
 
 #### Scenario: One or more mandatory runtime cases fail
 
-- **GIVEN** the sixteen-case (or twenty-case when vision is configured) runtime matrix is required
+- **GIVEN** the sixteen-case (or twenty-case when both Vision domains are configured) runtime matrix is required
 - **WHEN** any Xray or Mihomo case fails
 - **THEN** the corresponding case is `FAIL` and overall status is `FAIL`
 
@@ -694,11 +736,17 @@ and `TEARDOWN_FAILED`. Overall `PASS` requires all mandatory phases completed, a
 runtime cases verified, and the declared teardown policy completed. `SKIP` and `NOT_RUN` are non-passing.
 `shortUuid` SHALL NOT appear in JUnit XML or any CI-published artifact.
 
-#### Scenario: PASS requires all sixteen Data Plane runtime cases
+#### Scenario: PASS requires all active Data Plane runtime cases
 
-- **GIVEN** all installation, API, subscription, firewall, and NGINX phases are `PASS`
+- **GIVEN** Vision is disabled and all installation, API, subscription, firewall, and NGINX phases are `PASS`
 - **WHEN** only fourteen of sixteen runtime cases pass (two fail)
 - **THEN** overall status is `FAIL`, not `PASS`; the failing protocol/client cases are identified individually in `result.json`
+
+#### Scenario: Vision-enabled PASS requires all twenty runtime cases
+
+- **GIVEN** both Vision domains are configured and all installation, API, subscription, firewall, and NGINX phases are `PASS`
+- **WHEN** only eighteen of twenty runtime cases pass (two fail)
+- **THEN** overall status is `FAIL`, not `PASS`; both failed Vision or core protocol/client cases are identified individually in `result.json` and JUnit XML
 
 #### Scenario: result.json schema fields present
 
