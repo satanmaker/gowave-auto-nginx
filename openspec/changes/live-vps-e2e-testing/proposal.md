@@ -30,6 +30,7 @@ subscription delivery, and actual Data Plane tunnel traffic — on disposable re
   Let's Encrypt Staging CA trust for client HTTPS and Data Plane tunnel handshakes.
 - **Delta: `modules/node.sh`** — bundled upstream installer path must be verifiable by commit SHA at E2E
   acceptance time; fallback to floating `main` is prohibited in a pinned E2E run.
+- **Final safety delta** — all Master/Worker mutation entrypoints participate in one host-wide lock; the disposable gate covers every rollback target; interrupted Worker deployment and remote/API compensation produce independently verified transaction results; IPv6 DNS answers cannot be ignored when IPv6 traffic tests are disabled.
 
 ## Capabilities
 
