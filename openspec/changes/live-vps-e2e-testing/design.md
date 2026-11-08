@@ -225,8 +225,8 @@ interprets zero as a zero-character limit, not unlimited output. Run the exact `
 process tree under `strace -f -s "$STRACE_STRING_LIMIT" -e trace=execve,execveat` (or an equivalent
 kernel-level observer that captures both syscall forms with the same completeness guarantee). If page size
 cannot be determined, the computed limit is invalid, or the installed strace cannot accept it, record
-`INCOMPLETE` and do not run a weaker observer as a fallback. Write raw output to an ephemeral mode-0600 file,
-never stream it to the Control Machine, parse the strace-quoted argv including escaped bytes, scan locally for
+`INCOMPLETE` and do not run a weaker observer as a fallback. Write raw output to a mode-0600 file inside a private `/run` tmpfs directory (mode `0700`), never persist it
+or stream it to the Control Machine, parse the strace-quoted argv including escaped bytes, scan locally for
 the exact `SECRET_KEY` and known encoded forms, then securely remove the raw trace. The observer must exit
 successfully, follow all descendants, and contain no truncated or unfinished exec records or observer errors.
 The acceptance test MUST place a sentinel secret after byte 32 in arguments passed through both `execve` and
