@@ -201,8 +201,10 @@ mutating system-wide `/etc/ssl/certs` on the Control Machine:
    are not accepted as a trust anchor.
 2. For Python Panel API calls (`panel_api.py`), the staging CA is loaded into a dedicated `ssl.create_default_context(cafile=...)`.
 3. For curl calls, `--cacert <staging-ca-path>` is passed.
-4. For Xray and Mihomo temporary client configs, the staging CA certificate is referenced in `tlsSettings`
-   (or `allowInsecure: true` is configured in the ephemeral test client config).
+4. Xray and Mihomo are Go-based clients. Build a per-run CA bundle containing the Control Machine's
+   existing public roots plus the pinned Staging CA chain, then set `SSL_CERT_FILE=<bundle>` only in each
+   client process environment. Verify this behavior against the exact pinned client binaries before use;
+   never set `allowInsecure`, `skip-cert-verify`, or any equivalent verification bypass.
 
 **Rationale:** In staging mode, standard HTTPS requests to the Panel and TLS proxy tunnels fail with
 `certificate verify failed` if the staging CA is not explicitly trusted by the client. This scoped approach
@@ -214,12 +216,15 @@ allows strict verification without polluting the host machine's root store.
 
 **Chosen:** Do not use periodic `/proc/*/cmdline` sampling or a Bash DEBUG trap as proof: both can miss
 short-lived processes, and shell tracing can itself disclose expanded secrets. For the acceptance test,
-run the exact `gowave-auto.sh node add` invocation under a local `strace -f -e trace=execve` observer on Master
-(or an equivalent kernel-level exec event collector with documented completeness). Write raw observer output to
-an ephemeral mode-0600 file, never stream it to the Control Machine, scan it locally for the exact `SECRET_KEY`
-value and known encoded forms, then securely remove it. The report stores only `PASS`/`FAIL`, observer version,
-coverage limitations and timestamps. If the observer is unavailable, cannot attach to all child processes, or
-its output is truncated, record `INCOMPLETE`; do not infer PASS from absence in a sampled process list.
+run the exact `gowave-auto.sh node add` invocation under a local `strace -f -s 0 -e trace=execve` observer
+on Master (or an equivalent kernel-level exec event collector with documented completeness). The explicit
+`-s 0` disables strace's default 32-byte string limit so long argv values are not silently truncated. Write raw
+observer output to an ephemeral mode-0600 file, never stream it to the Control Machine, scan it locally for the
+exact `SECRET_KEY` value and known encoded forms, then securely remove it. Verify the trace is complete: strace
+must exit successfully, all descendants must remain traced, and no truncated/unfinished execve records or
+observer errors may be present. The report stores only `PASS`/`FAIL`, observer version, coverage limitations
+and timestamps. If the observer is unavailable, cannot attach to all child processes, or its output is
+truncated/incomplete, record `INCOMPLETE`; do not infer PASS from absence in a sampled process list.
 
 **Rationale:** Process polling is inherently racy. A kernel-level exec observer gives a bounded observation
 of process creation. The raw trace contains sensitive argv and therefore must never become a normal diagnostic
@@ -230,13 +235,13 @@ artifact. This verifies argv only; it does not prove absence from process enviro
 ### D11: Operational Lifecycle and Disposable Baseline Policy in v1
 
 **Chosen:** v1 accepts only operator-provisioned disposable VPS instances; it has no cloud provider adapter.
-Lifecycle policies are explicit and non-interchangeable:
-- `PRESERVE`: leave both VPS running and retain diagnostics; no uninstall is implied.
-- `RESTORE_SNAPSHOT`: allowed only when an externally managed snapshot identifier and restore procedure are
-  supplied and independently verified. The runner does not claim that the project uninstall command restores
-  OS packages, UFW, sysctl, swap/fstab, certificates or unrelated host state.
-- `DESTROY`: prohibited in v1 for pre-existing VPS. It is `NOT_RUN` with a reason. Future provider-managed
-  destruction requires an ownership record binding provider resource IDs to `TEST_RUN_ID`.
+The runner accepts one mutually exclusive `TEST_TEARDOWN_POLICY` value: `PRESERVE` (default) or
+`RESTORE_SNAPSHOT`. Boolean policy combinations are not accepted. `PRESERVE` leaves both VPS running and
+retains diagnostics after both successful and failed runs; no uninstall is implied. `RESTORE_SNAPSHOT` is
+allowed only when an externally managed snapshot identifier and restore procedure are supplied and independently
+verified; otherwise teardown is `NOT_RUN`. `DESTROY` is invalid and rejected during preflight in v1 because
+all VPS are operator-provisioned and no Provider Adapter/ownership record exists. The runner does not claim
+that project uninstall restores OS packages, UFW, sysctl, swap/fstab, certificates or unrelated host state.
 A clean baseline gate is mandatory before installation. After `PRESERVE`, the next run requires operator
 re-image or a separately verified restore; running `gowave-auto.sh uninstall` is not an acceptable reset.
 
