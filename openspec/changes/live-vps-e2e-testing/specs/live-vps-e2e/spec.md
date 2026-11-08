@@ -73,8 +73,8 @@ command.
 ### Requirement: Pinned Version Fidelity
 
 Every test run SHALL record and verify the exact version of each software component: repository commit,
-GoWave Panel version, GoWave Node version, upstream Node installer commit, Xray (server and client), Mihomo,
-NGINX, OpenSSL, OS and kernel, and SHA256 of installed binaries. If any required version cannot be
+GoWave Panel version, GoWave Node version, upstream Node installer commit and SHA256, Xray server/rw-core
+and client versions, Mihomo, NGINX, OpenSSL, OS and kernel, and SHA256 of installed binaries. If any required version cannot be
 unambiguously pinned or verified, preflight SHALL terminate before installation.
 
 #### Scenario: Version mismatch detected post-installation
@@ -84,11 +84,20 @@ unambiguously pinned or verified, preflight SHALL terminate before installation.
 - **THEN** the runner records the installed version; if it does not match the configured version, the
   `master_install` result is set to `FAIL`
 
-#### Scenario: Floating installer branch rejected
+#### Scenario: Floating installer branch or installer digest mismatch rejected
 
-- **GIVEN** `GOWAVE_NODE_INSTALLER_COMMIT` is not set or resolves to a floating branch reference
-- **WHEN** preflight validation runs
-- **THEN** the runner terminates before installation with an error requiring an explicit 40-hex commit SHA
+- **GIVEN** `GOWAVE_NODE_INSTALLER_COMMIT` is not an explicit 40-hex commit, or the installer artifact SHA256
+  does not match mandatory `GOWAVE_NODE_INSTALLER_SHA256`
+- **WHEN** preflight validates the bundled Master installer and immutable remote Worker installer source
+- **THEN** the runner terminates before installation; neither path may fall back to floating `main` or execute
+  an installer whose bytes do not match the configured digest
+
+#### Scenario: Server and client Xray versions are independently pinned
+
+- **GIVEN** `XRAY_SERVER_VERSION` and `XRAY_CLIENT_VERSION` are configured
+- **WHEN** preflight and post-install checks inspect the Node-managed server core and Control Machine client
+- **THEN** both exact versions are recorded and compared independently; Node version alone is not accepted as
+  evidence of the installed Xray core version; inability to identify either version prevents overall PASS
 
 ---
 
@@ -134,12 +143,14 @@ check succeeds; and `gowave-auto.sh health` returns `HEALTHY`.
 
 After `gowave-auto.sh node add worker-1`, the runner SHALL verify successful registration,
 pinned SSH host identity, active Worker services, valid certificates, passing `nginx -t`, and absence of
-`SECRET_KEY` from a complete process-tree argv trace covering both `execve` and `execveat`.
+`SECRET_KEY` from the complete Master-side descendant argv trace covering both `execve` and `execveat`.
+This trace does not observe remote Worker processes beyond the SSH boundary.
 
 #### Scenario: SECRET_KEY is absent from a complete process argv trace
 
 - **GIVEN** `gowave-auto.sh node add` is executing the SSH remote deployment on Master
-- **WHEN** the runner traces the entire descendant process tree with
+- **WHEN** the runner traces the local Master-side descendant process tree (including the local SSH client)
+  with
   `strace -f -v -s N -e trace=execve,execveat`, where `N=32 * os.sysconf("SC_PAGE_SIZE")`
 - **THEN** the observer exits successfully, every `argv` vector and string is complete, the scanner parses
   escaped argv bytes and finds no exact or known encoded `SECRET_KEY` value; only this complete observation
@@ -180,13 +191,13 @@ pinned SSH host identity, active Worker services, valid certificates, passing `n
 
 ### Requirement: Public mTLS Control Plane Verification (Master → Worker)
 
-The runner SHALL verify the public mTLS 1.3 control-plane connection from Master to Worker:3002 using credentials extracted from Master state. Probes requiring access to Worker:3002 MUST originate from Master because Worker UFW allowlists Master's actual source address. The runner SHALL report cryptographic input validation, TLS handshake, HTTP response, and authenticated Panel connectivity as distinct observations; it SHALL NOT invent output markers absent from the existing verifier.
+The runner SHALL verify the public mTLS 1.3 control-plane connection from Master to Worker:3002 using credentials extracted on Master by `/opt/gowave/gowave-server rescue --print-secret-key-raw`, matching the existing `modules/node.sh:extract_secret_key` implementation. `SECRET_KEY` is not read from `state.json` or `/root/gowave-credentials.txt`. Probes requiring access to Worker:3002 MUST originate from Master because Worker UFW allowlists Master's actual source address. The runner SHALL report cryptographic input validation, TLS handshake, HTTP response, and authenticated Panel connectivity as distinct observations; it SHALL NOT invent output markers absent from the existing verifier.
 
 #### Scenario: Existing verifier succeeds with valid credentials
 
 - **GIVEN** Worker is deployed and `gowave-node.service` is active
 - **WHEN** Master runs `modules/verify_node_mtls.py --host WORKER_IP --port 3002 --mode full` with the base64 payload on stdin
-- **THEN** the verifier exits 0, reports a successful TLS 1.3 handshake and prints the HTTP status line; the runner records the exact observations without logging credentials
+- **THEN** the verifier emits the existing `Payload cryptographic verification PASSED` line before the socket attempt, then (on a successful handshake) `Handshake SUCCESS: TLSv1.3 negotiated` and `Node response: <status line>`; the runner records these exact observations without logging the payload or derived SNI
 
 #### Scenario: HTTP 200 is distinguished from HTTP 401
 
@@ -229,6 +240,24 @@ The runner SHALL verify the public mTLS 1.3 control-plane connection from Master
 - **GIVEN** the valid derived SNI and normal connection pass
 - **WHEN** Master connects using a deliberately incorrect SNI
 - **THEN** the runner records the actual NGINX/default-route and TLS outcome; it MUST NOT assume that every wrong SNI necessarily produces a TLS handshake failure
+
+### Requirement: TLS-aware Bounded Panel API Client
+
+The runner SHALL call the real Panel through its public HTTPS endpoint with strict hostname and certificate
+verification. The client SHALL support the scoped combined CA bundle (including Staging roots when
+`ACME_MODE=staging`) and configured `API_TIMEOUT`. The current `GoWaveClient` defaults do not expose an SSL
+context or configurable timeout; the implementation SHALL add backward-compatible optional constructor
+parameters and pass them to `urllib.request.urlopen`, while preserving existing defaults for current callers.
+
+#### Scenario: Panel API client uses scoped trust and configured timeout
+
+- **GIVEN** `ACME_MODE=staging` and a validated combined CA bundle
+- **WHEN** `panel_api.py` logs in and requests the real Panel API over HTTPS
+- **THEN** the request uses an SSL context loaded from that bundle, retains hostname verification, uses
+  `API_TIMEOUT` per request attempt, and does not use `allowInsecure` or a trust bypass; normal production
+  callers that omit the optional parameters retain their current behavior
+
+---
 
 ### Requirement: Panel API Cluster Structure Audit
 
@@ -378,6 +407,14 @@ ingress evidence; syntax-only checks do not count as traffic verification.
 - **WHEN** a real Xray process exposes a local SOCKS5 listener and the runner sends an HTTPS request through that selected outbound
 - **THEN** the request succeeds, egress matches the configured Master expectation (or documented direct-egress baseline), and isolated packet evidence increases on Master during the request window
 
+#### Scenario: Mihomo runtime configuration is isolated on Control Machine
+
+- **GIVEN** a real Mihomo subscription YAML fetched from the Panel
+- **WHEN** the runner prepares the per-run Mihomo config
+- **THEN** it preserves all proxy definitions and routing rules but assigns collision-free loopback-only
+  mixed/SOCKS/redir/controller listeners, verifies `allow-lan: false` and controller binding to `127.0.0.1`,
+  and refuses to launch if any control endpoint would bind to a non-loopback interface
+
 #### Scenario: Mihomo runtime request traverses the selected Master endpoint
 
 - **GIVEN** a Master proxy has been selected from the real Mihomo subscription
@@ -493,6 +530,15 @@ VPS.
 
 ---
 
+#### Scenario: Negative suite cannot be silently skipped for a passing run
+
+- **GIVEN** `TEST_NEGATIVE_SUITE=false`
+- **WHEN** the full run reaches the negative-test phase
+- **THEN** all 15 negative scenarios are explicitly recorded as `SKIP` and overall status is `INCOMPLETE`;
+  the run MUST NOT be reported as `PASS`
+
+---
+
 ### Requirement: Teardown Policy Enforcement
 
 The runner SHALL accept one mutually exclusive `TEST_TEARDOWN_POLICY`: `PRESERVE` (default) or
@@ -541,6 +587,28 @@ Teardown is reported separately from test outcome; overall `PASS` requires the s
 - **GIVEN** preflight accepted the SHA256-pinned restore hook and both snapshot IDs
 - **WHEN** the hook times out, exits nonzero, returns invalid/mismatched JSON, or restored VPS fail the baseline check
 - **THEN** teardown is `TEARDOWN_FAILED`; neither test nor teardown status may be represented as overall `PASS`
+
+---
+
+### Requirement: Durable Run State for Partial CLI Modes
+
+The runner SHALL persist an atomic mode-`0600` `run-state.json` under
+`artifacts/live-vps/<TEST_RUN_ID>/`. It SHALL contain only the repository commit, non-secret target/config
+identity, baseline-manifest reference, phase statuses and timestamps. It SHALL NOT contain credentials,
+tokens, `SECRET_KEY`, `shortUuid`, subscription bodies, or hashes of secret values. `--mode full` creates a
+new run state; an existing run ID MUST NOT be silently overwritten. Every partial mode except a fresh
+`preflight` requires `--run-id` and a matching run-state record.
+
+#### Scenario: Partial mode cannot resume a different run or repeat completed installation
+
+- **GIVEN** a stored run state for a specific repository commit, Master/Worker addresses and non-secret config
+  identity
+- **WHEN** `install`, `verify`, `traffic`, `negative`, or `teardown` is invoked with that run ID
+- **THEN** the runner verifies the matching state and prerequisite phase statuses before remote modification;
+  completed phases are not repeated implicitly; missing state, mismatched identity or unmet prerequisites fail
+  closed. `install` requires preflight PASS, `verify` requires install PASS, `traffic` requires verification
+  PASS, `negative` requires an installed disposable environment, and `teardown` requires the original baseline
+  and diagnostic state.
 
 ---
 

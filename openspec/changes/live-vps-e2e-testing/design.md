@@ -269,9 +269,12 @@ Run the exact `gowave-auto.sh node add` process tree with both string and array 
 The `-v` / `--no-abbrev` option is mandatory: it is equivalent to `-e abbrev=none` and prevents
 strace's default structure/array abbreviation from replacing later `argv` elements with an omission marker.
 The positive `-s` limit independently prevents individual argument strings from being truncated. The observer
-MUST capture both `execve` and `execveat` for all descendants. If page size cannot be determined, the
-computed limit is invalid, the installed strace does not support either option, or the complete output cannot
-be parsed, record `INCOMPLETE`; do not use a weaker observer as fallback.
+MUST capture both `execve` and `execveat` for all descendants of the local `gowave-auto.sh
+node add` process on Master, including the local SSH client process. This is a Master-side observation only:
+it does not trace the remote Worker shell/process tree after the SSH boundary and MUST NOT be represented as
+proof about Worker-side argv. If page size cannot be determined, the computed limit is invalid, the installed
+strace does not support either option, or the complete output cannot be parsed, record `INCOMPLETE`; do not
+use a weaker observer as fallback.
 
 Because `-v` also expands the `envp` vector, the raw trace MUST be treated as containing arbitrary
 environment secrets as well as argv values. Store it only in a mode-`0600` file inside a private `/run`
@@ -338,6 +341,42 @@ unexpected Phase 0.7 failures.
 
 ---
 
+### D12: Panel API TLS Context and Request Timeout Injection
+
+**Chosen:** Extend `modules/api_client.py`'s `GoWaveClient` constructor compatibly with optional `ssl_context`
+and `timeout` parameters (defaults preserve existing callers). Its `urlopen` call passes the configured timeout
+and SSL context; `panel_api.py` constructs a client for `https://MASTER_PANEL_DOMAIN` with an SSL context built
+from the per-run combined CA bundle when staging is selected. Do not use `allowInsecure`, disable hostname
+verification, or silently fall back to system roots if the scoped bundle cannot be built. API timeout applies
+to each HTTP attempt; `NODE_READY_TIMEOUT` remains the separate overall polling deadline.
+
+**Rationale:** The current `GoWaveClient` hard-codes `urlopen(..., timeout=15)` and exposes no SSL-context
+injection. The E2E contract requires both a staging-aware trust context and configured `API_TIMEOUT`; those
+cannot be claimed by simply instantiating the current class unchanged.
+
+---
+
+### D13: Partial Run State and Optional Negative Suite Semantics
+
+**Chosen:** `--mode full` creates a new `TEST_RUN_ID` and an atomic mode-`0600` `run-state.json` under
+`artifacts/live-vps/<TEST_RUN_ID>/`. It records only non-secret target/config identity, repository commit,
+baseline-manifest reference, phase statuses and timestamps. It MUST NOT contain passwords, tokens, `SECRET_KEY`,
+`shortUuid`, or subscription contents. Partial modes require an existing run ID and matching run-state record;
+they verify target addresses, pinned repository commit, and non-secret configuration identity before resuming.
+`install` requires a successful preflight record; `verify` requires successful install records; `traffic`
+requires successful verification; `negative` requires an installed disposable environment; `teardown` requires
+an existing run and diagnostics/baseline record. A completed phase is not repeated implicitly. A mismatch or
+missing state record fails closed before remote modification.
+
+`TEST_NEGATIVE_SUITE` defaults to `true`. When explicitly false, all 15 negative scenarios are `SKIP` and the
+overall result is at least `INCOMPLETE`; disabling the suite can never yield overall `PASS`.
+
+**Rationale:** The CLI currently lists partial modes but has no durable contract for which run they resume or
+how it prevents a second install from mutating an already provisioned VPS. The config already exposes a
+negative-suite switch, so its effect on the acceptance gate must be normative.
+
+---
+
 ## Runner Module Structure
 
 ```
@@ -379,28 +418,34 @@ Phase 0: Preflight
 
 Phase 1: Master Installation
   1.1  Copy pinned repo commit to Master /opt/gowave-auto-nginx
-  1.2  Run gowave-auto.sh install (with ACME_MODE parameter)
+  1.2  Run gowave-auto.sh install with `GOWAVE_ACME_SERVER` derived from `ACME_MODE`; set
+       `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1` and provide the pinned Node installer commit + SHA256
   1.3  Verify service states, listeners, TLS certs
   1.4  Verify credentials file (mode, owner, keys present — values not logged)
   1.5  Retrieve shortUuid (state.json + API cross-check)
   1.6  Verify Panel locally and from Control Machine
-  1.7  Record versions (Panel, Node, Xray, NGINX, OpenSSL, OS)
+  1.7  Record and compare versions (Panel, Node, Node installer commit/hash, Xray server and client,
+       Mihomo, NGINX, OpenSSL, OS/kernel); an unpinned/mismatched component cannot PASS
 
 Phase 2: Worker Deployment
-  2.1  Run gowave-auto.sh node add worker-1 (from Master via SSH)
-  2.2  Verify exit code, state.json, process argv observation (SECRET_KEY not in argv)
+  2.1  Run `gowave-auto.sh node add worker-1` on Master with the same validated ACME directory and pinned
+       Node-installer commit + SHA256 used by Phase 1
+  2.2  Verify exit code, state.json, process argv observation (SECRET_KEY not in Master-side argv)
   2.3  Verify Worker services, listeners, certs, deploy hook, cover-reality SHA256
   2.4  Poll Panel API isConnected until true (bounded NODE_READY_TIMEOUT)
 
 Phase 3: Public mTLS Verification (execute allowed-source probes from Master)
-  3.1  Extract SECRET_KEY payload from Master state (via SSH, in-memory)
-  3.2  Run verify_node_mtls.py on Master against Worker:3002; retain raw output only in memory
-  3.3  Record verifier exit code, explicit TLSv1.3 handshake line, and HTTP status as separate observations
+  3.1  On Master, run `/opt/gowave/gowave-server rescue --print-secret-key-raw` via the existing
+       `modules/node.sh:extract_secret_key` contract; capture stdout in memory only (not state.json or credentials)
+  3.2  Base64-encode the payload as required by `verify_node_mtls.py`, feed it to verifier stdin, and run
+       the verifier on Master against Worker:3002; retain raw output only in memory
+  3.3  Parse only actual verifier output: `Payload cryptographic verification PASSED`,
+       `Handshake SUCCESS: TLSv1.3 negotiated`, `Node response: <status line>`, and exit code;
+       never persist derived SNI or payload
   3.4  Treat 200 as HTTP health success; 401 as TLS/SNI reached HTTP layer but not authenticated health
   3.5  Verify Panel↔Worker authenticated connectivity independently through Panel API state
   3.6  Run client-cert rejected / no-client-cert server-side probes from Master
   3.7  Run wrong-key local client-load test and wrong-server-CA client-verification test separately
-  3.8  Test wrong-SNI routing against observed NGINX/Xray behavior; do not assume a fixed TLS alert
 
 Phase 4: Panel API Audit
   4.1  GET /api/nodes — 2 nodes, correct addresses, 4 inbounds each, isConnected
@@ -415,6 +460,8 @@ Phase 5: Subscriptions
   5.4  Validate with xray run -test (temporary wrapper config)
   5.5  Fetch Mihomo YAML (Mihomo UA), verify 8 proxies, GEOIP rule, headers
   5.6  Validate with mihomo -t
+  5.7  Verify Mihomo runtime copy binds all local listeners to 127.0.0.1 on collision-free per-run ports;
+       preserve proxy/rule semantics and reject externally exposed or non-loopback controllers
 
 Phase 6: Firewall
   6.1  Master: loopback 127.0.0.1:3002 reachable; Control Machine public probe blocked
@@ -438,8 +485,10 @@ Phase 8: Data Plane E2E (8 logical endpoints × 2 client runtimes = 16 required 
        and Worker × the same four protocols
   8.2  For each logical endpoint, run a real Xray client case and a real Mihomo client case:
        - Extract the corresponding proxy from the real subscription
-       - Build/validate a temporary Xray wrapper config or load the real Mihomo subscription
-       - Start the actual client process and wait for its local proxy listener
+       - Build/validate a temporary Xray wrapper config; for Mihomo, create a per-run sanitized copy of
+         the real YAML preserving proxy definitions/rules but assigning free loopback-only mixed/SOCKS/
+         redir/controller ports and verifying `allow-lan: false` plus loopback controller binding
+       - Start the actual client process and wait for its selected local proxy listener
        - Send HTTPS request through the selected proxy; verify HTTP response and observed egress IP
        - Verify target VPS ingress evidence in an isolated observation window
        - Stop client and remove temporary configuration
@@ -448,6 +497,7 @@ Phase 8: Data Plane E2E (8 logical endpoints × 2 client runtimes = 16 required 
 
 Phase 9: Negative Tests (NEG-01 .. NEG-15)
   Executed on disposable VPS; fault states cleaned up before next test where possible
+  If TEST_NEGATIVE_SUITE=false, record all 15 as SKIP and force overall INCOMPLETE (never PASS)
 
 Phase 10: Diagnostics Collection
   SSH dump: OS, packages, systemd, listeners, firewall, nginx -t, cert metadata, API summaries
@@ -492,20 +542,40 @@ shortUuid and subscription content redacted in all CI artifacts.
 
 ## ACME Staging/Production Delta
 
-**Problem:** `gowave-auto.sh` calls `certbot certonly --webroot` with no `--server` override; repeated E2E
-runs against production ACME hit rate limits. Furthermore, when deploying worker nodes via `gowave-auto.sh node add`,
-the ACME server selection must be propagated across the network to Worker.
+**Problem:** The production installer currently invokes Certbot without `--server`; the runner's public
+configuration exposes `ACME_MODE`, while the installer contract uses `GOWAVE_ACME_SERVER`. These are two
+interfaces and MUST have one explicit mapping. The same selected directory must reach both Worker certificate
+issuance calls through the `node add` SSH-stdin payload.
 
-**Solution:**
-1. Support optional environment variable `GOWAVE_ACME_SERVER` in `gowave-auto.sh install`, `gowave-auto.sh domain-change`,
-   and `gowave-node-auto.sh`.
-2. When set to the staging URL, all `certbot certonly` invocations append `--server "$GOWAVE_ACME_SERVER"`.
-3. In `gowave-auto.sh node add`, forward `GOWAVE_ACME_SERVER="${GOWAVE_ACME_SERVER:-}"` into `gowave-node-auto.sh remote_payload`.
-4. In `gowave-node-auto.sh remote_payload()`, serialize `GOWAVE_ACME_SERVER` into the SSH stdin payload stream
-   (`printf 'export GOWAVE_ACME_SERVER=%q\n' "${GOWAVE_ACME_SERVER:-}"`) so Worker certbot runs execute with the same
-   staging endpoint.
+**Canonical mapping in the runner:**
+
+| `ACME_MODE` | Exact `GOWAVE_ACME_SERVER` value |
+|---|---|
+| `staging` | `https://acme-staging-v02.api.letsencrypt.org/directory` |
+| `production` | `https://acme-v02.api.letsencrypt.org/directory` |
+
+The runner accepts only the `ACME_MODE` enum and derives the URL itself; arbitrary ACME directory URLs are not
+accepted from the E2E config. The install scripts accept only those two exact URLs when `GOWAVE_ACME_SERVER`
+is set. When the variable is unset outside the runner, existing production-default behavior remains unchanged.
+
+**Propagation contract:**
+1. The runner derives the exact URL once and passes it to `gowave-auto.sh install` and `gowave-auto.sh node add`.
+2. `gowave-auto.sh install` and `domain-change` append `--server "$GOWAVE_ACME_SERVER"` to every Certbot issuance
+   call when set (two domain lineages in each path).
+3. `gowave-auto.sh node add` forwards the same value to `gowave-node-auto.sh remote_payload`.
+4. `remote_payload()` serializes the validated value into the SSH stdin script; Worker `certbot certonly`
+   calls for both Worker and REALITY domains use that exact URL.
+5. Before any certificate reuse, Master and Worker validate the renewal lineage's `server` directory URL
+   against the selected mode. Missing, unknown, or opposite-mode lineage metadata fails closed; do not infer
+   the ACME directory from a generic Let's Encrypt issuer string alone. A switch between modes requires a
+   verified isolated lineage plus atomic consumer/renewal-hook path migration, or a fresh disposable baseline;
+   never silently reuse or overwrite a cross-mode lineage.
+6. Tests cover both Master issuance calls, both Worker issuance calls, `domain-change`, SSH propagation, and
+   unset-variable backward compatibility.
 
 ---
+
+## Negative Scenario Matrix (NEG-01 — NEG-15)---
 
 ## Negative Scenario Matrix (NEG-01 — NEG-15)
 
@@ -553,7 +623,9 @@ the following strict schema:
 | `ACME_MODE` | `staging` \| `production` | No | `staging` | Let's Encrypt endpoint mode |
 | `GOWAVE_PANEL_VERSION` | SemVer / commit | Yes | — | Target GoWave Panel version to pin and verify |
 | `GOWAVE_NODE_VERSION` | SemVer / commit | Yes | — | Target GoWave Node version to pin and verify |
-| `GOWAVE_NODE_INSTALLER_COMMIT` | 40-hex SHA | Yes | — | Pinned commit of upstream `install.sh` |
+| `GOWAVE_NODE_INSTALLER_COMMIT` | 40-hex SHA | Yes | — | Pinned upstream `install.sh` commit; same value is used by Master-local and remote Worker paths |
+| `GOWAVE_NODE_INSTALLER_SHA256` | 64-hex SHA256 | Yes | — | SHA256 of exact upstream `install.sh` bytes at the pinned commit; verified before either execution path |
+| `XRAY_SERVER_VERSION` | Version string | Yes | — | Expected GoWave Node-managed Xray/rw-core version on both VPS; record and compare independently of Node version |
 | `XRAY_CLIENT_VERSION` | Version string | Yes | — | Pinned Xray client version on Control Machine |
 | `MIHOMO_CLIENT_VERSION` | Version string | Yes | — | Pinned Mihomo client version on Control Machine |
 | `ENABLE_IPV6` | Boolean | No | `false` | Enable IPv6 DNS, UFW, and listener verifications |
@@ -566,7 +638,7 @@ the following strict schema:
 | `TRAFFIC_TIMEOUT` | Integer seconds | No | `30` | SOCKS5 tunnel request timeout |
 | `TEST_TRAFFIC_VERIFICATION` | Boolean | No | `true` | Verify Data Plane traffic (`false` yields `INCOMPLETE`) |
 | `TEST_MIHOMO_TRAFFIC` | Boolean | No | `true` | Verify traffic with real Mihomo client process; false skips eight mandatory cases and makes overall status INCOMPLETE |
-| `TEST_NEGATIVE_SUITE` | Boolean | No | `true` | Execute NEG-01 through NEG-15 |
+| `TEST_NEGATIVE_SUITE` | Boolean | No | `true` | Execute NEG-01 through NEG-15; false marks all 15 SKIP and overall INCOMPLETE (never PASS) |
 | `TEST_TEARDOWN_POLICY` | Enum: `PRESERVE`, `RESTORE_SNAPSHOT` | No | `PRESERVE` | Mutually exclusive teardown policy; `DESTROY` is rejected in v1 |
 | `MASTER_SNAPSHOT_ID` | String | Conditional | — | Required for RESTORE_SNAPSHOT; operator-managed Master snapshot identifier |
 | `WORKER_SNAPSHOT_ID` | String | Conditional | — | Required for RESTORE_SNAPSHOT; operator-managed Worker snapshot identifier |
@@ -579,11 +651,19 @@ the following strict schema:
 
 ## Installer Pinning Gate
 
-**Problem:** `modules/node.sh` falls back to `curl .../main/install.sh` when no bundled installer is present.
+**Problem:** `modules/node.sh` falls back to `curl .../main/install.sh` when no bundled installer is present;
+`gowave-node-auto.sh` separately hard-codes the remote installer commit and downloads `install.sh` without a
+content-digest check. The config's `GOWAVE_NODE_INSTALLER_COMMIT` therefore does not currently control both
+installation paths, and a commit pin alone is not the documented commit-plus-content-integrity contract.
 
-**Solution:** E2E preflight verifies `sources/gowave-node/install.sh` exists in the pinned repository commit
-and that its SHA256 matches a computed value from the `GOWAVE_NODE_INSTALLER_COMMIT`. If the bundled file is
-absent or SHA256 mismatches, preflight terminates before installation.
+**Solution:** Vendor `sources/gowave-node/install.sh` from the exact configured 40-hex commit and record its
+real SHA256 in `GOWAVE_NODE_INSTALLER_SHA256`. The Master-local installer path MUST verify the bundled file
+against both the configured commit provenance and digest. The remote Worker path MUST use the same configured
+commit and digest, fetch only the immutable commit URL, verify the downloaded file's SHA256 before execution,
+and fail closed on any mismatch. `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1` disables the local floating-`main`
+fallback for E2E. The remote script MUST NOT keep an independent hard-coded commit that can drift from the
+runner configuration. The actual digest is computed from the vendored upstream file during implementation;
+no guessed or placeholder digest is allowed.
 
 ---
 
@@ -608,8 +688,16 @@ packet capture (tcpdump on the specific port for the duration of the test reques
 Documents this fallback explicitly in the diagnostic report.
 
 **[RISK] Xray and Mihomo binary versions on Control Machine may not match pinned config versions**
-→ Mitigation: Preflight checks binary version strings against `XRAY_CLIENT_VERSION` and
-`MIHOMO_CLIENT_VERSION`; mismatches terminate preflight.
+→ Mitigation: Preflight checks client versions against `XRAY_CLIENT_VERSION` and `MIHOMO_CLIENT_VERSION`,
+and checks the Node-managed server core independently against `XRAY_SERVER_VERSION`; mismatches terminate preflight.
+
+**[RISK] API TLS behavior differs between system trust and the Staging CA bundle**
+→ Mitigation: `GoWaveClient` accepts an injected SSL context and timeout; staging and public-CA positive
+requests plus an untrusted-CA negative test validate the actual pinned Python client path.
+
+**[RISK] Mihomo's subscription listener/controller ports collide with Control Machine services**
+→ Mitigation: Runtime config is isolated to loopback and free per-run ports; proxy definitions and rules are
+preserved and the controller is local only.
 
 **[RISK] Partial Worker SSH deployment leaves Worker in unknown state**
 → Mitigation: Runner invokes `gowave-auto.sh node rollback` on failure (which calls `remote_rollback`); result
