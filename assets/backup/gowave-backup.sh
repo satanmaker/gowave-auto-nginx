@@ -132,12 +132,29 @@ with tarfile.open(archive_path, "r:gz") as tar:
     allowlist = PANEL_ALLOWLIST_PATTERNS if backup_type == "panel" else NODE_ALLOWLIST_PATTERNS
 
     # 3. Inspect members against allowlist and forbidden patterns
-    file_checksums = {f["path"]: f.get("sha256") for f in meta_data.get("files", []) if "path" in f}
+    files_meta = meta_data.get("files")
+    if not isinstance(files_meta, list):
+        fail("meta.json files must be a list")
+    file_checksums = {}
+    for entry in files_meta:
+        if not isinstance(entry, dict):
+            fail("Invalid file metadata entry")
+        rel = entry.get("path")
+        digest = entry.get("sha256")
+        if not isinstance(rel, str) or not rel or rel in file_checksums:
+            fail(f"Missing or duplicate checksum path in meta.json: {rel}")
+        if not isinstance(digest, str) or len(digest) != 64 or any(ch not in "0123456789abcdefABCDEF" for ch in digest):
+            fail(f"Invalid SHA-256 digest in meta.json for {rel}")
+        file_checksums[rel] = digest.lower()
 
+    seen_members = set()
     for m in members:
         clean_name = m.name
         if clean_name.startswith("./"):
             clean_name = clean_name[2:]
+        if clean_name in seen_members:
+            fail(f"Duplicate archive member path rejected: {clean_name}")
+        seen_members.add(clean_name)
 
         if clean_name == "meta.json" or clean_name == "files" or clean_name == "files/":
             continue
@@ -196,11 +213,12 @@ with tarfile.open(archive_path, "r:gz") as tar:
         # 11. Checksum validation against meta.json
         if m.isreg():
             expected_sha = file_checksums.get(rel_path)
-            if expected_sha:
-                content = tar.extractfile(m).read()
-                actual_sha = hashlib.sha256(content).hexdigest()
-                if actual_sha != expected_sha:
-                    fail(f"Checksum mismatch for member {rel_path}: expected {expected_sha}, got {actual_sha}")
+            if not expected_sha:
+                fail(f"Missing SHA-256 metadata for regular file: {rel_path}")
+            content = tar.extractfile(m).read()
+            actual_sha = hashlib.sha256(content).hexdigest()
+            if actual_sha != expected_sha:
+                fail(f"Checksum mismatch for member {rel_path}: expected {expected_sha}, got {actual_sha}")
 
         # 4. Clear SUID / SGID bits
         m.mode &= ~(0o4000 | 0o2000 | 0o1000)
@@ -382,7 +400,8 @@ cmd_restore() {
     validate_archive_py "$archive" "$expected_type" "$staging_dir"
 
     # Pre-check: verify SQLite integrity of staged database before stopping services or modifying live files
-    if [[ "$expected_type" == "panel" ]] && [[ -f "$staging_dir/files/opt/gowave/gowave.db" ]]; then
+    if [[ "$expected_type" == "panel" ]]; then
+        [[ -s "$staging_dir/files/opt/gowave/gowave.db" ]] || die "Panel archive does not contain a non-empty gowave.db"
         echo "Verifying staged SQLite database integrity..."
         local integrity_ok
         integrity_ok=$(python3 -c "
@@ -412,36 +431,48 @@ except Exception as e:
     mkdir -p "$restore_snap"
     chmod 0700 "$restore_snap" 2>/dev/null || true
 
-    # Helper function to write journal atomically
+    # Helper function to write journal atomically. Do not hide journal failures:
+    # the journal is the recovery contract, not best-effort telemetry.
     update_restore_journal() {
         local j_state="$1"
         local j_snap="${2:-$restore_snap}"
         local j_err="${3:-}"
 
-        python3 -c "
+        PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$JOURNAL_FILE" "$j_state" "$j_snap" "$j_err" "$ts" <<'PY'
 import sys, time
-for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
-    if p not in sys.path:
-        sys.path.insert(0, p)
 from modules.recovery import write_journal_atomically
-
 jdata = {
-    'transaction_id': 'restore-$ts',
-    'op': 'restore',
-    'state': '$j_state',
-    'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-    'snapshot_dir': '$j_snap'
+    "transaction_id": "restore-" + sys.argv[5],
+    "op": "restore",
+    "state": sys.argv[2],
+    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "snapshot_dir": sys.argv[3],
 }
-if '$j_err':
-    jdata['error'] = '$j_err'
-write_journal_atomically('$JOURNAL_FILE', jdata)
-" 2>/dev/null || true
+if sys.argv[4]:
+    jdata["error"] = sys.argv[4]
+write_journal_atomically(sys.argv[1], jdata)
+PY
     }
 
-    # Step 1: Initialize PREPARED journal state
+    fail_snapshot_preflight() {
+        local reason="$1"
+        log_err "$reason; live data was not modified."
+        if [[ "$gowave_was_active" == "true" ]] && [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
+            systemctl start gowave.service
+            systemctl is-active --quiet gowave.service
+        fi
+        if [[ "$gowave_node_was_active" == "true" ]] && [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
+            systemctl start gowave-node.service
+            systemctl is-active --quiet gowave-node.service
+        fi
+        update_restore_journal "ROLLED_BACK" "$restore_snap" "$reason"
+        die "$reason"
+    }
+
+    # Step 1: Initialize PREPARED journal state.
     update_restore_journal "PREPARED"
 
-    # Stop service prior to live database snapshot / replacement to avoid dirty WAL
+    # Stop the target service before taking its rollback snapshot.
     local gowave_was_active=false
     local gowave_node_was_active=false
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
@@ -460,32 +491,36 @@ write_journal_atomically('$JOURNAL_FILE', jdata)
         fi
     fi
 
-    # Step 2: Capture consistent pre-restore snapshot
+    # Step 2: Capture a consistent and complete rollback snapshot before APPLYING.
     echo "Capturing pre-restore snapshot in $restore_snap..."
     if [[ "$expected_type" == "panel" ]]; then
-        if [[ -f "$DEFAULT_GOWAVE_DIR/gowave.db" ]]; then
-            echo "Taking snapshot of existing gowave.db..."
-            python3 -c "
+        [[ -s "$DEFAULT_GOWAVE_DIR/gowave.db" ]] || fail_snapshot_preflight "Live GoWave database is missing or empty"
+        echo "Taking consistent SQLite Online Backup of current gowave.db..."
+        if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$DEFAULT_GOWAVE_DIR/gowave.db" "$restore_snap/gowave.db" <<'PY'
 import sys
-for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
-    if p not in sys.path:
-        sys.path.insert(0, p)
 from modules.recovery import sqlite_online_backup
-sqlite_online_backup('$DEFAULT_GOWAVE_DIR/gowave.db', '$restore_snap/gowave.db')
-" 2>/dev/null || cp -p "$DEFAULT_GOWAVE_DIR/gowave.db" "$restore_snap/gowave.db"
-
-            [[ -f "$DEFAULT_GOWAVE_DIR/gowave.db-wal" ]] && cp -p "$DEFAULT_GOWAVE_DIR/gowave.db-wal" "$restore_snap/" 2>/dev/null || true
-            [[ -f "$DEFAULT_GOWAVE_DIR/gowave.db-shm" ]] && cp -p "$DEFAULT_GOWAVE_DIR/gowave.db-shm" "$restore_snap/" 2>/dev/null || true
+sqlite_online_backup(sys.argv[1], sys.argv[2])
+PY
+        then
+            fail_snapshot_preflight "Could not capture a consistent pre-restore SQLite snapshot"
         fi
         if [[ -f "$DEFAULT_GOWAVE_DIR/.env" ]]; then
-            cp -p "$DEFAULT_GOWAVE_DIR/.env" "$restore_snap/.env"
+            cp -p "$DEFAULT_GOWAVE_DIR/.env" "$restore_snap/.env" || fail_snapshot_preflight "Could not snapshot the Panel environment"
         fi
         if [[ -f "/var/lib/gowave-auto-nginx/state.json" ]]; then
-            cp -p "/var/lib/gowave-auto-nginx/state.json" "$restore_snap/state.json"
+            cp -p "/var/lib/gowave-auto-nginx/state.json" "$restore_snap/state.json" || fail_snapshot_preflight "Could not snapshot installation state"
+        fi
+        if [[ -d /etc/nginx ]]; then
+            mkdir -p "$restore_snap/etc"
+            cp -a /etc/nginx "$restore_snap/etc/nginx" || fail_snapshot_preflight "Could not snapshot NGINX configuration"
+        fi
+        if [[ -d /etc/letsencrypt ]]; then
+            mkdir -p "$restore_snap/etc"
+            cp -a /etc/letsencrypt "$restore_snap/etc/letsencrypt" || fail_snapshot_preflight "Could not snapshot ACME certificates"
         fi
     else
         if [[ -f "$DEFAULT_NODE_DIR/.env" ]]; then
-            cp -p "$DEFAULT_NODE_DIR/.env" "$restore_snap/.env"
+            cp -p "$DEFAULT_NODE_DIR/.env" "$restore_snap/.env" || fail_snapshot_preflight "Could not snapshot the Worker environment"
         fi
     fi
 
@@ -512,14 +547,13 @@ prune_snapshots('$RECOVERY_STORE')
 
         if [[ "$expected_type" == "panel" ]]; then
             if [[ -f "$restore_snap/gowave.db" ]]; then
-                cp -p "$restore_snap/gowave.db" "$DEFAULT_GOWAVE_DIR/gowave.db"
-                rm -f "$DEFAULT_GOWAVE_DIR/gowave.db-wal" "$DEFAULT_GOWAVE_DIR/gowave.db-shm"
-                [[ -f "$restore_snap/gowave.db-wal" ]] && cp -p "$restore_snap/gowave.db-wal" "$DEFAULT_GOWAVE_DIR/" 2>/dev/null || true
-                [[ -f "$restore_snap/gowave.db-shm" ]] && cp -p "$restore_snap/gowave.db-shm" "$DEFAULT_GOWAVE_DIR/" 2>/dev/null || true
-                chmod 0640 "$DEFAULT_GOWAVE_DIR/gowave.db" 2>/dev/null || true
+                cp "$restore_snap/gowave.db" "$DEFAULT_GOWAVE_DIR/gowave.db.rollback"
+                chmod 0640 "$DEFAULT_GOWAVE_DIR/gowave.db.rollback"
                 if [[ "$(id -u)" -eq 0 ]] && id -u gowave >/dev/null 2>&1; then
-                    chown gowave:gowave "$DEFAULT_GOWAVE_DIR/gowave.db" 2>/dev/null || true
+                    chown gowave:gowave "$DEFAULT_GOWAVE_DIR/gowave.db.rollback"
                 fi
+                rm -f "$DEFAULT_GOWAVE_DIR/gowave.db-wal" "$DEFAULT_GOWAVE_DIR/gowave.db-shm"
+                mv -f "$DEFAULT_GOWAVE_DIR/gowave.db.rollback" "$DEFAULT_GOWAVE_DIR/gowave.db"
             fi
             if [[ -f "$restore_snap/.env" ]]; then
                 cp -p "$restore_snap/.env" "$DEFAULT_GOWAVE_DIR/.env"
@@ -529,10 +563,27 @@ prune_snapshots('$RECOVERY_STORE')
                 fi
             fi
             if [[ -f "$restore_snap/state.json" ]]; then
-                cp -p "$restore_snap/state.json" "/var/lib/gowave-auto-nginx/state.json" 2>/dev/null || true
+                install -m 0600 "$restore_snap/state.json" "/var/lib/gowave-auto-nginx/state.json"
+            fi
+            if [[ -d "$restore_snap/etc/nginx" ]]; then
+                mkdir -p /etc/nginx/conf.d /etc/nginx/stream-enabled
+                rm -f /etc/nginx/conf.d/gowave-*.conf /etc/nginx/conf.d/00-bootstrap-acme.conf
+                rm -f /etc/nginx/stream-enabled/gowave-*.conf
+                cp -a "$restore_snap/etc/nginx/." /etc/nginx/
+                nginx -t
+            fi
+            if [[ -d "$restore_snap/etc/letsencrypt" ]]; then
+                mkdir -p /etc/letsencrypt
+                cp -a "$restore_snap/etc/letsencrypt/." /etc/letsencrypt/
             fi
             if [[ "$gowave_was_active" == "true" ]] && [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
-                systemctl start gowave.service 2>/dev/null || true
+                systemctl start gowave.service
+                systemctl is-active --quiet gowave.service
+                if command -v nginx >/dev/null 2>&1; then
+                    nginx -t
+                    systemctl reload nginx
+                    systemctl is-active --quiet nginx
+                fi
             fi
         else
             if [[ -f "$restore_snap/.env" ]]; then
@@ -593,14 +644,19 @@ prune_snapshots('$RECOVERY_STORE')
             echo "Restoring NGINX configurations..."
             if [[ -d "$staging_dir/files/etc/nginx/conf.d" ]]; then
                 mkdir -p /etc/nginx/conf.d
-                cp -a "$staging_dir"/files/etc/nginx/conf.d/* /etc/nginx/conf.d/ 2>/dev/null || true
+                rm -f /etc/nginx/conf.d/gowave-*.conf /etc/nginx/conf.d/00-bootstrap-acme.conf
+                cp -a "$staging_dir"/files/etc/nginx/conf.d/. /etc/nginx/conf.d/
             fi
             if [[ -d "$staging_dir/files/etc/nginx/stream-enabled" ]]; then
                 mkdir -p /etc/nginx/stream-enabled
-                cp -a "$staging_dir"/files/etc/nginx/stream-enabled/* /etc/nginx/stream-enabled/ 2>/dev/null || true
+                rm -f /etc/nginx/stream-enabled/gowave-*.conf
+                cp -a "$staging_dir"/files/etc/nginx/stream-enabled/. /etc/nginx/stream-enabled/
             fi
             if command -v nginx >/dev/null 2>&1; then
-                nginx -t || log_warn "Restored NGINX configuration test failed"
+                nginx -t || rollback_restore "Restored NGINX configuration test failed"
+                if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx; then
+                    systemctl reload nginx || rollback_restore "Restored NGINX reload failed"
+                fi
             fi
         fi
 
@@ -608,7 +664,7 @@ prune_snapshots('$RECOVERY_STORE')
         if [[ -d "$staging_dir/files/etc/letsencrypt" ]] && [[ "$(id -u)" -eq 0 ]]; then
             echo "Restoring Let's Encrypt certificates..."
             mkdir -p /etc/letsencrypt
-            cp -a "$staging_dir"/files/etc/letsencrypt/* /etc/letsencrypt/ 2>/dev/null || true
+            cp -a "$staging_dir"/files/etc/letsencrypt/. /etc/letsencrypt/
         fi
     else
         # Worker node restore

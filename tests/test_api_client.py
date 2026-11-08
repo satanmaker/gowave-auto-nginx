@@ -56,8 +56,9 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"response": {"uuid": uuid, "remark": body.get("remark")}})
         elif self.path == "/api/users":
             short_uuid = "suuid-12345"
-            self.users[body["username"]] = {**body, "shortUuid": short_uuid}
-            self.send_json(200, {"response": {"shortUuid": short_uuid, "username": body["username"]}})
+            user_uuid = f"user-{len(self.users) + 1}"
+            self.users[body["username"]] = {**body, "uuid": user_uuid, "shortUuid": short_uuid}
+            self.send_json(200, {"response": {"uuid": user_uuid, "shortUuid": short_uuid, "username": body["username"]}})
         elif self.path == "/api/tokens":
             self.send_json(200, {"response": {"token": "gowave-scoped-api-token-xyz", "id": "token-1"}})
         else:
@@ -68,6 +69,13 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"response": {"keypairs": [{"privateKey": "priv-key-base64", "publicKey": "pub-key-base64"}]}})
         elif self.path == "/api/config-profiles":
             self.send_json(200, {"response": {"configProfiles": [{"uuid": k, **v} for k, v in self.profiles.items()]}})
+        elif self.path.startswith("/api/config-profiles/") and self.path.count("/") == 3:
+            uuid = self.path.split("/")[3]
+            profile = self.profiles.get(uuid)
+            if profile is None:
+                self.send_json(404, {"error": "Not found"})
+            else:
+                self.send_json(200, {"response": {"uuid": uuid, **profile}})
         elif self.path.startswith("/api/config-profiles/") and self.path.endswith("/computed-config"):
             uuid = self.path.split("/")[3]
             cfg_str = self.profiles.get(uuid, {}).get("config", "{}")
@@ -380,14 +388,15 @@ class TestAPIClient(unittest.TestCase):
                 "op": "provision",
                 "state": "PROVISION_APPLYING",
                 "timestamp": "2026-11-08T00:00:00Z",
-                "entities": {
-                    "token_id": "token-1",
-                    "user_uuid": "user-uuid-1",
-                    "host_uuids": ["host-1", "host-2"],
-                    "squad_uuid": "squad-1",
-                    "node_uuid": "node-1",
-                    "profile_uuid": "prof-1",
-                }
+                "entities": [
+                    {"type": "token", "uuid": "token-1", "action": "created"},
+                    {"type": "user", "uuid": "user-uuid-1", "action": "created"},
+                    {"type": "host", "uuid": "host-1", "action": "created"},
+                    {"type": "host", "uuid": "host-2", "action": "created"},
+                    {"type": "squad", "uuid": "squad-1", "action": "created"},
+                    {"type": "node", "uuid": "node-1", "action": "created"},
+                    {"type": "profile", "uuid": "prof-1", "action": "created"},
+                ]
             }
             jfile.write_text(json.dumps(jdata))
             sfile.write_text(json.dumps({"schemaVersion": 2, "squadUuid": "squad-1"}))
@@ -398,6 +407,23 @@ class TestAPIClient(unittest.TestCase):
             # Check journal state transitioned to PROVISION_ROLLED_BACK
             updated_jdata = json.loads(jfile.read_text())
             self.assertEqual(updated_jdata["state"], "PROVISION_ROLLED_BACK")
+
+    def test_empty_prepared_journal_rolls_back_without_api_login(self):
+        """A PREPARED journal with no recorded side effects is safe to close without credentials."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            jfile.write_text(json.dumps({
+                "transaction_id": "provision_prepared",
+                "op": "provision",
+                "state": "PROVISION_PREPARED",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": {},
+            }))
+            res = rollback_provisioning(str(jfile), str(Path(tmpdir) / "state.json"),
+                                        str(Path(tmpdir) / "missing-credentials.txt"),
+                                        base_url=f"http://127.0.0.1:{self.port}")
+            self.assertTrue(res)
+            self.assertEqual(json.loads(jfile.read_text())["state"], "PROVISION_ROLLED_BACK")
 
     def test_rollback_node_add_flow(self):
         MockGoWaveServer.registered_users["admin"] = "securepass1234567890"
@@ -415,12 +441,11 @@ class TestAPIClient(unittest.TestCase):
                 "state": "NODE_ADD_APPLYING",
                 "node_name": "worker-1",
                 "timestamp": "2026-11-08T00:00:00Z",
-                "entities": {
-                    "profile_uuid": "prof-w1",
-                    "node_uuid": "node-w1",
-                    "inbound_uuids": ["inb-w1"],
-                    "host_uuids": ["host-w1"]
-                }
+                "entities": [
+                    {"type": "host", "uuid": "host-w1", "action": "created"},
+                    {"type": "node", "uuid": "node-w1", "action": "created"},
+                    {"type": "profile", "uuid": "prof-w1", "action": "created"},
+                ]
             }
             jfile.write_text(json.dumps(jdata))
             sfile.write_text(json.dumps({
@@ -549,9 +574,12 @@ class TestAPIClient(unittest.TestCase):
             sfile.write_text(json.dumps({"schemaVersion": 2}))
 
             res = rollback_provisioning(str(jfile), str(sfile), str(cfile), base_url=f"http://127.0.0.1:{self.port}")
-            self.assertTrue(res)
+            self.assertFalse(res)
 
-            # Unrelated profile and node must remain untouched
+            # Legacy UUID-only journals do not prove transaction ownership.
+            updated = json.loads(jfile.read_text())
+            self.assertEqual(updated["state"], "PROVISION_ROLLBACK_REQUIRED")
+            self.assertIn("rollback_error", updated)
             self.assertIn("unrelated-prof", MockGoWaveServer.profiles)
             self.assertIn("unrelated-node", MockGoWaveServer.nodes)
 

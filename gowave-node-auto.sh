@@ -39,6 +39,24 @@ remote_payload() {
     local panel_ip="${PANEL_IP:-}"
     local panel_ipv6="${PANEL_IPV6:-}"
     local admin_email="${ADMIN_EMAIL:-admin@${worker_domain}}"
+    local known_hosts="${SSH_KNOWN_HOSTS:-/root/.ssh/known_hosts}"
+    local host_key="$host"
+    if [[ "$port" != "22" ]]; then
+        host_key="[$host]:$port"
+    fi
+    if [[ ! -s "$known_hosts" ]] || ! ssh-keygen -F "$host_key" -f "$known_hosts" >/dev/null 2>&1; then
+        log_err "SSH host key for $host_key is not pre-pinned in $known_hosts."
+        log_err "Obtain the host key over a trusted channel, compare its fingerprint out-of-band, then add it to known_hosts."
+        return 1
+    fi
+    local installer_commit="7b3514d1ab8c674050597820d52d55525d4bece7"
+    local verifier_b64=""
+    if [[ -f "$SCRIPT_DIR/modules/verify_node_mtls.py" ]]; then
+        verifier_b64=$(base64 -w 0 "$SCRIPT_DIR/modules/verify_node_mtls.py")
+    else
+        echo "Error: mTLS verifier is required for remote worker acceptance." >&2
+        return 1
+    fi
 
     # Validate node port and warn on host collisions if worker host matches panel IP
     if [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "$panel_ip" ]]; then
@@ -61,6 +79,9 @@ remote_payload() {
         printf 'export PANEL_IPV6=%q\n' "$panel_ipv6"
         printf 'export NODE_PORT=%q\n' "$node_port"
         printf 'export GOWAVE_NODE_VERSION=%q\n' "${GOWAVE_NODE_VERSION:-latest}"
+        printf 'export GOWAVE_NODE_INSTALLER_COMMIT=%q\n' "$installer_commit"
+        printf 'export SSH_PORT=%q\n' "$port"
+        printf 'export VERIFY_NODE_MTLS_B64=%q\n' "$verifier_b64"
         printf 'export WORKER_DOMAIN=%q\n' "$worker_domain"
         printf 'export REALITY_DOMAIN=%q\n' "$reality_domain"
         printf 'export ADMIN_EMAIL=%q\n' "$admin_email"
@@ -80,38 +101,103 @@ setup_system_prereqs() {
 }
 
 configure_host_security() {
-    # 1. TCP MTU Probing and kernel BBR / FQ tuning
+    # Keep MTU/file-limit tuning independent from optional BBR support.
     mkdir -p /etc/sysctl.d
-    cat > /etc/sysctl.d/99-gowave-node.conf <<'EOF'
-# Managed by GoWave Auto NGINX
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_mtu_probing = 1
-fs.file-max = 1048576
-EOF
-    sysctl -p /etc/sysctl.d/99-gowave-node.conf 2>/dev/null || true
+    modprobe tcp_bbr 2>/dev/null || true
+    {
+        echo "# Managed by GoWave Auto NGINX"
+        echo "net.ipv4.tcp_mtu_probing = 1"
+        echo "fs.file-max = 1048576"
+        if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+            echo "net.core.default_qdisc = fq"
+            echo "net.ipv4.tcp_congestion_control = bbr"
+        else
+            echo "Warning: BBR is unavailable in this kernel; retaining the system congestion-control default." >&2
+        fi
+    } > /etc/sysctl.d/99-gowave-node.conf
+    sysctl -p /etc/sysctl.d/99-gowave-node.conf
 
-    # 2. Swap allocation if <= 1GB RAM on KVM
-    local mem_kb
-    mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
-    if [ "$mem_kb" -le 1048576 ] && [ "$mem_kb" -gt 0 ] && ! swapon --show 2>/dev/null | grep -q .; then
-        dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none
-        chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile || true
-        grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    # Allocate swap only on small-memory hosts. Do not persist a failed swapon.
+    local mem_kb fs_type swap_tmp
+    mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+    if [[ "$mem_kb" -le 1048576 && "$mem_kb" -gt 0 ]] && ! swapon --show --noheadings | grep -q .; then
+        if [[ -e /swapfile ]]; then
+            log_warn "/swapfile already exists; refusing to overwrite an unmanaged file."
+        else
+            fs_type=$(findmnt -n -o FSTYPE /)
+            if [[ "$fs_type" == "btrfs" ]]; then
+                if ! command -v btrfs >/dev/null 2>&1 || ! btrfs filesystem mkswapfile --size 1G /swapfile; then
+                    log_warn "Could not create a Btrfs-compatible swapfile; continuing without swap."
+                    rm -f /swapfile
+                fi
+            elif fallocate -l 1G /swapfile 2>/dev/null; then
+                chmod 0600 /swapfile
+                mkswap /swapfile >/dev/null
+            else
+                rm -f /swapfile
+                dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none
+                chmod 0600 /swapfile
+                mkswap /swapfile >/dev/null
+            fi
+            if [[ -f /swapfile ]] && swapon /swapfile; then
+                if ! grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab; then
+                    swap_tmp=$(mktemp /etc/fstab.gowave.XXXXXX)
+                    cat /etc/fstab > "$swap_tmp"
+                    printf '/swapfile none swap sw 0 0\n' >> "$swap_tmp"
+                    chmod --reference=/etc/fstab "$swap_tmp"
+                    chown --reference=/etc/fstab "$swap_tmp"
+                    mv -f "$swap_tmp" /etc/fstab
+                fi
+            else
+                log_warn "Swap activation failed; no /etc/fstab entry was written."
+                swapoff /swapfile 2>/dev/null || true
+                rm -f /swapfile
+            fi
+        fi
     fi
 }
 
 configure_firewall() {
-    # Enforce UFW rules: whitelist PANEL_IP for NODE_PORT, open 80/443
-    ufw allow 80/tcp comment "HTTP ACME challenge" || true
-    ufw allow 443/tcp comment "HTTPS and Xray Stream" || true
-    if [ -n "${PANEL_IP:-}" ]; then
-        ufw allow proto tcp from "$PANEL_IP" to any port "$NODE_PORT" comment "GoWave Control Plane IPv4" || true
+    local panel_ip="${PANEL_IP:-}" panel_ipv6="${PANEL_IPV6:-}" ssh_port="${SSH_PORT:-22}"
+    if [[ -z "$panel_ip" && -z "$panel_ipv6" ]]; then
+        echo "Fatal: PANEL_IP or PANEL_IPV6 is required; refusing an unscoped Node API firewall rule." >&2
+        return 1
     fi
-    if [ -n "${PANEL_IPV6:-}" ]; then
-        ufw allow proto tcp from "$PANEL_IPV6" to any port "$NODE_PORT" comment "GoWave Control Plane IPv6" || true
+    python3 - "$panel_ip" "$panel_ipv6" "$ssh_port" "$NODE_PORT" <<'PY'
+import ipaddress, sys
+v4, v6, ssh_port, node_port = sys.argv[1:]
+if v4 and ipaddress.ip_address(v4).version != 4:
+    raise SystemExit("PANEL_IP must be an IPv4 address")
+if v6 and ipaddress.ip_address(v6).version != 6:
+    raise SystemExit("PANEL_IPV6 must be an IPv6 address")
+for name, value in (("SSH_PORT", ssh_port), ("NODE_PORT", node_port)):
+    if not value.isdigit() or not 1 <= int(value) <= 65535:
+        raise SystemExit(f"{name} must be a valid TCP port")
+PY
+
+    # Detect an existing unrestricted API-port exception rather than claiming
+    # the new source-specific rule makes an already-open port private.
+    if ufw status | awk -v p="$NODE_PORT/tcp" 'index($0, p) == 1 && $0 ~ /ALLOW[[:space:]]+IN/ && $0 ~ /Anywhere/ {found=1} END {exit !found}'; then
+        echo "Fatal: UFW already contains an unrestricted allow rule for NODE_PORT=$NODE_PORT; remove it manually before retrying." >&2
+        return 1
     fi
-    ufw --force enable || true
+
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw allow "$ssh_port/tcp" comment "SSH administration"
+    ufw allow 80/tcp comment "HTTP ACME challenge"
+    ufw allow 443/tcp comment "HTTPS and Xray Stream"
+    if [[ -n "$panel_ip" ]]; then
+        ufw allow proto tcp from "$panel_ip" to any port "$NODE_PORT" comment "GoWave Control Plane IPv4"
+    fi
+    if [[ -n "$panel_ipv6" ]]; then
+        ufw allow proto tcp from "$panel_ipv6" to any port "$NODE_PORT" comment "GoWave Control Plane IPv6"
+    fi
+    ufw --force enable
+    ufw status | grep -q '^Status: active$' || {
+        echo "Fatal: UFW did not enter the active state." >&2
+        return 1
+    }
 }
 
 unpack_cover_reality() {
@@ -160,19 +246,29 @@ EOF
 
     rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf
 
-    # Verify both certificates exist and are non-empty
-    [[ -s "/etc/letsencrypt/live/$WORKER_DOMAIN/fullchain.pem" ]] || { echo "Fatal: $WORKER_DOMAIN certificate missing" >&2; return 1; }
-    [[ -s "/etc/letsencrypt/live/$WORKER_DOMAIN/privkey.pem" ]] || { echo "Fatal: $WORKER_DOMAIN private key missing" >&2; return 1; }
-    [[ -s "/etc/letsencrypt/live/$REALITY_DOMAIN/fullchain.pem" ]] || { echo "Fatal: $REALITY_DOMAIN certificate missing" >&2; return 1; }
-    [[ -s "/etc/letsencrypt/live/$REALITY_DOMAIN/privkey.pem" ]] || { echo "Fatal: $REALITY_DOMAIN private key missing" >&2; return 1; }
+    verify_worker_certificate() {
+        local domain="$1" cert="/etc/letsencrypt/live/$1/fullchain.pem" key="/etc/letsencrypt/live/$1/privkey.pem"
+        [[ -s "$cert" && -s "$key" ]] || { echo "Fatal: certificate/key missing for $domain" >&2; return 1; }
+        openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null
+        openssl x509 -in "$cert" -noout -checkend 86400 >/dev/null
+        local cert_pub key_pub
+        cert_pub=$(openssl x509 -in "$cert" -noout -pubkey)
+        key_pub=$(openssl pkey -in "$key" -pubout)
+        [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]] || {
+            echo "Fatal: certificate/private-key mismatch for $domain" >&2
+            return 1
+        }
+    }
+    verify_worker_certificate "$WORKER_DOMAIN"
+    verify_worker_certificate "$REALITY_DOMAIN"
 
     # Configure automated ACME reload hook for Worker
     mkdir -p /etc/letsencrypt/renewal-hooks/deploy
     cat > /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh <<'EOF'
 #!/bin/sh
-if nginx -t -q; then
-    systemctl reload nginx
-fi
+set -eu
+nginx -t -q
+systemctl reload nginx
 EOF
     chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh
 
@@ -296,11 +392,26 @@ EOF
 
 run_upstream_node_installer() {
     local tmp_inst
+    : "${GOWAVE_NODE_INSTALLER_COMMIT:?Pinned upstream installer commit is required}"
+    [[ "$GOWAVE_NODE_INSTALLER_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+        echo "Fatal: invalid pinned upstream installer commit." >&2
+        return 1
+    }
     tmp_inst=$(mktemp "/tmp/gowave-node-install-XXXXXX.sh")
-    curl -fsSL https://raw.githubusercontent.com/aaaSaZaN/gowave-node/main/install.sh -o "$tmp_inst"
+    if ! curl -fsSL --retry 2 --connect-timeout 15 --max-time 60 \
+        "https://raw.githubusercontent.com/aaaSaZaN/gowave-node/$GOWAVE_NODE_INSTALLER_COMMIT/install.sh" -o "$tmp_inst"; then
+        rm -f "$tmp_inst"
+        echo "Fatal: failed to fetch the pinned GoWave Node installer." >&2
+        return 1
+    fi
     chmod 0700 "$tmp_inst"
-    bash "$tmp_inst" </dev/null
-    rm -f "$tmp_inst"
+    if bash "$tmp_inst" </dev/null; then
+        rm -f "$tmp_inst"
+    else
+        local installer_rc=$?
+        rm -f "$tmp_inst"
+        return "$installer_rc"
+    fi
 
     # Configure drop-in for NODE_PORT
     mkdir -p /etc/systemd/system/gowave-node.service.d
@@ -310,6 +421,10 @@ Environment="NODE_PORT=$NODE_PORT"
 EOF
     systemctl daemon-reload
     systemctl restart gowave-node.service
+    systemctl is-active --quiet gowave-node.service || {
+        echo "Fatal: gowave-node.service is not active after upstream installation." >&2
+        return 1
+    }
 }
 RUNNER_FUNCS
 
@@ -318,7 +433,7 @@ RUNNER_FUNCS
 set -euo pipefail
 main() {
     umask 077
-    trap 'unset _NODE_SECRET_KEY SECRET_KEY' EXIT HUP INT TERM
+    trap 'unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64; rm -f /tmp/gowave-verify-node-mtls.py' EXIT HUP INT TERM
     setup_system_prereqs </dev/null
     configure_host_security </dev/null
     configure_firewall </dev/null
@@ -326,14 +441,21 @@ main() {
     unpack_cover_reality </dev/null
     configure_edge_nginx </dev/null
     umask 077
-    # Pass secret strictly scoped to upstream installer execution only
+    printf '%s' "$VERIFY_NODE_MTLS_B64" | base64 -d > /tmp/gowave-verify-node-mtls.py
+    chmod 0700 /tmp/gowave-verify-node-mtls.py
+    # Pass secret strictly scoped to upstream installer execution only.
     SECRET_KEY="$_NODE_SECRET_KEY" run_upstream_node_installer </dev/null
-    unset _NODE_SECRET_KEY SECRET_KEY
-    echo "GoWave Edge Worker deployment complete."
+    unset SECRET_KEY
+    systemctl is-active --quiet gowave-node.service
+    printf '%s' "$_NODE_SECRET_KEY" | python3 /tmp/gowave-verify-node-mtls.py --host 127.0.0.1 --port "$NODE_PORT"
+    nginx -t
+    systemctl is-active --quiet nginx
+    unset _NODE_SECRET_KEY VERIFY_NODE_MTLS_B64
+    echo "GoWave Edge Worker deployment complete (service, NGINX, TLS and mTLS health verified)."
 }
 main "$@" </dev/null
 REMOTE_EOF
-    } | ssh -T -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=15 -p "$port" "${ssh_user}@${host}" 'bash -s'
+    } | ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" -o ServerAliveInterval=15 -p "$port" "${ssh_user}@${host}" 'bash -s'
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
@@ -343,3 +465,4 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
         echo "Usage: gowave-node-auto.sh <command> [args]"
     fi
 fi
+

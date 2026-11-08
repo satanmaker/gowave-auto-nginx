@@ -6,6 +6,21 @@
 
 ---
 
+## Current execution and acceptance status (2026-11-08)
+
+The workflow names and local scripts must not be interpreted as evidence that every acceptance scenario has been executed:
+
+- `tests/run_ci.py --suite systemd` currently exercises static unit-template contract assertions. It is **not** a QEMU guest boot.
+- `tests/systemd/boot.sh` is a separate QEMU cold-boot runner. It requires a prepared target-distribution root filesystem at `WORK_DIR/rootfs.tar`, a host kernel and QEMU; it now fails when these prerequisites are missing and checks for the guest success marker.
+- `tests/podman_testbed.sh all` runs container-level stages when Podman is present. A missing Podman binary returns exit code 77 (unavailable), never success.
+- `tests/podman_testbed.sh multi-node` remains a scaffold. It does not call `remote_payload`, register a real GoWave Worker through the Panel API, perform mTLS, or generate client data-plane traffic. It returns exit code 77 after identifying the missing E2E coverage.
+- A deployment-grade multi-node E2E and four-distribution QEMU cold-boot matrix remain incomplete. Do not use these two targets as a release gate until those tests are implemented and their runs are recorded.
+- Worker SSH deployment requires a pre-pinned host key in the Panel operator's `known_hosts`. Obtain the key over a trusted channel, compare its fingerprint out of band, and only then add it; the script no longer trusts the first network observation.
+
+The GitHub workflows run on pull requests targeting `main` and `feature/**`. A green workflow run validates only the suite named by that workflow, not the deferred Podman multi-node or QEMU acceptance scope.
+
+---
+
 ## 1. Test Runner Contract & Privilege Separation
 
 GoWave Auto NGINX adopts the exact test runner architecture of `community-baseline/tests/run_ci.py`. The runner verifies test completeness dynamically and enforces strict process EUID privileges before running any suite:
