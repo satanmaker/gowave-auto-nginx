@@ -441,8 +441,9 @@ When the pair is configured:
    Panel and REALITY certificates before compiling/provisioning the Master profile. The current best-effort
    suppression of Vision Certbot/certificate-verification failures (`|| true`) MUST be removed for this E2E
    path. A missing, wrong-ACME-lineage, expired, or hostname-invalid Vision certificate fails Master
-   installation and triggers rollback; the runner MUST NOT report a partial four-inbound Master as successful
-   Vision-enabled installation.
+   installation; implementation MUST provide an install cleanup/rollback path and test that no partial Vision
+   profile, certificate consumer, or NGINX route remains active. The runner MUST NOT report a partial
+   four-inbound Master as successful Vision-enabled installation.
 2. `gowave-auto.sh node add` MUST receive the Worker Vision domain through an explicit named
    `--vision-domain` option (not by shifting the existing optional SSH-user/SSH-port positional arguments).
    It validates the domain, includes it in the Worker API profile via `compile_config_profile(...,
@@ -499,10 +500,10 @@ Phase 0: Preflight
   0.2  Acquire the local per-target `fcntl.flock` in the private runtime directory
   0.3  Control Machine tool check (python3, ssh, openssl, curl, dig, xray, mihomo)
   0.4  SSH trust check (both VPS, StrictHostKeyChecking=yes)
-  0.5  DNS verification (4 domains required: Panel, Reality for Master/Worker; plus optional 2 Vision domains when configured, A/AAAA, 2+ resolvers)
+  0.5  DNS verification (4 domains required: Panel, Reality for Master/Worker; plus both optional Vision domains when the pair is configured, A/AAAA, 2+ resolvers)
   0.6  Baseline snapshot (systemd, listeners, firewall, GoWave dirs)
   0.7  Disposable gate (reject if GoWave present or ports occupied)
-  0.8  Port hygiene (11+ required ports checked as free: 80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, 10003; plus 8444 and 9444 when vision domain is enabled)
+  0.8  Port hygiene (11+ required ports checked as free: 80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, 10003; plus 8444 and 9444 when the Vision domain pair is enabled)
   0.9  Acquire and hold authoritative `flock` sessions on both VPS hosts in deterministic address order;
        preflight-only runs release them on exit; all mutating phases require both locks
   0.10 Re-collect the read-only baseline/disposable gate on both hosts while both locks are held; if any
@@ -555,9 +556,9 @@ Phase 4: Panel API Audit
 Phase 5: Subscriptions
   5.1  GET /api/users/by-username/default-user → shortUuid
   5.2  User-Agent policy (empty, absent, Xray UA, Mihomo UA → check actual Panel response)
-  5.3  Fetch Xray JSON (Xray UA), verify 8 proxy outbounds (or 10 with vision), fingerprint="firefox", headers, no server secrets
+  5.3  Fetch Xray JSON (Xray UA), verify 8 proxy outbounds (or 10 when the paired Vision domains are configured), fingerprint="firefox", headers, no server secrets
   5.4  Validate with xray run -test (temporary wrapper config)
-  5.5  Fetch Mihomo YAML (Mihomo UA), verify 8 proxies (or 10 with vision), client-fingerprint="firefox", GEOIP rule, headers
+  5.5  Fetch Mihomo YAML (Mihomo UA), verify 8 proxies (or 10 when the paired Vision domains are configured), client-fingerprint="firefox", GEOIP rule, headers
   5.6  Validate with mihomo -t
   5.7  Verify Mihomo runtime copy binds all local listeners to 127.0.0.1 on collision-free per-run ports;
        preserve proxy/rule semantics and reject externally exposed or non-loopback controllers
@@ -577,14 +578,14 @@ Phase 7: NGINX SNI + REALITY Decoy (+ Optional Vision)
   7.2  Worker HTTPS with correct SNI
   7.3  REALITY fallback with REALITY SNI + invalid REALITY params (decoy content on 9443, not GoWave API)
   7.4  Unknown SNI routing (matches NGINX + Xray REALITY fallback behavior)
-  7.5  Optional Vision SNI routing to 8444 and non-VLESS HTTP fallback to decoy on 9444 when configured
+  7.5  Optional paired-Vision SNI routing to 8444 and non-VLESS HTTP fallback to decoy on 9444 when configured
   7.6  nginx -t on both VPS configs
   7.7  cover-reality unique marker file accessible
   7.8  PROXY protocol integrity (inferred from correct Panel, Worker, REALITY, and Vision responses)
 
 Phase 8: Data Plane E2E (8 or 10 logical endpoints × 2 client runtimes = 16 or 20 required cases)
-  8.1  Logical endpoint matrix: Master × {VLESS REALITY, VLESS XHTTP, VLESS WS, Trojan gRPC, and optional VLESS XTLS-Vision when Vision domain is configured}
-       and Worker × the same protocols (8 endpoints by default; 10 when Vision domain is configured)
+  8.1  Logical endpoint matrix: Master × {VLESS REALITY, VLESS XHTTP, VLESS WS, Trojan gRPC, and optional VLESS XTLS-Vision when the Vision domain pair is configured}
+       and Worker × the same protocols (8 endpoints by default; 10 when both Vision domains are configured)
   8.2  For each logical endpoint, run a real Xray client case and a real Mihomo client case (with firefox fingerprint):
        - Extract the corresponding proxy from the real subscription
        - Build/validate a temporary Xray wrapper config; for Mihomo, create a per-run sanitized copy of
