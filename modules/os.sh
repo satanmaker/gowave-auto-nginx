@@ -184,13 +184,32 @@ ensure_systemd_resolved() {
     local os_release="${1:-/etc/os-release}"
     detect_os "$os_release" || true
 
-    if ! command -v resolvectl >/dev/null 2>&1; then
-        if [[ "$OS_ID" == "debian" && ( "$OS_VERSION_ID" == "12" || "$OS_VERSION_ID" == "13" ) ]]; then
+    if [[ "$OS_ID" == "debian" && ( "$OS_VERSION_ID" == "12" || "$OS_VERSION_ID" == "13" ) ]]; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        if [[ ! -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf ]]; then
+            cat > /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf << 'EOF'
+# Managed by GoWave Auto NGINX: VPS Security
+[Resolve]
+DNS=
+DNS=1.1.1.1#one.one.one.one 1.0.0.1#one.one.one.one 8.8.8.8#dns.google 8.8.4.4#dns.google
+FallbackDNS=
+Domains=
+Domains=~.
+DNSOverTLS=yes
+DNSSEC=no
+LLMNR=no
+MulticastDNS=no
+Cache=yes
+DNSStubListener=yes
+EOF
+        fi
+        if ! command -v resolvectl >/dev/null 2>&1; then
             echo "Installing systemd-resolved on Debian ${OS_VERSION_ID}..."
             DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends systemd-resolved
             systemctl enable --now systemd-resolved || true
         fi
+        systemctl restart systemd-resolved 2>/dev/null || true
     fi
 }
 
@@ -243,5 +262,6 @@ install_prerequisites() {
     echo "Installing missing prerequisites: ${missing[*]}..."
     DEBIAN_FRONTEND=noninteractive apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+    ensure_systemd_resolved
     return 0
 }
