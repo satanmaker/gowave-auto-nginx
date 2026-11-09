@@ -182,5 +182,40 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
         self.assertEqual(status, "INCOMPLETE")
 
 
+    def test_report_builder_fails_closed_on_missing_phase_and_case_status(self):
+        cases = build_test_cases_from_state({
+            "results": {
+                "verify": {},
+                "traffic": {
+                    "xray_results": [{"tag": "xray-master"}],
+                    "mihomo_results": {"results": [{"proxy": "mihomo-worker"}]},
+                },
+                "negative": {"scenarios": [{"id": "NEG-01"}]},
+            }
+        })
+        by_name = {case["name"]: case for case in cases}
+        self.assertEqual(by_name["phase_verify"]["status"], "INCOMPLETE")
+        self.assertEqual(by_name["traffic_xray_xray-master"]["status"], "INCOMPLETE")
+        self.assertEqual(by_name["traffic_mihomo_mihomo-worker"]["status"], "INCOMPLETE")
+        self.assertEqual(by_name["negative_NEG-01"]["status"], "INCOMPLETE")
+
+    def test_report_builder_uses_mihomo_proxy_name_instead_of_unknown(self):
+        cases = build_test_cases_from_state({
+            "results": {
+                "traffic": {
+                    "status": "PASS",
+                    "xray_results": [{"tag": "master-reality", "status": "PASS"}],
+                    "mihomo_results": {
+                        "status": "PASS",
+                        "results": [{"proxy": "worker-vision", "status": "PASS"}],
+                    },
+                }
+            }
+        })
+        names = {case["name"] for case in cases}
+        self.assertIn("traffic_mihomo_worker-vision", names)
+        self.assertNotIn("traffic_mihomo_unknown", names)
+
+
 if __name__ == "__main__":
     unittest.main()
