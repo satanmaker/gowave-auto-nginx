@@ -8,6 +8,7 @@ from datetime import datetime
 import math
 from pathlib import Path
 import shutil
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -33,6 +34,18 @@ VALID_STATES = {st for states in OP_ALLOWED_STATES.values() for st in states}
 
 class JournalValidationError(Exception):
     pass
+
+
+def load_journal_file(journal_path):
+    """Load a regular recovery journal without following symlinks or blocking on special files."""
+    fd = os.open(
+        str(journal_path),
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+    )
+    with os.fdopen(fd, "r", encoding="utf-8") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError("recovery journal is not a regular file")
+        return json.load(stream)
 
 
 def validate_journal(journal_data):
@@ -269,8 +282,7 @@ def sqlite_online_backup(db_path, backup_dest, gowave_user="gowave"):
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--validate-journal":
-        with open(sys.argv[2]) as f:
-            data = json.load(f)
+        data = load_journal_file(sys.argv[2])
         validate_journal(data)
         print("Journal valid.")
     else:
