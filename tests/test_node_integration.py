@@ -155,6 +155,13 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn("certbot delete --cert-name \"$WORKER_DOMAIN\"", worker_script)
         self.assertIn("swapoff /swapfile", worker_script)
         self.assertIn("ufw delete allow proto tcp from \"$PANEL_IP\"", worker_script)
+        self.assertIn("local rollback_failed=0", worker_script)
+        self.assertIn("compensating rollback incomplete; one or more cleanup operations failed", worker_script)
+        self.assertIn('if [[ "$swap_is_inactive" -eq 1 ]]; then', worker_script)
+        self.assertIn('active_swaps=$(swapon --noheadings --raw --output NAME 2>/dev/null)', worker_script)
+
+        self.assertNotIn("Compensating rollback completed on worker host.", worker_script)
+        self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_failed=1', worker_script)
 
     def test_worker_standalone_remote_rollback_defined(self):
         """gowave-node-auto.sh must provide standalone remote_rollback command."""
