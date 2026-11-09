@@ -15,7 +15,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 import sys
 sys.path.insert(0, str(REPO_ROOT))
-from modules.api_client import GoWaveClient, atomic_write_state, save_credentials, rollback_provisioning, _extract_list
+from modules.api_client import GoWaveAPIError, GoWaveClient, atomic_write_state, save_credentials, rollback_provisioning, _extract_list
 
 
 class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
@@ -504,6 +504,46 @@ class TestAPIClient(unittest.TestCase):
             # Check journal state transitioned to PROVISION_ROLLED_BACK
             updated_jdata = json.loads(jfile.read_text())
             self.assertEqual(updated_jdata["state"], "PROVISION_ROLLED_BACK")
+
+    def test_rollback_journal_does_not_persist_api_response_secrets(self):
+        marker = "private-key-secret-marker"
+        class FailingRollbackClient:
+            def __init__(self, base_url):
+                pass
+
+            def login(self, username, password):
+                return "mock-token"
+
+            def delete_node(self, uuid):
+                raise GoWaveAPIError(
+                    f"API rejected request and echoed {marker}",
+                    status_code=500,
+                    response_body=f'{{"error":"{marker}"}}',
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            cfile = Path(tmpdir) / "credentials.txt"
+            save_credentials("admin", "securepass1234567890", "https://panel.example.com", creds_path=str(cfile))
+            jfile.write_text(json.dumps({
+                "transaction_id": "provision_redaction",
+                "op": "provision",
+                "state": "PROVISION_APPLYING",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": [{"type": "node", "uuid": "node-1", "action": "created"}],
+            }))
+
+            with mock.patch("modules.api_client.GoWaveClient", FailingRollbackClient):
+                result = rollback_provisioning(
+                    str(jfile), str(Path(tmpdir) / "state.json"), str(cfile)
+                )
+
+            self.assertFalse(result)
+            journal_text = jfile.read_text()
+            self.assertNotIn(marker, journal_text)
+            journal = json.loads(journal_text)
+            self.assertIn("GoWaveAPIError", journal["rollback_errors"][0])
+            self.assertIn("HTTP 500", journal["rollback_errors"][0])
 
     def test_empty_prepared_journal_rolls_back_without_api_login(self):
         """A PREPARED journal with no recorded side effects is safe to close without credentials."""
