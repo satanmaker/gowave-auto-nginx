@@ -118,7 +118,7 @@ command.
 
 #### Scenario: Published AAAA records cannot bypass IPv6 verification
 
-- **GIVEN** any configured Panel, REALITY or paired Vision FQDN publishes an AAAA record
+- **GIVEN** any configured Panel, REALITY, or independently configured Vision FQDN publishes an AAAA record
 - **WHEN** preflight validates DNS and the listener/firewall policy
 - **THEN** with ENABLE_IPV6=false preflight fails before remote modification; with ENABLE_IPV6=true,
   every AAAA answer from each independent resolver matches only the configured VPS IPv6 address and the
@@ -937,8 +937,9 @@ token, raw `shortUuid`, or subscription content containing private parameters.
 ### Requirement: Result Status Semantics
 
 The runner SHALL use exactly the status values: `PASS`, `FAIL`, `SKIP`, `NOT_RUN`, `PARTIAL`, `INCOMPLETE`,
-and `TEARDOWN_FAILED`. Overall `PASS` requires all mandatory phases completed, all sixteen or twenty Data Plane
-runtime cases verified, and the declared teardown policy completed. `SKIP` and `NOT_RUN` are non-passing.
+and `TEARDOWN_FAILED`. Overall `PASS` requires all mandatory phases completed, all sixteen, eighteen, or twenty Data Plane
+runtime cases verified according to the configured Vision domains, verified temporary SSH-key cleanup, and
+the declared teardown policy completed. `SKIP` and `NOT_RUN` are non-passing.
 `shortUuid` SHALL NOT appear in JUnit XML or any CI-published artifact.
 
 #### Scenario: PASS requires all active Data Plane runtime cases
@@ -950,8 +951,8 @@ runtime cases verified, and the declared teardown policy completed. `SKIP` and `
 #### Scenario: Vision-enabled PASS requires all active runtime cases
 
 - **GIVEN** one or both Vision domains are configured and all installation, API, subscription, firewall, and NGINX phases are `PASS`
-- **WHEN** one or more active runtime cases fail (fewer than 16, 18, or 20 pass, as applicable)
-- **THEN** overall status is `FAIL`, not `PASS`; both failed Vision or core protocol/client cases are identified individually in `result.json` and JUnit XML
+- **WHEN** any active runtime case fails
+- **THEN** overall status is `FAIL`, not `PASS`; each failed Vision or core protocol/client case is identified individually in `result.json` and JUnit XML
 
 #### Scenario: result.json schema fields present
 
