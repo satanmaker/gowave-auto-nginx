@@ -376,8 +376,7 @@ def run_neg_14_duplicate_worker_registration(
         return {"scenario": "NEG-14", "status": "INCOMPLETE",
                 "message": f"Could not verify Panel API identities after duplicate call: {type(exc).__name__}"}
 
-    combined_output = result.stdout + "
-" + result.stderr
+    combined_output = result.stdout + chr(10) + result.stderr
     explicit_duplicate_rejection = (
         not result.ok and "already registered in state.json" in combined_output
     )

@@ -118,14 +118,6 @@ def verify_worker_firewall(
     worker_ipv6: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Verify Master allow-list access and external TCP/3002 denial on Worker."""
-    master_public_ip_r = master_ssh.run("curl -fsS4 --connect-timeout 5 --max-time 10 https://api.ipify.org")
-    master_public_ip = master_public_ip_r.stdout.strip() if master_public_ip_r.ok else ""
-    if not master_public_ip:
-        return {
-            "status": "INCOMPLETE",
-            "error": "Could not determine Master public egress IP for Worker allow-list verification",
-        }
-
     master_probe = master_ssh.run(
         f"python3 -c \"import socket; s = socket.create_connection(('{worker_ip}', 3002), timeout=5); s.close(); print('CONNECTED')\""
     )
@@ -135,6 +127,15 @@ def verify_worker_firewall(
             "status": "FAIL",
             "positive_control_ok": False,
             "error": "Master could not connect to Worker TCP/3002",
+        }
+
+    master_public_ip_r = master_ssh.run("curl -fsS4 --connect-timeout 5 --max-time 10 https://api.ipify.org")
+    master_public_ip = master_public_ip_r.stdout.strip() if master_public_ip_r.ok else ""
+    if not master_public_ip:
+        return {
+            "status": "INCOMPLETE",
+            "positive_control_ok": positive_ok,
+            "error": "Could not determine Master public egress IP for Worker allow-list verification",
         }
 
     worker_ufw = worker_ssh.run("ufw status verbose")

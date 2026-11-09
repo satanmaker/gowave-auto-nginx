@@ -99,8 +99,8 @@ class TestPreflightSSHDNS(unittest.TestCase):
     def test_worker_firewall_requires_source_specific_master_allow(self, cm_ip, probe):
         master = MagicMock()
         master.run.side_effect = [
-            MagicMock(ok=True, stdout="203.0.113.10"),
             MagicMock(ok=True, stdout="CONNECTED"),
+            MagicMock(ok=True, stdout="203.0.113.10"),
         ]
         worker = MagicMock()
         worker.run.side_effect = [
