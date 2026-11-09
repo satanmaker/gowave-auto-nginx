@@ -16,6 +16,7 @@ from live_vps.firewall import verify_master_firewall, verify_worker_firewall
 from live_vps.preflight import (
     check_disposable_gate,
     check_private_key_file,
+    check_ssh_trust,
     LocalLock,
     check_control_machine_tools,
 )
