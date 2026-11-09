@@ -589,7 +589,13 @@ def main() -> int:
                 sub_url = f"https://{config.master_panel_domain}/api/sub/{short_uuid}/v2ray-json"
                 req_x = urllib.request.Request(sub_url, headers={"User-Agent": "v2rayNG/1.8.5"})
                 with urllib.request.urlopen(req_x, context=ssl_ctx, timeout=10) as resp_x:
-                    xray_raw_outbounds = json.loads(resp_x.read().decode("utf-8")).get("outbounds", [])
+                    parsed_sub = json.loads(resp_x.read().decode("utf-8"))
+                    if isinstance(parsed_sub, list):
+                        for item in parsed_sub:
+                            if isinstance(item, dict):
+                                xray_raw_outbounds.extend(item.get("outbounds", []))
+                    elif isinstance(parsed_sub, dict):
+                        xray_raw_outbounds = parsed_sub.get("outbounds", [])
             except Exception:
                 pass
 

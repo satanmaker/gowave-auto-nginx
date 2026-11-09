@@ -175,13 +175,29 @@ def fetch_and_validate_xray_subscription(
         return False, {"error": f"Malformed Xray subscription JSON: {e}"}
 
     # Filter proxy-capable outbounds: exclude direct, block, dns, etc.
-    raw_outbounds = sub_json.get("outbounds", [])
+    if isinstance(sub_json, list):
+        items = sub_json
+    elif isinstance(sub_json, dict):
+        items = sub_json.get("outbounds", [])
+    else:
+        items = []
+
     proxy_outbounds = []
-    for ob in raw_outbounds:
-        protocol = ob.get("protocol", "").lower()
-        tag = ob.get("tag", "").lower()
-        if protocol in ("vless", "trojan", "vmess", "shadowsocks"):
-            proxy_outbounds.append(ob)
+    configs_to_validate = []
+
+    if isinstance(sub_json, list):
+        for item in sub_json:
+            if isinstance(item, dict):
+                configs_to_validate.append(item)
+                for ob in item.get("outbounds", []):
+                    protocol = ob.get("protocol", "").lower()
+                    if protocol in ("vless", "trojan", "vmess", "shadowsocks"):
+                        proxy_outbounds.append(ob)
+    else:
+        for ob in items:
+            protocol = ob.get("protocol", "").lower()
+            if protocol in ("vless", "trojan", "vmess", "shadowsocks"):
+                proxy_outbounds.append(ob)
 
     expected_count = 10 if has_vision else 8
     if len(proxy_outbounds) != expected_count:
@@ -201,26 +217,42 @@ def fetch_and_validate_xray_subscription(
     # Validate with real Xray CLI if installed
     xray_cli_ok = True
     if subprocess.run(["which", "xray"], capture_output=True).returncode == 0:
-        # Wrap into full valid Xray client config
-        full_xray_config = {
-            "log": {"loglevel": "warning"},
-            "inbounds": [{"port": 10808, "listen": "127.0.0.1", "protocol": "socks", "settings": {"auth": "noauth"}}],
-            "outbounds": raw_outbounds,
-        }
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
-            json.dump(full_xray_config, tf)
-            tmp_config = tf.name
+        env = os.environ.copy()
+        if ca_bundle_path:
+            env["SSL_CERT_FILE"] = str(ca_bundle_path)
 
-        try:
-            env = os.environ.copy()
-            if ca_bundle_path:
-                env["SSL_CERT_FILE"] = str(ca_bundle_path)
-            res = subprocess.run(["xray", "run", "-test", "-config", tmp_config], capture_output=True, text=True, env=env)
-            if res.returncode != 0:
-                xray_cli_ok = False
-        finally:
-            if os.path.exists(tmp_config):
-                os.remove(tmp_config)
+        if configs_to_validate:
+            # Validate each full individual profile JSON returned by the subscription
+            for cfg_item in configs_to_validate:
+                with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+                    json.dump(cfg_item, tf)
+                    tmp_config = tf.name
+                try:
+                    res = subprocess.run(["xray", "run", "-test", "-config", tmp_config], capture_output=True, text=True, env=env)
+                    if res.returncode != 0:
+                        xray_cli_ok = False
+                        break
+                finally:
+                    if os.path.exists(tmp_config):
+                        os.remove(tmp_config)
+        else:
+            # Wrap into full valid Xray client config
+            full_xray_config = {
+                "log": {"loglevel": "warning"},
+                "inbounds": [{"port": 10808, "listen": "127.0.0.1", "protocol": "socks", "settings": {"auth": "noauth"}}],
+                "outbounds": items,
+            }
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+                json.dump(full_xray_config, tf)
+                tmp_config = tf.name
+
+            try:
+                res = subprocess.run(["xray", "run", "-test", "-config", tmp_config], capture_output=True, text=True, env=env)
+                if res.returncode != 0:
+                    xray_cli_ok = False
+            finally:
+                if os.path.exists(tmp_config):
+                    os.remove(tmp_config)
 
     if not xray_cli_ok:
         return False, {"error": "xray run -test failed on fetched subscription"}
