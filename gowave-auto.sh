@@ -694,6 +694,7 @@ write_journal_atomically('$JOURNAL_FILE', jdata)
             local secret_key
             secret_key=$(extract_secret_key "$GOWAVE_DIR")
             if ! PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
+                XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
                 GOWAVE_ACME_SERVER="${GOWAVE_ACME_SERVER:-}" \
                 GOWAVE_NODE_INSTALLER_COMMIT="${GOWAVE_NODE_INSTALLER_COMMIT:-}" \
                 GOWAVE_NODE_INSTALLER_SHA256="${GOWAVE_NODE_INSTALLER_SHA256:-}" \

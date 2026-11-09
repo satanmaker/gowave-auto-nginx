@@ -58,7 +58,8 @@ class TestSection6Modules(unittest.TestCase):
         mock_resp.headers = {"Cache-Control": "no-store"}
         mock_resp.read.return_value = json.dumps(valid_xray_payload).encode("utf-8")
 
-        with patch("urllib.request.urlopen", return_value=mock_resp):
+        with patch("urllib.request.urlopen", return_value=mock_resp), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0)):
             ok, res = fetch_and_validate_xray_subscription("panel.example.com", "uuid", ctx, has_vision=False)
             self.assertTrue(ok)
             self.assertEqual(res["proxy_outbounds_count"], 8)
@@ -101,7 +102,8 @@ rules:
         mock_resp.status = 200
         mock_resp.read.return_value = valid_yaml_text.encode("utf-8")
 
-        with patch("urllib.request.urlopen", return_value=mock_resp):
+        with patch("urllib.request.urlopen", return_value=mock_resp), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0)):
             ok, res = fetch_and_validate_mihomo_subscription("panel.example.com", "uuid", ctx, has_vision=False)
             self.assertTrue(ok)
             self.assertEqual(res["proxies_count"], 8)

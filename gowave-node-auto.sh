@@ -638,6 +638,7 @@ remote_payload() {
         printf 'export GOWAVE_NODE_INSTALLER_COMMIT=%q\n' "$installer_commit"
         printf 'export GOWAVE_NODE_INSTALLER_SHA256=%q\n' "$installer_sha256"
         printf 'export SSH_PORT=%q\n' "$port"
+        printf 'export XRAY_SERVER_VERSION=%q\n' "${XRAY_SERVER_VERSION:-}"
         printf 'export VERIFY_NODE_MTLS_B64=%q\n' "$verifier_b64"
         printf 'export WORKER_DOMAIN=%q\n' "$worker_domain"
         printf 'export REALITY_DOMAIN=%q\n' "$reality_domain"
@@ -1590,6 +1591,17 @@ run_upstream_node_installer() {
 [Service]
 Environment="NODE_PORT=$NODE_PORT"
 EOF
+
+    # Install pinned Xray core version if explicitly configured and mismatched
+    if [[ -n "${XRAY_SERVER_VERSION:-}" && -x "/opt/gowave-node/gowave-node" ]]; then
+        local cur_core
+        cur_core=$(/opt/gowave-node/rw-core version 2>/dev/null || true)
+        if ! echo "$cur_core" | grep -q "${XRAY_SERVER_VERSION#v}"; then
+            log_info "Installing explicit Xray server version $XRAY_SERVER_VERSION..."
+            /opt/gowave-node/gowave-node core install --version "v${XRAY_SERVER_VERSION#v}" -y 2>/dev/null || \
+            /opt/gowave-node/gowave-node core install --version "${XRAY_SERVER_VERSION#v}" -y 2>/dev/null || true
+        fi
+    fi
     systemctl daemon-reload
     systemctl restart gowave-node.service
     systemctl is-active --quiet gowave-node.service || {
