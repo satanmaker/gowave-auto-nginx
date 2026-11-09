@@ -10,6 +10,7 @@ REMEDIATION_REPORT.md
 # IDE and Editor files
 .idea/
 .vscode/
+.qwen/
 *.swp
 *.swo
 *~
