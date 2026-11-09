@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import subprocess
@@ -82,10 +83,20 @@ def get_git_head_commit() -> str:
     return "unknown_commit"
 
 
+def build_config_fingerprint(config: LiveVPSConfig) -> str:
+    """Hash every parsed non-secret configuration value for partial-run identity."""
+    canonical = json.dumps(config.values, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def load_run_state(artifact_dir: Path) -> Dict[str, Any]:
     state_file = artifact_dir / "run-state.json"
+    if state_file.is_symlink():
+        raise ValueError("run-state.json must not be a symlink")
     if not state_file.is_file():
         raise FileNotFoundError(f"run-state.json not found in {artifact_dir}")
+    if state_file.stat().st_mode & 0o077:
+        raise PermissionError("run-state.json permissions must not grant group or other access")
     return json.loads(state_file.read_text(encoding="utf-8"))
 
 
@@ -184,20 +195,7 @@ def main() -> int:
             "test_run_id": run_id,
             "repository_commit": head_commit,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "config_fingerprint": {
-                "master_ip": config.master_ip,
-                "worker_ip": config.worker_ip,
-                "master_panel_domain": config.master_panel_domain,
-                "master_reality_domain": config.master_reality_domain,
-                "worker_domain": config.worker_domain,
-                "worker_reality_domain": config.worker_reality_domain,
-                "master_vision_domain": config.master_vision_domain,
-                "worker_vision_domain": config.worker_vision_domain,
-                "acme_mode": config.acme_mode,
-                "enable_ipv6": config.enable_ipv6,
-                "master_ssh_port": config.master_ssh_port,
-                "worker_ssh_port": config.worker_ssh_port,
-            },
+            "config_fingerprint": build_config_fingerprint(config),
             "results": {},
             "overall": "RUNNING",
         }
@@ -224,20 +222,7 @@ def main() -> int:
             return 1
 
         cfg_fp = state.get("config_fingerprint", {})
-        expected_fp = {
-            "master_ip": config.master_ip,
-            "worker_ip": config.worker_ip,
-            "master_panel_domain": config.master_panel_domain,
-            "master_reality_domain": config.master_reality_domain,
-            "worker_domain": config.worker_domain,
-            "worker_reality_domain": config.worker_reality_domain,
-            "master_vision_domain": config.master_vision_domain,
-            "worker_vision_domain": config.worker_vision_domain,
-            "acme_mode": config.acme_mode,
-            "enable_ipv6": config.enable_ipv6,
-            "master_ssh_port": config.master_ssh_port,
-            "worker_ssh_port": config.worker_ssh_port,
-        }
+        expected_fp = build_config_fingerprint(config)
         if cfg_fp != expected_fp:
             print("Error: Non-secret configuration identity mismatch with run state", file=sys.stderr)
             return 1
@@ -386,8 +371,15 @@ def main() -> int:
 
             short_uuid = get_default_user_short_uuid(panel_client)
             ua_res = verify_user_agent_policy(config.master_panel_domain, short_uuid, ssl_ctx)
-            xray_sub_ok, xray_sub_res = fetch_and_validate_xray_subscription(config.master_panel_domain, short_uuid, ssl_ctx, ca_bundle_path=ca_bundle)
-            mih_sub_ok, mih_sub_res = fetch_and_validate_mihomo_subscription(config.master_panel_domain, short_uuid, ssl_ctx, ca_bundle_path=ca_bundle)
+            vision_enabled = bool(config.master_vision_domain and config.worker_vision_domain)
+            xray_sub_ok, xray_sub_res = fetch_and_validate_xray_subscription(
+                config.master_panel_domain, short_uuid, ssl_ctx,
+                has_vision=vision_enabled, ca_bundle_path=ca_bundle,
+            )
+            mih_sub_ok, mih_sub_res = fetch_and_validate_mihomo_subscription(
+                config.master_panel_domain, short_uuid, ssl_ctx,
+                has_vision=vision_enabled, ca_bundle_path=ca_bundle,
+            )
 
             verification_statuses = [
                 mtls_res.get("status"),

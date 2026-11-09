@@ -18,7 +18,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from live_vps.deployment import ACME_MODE_URLS
 from live_vps.negative import run_negative_suite
 from live_vps.traffic import evaluate_traffic_suite_status
-from test_live_vps import load_run_state, save_run_state
+from test_live_vps import load_run_state, save_run_state, build_config_fingerprint
 
 
 class TestCLIRunnerAndIntegration(unittest.TestCase):
@@ -41,6 +41,22 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
         )
         self.assertIsNone(ACME_MODE_URLS.get("custom"))
         self.assertIsNone(ACME_MODE_URLS.get("http://arbitrary-acme.org"))
+
+    def test_config_fingerprint_covers_all_parsed_values(self):
+        base = {"MASTER_IP": "93.184.216.34", "GOWAVE_PANEL_VERSION": "0.4.0",
+                "XRAY_SERVER_VERSION": "25.10.15", "TEST_NEGATIVE_SUITE": True}
+        same = type("Config", (), {"values": dict(base)})()
+        changed = dict(base, GOWAVE_PANEL_VERSION="0.4.1")
+        changed_config = type("Config", (), {"values": changed})()
+        self.assertEqual(build_config_fingerprint(same), build_config_fingerprint(type("Config", (), {"values": dict(base)})()))
+        self.assertNotEqual(build_config_fingerprint(same), build_config_fingerprint(changed_config))
+
+    def test_run_state_load_rejects_symlink(self):
+        target = self.artifact_dir / "target.json"
+        target.write_text("{}")
+        (self.artifact_dir / "run-state.json").symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+            load_run_state(self.artifact_dir)
 
     def test_run_state_save_and_load(self):
         state = {
