@@ -751,6 +751,53 @@ class TestAPIClient(unittest.TestCase):
                 client.request("POST", "/api/nodes", {"name": "worker-1"})
         urlopen.assert_not_called()
 
+    def test_pending_create_is_journaled_before_api_post(self):
+        """A crash after POST must leave a durable pending-create marker, not an empty ledger."""
+        client = GoWaveClient(f"http://127.0.0.1:{self.port}")
+        persisted = []
+        client.transaction_callback = lambda entities: persisted.append(json.loads(json.dumps(entities)))
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            if method == "GET" and endpoint == "/api/nodes":
+                return {"response": []}
+            if method == "POST" and endpoint == "/api/nodes":
+                self.assertEqual(persisted[-1], [{"type": "node", "action": "pending_create"}])
+                return {"response": {"uuid": "node-pending-1"}}
+            raise AssertionError(f"Unexpected request: {method} {endpoint}")
+
+        client.request = fake_request
+        node_uuid = client.associate_node("worker-1", "127.0.0.1", 3002, "profile-1", [])
+        self.assertEqual(node_uuid, "node-pending-1")
+        self.assertEqual(persisted[0], [{"type": "node", "action": "pending_create"}])
+        self.assertEqual(
+            persisted[1],
+            [{"type": "node", "action": "created", "uuid": "node-pending-1"}],
+        )
+
+    def test_unresolved_pending_create_requires_manual_reconciliation(self):
+        """A durable pending create with no UUID must never be treated as rolled back."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            jfile.write_text(json.dumps({
+                "transaction_id": "provision_pending_create",
+                "op": "provision",
+                "state": "PROVISION_APPLYING",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": [{"type": "node", "action": "pending_create"}],
+            }))
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                result = rollback_provisioning(
+                    str(jfile), str(Path(tmpdir) / "state.json"),
+                    str(Path(tmpdir) / "missing-credentials.txt"),
+                    base_url=f"http://127.0.0.1:{self.port}",
+                )
+            self.assertFalse(result)
+            journal = json.loads(jfile.read_text())
+            self.assertEqual(journal["state"], "PROVISION_ROLLBACK_REQUIRED")
+            self.assertIn("Unresolved node create request", journal["rollback_errors"][0])
+            self.assertIn("API outcome is unknown", stderr.getvalue())
+
     def test_empty_applying_journal_requires_manual_rollback(self):
         cases = (
             ("provision", "PROVISION_APPLYING", {}, "PROVISION_ROLLBACK_REQUIRED"),

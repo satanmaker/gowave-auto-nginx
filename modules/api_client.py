@@ -65,6 +65,24 @@ class GoWaveClient:
         if self.transaction_callback is not None:
             self.transaction_callback(self.transaction_entities)
 
+    def _record_pending_create(self, resource_type):
+        """Persist an unresolved create intent before sending a mutating API request."""
+        entry = {"type": resource_type, "action": "pending_create"}
+        self.transaction_entities.append(entry)
+        if self.transaction_callback is not None:
+            self.transaction_callback(self.transaction_entities)
+        return entry
+
+    def _complete_pending_create(self, entry, uuid):
+        if not uuid:
+            raise GoWaveAPIError(
+                f"Cannot complete journaled create for {entry.get('type')}: API response has no UUID"
+            )
+        entry["uuid"] = str(uuid)
+        entry["action"] = "created"
+        if self.transaction_callback is not None:
+            self.transaction_callback(self.transaction_entities)
+
     def request(self, method, endpoint, data=None, headers=None, authenticate=True):
         url = f"{self.base_url}{endpoint}"
         req_headers = {
@@ -299,10 +317,11 @@ class GoWaveClient:
             self.request("PATCH", f"/api/config-profiles/{target_uuid}", {"name": profile_name, "config": raw_config_json})
             profile_uuid = target_uuid
         else:
+            pending = self._record_pending_create("profile")
             res = self.request("POST", "/api/config-profiles", {"name": profile_name, "config": raw_config_json})
             data = res.get("response", res)
             profile_uuid = data.get("uuid")
-            self._record_transaction_entity("profile", profile_uuid, "created")
+            self._complete_pending_create(pending, profile_uuid)
 
         # 5-point verification checklist on computed-config
         computed = self.request("GET", f"/api/config-profiles/{profile_uuid}/computed-config")
@@ -376,10 +395,11 @@ class GoWaveClient:
                 res = self.request("PATCH", f"/api/nodes/{found_uuid}", payload)
                 node_uuid = found_uuid
             else:
+                pending = self._record_pending_create("node")
                 res = self.request("POST", "/api/nodes", payload)
                 data = res.get("response", res)
                 node_uuid = data.get("uuid")
-                self._record_transaction_entity("node", node_uuid, "created")
+                self._complete_pending_create(pending, node_uuid)
 
         return node_uuid
 
@@ -403,10 +423,11 @@ class GoWaveClient:
             self._record_transaction_entity("squad", squad_uuid, "updated", before)
             self.request("PATCH", "/api/internal-squads", {"uuid": squad_uuid, "name": squad_name, "inbounds": all_inbounds})
         else:
+            pending = self._record_pending_create("squad")
             res = self.request("POST", "/api/internal-squads", {"name": squad_name, "inbounds": all_inbounds})
             data = res.get("response", res)
             squad_uuid = data.get("uuid")
-            self._record_transaction_entity("squad", squad_uuid, "created")
+            self._complete_pending_create(pending, squad_uuid)
 
         return squad_uuid
 
@@ -527,10 +548,11 @@ class GoWaveClient:
                 payload["uuid"] = host_uuid
                 self.request("PATCH", "/api/hosts", payload)
             else:
+                pending = self._record_pending_create("host")
                 res = self.request("POST", "/api/hosts", payload)
                 data = res.get("response", res)
                 host_uuid = data.get("uuid")
-                self._record_transaction_entity("host", host_uuid, "created")
+                self._complete_pending_create(pending, host_uuid)
 
             created_host_uuids.append(host_uuid)
 
@@ -557,10 +579,11 @@ class GoWaveClient:
             "expireAt": expire_at,
             "activeInternalSquads": [squad_uuid],
         }
+        pending = self._record_pending_create("user")
         res = self.request("POST", "/api/users", payload)
         data = res.get("response", res)
         short_uuid = data.get("shortUuid")
-        self._record_transaction_entity("user", data.get("uuid") or data.get("id"), "created")
+        self._complete_pending_create(pending, data.get("uuid") or data.get("id"))
         return short_uuid
 
     def issue_api_token(self, token_name="gowave-auto-sub-token"):
@@ -577,11 +600,12 @@ class GoWaveClient:
             "scopes": scopes,
             "expiresInDays": 365,
         }
+        pending = self._record_pending_create("token")
         res = self.request("POST", "/api/tokens", payload)
         data = res.get("response", res)
         token_str = data.get("token")
         token_id = data.get("id") or data.get("uuid")
-        self._record_transaction_entity("token", token_id, "created")
+        self._complete_pending_create(pending, token_id)
         return {"token": token_str, "id": token_id}
 
     def delete_token(self, token_id):
@@ -765,6 +789,24 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
         print(f"Refusing provisioning rollback for unsupported operation: {op}", file=sys.stderr)
         return False
 
+    pending_create_errors = [
+        f"Unresolved {item.get('type')} create request: API outcome is unknown and no UUID was durably recorded."
+        for item in entities
+        if isinstance(item, dict) and item.get("action") == "pending_create"
+    ]
+    known_mutations = [
+        item for item in entities
+        if isinstance(item, dict) and item.get("action") in ("created", "updated")
+    ]
+    if pending_create_errors and not known_mutations:
+        journal_data["state"] = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
+        journal_data["rollback_errors"] = pending_create_errors
+        journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        write_journal_atomically(str(journal_file), journal_data)
+        for message in pending_create_errors:
+            print(message, file=sys.stderr)
+        return False
+
     # Read credentials
     username = "admin"
     password = ""
@@ -793,6 +835,11 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
             except Exception as exc:
                 print(f"Warning reading environment credentials ({type(exc).__name__}).", file=sys.stderr)
     if not password:
+        errors = pending_create_errors + ["Cannot reconcile recorded API mutations: no admin password is available."]
+        journal_data["state"] = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
+        journal_data["rollback_errors"] = errors
+        journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        write_journal_atomically(str(journal_file), journal_data)
         print("Refusing API rollback: no admin password is available.", file=sys.stderr)
         return False
 
@@ -803,6 +850,11 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
         except Exception as e:
             status = getattr(e, "status_code", None)
             suffix = f", HTTP {status}" if isinstance(status, int) and not isinstance(status, bool) else ""
+            errors = pending_create_errors + [f"Cannot reconcile recorded API mutations: login failed ({type(e).__name__}{suffix})."]
+            journal_data["state"] = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
+            journal_data["rollback_errors"] = errors
+            journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            write_journal_atomically(str(journal_file), journal_data)
             print(f"Warning: Login failed during rollback ({type(e).__name__}{suffix}).", file=sys.stderr)
             return False
 
@@ -872,6 +924,11 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
             action = item.get("action")
             etype = item.get("type")
             uuid = item.get("uuid")
+            if action == "pending_create":
+                rollback_errors.append(
+                    f"Unresolved {etype} create request: API outcome is unknown and no UUID was durably recorded."
+                )
+                continue
             if action not in ("created", "updated", "adopted"):
                 rollback_errors.append(f"Invalid action for entity {etype}: {action}")
                 continue
