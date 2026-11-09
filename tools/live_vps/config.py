@@ -65,8 +65,6 @@ MANDATORY_KEYS = {
     "WORKER_IP",
     "WORKER_DOMAIN",
     "WORKER_REALITY_DOMAIN",
-    "SSH_KEY_PATH",
-    "SSH_KNOWN_HOSTS",
     "GOWAVE_PANEL_VERSION",
     "GOWAVE_NODE_VERSION",
     "GOWAVE_NODE_INSTALLER_COMMIT",
@@ -207,6 +205,8 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
     # Target IPs
     parsed["MASTER_IP"] = validate_public_ip(raw_pairs["MASTER_IP"], "MASTER_IP")
     parsed["WORKER_IP"] = validate_public_ip(raw_pairs["WORKER_IP"], "WORKER_IP")
+    if parsed["MASTER_IP"] == parsed["WORKER_IP"]:
+        raise ValueError("MASTER_IP and WORKER_IP must identify different VPS hosts.")
 
     # Target Domains
     parsed["MASTER_PANEL_DOMAIN"] = validate_domain(raw_pairs["MASTER_PANEL_DOMAIN"], "MASTER_PANEL_DOMAIN")
@@ -218,6 +218,12 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
     parsed["WORKER_REALITY_DOMAIN"] = validate_domain(raw_pairs["WORKER_REALITY_DOMAIN"], "WORKER_REALITY_DOMAIN")
     if parsed["WORKER_DOMAIN"].lower() == parsed["WORKER_REALITY_DOMAIN"].lower():
         raise ValueError("WORKER_DOMAIN and WORKER_REALITY_DOMAIN must be different.")
+
+    # Vision is a pair-wide capability. Reject one-sided configuration before SSH.
+    master_vision_set = bool(raw_pairs.get("MASTER_VISION_DOMAIN", "").strip())
+    worker_vision_set = bool(raw_pairs.get("WORKER_VISION_DOMAIN", "").strip())
+    if master_vision_set != worker_vision_set:
+        raise ValueError("MASTER_VISION_DOMAIN and WORKER_VISION_DOMAIN must both be configured or both be omitted.")
 
     # Optional Vision domains
     if "MASTER_VISION_DOMAIN" in raw_pairs and raw_pairs["MASTER_VISION_DOMAIN"]:
@@ -240,20 +246,35 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
     else:
         parsed["WORKER_VISION_DOMAIN"] = None
 
-    # SSH configuration
-    parsed["MASTER_SSH_PORT"] = parse_port(raw_pairs.get("MASTER_SSH_PORT", "22"), "MASTER_SSH_PORT")
-    parsed["MASTER_SSH_USER"] = raw_pairs.get("MASTER_SSH_USER", "root")
-    parsed["WORKER_SSH_PORT"] = parse_port(raw_pairs.get("WORKER_SSH_PORT", "22"), "WORKER_SSH_PORT")
-    parsed["WORKER_SSH_USER"] = raw_pairs.get("WORKER_SSH_USER", "root")
+    domain_values = [
+        parsed["MASTER_PANEL_DOMAIN"], parsed["MASTER_REALITY_DOMAIN"],
+        parsed["WORKER_DOMAIN"], parsed["WORKER_REALITY_DOMAIN"],
+    ]
+    if parsed["MASTER_VISION_DOMAIN"]:
+        domain_values.extend([parsed["MASTER_VISION_DOMAIN"], parsed["WORKER_VISION_DOMAIN"]])
+    normalized_domains = [domain.lower() for domain in domain_values]
+    if len(normalized_domains) != len(set(normalized_domains)):
+        raise ValueError("All configured Master/Worker Panel, REALITY, and Vision domains must be globally distinct.")
 
-    parsed["SSH_KEY_PATH"] = raw_pairs["SSH_KEY_PATH"]
-    parsed["SSH_KNOWN_HOSTS"] = raw_pairs["SSH_KNOWN_HOSTS"]
-    # Per-host paths support CI where Master and Worker use separate keys.
-    # Existing local configs continue to use the shared SSH_KEY_PATH/known_hosts.
+    # SSH configuration. E2E v1 deliberately supports root SSH only; no sudo adapter exists.
+    parsed["MASTER_SSH_PORT"] = parse_port(raw_pairs.get("MASTER_SSH_PORT", "22"), "MASTER_SSH_PORT")
+    parsed["WORKER_SSH_PORT"] = parse_port(raw_pairs.get("WORKER_SSH_PORT", "22"), "WORKER_SSH_PORT")
+    parsed["MASTER_SSH_USER"] = raw_pairs.get("MASTER_SSH_USER", "root").strip()
+    parsed["WORKER_SSH_USER"] = raw_pairs.get("WORKER_SSH_USER", "root").strip()
+    if parsed["MASTER_SSH_USER"] != "root" or parsed["WORKER_SSH_USER"] != "root":
+        raise ValueError("E2E v1 requires MASTER_SSH_USER=root and WORKER_SSH_USER=root; sudo fallback is unsupported.")
+
+    # Support per-host credentials without requiring legacy shared paths.
+    parsed["SSH_KEY_PATH"] = raw_pairs.get("SSH_KEY_PATH")
+    parsed["SSH_KNOWN_HOSTS"] = raw_pairs.get("SSH_KNOWN_HOSTS")
     parsed["MASTER_SSH_KEY_PATH"] = raw_pairs.get("MASTER_SSH_KEY_PATH", parsed["SSH_KEY_PATH"])
     parsed["WORKER_SSH_KEY_PATH"] = raw_pairs.get("WORKER_SSH_KEY_PATH", parsed["SSH_KEY_PATH"])
     parsed["MASTER_KNOWN_HOSTS_PATH"] = raw_pairs.get("MASTER_KNOWN_HOSTS_PATH", parsed["SSH_KNOWN_HOSTS"])
     parsed["WORKER_KNOWN_HOSTS_PATH"] = raw_pairs.get("WORKER_KNOWN_HOSTS_PATH", parsed["SSH_KNOWN_HOSTS"])
+    for key in ("MASTER_SSH_KEY_PATH", "WORKER_SSH_KEY_PATH",
+                "MASTER_KNOWN_HOSTS_PATH", "WORKER_KNOWN_HOSTS_PATH"):
+        if not parsed[key]:
+            raise ValueError(f"{key} (or its shared SSH_KEY_PATH/SSH_KNOWN_HOSTS fallback) is mandatory.")
 
     # ACME mode
     acme_mode = raw_pairs.get("ACME_MODE", "staging").lower()
@@ -299,8 +320,14 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
         parsed["WORKER_IPV6"] = raw_pairs.get("WORKER_IPV6")
 
     # Egress expectations
-    parsed["EXPECTED_MASTER_EGRESS_IP"] = raw_pairs.get("EXPECTED_MASTER_EGRESS_IP")
-    parsed["EXPECTED_WORKER_EGRESS_IP"] = raw_pairs.get("EXPECTED_WORKER_EGRESS_IP")
+    parsed["EXPECTED_MASTER_EGRESS_IP"] = (
+        validate_public_ip(raw_pairs["EXPECTED_MASTER_EGRESS_IP"], "EXPECTED_MASTER_EGRESS_IP")
+        if raw_pairs.get("EXPECTED_MASTER_EGRESS_IP") else None
+    )
+    parsed["EXPECTED_WORKER_EGRESS_IP"] = (
+        validate_public_ip(raw_pairs["EXPECTED_WORKER_EGRESS_IP"], "EXPECTED_WORKER_EGRESS_IP")
+        if raw_pairs.get("EXPECTED_WORKER_EGRESS_IP") else None
+    )
 
     # Timeouts
     parsed["NODE_READY_TIMEOUT"] = parse_positive_int(raw_pairs.get("NODE_READY_TIMEOUT", "120"), "NODE_READY_TIMEOUT")
