@@ -26,7 +26,7 @@ class TestSubscriptionVisionCounts(unittest.TestCase):
         self.assertEqual(expected_proxy_count(has_vision=True), 10)
 
     def test_invalid_vision_count_is_rejected(self):
-        for value in (-1, 3, True):
+        for value in (-1, 3, True, 1.0, 2.0):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
                     expected_proxy_count(vision_count=value)

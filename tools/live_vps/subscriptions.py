@@ -24,7 +24,7 @@ def expected_proxy_count(has_vision: bool = False, vision_count: Optional[int] =
     """Return the expected number of core plus independently configured Vision proxies."""
     if vision_count is None:
         return 10 if has_vision else 8
-    if isinstance(vision_count, bool) or vision_count not in (0, 1, 2):
+    if type(vision_count) is not int or vision_count not in (0, 1, 2):
         raise ValueError("vision_count must be an integer from 0 through 2")
     return 8 + vision_count
 
@@ -184,14 +184,23 @@ def fetch_and_validate_xray_subscription(
     except Exception as e:
         return False, {"error": f"Malformed Xray subscription JSON: {e}"}
 
+    if not isinstance(sub_json, dict):
+        return False, {"error": "Xray subscription JSON root must be an object"}
+
     # Filter proxy-capable outbounds: exclude direct, block, dns, etc.
     raw_outbounds = sub_json.get("outbounds", [])
+    if not isinstance(raw_outbounds, list):
+        return False, {"error": "Xray subscription outbounds must be a list"}
+
     proxy_outbounds = []
-    for ob in raw_outbounds:
-        protocol = ob.get("protocol", "").lower()
-        tag = ob.get("tag", "").lower()
-        if protocol in ("vless", "trojan", "vmess", "shadowsocks"):
-            proxy_outbounds.append(ob)
+    for index, outbound in enumerate(raw_outbounds):
+        if not isinstance(outbound, dict):
+            return False, {"error": f"Xray outbound at index {index} must be an object"}
+        protocol = outbound.get("protocol", "")
+        if not isinstance(protocol, str):
+            return False, {"error": f"Xray outbound at index {index} has an invalid protocol"}
+        if protocol.lower() in ("vless", "trojan", "vmess", "shadowsocks"):
+            proxy_outbounds.append(outbound)
 
     expected_count = expected_proxy_count(has_vision, vision_count)
     if len(proxy_outbounds) != expected_count:
@@ -201,12 +210,18 @@ def fetch_and_validate_xray_subscription(
         }
 
     # Verify fingerprint: "firefox"
-    for ob in proxy_outbounds:
-        stream_settings = ob.get("streamSettings", {})
+    for index, outbound in enumerate(proxy_outbounds):
+        stream_settings = outbound.get("streamSettings", {})
+        if not isinstance(stream_settings, dict):
+            return False, {"error": f"Xray outbound at index {index} streamSettings must be an object"}
         tls_settings = stream_settings.get("tlsSettings") or stream_settings.get("realitySettings") or {}
-        fp = tls_settings.get("fingerprint", "")
-        if fp.lower() != "firefox":
-            return False, {"error": f"Outbound {ob.get('tag')} missing fingerprint 'firefox': {fp}"}
+        if not isinstance(tls_settings, dict):
+            return False, {"error": f"Xray outbound at index {index} TLS settings must be an object"}
+        fingerprint = tls_settings.get("fingerprint", "")
+        if not isinstance(fingerprint, str) or fingerprint.lower() != "firefox":
+            return False, {
+                "error": f"Outbound {outbound.get('tag')} missing fingerprint 'firefox': {fingerprint}"
+            }
 
     # Validate with real Xray CLI if installed
     xray_cli_ok = True
@@ -270,8 +285,16 @@ def fetch_and_validate_mihomo_subscription(
     except Exception as e:
         return False, {"error": f"Malformed Mihomo subscription YAML: {e}"}
 
+    if not isinstance(sub_yaml, dict):
+        return False, {"error": "Mihomo subscription YAML root must be a mapping"}
+
     proxies = sub_yaml.get("proxies", [])
-    expected_count = 8 + (vision_count if vision_count is not None else (2 if has_vision else 0))
+    if not isinstance(proxies, list):
+        return False, {"error": "Mihomo subscription proxies must be a list"}
+    try:
+        expected_count = expected_proxy_count(has_vision, vision_count)
+    except ValueError as exc:
+        return False, {"error": str(exc)}
     if len(proxies) != expected_count:
         return False, {
             "error": f"Expected {expected_count} proxies in YAML, found {len(proxies)}",
@@ -279,14 +302,20 @@ def fetch_and_validate_mihomo_subscription(
         }
 
     # Verify client-fingerprint: "firefox"
-    for p in proxies:
-        fp = p.get("client-fingerprint") or p.get("fingerprint") or ""
-        if fp.lower() != "firefox":
-            return False, {"error": f"Proxy {p.get('name')} missing client-fingerprint 'firefox'"}
+    for index, proxy in enumerate(proxies):
+        if not isinstance(proxy, dict):
+            return False, {"error": f"Mihomo proxy at index {index} must be a mapping"}
+        fingerprint = proxy.get("client-fingerprint") or proxy.get("fingerprint") or ""
+        if not isinstance(fingerprint, str) or fingerprint.lower() != "firefox":
+            return False, {
+                "error": f"Proxy {proxy.get('name')} missing client-fingerprint 'firefox'"
+            }
 
     # Verify GEOIP,private,DIRECT,no-resolve rule
     rules = sub_yaml.get("rules", [])
-    has_geoip_rule = any("GEOIP,private,DIRECT,no-resolve" in r for r in rules)
+    if not isinstance(rules, list) or any(not isinstance(rule, str) for rule in rules):
+        return False, {"error": "Mihomo subscription rules must be a list of strings"}
+    has_geoip_rule = any("GEOIP,private,DIRECT,no-resolve" in rule for rule in rules)
     if not has_geoip_rule:
         return False, {"error": "Missing mandatory rule: GEOIP,private,DIRECT,no-resolve"}
 
