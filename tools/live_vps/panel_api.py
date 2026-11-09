@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from modules.api_client import GoWaveClient, GoWaveAPIError
+from .redaction import register_secret
 
 
 class E2EPanelClient:
@@ -119,3 +120,40 @@ class E2EPanelClient:
                 pass
             time.sleep(poll_interval)
         return False
+
+
+def read_master_credentials(master_ssh: Any) -> Dict[str, str]:
+    """Read generated Panel credentials without putting secret values in argv.
+
+    The file is trusted only when it is root-owned and has exact mode 0600.
+    Values are registered for redaction immediately after parsing.
+    """
+    result = master_ssh.run(
+        "test -f /root/gowave-credentials.txt && test ! -L /root/gowave-credentials.txt && "
+        "test \"$(stat -c '%F:%a:%u' /root/gowave-credentials.txt)\" = 'regular file:600:0' && "
+        "cat -- /root/gowave-credentials.txt",
+        timeout=10,
+    )
+    if not result.ok:
+        raise GoWaveAPIError(
+            "Cannot read root-owned mode-0600 /root/gowave-credentials.txt on Master"
+        )
+
+    values: Dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key in ("ADMIN_USERNAME", "ADMIN_PASSWORD", "SCOPED_API_TOKEN"):
+            values[key] = value.strip()
+
+    missing = [key for key in ("ADMIN_USERNAME", "ADMIN_PASSWORD", "SCOPED_API_TOKEN")
+               if not values.get(key)]
+    if missing:
+        raise GoWaveAPIError(
+            "Master credentials file is missing required fields: " + ", ".join(missing)
+        )
+
+    register_secret(values["ADMIN_PASSWORD"])
+    register_secret(values["SCOPED_API_TOKEN"])
+    return values

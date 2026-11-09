@@ -36,16 +36,25 @@ def verify_panel_https(
     timeout: int = 10,
 ) -> Dict[str, Any]:
     """Verify GoWave Panel responds over HTTPS with correct certificate and headers."""
-    url = f"https://{panel_domain}/"
+    url = f"https://{panel_domain}/api/nodes"
     try:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, context=ssl_context, timeout=timeout) as resp:
             status = resp.status
             body = resp.read(1024).decode("utf-8", errors="replace")
-            return {"status": "PASS", "http_status": status, "body_snippet": body[:100]}
+            if status in (200, 401):
+                return {"status": "PASS", "http_status": status, "body_snippet": body[:100]}
+            return {
+                "status": "FAIL", "http_status": status,
+                "error": "Panel API endpoint returned an unexpected HTTP status",
+            }
     except urllib.error.HTTPError as e:
-        # e.g. 404 or 401 is still a valid HTTP response from Panel behind NGINX
-        return {"status": "PASS", "http_status": e.code}
+        if e.code == 401:
+            return {"status": "PASS", "http_status": e.code}
+        return {
+            "status": "FAIL", "http_status": e.code,
+            "error": "Panel API endpoint returned an unexpected HTTP status",
+        }
     except Exception as e:
         return {"status": "FAIL", "error": f"Failed connecting to Panel HTTPS: {e}"}
 
@@ -93,8 +102,12 @@ def verify_reality_decoy_fallback(
                 "snippet": resp_text[:200],
             }
 
-        # Check for static html decoy
-        is_decoy = "<!doctype html" in resp_text.lower() or "<html" in resp_text.lower() or "200 ok" in resp_text.lower()
+        # A successful HTTP status alone is not decoy evidence: require an HTML
+        # document body and an explicit HTTP 200 response.
+        status_line = resp_text.splitlines()[0] if resp_text.splitlines() else ""
+        body = resp_text.partition("\r\n\r\n")[2].lower()
+        http_200 = status_line.startswith("HTTP/") and status_line.split()[1:2] == ["200"]
+        is_decoy = http_200 and ("<!doctype html" in body or "<html" in body)
         if not is_decoy:
             return {
                 "status": "FAIL",

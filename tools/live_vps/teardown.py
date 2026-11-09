@@ -48,6 +48,30 @@ def validate_restore_hook(hook_path_str: str, expected_sha256: str) -> Tuple[boo
     return True, None
 
 
+BASELINE_COMPARISON_KEYS = (
+    "os_kernel",
+    "running_services",
+    "tcp_listeners_raw",
+    "listening_ports",
+    "existing_gowave_dirs",
+    "firewall_status",
+    "swap_info",
+    "key_packages",
+)
+
+
+def compare_captured_baseline(
+    before: Dict[str, Any], after: Dict[str, Any]
+) -> Tuple[bool, List[str], List[str]]:
+    """Compare the stable fields currently captured by preflight."""
+    missing = [key for key in BASELINE_COMPARISON_KEYS if key not in before or key not in after]
+    changed = [
+        key for key in BASELINE_COMPARISON_KEYS
+        if key in before and key in after and before[key] != after[key]
+    ]
+    return not missing and not changed, missing, changed
+
+
 def execute_teardown(
     config: LiveVPSConfig,
     run_id: str,
@@ -79,6 +103,17 @@ def execute_teardown(
             "status": "TEARDOWN_FAILED",
             "policy": "RESTORE_SNAPSHOT",
             "error": "Missing master_snapshot_id or worker_snapshot_id for RESTORE_SNAPSHOT",
+        }
+
+    if (
+        master_ssh is None or worker_ssh is None
+        or not isinstance(pre_baseline_master, dict)
+        or not isinstance(pre_baseline_worker, dict)
+    ):
+        return {
+            "status": "TEARDOWN_FAILED",
+            "policy": "RESTORE_SNAPSHOT",
+            "error": "RESTORE_SNAPSHOT requires both SSH clients and both saved preflight baselines; refusing unverifiable restore",
         }
 
     hook_ok, hook_err = validate_restore_hook(config.restore_hook_path or "", config.restore_hook_sha256 or "")
@@ -155,44 +190,51 @@ def execute_teardown(
             "error": "Restore hook snapshot IDs mismatch response",
         }
 
-    # Reconnect and verify clean baseline
-    if master_ssh and pre_baseline_master:
-        time.sleep(5)  # allow snapshot boot
-        try:
-            post_m = collect_remote_baseline(master_ssh)
-            disp_ok, disp_errs = check_disposable_gate(post_m)
-            if not disp_ok:
-                return {
-                    "status": "TEARDOWN_FAILED",
-                    "policy": "RESTORE_SNAPSHOT",
-                    "error": f"Master baseline verification failed after snapshot restore: {disp_errs}",
-                }
-        except Exception as e:
+    # Reconnect and compare the captured pre/post state on both hosts. This is
+    # deliberately not reported as PASS: D8 pair-lock reacquisition and the
+    # complete D19 mutation-target inventory/ownership comparison are not yet
+    # implemented, so the current partial manifest cannot prove full restoration.
+    try:
+        time.sleep(5)  # allow both snapshot instances to boot
+        post_m = collect_remote_baseline(master_ssh)
+        post_w = collect_remote_baseline(worker_ssh)
+    except Exception as exc:
+        return {
+            "status": "TEARDOWN_FAILED",
+            "policy": "RESTORE_SNAPSHOT",
+            "error": f"Failed collecting both post-restore baselines: {type(exc).__name__}: {exc}",
+        }
+
+    for host_name, post in (("Master", post_m), ("Worker", post_w)):
+        clean, disqualifications = check_disposable_gate(post)
+        if not clean:
             return {
                 "status": "TEARDOWN_FAILED",
                 "policy": "RESTORE_SNAPSHOT",
-                "error": f"Failed verifying Master baseline after restore: {e}",
+                "error": f"{host_name} post-restore disposable gate failed: {disqualifications}",
             }
 
-    if worker_ssh and pre_baseline_worker:
-        try:
-            post_w = collect_remote_baseline(worker_ssh)
-            disp_ok, disp_errs = check_disposable_gate(post_w)
-            if not disp_ok:
-                return {
-                    "status": "TEARDOWN_FAILED",
-                    "policy": "RESTORE_SNAPSHOT",
-                    "error": f"Worker baseline verification failed after snapshot restore: {disp_errs}",
-                }
-        except Exception as e:
-            return {
-                "status": "TEARDOWN_FAILED",
-                "policy": "RESTORE_SNAPSHOT",
-                "error": f"Failed verifying Worker baseline after restore: {e}",
-            }
+    matches_m, missing_m, changed_m = compare_captured_baseline(pre_baseline_master, post_m)
+    matches_w, missing_w, changed_w = compare_captured_baseline(pre_baseline_worker, post_w)
+    if not matches_m or not matches_w:
+        return {
+            "status": "TEARDOWN_FAILED",
+            "policy": "RESTORE_SNAPSHOT",
+            "error": "Captured pre/post snapshot baseline differs",
+            "master": {"missing_fields": missing_m, "changed_fields": changed_m},
+            "worker": {"missing_fields": missing_w, "changed_fields": changed_w},
+        }
 
     return {
-        "status": "PASS",
+        "status": "INCOMPLETE",
         "policy": "RESTORE_SNAPSHOT",
-        "message": "Snapshots successfully restored and baselines re-verified clean",
+        "hook_status": "RESTORED",
+        "captured_baseline_comparison": "MATCHED",
+        "pair_lock_reacquisition": "NOT_IMPLEMENTED",
+        "complete_resource_ownership_comparison": "NOT_IMPLEMENTED",
+        "message": (
+            "The snapshot hook restored both snapshots and the currently captured baseline fields match. "
+            "RESTORE_SNAPSHOT cannot be marked PASS until D8 pair-lock reacquisition and the complete D19 "
+            "mutation-target/ownership baseline are implemented and verified."
+        ),
     }

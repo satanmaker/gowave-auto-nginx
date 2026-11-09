@@ -229,7 +229,7 @@ PY
         certbot certonly --webroot -w "$ACME_WEBROOT" \
             -d "$vision_domain" --cert-name "$vision_domain" \
             --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring \
-            "${certbot_extra_args[@]}" || true
+            "${certbot_extra_args[@]}"
     fi
 
     rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
@@ -238,7 +238,7 @@ PY
     verify_acme_certificate "$panel_domain"
     verify_acme_certificate "$reality_domain"
     if [[ -n "$vision_domain" ]]; then
-        verify_acme_certificate "$vision_domain" || true
+        verify_acme_certificate "$vision_domain"
     fi
 
     # Step 5: NGINX Configuration
@@ -255,7 +255,7 @@ PY
     reload_nginx_strict
 
     # Step 6: GoWave Panel Native Installation
-    download_panel_release "$GOWAVE_DIR"
+    download_panel_release "$GOWAVE_DIR" "${GOWAVE_PANEL_VERSION:-$GOWAVE_DEFAULT_VERSION}"
     generate_panel_env "$GOWAVE_DIR" "$panel_domain" "$panel_domain/api/sub"
     configure_panel_systemd "$GOWAVE_DIR"
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then

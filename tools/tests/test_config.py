@@ -57,12 +57,45 @@ TEST_TEARDOWN_POLICY=PRESERVE
         self.assertTrue(cfg.TEST_TRAFFIC_VERIFICATION)
         self.assertEqual(cfg.NODE_READY_TIMEOUT, 120)
 
+    def test_lowercase_attributes_and_per_host_ssh_paths(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        content += "\nMASTER_SSH_KEY_PATH=/tmp/master_key\nWORKER_SSH_KEY_PATH=/tmp/worker_key\n"
+        content += "MASTER_KNOWN_HOSTS_PATH=/tmp/master_known\nWORKER_KNOWN_HOSTS_PATH=/tmp/worker_known\n"
+        cfg = load_config(self._write_config(content))
+        self.assertEqual(cfg.master_ip, "93.184.216.34")
+        self.assertEqual(cfg.worker_ip, "93.184.216.35")
+        self.assertEqual(cfg.master_ssh_key_path, "/tmp/master_key")
+        self.assertEqual(cfg.worker_ssh_key_path, "/tmp/worker_key")
+        self.assertEqual(cfg.master_known_hosts_path, "/tmp/master_known")
+        self.assertEqual(cfg.worker_known_hosts_path, "/tmp/worker_known")
+
+    def test_shared_ssh_paths_remain_backward_compatible(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        cfg = load_config(self._write_config(content))
+        self.assertEqual(cfg.master_ssh_key_path, "/tmp/id_rsa")
+        self.assertEqual(cfg.worker_ssh_key_path, "/tmp/id_rsa")
+        self.assertEqual(cfg.master_known_hosts_path, "/tmp/known_hosts")
+        self.assertEqual(cfg.worker_known_hosts_path, "/tmp/known_hosts")
+
     def test_insecure_mode_rejected(self):
         content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
         p = self._write_config(content, mode=0o644)
         with self.assertRaises(PermissionError) as ctx:
             load_config(p)
         self.assertIn("insecure permissions", str(ctx.exception))
+
+    def test_owner_executable_config_mode_rejected(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        with self.assertRaises(PermissionError):
+            load_config(self._write_config(content, mode=0o700))
+
+    def test_config_symlink_rejected(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        target = self._write_config(content)
+        link = self.tmp / "config-link.env"
+        link.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+            load_config(link)
 
     def test_unknown_key_rejected(self):
         content = self.valid_content + "\nUNKNOWN_VARIABLE=foo\n"
@@ -108,6 +141,51 @@ TEST_TEARDOWN_POLICY=PRESERVE
         with self.assertRaises(ValueError) as ctx:
             load_config(p)
         self.assertIn("Missing mandatory configuration keys", str(ctx.exception))
+
+    def test_floating_component_versions_rejected(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        content = content.replace("GOWAVE_PANEL_VERSION=0.4.0", "GOWAVE_PANEL_VERSION=latest")
+        with self.assertRaisesRegex(ValueError, "explicit pinned version"):
+            load_config(self._write_config(content))
+
+    def test_per_host_ssh_credentials_without_shared_paths(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        content = content.replace("SSH_KEY_PATH=/tmp/id_rsa\n", "")
+        content = content.replace("SSH_KNOWN_HOSTS=/tmp/known_hosts\n", "")
+        content += "\nMASTER_SSH_KEY_PATH=/tmp/master_key\nWORKER_SSH_KEY_PATH=/tmp/worker_key\n"
+        content += "MASTER_KNOWN_HOSTS_PATH=/tmp/master_known\nWORKER_KNOWN_HOSTS_PATH=/tmp/worker_known\n"
+        cfg = load_config(self._write_config(content))
+        self.assertEqual(cfg.master_ssh_key_path, "/tmp/master_key")
+        self.assertEqual(cfg.worker_ssh_key_path, "/tmp/worker_key")
+
+    def test_same_master_and_worker_ip_rejected(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.34")
+        with self.assertRaisesRegex(ValueError, "different VPS hosts"):
+            load_config(self._write_config(content))
+
+    def test_non_root_ssh_user_rejected(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        content += "\nWORKER_SSH_USER=ubuntu\n"
+        with self.assertRaisesRegex(ValueError, "requires MASTER_SSH_USER=root"):
+            load_config(self._write_config(content))
+
+    def test_one_sided_vision_configuration_rejected(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        content += "\nMASTER_VISION_DOMAIN=vision-master.example.com\n"
+        with self.assertRaisesRegex(ValueError, "both be configured"):
+            load_config(self._write_config(content))
+
+    def test_global_domain_collision_rejected(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        content = content.replace("WORKER_DOMAIN=worker.example.com", "WORKER_DOMAIN=panel.example.com")
+        with self.assertRaisesRegex(ValueError, "globally distinct"):
+            load_config(self._write_config(content))
+
+    def test_expected_egress_ip_must_be_public_ipv4(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        content += "\nEXPECTED_WORKER_EGRESS_IP=192.168.1.10\n"
+        with self.assertRaisesRegex(ValueError, "not a public routable address"):
+            load_config(self._write_config(content))
 
     def test_teardown_destroy_rejected(self):
         content = self.valid_content.replace("TEST_TEARDOWN_POLICY=PRESERVE", "TEST_TEARDOWN_POLICY=DESTROY")

@@ -67,17 +67,38 @@ class SSHClient:
         self.known_hosts = str(Path(known_hosts).resolve()) if known_hosts else None
         self.connect_timeout = connect_timeout
 
-    def _build_ssh_cmd(self, remote_cmd: Optional[str] = None) -> List[str]:
-        cmd = [
-            "ssh",
-            "-p", str(self.port),
+    def _base_ssh_options(self) -> List[str]:
+        """Disable ambient SSH configuration and trust sources; use only explicit pins."""
+        known_hosts = self.known_hosts or "/dev/null"
+        options = [
+            "-F", "/dev/null",
             "-o", "BatchMode=yes",
             "-o", "StrictHostKeyChecking=yes",
+            "-o", f"UserKnownHostsFile={known_hosts}",
+            "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", "UpdateHostKeys=no",
+            "-o", "VerifyHostKeyDNS=no",
+            "-o", "CanonicalizeHostname=no",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "IdentityAgent=none",
+            "-o", "ForwardAgent=no",
+            "-o", "ClearAllForwardings=yes",
+            "-o", "ProxyCommand=none",
+            "-o", "ProxyJump=none",
+            "-o", "PermitLocalCommand=no",
+            "-o", "ControlMaster=no",
+            "-o", "ControlPath=none",
+            "-o", "PasswordAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no",
+            "-o", "GSSAPIAuthentication=no",
             "-o", f"ConnectTimeout={self.connect_timeout}",
             "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=2",
         ]
-        if self.known_hosts:
-            cmd.extend(["-o", f"UserKnownHostsFile={self.known_hosts}"])
+        return options
+
+    def _build_ssh_cmd(self, remote_cmd: Optional[str] = None) -> List[str]:
+        cmd = ["ssh", "-p", str(self.port), *self._base_ssh_options()]
         if self.key_path:
             cmd.extend(["-i", self.key_path])
 
@@ -131,15 +152,7 @@ class SSHClient:
         timeout: int = 60,
     ) -> SSHResult:
         lp = str(Path(local_path).resolve())
-        cmd = [
-            "scp",
-            "-P", str(self.port),
-            "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=yes",
-            "-o", f"ConnectTimeout={self.connect_timeout}",
-        ]
-        if self.known_hosts:
-            cmd.extend(["-o", f"UserKnownHostsFile={self.known_hosts}"])
+        cmd = ["scp", "-P", str(self.port), *self._base_ssh_options()]
         if self.key_path:
             cmd.extend(["-i", self.key_path])
 

@@ -7,7 +7,10 @@ on:
         description: "Target GitHub Environment"
         required: true
         default: "staging-vps"
-        type: string
+        type: choice
+        options:
+          - staging-vps
+          - production-vps
       acme_mode:
         description: "ACME mode (staging or production)"
         required: true
@@ -45,12 +48,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
 
       - name: Install Control Machine system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends dnsutils openssh-client openssl curl libcap2-bin
+          sudo apt-get install -y --no-install-recommends dnsutils openssh-client openssl curl libcap2-bin unzip
 
       - name: Install Python dependencies
         run: |
@@ -59,10 +61,12 @@ jobs:
 
       - name: Download and install pinned Xray client binary
         env:
-          XRAY_VERSION: "v25.1.30"
+          LIVE_VPS_CONFIG: ${{ secrets.LIVE_VPS_CONFIG }}
         run: |
+          XRAY_VERSION="$(printf '%s\n' "$LIVE_VPS_CONFIG" | awk -F= '$1 == "XRAY_CLIENT_VERSION" {print $2; exit}')"
+          test -n "$XRAY_VERSION" || { echo "XRAY_CLIENT_VERSION missing from LIVE_VPS_CONFIG" >&2; exit 1; }
           mkdir -p /tmp/xray-bin
-          curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" -o /tmp/xray.zip
+          curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip" -o /tmp/xray.zip
           unzip -q /tmp/xray.zip -d /tmp/xray-bin
           sudo mv /tmp/xray-bin/xray /usr/local/bin/xray
           sudo chmod 0755 /usr/local/bin/xray
@@ -70,9 +74,11 @@ jobs:
 
       - name: Download and install pinned Mihomo client binary
         env:
-          MIHOMO_VERSION: "v1.19.2"
+          LIVE_VPS_CONFIG: ${{ secrets.LIVE_VPS_CONFIG }}
         run: |
-          curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/mihomo-linux-amd64-${MIHOMO_VERSION}.gz" -o /tmp/mihomo.gz
+          MIHOMO_VERSION="$(printf '%s\n' "$LIVE_VPS_CONFIG" | awk -F= '$1 == "MIHOMO_CLIENT_VERSION" {print $2; exit}')"
+          test -n "$MIHOMO_VERSION" || { echo "MIHOMO_CLIENT_VERSION missing from LIVE_VPS_CONFIG" >&2; exit 1; }
+          curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/mihomo-linux-amd64-v${MIHOMO_VERSION}.gz" -o /tmp/mihomo.gz
           gunzip /tmp/mihomo.gz
           sudo mv /tmp/mihomo /usr/local/bin/mihomo
           sudo chmod 0755 /usr/local/bin/mihomo
@@ -85,6 +91,8 @@ jobs:
           WORKER_SSH_KEY: ${{ secrets.WORKER_SSH_KEY }}
           MASTER_KNOWN_HOSTS: ${{ secrets.MASTER_KNOWN_HOSTS }}
           WORKER_KNOWN_HOSTS: ${{ secrets.WORKER_KNOWN_HOSTS }}
+          ACME_MODE: ${{ inputs.acme_mode }}
+          TEARDOWN_POLICY: ${{ inputs.teardown_policy }}
         run: |
           mkdir -p ~/.ssh
           chmod 0700 ~/.ssh
@@ -96,15 +104,36 @@ jobs:
           echo "$WORKER_SSH_KEY" > ~/.ssh/id_worker
           chmod 0600 ~/.ssh/id_worker
 
-          echo "$MASTER_KNOWN_HOSTS" > ~/.ssh/known_hosts_master
+          printf '%s\n' "$MASTER_KNOWN_HOSTS" > ~/.ssh/known_hosts_master
           chmod 0600 ~/.ssh/known_hosts_master
 
-          echo "$WORKER_KNOWN_HOSTS" > ~/.ssh/known_hosts_worker
+          printf '%s\n' "$WORKER_KNOWN_HOSTS" > ~/.ssh/known_hosts_worker
           chmod 0600 ~/.ssh/known_hosts_worker
 
-          # Materialize runner configuration file
-          echo "$LIVE_VPS_CONFIG" > tools/live_vps_config.env
-          chmod 0600 tools/live_vps_config.env
+          # Apply dispatch inputs and separate per-host SSH credentials.
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          raw = os.environ.get("LIVE_VPS_CONFIG", "")
+          if not raw.strip():
+              raise SystemExit("LIVE_VPS_CONFIG secret is empty")
+          replacements = {
+              "SSH_KEY_PATH": str(Path.home() / ".ssh/id_master"),
+              "SSH_KNOWN_HOSTS": str(Path.home() / ".ssh/known_hosts_master"),
+              "MASTER_SSH_KEY_PATH": str(Path.home() / ".ssh/id_master"),
+              "WORKER_SSH_KEY_PATH": str(Path.home() / ".ssh/id_worker"),
+              "MASTER_KNOWN_HOSTS_PATH": str(Path.home() / ".ssh/known_hosts_master"),
+              "WORKER_KNOWN_HOSTS_PATH": str(Path.home() / ".ssh/known_hosts_worker"),
+              "ACME_MODE": os.environ["ACME_MODE"],
+              "TEST_TEARDOWN_POLICY": os.environ["TEARDOWN_POLICY"],
+          }
+          lines = [line for line in raw.splitlines() if line.strip() and line.split("=", 1)[0].strip() not in replacements]
+          lines.extend(f"{key}={value}" for key, value in replacements.items())
+          target = Path("tools/live_vps_config.env")
+          target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          target.chmod(0o600)
+          PY
 
       - name: Execute Live VPS E2E Test Suite
         run: |
