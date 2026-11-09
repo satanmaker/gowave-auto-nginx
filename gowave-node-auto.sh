@@ -1959,18 +1959,40 @@ rollback_managed_deploy_hook() {
     if [[ ! -f "$manifest" ]]; then
         return 0
     fi
-    local created_by_tx recorded_sha
-    created_by_tx=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
-    recorded_sha=$(python3 -c "import json; print(json.load(open('$manifest')).get('sha256', ''))" 2>/dev/null || echo "")
+    local manifest_data
+    manifest_data=$(python3 - "$manifest" <<'PY'
+import json
+import sys
 
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict) or type(data.get("created_by_tx")) is not bool:
+        raise ValueError("invalid deploy-hook manifest")
+    digest = data.get("sha256", "")
+    if not isinstance(digest, str) or (data["created_by_tx"] and not digest):
+        raise ValueError("invalid deploy-hook digest")
+    print("1" if data["created_by_tx"] else "0")
+    print(digest)
+except Exception as exc:
+    print(f"Invalid deploy-hook manifest: {type(exc).__name__}", file=sys.stderr)
+    sys.exit(1)
+PY
+    ) || return 1
+    local -a manifest_fields=()
+    mapfile -t manifest_fields <<< "$manifest_data"
+    if [[ "${#manifest_fields[@]}" -ne 2 ]]; then
+        return 1
+    fi
+    local created_by_tx="${manifest_fields[0]}" recorded_sha="${manifest_fields[1]}"
     if [[ "$created_by_tx" != "1" || ! -f "$hook_file" ]]; then
         return 0
     fi
     local current_sha
-    current_sha=$(sha256sum "$hook_file" | awk '{print $1}')
+    current_sha=$(sha256sum "$hook_file" | awk '{print $1}') || return 1
     if [[ "$current_sha" == "$recorded_sha" ]]; then
-        rm -f "$hook_file"
-        sync "$(dirname "$hook_file")"
+        rm -f "$hook_file" || return 1
+        sync "$(dirname "$hook_file")" || return 1
     fi
     return 0
 }
@@ -2112,80 +2134,93 @@ PY
 acquire_mutation_lock
 echo "Executing worker compensation teardown..." >&2
 
-# 1. Stop and disable systemd services
-systemctl stop gowave-node.service 2>/dev/null || true
-systemctl disable gowave-node.service 2>/dev/null || true
-systemctl stop xray.service 2>/dev/null || true
-systemctl disable xray.service 2>/dev/null || true
-rm -rf /etc/systemd/system/gowave-node.service.d
-rm -f /etc/systemd/system/gowave-node.service
-rm -f /etc/systemd/system/remnanode.service
-systemctl daemon-reload 2>/dev/null || true
-systemctl reset-failed 2>/dev/null || true
-rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode
-rm -f /usr/local/bin/gowave-node /usr/local/bin/xray
+rollback_failed=0
+
+# 1. Stop and disable systemd services that are actually installed or active.
+for unit in gowave-node.service xray.service; do
+    if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "^$unit" ||
+        systemctl is-active --quiet "$unit" 2>/dev/null; then
+        systemctl stop "$unit" 2>/dev/null || rollback_failed=1
+        systemctl disable "$unit" 2>/dev/null || rollback_failed=1
+    fi
+done
+rm -rf /etc/systemd/system/gowave-node.service.d || rollback_failed=1
+rm -f /etc/systemd/system/gowave-node.service /etc/systemd/system/remnanode.service || rollback_failed=1
+systemctl daemon-reload 2>/dev/null || rollback_failed=1
+rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode || rollback_failed=1
+rm -f /usr/local/bin/gowave-node /usr/local/bin/xray || rollback_failed=1
 
 # 2. Remove NGINX worker configs
-rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf
-rm -f /etc/nginx/conf.d/gowave-worker-https.conf
-rm -f /etc/nginx/conf.d/gowave-worker-decoy.conf
-rm -f /etc/nginx/conf.d/gowave-worker-vision-fallback.conf
-rm -f /etc/nginx/stream-enabled/gowave-worker-stream.conf
-rollback_managed_deploy_hook "${ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || true
-rm -rf /var/www/gowave-acme
-rm -rf /var/www/gowave-auto-nginx/cover-reality
-rmdir /var/www/gowave-auto-nginx 2>/dev/null || true
+rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf /etc/nginx/conf.d/gowave-worker-https.conf /etc/nginx/conf.d/gowave-worker-decoy.conf /etc/nginx/conf.d/gowave-worker-vision-fallback.conf /etc/nginx/stream-enabled/gowave-worker-stream.conf || rollback_failed=1
+rollback_managed_deploy_hook "${ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || rollback_failed=1
+rm -rf /var/www/gowave-acme /var/www/gowave-auto-nginx/cover-reality || rollback_failed=1
+if [[ -d /var/www/gowave-auto-nginx ]]; then
+    rmdir /var/www/gowave-auto-nginx 2>/dev/null || true
+fi
 
 # Revert stream include in nginx.conf if stream-enabled is empty
 if [[ -d /etc/nginx/stream-enabled ]] && ! ls -1 /etc/nginx/stream-enabled/*.conf >/dev/null 2>&1; then
-    sed -i '\#stream { include /etc/nginx/stream-enabled/\*\.conf; }#d' /etc/nginx/nginx.conf 2>/dev/null || true
+    sed -i '\#stream { include /etc/nginx/stream-enabled/\*\.conf; }#d' /etc/nginx/nginx.conf 2>/dev/null || rollback_failed=1
 fi
-if nginx -t >/dev/null 2>&1; then
-    systemctl reload nginx 2>/dev/null || true
+if command -v nginx >/dev/null 2>&1; then
+    if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx 2>/dev/null || rollback_failed=1
+    else
+        rollback_failed=1
+    fi
 fi
 
 # 3. Clean ACME certificates
-rollback_restore_failed=0
 if [[ -n "${ACME_TX_ID:-}" ]]; then
     echo "[ROLLBACK] Restoring ACME lineages via snapshot for transaction $ACME_TX_ID..." >&2
-    restore_acme_lineage "$ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_restore_failed=1
-    restore_acme_lineage "$ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || rollback_restore_failed=1
+    restore_acme_lineage "$ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_failed=1
+    restore_acme_lineage "$ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || rollback_failed=1
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
-        restore_acme_lineage "$ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || rollback_restore_failed=1
+        restore_acme_lineage "$ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || rollback_failed=1
     fi
 else
     if [[ -n "${WORKER_DOMAIN:-}" ]]; then
         certbot delete --cert-name "$WORKER_DOMAIN" --non-interactive 2>/dev/null || true
-        rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || true
+        rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || rollback_failed=1
     fi
     if [[ -n "${REALITY_DOMAIN:-}" ]]; then
         certbot delete --cert-name "$REALITY_DOMAIN" --non-interactive 2>/dev/null || true
-        rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || true
+        rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || rollback_failed=1
     fi
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
         certbot delete --cert-name "$VISION_DOMAIN" --non-interactive 2>/dev/null || true
-        rm -rf "/etc/letsencrypt/live/$VISION_DOMAIN" "/etc/letsencrypt/archive/$VISION_DOMAIN" "/etc/letsencrypt/renewal/$VISION_DOMAIN.conf" 2>/dev/null || true
+        rm -rf "/etc/letsencrypt/live/$VISION_DOMAIN" "/etc/letsencrypt/archive/$VISION_DOMAIN" "/etc/letsencrypt/renewal/$VISION_DOMAIN.conf" 2>/dev/null || rollback_failed=1
     fi
 fi
-# 4. Remove UFW rules added for Control Plane
+# 4. Remove UFW rules added for Control Plane. Missing rules are already clean;
+# only attempt deletion when the active ruleset confirms the exact rule exists.
 if command -v ufw >/dev/null 2>&1; then
-    if [[ -n "${PANEL_IP:-}" ]]; then
-        ufw delete allow proto tcp from "$PANEL_IP" to any port "${NODE_PORT:-3002}" 2>/dev/null || true
+    ufw_rules=$(ufw status numbered 2>/dev/null) || {
+        rollback_failed=1
+        ufw_rules=""
+    }
+    if [[ -n "${PANEL_IP:-}" ]] &&
+        awk -v port="${NODE_PORT:-3002}/tcp" -v ip="$PANEL_IP" '$3 == port && index($0, ip) > 0 { found=1 } END { exit !found }' <<< "$ufw_rules"; then
+        ufw delete allow proto tcp from "$PANEL_IP" to any port "${NODE_PORT:-3002}" 2>/dev/null || rollback_failed=1
     fi
-    if [[ -n "${PANEL_IPV6:-}" ]]; then
-        ufw delete allow proto tcp from "$PANEL_IPV6" to any port "${NODE_PORT:-3002}" 2>/dev/null || true
+    if [[ -n "${PANEL_IPV6:-}" ]] &&
+        awk -v port="${NODE_PORT:-3002}/tcp" -v ip="$PANEL_IPV6" '$3 == port && index($0, ip) > 0 { found=1 } END { exit !found }' <<< "$ufw_rules"; then
+        ufw delete allow proto tcp from "$PANEL_IPV6" to any port "${NODE_PORT:-3002}" 2>/dev/null || rollback_failed=1
     fi
-    ufw delete allow 80/tcp 2>/dev/null || true
-    ufw delete allow 443/tcp 2>/dev/null || true
+    if awk '$3 == "80/tcp" { found=1 } END { exit !found }' <<< "$ufw_rules"; then
+        ufw delete allow 80/tcp 2>/dev/null || rollback_failed=1
+    fi
+    if awk '$3 == "443/tcp" { found=1 } END { exit !found }' <<< "$ufw_rules"; then
+        ufw delete allow 443/tcp 2>/dev/null || rollback_failed=1
+    fi
 fi
-
 # 5. Clean sysctl and scratch
-rm -f /etc/sysctl.d/99-gowave-node.conf
-rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh
-sysctl --system 2>/dev/null || true
+rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1
+rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh || rollback_failed=1
+sysctl --system 2>/dev/null || rollback_failed=1
 
-if [[ "$rollback_restore_failed" -ne 0 ]]; then
-    echo "Error: Remote worker compensation teardown incomplete; one or more ACME lineages were not restored and verified." >&2
+if [[ "$rollback_failed" -ne 0 ]]; then
+    echo "Error: Remote worker compensation teardown incomplete; one or more cleanup or restoration operations failed." >&2
     exit 1
 fi
 echo "Remote worker compensation teardown finished." >&2
