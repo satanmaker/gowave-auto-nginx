@@ -187,13 +187,12 @@ print(json.dumps(results))
         parsed["status"] = "INCOMPLETE"
     elif not all(parsed[key] is True for key in required):
         parsed["status"] = "FAIL"
-    wrong_sni = parsed.get("wrong_sni_observation")
-    if not isinstance(wrong_sni, dict):
-        parsed["status"] = "INCOMPLETE"
-    elif wrong_sni.get("outcome") == "TLS_REJECTED":
-        parsed["status"] = "PASS"
     else:
-        # We observed the handshake but do not yet prove which application
-        # route handles unknown SNI, so do not claim either acceptance or rejection.
-        parsed["status"] = "INCOMPLETE"
+        wrong_sni = parsed.get("wrong_sni_observation")
+        if isinstance(wrong_sni, dict) and wrong_sni.get("outcome") == "TLS_REJECTED":
+            parsed["status"] = "PASS"
+        else:
+            # We observed an unproven/malformed wrong-SNI result. Do not claim
+            # rejection or acceptance without a concrete policy observation.
+            parsed["status"] = "INCOMPLETE"
     return parsed
