@@ -260,6 +260,16 @@ class GoWaveClient:
 
         raw_xray = {
             "inbounds": inbounds,
+            "outbounds": [
+                {
+                    "tag": "DIRECT",
+                    "protocol": "freedom",
+                },
+                {
+                    "tag": "BLOCK",
+                    "protocol": "blackhole",
+                },
+            ],
             "routing": routing_block,
         }
         return json.dumps(raw_xray, indent=2)
