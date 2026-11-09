@@ -578,8 +578,8 @@ def main() -> int:
 
             # Fetch subscriptions
             _, xray_sub_res = fetch_and_validate_xray_subscription(config.master_panel_domain, short_uuid, ssl_ctx, ca_bundle_path=ca_bundle)
-            mihomo_sub_url = f"https://{config.master_panel_domain}/api/sub/{short_uuid}/clash"
-            req = urllib.request.Request(mihomo_sub_url, headers={"User-Agent": "clash.meta"})
+            mihomo_sub_url = f"https://{config.master_panel_domain}/api/sub/{short_uuid}/mihomo"
+            req = urllib.request.Request(mihomo_sub_url, headers={"User-Agent": "mihomo"})
             with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
                 mihomo_yaml_str = resp.read().decode("utf-8")
 

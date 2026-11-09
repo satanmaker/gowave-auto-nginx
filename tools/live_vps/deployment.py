@@ -482,7 +482,10 @@ print(json.dumps({
 }))
 """
     # Fetch Master secret key for observer check via extract_secret_key
-    sec_r = master_ssh.run(f"/opt/gowave/gowave-server rescue --print-secret-key-raw </dev/null 2>/dev/null || true")
+    sec_r = master_ssh.run(
+        "(cd /opt/gowave && ./gowave-server rescue --print-secret-key-raw </dev/null 2>/dev/null) || "
+        "/opt/gowave/gowave-server rescue --print-secret-key-raw </dev/null 2>/dev/null || true"
+    )
     master_secret = sec_r.stdout.strip()
 
     if not sec_r.ok or not master_secret:

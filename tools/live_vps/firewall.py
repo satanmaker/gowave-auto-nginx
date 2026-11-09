@@ -14,10 +14,26 @@ from .ssh import SSHClient
 
 
 def probe_tcp_port(host: str, port: int, timeout: float = 3.0) -> Tuple[bool, str]:
-    """Probe TCP host:port from Control Machine."""
+    """Probe TCP host:port from Control Machine, validating actual traffic delivery to guard against SYN-spoofing middleboxes."""
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True, "CONNECTED"
+        s = socket.create_connection((host, port), timeout=timeout)
+        s.settimeout(min(timeout, 2.0))
+        try:
+            # Send small probe to verify whether connection reaches a real server application
+            s.sendall(b"GET / HTTP/1.0\r\n\r\n")
+            data = s.recv(512)
+            s.close()
+            if data:
+                return True, "CONNECTED"
+            # If closed immediately with EOF without data
+            return False, "REFUSED"
+        except (socket.timeout, TimeoutError):
+            # SYN was ACKed by local middlebox but no application packet answered
+            s.close()
+            return False, "TIMEOUT"
+        except (ConnectionResetError, BrokenPipeError):
+            s.close()
+            return False, "REFUSED"
     except socket.timeout:
         return False, "TIMEOUT"
     except ConnectionRefusedError:
