@@ -563,6 +563,8 @@ print(json.dumps({
     overall_ok = r.ok and observer_verdict.get("status") == "PASS" and worker_state_ok
     return overall_ok, {
         "dispatch_exit_code": r.returncode,
+        "dispatch_stdout": (r.stdout or "").strip()[-1000:],
+        "dispatch_stderr": (r.stderr or "").strip()[-1000:],
         "observer": observer_verdict,
         "worker_state_ok": worker_state_ok,
         "worker_errors": worker_errors,
