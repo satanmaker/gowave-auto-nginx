@@ -273,8 +273,8 @@ def fetch_and_validate_mihomo_subscription(
     ca_bundle_path: Optional[Path] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Fetch Mihomo YAML subscription and validate schema, proxy entries, and mihomo -t."""
-    url = f"https://{panel_domain}/api/sub/{short_uuid}/clash"
-    req = urllib.request.Request(url, headers={"User-Agent": "clash.meta"})
+    url = f"https://{panel_domain}/api/sub/{short_uuid}/mihomo"
+    req = urllib.request.Request(url, headers={"User-Agent": "mihomo"})
 
     try:
         with urllib.request.urlopen(req, context=ssl_context, timeout=15) as resp:

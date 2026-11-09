@@ -20,7 +20,7 @@ def verify_worker_mtls(
 ) -> Dict[str, Any]:
     """Execute live mTLS verification from Master to Worker:3002 and audit Panel connection state."""
     # 1. Extract secret key raw on Master
-    sec_cmd = "/opt/gowave/gowave-server rescue --print-secret-key-raw </dev/null 2>/dev/null || true"
+    sec_cmd = "(cd /opt/gowave && ./gowave-server rescue --print-secret-key-raw </dev/null 2>/dev/null) || /opt/gowave/gowave-server rescue --print-secret-key-raw </dev/null 2>/dev/null || true"
     sec_r = master_ssh.run(sec_cmd)
     if not sec_r.ok or not sec_r.stdout.strip():
         return {
@@ -71,7 +71,7 @@ def run_mtls_negative_tests(
     port: int = 3002,
 ) -> Dict[str, Any]:
     """Verify all negative mTLS handshakes; transport failures are INCOMPLETE."""
-    sec_cmd = "/opt/gowave/gowave-server rescue --print-secret-key-raw </dev/null 2>/dev/null || true"
+    sec_cmd = "(cd /opt/gowave && ./gowave-server rescue --print-secret-key-raw </dev/null 2>/dev/null) || /opt/gowave/gowave-server rescue --print-secret-key-raw </dev/null 2>/dev/null || true"
     sec_r = master_ssh.run(sec_cmd)
     if not sec_r.ok or not sec_r.stdout.strip():
         return {"status": "INCOMPLETE", "error": "Cannot extract secret key for negative tests"}
