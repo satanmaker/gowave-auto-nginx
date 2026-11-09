@@ -676,81 +676,128 @@ snapshot_acme_lineage() {
     local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
     local letsencrypt_root="${4:-/etc/letsencrypt}"
 
+    if [[ ! "$transaction_id" =~ ^[A-Za-z0-9._-]+$ || ! "$domain" =~ ^[A-Za-z0-9.-]+$ ]]; then
+        echo "Error: Invalid transaction ID or domain for ACME snapshot." >&2
+        return 1
+    fi
+
     local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
-    mkdir -p "$snap_dir"
-    chmod 0700 "$snap_dir" 2>/dev/null || true
+    mkdir -p "$snap_dir" || { echo "Error: Could not create ACME snapshot directory for $domain." >&2; return 1; }
+    if [[ -L "$snap_dir" ]]; then
+        echo "Error: ACME snapshot directory is an unsafe symlink for $domain." >&2
+        return 1
+    fi
+    chmod 0700 "$snap_dir" 2>/dev/null || { echo "Error: Could not secure ACME snapshot directory for $domain." >&2; return 1; }
 
     local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
     local live_dir="${letsencrypt_root}/live/${domain}"
+    local archive_dir="${letsencrypt_root}/archive/${domain}"
     local meta_file="${snap_dir}/lineage-manifest.json"
+    local existed_before=false cert_serial="" cert_fingerprint=""
 
-    if [[ -f "$renewal_conf" || -d "$live_dir" ]]; then
-        mkdir -p "$snap_dir/archive" "$snap_dir/live"
-        chmod 0700 "$snap_dir/archive" "$snap_dir/live" 2>/dev/null || true
-
-        if [[ -f "$renewal_conf" ]]; then
-            cp -p "$renewal_conf" "$snap_dir/renewal.conf"
+    if [[ -e "$renewal_conf" || -L "$renewal_conf" || -e "$live_dir" || -L "$live_dir" ]]; then
+        if [[ ! -f "$renewal_conf" || -L "$renewal_conf" || ! -d "$live_dir" || -L "$live_dir" ]]; then
+            echo "Error: Existing ACME lineage for $domain is incomplete or unsafe; refusing to snapshot it." >&2
+            return 1
         fi
+        mkdir -p "$snap_dir/archive" "$snap_dir/live" || { echo "Error: Could not create ACME snapshot subdirectories for $domain." >&2; return 1; }
+        chmod 0700 "$snap_dir/archive" "$snap_dir/live" 2>/dev/null || { echo "Error: Could not secure ACME snapshot subdirectories for $domain." >&2; return 1; }
+        cp -p "$renewal_conf" "$snap_dir/renewal.conf" || { echo "Error: Could not snapshot ACME renewal config for $domain." >&2; return 1; }
 
-        local cert_serial=""
-        local cert_fingerprint=""
-        if [[ -d "$live_dir" ]]; then
-            local f
-            for f in cert.pem chain.pem fullchain.pem privkey.pem; do
-                local link_path="${live_dir}/${f}"
-                if [[ -L "$link_path" ]]; then
-                    local target
-                    target=$(readlink "$link_path")
-                    echo "$target" > "$snap_dir/live/${f}.target"
-                    local real_file
-                    real_file=$(realpath -q "$link_path" || true)
-                    if [[ -n "$real_file" && -f "$real_file" ]]; then
-                        local bn
-                        bn=$(basename "$real_file")
-                        cp -p "$real_file" "$snap_dir/archive/$bn"
-                        if [[ "$f" == "privkey.pem" || "$bn" =~ ^privkey ]]; then
-                            chmod 0600 "$snap_dir/archive/$bn" 2>/dev/null || true
-                        fi
-                    fi
-                elif [[ -f "$link_path" ]]; then
-                    cp -p "$link_path" "$snap_dir/live/$f"
-                    if [[ "$f" == "privkey.pem" ]]; then
-                        chmod 0600 "$snap_dir/live/$f" 2>/dev/null || true
-                    fi
+        local archive_real
+        archive_real=$(realpath -e -- "$archive_dir") || { echo "Error: ACME archive directory is missing for existing lineage $domain." >&2; return 1; }
+        local f link_path target real_file bn
+        for f in cert.pem chain.pem fullchain.pem privkey.pem; do
+            link_path="${live_dir}/${f}"
+            if [[ -L "$link_path" ]]; then
+                target=$(readlink "$link_path") || { echo "Error: Could not read ACME symlink $f for $domain." >&2; return 1; }
+                if [[ -z "$target" || "$target" == /* ]]; then
+                    echo "Error: Unsafe ACME symlink target for $domain/$f." >&2
+                    return 1
                 fi
-            done
-
-            local fc="${live_dir}/fullchain.pem"
-            if [[ -s "$fc" ]]; then
-                cert_serial=$(openssl x509 -in "$fc" -noout -serial 2>/dev/null || true)
-                cert_fingerprint=$(openssl x509 -in "$fc" -noout -fingerprint -sha256 2>/dev/null || true)
+                printf '%s\n' "$target" > "$snap_dir/live/${f}.target" || { echo "Error: Could not snapshot ACME symlink target for $domain/$f." >&2; return 1; }
+                chmod 0600 "$snap_dir/live/${f}.target" 2>/dev/null || { echo "Error: Could not secure ACME symlink metadata for $domain/$f." >&2; return 1; }
+                real_file=$(realpath -e -- "$link_path") || { echo "Error: ACME symlink $domain/$f is broken." >&2; return 1; }
+                case "$real_file" in
+                    "$archive_real"/*) ;;
+                    *)
+                        echo "Error: ACME symlink $domain/$f escapes its archive directory." >&2
+                        return 1
+                        ;;
+                esac
+                bn=$(basename "$real_file")
+                cp -p "$real_file" "$snap_dir/archive/$bn" || { echo "Error: Could not snapshot ACME archive file $bn for $domain." >&2; return 1; }
+                if [[ "$bn" =~ ^privkey ]]; then
+                    chmod 0600 "$snap_dir/archive/$bn" 2>/dev/null || { echo "Error: Could not secure snapshotted ACME private key for $domain." >&2; return 1; }
+                else
+                    chmod 0644 "$snap_dir/archive/$bn" 2>/dev/null || { echo "Error: Could not set snapshotted ACME certificate permissions for $domain." >&2; return 1; }
+                fi
+            elif [[ -f "$link_path" ]]; then
+                cp -p "$link_path" "$snap_dir/live/$f" || { echo "Error: Could not snapshot ACME live file $f for $domain." >&2; return 1; }
+                if [[ "$f" == "privkey.pem" ]]; then
+                    chmod 0600 "$snap_dir/live/$f" 2>/dev/null || { echo "Error: Could not secure snapshotted ACME private key for $domain." >&2; return 1; }
+                fi
+            else
+                if [[ "$f" == "fullchain.pem" || "$f" == "privkey.pem" ]]; then
+                    echo "Error: Existing ACME lineage is missing required file $domain/$f." >&2
+                    return 1
+                fi
+                continue
             fi
-        fi
+        done
 
-        python3 - "$meta_file" "$domain" "$cert_serial" "$cert_fingerprint" <<'PY'
-import json, sys
-meta_file, domain, serial, fingerprint = sys.argv[1:5]
-data = {
-    "domain": domain,
-    "existed_before": True,
-    "serial": serial,
-    "fingerprint": fingerprint
-}
-with open(meta_file, "w") as f:
-    json.dump(data, f, indent=2)
-PY
-    else
-        python3 - "$meta_file" "$domain" <<'PY'
-import json, sys
-meta_file, domain = sys.argv[1:3]
-data = {
-    "domain": domain,
-    "existed_before": False
-}
-with open(meta_file, "w") as f:
-    json.dump(data, f, indent=2)
-PY
+        local fullchain="${live_dir}/fullchain.pem" privkey="${live_dir}/privkey.pem"
+        openssl x509 -in "$fullchain" -noout >/dev/null 2>&1 || { echo "Error: Existing ACME certificate is invalid for $domain." >&2; return 1; }
+        local pub_from_cert pub_from_key
+        pub_from_cert=$(openssl x509 -in "$fullchain" -noout -pubkey 2>/dev/null) || { echo "Error: Could not read existing ACME certificate key for $domain." >&2; return 1; }
+        pub_from_key=$(openssl pkey -in "$privkey" -pubout 2>/dev/null) || { echo "Error: Could not read existing ACME private key for $domain." >&2; return 1; }
+        if [[ -z "$pub_from_cert" || "$pub_from_cert" != "$pub_from_key" ]]; then
+            echo "Error: Existing ACME certificate and private key do not match for $domain." >&2
+            return 1
+        fi
+        cert_serial=$(openssl x509 -in "$fullchain" -noout -serial 2>/dev/null) || { echo "Error: Could not read existing ACME certificate serial for $domain." >&2; return 1; }
+        cert_fingerprint=$(openssl x509 -in "$fullchain" -noout -fingerprint -sha256 2>/dev/null) || { echo "Error: Could not read existing ACME certificate fingerprint for $domain." >&2; return 1; }
+        if [[ -z "$cert_serial" || -z "$cert_fingerprint" ]]; then
+            echo "Error: Existing ACME certificate identity metadata is empty for $domain." >&2
+            return 1
+        fi
+        existed_before=true
     fi
+
+    python3 - "$meta_file" "$domain" "$existed_before" "$cert_serial" "$cert_fingerprint" <<'PY'
+import json
+import os
+import sys
+
+meta_file, domain, existed, serial, fingerprint = sys.argv[1:6]
+data = {
+    "domain": domain,
+    "existed_before": existed == "true",
+    "serial": serial,
+    "fingerprint": fingerprint,
+}
+tmp_path = meta_file + ".tmp"
+fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        json.dump(data, stream, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp_path, meta_file)
+    dir_fd = os.open(os.path.dirname(meta_file), os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+except Exception as exc:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    print(f"Failed to persist ACME snapshot manifest: {type(exc).__name__}", file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
 restore_acme_lineage() {
