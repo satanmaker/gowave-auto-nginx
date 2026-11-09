@@ -77,8 +77,12 @@ def validate_journal(journal_data):
                     raise JournalValidationError(f"Invalid entity entry at index {index}")
                 if item.get("type") not in {"profile", "node", "squad", "host", "user", "token"}:
                     raise JournalValidationError(f"Unsupported entity type at index {index}")
-                if item.get("action") not in {"created", "updated", "adopted"}:
+                if item.get("action") not in {"created", "updated", "adopted", "pending_create"}:
                     raise JournalValidationError(f"Unsupported entity action at index {index}")
+                if item["action"] == "pending_create":
+                    if set(item) != {"type", "action"}:
+                        raise JournalValidationError(f"Pending create entry has unexpected fields at index {index}")
+                    continue
                 if not isinstance(item.get("uuid"), str) or not item["uuid"].strip():
                     raise JournalValidationError(f"Missing entity UUID at index {index}")
                 if item["action"] == "updated":
