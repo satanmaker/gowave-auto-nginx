@@ -514,8 +514,11 @@ def main() -> int:
 
         # Phase: Teardown
         if args.mode in ("full", "teardown"):
-            if args.mode == "teardown" and not state.get("results", {}).get("preflight", {}).get("master_baseline"):
-                print("Prerequisite preflight baseline is missing; refusing teardown", file=sys.stderr)
+            if args.mode == "teardown" and (
+                not state.get("results", {}).get("preflight", {}).get("master_baseline")
+                or not state.get("results", {}).get("preflight", {}).get("worker_baseline")
+            ):
+                print("Prerequisite preflight baselines for both VPS are missing; refusing teardown", file=sys.stderr)
                 return 1
             # Collect diagnostics before teardown
             collect_diagnostics(artifact_dir, master_ssh, worker_ssh)
@@ -553,6 +556,50 @@ def main() -> int:
         write_summary_txt(artifact_dir, state)
 
     finally:
+        # A full run with RESTORE_SNAPSHOT must not bypass the requested restore
+        # merely because an earlier phase returned early. Preflight itself is
+        # read-only; only proceed once both saved baselines exist.
+        if (
+            args.mode == "full"
+            and config.test_teardown_policy == "RESTORE_SNAPSHOT"
+            and "teardown" not in state.get("results", {})
+            and state.get("results", {}).get("preflight", {}).get("status") == "PASS"
+        ):
+            try:
+                if master_ssh and worker_ssh:
+                    try:
+                        collect_diagnostics(artifact_dir, master_ssh, worker_ssh)
+                    except Exception as diagnostics_error:
+                        print(
+                            f"Pre-restore diagnostics incomplete: {type(diagnostics_error).__name__}",
+                            file=sys.stderr,
+                        )
+                    state["results"]["teardown"] = execute_teardown(
+                        config=config,
+                        run_id=run_id,
+                        master_ssh=master_ssh,
+                        worker_ssh=worker_ssh,
+                        pre_baseline_master=state["results"]["preflight"].get("master_baseline"),
+                        pre_baseline_worker=state["results"]["preflight"].get("worker_baseline"),
+                    )
+                else:
+                    state["results"]["teardown"] = {
+                        "status": "TEARDOWN_FAILED",
+                        "policy": "RESTORE_SNAPSHOT",
+                        "error": "SSH sessions unavailable during early-failure snapshot teardown",
+                    }
+                save_run_state(artifact_dir, state)
+            except Exception as teardown_error:
+                state["results"]["teardown"] = {
+                    "status": "TEARDOWN_FAILED",
+                    "policy": "RESTORE_SNAPSHOT",
+                    "error": f"Unexpected early-failure teardown error: {type(teardown_error).__name__}",
+                }
+                try:
+                    save_run_state(artifact_dir, state)
+                except Exception:
+                    pass
+
         # Early phase returns and unexpected exceptions must still leave a
         # terminal, permission-restricted report instead of a RUNNING state.
         try:
