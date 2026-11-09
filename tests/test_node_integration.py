@@ -163,6 +163,31 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertNotIn("Compensating rollback completed on worker host.", worker_script)
         self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_failed=1', worker_script)
 
+    def test_standalone_remote_rollback_reports_non_acme_cleanup_failures(self):
+        """Standalone rollback must fail if service, NGINX, hook, or scratch cleanup is incomplete."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        remote_start = worker_script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
+        remote_end = worker_script.index("\nROLLBACK_REMOTE_SCRIPT", remote_start)
+        rollback_script = worker_script[remote_start:remote_end]
+
+        self.assertIn("rollback_failed=0", rollback_script)
+        self.assertIn('systemctl stop "$unit" 2>/dev/null || rollback_failed=1', rollback_script)
+        self.assertIn('rollback_managed_deploy_hook', rollback_script)
+        self.assertIn('rm -f "$hook_file" || return 1', rollback_script)
+        self.assertIn('sync "$(dirname "$hook_file")" || return 1', rollback_script)
+        self.assertIn('type(data.get("created_by_tx")) is not bool', rollback_script)
+        self.assertIn(' ) || return 1', rollback_script)
+        self.assertIn("nginx -t >/dev/null 2>&1", rollback_script)
+        self.assertIn('systemctl reload nginx 2>/dev/null || rollback_failed=1', rollback_script)
+        self.assertIn('rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1', rollback_script)
+        self.assertIn('sysctl --system 2>/dev/null || rollback_failed=1', rollback_script)
+        self.assertIn("one or more cleanup or restoration operations failed", rollback_script)
+        self.assertIn('ufw status numbered 2>/dev/null', rollback_script)
+        self.assertIn('ufw delete allow 80/tcp 2>/dev/null || rollback_failed=1', rollback_script)
+        self.assertIn('awk \'$3 == "80/tcp" { found=1 } END { exit !found }\'', rollback_script)
+        self.assertIn('awk \'$3 == "443/tcp" { found=1 } END { exit !found }\'', rollback_script)
+        self.assertNotIn("rollback_restore_failed", rollback_script)
+
     def test_worker_standalone_remote_rollback_defined(self):
         """gowave-node-auto.sh must provide standalone remote_rollback command."""
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
