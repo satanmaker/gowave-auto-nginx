@@ -5,6 +5,7 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import shlex
 import ssl
 import subprocess
 import tempfile
@@ -284,6 +285,11 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
         self.assertEqual(result["status"], "PASS")
         command = ssh.run.call_args.args[0]
         self.assertTrue(command.startswith("python3 -c "))
+        # Compile the exact remote source after shell unquoting; import-time
+        # tests cannot detect broken escaping inside the generated script.
+        remote_argv = shlex.split(command)
+        self.assertEqual(remote_argv[:2], ["python3", "-c"])
+        compile(remote_argv[2], "<remote-mtls-negative-probe>", "exec")
         self.assertNotIn(secret, command)
         self.assertEqual(ssh.run.call_args.kwargs["input_data"], secret)
 

@@ -109,7 +109,7 @@ def observe_wrong_sni(context, server_name):
         with socket.create_connection((worker_ip, port), timeout=5) as sock:
             with context.wrap_socket(sock, server_hostname=server_name) as tls:
                 tls.sendall(
-                    b"GET / HTTP/1.1\r\nHost: wrong-sni.example.com\r\n"
+                    b"GET / HTTP/1.1\\r\\nHost: wrong-sni.example.com\\r\\n"
                     b"Connection: close\\r\\n\\r\\n"
                 )
                 response = tls.recv(1024)
