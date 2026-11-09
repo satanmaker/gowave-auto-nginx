@@ -87,29 +87,47 @@ def verify_user_agent_policy(
 
     # 2. Valid Xray User-Agent
     xray_accepted = False
+    xray_code = None
+    xray_error = None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "v2rayNG/1.8.5"})
         with urllib.request.urlopen(req, context=ssl_context, timeout=10) as resp:
-            if resp.status == 200:
-                xray_accepted = True
-    except Exception:
-        xray_accepted = False
+            xray_code = resp.status
+            xray_accepted = xray_code == 200
+    except urllib.error.HTTPError as exc:
+        xray_code = exc.code
+        xray_error = f"HTTP {exc.code}: {exc.reason}"
+    except Exception as exc:
+        xray_error = f"{type(exc).__name__}: {exc}"
 
     # 3. Valid Mihomo User-Agent
     clash_url = f"https://{panel_domain}/api/sub/{short_uuid}/clash"
     mihomo_accepted = False
+    mihomo_code = None
+    mihomo_error = None
     try:
         req = urllib.request.Request(clash_url, headers={"User-Agent": "clash.meta"})
         with urllib.request.urlopen(req, context=ssl_context, timeout=10) as resp:
-            if resp.status == 200:
-                mihomo_accepted = True
-    except Exception:
-        mihomo_accepted = False
+            mihomo_code = resp.status
+            mihomo_accepted = mihomo_code == 200
+    except urllib.error.HTTPError as exc:
+        mihomo_code = exc.code
+        mihomo_error = f"HTTP {exc.code}: {exc.reason}"
+    except Exception as exc:
+        mihomo_error = f"{type(exc).__name__}: {exc}"
 
-    passed = absent_rejected and blank_rejected and xray_accepted and mihomo_accepted
-    status = "PASS" if passed else (
-        "INCOMPLETE" if absent_code is None or blank_code is None else "FAIL"
+    # A known policy violation is FAIL even when another probe is inconclusive.
+    # Only missing transport/HTTP evidence without a proven violation is INCOMPLETE.
+    proven_failure = (
+        (absent_code is not None and not absent_rejected)
+        or (blank_code is not None and not blank_rejected)
+        or (xray_code is not None and not xray_accepted)
+        or (mihomo_code is not None and not mihomo_accepted)
     )
+    missing_evidence = any(
+        code is None for code in (absent_code, blank_code, xray_code, mihomo_code)
+    )
+    status = "FAIL" if proven_failure else ("INCOMPLETE" if missing_evidence else "PASS")
     return {
         "status": status,
         "absent_rejected": absent_rejected,
@@ -119,7 +137,11 @@ def verify_user_agent_policy(
         "blank_code": blank_code,
         "blank_error": blank_error,
         "xray_accepted": xray_accepted,
+        "xray_code": xray_code,
+        "xray_error": xray_error,
         "mihomo_accepted": mihomo_accepted,
+        "mihomo_code": mihomo_code,
+        "mihomo_error": mihomo_error,
     }
 
 

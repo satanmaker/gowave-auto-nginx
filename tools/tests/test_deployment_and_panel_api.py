@@ -234,6 +234,36 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
         ssh.run.return_value = SSHResult(returncode=1, stdout="", stderr="metadata mismatch")
         with self.assertRaises(GoWaveAPIError):
             read_master_credentials(ssh)
+    @patch("live_vps.subscriptions.urllib.request.urlopen", side_effect=urllib.error.URLError("temporary transport failure"))
+    @patch("live_vps.subscriptions.request_subscription_status", side_effect=[200, TimeoutError("blank UA probe timed out")])
+    def test_user_agent_proven_policy_violation_beats_other_incomplete_probes(
+        self, request_status, urlopen
+    ):
+        trusted_ctx = ssl.create_default_context(cafile=str(self.ca_crt))
+        result = verify_user_agent_policy(
+            f"localhost:{self.port}", "opaque-short-uuid", trusted_ctx
+        )
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["absent_code"], 200)
+        self.assertIsNone(result["blank_code"])
+        self.assertIsNone(result["xray_code"])
+        self.assertIsNone(result["mihomo_code"])
+
+    @patch("live_vps.subscriptions.urllib.request.urlopen", side_effect=urllib.error.URLError("temporary transport failure"))
+    @patch("live_vps.subscriptions.request_subscription_status", return_value=403)
+    def test_user_agent_transport_uncertainty_is_incomplete_without_proven_violation(
+        self, request_status, urlopen
+    ):
+        trusted_ctx = ssl.create_default_context(cafile=str(self.ca_crt))
+        result = verify_user_agent_policy(
+            f"localhost:{self.port}", "opaque-short-uuid", trusted_ctx
+        )
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertTrue(result["absent_rejected"])
+        self.assertTrue(result["blank_rejected"])
+        self.assertIsNone(result["xray_code"])
+        self.assertIsNone(result["mihomo_code"])
+
     def test_subscription_policy_sends_absent_and_blank_user_agent(self):
         trusted_ctx = ssl.create_default_context(cafile=str(self.ca_crt))
         MockServerHandler.seen_subscription_user_agents.clear()
