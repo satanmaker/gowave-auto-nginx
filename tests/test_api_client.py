@@ -288,6 +288,18 @@ class TestAPIClient(unittest.TestCase):
             self.assertIn("ADMIN_PASSWORD=securepass1234567890", content)
             self.assertIn("SCOPED_API_TOKEN=token-xyz", content)
 
+    def test_save_credentials_refuses_temporary_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            creds_file = Path(tmpdir) / "credentials.txt"
+            target = Path(tmpdir) / "do-not-overwrite.txt"
+            tmp_path = Path(f"{creds_file}.tmp")
+            target.write_text("sentinel")
+            tmp_path.symlink_to(target)
+            with self.assertRaises(OSError):
+                save_credentials("admin", "secret-password", "https://panel.example.com", creds_path=str(creds_file))
+            self.assertEqual(target.read_text(), "sentinel")
+            self.assertTrue(tmp_path.is_symlink())
+
     def test_atomic_write_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state_file = Path(tmpdir) / "state.json"
@@ -297,6 +309,27 @@ class TestAPIClient(unittest.TestCase):
             loaded = json.loads(state_file.read_text())
             self.assertEqual(loaded["schemaVersion"], 2)
             self.assertEqual(loaded["installationMode"], "all-in-one")
+
+    def test_atomic_state_file_uses_private_permissions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            tmp_path = Path(f"{state_file}.tmp")
+            tmp_path.write_text("stale temporary data")
+            tmp_path.chmod(0o644)
+            atomic_write_state({"nodes": []}, str(state_file))
+            self.assertEqual(stat.S_IMODE(state_file.stat().st_mode), 0o600)
+
+    def test_atomic_state_writer_refuses_temporary_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            target = Path(tmpdir) / "do-not-overwrite.txt"
+            tmp_path = Path(f"{state_file}.tmp")
+            target.write_text("sentinel")
+            tmp_path.symlink_to(target)
+            with self.assertRaises(OSError):
+                atomic_write_state({"nodes": []}, str(state_file))
+            self.assertEqual(target.read_text(), "sentinel")
+            self.assertTrue(tmp_path.is_symlink())
 
     def test_compile_config_profile(self):
         # Case 1: Default mode without vision_domain (4 inbounds)
