@@ -534,16 +534,64 @@ rollback_managed_deploy_hook() {
     local transaction_id="$1"
     local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
     local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
-
-    local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
-    if [[ ! -f "$manifest" ]]; then
+    if [[ -z "$transaction_id" ]]; then
         return 0
     fi
 
-    local created_by_tx recorded_sha
-    created_by_tx=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
-    recorded_sha=$(python3 -c "import json; print(json.load(open('$manifest')).get('sha256', ''))" 2>/dev/null || echo "")
+    local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
+    if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
+        if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            echo "Error: Deploy hook exists without an ownership manifest; refusing to claim rollback succeeded." >&2
+            return 1
+        fi
+        return 0
+    fi
+    if [[ ! -f "$manifest" || -L "$manifest" ]]; then
+        echo "Error: Deploy-hook rollback manifest is missing, non-regular, or a symlink." >&2
+        return 1
+    fi
 
+    local manifest_data
+    manifest_data=$(python3 - "$manifest" "$transaction_id" "$hook_file" <<'PY'
+import json
+import re
+import sys
+
+path, expected_tx, expected_hook = sys.argv[1:4]
+try:
+    with open(path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict):
+        raise ValueError("manifest root must be an object")
+    if data.get("transaction_id") != expected_tx or data.get("path") != expected_hook:
+        raise ValueError("manifest transaction/path mismatch")
+    created = data.get("created_by_tx")
+    if type(created) is not bool:
+        raise ValueError("created_by_tx must be a boolean")
+    digest = data.get("sha256", "")
+    if not isinstance(digest, str):
+        raise ValueError("sha256 must be a string")
+    if created and not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("created hook digest is invalid")
+    print("1" if created else "0")
+    print(digest)
+except Exception as exc:
+    print(f"Invalid deploy-hook rollback manifest: {type(exc).__name__}", file=sys.stderr)
+    sys.exit(1)
+PY
+    ) || {
+        echo "Error: Refusing deploy-hook rollback because its ownership manifest is invalid." >&2
+        return 1
+    }
+
+    local -a manifest_fields=()
+    mapfile -t manifest_fields <<< "$manifest_data"
+    if [[ "${#manifest_fields[@]}" -ne 2 ]]; then
+        echo "Error: Deploy-hook rollback manifest has an invalid field count." >&2
+        return 1
+    fi
+    local created_by_tx="${manifest_fields[0]}"
+    local recorded_sha="${manifest_fields[1]}"
     if [[ "$created_by_tx" != "1" ]]; then
         return 0
     fi
@@ -551,26 +599,33 @@ rollback_managed_deploy_hook() {
     if [[ ! -e "$hook_file" && ! -L "$hook_file" ]]; then
         return 0
     fi
-
     if [[ -L "$hook_file" ]]; then
         echo "Warning: Deploy hook $hook_file is now a symlink; preserving modified object and reporting incomplete recovery." >&2
         return 1
     fi
-
     if [[ ! -f "$hook_file" ]]; then
         echo "Warning: Deploy hook $hook_file is not a regular file; preserving modified object and reporting incomplete recovery." >&2
         return 1
     fi
 
     local current_sha
-    current_sha=$(sha256sum "$hook_file" | awk '{print $1}')
+    current_sha=$(sha256sum "$hook_file" | awk '{print $1}') || {
+        echo "Error: Could not verify managed deploy-hook digest." >&2
+        return 1
+    }
     if [[ "$current_sha" != "$recorded_sha" ]]; then
         echo "Warning: Deploy hook $hook_file was modified after installation (digest mismatch); preserving modified object and reporting incomplete recovery." >&2
         return 1
     fi
 
-    rm -f "$hook_file"
-    sync "$(dirname "$hook_file")"
+    rm -f "$hook_file" || {
+        echo "Error: Could not remove transaction-owned deploy hook $hook_file." >&2
+        return 1
+    }
+    sync "$(dirname "$hook_file")" || {
+        echo "Error: Could not sync deploy-hook directory after rollback." >&2
+        return 1
+    }
     return 0
 }
 
@@ -1186,16 +1241,64 @@ rollback_managed_deploy_hook() {
     local transaction_id="$1"
     local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
     local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
-
-    local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
-    if [[ ! -f "$manifest" ]]; then
+    if [[ -z "$transaction_id" ]]; then
         return 0
     fi
 
-    local created_by_tx recorded_sha
-    created_by_tx=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
-    recorded_sha=$(python3 -c "import json; print(json.load(open('$manifest')).get('sha256', ''))" 2>/dev/null || echo "")
+    local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
+    if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
+        if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            echo "Error: Deploy hook exists without an ownership manifest; refusing to claim rollback succeeded." >&2
+            return 1
+        fi
+        return 0
+    fi
+    if [[ ! -f "$manifest" || -L "$manifest" ]]; then
+        echo "Error: Deploy-hook rollback manifest is missing, non-regular, or a symlink." >&2
+        return 1
+    fi
 
+    local manifest_data
+    manifest_data=$(python3 - "$manifest" "$transaction_id" "$hook_file" <<'PY'
+import json
+import re
+import sys
+
+path, expected_tx, expected_hook = sys.argv[1:4]
+try:
+    with open(path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict):
+        raise ValueError("manifest root must be an object")
+    if data.get("transaction_id") != expected_tx or data.get("path") != expected_hook:
+        raise ValueError("manifest transaction/path mismatch")
+    created = data.get("created_by_tx")
+    if type(created) is not bool:
+        raise ValueError("created_by_tx must be a boolean")
+    digest = data.get("sha256", "")
+    if not isinstance(digest, str):
+        raise ValueError("sha256 must be a string")
+    if created and not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("created hook digest is invalid")
+    print("1" if created else "0")
+    print(digest)
+except Exception as exc:
+    print(f"Invalid deploy-hook rollback manifest: {type(exc).__name__}", file=sys.stderr)
+    sys.exit(1)
+PY
+    ) || {
+        echo "Error: Refusing deploy-hook rollback because its ownership manifest is invalid." >&2
+        return 1
+    }
+
+    local -a manifest_fields=()
+    mapfile -t manifest_fields <<< "$manifest_data"
+    if [[ "${#manifest_fields[@]}" -ne 2 ]]; then
+        echo "Error: Deploy-hook rollback manifest has an invalid field count." >&2
+        return 1
+    fi
+    local created_by_tx="${manifest_fields[0]}"
+    local recorded_sha="${manifest_fields[1]}"
     if [[ "$created_by_tx" != "1" ]]; then
         return 0
     fi
@@ -1203,26 +1306,33 @@ rollback_managed_deploy_hook() {
     if [[ ! -e "$hook_file" && ! -L "$hook_file" ]]; then
         return 0
     fi
-
     if [[ -L "$hook_file" ]]; then
         echo "Warning: Deploy hook $hook_file is now a symlink; preserving modified object and reporting incomplete recovery." >&2
         return 1
     fi
-
     if [[ ! -f "$hook_file" ]]; then
         echo "Warning: Deploy hook $hook_file is not a regular file; preserving modified object and reporting incomplete recovery." >&2
         return 1
     fi
 
     local current_sha
-    current_sha=$(sha256sum "$hook_file" | awk '{print $1}')
+    current_sha=$(sha256sum "$hook_file" | awk '{print $1}') || {
+        echo "Error: Could not verify managed deploy-hook digest." >&2
+        return 1
+    }
     if [[ "$current_sha" != "$recorded_sha" ]]; then
         echo "Warning: Deploy hook $hook_file was modified after installation (digest mismatch); preserving modified object and reporting incomplete recovery." >&2
         return 1
     fi
 
-    rm -f "$hook_file"
-    sync "$(dirname "$hook_file")"
+    rm -f "$hook_file" || {
+        echo "Error: Could not remove transaction-owned deploy hook $hook_file." >&2
+        return 1
+    }
+    sync "$(dirname "$hook_file")" || {
+        echo "Error: Could not sync deploy-hook directory after rollback." >&2
+        return 1
+    }
     return 0
 }
 
@@ -1985,49 +2095,98 @@ rollback_managed_deploy_hook() {
     local transaction_id="$1"
     local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
     local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
-
     if [[ -z "$transaction_id" ]]; then
         return 0
     fi
+
     local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
-    if [[ ! -f "$manifest" ]]; then
+    if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
+        if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            echo "Error: Deploy hook exists without an ownership manifest; refusing to claim rollback succeeded." >&2
+            return 1
+        fi
         return 0
     fi
+    if [[ ! -f "$manifest" || -L "$manifest" ]]; then
+        echo "Error: Deploy-hook rollback manifest is missing, non-regular, or a symlink." >&2
+        return 1
+    fi
+
     local manifest_data
-    manifest_data=$(python3 - "$manifest" <<'PY'
+    manifest_data=$(python3 - "$manifest" "$transaction_id" "$hook_file" <<'PY'
 import json
+import re
 import sys
 
+path, expected_tx, expected_hook = sys.argv[1:4]
 try:
-    with open(sys.argv[1], "r", encoding="utf-8") as stream:
+    with open(path, "r", encoding="utf-8") as stream:
         data = json.load(stream)
-    if not isinstance(data, dict) or type(data.get("created_by_tx")) is not bool:
-        raise ValueError("invalid deploy-hook manifest")
+    if not isinstance(data, dict):
+        raise ValueError("manifest root must be an object")
+    if data.get("transaction_id") != expected_tx or data.get("path") != expected_hook:
+        raise ValueError("manifest transaction/path mismatch")
+    created = data.get("created_by_tx")
+    if type(created) is not bool:
+        raise ValueError("created_by_tx must be a boolean")
     digest = data.get("sha256", "")
-    if not isinstance(digest, str) or (data["created_by_tx"] and not digest):
-        raise ValueError("invalid deploy-hook digest")
-    print("1" if data["created_by_tx"] else "0")
+    if not isinstance(digest, str):
+        raise ValueError("sha256 must be a string")
+    if created and not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("created hook digest is invalid")
+    print("1" if created else "0")
     print(digest)
 except Exception as exc:
-    print(f"Invalid deploy-hook manifest: {type(exc).__name__}", file=sys.stderr)
+    print(f"Invalid deploy-hook rollback manifest: {type(exc).__name__}", file=sys.stderr)
     sys.exit(1)
 PY
-    ) || return 1
+    ) || {
+        echo "Error: Refusing deploy-hook rollback because its ownership manifest is invalid." >&2
+        return 1
+    }
+
     local -a manifest_fields=()
     mapfile -t manifest_fields <<< "$manifest_data"
     if [[ "${#manifest_fields[@]}" -ne 2 ]]; then
+        echo "Error: Deploy-hook rollback manifest has an invalid field count." >&2
         return 1
     fi
-    local created_by_tx="${manifest_fields[0]}" recorded_sha="${manifest_fields[1]}"
-    if [[ "$created_by_tx" != "1" || ! -f "$hook_file" ]]; then
+    local created_by_tx="${manifest_fields[0]}"
+    local recorded_sha="${manifest_fields[1]}"
+    if [[ "$created_by_tx" != "1" ]]; then
         return 0
     fi
-    local current_sha
-    current_sha=$(sha256sum "$hook_file" | awk '{print $1}') || return 1
-    if [[ "$current_sha" == "$recorded_sha" ]]; then
-        rm -f "$hook_file" || return 1
-        sync "$(dirname "$hook_file")" || return 1
+
+    if [[ ! -e "$hook_file" && ! -L "$hook_file" ]]; then
+        return 0
     fi
+    if [[ -L "$hook_file" ]]; then
+        echo "Warning: Deploy hook $hook_file is now a symlink; preserving modified object and reporting incomplete recovery." >&2
+        return 1
+    fi
+    if [[ ! -f "$hook_file" ]]; then
+        echo "Warning: Deploy hook $hook_file is not a regular file; preserving modified object and reporting incomplete recovery." >&2
+        return 1
+    fi
+
+    local current_sha
+    current_sha=$(sha256sum "$hook_file" | awk '{print $1}') || {
+        echo "Error: Could not verify managed deploy-hook digest." >&2
+        return 1
+    }
+    if [[ "$current_sha" != "$recorded_sha" ]]; then
+        echo "Warning: Deploy hook $hook_file was modified after installation (digest mismatch); preserving modified object and reporting incomplete recovery." >&2
+        return 1
+    fi
+
+    rm -f "$hook_file" || {
+        echo "Error: Could not remove transaction-owned deploy hook $hook_file." >&2
+        return 1
+    }
+    sync "$(dirname "$hook_file")" || {
+        echo "Error: Could not sync deploy-hook directory after rollback." >&2
+        return 1
+    }
     return 0
 }
 
