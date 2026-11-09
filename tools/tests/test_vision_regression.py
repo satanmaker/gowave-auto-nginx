@@ -150,7 +150,8 @@ class TestVisionRegressionCoverage(unittest.TestCase):
             subprocess.run([
                 "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                 "-keyout", str(key_file), "-out", str(cert_file),
-                "-days", "30", "-subj", "/CN=other.master.com"
+                "-days", "30", "-subj", "/CN=other.master.com",
+                "-addext", "subjectAltName=DNS:other.master.com"
             ], check=True, stderr=subprocess.DEVNULL)
 
             cmd = f'source "{NGINX_SH}" && verify_acme_certificate "vision.master.com" "{live_dir}"'
