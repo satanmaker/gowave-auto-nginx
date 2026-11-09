@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import tempfile
 
 VALID_OPS = {"provision", "node_add", "update", "channel_switch", "restore"}
 OP_ALLOWED_STATES = {
@@ -203,28 +204,52 @@ def sqlite_online_backup(db_path, backup_dest, gowave_user="gowave"):
         conn.close()
 
     # Staged backup into pre-created file
-    staged_file = db_file.parent / f".backup-{int(time.time())}.db"
+    # Use a unique staging file; timestamp-only names collide for concurrent backups.
+    fd, staged_name = tempfile.mkstemp(prefix=".backup-", suffix=".db", dir=str(db_file.parent))
+    os.close(fd)
+    staged_file = Path(staged_name)
 
     is_root = os.geteuid() == 0
-    if is_root:
-        # Pre-create with 0640 ownership gowave:gowave
-        subprocess.run(["install", "-o", gowave_user, "-g", gowave_user, "-m", "0640", "/dev/null", str(staged_file)], check=True)
-        # Execute backup under service user privileges
-        backup_cmd = f"sqlite3 '{db_file}' '.backup {staged_file}'"
-        subprocess.run(["runuser", "-u", gowave_user, "--", "bash", "-c", backup_cmd], check=True)
-        # Move into private recovery storage
+    try:
+        if is_root:
+            # The service user performs the SQLite Online Backup, but all paths
+            # are passed as argv rather than interpolated into a shell command.
+            subprocess.run(["chown", f"{gowave_user}:{gowave_user}", str(staged_file)], check=True)
+            os.chmod(str(staged_file), 0o640)
+            backup_script = (
+                "import sqlite3, sys\n"
+                "source = sqlite3.connect(sys.argv[1], timeout=5.0)\n"
+                "destination = sqlite3.connect(sys.argv[2], timeout=5.0)\n"
+                "try:\n"
+                "    source.backup(destination)\n"
+                "finally:\n"
+                "    destination.close()\n"
+                "    source.close()\n"
+            )
+            subprocess.run(
+                ["runuser", "-u", gowave_user, "--", "python3", "-c",
+                 backup_script, str(db_file), str(staged_file)],
+                check=True,
+            )
+        else:
+            # Non-root fallback (for testing/unprivileged execution).
+            bconn = sqlite3.connect(str(staged_file))
+            try:
+                src_conn = sqlite3.connect(str(db_file))
+                try:
+                    src_conn.backup(bconn)
+                finally:
+                    src_conn.close()
+            finally:
+                bconn.close()
+
         shutil.move(str(staged_file), str(dest_file))
         os.chmod(str(dest_file), 0o600)
-    else:
-        # Non-root fallback (for testing/unprivileged execution)
-        bconn = sqlite3.connect(str(dest_file))
+    finally:
         try:
-            src_conn = sqlite3.connect(str(db_file))
-            src_conn.backup(bconn)
-            src_conn.close()
-        finally:
-            bconn.close()
-        os.chmod(str(dest_file), 0o600)
+            staged_file.unlink()
+        except FileNotFoundError:
+            pass
 
     # Verify integrity of destination copy
     dest_conn = sqlite3.connect(str(dest_file))

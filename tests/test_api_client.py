@@ -3,6 +3,7 @@ import http.server
 import io
 import json
 import os
+import sqlite3
 import stat
 from pathlib import Path
 import tempfile
@@ -17,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 import sys
 sys.path.insert(0, str(REPO_ROOT))
 from modules.api_client import GoWaveAPIError, GoWaveClient, atomic_write_state, save_credentials, rollback_provisioning, _extract_list
-from modules.recovery import write_journal_atomically
+from modules.recovery import sqlite_online_backup, write_journal_atomically
 
 
 class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
@@ -299,6 +300,48 @@ class TestAPIClient(unittest.TestCase):
                 save_credentials("admin", "secret-password", "https://panel.example.com", creds_path=str(creds_file))
             self.assertEqual(target.read_text(), "sentinel")
             self.assertTrue(tmp_path.is_symlink())
+
+    def test_root_sqlite_backup_uses_argv_and_unique_staging_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_file = root / "source ' database.sqlite"
+            backup_file = root / "backup ' destination.sqlite"
+            connection = sqlite3.connect(db_file)
+            try:
+                connection.execute("CREATE TABLE sample (value TEXT)")
+                connection.execute("INSERT INTO sample VALUES ('backup-ok')")
+                connection.commit()
+            finally:
+                connection.close()
+
+            calls = []
+
+            def fake_run(args, check):
+                calls.append(args)
+                if args[0] == "runuser":
+                    self.assertNotIn("bash", args)
+                    self.assertEqual(args[4:6], ["python3", "-c"])
+                    source = sqlite3.connect(args[-2])
+                    destination = sqlite3.connect(args[-1])
+                    try:
+                        source.backup(destination)
+                    finally:
+                        destination.close()
+                        source.close()
+                return mock.Mock(returncode=0)
+
+            with mock.patch("modules.recovery.os.geteuid", return_value=0), \
+                 mock.patch("modules.recovery.subprocess.run", side_effect=fake_run):
+                self.assertTrue(sqlite_online_backup(str(db_file), str(backup_file)))
+
+            self.assertTrue(any(call[0] == "chown" for call in calls))
+            self.assertTrue(any(call[0] == "runuser" for call in calls))
+            check = sqlite3.connect(backup_file)
+            try:
+                self.assertEqual(check.execute("SELECT value FROM sample").fetchone(), ("backup-ok",))
+            finally:
+                check.close()
+            self.assertEqual(list(root.glob(".backup-*.db")), [])
 
     def test_atomic_write_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:
