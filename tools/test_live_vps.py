@@ -265,6 +265,34 @@ def main() -> int:
     overall_status = "PASS"
 
     try:
+        # Revalidate local SSH identity material on every invocation, including
+        # resumed partial phases. The config fingerprint stores paths, not the
+        # mutable file metadata or contents.
+        ssh_preconditions = {
+            "master_private_key": check_private_key_file(config.master_ssh_key_path),
+            "worker_private_key": check_private_key_file(config.worker_ssh_key_path),
+            "master_known_hosts": check_ssh_trust(
+                config.master_ip, config.master_ssh_port, config.master_known_hosts_path
+            ),
+            "worker_known_hosts": check_ssh_trust(
+                config.worker_ip, config.worker_ssh_port, config.worker_known_hosts_path
+            ),
+        }
+        failed_ssh_preconditions = {
+            name: error for name, (ok, error) in ssh_preconditions.items() if not ok
+        }
+        if failed_ssh_preconditions:
+            state["results"]["ssh_precondition"] = {
+                "status": "FAIL",
+                "errors": failed_ssh_preconditions,
+            }
+            save_run_state(artifact_dir, state)
+            print(
+                "Local SSH credential/host-trust precondition failed; no VPS connection attempted.",
+                file=sys.stderr,
+            )
+            return 1
+
         # Phase: Preflight
         if args.mode in ("full", "preflight"):
             tools_chk = check_control_machine_tools(config)
