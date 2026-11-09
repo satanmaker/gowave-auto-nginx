@@ -388,7 +388,13 @@ def _run_runner(command: list[str], cwd: Path) -> int:
         raise
 
 
-def run_interactive(acme_mode: str) -> int:
+def _build_runner_command(config_path: Path, run_id: str, mode: str) -> list[str]:
+    if mode not in ("preflight", "full"):
+        raise ValueError(f"Unsupported operator mode: {mode}")
+    return [sys.executable, str(TOOLS_DIR / "test_live_vps.py"), "--config", str(config_path), "--mode", mode, "--run-id", run_id]
+
+
+def run_interactive(acme_mode: str, mode: str = "full") -> int:
     signal.signal(signal.SIGTERM, _handle_termination)
     signal.signal(signal.SIGHUP, _handle_termination)
     if paramiko is None:
@@ -403,26 +409,29 @@ def run_interactive(acme_mode: str) -> int:
             print(f"Required local tool not found: {tool}", file=sys.stderr)
             return 1
 
-    print("Live VPS E2E — local operator")
+    print(f"Live VPS E2E — local operator ({mode})")
     print("Only disposable VPS instances are accepted by the existing preflight gate.")
+    if mode == "preflight":
+        print("Preflight does not install GoWave or change its services; temporary SSH access is bootstrapped and revoked afterwards.")
+    else:
+        print("Full mode installs GoWave on both disposable VPS instances.")
     print("The SSH account must be root. Passwords are hidden and are not written to disk.")
     master_ip = input("Master public IPv4: ").strip()
     master_port = int(input("Master SSH port [22]: ").strip() or "22")
     master_user = input("Master SSH login [root]: ").strip() or "root"
     master_panel = input("Master Panel subdomain: ").strip()
     master_reality = input("Master REALITY subdomain: ").strip()
-    master_vision = input("Master third (Vision) subdomain: ").strip()
-    if not master_vision:
-        raise ValueError("The third Master domain (MASTER_VISION_DOMAIN) is required for the 3+2 operator topology.")
+    master_vision = input("Master Vision domain (optional; Enter to disable): ").strip()
     worker_ip = input("Worker public IPv4: ").strip()
     worker_port = int(input("Worker SSH port [22]: ").strip() or "22")
     worker_user = input("Worker SSH login [root]: ").strip() or "root"
     worker_domain = input("Worker NGINX subdomain: ").strip()
     worker_reality = input("Worker REALITY subdomain: ").strip()
-    admin_email = input("ACME registration email: ").strip()
-    if not admin_email:
-        raise ValueError("A real ACME registration email is required.")
-    if acme_mode == "production":
+    worker_vision = input("Worker Vision domain (optional; Enter to disable): ").strip()
+    admin_email = input("ACME registration email" + (" (required)" if mode == "full" else " (optional for preflight)") + ": ").strip()
+    if mode == "full" and not admin_email:
+        raise ValueError("A real ACME registration email is required for full deployment.")
+    if mode == "full" and acme_mode == "production":
         confirmation = input("Production ACME can consume rate limits. Type PRODUCTION to continue: ").strip()
         if confirmation != "PRODUCTION":
             print("Production ACME was not confirmed; aborting before any VPS connection.")
@@ -451,7 +460,7 @@ def run_interactive(acme_mode: str) -> int:
             validation_path = runtime_dir / "validation.env"
             validation_values = {
                 "MASTER_IP": master_ip, "MASTER_PANEL_DOMAIN": master_panel,
-                "MASTER_REALITY_DOMAIN": master_reality, "MASTER_VISION_DOMAIN": master_vision,
+                "MASTER_REALITY_DOMAIN": master_reality,
                 "MASTER_SSH_PORT": str(master_port), "MASTER_SSH_USER": master_user,
                 "WORKER_IP": worker_ip, "WORKER_DOMAIN": worker_domain,
                 "WORKER_REALITY_DOMAIN": worker_reality, "WORKER_SSH_PORT": str(worker_port),
@@ -459,6 +468,10 @@ def run_interactive(acme_mode: str) -> int:
                 "SSH_KNOWN_HOSTS": "/tmp/not-used", "ACME_MODE": acme_mode,
                 "ADMIN_EMAIL": admin_email,
             }
+            if master_vision:
+                validation_values["MASTER_VISION_DOMAIN"] = master_vision
+            if worker_vision:
+                validation_values["WORKER_VISION_DOMAIN"] = worker_vision
             _build_config(TOOLS_DIR / "live_vps_config.env.example", validation_path, validation_values)
             validation_config = load_config(validation_path)
             tool_checks = check_control_machine_tools(validation_config)
@@ -484,7 +497,6 @@ def run_interactive(acme_mode: str) -> int:
                 "MASTER_IP": master_ip,
                 "MASTER_PANEL_DOMAIN": master_panel,
                 "MASTER_REALITY_DOMAIN": master_reality,
-                "MASTER_VISION_DOMAIN": master_vision,
                 "MASTER_SSH_PORT": str(master_port),
                 "MASTER_SSH_USER": master_user,
                 "WORKER_IP": worker_ip,
@@ -501,12 +513,12 @@ def run_interactive(acme_mode: str) -> int:
                 "ACME_MODE": acme_mode,
                 "ADMIN_EMAIL": admin_email,
             }
+            if master_vision:
+                values["MASTER_VISION_DOMAIN"] = master_vision
+            if worker_vision:
+                values["WORKER_VISION_DOMAIN"] = worker_vision
             _build_config(template, config_path, values)
-            result_code = _run_runner(
-                [sys.executable, str(TOOLS_DIR / "test_live_vps.py"),
-                 "--config", str(config_path), "--mode", "full", "--run-id", run_id],
-                cwd=REPO_ROOT,
-            )
+            result_code = _run_runner(_build_runner_command(config_path, run_id, mode), cwd=REPO_ROOT)
         except KeyboardInterrupt:
             print("\nInterrupted. Attempting to revoke temporary SSH access…", file=sys.stderr)
             result_code = 130
@@ -544,9 +556,11 @@ def run_interactive(acme_mode: str) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Interactive local Live VPS E2E controller")
     parser.add_argument("--acme-mode", choices=("staging", "production"), default="staging")
+    parser.add_argument("--mode", choices=("preflight", "full"), default="full",
+                        help="preflight checks both disposable VPS without installing GoWave; full performs deployment")
     args = parser.parse_args()
     try:
-        return run_interactive(args.acme_mode)
+        return run_interactive(args.acme_mode, args.mode)
     except (ValueError, OSError) as exc:
         print(f"Input/preflight error: {exc}", file=sys.stderr)
         return 1
