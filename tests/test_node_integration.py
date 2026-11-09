@@ -13,6 +13,98 @@ NODE_SH = REPO_ROOT / "modules" / "node.sh"
 
 
 class TestNodeIntegration(unittest.TestCase):
+    def test_recovery_directory_is_created_private_and_owned_by_caller(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            recovery_dir = Path(tmpdir) / "recovery"
+            env = os.environ.copy()
+            env["RECOVERY_DIR"] = str(recovery_dir)
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1/modules/recovery.sh"; ensure_recovery_dir', "test", str(REPO_ROOT)],
+                env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            metadata = recovery_dir.stat()
+            self.assertEqual(metadata.st_uid, os.geteuid())
+            self.assertEqual(metadata.st_mode & 0o777, 0o700)
+
+    def test_recovery_directory_refuses_filesystem_root(self):
+        root_mode = Path("/").stat().st_mode & 0o777
+        env = os.environ.copy()
+        env["RECOVERY_DIR"] = "/"
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1/modules/recovery.sh"; ensure_recovery_dir', "test", str(REPO_ROOT)],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dedicated 'recovery' directory", result.stderr)
+        self.assertEqual(Path("/").stat().st_mode & 0o777, root_mode)
+
+    def test_recovery_directory_does_not_chmod_foreign_owned_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            recovery_dir = root / "recovery"
+            recovery_dir.mkdir(mode=0o755)
+            recovery_dir.chmod(0o755)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            chmod_marker = root / "chmod-called"
+            fake_stat = bin_dir / "stat"
+            fake_stat.write_text("#!/bin/sh\necho 65534:755\n")
+            fake_stat.chmod(0o755)
+            fake_chmod = bin_dir / "chmod"
+            fake_chmod.write_text(f"#!/bin/sh\ntouch '{chmod_marker}'\nexit 0\n")
+            fake_chmod.chmod(0o755)
+
+            env = os.environ.copy()
+            env["RECOVERY_DIR"] = str(recovery_dir)
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1/modules/recovery.sh"; ensure_recovery_dir', "test", str(REPO_ROOT)],
+                env=env, capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must be owned by the current user", result.stderr)
+            self.assertFalse(chmod_marker.exists(), "chmod must not mutate a foreign-owned directory")
+            self.assertEqual(recovery_dir.stat().st_mode & 0o777, 0o755)
+    def test_recovery_directory_rejects_symlink_path_components(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            real_parent = root / "real"
+            real_parent.mkdir()
+            real_parent.chmod(0o755)
+            linked_parent = root / "linked"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            recovery_dir = linked_parent / "recovery"
+            env = os.environ.copy()
+            env["RECOVERY_DIR"] = str(recovery_dir)
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1/modules/recovery.sh"; ensure_recovery_dir', "test", str(REPO_ROOT)],
+                env=env, capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("recovery directory path contains a symlink", result.stderr)
+            self.assertFalse((real_parent / "recovery").exists())
+            self.assertEqual(real_parent.stat().st_mode & 0o777, 0o755)
+
+    def test_recovery_directory_permission_failure_aborts_snapshot_setup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            recovery_dir = root / "recovery"
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake_chmod = bin_dir / "chmod"
+            fake_chmod.write_text("#!/bin/sh\nexit 1\n")
+            fake_chmod.chmod(0o755)
+            env = os.environ.copy()
+            env["RECOVERY_DIR"] = str(recovery_dir)
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1/modules/recovery.sh"; ensure_recovery_dir', "test", str(REPO_ROOT)],
+                env=env, capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot enforce private recovery directory permissions", result.stderr)
+
     def test_vendored_upstream_installer_matches_pinned_commit_digest(self):
         installer = REPO_ROOT / "sources" / "gowave-node" / "install.sh"
         self.assertTrue(installer.is_file(), "Pinned GoWave Node installer must be vendored")
