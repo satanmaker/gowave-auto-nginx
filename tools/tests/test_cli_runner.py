@@ -23,6 +23,7 @@ from live_vps.traffic import evaluate_traffic_suite_status
 from test_live_vps import (
     load_run_state, save_run_state, build_config_fingerprint,
     evaluate_preflight_eligibility, get_git_head_commit,
+    build_test_cases_from_state,
 )
 
 

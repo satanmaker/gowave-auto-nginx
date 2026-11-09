@@ -231,6 +231,7 @@ class TestVisionRegressionCoverage(unittest.TestCase):
         # Every synthetic PASS fixture carries the same mandatory packet-evidence contract.
         packet_evidence = {
             "target_packets": 3, "offload_packets": 0,
+            "target_ingress_ok": True, "offload_ok": True, "egress_matches": True,
             "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
         }
         # 1. Disabled Vision: expected 8 per client (total 16)
