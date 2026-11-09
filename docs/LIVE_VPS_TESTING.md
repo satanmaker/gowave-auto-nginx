@@ -33,7 +33,7 @@ The live two-VPS acceptance run is launched from the operator's Linux workstatio
 
 - Use freshly provisioned disposable VPS instances only. The existing preflight rejects occupied GoWave directories, conflicting services, and required listeners before deployment.
 - DNS for all five supplied domains must resolve exactly to the corresponding VPS addresses. Unexpected A/AAAA answers or resolver disagreement fail preflight.
-- The existing runner requires pinned software versions, strict DNS, TLS trust, and a clean repository worktree. Local Xray and Mihomo binaries must match the pinned versions. Both target VPS instances must have `tcpdump` installed and executable by root; the runner does not install or remove it.
+- The existing runner requires pinned software versions, strict DNS, TLS trust, and a clean repository worktree. Local Xray and Mihomo binaries must match the pinned versions. Both target VPS instances must have `tcpdump` and coreutils `timeout` installed and executable by root; the runner does not install or remove them.
 - The default teardown policy remains `PRESERVE`: the controller revokes temporary SSH access but does not destroy VPS instances or automatically restore provider snapshots. Review the report and remove disposable instances through the provider when appropriate. Snapshot restoration remains an explicitly configured option.
 - The Master Vision domain is independent of Worker Vision. The interactive five-domain topology uses Master Panel + Master REALITY + Master Vision, and Worker NGINX + Worker REALITY.
 
