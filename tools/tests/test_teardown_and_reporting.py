@@ -17,7 +17,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT))
 
-from live_vps.teardown import validate_restore_hook, execute_teardown
+from live_vps.teardown import (
+    BASELINE_COMPARISON_KEYS,
+    compare_captured_baseline,
+    execute_teardown,
+    validate_restore_hook,
+)
 from live_vps.reporting import write_result_json, write_junit_report, write_summary_txt
 from live_vps.redaction import register_secret, clear_secrets
 
@@ -81,6 +86,49 @@ class TestTeardownAndReporting(unittest.TestCase):
         ok, err = validate_restore_hook(str(hook), valid_sha)
         self.assertTrue(ok)
         self.assertIsNone(err)
+
+    def test_validate_restore_hook_rejects_symlink_and_non_regular_paths(self):
+        target = self.td_path / "target.sh"
+        target.write_text("#!/bin/sh\\nexit 0\\n")
+        target.chmod(0o700)
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+
+        link = self.td_path / "restore-link.sh"
+        link.symlink_to(target)
+        ok, error = validate_restore_hook(str(link), digest)
+        self.assertFalse(ok)
+        self.assertIn("symlink", error)
+
+        directory = self.td_path / "restore-directory"
+        directory.mkdir()
+        ok, error = validate_restore_hook(str(directory), digest)
+        self.assertFalse(ok)
+        self.assertIsNotNone(error)
+
+        non_executable = self.td_path / "restore-non-executable.sh"
+        non_executable.write_text("#!/bin/sh\\nexit 0\\n")
+        non_executable.chmod(0o600)
+        ok, error = validate_restore_hook(
+            str(non_executable), hashlib.sha256(non_executable.read_bytes()).hexdigest()
+        )
+        self.assertFalse(ok)
+        self.assertIn("not executable", error)
+
+    def test_compare_captured_baseline_reports_missing_and_changed_fields(self):
+        baseline = {key: f"before-{key}" for key in BASELINE_COMPARISON_KEYS}
+        changed = dict(baseline)
+        changed["firewall_status"] = "after-firewall"
+        del changed["swap_info"]
+
+        matches, missing, changed_fields = compare_captured_baseline(baseline, changed)
+
+        self.assertFalse(matches)
+        self.assertEqual(missing, ["swap_info"])
+        self.assertEqual(changed_fields, ["firewall_status"])
+
+    def test_compare_captured_baseline_matches_complete_equal_state(self):
+        baseline = {key: f"value-{key}" for key in BASELINE_COMPARISON_KEYS}
+        self.assertEqual(compare_captured_baseline(baseline, dict(baseline)), (True, [], []))
 
     def test_execute_teardown_preserve(self):
         config = MagicMock()

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import signal
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -47,6 +49,49 @@ class TestLocalOperator(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 _run_runner(["python3", "test_live_vps.py"], Path("/tmp"))
         self.assertTrue(process.signals)
+
+    def test_runner_child_escalates_termination_when_sigint_is_ignored(self):
+        class FakeProcess:
+            def __init__(self):
+                self.wait_calls = 0
+                self.signals = []
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise KeyboardInterrupt()
+                if self.wait_calls in (2, 3):
+                    raise subprocess.TimeoutExpired("runner", timeout)
+                return 137
+
+            def poll(self):
+                return None
+
+            def send_signal(self, signum):
+                self.signals.append(("signal", signum))
+
+            def terminate(self):
+                self.signals.append(("terminate", None))
+
+            def kill(self):
+                self.signals.append(("kill", None))
+
+        process = FakeProcess()
+        with patch("live_vps.operator.subprocess.Popen", return_value=process):
+            with self.assertRaises(KeyboardInterrupt):
+                _run_runner(["python3", "test_live_vps.py"], Path("/tmp"))
+
+        self.assertEqual(process.signals[0], ("signal", signal.SIGINT))
+        self.assertEqual(process.signals[1:], [("terminate", None), ("kill", None)])
+        self.assertEqual(process.wait_calls, 4)
+
+    def test_runner_returns_child_exit_code(self):
+        class FakeProcess:
+            def wait(self):
+                return 23
+
+        with patch("live_vps.operator.subprocess.Popen", return_value=FakeProcess()):
+            self.assertEqual(_run_runner(["python3", "test_live_vps.py"], Path("/tmp")), 23)
 
     def test_temporary_authorized_key_disables_forwarding_and_pty(self):
         line = _public_key_line(FakeKey(), "gowave-e2e:run:master:marker")

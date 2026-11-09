@@ -27,6 +27,12 @@ from live_vps.redaction import (
 
 
 class TestTLSAndRedaction(unittest.TestCase):
+    def setUp(self):
+        clear_secrets()
+
+    def tearDown(self):
+        clear_secrets()
+
     def test_find_system_ca_bundle(self):
         bundle = find_system_ca_bundle()
         self.assertTrue(bundle.is_file())

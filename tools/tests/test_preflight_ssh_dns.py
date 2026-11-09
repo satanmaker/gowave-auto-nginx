@@ -23,6 +23,9 @@ from live_vps.preflight import (
 
 
 class TestPreflightSSHDNS(unittest.TestCase):
+    def setUp(self):
+        clear_secrets()
+
     def tearDown(self):
         clear_secrets()
 
@@ -137,13 +140,13 @@ class TestPreflightSSHDNS(unittest.TestCase):
     def test_dns_ipv6_disabled_requires_no_aaaa_answers(self, run):
         run.return_value = MagicMock(
             returncode=0,
-            stdout=";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\\n",
+            stdout=";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n",
         )
         result = verify_domain_no_aaaa("panel.example.test", resolvers=["1.1.1.1", "8.8.8.8"])
         self.assertTrue(result.ok)
         run.return_value = MagicMock(
             returncode=0,
-            stdout=";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\\npanel.example.test. 60 IN AAAA 2001:db8::10\\n",
+            stdout=";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\npanel.example.test. 60 IN AAAA 2001:db8::10\n",
         )
         result = verify_domain_no_aaaa("panel.example.test", resolvers=["1.1.1.1", "8.8.8.8"])
         self.assertFalse(result.ok)
@@ -184,7 +187,7 @@ class TestPreflightSSHDNS(unittest.TestCase):
         ]
         worker = MagicMock()
         worker.run.side_effect = [
-            MagicMock(ok=True, stdout="Status: active\\nDefault: deny (incoming)\\n3002/tcp ALLOW IN 203.0.113.10"),
+            MagicMock(ok=True, stdout="Status: active\nDefault: deny (incoming)\n3002/tcp ALLOW IN 203.0.113.10"),
             MagicMock(ok=True, stdout=""),
         ]
         result = verify_worker_firewall(master, worker, "203.0.113.20")
@@ -201,7 +204,7 @@ class TestPreflightSSHDNS(unittest.TestCase):
         ]
         worker = MagicMock()
         worker.run.side_effect = [
-            MagicMock(ok=True, stdout="Status: active\\nDefault: deny (incoming)\\n3002/tcp ALLOW IN 203.0.113.10"),
+            MagicMock(ok=True, stdout="Status: active\nDefault: deny (incoming)\n3002/tcp ALLOW IN 203.0.113.10"),
             MagicMock(ok=True, stdout=""),
         ]
         result = verify_worker_firewall(master, worker, "203.0.113.20")
