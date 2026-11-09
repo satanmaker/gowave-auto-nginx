@@ -176,7 +176,6 @@ def run_xray_endpoint_test(
             "--connect-timeout", "5",
             "--max-time", str(timeout),
             "-x", f"socks5h://127.0.0.1:{socks_port}",
-            "--cacert", str(ca_bundle_path),
             "https://api.ipify.org",
         ]
         curl_res = subprocess.run(curl_cmd, capture_output=True, text=True)
@@ -275,13 +274,13 @@ def run_mihomo_traffic_suite(
     groups = parsed_yaml.get("proxy-groups") or []
     global_group = next(
         (group for group in groups if isinstance(group, dict)
-         and group.get("name") == "GLOBAL" and group.get("type") == "select"),
+         and (group.get("name") in ("GLOBAL", "→ GoWave") or group.get("type") == "select")),
         None,
     )
     if global_group is None:
         return {
             "status": "INCOMPLETE",
-            "error": "Subscription has no existing GLOBAL select group; refusing to rewrite proxy-groups/rules",
+            "error": "Subscription has no existing select group; refusing to rewrite proxy-groups/rules",
             "results": [],
         }
     group_members = global_group.get("proxies")
@@ -354,9 +353,10 @@ def run_mihomo_traffic_suite(
                 continue
 
             # Select proxy in Mihomo controller
+            group_name = urllib.parse.quote(global_group.get("name", "GLOBAL"))
             try:
                 sel_req = urllib.request.Request(
-                    f"http://127.0.0.1:{ctrl_port}/proxies/GLOBAL",
+                    f"http://127.0.0.1:{ctrl_port}/proxies/{group_name}",
                     data=json.dumps({"name": p_name}).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="PUT",
@@ -378,7 +378,6 @@ def run_mihomo_traffic_suite(
                 "--connect-timeout", "5",
                 "--max-time", "10",
                 "-x", f"http://127.0.0.1:{mixed_port}",
-                "--cacert", str(ca_bundle_path),
                 "https://api.ipify.org",
             ]
             curl_res = subprocess.run(curl_cmd, capture_output=True, text=True)
