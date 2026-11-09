@@ -540,6 +540,42 @@ class TestAPIClient(unittest.TestCase):
             updated_jdata = json.loads(jfile.read_text())
             self.assertEqual(updated_jdata["state"], "PROVISION_ROLLED_BACK")
 
+    def test_rollback_journal_parse_error_does_not_echo_file_contents(self):
+        marker = "sensitive-journal-content-marker"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            jfile.write_text(marker + " { invalid json")
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                result = rollback_provisioning(
+                    str(jfile), str(Path(tmpdir) / "state.json"),
+                    str(Path(tmpdir) / "missing-credentials.txt"),
+                )
+            self.assertFalse(result)
+            self.assertNotIn(marker, stderr.getvalue())
+            self.assertIn("JSONDecodeError", stderr.getvalue())
+
+    def test_rollback_journal_validation_error_does_not_echo_field_values(self):
+        marker = "sensitive-transaction-marker"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            jfile.write_text(json.dumps({
+                "transaction_id": marker,
+                "op": "invalid-operation",
+                "state": "PROVISION_APPLYING",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": [],
+            }))
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                result = rollback_provisioning(
+                    str(jfile), str(Path(tmpdir) / "state.json"),
+                    str(Path(tmpdir) / "missing-credentials.txt"),
+                )
+            self.assertFalse(result)
+            self.assertNotIn(marker, stderr.getvalue())
+            self.assertIn("JournalValidationError", stderr.getvalue())
+
     def test_rollback_journal_does_not_persist_api_response_secrets(self):
         marker = "private-key-secret-marker"
         class FailingRollbackClient:

@@ -689,14 +689,14 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
         with open(journal_file, "r") as f:
             journal_data = json.load(f)
     except Exception as e:
-        print(f"Warning: Failed to load journal {journal_file}: {e}", file=sys.stderr)
+        print(f"Warning: Failed to load recovery journal ({type(e).__name__}).", file=sys.stderr)
         return False
 
     try:
         from modules.recovery import validate_journal
         validate_journal(journal_data)
     except Exception as e:
-        print(f"Refusing API rollback because journal validation failed: {e}", file=sys.stderr)
+        print(f"Refusing API rollback because journal validation failed ({type(e).__name__}).", file=sys.stderr)
         return False
 
     op = journal_data.get("op", "")
