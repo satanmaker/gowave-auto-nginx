@@ -521,6 +521,7 @@ cmd_node() {
                 return 1
             fi
             local node_port=3002
+            local acme_tx_id="worker_install_${name}_$(date +%s)_${BASHPID}"
 
             if [[ "$ip" == "$panel_ip" || "$ip" == "127.0.0.1" ]]; then
                 log_warn "Worker IP matches PANEL_IP or 127.0.0.1; enforcing NODE_PORT=3002 to avoid collision with Panel on 3000."
@@ -709,7 +710,7 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
 
 
             # 4. Dispatch remote deployment strictly via SSH stdin
-            if ! PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
+            if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
                 XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
                 GOWAVE_ACME_SERVER="${GOWAVE_ACME_SERVER:-}" \
                 GOWAVE_NODE_INSTALLER_COMMIT="${GOWAVE_NODE_INSTALLER_COMMIT:-}" \
@@ -718,7 +719,7 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
                 SSH_KNOWN_HOSTS="$known_hosts" "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
                 echo "Remote Worker deployment failed; rolling back Worker host configuration and Panel API entities." >&2
                 local rollback_failed=0
-                if ! PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
+                if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
                     VISION_DOMAIN="$vision_domain" \
                     "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
                     echo "CRITICAL: Remote Worker host rollback failed; manual inspection required." >&2
