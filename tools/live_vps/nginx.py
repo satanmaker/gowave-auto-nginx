@@ -93,8 +93,12 @@ def verify_reality_decoy_fallback(
                 "snippet": resp_text[:200],
             }
 
-        # Check for static html decoy
-        is_decoy = "<!doctype html" in resp_text.lower() or "<html" in resp_text.lower() or "200 ok" in resp_text.lower()
+        # A successful HTTP status alone is not decoy evidence: require an HTML
+        # document body and an explicit HTTP 200 response.
+        status_line = resp_text.splitlines()[0] if resp_text.splitlines() else ""
+        body = resp_text.partition("\\r\\n\\r\\n")[2].lower()
+        http_200 = status_line.startswith("HTTP/") and status_line.split()[1:2] == ["200"]
+        is_decoy = http_200 and ("<!doctype html" in body or "<html" in body)
         if not is_decoy:
             return {
                 "status": "FAIL",

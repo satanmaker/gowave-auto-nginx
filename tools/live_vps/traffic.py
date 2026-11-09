@@ -29,14 +29,34 @@ def find_free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def parse_proc_net_dev_rx_packets(output: str) -> Optional[int]:
+    """Sum RX packet counters from /proc/net/dev, excluding loopback/container links."""
+    total = 0
+    interfaces_seen = 0
+    for line in output.splitlines()[2:]:
+        if ":" not in line:
+            continue
+        interface, counters = line.split(":", 1)
+        interface = interface.strip()
+        if not interface or interface.startswith(("lo", "docker", "veth")):
+            continue
+        fields = counters.split()
+        # /proc/net/dev columns begin with RX bytes, RX packets, RX errors, ...
+        if len(fields) < 2 or not fields[1].isdigit():
+            continue
+        total += int(fields[1])
+        interfaces_seen += 1
+    return total if interfaces_seen else None
+
+
 def get_server_rx_packets(ssh: SSHClient) -> int:
-    """Capture incoming packet counter on the default public network interface."""
-    r = ssh.run(
-        "cat /proc/net/dev | awk -F'[: ]+' '$1 !~ /(lo|docker|veth)/ && $2 ~ /^[0-9]+$/ {sum += $3} END {print sum}'"
-    )
-    if r.ok and r.stdout.strip().isdigit():
-        return int(r.stdout.strip())
-    # Fallback to ip -s link
+    """Capture aggregate RX packets from non-loopback/non-container interfaces."""
+    r = ssh.run("cat /proc/net/dev")
+    if r.ok:
+        parsed = parse_proc_net_dev_rx_packets(r.stdout)
+        if parsed is not None:
+            return parsed
+    # Fallback to ip -s link; the second field after RX bytes is RX packets.
     r2 = ssh.run("ip -s link show | awk '/RX: bytes/{getline; sum += $2} END {print sum}'")
     if r2.ok and r2.stdout.strip().isdigit():
         return int(r2.stdout.strip())

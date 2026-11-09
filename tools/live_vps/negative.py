@@ -22,6 +22,7 @@ from .config import LiveVPSConfig
 from .preflight import check_ssh_trust
 from .dns import verify_domain_dns, verify_domain_no_aaaa
 from .nginx import verify_nginx_config_syntax
+from .mtls import run_mtls_negative_tests
 
 
 def run_neg_01_ssh_host_key_absent() -> Dict[str, Any]:
@@ -249,47 +250,20 @@ def run_neg_09_subscription_absent_user_agent(panel_domain: str, short_uuid: str
 
 
 def run_neg_10_mtls_forged_certificate(master_ssh: SSHClient, worker_ip: str) -> Dict[str, Any]:
-    """NEG-10: A reachable Worker rejects a forged certificate at TLS handshake."""
-    script = f"""
-import socket, ssl, subprocess, sys, tempfile
-with tempfile.TemporaryDirectory() as td:
-    key = td + "/forged.key"
-    cert = td + "/forged.crt"
-    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-                    "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=ForgedClient"],
-                   capture_output=True, check=True)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    ctx.load_cert_chain(cert, key)
-    try:
-        sock = socket.create_connection(("{worker_ip}", 3002), timeout=5)
-    except OSError as exc:
-        print("CONNECT_INCOMPLETE:" + type(exc).__name__)
-        sys.exit(0)
-    try:
-        with sock:
-            try:
-                with ctx.wrap_socket(sock, server_hostname="invalid.node.gowave") as tls:
-                    tls.sendall(b"GET / HTTP/1.1\\r\\nHost: invalid.node.gowave\\r\\nConnection: close\\r\\n\\r\\n")
-                    print("FORGED_CERT_ACCEPTED")
-            except ssl.SSLError as exc:
-                print("TLS_REJECTED:" + type(exc).__name__)
-            except OSError as exc:
-                print("TLS_INCOMPLETE:" + type(exc).__name__)
-    except Exception as exc:
-        print("TLS_INCOMPLETE:" + type(exc).__name__)
-"""
-    result = master_ssh.run("python3 -", input_data=script)
-    rejected = result.ok and "TLS_REJECTED:" in result.stdout
-    incomplete = not result.ok or "INCOMPLETE:" in result.stdout
+    """NEG-10: A trusted server/SNI path rejects an untrusted client certificate."""
+    result = run_mtls_negative_tests(master_ssh, worker_ip)
+    rejected = result.get("untrusted_client_rejected") is True
+    incomplete = result.get("untrusted_client_rejected") == "INCOMPLETE" or result.get("untrusted_client_rejected") is None
     return {
         "scenario": "NEG-10",
         "name": "mTLS Forged Client Certificate Handshake Rejection",
         "status": "PASS" if rejected else ("INCOMPLETE" if incomplete else "FAIL"),
-        "message": "Worker TLS handshake rejected the forged client certificate" if rejected
-                   else "A reachable Worker did not provide conclusive forged-certificate rejection evidence",
-        "output": result.stdout.strip(),
+        "message": (
+            "Worker rejected a self-signed client certificate while using the real derived SNI and trusted server CA"
+            if rejected else
+            "Could not prove rejection of an untrusted client certificate on the valid SNI/server-trust path"
+        ),
+        "untrusted_client_rejected": result.get("untrusted_client_rejected"),
     }
 
 
@@ -464,7 +438,23 @@ def run_negative_suite(
 
     # Execute live / mock scenarios
     if master_ssh:
-        scenarios.append(run_neg_05_acme_install_failure(master_ssh))
+        neg05 = run_neg_05_acme_install_failure(master_ssh)
+        scenarios.append(neg05)
+        if neg05.get("status") != "PASS":
+            for index in range(6, 16):
+                scenarios.append({
+                    "scenario": f"NEG-{index:02d}", "status": "INCOMPLETE",
+                    "message": "Skipped because NEG-05 did not prove fail-closed ACME rejection; further live mutations are unsafe",
+                })
+            passed_count = sum(1 for item in scenarios if item.get("status") == "PASS")
+            failed_count = sum(1 for item in scenarios if item.get("status") == "FAIL")
+            return {
+                "status": "FAIL" if failed_count else "INCOMPLETE",
+                "scenarios": scenarios,
+                "passed_count": passed_count,
+                "failed_count": failed_count,
+                "skipped_count": 0,
+            }
         neg06 = run_neg_06_nginx_syntax_corruption(master_ssh)
         scenarios.append(neg06)
         if neg06.get("cleanup_ok") is False:
