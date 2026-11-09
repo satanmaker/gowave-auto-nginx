@@ -169,11 +169,19 @@ TEST_TEARDOWN_POLICY=PRESERVE
         with self.assertRaisesRegex(ValueError, "requires MASTER_SSH_USER=root"):
             load_config(self._write_config(content))
 
-    def test_one_sided_vision_configuration_rejected(self):
+    def test_master_only_vision_configuration_is_supported(self):
         content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
         content += "\nMASTER_VISION_DOMAIN=vision-master.example.com\n"
-        with self.assertRaisesRegex(ValueError, "both be configured"):
-            load_config(self._write_config(content))
+        cfg = load_config(self._write_config(content))
+        self.assertEqual(cfg.master_vision_domain, "vision-master.example.com")
+        self.assertIsNone(cfg.worker_vision_domain)
+
+    def test_worker_only_vision_configuration_is_supported(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        content += "\nWORKER_VISION_DOMAIN=vision-worker.example.com\n"
+        cfg = load_config(self._write_config(content))
+        self.assertIsNone(cfg.master_vision_domain)
+        self.assertEqual(cfg.worker_vision_domain, "vision-worker.example.com")
 
     def test_global_domain_collision_rejected(self):
         content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")

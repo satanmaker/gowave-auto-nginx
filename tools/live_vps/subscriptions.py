@@ -20,6 +20,15 @@ from .panel_api import E2EPanelClient
 from .redaction import register_secret
 
 
+def expected_proxy_count(has_vision: bool = False, vision_count: Optional[int] = None) -> int:
+    """Return the expected number of core plus independently configured Vision proxies."""
+    if vision_count is None:
+        return 10 if has_vision else 8
+    if isinstance(vision_count, bool) or vision_count not in (0, 1, 2):
+        raise ValueError("vision_count must be an integer from 0 through 2")
+    return 8 + vision_count
+
+
 def get_default_user_short_uuid(panel_client: E2EPanelClient) -> str:
     """Retrieve default-user shortUuid from Panel and register it in redaction filter."""
     user = panel_client.get_user_by_username("default-user")
@@ -151,6 +160,7 @@ def fetch_and_validate_xray_subscription(
     ssl_context: ssl.SSLContext,
     has_vision: bool = False,
     ca_bundle_path: Optional[Path] = None,
+    vision_count: Optional[int] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Fetch Xray JSON subscription and validate schema, proxy outbounds, and xray run -test."""
     url = f"https://{panel_domain}/api/sub/{short_uuid}/v2ray-json"
@@ -183,7 +193,7 @@ def fetch_and_validate_xray_subscription(
         if protocol in ("vless", "trojan", "vmess", "shadowsocks"):
             proxy_outbounds.append(ob)
 
-    expected_count = 10 if has_vision else 8
+    expected_count = expected_proxy_count(has_vision, vision_count)
     if len(proxy_outbounds) != expected_count:
         return False, {
             "error": f"Expected {expected_count} proxy outbounds, found {len(proxy_outbounds)}",
@@ -239,6 +249,7 @@ def fetch_and_validate_mihomo_subscription(
     ssl_context: ssl.SSLContext,
     has_vision: bool = False,
     ca_bundle_path: Optional[Path] = None,
+    vision_count: Optional[int] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Fetch Mihomo YAML subscription and validate schema, proxy entries, and mihomo -t."""
     url = f"https://{panel_domain}/api/sub/{short_uuid}/clash"
@@ -260,7 +271,7 @@ def fetch_and_validate_mihomo_subscription(
         return False, {"error": f"Malformed Mihomo subscription YAML: {e}"}
 
     proxies = sub_yaml.get("proxies", [])
-    expected_count = 10 if has_vision else 8
+    expected_count = 8 + (vision_count if vision_count is not None else (2 if has_vision else 0))
     if len(proxies) != expected_count:
         return False, {
             "error": f"Expected {expected_count} proxies in YAML, found {len(proxies)}",

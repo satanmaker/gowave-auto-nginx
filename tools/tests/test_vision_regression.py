@@ -2,7 +2,7 @@
 """Regression test suite for Vision capability (Task 10.9 & Task 1.7).
 
 Verifies:
-1. One-sided Vision configuration is rejected by parser.
+1. Master and Worker Vision domains are configured independently.
 2. Master Vision Certbot/verification failure aborts and rolls back.
 3. Worker --vision-domain reaches API profile, host provisioning, bootstrap HTTP-01 server_name, and SSH stdin.
 4. Worker issues/validates Vision certificate using selected ACME server.
@@ -10,7 +10,7 @@ Verifies:
 6. Worker rollback removes only transaction-owned Vision artifacts and preserves unrelated lineages.
 7. Failpoints cover challenge issuance, certificate validation, NGINX syntax, and API provisioning.
 8. Disabled Vision retains 4 inbounds and no Vision certificate/route/fallback.
-9. Case matrix enforces exactly 16 runtime cases when disabled and 20 when enabled.
+9. Case matrix enforces 16, 18, or 20 runtime cases for zero, one, or two Vision domains.
 """
 from __future__ import annotations
 
@@ -41,27 +41,22 @@ NODE_AUTO_SH = str(REPO_ROOT / "gowave-node-auto.sh")
 class TestVisionRegressionCoverage(unittest.TestCase):
     """Test matrix and lifecycle regression tests for Vision capability."""
 
-    def test_one_sided_vision_config_rejected(self):
-        """Parser must reject one-sided vision configuration before any remote action."""
+    def test_master_and_worker_vision_domains_are_independent(self):
+        """Parser accepts Master-only and Worker-only Vision topologies."""
         example_cfg = (REPO_ROOT / "tools" / "live_vps_config.env.example").read_text()
         example_cfg = example_cfg.replace("203.0.113.10", "93.184.216.34").replace("203.0.113.20", "93.184.216.35")
         with tempfile.TemporaryDirectory() as td:
             cfg = Path(td) / "live_vps_config.env"
-            # 1. Only Master Vision domain set
-            content = example_cfg + "\nMASTER_VISION_DOMAIN=vision.master.com\n"
-            cfg.write_text(content)
-            cfg.chmod(0o600)
-            with self.assertRaises(ValueError) as ctx:
-                load_config(cfg)
-            self.assertIn("must both be configured or both be omitted", str(ctx.exception))
-
-            # 2. Only Worker Vision domain set
-            content = example_cfg + "\nWORKER_VISION_DOMAIN=vision.worker.com\n"
-            cfg.write_text(content)
-            cfg.chmod(0o600)
-            with self.assertRaises(ValueError) as ctx:
-                load_config(cfg)
-            self.assertIn("must both be configured or both be omitted", str(ctx.exception))
+            for addition, expected_master, expected_worker in (
+                ("\nMASTER_VISION_DOMAIN=vision.master.com\n", "vision.master.com", None),
+                ("\nWORKER_VISION_DOMAIN=vision.worker.com\n", None, "vision.worker.com"),
+            ):
+                with self.subTest(addition=addition):
+                    cfg.write_text(example_cfg + addition)
+                    cfg.chmod(0o600)
+                    parsed = load_config(cfg)
+                    self.assertEqual(parsed.master_vision_domain, expected_master)
+                    self.assertEqual(parsed.worker_vision_domain, expected_worker)
 
     def test_worker_vision_domain_propagation_and_inbound_counts(self):
         """Worker compile_config_profile and provision_hosts generate 5 inbounds/hosts with Vision, 4 without."""
@@ -232,24 +227,35 @@ class TestVisionRegressionCoverage(unittest.TestCase):
             self.assertIn("BEGIN CERTIFICATE", cert_file.read_text())
 
     def test_case_matrix_counting_16_vs_20_in_traffic_and_junit(self):
-        """Case matrix: 16 cases when Vision is disabled, 20 cases when Vision is enabled."""
+        """Case matrix: 16, 18, or 20 cases for zero, one, or two Vision domains."""
+        # Every synthetic PASS fixture carries the same mandatory packet-evidence contract.
+        packet_evidence = {
+            "target_packets": 3, "offload_packets": 0,
+            "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
+        }
         # 1. Disabled Vision: expected 8 per client (total 16)
-        xray_8 = [{"status": "PASS", "tag": f"outbound-{i}", "duration": 0.5} for i in range(8)]
-        mihomo_8 = {"status": "PASS", "results": [{"status": "PASS", "name": f"proxy-{i}", "duration": 0.5} for i in range(8)]}
+        xray_8 = [{"status": "PASS", "tag": f"outbound-{i}", "duration": 0.5, **packet_evidence} for i in range(8)]
+        mihomo_8 = {"status": "PASS", "results": [{"status": "PASS", "name": f"proxy-{i}", "duration": 0.5, **packet_evidence} for i in range(8)]}
 
         # Passing 8 per client with expected_case_count=8 yields PASS
         self.assertEqual(evaluate_traffic_suite_status(True, xray_8, mihomo_8, expected_case_count=8), "PASS")
 
-        # Passing 8 per client when expected_case_count=10 (Vision enabled) yields INCOMPLETE
+        # Passing 8 per client when at least one Vision domain is enabled yields INCOMPLETE
         self.assertEqual(evaluate_traffic_suite_status(True, xray_8, mihomo_8, expected_case_count=10), "INCOMPLETE")
 
-        # 2. Enabled Vision: expected 10 per client (total 20)
-        xray_10 = [{"status": "PASS", "tag": f"outbound-{i}", "duration": 0.5} for i in range(10)]
-        mihomo_10 = {"status": "PASS", "results": [{"status": "PASS", "name": f"proxy-{i}", "duration": 0.5} for i in range(10)]}
+        # 2. Exactly one Vision domain: expected 9 per client (total 18)
+        xray_9 = [{"status": "PASS", "tag": f"outbound-{i}", "duration": 0.5, **packet_evidence} for i in range(9)]
+        mihomo_9 = {"status": "PASS", "results": [{"status": "PASS", "name": f"proxy-{i}", "duration": 0.5, **packet_evidence} for i in range(9)]}
+        self.assertEqual(evaluate_traffic_suite_status(True, xray_9, mihomo_9, expected_case_count=9), "PASS")
+        self.assertEqual(evaluate_traffic_suite_status(True, xray_9, mihomo_9, expected_case_count=10), "INCOMPLETE")
+
+        # 3. Enabled Vision on both hosts: expected 10 per client (total 20)
+        xray_10 = [{"status": "PASS", "tag": f"outbound-{i}", "duration": 0.5, **packet_evidence} for i in range(10)]
+        mihomo_10 = {"status": "PASS", "results": [{"status": "PASS", "name": f"proxy-{i}", "duration": 0.5, **packet_evidence} for i in range(10)]}
 
         self.assertEqual(evaluate_traffic_suite_status(True, xray_10, mihomo_10, expected_case_count=10), "PASS")
 
-        # 3. JUnit report generation contains exact case counts
+        # 4. JUnit report generation contains exact case counts
         with tempfile.TemporaryDirectory() as td:
             artifact_dir = Path(td)
 
@@ -270,6 +276,23 @@ class TestVisionRegressionCoverage(unittest.TestCase):
             junit_path_no_vis = write_junit_report(artifact_dir, cases_no_vis)
             content_no_vis = junit_path_no_vis.read_text()
             self.assertIn('tests="17"', content_no_vis)
+
+            # State with exactly one Vision endpoint (9 Xray + 9 Mihomo = 18 endpoint testcases)
+            state_one_vis = {
+                "results": {
+                    "traffic": {
+                        "status": "PASS",
+                        "xray_results": xray_9,
+                        "mihomo_results": mihomo_9,
+                    }
+                }
+            }
+            cases_one_vis = build_test_cases_from_state(state_one_vis)
+            endpoint_cases_one_vis = [c for c in cases_one_vis if c["classname"].startswith("live_vps.traffic.")]
+            self.assertEqual(len(endpoint_cases_one_vis), 18)
+            junit_path_one_vis = write_junit_report(artifact_dir, cases_one_vis)
+            content_one_vis = junit_path_one_vis.read_text()
+            self.assertIn('tests="19"', content_one_vis)
 
             # State with vision (10 Xray + 10 Mihomo = 20 endpoint testcases)
             state_vis = {
