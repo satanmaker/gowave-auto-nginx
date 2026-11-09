@@ -18,8 +18,9 @@ subscription delivery, and actual Data Plane tunnel traffic — on disposable re
   `tools/live_vps/`.
 - **New configuration** `tools/live_vps_config.env.example` — whitelist-parsed env configuration with complete
   parameter documentation. `tools/live_vps_config.env` added to `.gitignore`.
-- **New workflow** `.github/workflows/live-vps-e2e.yml` — `workflow_dispatch`-only CI job, isolated from PR
-  workflows, using GitHub Environment secrets.
+- **New workflows** `.github/workflows/live-vps-e2e.yml` (`workflow_dispatch`-only CI acceptance job using
+  GitHub Environment secrets) and `.github/workflows/live-vps-unit.yml` (automated unit test CI executing
+  the runner submodule test suite under `tools/tests/`).
 - **New documentation** `docs/LIVE_VPS_TESTING.md` — operator guide covering VPS prerequisites, DNS setup, SSH
   host key pinning, ACME staging vs production, run modes, and artifact handling.
 - **New artifact directory structure** `artifacts/live-vps/<TEST_RUN_ID>/` — structured reports with redacted
@@ -51,8 +52,9 @@ subscription delivery, and actual Data Plane tunnel traffic — on disposable re
 
 ## Impact
 
-- **New files**: `tools/test_live_vps.py`, `tools/live_vps/` package, `tools/live_vps_config.env.example`,
-  `.github/workflows/live-vps-e2e.yml`, `docs/LIVE_VPS_TESTING.md`.
+- **New files**: `tools/test_live_vps.py`, `tools/live_vps/` package, `tools/tests/` unit test package,
+  `tools/live_vps_config.env.example`, `.github/workflows/live-vps-e2e.yml`, `.github/workflows/live-vps-unit.yml`,
+  `docs/LIVE_VPS_TESTING.md`.
 - **Modified files**: `gowave-auto.sh` (ACME mode mapping, Master/Worker Vision domain-pair validation and
   propagation), `gowave-node-auto.sh` (ACME propagation, optional Worker Vision certificate/inbound and NGINX
   routing support, plus configurable commit/SHA256 verification of the remote installer),
