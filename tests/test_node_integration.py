@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -12,6 +13,22 @@ NODE_SH = REPO_ROOT / "modules" / "node.sh"
 
 
 class TestNodeIntegration(unittest.TestCase):
+    def test_vendored_upstream_installer_matches_pinned_commit_digest(self):
+        installer = REPO_ROOT / "sources" / "gowave-node" / "install.sh"
+        self.assertTrue(installer.is_file(), "Pinned GoWave Node installer must be vendored")
+        config = REPO_ROOT / "tools" / "live_vps_config.env.example"
+        values = {}
+        for line in config.read_text(encoding="utf-8").splitlines():
+            if line and not line.lstrip().startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip()
+        commit = values.get("GOWAVE_NODE_INSTALLER_COMMIT", "")
+        expected_digest = values.get("GOWAVE_NODE_INSTALLER_SHA256", "")
+        self.assertRegex(commit, r"^[0-9a-fA-F]{40}$")
+        self.assertRegex(expected_digest, r"^[0-9a-fA-F]{64}$")
+        actual_digest = hashlib.sha256(installer.read_bytes()).hexdigest()
+        self.assertEqual(actual_digest, expected_digest)
+
     def test_extract_secret_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
