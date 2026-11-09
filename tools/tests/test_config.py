@@ -129,6 +129,12 @@ TEST_TEARDOWN_POLICY=PRESERVE
             load_config(p)
         self.assertIn("Missing mandatory configuration keys", str(ctx.exception))
 
+    def test_floating_component_versions_rejected(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        content = content.replace("GOWAVE_PANEL_VERSION=0.4.0", "GOWAVE_PANEL_VERSION=latest")
+        with self.assertRaisesRegex(ValueError, "explicit pinned version"):
+            load_config(self._write_config(content))
+
     def test_per_host_ssh_credentials_without_shared_paths(self):
         content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
         content = content.replace("SSH_KEY_PATH=/tmp/id_rsa\n", "")

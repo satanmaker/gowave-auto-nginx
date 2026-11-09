@@ -79,6 +79,7 @@ DOMAIN_REGEX = re.compile(
 )
 HEX40_REGEX = re.compile(r"^[0-9a-fA-F]{40}$")
 HEX64_REGEX = re.compile(r"^[0-9a-fA-F]{64}$")
+VERSION_REGEX = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$")
 
 
 def parse_bool(val: str, key_name: str) -> bool:
@@ -283,9 +284,16 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
     parsed["ACME_MODE"] = acme_mode
     parsed["ADMIN_EMAIL"] = raw_pairs.get("ADMIN_EMAIL", "admin@example.com")
 
-    # Version pins
-    parsed["GOWAVE_PANEL_VERSION"] = raw_pairs["GOWAVE_PANEL_VERSION"]
-    parsed["GOWAVE_NODE_VERSION"] = raw_pairs["GOWAVE_NODE_VERSION"]
+    # Version pins must be explicit version/tag identifiers; floating channels are rejected.
+    for version_key in (
+        "GOWAVE_PANEL_VERSION", "GOWAVE_NODE_VERSION",
+        "XRAY_SERVER_VERSION", "XRAY_CLIENT_VERSION", "MIHOMO_CLIENT_VERSION",
+    ):
+        version_value = raw_pairs[version_key].strip()
+        if not VERSION_REGEX.fullmatch(version_value) or version_value.lower() in ("latest", "stable", "main", "master"):
+            raise ValueError(f"{version_key} must be an explicit pinned version/tag, not a floating channel.")
+        parsed[version_key] = version_value
+
 
     commit = raw_pairs["GOWAVE_NODE_INSTALLER_COMMIT"]
     if not HEX40_REGEX.match(commit):
@@ -300,10 +308,6 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
             f"Invalid GOWAVE_NODE_INSTALLER_SHA256: '{sha256}'. Must be an explicit 64-hex SHA256 digest."
         )
     parsed["GOWAVE_NODE_INSTALLER_SHA256"] = sha256
-
-    parsed["XRAY_SERVER_VERSION"] = raw_pairs["XRAY_SERVER_VERSION"]
-    parsed["XRAY_CLIENT_VERSION"] = raw_pairs["XRAY_CLIENT_VERSION"]
-    parsed["MIHOMO_CLIENT_VERSION"] = raw_pairs["MIHOMO_CLIENT_VERSION"]
 
     # IPv6
     enable_ipv6 = parse_bool(raw_pairs.get("ENABLE_IPV6", "false"), "ENABLE_IPV6")

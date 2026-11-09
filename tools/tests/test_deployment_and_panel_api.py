@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT))
 
-from live_vps.deployment import parse_strace_argv_output
+from live_vps.deployment import parse_strace_argv_output, output_matches_pinned_version
 from live_vps.panel_api import E2EPanelClient, read_master_credentials
 from live_vps.mtls import run_mtls_negative_tests
 from live_vps.ssh import SSHResult
@@ -66,6 +66,12 @@ class MockServerHandler(http.server.BaseHTTPRequestHandler):
 
 
 class TestDeploymentAndPanelAPI(unittest.TestCase):
+    def test_pinned_version_match_requires_exact_token(self):
+        self.assertTrue(output_matches_pinned_version("GoWave Server v0.4.0", "0.4.0"))
+        self.assertTrue(output_matches_pinned_version("Xray 25.10.15 (Xray, Penetrates Everything.)", "25.10.15"))
+        self.assertFalse(output_matches_pinned_version("GoWave Server v0.4.10", "0.4.1"))
+        self.assertFalse(output_matches_pinned_version("version output unavailable", "0.4.0"))
+
     @classmethod
     def setUpClass(cls):
         # Generate temporary CA and server cert/key for localhost
