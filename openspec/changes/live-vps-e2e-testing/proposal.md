@@ -5,8 +5,7 @@
 GoWave Auto NGINX has a comprehensive mock-and-static CI suite (5 suites, QEMU cold-boot matrix, ShellCheck, unit
 tests), but `tests/podman_testbed.sh multi-node` explicitly returns exit code `77` — there is no implemented
 distributed E2E on real VPS hardware. Successful CI green does not prove that user VPN traffic traverses all
-expected protocol endpoints (eight core endpoints by default across four protocols, or ten endpoints when both Master and Worker
-VLESS XTLS Vision domains are configured) on real Master and Worker VPS over the public internet.
+expected protocol endpoints (eight core endpoints by default across four protocols, nine when Vision is configured on one VPS, or ten when Vision is configured on both Master and Worker) on real Master and Worker VPS over the public internet.
 
 A dedicated Live VPS E2E Test Runner is needed to close this gap and provide a production-grade acceptance gate
 that validates the complete infrastructure lifecycle — from bare OS through deployment, mTLS control plane,
@@ -18,9 +17,9 @@ subscription delivery, and actual Data Plane tunnel traffic — on disposable re
   `tools/live_vps/`.
 - **New configuration** `tools/live_vps_config.env.example` — whitelist-parsed env configuration with complete
   parameter documentation. `tools/live_vps_config.env` added to `.gitignore`.
-- **New workflows** `.github/workflows/live-vps-e2e.yml` (`workflow_dispatch`-only CI acceptance job using
-  GitHub Environment secrets) and `.github/workflows/live-vps-unit.yml` (automated unit test CI executing
-  the runner submodule test suite under `tools/tests/`).
+- **Workflows** `.github/workflows/live-vps-unit.yml` runs automated runner unit tests. The original
+  credential-bearing `.github/workflows/live-vps-e2e.yml` dispatch workflow was removed; live acceptance
+  is launched locally through `python3 tools/run_live_vps.py`, without storing target VPS credentials in GitHub.
 - **New documentation** `docs/LIVE_VPS_TESTING.md` — operator guide covering VPS prerequisites, DNS setup, SSH
   host key pinning, ACME staging vs production, run modes, and artifact handling.
 - **New artifact directory structure** `artifacts/live-vps/<TEST_RUN_ID>/` — structured reports with redacted
@@ -41,8 +40,8 @@ subscription delivery, and actual Data Plane tunnel traffic — on disposable re
   on real disposable servers: preflight safety, All-in-One Master installation, Distributed Worker deployment,
   public mTLS control plane, Panel API cluster structure, subscription delivery policy, UFW firewall isolation,
   NGINX SNI routing and REALITY decoy, and Data Plane traffic through eight logical VPN endpoints by default (four core
-  protocols on each VPS), or ten when both Vision domains are configured; each endpoint is exercised by both real
-  Xray and Mihomo client processes with Firefox client fingerprint (sixteen or twenty runtime cases).
+  protocols on each VPS), nine when one VPS has Vision enabled, or ten when both do; each endpoint is exercised by
+  both real Xray and Mihomo client processes with Firefox client fingerprint (sixteen, eighteen, or twenty runtime cases).
 
 ### Modified Capabilities
 
