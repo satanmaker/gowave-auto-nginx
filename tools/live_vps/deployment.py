@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .ssh import SSHClient, SSHResult
 from .redaction import redact
 from .config import LiveVPSConfig
+from .tls import build_runtime_ca_bundle
 
 ACME_MODE_URLS = {
     "staging": "https://acme-staging-v02.api.letsencrypt.org/directory",
@@ -214,9 +215,18 @@ def install_master(
     if not acme_server:
         raise ValueError(f"Invalid ACME mode: {config.acme_mode}")
 
+    # Stage the mode-specific CA bundle on Master under /run
+    local_ca_bundle = build_runtime_ca_bundle(config.acme_mode)
+    remote_ca_dir = "/run/live_vps_ca"
+    remote_ca_file = f"{remote_ca_dir}/ca-bundle.crt"
+    master_ssh.run(f"mkdir -p -m 0700 {remote_ca_dir}")
+    master_ssh.copy_to_remote(local_ca_bundle, remote_ca_file)
+    master_ssh.run(f"chmod 0600 {remote_ca_file}")
+
     # Pass immutable release versions and all non-secret arguments explicitly.
     env_values = {
         "GOWAVE_ACME_SERVER": acme_server,
+        "GOWAVE_TLS_CA_FILE": remote_ca_file,
         "GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER": "1",
         "GOWAVE_NODE_INSTALLER_COMMIT": config.gowave_node_installer_commit,
         "GOWAVE_NODE_INSTALLER_SHA256": config.gowave_node_installer_sha256,
@@ -240,7 +250,15 @@ def install_master(
 
     install_cmd = f"{env_vars}\nexec " + " ".join(shlex.quote(str(value)) for value in args)
     input_data = f"GOWAVE_LEASE: {lease_token}\n" if lease_token else None
-    r = master_ssh.run(install_cmd, input_data=input_data, timeout=600)
+    try:
+        r = master_ssh.run(install_cmd, input_data=input_data, timeout=600)
+    finally:
+        master_ssh.run(f"rm -rf {remote_ca_dir}")
+        if local_ca_bundle.exists():
+            try:
+                local_ca_bundle.unlink()
+            except Exception:
+                pass
     if not r.ok:
         return False, {"error": "gowave-auto.sh install exited non-zero", "stderr": r.stderr}
 

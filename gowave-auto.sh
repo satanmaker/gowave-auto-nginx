@@ -30,8 +30,16 @@ reload_nginx_strict() {
 verify_public_tls_sni() {
     local domain="$1"
     command -v timeout >/dev/null 2>&1 || { echo "Fatal: timeout is required for TLS verification." >&2; return 1; }
+    local ca_opts=(-CApath /etc/ssl/certs)
+    if [[ -n "${GOWAVE_TLS_CA_FILE:-}" ]]; then
+        if [[ ! -f "$GOWAVE_TLS_CA_FILE" || -L "$GOWAVE_TLS_CA_FILE" ]]; then
+            echo "Fatal: GOWAVE_TLS_CA_FILE must be a readable regular file, not a symlink." >&2
+            return 1
+        fi
+        ca_opts=(-CAfile "$GOWAVE_TLS_CA_FILE")
+    fi
     timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$domain" \
-        -verify_return_error -verify_hostname "$domain" -CApath /etc/ssl/certs -brief </dev/null
+        -verify_return_error -verify_hostname "$domain" "${ca_opts[@]}" -brief </dev/null
 }
 
 acquire_lock() {
