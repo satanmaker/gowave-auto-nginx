@@ -12,9 +12,9 @@ See `proposal.md — Why` for motivation. Key implementation constraints derived
   the runner reads it from `state.json` via SSH and cross-validates via `GET /api/users/by-username/default-user`.
 - `gowave-auto.sh node add` reads Master egress IP via `curl -s4 https://ifconfig.me` and uses it for Worker
   UFW allowlist; this IP may differ from `MASTER_IP` under NAT/multi-homed setups.
-- `gowave-auto.sh install` calls `certbot certonly --webroot` with no server parameter override; staging
-  support requires a delta to this call.
-- `gowave-node-auto.sh` calls `certbot certonly --webroot` with no server override; same delta needed.
+- The implementation now maps the validated `ACME_MODE` to the exact Let's Encrypt staging or production
+  directory and passes the selected `--server` to Master and Worker Certbot calls. The default remains
+  production-compatible; the local operator controller selects staging unless production is explicitly chosen.
 - `modules/node.sh` falls back to `curl -fsSL https://raw.githubusercontent.com/aaaSaZaN/gowave-node/main/install.sh`
   when no bundled installer is present; E2E runs must gate on bundled installer with verified SHA256.
 - `tests/podman_testbed.sh multi-node` returns exit `77` — real distributed E2E is not implemented.
@@ -459,7 +459,7 @@ negative-suite switch, so its effect on the acceptance gate must be normative.
 
 ---
 
-### D14: Optional Vision Is a Paired, Fail-Closed Capability
+### D14: Optional Vision Is an Independent, Fail-Closed Capability
 
 **Chosen:** VLESS XTLS Vision is optional and configured independently per VPS. Either
 `MASTER_VISION_DOMAIN`, `WORKER_VISION_DOMAIN`, both, or neither may be set. A configured Vision domain
@@ -468,7 +468,7 @@ endpoints and sixteen client/runtime cases; one-sided Vision has nine endpoints 
 on both VPS has ten endpoints and twenty cases. Each domain remains subject to global FQDN uniqueness and
 host-specific DNS/certificate validation.
 
-When the pair is configured:
+For each host independently, when its corresponding Vision domain is configured:
 
 1. Master installation MUST issue and cryptographically verify the Vision certificate in addition to the
    Panel and REALITY certificates before compiling/provisioning the Master profile. The current best-effort
@@ -1176,8 +1176,10 @@ existing codebase unchanged. The ACME staging delta is a backward-compatible def
 
 - **[RESOLVED] Xray stats API availability:** Codebase audit confirms that GoWave Panel profile templates
   in `assets/xray/` do not configure the Xray Stats gRPC API (`"stats": {}`, `"StatsService"`). Upstream binaries
-  are treated as immutable per AGENTS.md. Therefore, server-side traffic evidence uses iptables/nftables packet
-  counters and temporary SSH packet capture on the target port.
+  are treated as immutable per AGENTS.md. Therefore, server-side traffic evidence uses simultaneous per-case
+  `tcpdump` captures on both VPS, filtered by control-machine source IPv4 and the exact tested proxy destination
+  port while excluding each SSH port. Missing or unattributable capture evidence is INCOMPLETE; aggregate
+  interface/packet counters are not a PASS fallback.
 - **Worker `isConnected` polling behavior:** The 120s `NODE_READY_TIMEOUT` with 5s polling interval is a provisional
   initial bound, not a measured real-VPS guarantee. Mock integration benchmarks do not establish the latency
   distribution of the pinned Panel/Node pair; staging acceptance MUST record observed registration latency and

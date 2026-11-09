@@ -1,6 +1,6 @@
 """Data plane traffic testing with Xray and Mihomo clients.
-Performs sequential endpoint verification, server-side ingress counters,
-isolated local SOCKS5 proxy processes, and egress IP matching.
+Performs sequential endpoint verification with simultaneous per-case tcpdump
+captures on both VPS, isolated local proxy processes, and egress IP matching.
 """
 from __future__ import annotations
 
@@ -551,7 +551,7 @@ def evaluate_traffic_suite_status(
 ) -> str:
     """Evaluate overall status for traffic suite.
     Enforces that disabling traffic verification or Mihomo traffic forces INCOMPLETE, not PASS.
-    Enforces expected active case count (8 per client without Vision, 10 per client with Vision).
+    Enforces the expected active case count (8, 9, or 10 per client depending on the number of independently configured Vision domains).
     """
     if not test_traffic_verification:
         return "INCOMPLETE"
