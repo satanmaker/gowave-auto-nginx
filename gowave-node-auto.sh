@@ -652,6 +652,10 @@ remote_payload() {
 
         # 2. Remote helper functions
         cat <<'RUNNER_FUNCS'
+log_info() { printf '[INFO] %s\n' "$*"; }
+log_warn() { printf '[WARN] %s\n' "$*" >&2; }
+log_err()  { printf '[ERROR] %s\n' "$*" >&2; }
+
 validate_acme_server() {
     local server="${1:-}"
     if [[ -z "$server" ]]; then
