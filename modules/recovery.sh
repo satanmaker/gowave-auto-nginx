@@ -236,8 +236,12 @@ execute_file_rollback() {
 
 recover_boot_files() {
     acquire_mutation_lock || return 1
-    if [[ ! -f "$JOURNAL_FILE" ]]; then
+    if [[ ! -e "$JOURNAL_FILE" && ! -L "$JOURNAL_FILE" ]]; then
         return 0
+    fi
+    if [[ -L "$JOURNAL_FILE" || ! -f "$JOURNAL_FILE" ]]; then
+        echo "CRITICAL: recovery journal is a symlink or non-regular file; refusing automatic recovery." >&2
+        return 1
     fi
 
     echo "Inspecting journal for interrupted file transactions on boot..."
@@ -249,8 +253,8 @@ recover_boot_files() {
     fi
 
     local state snap_dir
-    state=$(python3 -c "import json; print(json.load(open('$JOURNAL_FILE')).get('state', ''))")
-    snap_dir=$(python3 -c "import json; print(json.load(open('$JOURNAL_FILE')).get('snapshot_dir', ''))")
+    state=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "from modules.recovery import load_journal_file; print(load_journal_file('$JOURNAL_FILE').get('state', ''))")
+    snap_dir=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "from modules.recovery import load_journal_file; print(load_journal_file('$JOURNAL_FILE').get('snapshot_dir', ''))")
 
     if [[ "$state" == "APPLYING" || "$state" == "VERIFYING" || "$state" == "ROLLBACK_REQUIRED" ]]; then
         echo "Detected interrupted update/restore in state $state. Performing file rollback..."
@@ -274,7 +278,8 @@ PY
         PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
 import json, sys, time
 from modules.recovery import write_journal_atomically
-data = json.load(open('$JOURNAL_FILE'))
+from modules.recovery import load_journal_file
+data = load_journal_file('$JOURNAL_FILE')
 data['state'] = 'ROLLED_BACK'
 data['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 write_journal_atomically('$JOURNAL_FILE', data)
@@ -285,8 +290,12 @@ write_journal_atomically('$JOURNAL_FILE', data)
 
 recover_boot_provision() {
     acquire_mutation_lock || return 1
-    if [[ ! -f "$JOURNAL_FILE" ]]; then
+    if [[ ! -e "$JOURNAL_FILE" && ! -L "$JOURNAL_FILE" ]]; then
         return 0
+    fi
+    if [[ -L "$JOURNAL_FILE" || ! -f "$JOURNAL_FILE" ]]; then
+        echo "CRITICAL: recovery journal is a symlink or non-regular file; refusing automatic recovery." >&2
+        return 1
     fi
 
     if ! python3 "$RECOVERY_PY" --validate-journal "$JOURNAL_FILE"; then
@@ -295,7 +304,7 @@ recover_boot_provision() {
     fi
 
     local state
-    state=$(python3 -c "import json; print(json.load(open('$JOURNAL_FILE')).get('state', ''))")
+    state=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "from modules.recovery import load_journal_file; print(load_journal_file('$JOURNAL_FILE').get('state', ''))")
 
     if [[ "$state" =~ ^PROVISION_ || "$state" =~ ^NODE_ADD_ ]]; then
         if [[ "$state" != "PROVISION_COMMITTED" && "$state" != "NODE_ADD_COMMITTED" && "$state" != "PROVISION_ROLLED_BACK" && "$state" != "NODE_ADD_ROLLED_BACK" ]]; then
@@ -404,7 +413,8 @@ PY
     PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
 import json, sys, time
 from modules.recovery import write_journal_atomically, prune_snapshots
-data = json.load(open('$JOURNAL_FILE'))
+from modules.recovery import load_journal_file
+data = load_journal_file('$JOURNAL_FILE')
 data['state'] = 'COMMITTED'
 data['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 write_journal_atomically('$JOURNAL_FILE', data)
