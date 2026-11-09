@@ -211,14 +211,23 @@ PY
     fi
 
     rollback_acme_lineages() {
+        local rollback_failed=0
         echo "ACME acquisition or verification failed. Rolling back certificate lineages..." >&2
-        rollback_managed_deploy_hook "$acme_tx_id" 2>/dev/null || true
-        restore_acme_lineage "$acme_tx_id" "$panel_domain" 2>/dev/null || true
-        restore_acme_lineage "$acme_tx_id" "$reality_domain" 2>/dev/null || true
+        rollback_managed_deploy_hook "$acme_tx_id" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$acme_tx_id" "$panel_domain" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$acme_tx_id" "$reality_domain" 2>/dev/null || rollback_failed=1
         if [[ -n "$vision_domain" ]]; then
-            restore_acme_lineage "$acme_tx_id" "$vision_domain" 2>/dev/null || true
+            restore_acme_lineage "$acme_tx_id" "$vision_domain" 2>/dev/null || rollback_failed=1
         fi
-        rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
+        rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf || rollback_failed=1
+        if [[ "$rollback_failed" -ne 0 ]]; then
+            echo "CRITICAL: ACME rollback incomplete; certificate lineage or deploy-hook restoration failed. Recovery snapshot retained for operator intervention." >&2
+        else
+            echo "ACME certificate lineage rollback completed successfully." >&2
+        fi
+        # Preserve the caller's original deployment failure status; the explicit
+        # diagnostic above distinguishes a complete rollback from partial recovery.
+        return 0
     }
 
     generate_bootstrap_acme_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/00-bootstrap-acme.conf" "/proc/net/if_inet6" "$vision_domain"
