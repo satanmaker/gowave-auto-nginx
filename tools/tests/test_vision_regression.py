@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import textwrap
 import subprocess
 import tempfile
 import unittest
@@ -225,6 +227,32 @@ class TestVisionRegressionCoverage(unittest.TestCase):
             subprocess.run(["bash", "-c", cmd_rb], check=True)
             self.assertNotEqual(cert_file.read_text(), "TAMPERED_CERT_BYTES")
             self.assertIn("BEGIN CERTIFICATE", cert_file.read_text())
+
+    def test_all_in_one_acme_rollback_reports_partial_failure(self):
+        script = (REPO_ROOT / "gowave-auto.sh").read_text(encoding="utf-8")
+        match = re.search(r"(?ms)^    rollback_acme_lineages\(\) \{\n.*?^    \}", script)
+        self.assertIsNotNone(match, "all-in-one ACME rollback function not found")
+        function = textwrap.dedent(match.group(0))
+        harness = '''
+rollback_managed_deploy_hook() { return 0; }
+restore_acme_lineage() {
+    if [[ "${FAIL_RESTORE:-0}" == "1" && "$2" == "panel.example.test" ]]; then return 1; fi
+    return 0
+}
+rm() { return 0; }
+acme_tx_id=test_tx
+panel_domain=panel.example.test
+reality_domain=reality.example.test
+vision_domain=vision.example.test
+'''
+        failed = subprocess.run(["bash", "-c", harness + "\n" + function + "\nrollback_acme_lineages"], env={**os.environ, "FAIL_RESTORE": "1"}, text=True, capture_output=True, check=False)
+        self.assertEqual(failed.returncode, 0)
+        self.assertIn("CRITICAL: ACME rollback incomplete", failed.stderr)
+        self.assertNotIn("ACME certificate lineage rollback completed successfully", failed.stderr)
+        succeeded = subprocess.run(["bash", "-c", harness + "\n" + function + "\nrollback_acme_lineages"], env={**os.environ, "FAIL_RESTORE": "0"}, text=True, capture_output=True, check=False)
+        self.assertEqual(succeeded.returncode, 0)
+        self.assertIn("ACME certificate lineage rollback completed successfully", succeeded.stderr)
+        self.assertNotIn("CRITICAL: ACME rollback incomplete", succeeded.stderr)
 
     def test_worker_compensation_removes_vision_artifacts_and_restores_lineage(self):
         """Worker ERR compensation removes the Vision fallback and restores its ACME lineage."""
