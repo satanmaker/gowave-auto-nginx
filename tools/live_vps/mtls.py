@@ -44,14 +44,21 @@ def verify_worker_mtls(
 
     panel_worker_auth_pass = False
     if panel_client:
-        try:
-            nodes = panel_client.get_nodes()
-            for n in nodes:
-                if n.get("name") == "worker-1" and n.get("isConnected") is True:
-                    panel_worker_auth_pass = True
+        # Give GoWave node connection up to 10 seconds to register isConnected in Panel
+        import time
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            try:
+                nodes = panel_client.get_nodes()
+                for n in nodes:
+                    if n.get("name") == "worker-1" and n.get("isConnected") is True:
+                        panel_worker_auth_pass = True
+                        break
+                if panel_worker_auth_pass:
                     break
-        except Exception:
-            panel_worker_auth_pass = False
+            except Exception:
+                pass
+            time.sleep(1.0)
 
     status = "PASS" if (res.ok and payload_crypto_pass and mtls_handshake_pass and worker_http_health_pass and panel_worker_auth_pass) else "FAIL"
 
