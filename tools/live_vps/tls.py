@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import ssl
 import subprocess
 import tempfile
@@ -43,28 +44,58 @@ def verify_staging_roots(staging_dir: Path = STAGING_CERTS_DIR) -> List[Tuple[Pa
     """Verify all vendored Let's Encrypt Staging roots against pins.json.
     Enforces exactly 4 unique roots, CA:TRUE, self-signature, validity window, and DER SHA-256.
     """
-    if not staging_dir.is_dir():
-        raise FileNotFoundError(f"Staging certificates directory not found: {staging_dir}")
+    staging_dir = Path(staging_dir)
+    if staging_dir.is_symlink() or not staging_dir.is_dir():
+        raise FileNotFoundError(f"Staging certificates directory must be a non-symlink directory: {staging_dir}")
+    staging_root = staging_dir.resolve()
 
     pins_file = staging_dir / "pins.json"
-    if not pins_file.is_file():
-        raise FileNotFoundError(f"Pins manifest not found: {pins_file}")
+    if pins_file.is_symlink() or not pins_file.is_file():
+        raise FileNotFoundError(f"Pins manifest must be a non-symlink regular file: {pins_file}")
 
     try:
         manifest = json.loads(pins_file.read_text(encoding="utf-8"))
     except Exception as e:
         raise ValueError(f"Malformed pins.json: {e}")
 
-    roots = manifest.get("roots", [])
+    if not isinstance(manifest, dict):
+        raise ValueError("Malformed pins.json: root must be an object")
+    roots = manifest.get("roots")
+    if not isinstance(roots, list):
+        raise ValueError("Malformed pins.json: roots must be a list")
     if len(roots) != 4:
         raise ValueError(f"Expected exactly 4 Staging roots in pins.json, found {len(roots)}")
 
-    # Verify no extra .pem files exist in staging_dir
+    required_fields = {"file", "subject_cn", "der_sha256"}
+    pinned_files = []
+    seen_names = set()
+    for index, item in enumerate(roots):
+        if not isinstance(item, dict) or not required_fields.issubset(item):
+            raise ValueError(f"Malformed pins.json: root entry {index} must contain file, subject_cn, and der_sha256")
+        file_name = item["file"]
+        subject_cn = item["subject_cn"]
+        digest = item["der_sha256"]
+        if (
+            not isinstance(file_name, str)
+            or not file_name.endswith(".pem")
+            or Path(file_name).name != file_name
+            or file_name in (".pem", ".", "..")
+        ):
+            raise ValueError(f"Malformed pins.json: invalid certificate filename at root entry {index}")
+        if file_name in seen_names:
+            raise ValueError(f"Malformed pins.json: duplicate certificate filename '{file_name}'")
+        seen_names.add(file_name)
+        if not isinstance(subject_cn, str) or not subject_cn.strip():
+            raise ValueError(f"Malformed pins.json: invalid subject_cn at root entry {index}")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-fA-F]{64}", digest) is None:
+            raise ValueError(f"Malformed pins.json: invalid DER SHA-256 at root entry {index}")
+        pinned_files.append(file_name)
+
+    # Verify no extra .pem files exist in staging_dir.
     actual_pem_files = sorted(p.name for p in staging_dir.glob("*.pem"))
-    pinned_files = sorted(r["file"] for r in roots)
-    if actual_pem_files != pinned_files:
+    if actual_pem_files != sorted(pinned_files):
         raise ValueError(
-            f"Staging certificate file mismatch: actual {actual_pem_files} != pinned {pinned_files}"
+            f"Staging certificate file mismatch: actual {actual_pem_files} != pinned {sorted(pinned_files)}"
         )
 
     verified: List[Tuple[Path, Dict[str, Any]]] = []
@@ -76,8 +107,8 @@ def verify_staging_roots(staging_dir: Path = STAGING_CERTS_DIR) -> List[Tuple[Pa
         expected_sha = item["der_sha256"].lower()
 
         pem_path = staging_dir / file_name
-        if not pem_path.is_file():
-            raise FileNotFoundError(f"Pinned root PEM file missing: {pem_path}")
+        if pem_path.is_symlink() or not pem_path.is_file() or pem_path.resolve().parent != staging_root:
+            raise ValueError(f"Pinned root PEM must be a non-symlink regular file inside staging directory: {pem_path}")
 
         # Check DER SHA-256
         res_der = subprocess.run(
