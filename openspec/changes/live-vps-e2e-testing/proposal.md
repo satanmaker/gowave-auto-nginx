@@ -52,8 +52,8 @@ subscription delivery, and actual Data Plane tunnel traffic — on disposable re
 ## Impact
 
 - **New files**: `tools/test_live_vps.py`, `tools/live_vps/` package, `tools/tests/` unit test package,
-  `tools/live_vps_config.env.example`, `.github/workflows/live-vps-e2e.yml`, `.github/workflows/live-vps-unit.yml`,
-  `docs/LIVE_VPS_TESTING.md`.
+  `tools/live_vps_config.env.example`, `.github/workflows/live-vps-unit.yml`, `docs/LIVE_VPS_TESTING.md`,
+  `tools/run_live_vps.py`, `tools/live_vps/operator.py`, and pinned `tools/requirements-live-vps.txt`.
 - **Modified files**: `gowave-auto.sh` (ACME mode mapping, Master/Worker Vision domain-pair validation and
   propagation), `gowave-node-auto.sh` (ACME propagation, optional Worker Vision certificate/inbound and NGINX
   routing support, plus configurable commit/SHA256 verification of the remote installer),
