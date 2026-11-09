@@ -272,7 +272,7 @@ def install_master(
     # Interrogate exact Panel, Node and Node-managed Xray versions.
     panel_ver_r = master_ssh.run("/opt/gowave/gowave-server --version || /opt/gowave/gowave-server version")
     node_ver_r = master_ssh.run("/usr/local/bin/gowave-node --version || /usr/local/bin/gowave-node version")
-    xray_ver_r = master_ssh.run("/usr/local/bin/xray version")
+    xray_ver_r = master_ssh.run("/opt/gowave-node/rw-core version")
     version_checks = {
         "panel": (panel_ver_r, config.gowave_panel_version),
         "node": (node_ver_r, config.gowave_node_version),
@@ -497,7 +497,7 @@ print(json.dumps({
         worker_errors.append("Worker cover-reality assets missing")
 
     worker_node_ver = worker_ssh.run("/usr/local/bin/gowave-node --version || /usr/local/bin/gowave-node version")
-    worker_xray_ver = worker_ssh.run("/usr/local/bin/xray version")
+    worker_xray_ver = worker_ssh.run("/opt/gowave-node/rw-core version")
     for component, result, expected in (
         ("node", worker_node_ver, config.gowave_node_version),
         ("xray_server", worker_xray_ver, config.xray_server_version),
