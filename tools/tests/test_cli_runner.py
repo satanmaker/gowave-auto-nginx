@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Integration and CLI runner tests for Live VPS E2E:
-Validates partial-run resume identity/prerequisite checks, ACME directory mappings,
-installer digest consistency, and negative suite status gate.
+Validates preflight eligibility, run-state persistence, ACME directory mappings,
+and the fail-closed status gates used by the Live VPS runner.
 """
 from __future__ import annotations
 
@@ -35,6 +35,25 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
     def tearDown(self):
         self.td.cleanup()
 
+    def _evaluate_preflight(self, config, **overrides):
+        baseline = {
+            "existing_gowave_dirs": [],
+            "running_services": [],
+            "listening_ports": [],
+        }
+        arguments = {
+            "tools_ok": True,
+            "master_trust_ok": True,
+            "worker_trust_ok": True,
+            "dns_ok": True,
+            "master_root_ok": True,
+            "worker_root_ok": True,
+            "master_baseline": baseline,
+            "worker_baseline": baseline,
+        }
+        arguments.update(overrides)
+        return evaluate_preflight_eligibility(config, **arguments)
+
     def test_acme_mode_exact_mappings(self):
         # Exactly two official directories allowed
         self.assertEqual(
@@ -51,36 +70,58 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
     def test_config_fingerprint_covers_all_parsed_values(self):
         base = {"MASTER_IP": "93.184.216.34", "GOWAVE_PANEL_VERSION": "0.4.0",
                 "XRAY_SERVER_VERSION": "25.10.15", "TEST_NEGATIVE_SUITE": True}
-        same = type("Config", (), {"values": dict(base)})()
-        changed = dict(base, GOWAVE_PANEL_VERSION="0.4.1")
-        changed_config = type("Config", (), {"values": changed})()
-        self.assertEqual(build_config_fingerprint(same), build_config_fingerprint(type("Config", (), {"values": dict(base)})()))
-        self.assertNotEqual(build_config_fingerprint(same), build_config_fingerprint(changed_config))
+        original = SimpleNamespace(values=dict(base))
+        reordered = SimpleNamespace(values=dict(reversed(list(base.items()))))
+        changed = SimpleNamespace(values={**base, "GOWAVE_PANEL_VERSION": "0.4.1"})
 
-    def test_vision_preflight_passes_when_supported(self):
-        config = SimpleNamespace(
-            master_vision_domain="vision-master.example.com",
-            worker_vision_domain=None,
+        self.assertEqual(build_config_fingerprint(original), build_config_fingerprint(reordered))
+        self.assertNotEqual(build_config_fingerprint(original), build_config_fingerprint(changed))
+
+    def test_preflight_supports_independent_vision_topologies(self):
+        topologies = (
+            ("master-vision.example.com", None, True),
+            (None, "worker-vision.example.com", True),
+            (None, None, False),
         )
-        baseline = {
-            "existing_gowave_dirs": [],
-            "running_services": [],
-            "listening_ports": [],
+        for master_domain, worker_domain, requested in topologies:
+            with self.subTest(master=master_domain, worker=worker_domain):
+                result = self._evaluate_preflight(SimpleNamespace(
+                    master_vision_domain=master_domain,
+                    worker_vision_domain=worker_domain,
+                ))
+                self.assertEqual(result["status"], "PASS")
+                self.assertEqual(result["vision_requested"], requested)
+                self.assertTrue(result["vision_supported"])
+
+    def test_preflight_fails_closed_when_any_required_prerequisite_fails(self):
+        config = SimpleNamespace(master_vision_domain=None, worker_vision_domain=None)
+        required_gates = (
+            "tools_ok",
+            "master_trust_ok",
+            "worker_trust_ok",
+            "dns_ok",
+            "master_root_ok",
+            "worker_root_ok",
+        )
+        for gate in required_gates:
+            with self.subTest(gate=gate):
+                result = self._evaluate_preflight(config, **{gate: False})
+                self.assertEqual(result["status"], "FAIL")
+
+    def test_preflight_fails_closed_when_either_host_is_not_disposable(self):
+        config = SimpleNamespace(master_vision_domain=None, worker_vision_domain=None)
+        occupied_baseline = {
+            "existing_gowave_dirs": ["/opt/gowave"],
+            "running_services": ["ssh.service"],
+            "listening_ports": [22],
         }
-        result = evaluate_preflight_eligibility(
-            config,
-            tools_ok=True,
-            master_trust_ok=True,
-            worker_trust_ok=True,
-            dns_ok=True,
-            master_root_ok=True,
-            worker_root_ok=True,
-            master_baseline=baseline,
-            worker_baseline=baseline,
-        )
-        self.assertEqual(result["status"], "PASS")
-        self.assertTrue(result["vision_requested"])
-        self.assertTrue(result["vision_supported"])
+        for host in ("master", "worker"):
+            with self.subTest(host=host):
+                result = self._evaluate_preflight(
+                    config, **{f"{host}_baseline": occupied_baseline}
+                )
+                self.assertEqual(result["status"], "FAIL")
+                self.assertFalse(result[f"{host}_gate_ok"])
 
     @patch("test_live_vps.subprocess.run")
     def test_git_head_rejects_dirty_worktree(self, run):
@@ -103,22 +144,7 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
             master_vision_domain=None,
             worker_vision_domain=None,
         )
-        baseline = {
-            "existing_gowave_dirs": [],
-            "running_services": [],
-            "listening_ports": [],
-        }
-        result = evaluate_preflight_eligibility(
-            config,
-            tools_ok=True,
-            master_trust_ok=True,
-            worker_trust_ok=True,
-            dns_ok=True,
-            master_root_ok=True,
-            worker_root_ok=True,
-            master_baseline=baseline,
-            worker_baseline=baseline,
-        )
+        result = self._evaluate_preflight(config)
         self.assertEqual(result["status"], "PASS")
         self.assertTrue(result["remote_pair_lock_supported"])
         self.assertTrue(result["transactional_restore_supported"])
@@ -148,27 +174,8 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
         st = (self.artifact_dir / "run-state.json").stat()
         self.assertEqual(st.st_mode & 0o777, 0o600)
 
-    def test_partial_run_prerequisites_logic(self):
-        # Without preflight PASS, install must not proceed
-        state_no_preflight = {
-            "test_run_id": "run-test-2",
-            "results": {"preflight": {"status": "FAIL"}},
-        }
-        save_run_state(self.artifact_dir, state_no_preflight)
-        st = load_run_state(self.artifact_dir)
-        self.assertNotEqual(st.get("results", {}).get("preflight", {}).get("status"), "PASS")
-
-        # With preflight PASS, install can proceed
-        state_preflight_ok = {
-            "test_run_id": "run-test-2",
-            "results": {"preflight": {"status": "PASS"}},
-        }
-        save_run_state(self.artifact_dir, state_preflight_ok)
-        st2 = load_run_state(self.artifact_dir)
-        self.assertEqual(st2.get("results", {}).get("preflight", {}).get("status"), "PASS")
-
     def test_negative_suite_disabled_gate_produces_incomplete(self):
-        config = type("Config", (), {"test_negative_suite": False})()
+        config = SimpleNamespace(test_negative_suite=False)
         res = run_negative_suite(config)
         self.assertEqual(res["status"], "INCOMPLETE")
         self.assertEqual(res["skipped_count"], 15)
@@ -181,7 +188,6 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
             mihomo_results={"status": "PASS"},
         )
         self.assertEqual(status, "INCOMPLETE")
-
 
     def test_report_builder_fails_closed_on_missing_phase_and_case_status(self):
         cases = build_test_cases_from_state({

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for tools/live_vps/config.py."""
-import os
+from __future__ import annotations
+
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +10,7 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
-from live_vps.config import load_config, LiveVPSConfig
+from live_vps.config import load_config
 
 
 class TestLiveVPSConfig(unittest.TestCase):
@@ -17,10 +18,10 @@ class TestLiveVPSConfig(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.tmp = Path(self.tmpdir.name)
         self.valid_content = """
-MASTER_IP=198.51.100.1
+MASTER_IP=93.184.216.34
 MASTER_PANEL_DOMAIN=panel.example.com
 MASTER_REALITY_DOMAIN=reality.example.com
-WORKER_IP=198.51.100.2
+WORKER_IP=93.184.216.35
 WORKER_DOMAIN=worker.example.com
 WORKER_REALITY_DOMAIN=reality-worker.example.com
 SSH_KEY_PATH=/tmp/id_rsa
@@ -39,6 +40,16 @@ TEST_TEARDOWN_POLICY=PRESERVE
     def tearDown(self):
         self.tmpdir.cleanup()
 
+    def _config_content(self, **overrides: str) -> str:
+        """Build a valid baseline while keeping each test's mutation explicit."""
+        values = dict(
+            line.split("=", 1)
+            for line in self.valid_content.strip().splitlines()
+            if line.strip()
+        )
+        values.update({key: str(value) for key, value in overrides.items()})
+        return "\n".join(f"{key}={value}" for key, value in values.items())
+
     def _write_config(self, content: str, mode: int = 0o600) -> Path:
         p = self.tmp / "test_config.env"
         p.write_text(content.strip() + "\n", encoding="utf-8")
@@ -46,9 +57,7 @@ TEST_TEARDOWN_POLICY=PRESERVE
         return p
 
     def test_valid_config_loading(self):
-        # Note: 198.51.100.1 is doc range, but let's test with public IP e.g. 1.1.1.1
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        p = self._write_config(content)
+        p = self._write_config(self.valid_content)
         cfg = load_config(p)
         self.assertEqual(cfg.MASTER_IP, "93.184.216.34")
         self.assertEqual(cfg.WORKER_IP, "93.184.216.35")
@@ -58,9 +67,12 @@ TEST_TEARDOWN_POLICY=PRESERVE
         self.assertEqual(cfg.NODE_READY_TIMEOUT, 120)
 
     def test_lowercase_attributes_and_per_host_ssh_paths(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        content += "\nMASTER_SSH_KEY_PATH=/tmp/master_key\nWORKER_SSH_KEY_PATH=/tmp/worker_key\n"
-        content += "MASTER_KNOWN_HOSTS_PATH=/tmp/master_known\nWORKER_KNOWN_HOSTS_PATH=/tmp/worker_known\n"
+        content = self._config_content(
+            MASTER_SSH_KEY_PATH="/tmp/master_key",
+            WORKER_SSH_KEY_PATH="/tmp/worker_key",
+            MASTER_KNOWN_HOSTS_PATH="/tmp/master_known",
+            WORKER_KNOWN_HOSTS_PATH="/tmp/worker_known",
+        )
         cfg = load_config(self._write_config(content))
         self.assertEqual(cfg.master_ip, "93.184.216.34")
         self.assertEqual(cfg.worker_ip, "93.184.216.35")
@@ -70,28 +82,24 @@ TEST_TEARDOWN_POLICY=PRESERVE
         self.assertEqual(cfg.worker_known_hosts_path, "/tmp/worker_known")
 
     def test_shared_ssh_paths_remain_backward_compatible(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        cfg = load_config(self._write_config(content))
+        cfg = load_config(self._write_config(self.valid_content))
         self.assertEqual(cfg.master_ssh_key_path, "/tmp/id_rsa")
         self.assertEqual(cfg.worker_ssh_key_path, "/tmp/id_rsa")
         self.assertEqual(cfg.master_known_hosts_path, "/tmp/known_hosts")
         self.assertEqual(cfg.worker_known_hosts_path, "/tmp/known_hosts")
 
     def test_insecure_mode_rejected(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        p = self._write_config(content, mode=0o644)
+        p = self._write_config(self.valid_content, mode=0o644)
         with self.assertRaises(PermissionError) as ctx:
             load_config(p)
         self.assertIn("insecure permissions", str(ctx.exception))
 
     def test_owner_executable_config_mode_rejected(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
         with self.assertRaises(PermissionError):
-            load_config(self._write_config(content, mode=0o700))
+            load_config(self._write_config(self.valid_content, mode=0o700))
 
     def test_config_symlink_rejected(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        target = self._write_config(content)
+        target = self._write_config(self.valid_content)
         link = self.tmp / "config-link.env"
         link.symlink_to(target)
         with self.assertRaisesRegex(ValueError, "must not be a symlink"):
@@ -99,7 +107,6 @@ TEST_TEARDOWN_POLICY=PRESERVE
 
     def test_unknown_key_rejected(self):
         content = self.valid_content + "\nUNKNOWN_VARIABLE=foo\n"
-        content = content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
         p = self._write_config(content)
         with self.assertRaises(ValueError) as ctx:
             load_config(p)
@@ -107,97 +114,83 @@ TEST_TEARDOWN_POLICY=PRESERVE
 
     def test_duplicate_key_rejected(self):
         content = self.valid_content + "\nMASTER_IP=93.184.216.34\n"
-        content = content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
         p = self._write_config(content)
         with self.assertRaises(ValueError) as ctx:
             load_config(p)
         self.assertIn("Duplicate configuration key", str(ctx.exception))
 
-    def test_private_or_doc_ip_rejected(self):
-        # 192.168.1.1 (RFC-1918)
-        c1 = self.valid_content.replace("198.51.100.1", "192.168.1.1")
-        p1 = self._write_config(c1)
-        with self.assertRaises(ValueError) as ctx1:
-            load_config(p1)
-        self.assertIn("not a public routable address", str(ctx1.exception))
-
-        # 127.0.0.1 (Loopback)
-        c2 = self.valid_content.replace("198.51.100.1", "127.0.0.1")
-        p2 = self._write_config(c2)
-        with self.assertRaises(ValueError) as ctx2:
-            load_config(p2)
-        self.assertIn("not a public routable address", str(ctx2.exception))
-
-        # 203.0.113.1 (Documentation address)
-        c3 = self.valid_content.replace("198.51.100.1", "203.0.113.1")
-        p3 = self._write_config(c3)
-        with self.assertRaises(ValueError) as ctx3:
-            load_config(p3)
-        self.assertIn("not a public routable address", str(ctx3.exception))
+    def test_non_public_master_addresses_are_rejected(self):
+        invalid_addresses = (
+            "192.168.1.1",  # RFC 1918
+            "127.0.0.1",    # loopback
+            "203.0.113.1",  # documentation range
+        )
+        for address in invalid_addresses:
+            with self.subTest(master_ip=address):
+                with self.assertRaisesRegex(ValueError, "not a public routable address"):
+                    load_config(
+                        self._write_config(self._config_content(MASTER_IP=address))
+                    )
 
     def test_missing_mandatory_key_rejected(self):
         lines = [line for line in self.valid_content.splitlines() if not line.startswith("GOWAVE_PANEL_VERSION")]
-        p = self._write_config("\n".join(lines).replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35"))
+        p = self._write_config("\n".join(lines))
         with self.assertRaises(ValueError) as ctx:
             load_config(p)
         self.assertIn("Missing mandatory configuration keys", str(ctx.exception))
 
     def test_floating_component_versions_rejected(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        content = content.replace("GOWAVE_PANEL_VERSION=0.4.0", "GOWAVE_PANEL_VERSION=latest")
+        content = self._config_content(GOWAVE_PANEL_VERSION="latest")
         with self.assertRaisesRegex(ValueError, "explicit pinned version"):
             load_config(self._write_config(content))
 
     def test_per_host_ssh_credentials_without_shared_paths(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        content = content.replace("SSH_KEY_PATH=/tmp/id_rsa\n", "")
-        content = content.replace("SSH_KNOWN_HOSTS=/tmp/known_hosts\n", "")
-        content += "\nMASTER_SSH_KEY_PATH=/tmp/master_key\nWORKER_SSH_KEY_PATH=/tmp/worker_key\n"
-        content += "MASTER_KNOWN_HOSTS_PATH=/tmp/master_known\nWORKER_KNOWN_HOSTS_PATH=/tmp/worker_known\n"
+        content = self._config_content(
+            SSH_KEY_PATH="",
+            SSH_KNOWN_HOSTS="",
+            MASTER_SSH_KEY_PATH="/tmp/master_key",
+            WORKER_SSH_KEY_PATH="/tmp/worker_key",
+            MASTER_KNOWN_HOSTS_PATH="/tmp/master_known",
+            WORKER_KNOWN_HOSTS_PATH="/tmp/worker_known",
+        )
         cfg = load_config(self._write_config(content))
         self.assertEqual(cfg.master_ssh_key_path, "/tmp/master_key")
         self.assertEqual(cfg.worker_ssh_key_path, "/tmp/worker_key")
 
     def test_same_master_and_worker_ip_rejected(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.34")
+        content = self._config_content(WORKER_IP="93.184.216.34")
         with self.assertRaisesRegex(ValueError, "different VPS hosts"):
             load_config(self._write_config(content))
 
     def test_non_root_ssh_user_rejected(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        content += "\nWORKER_SSH_USER=ubuntu\n"
+        content = self._config_content(WORKER_SSH_USER="ubuntu")
         with self.assertRaisesRegex(ValueError, "requires MASTER_SSH_USER=root"):
             load_config(self._write_config(content))
 
     def test_master_only_vision_configuration_is_supported(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        content += "\nMASTER_VISION_DOMAIN=vision-master.example.com\n"
+        content = self._config_content(MASTER_VISION_DOMAIN="vision-master.example.com")
         cfg = load_config(self._write_config(content))
         self.assertEqual(cfg.master_vision_domain, "vision-master.example.com")
         self.assertIsNone(cfg.worker_vision_domain)
 
     def test_worker_only_vision_configuration_is_supported(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        content += "\nWORKER_VISION_DOMAIN=vision-worker.example.com\n"
+        content = self._config_content(WORKER_VISION_DOMAIN="vision-worker.example.com")
         cfg = load_config(self._write_config(content))
         self.assertIsNone(cfg.master_vision_domain)
         self.assertEqual(cfg.worker_vision_domain, "vision-worker.example.com")
 
     def test_global_domain_collision_rejected(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        content = content.replace("WORKER_DOMAIN=worker.example.com", "WORKER_DOMAIN=panel.example.com")
+        content = self._config_content(WORKER_DOMAIN="panel.example.com")
         with self.assertRaisesRegex(ValueError, "globally distinct"):
             load_config(self._write_config(content))
 
     def test_expected_egress_ip_must_be_public_ipv4(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        content += "\nEXPECTED_WORKER_EGRESS_IP=192.168.1.10\n"
+        content = self._config_content(EXPECTED_WORKER_EGRESS_IP="192.168.1.10")
         with self.assertRaisesRegex(ValueError, "not a public routable address"):
             load_config(self._write_config(content))
 
     def test_teardown_destroy_rejected(self):
-        content = self.valid_content.replace("TEST_TEARDOWN_POLICY=PRESERVE", "TEST_TEARDOWN_POLICY=DESTROY")
-        content = content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        content = self._config_content(TEST_TEARDOWN_POLICY="DESTROY")
         p = self._write_config(content)
         with self.assertRaises(ValueError) as ctx:
             load_config(p)
