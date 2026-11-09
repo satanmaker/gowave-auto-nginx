@@ -188,6 +188,32 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn('awk \'$3 == "443/tcp" { found=1 } END { exit !found }\'', rollback_script)
         self.assertNotIn("rollback_restore_failed", rollback_script)
 
+    def test_initial_provision_persists_applying_state_at_first_api_mutation(self):
+        auto_script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        prepared_at = auto_script.index('"state": "PROVISION_PREPARED"')
+        callback_at = auto_script.index("def persist_transaction_entities(entities):", prepared_at)
+        callback_end = auto_script.index("\nclient.transaction_callback", callback_at)
+        callback = auto_script[callback_at:callback_end]
+        self.assertIn('journal["state"] = "PROVISION_APPLYING"', callback)
+        self.assertIn('journal["entities"] = list(entities)', callback)
+        self.assertLess(
+            auto_script.index("client.transaction_callback = persist_transaction_entities", callback_at),
+            auto_script.index('client.provision_config_profile("GoWave MVP Unified Profile - local-node"', callback_at),
+        )
+
+    def test_node_add_persists_applying_state_before_first_api_create(self):
+        auto_script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        prepared_at = auto_script.index('"state": "NODE_ADD_PREPARED"')
+        callback_at = auto_script.index("def persist_transaction_entities(entities):", prepared_at)
+        callback_end = auto_script.index("\nclient.transaction_callback", callback_at)
+        callback = auto_script[callback_at:callback_end]
+        self.assertIn('journal["state"] = "NODE_ADD_APPLYING"', callback)
+        self.assertIn('journal["entities"] = list(entities)', callback)
+        self.assertLess(
+            auto_script.index("client.transaction_callback = persist_transaction_entities", callback_at),
+            auto_script.index('client.provision_config_profile(f"GoWave Worker {name} Profile"', callback_at),
+        )
+
     def test_node_add_pre_dispatch_failures_stay_inside_api_rollback_boundary(self):
         """Resolve local prerequisites early and persist VERIFYING inside the guarded API transaction."""
         worker_script = (REPO_ROOT / "gowave-auto.sh").read_text()

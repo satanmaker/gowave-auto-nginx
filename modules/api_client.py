@@ -89,6 +89,13 @@ class GoWaveClient:
 
         req = urllib.request.Request(url, data=encoded_data, headers=req_headers, method=method)
 
+        # Persist an APPLYING checkpoint before non-idempotent creates. If the
+        # API commits a POST but the subsequent UUID journal write fails, the
+        # on-disk journal must not still look like a side-effect-free PREPARED
+        # transaction.
+        if method.upper() == "POST" and endpoint not in ("/api/auth/login", "/api/auth/register") and self.transaction_callback is not None:
+            self.transaction_callback(self.transaction_entities)
+
         # Retrying a mutation after a timeout or 5xx can duplicate a request
         # that the server already committed but whose response was lost.
         # Restrict automatic retries to methods with safe/idempotent semantics.
@@ -728,6 +735,18 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
 
     entities = journal_data.get("entities")
     if entities == {} or entities == []:
+        prepared_states = {"PROVISION_PREPARED", "NODE_ADD_PREPARED"}
+        if state not in prepared_states:
+            required_state = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
+            journal_data["state"] = required_state
+            journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            journal_data["rollback_error"] = (
+                "Transaction entered APPLYING/VERIFYING without a durable action ledger; "
+                "API side effects may exist and automatic rollback is unsafe."
+            )
+            write_journal_atomically(str(journal_file), journal_data)
+            print(journal_data["rollback_error"], file=sys.stderr)
+            return False
         journal_data["state"] = "PROVISION_ROLLED_BACK" if op == "provision" else "NODE_ADD_ROLLED_BACK"
         journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         write_journal_atomically(str(journal_file), journal_data)
