@@ -507,9 +507,9 @@ When the pair is configured:
    check and record both remote Worker rollback and Panel API rollback results; it MUST NOT suppress a failed
    `remote_rollback` with `|| true`. If either compensation fails, preserve the recovery journal, mark
    rollback incomplete and force the E2E run to `INCOMPLETE`; only verified success of both sides is rollback PASS.
-5. Panel API acceptance MUST verify five inbounds and five corresponding hosts per node, including each
-   Vision inbound/host association. The subscription MUST expose one Vision proxy per VPS, and Xray and
-   Mihomo MUST each execute the two Vision endpoints as independent runtime cases.
+5. Panel API acceptance MUST verify four core inbounds and corresponding hosts per node, plus one additional
+   inbound/host only on each VPS whose Vision domain is configured. The subscription MUST expose one Vision
+   proxy for each configured Vision domain, and Xray and Mihomo MUST exercise each such endpoint independently.
 6. When a host's Vision domain is absent, that host retains its default four-inbound topology: no Vision
    certificate issuance, no Vision SNI route/fallback, and no Vision subscription endpoint. The other host's
    independently configured Vision endpoint remains enabled.
@@ -517,8 +517,8 @@ When the pair is configured:
 **Rationale:** The current Master installer suppresses Vision certificate issuance/verification errors, while
 the current Worker dispatch does not propagate the Vision domain into Worker API provisioning or Worker
 certificate issuance. Treating Vision as active after either partial path can create mismatched Master/Worker
-profiles, missing TLS material, or an advertised proxy that cannot accept traffic. Pair validation and
-fail-closed activation make the sixteen-versus-twenty test matrix deterministic.
+profiles, missing TLS material, or an advertised proxy that cannot accept traffic. Host-specific validation and
+fail-closed activation make the sixteen-, eighteen-, or twenty-case test matrix deterministic.
 
 ---
 
@@ -822,7 +822,7 @@ Phase 0: Preflight
   0.5  Reject identical MASTER_IP/WORKER_IP and duplicate configured FQDNs; validate each independently configured Vision domain and its host-specific A/AAAA answers across all configured domains, using 2+ resolvers
   0.6  Baseline snapshot (systemd, listeners, firewall, GoWave dirs)
   0.7  Disposable gate (reject if GoWave present or ports occupied)
-  0.8  Port hygiene (11+ required ports checked as free: 80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, 10003; plus 8444 and 9444 when the Vision domain pair is enabled)
+  0.8  Port hygiene (11+ required ports checked as free: 80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, 10003; plus 8444 and 9444 only on each VPS whose Vision domain is configured)
   0.9  Acquire and hold authoritative `flock` sessions on both VPS hosts in deterministic address order;
        preflight-only runs release them on exit; all mutating phases require both locks
   0.10 Re-collect the read-only baseline/disposable gate on both hosts while both locks are held; if any
@@ -836,7 +836,7 @@ Phase 1: Master Installation
   1.3  Run gowave-auto.sh install with `GOWAVE_ACME_SERVER` derived from `ACME_MODE` and
        `GOWAVE_TLS_CA_FILE` pointing to the staged bundle; set `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1`
        and provide the pinned Node installer commit + SHA256;
-       when the validated Vision pair is enabled, pass `VISION_DOMAIN=MASTER_VISION_DOMAIN` in the
+       when `MASTER_VISION_DOMAIN` is configured, pass `VISION_DOMAIN=MASTER_VISION_DOMAIN` in the
        controlled environment and require Master Vision certificate issuance/verification to succeed
   1.4  Verify service states, listeners, TLS certs
   1.5  Verify credentials file (mode, owner, keys present — values not logged)
@@ -849,8 +849,8 @@ Phase 1: Master Installation
 
 Phase 2: Worker Deployment
   2.1  Run `gowave-auto.sh node add worker-1` on Master with the same validated ACME directory and the
-       same Node-installer commit + SHA256 explicitly supplied again for the Worker dispatch; when the
-       validated Vision pair is enabled, pass `--vision-domain WORKER_VISION_DOMAIN` as a named option
+       same Node-installer commit + SHA256 explicitly supplied again for the Worker dispatch; when
+       `WORKER_VISION_DOMAIN` is configured, pass `--vision-domain WORKER_VISION_DOMAIN` as a named option
   2.2  Verify exit code, state.json, process argv observation (SECRET_KEY not in Master-side argv)
   2.3  Verify Worker services, listeners, certs, deploy hook, cover-reality SHA256
   2.4  Poll Panel API isConnected until true (bounded NODE_READY_TIMEOUT)
@@ -869,8 +869,8 @@ Phase 3: Public mTLS Verification (execute allowed-source probes from Master)
   3.7  Run wrong-key local client-load test and wrong-server-CA client-verification test separately
 
 Phase 4: Panel API Audit
-  4.1  GET /api/nodes — 2 nodes, correct addresses, 4 inbounds each (or 5 with the validated Vision pair), isConnected
-  4.2  GET /api/config-profiles — 2 profiles, 4 inbounds each (or 5 with the validated Vision pair), computed-config valid JSON
+  4.1  GET /api/nodes — 2 nodes, correct addresses, 4 core inbounds each plus one only on a host with Vision configured, isConnected
+  4.2  GET /api/config-profiles — 2 profiles, 4 core inbounds each plus one only on a host with Vision configured, computed-config valid JSON
   4.3  GET /api/internal-squads — Default MVP Squad, 8 core inbound UUIDs plus one per configured Vision domain (8/9/10 total), set equality
   4.4  GET /api/hosts — 8 core hosts plus one per configured Vision domain (8/9/10 total), all fields verified, fingerprint="firefox", correct node/inbound associations
 
@@ -992,7 +992,7 @@ is set. When the variable is unset outside the runner, existing production-defau
 1. The runner derives the exact URL once and passes it to `gowave-auto.sh install` and `gowave-auto.sh node add`.
 2. `gowave-auto.sh install` and `domain-change` append `--server "$GOWAVE_ACME_SERVER"` to every Certbot issuance
    call when set. `install` issues two mandatory lineages (Panel and REALITY) and a third Vision lineage only
-   when the validated Vision pair is enabled; `domain-change` applies the selected server to every lineage it
+   when the corresponding host's Vision domain is enabled; `domain-change` applies the selected server to every lineage it
    issues for the domains being changed.
 3. `gowave-auto.sh node add` forwards the same value to `gowave-node-auto.sh remote_payload`.
 4. `remote_payload()` serializes the validated ACME URL and optional Worker Vision domain into the SSH stdin
