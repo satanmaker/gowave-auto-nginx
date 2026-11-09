@@ -716,7 +716,20 @@ restore_acme_lineage() {
     fi
 
     local existed
-    existed=$(python3 -c "import json; print('1' if json.load(open('$meta_file')).get('existed_before') else '0')")
+    existed=$(python3 - "$meta_file" "$domain" <<'PY'
+import json, sys
+path, domain = sys.argv[1:3]
+with open(path, encoding="utf-8") as stream:
+    data = json.load(stream)
+if not isinstance(data, dict) or data.get("domain") != domain or type(data.get("existed_before")) is not bool:
+    raise SystemExit(1)
+print("1" if data["existed_before"] else "0")
+PY
+) || { echo "Error: Invalid ACME lineage manifest for $domain" >&2; return 1; }
+if [[ "$existed" != "0" && "$existed" != "1" ]]; then
+    echo "Error: Invalid existed_before marker for $domain" >&2
+    return 1
+fi
 
     local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
     local live_dir="${letsencrypt_root}/live/${domain}"
@@ -724,18 +737,18 @@ restore_acme_lineage() {
 
     if [[ "$existed" == "0" ]]; then
         echo "Removing transaction-created ACME lineage for $domain..." >&2
-        rm -f "$renewal_conf"
-        rm -rf "$live_dir" "$archive_dir"
+        rm -f "$renewal_conf" || { echo "Error: Could not remove transaction-created renewal config for $domain" >&2; return 1; }
+        rm -rf "$live_dir" "$archive_dir" || { echo "Error: Could not remove transaction-created lineage for $domain" >&2; return 1; }
         return 0
     fi
 
     echo "Restoring pre-existing ACME lineage for $domain from snapshot..." >&2
-    mkdir -p "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir"
-    chmod 0755 "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" 2>/dev/null || true
+    mkdir -p "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" || { echo "Error: Could not create ACME restore directories for $domain" >&2; return 1; }
+    chmod 0755 "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" 2>/dev/null || { echo "Error: Could not set ACME directory permissions for $domain" >&2; return 1; }
 
     if [[ -f "$snap_dir/renewal.conf" ]]; then
-        cp -p "$snap_dir/renewal.conf" "$renewal_conf"
-        chmod 0644 "$renewal_conf" 2>/dev/null || true
+        cp -p "$snap_dir/renewal.conf" "$renewal_conf" || { echo "Error: Could not restore renewal config for $domain" >&2; return 1; }
+        chmod 0644 "$renewal_conf" 2>/dev/null || { echo "Error: Could not set renewal config permissions for $domain" >&2; return 1; }
     fi
 
     if [[ -d "$snap_dir/archive" ]]; then
@@ -744,11 +757,11 @@ restore_acme_lineage() {
             [[ -f "$arc" ]] || continue
             local bn
             bn=$(basename "$arc")
-            cp -p "$arc" "$archive_dir/$bn"
+            cp -p "$arc" "$archive_dir/$bn" || { echo "Error: Could not restore ACME archive file $bn for $domain" >&2; return 1; }
             if [[ "$bn" =~ ^privkey ]]; then
-                chmod 0600 "$archive_dir/$bn" 2>/dev/null || true
+                chmod 0600 "$archive_dir/$bn" 2>/dev/null || { echo "Error: Could not secure restored private key $bn for $domain" >&2; return 1; }
             else
-                chmod 0644 "$archive_dir/$bn" 2>/dev/null || true
+                chmod 0644 "$archive_dir/$bn" 2>/dev/null || { echo "Error: Could not set restored certificate permissions for $bn ($domain)" >&2; return 1; }
             fi
         done
     fi
@@ -758,14 +771,14 @@ restore_acme_lineage() {
         for f in cert.pem chain.pem fullchain.pem privkey.pem; do
             if [[ -f "$snap_dir/live/${f}.target" ]]; then
                 local tgt
-                tgt=$(cat "$snap_dir/live/${f}.target")
-                ln -sf "$tgt" "$live_dir/$f"
+                tgt=$(cat "$snap_dir/live/${f}.target") || { echo "Error: Could not read ACME symlink target for $f ($domain)" >&2; return 1; }
+                ln -sf "$tgt" "$live_dir/$f" || { echo "Error: Could not restore ACME symlink $f for $domain" >&2; return 1; }
             elif [[ -f "$snap_dir/live/$f" ]]; then
-                cp -p "$snap_dir/live/$f" "$live_dir/$f"
+                cp -p "$snap_dir/live/$f" "$live_dir/$f" || { echo "Error: Could not restore ACME live file $f for $domain" >&2; return 1; }
                 if [[ "$f" == "privkey.pem" ]]; then
-                    chmod 0600 "$live_dir/$f" 2>/dev/null || true
+                    chmod 0600 "$live_dir/$f" 2>/dev/null || { echo "Error: Could not secure restored live private key for $domain" >&2; return 1; }
                 else
-                    chmod 0644 "$live_dir/$f" 2>/dev/null || true
+                    chmod 0644 "$live_dir/$f" 2>/dev/null || { echo "Error: Could not set restored live certificate permissions for $domain" >&2; return 1; }
                 fi
             fi
         done
@@ -792,17 +805,21 @@ restore_acme_lineage() {
     fi
 
     local exp_serial exp_fingerprint cur_serial cur_fingerprint
-    exp_serial=$(python3 -c "import json; print(json.load(open('$meta_file')).get('serial', ''))")
-    exp_fingerprint=$(python3 -c "import json; print(json.load(open('$meta_file')).get('fingerprint', ''))")
+    exp_serial=$(python3 -c "import json; print(json.load(open('$meta_file', encoding='utf-8')).get('serial', ''))") || { echo "Error: Could not read snapshot certificate serial for $domain" >&2; return 1; }
+    exp_fingerprint=$(python3 -c "import json; print(json.load(open('$meta_file', encoding='utf-8')).get('fingerprint', ''))") || { echo "Error: Could not read snapshot certificate fingerprint for $domain" >&2; return 1; }
+    if [[ -z "$exp_serial" || -z "$exp_fingerprint" ]]; then
+        echo "Error: ACME snapshot is missing certificate identity metadata for $domain" >&2
+        return 1
+    fi
     if [[ -n "$exp_serial" ]]; then
-        cur_serial=$(openssl x509 -in "$fullchain" -noout -serial 2>/dev/null || true)
+        cur_serial=$(openssl x509 -in "$fullchain" -noout -serial 2>/dev/null) || { echo "Error: Could not read restored certificate serial for $domain" >&2; return 1; }
         if [[ "$cur_serial" != "$exp_serial" ]]; then
             echo "Error: Restored certificate serial ($cur_serial) does not match snapshot ($exp_serial)" >&2
             return 1
         fi
     fi
     if [[ -n "$exp_fingerprint" ]]; then
-        cur_fingerprint=$(openssl x509 -in "$fullchain" -noout -fingerprint -sha256 2>/dev/null || true)
+        cur_fingerprint=$(openssl x509 -in "$fullchain" -noout -fingerprint -sha256 2>/dev/null) || { echo "Error: Could not read restored certificate fingerprint for $domain" >&2; return 1; }
         if [[ "$cur_fingerprint" != "$exp_fingerprint" ]]; then
             echo "Error: Restored certificate fingerprint ($cur_fingerprint) does not match snapshot ($exp_fingerprint)" >&2
             return 1

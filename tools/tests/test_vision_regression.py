@@ -254,6 +254,29 @@ vision_domain=vision.example.test
         self.assertIn("ACME certificate lineage rollback completed successfully", succeeded.stderr)
         self.assertNotIn("CRITICAL: ACME rollback incomplete", succeeded.stderr)
 
+    def test_restore_acme_lineage_propagates_removal_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            recovery = root / "recovery"
+            letsencrypt = root / "letsencrypt"
+            domain = "new.example.test"
+            manifest = recovery / "tx" / "acme" / domain / "lineage-manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(json.dumps({"domain": domain, "existed_before": False}))
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_rm = fake_bin / "rm"
+            fake_rm.write_text("#!/bin/sh\nexit 1\n")
+            fake_rm.chmod(0o755)
+            env = {**os.environ, "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}"}
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1" && restore_acme_lineage "$2" "$3" "$4" "$5"',
+                 "bash", str(NGINX_SH), "tx", domain, str(recovery), str(letsencrypt)],
+                text=True, capture_output=True, env=env, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Could not remove transaction-created renewal config", result.stderr)
+
     def test_worker_compensation_removes_vision_artifacts_and_restores_lineage(self):
         """Worker ERR compensation removes the Vision fallback and restores its ACME lineage."""
         node_script = (REPO_ROOT / "gowave-node-auto.sh").read_text(encoding="utf-8")
