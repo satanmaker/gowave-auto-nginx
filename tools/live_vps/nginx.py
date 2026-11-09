@@ -96,7 +96,7 @@ def verify_reality_decoy_fallback(
         # A successful HTTP status alone is not decoy evidence: require an HTML
         # document body and an explicit HTTP 200 response.
         status_line = resp_text.splitlines()[0] if resp_text.splitlines() else ""
-        body = resp_text.partition("\\r\\n\\r\\n")[2].lower()
+        body = resp_text.partition("\r\n\r\n")[2].lower()
         http_200 = status_line.startswith("HTTP/") and status_line.split()[1:2] == ["200"]
         is_decoy = http_200 and ("<!doctype html" in body or "<html" in body)
         if not is_decoy:
