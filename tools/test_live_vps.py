@@ -28,6 +28,7 @@ from live_vps.ssh import SSHClient
 from live_vps.dns import verify_all_domains
 from live_vps.preflight import (
     check_control_machine_tools,
+    check_private_key_file,
     check_ssh_trust,
     collect_remote_baseline,
     check_disposable_gate,
@@ -268,8 +269,26 @@ def main() -> int:
         if args.mode in ("full", "preflight"):
             tools_chk = check_control_machine_tools(config)
             tools_ok = all(t.ok for t in tools_chk.values())
-            m_trust_ok, _ = check_ssh_trust(config.master_ip, config.master_ssh_port, config.master_known_hosts_path)
-            w_trust_ok, _ = check_ssh_trust(config.worker_ip, config.worker_ssh_port, config.worker_known_hosts_path)
+            m_key_ok, m_key_error = check_private_key_file(config.master_ssh_key_path)
+            w_key_ok, w_key_error = check_private_key_file(config.worker_ssh_key_path)
+            m_trust_ok, m_trust_error = check_ssh_trust(config.master_ip, config.master_ssh_port, config.master_known_hosts_path)
+            w_trust_ok, w_trust_error = check_ssh_trust(config.worker_ip, config.worker_ssh_port, config.worker_known_hosts_path)
+            ssh_local_ok = m_key_ok and w_key_ok and m_trust_ok and w_trust_ok
+
+            # Never contact either target unless both SSH credentials and both
+            # pinned host identities passed local metadata/trust validation.
+            if ssh_local_ok:
+                m_base = collect_remote_baseline(master_ssh)
+                w_base = collect_remote_baseline(worker_ssh)
+                m_gate_ok, m_errs = check_disposable_gate(m_base)
+                w_gate_ok, w_errs = check_disposable_gate(w_base)
+                root_m_ok = master_ssh.run("test \"$(id -u)\" -eq 0").ok
+                root_w_ok = worker_ssh.run("test \"$(id -u)\" -eq 0").ok
+            else:
+                m_base, w_base = {}, {}
+                m_gate_ok = w_gate_ok = root_m_ok = root_w_ok = False
+                m_errs = w_errs = ["Remote checks skipped: local SSH key/known_hosts validation failed"]
+
             dns_chk = verify_all_domains(config)
 
             # Baselines
@@ -284,12 +303,20 @@ def main() -> int:
             dns_details = {name: {"ok": result.ok, "expected_ip": result.expected_ip,
                                   "record_type": result.record_type, "resolved_ips": result.resolved_ips,
                                   "error": result.error} for name, result in dns_chk.items()}
-            preflight_pass = tools_ok and m_trust_ok and w_trust_ok and dns_ok and m_gate_ok and w_gate_ok and root_m_ok and root_w_ok
+            preflight_pass = (
+                tools_ok and ssh_local_ok and dns_ok and m_gate_ok and w_gate_ok
+                and root_m_ok and root_w_ok
+            )
             state["results"]["preflight"] = {
                 "status": "PASS" if preflight_pass else "FAIL",
                 "tools_ok": tools_ok,
                 "dns_ok": dns_ok,
                 "dns_details": dns_details,
+                "master_ssh_key_ok": m_key_ok,
+                "worker_ssh_key_ok": w_key_ok,
+                "master_known_hosts_ok": m_trust_ok,
+                "worker_known_hosts_ok": w_trust_ok,
+                "ssh_local_errors": [value for value in (m_key_error, w_key_error, m_trust_error, w_trust_error) if value],
                 "master_root": root_m_ok,
                 "worker_root": root_w_ok,
                 "master_gate_ok": m_gate_ok,

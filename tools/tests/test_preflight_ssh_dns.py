@@ -15,6 +15,7 @@ from live_vps.dns import verify_domain_dns, verify_domain_no_aaaa
 from live_vps.firewall import verify_master_firewall, verify_worker_firewall
 from live_vps.preflight import (
     check_disposable_gate,
+    check_private_key_file,
     LocalLock,
     check_control_machine_tools,
 )
@@ -23,6 +24,53 @@ from live_vps.preflight import (
 class TestPreflightSSHDNS(unittest.TestCase):
     def tearDown(self):
         clear_secrets()
+
+    def test_private_key_file_requires_runner_owned_private_regular_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            key = root / "id_ed25519"
+            key.write_text("private-key-material")
+            key.chmod(0o600)
+            self.assertEqual(check_private_key_file(key), (True, None))
+
+            key.chmod(0o644)
+            ok, error = check_private_key_file(key)
+            self.assertFalse(ok)
+            self.assertIn("permissions are too broad", error)
+
+            key.chmod(0o600)
+            symlink = root / "key-link"
+            symlink.symlink_to(key)
+            ok, error = check_private_key_file(symlink)
+            self.assertFalse(ok)
+            self.assertIn("must not be a symlink", error)
+
+            directory = root / "key-dir"
+            directory.mkdir()
+            ok, error = check_private_key_file(directory)
+            self.assertFalse(ok)
+            self.assertIn("regular file", error)
+
+    @patch("live_vps.preflight.subprocess.run")
+    def test_known_hosts_rejects_symlink_and_group_world_writable(self, run):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            kh = root / "known_hosts"
+            kh.write_text("203.0.113.10 ssh-ed25519 AAAATEST")
+            kh.chmod(0o600)
+            run.return_value = MagicMock(returncode=0, stdout="pinned\n")
+            self.assertEqual(check_ssh_trust("203.0.113.10", 22, kh), (True, None))
+
+            symlink = root / "known_hosts-link"
+            symlink.symlink_to(kh)
+            ok, error = check_ssh_trust("203.0.113.10", 22, symlink)
+            self.assertFalse(ok)
+            self.assertIn("non-symlink", error)
+
+            kh.chmod(0o666)
+            ok, error = check_ssh_trust("203.0.113.10", 22, kh)
+            self.assertFalse(ok)
+            self.assertIn("group- or world-writable", error)
 
     def test_ssh_client_ignores_ambient_config_and_global_trust(self):
         client = SSHClient(

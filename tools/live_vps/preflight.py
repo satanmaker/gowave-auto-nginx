@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -109,11 +110,43 @@ def check_control_machine_tools(config: Any) -> Dict[str, ToolCheckResult]:
     return results
 
 
+def check_private_key_file(key_path: str | Path) -> Tuple[bool, Optional[str]]:
+    """Require a runner-owned, regular, non-symlink private key with safe permissions."""
+    path = Path(key_path).expanduser()
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        return False, f"SSH private key cannot be inspected: {path}: {type(exc).__name__}"
+    if stat.S_ISLNK(info.st_mode):
+        return False, f"SSH private key must not be a symlink: {path}"
+    if not stat.S_ISREG(info.st_mode):
+        return False, f"SSH private key must be a regular file: {path}"
+    if info.st_uid != os.geteuid():
+        return False, f"SSH private key must be owned by the runner user: {path}"
+    if not (info.st_mode & stat.S_IRUSR):
+        return False, f"SSH private key must be readable by the runner user: {path}"
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        return False, f"SSH private key permissions are too broad; require 0600 or 0400: {path}"
+    if info.st_size == 0:
+        return False, f"SSH private key is empty: {path}"
+    return True, None
+
+
 def check_ssh_trust(host: str, port: int, known_hosts_path: str | Path) -> Tuple[bool, Optional[str]]:
-    """Verify that SSH host key for host:port is pre-pinned in known_hosts."""
-    kh = Path(known_hosts_path).resolve()
-    if not kh.is_file() or kh.stat().st_size == 0:
-        return False, f"SSH known_hosts file missing or empty: {kh}"
+    """Verify safe known_hosts metadata and a pre-pinned key for host:port."""
+    kh = Path(known_hosts_path).expanduser()
+    try:
+        info = kh.lstat()
+    except OSError as exc:
+        return False, f"SSH known_hosts file cannot be inspected: {kh}: {type(exc).__name__}"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return False, f"SSH known_hosts must be a regular non-symlink file: {kh}"
+    if info.st_uid != os.geteuid():
+        return False, f"SSH known_hosts must be owned by the runner user: {kh}"
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        return False, f"SSH known_hosts must not be group- or world-writable: {kh}"
+    if info.st_size == 0:
+        return False, f"SSH known_hosts file is empty: {kh}"
 
     host_pattern = host if port == 22 else f"[{host}]:{port}"
     cmd = ["ssh-keygen", "-F", host_pattern, "-f", str(kh)]
