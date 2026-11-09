@@ -553,47 +553,66 @@ def evaluate_traffic_suite_status(
     Enforces that disabling traffic verification or Mihomo traffic forces INCOMPLETE, not PASS.
     Enforces the expected active case count (8, 9, or 10 per client depending on the number of independently configured Vision domains).
     """
-    if not test_traffic_verification:
+    if test_traffic_verification is not True:
+        return "INCOMPLETE"
+    if not isinstance(xray_results, list) or not isinstance(mihomo_results, dict):
+        return "INCOMPLETE"
+    if expected_case_count is not None and (
+        type(expected_case_count) is not int or expected_case_count <= 0
+    ):
         return "INCOMPLETE"
 
+    mihomo_cases = mihomo_results.get("results")
+    if not isinstance(mihomo_cases, list):
+        mihomo_cases = []
+
     # A concrete failing case takes precedence over missing evidence in another case.
-    mihomo_precheck_cases = mihomo_results.get("results", []) if isinstance(mihomo_results, dict) else []
+    all_cases = [*xray_results, *mihomo_cases]
     if (
-        any(case.get("status") == "FAIL" for case in (xray_results or []))
-        or (isinstance(mihomo_results, dict) and mihomo_results.get("status") == "FAIL")
-        or (
-            isinstance(mihomo_precheck_cases, list)
-            and any(case.get("status") == "FAIL" for case in mihomo_precheck_cases)
-        )
+        mihomo_results.get("status") == "FAIL"
+        or any(isinstance(case, dict) and case.get("status") == "FAIL" for case in all_cases)
     ):
         return "FAIL"
 
-    # Empty, missing, or explicitly incomplete results are not successful evidence.
-    if not xray_results or mihomo_results is None:
+    # A PASS requires a complete, well-formed case matrix from both clients.
+    if not xray_results or not mihomo_cases:
         return "INCOMPLETE"
-    if isinstance(mihomo_results, dict) and mihomo_results.get("status") == "INCOMPLETE":
+    if mihomo_results.get("status") != "PASS":
         return "INCOMPLETE"
-
-    if expected_case_count is not None:
-        if len(xray_results) != expected_case_count:
-            return "INCOMPLETE"
-        mihomo_cases = mihomo_results.get("results", []) if isinstance(mihomo_results, dict) else []
-        if len(mihomo_cases) != expected_case_count:
-            return "INCOMPLETE"
+    if expected_case_count is not None and (
+        len(xray_results) != expected_case_count
+        or len(mihomo_cases) != expected_case_count
+    ):
+        return "INCOMPLETE"
 
     def case_evidence_status(result: Dict[str, Any]) -> str:
+        if not isinstance(result, dict):
+            return "INCOMPLETE"
         if result.get("status") == "INCOMPLETE":
             return "INCOMPLETE"
-        if result.get("status") != "PASS":
+        if result.get("status") == "FAIL":
             return "FAIL"
+        if result.get("status") != "PASS":
+            return "INCOMPLETE"
+
+        # bool is a subclass of int in Python; packet counters must be actual integers.
         target_packets = result.get("target_packets")
         offload_packets = result.get("offload_packets")
-        if not isinstance(target_packets, int) or target_packets <= 0:
+        if type(target_packets) is not int or target_packets <= 0:
             return "INCOMPLETE"
-        if not isinstance(offload_packets, int):
+        if type(offload_packets) is not int:
             return "INCOMPLETE"
         if offload_packets != 0:
             return "FAIL"
+
+        # Do not trust a precomputed PASS status if its constituent evidence disagrees.
+        if result.get("target_ingress_ok") is not True:
+            return "INCOMPLETE"
+        if result.get("offload_ok") is not True:
+            return "FAIL" if result.get("offload_ok") is False else "INCOMPLETE"
+        if result.get("egress_matches") is not True:
+            return "FAIL" if result.get("egress_matches") is False else "INCOMPLETE"
+
         evidence_method = result.get("evidence_method")
         if not isinstance(evidence_method, str) or not evidence_method.startswith("tcpdump "):
             return "INCOMPLETE"
@@ -604,13 +623,6 @@ def evaluate_traffic_suite_status(
         if evidence_status != "PASS":
             return evidence_status
 
-    if mihomo_results.get("status") == "INCOMPLETE":
-        return "INCOMPLETE"
-    if mihomo_results.get("status") != "PASS":
-        return "FAIL"
-    mihomo_cases = mihomo_results.get("results", [])
-    if not isinstance(mihomo_cases, list) or not mihomo_cases:
-        return "INCOMPLETE"
     for result in mihomo_cases:
         evidence_status = case_evidence_status(result)
         if evidence_status != "PASS":

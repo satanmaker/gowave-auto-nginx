@@ -52,6 +52,7 @@ class TestTrafficModule(unittest.TestCase):
     def test_status_gate_when_all_pass(self):
         evidence = {
             "status": "PASS", "target_packets": 4, "offload_packets": 0,
+            "target_ingress_ok": True, "offload_ok": True, "egress_matches": True,
             "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
         }
         status = evaluate_traffic_suite_status(
@@ -72,6 +73,7 @@ class TestTrafficModule(unittest.TestCase):
     def test_status_gate_fails_when_offload_host_received_test_source_packets(self):
         evidence = {
             "status": "PASS", "target_packets": 4, "offload_packets": 1,
+            "target_ingress_ok": True, "offload_ok": False, "egress_matches": True,
             "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
         }
         status = evaluate_traffic_suite_status(
@@ -200,6 +202,118 @@ class TestTrafficModule(unittest.TestCase):
         )
         self.assertEqual(res["status"], "INCOMPLETE")
         self.assertTrue(res.get("skipped"))
+
+
+    def test_status_gate_requires_complete_expected_case_matrix_for_both_clients(self):
+        evidence = {
+            "status": "PASS", "target_packets": 4, "offload_packets": 0,
+            "target_ingress_ok": True, "offload_ok": True, "egress_matches": True,
+            "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
+        }
+        for count in (8, 9, 10):
+            with self.subTest(expected_case_count=count):
+                self.assertEqual(
+                    evaluate_traffic_suite_status(
+                        True, [dict(evidence)] * (count - 1),
+                        {"status": "PASS", "results": [dict(evidence)] * count},
+                        expected_case_count=count,
+                    ),
+                    "INCOMPLETE",
+                )
+                self.assertEqual(
+                    evaluate_traffic_suite_status(
+                        True, [dict(evidence)] * count,
+                        {"status": "PASS", "results": [dict(evidence)] * (count - 1)},
+                        expected_case_count=count,
+                    ),
+                    "INCOMPLETE",
+                )
+                self.assertEqual(
+                    evaluate_traffic_suite_status(
+                        True, [dict(evidence)] * count,
+                        {"status": "PASS", "results": [dict(evidence)] * count},
+                        expected_case_count=count,
+                    ),
+                    "PASS",
+                )
+
+    def test_status_gate_rejects_inconsistent_precomputed_pass_flags(self):
+        base = {
+            "status": "PASS", "target_packets": 4, "offload_packets": 0,
+            "target_ingress_ok": True, "offload_ok": True, "egress_matches": True,
+            "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
+        }
+        for field, value, expected in (
+            ("target_ingress_ok", False, "INCOMPLETE"),
+            ("target_ingress_ok", None, "INCOMPLETE"),
+            ("offload_ok", False, "FAIL"),
+            ("offload_ok", None, "INCOMPLETE"),
+            ("egress_matches", False, "FAIL"),
+            ("egress_matches", None, "INCOMPLETE"),
+        ):
+            with self.subTest(field=field, value=value):
+                broken = dict(base, **{field: value})
+                self.assertEqual(
+                    evaluate_traffic_suite_status(
+                        True, [broken],
+                        {"status": "PASS", "results": [dict(base)]},
+                    ),
+                    expected,
+                )
+
+    def test_status_gate_rejects_boolean_or_negative_packet_counters(self):
+        base = {
+            "status": "PASS", "target_packets": 4, "offload_packets": 0,
+            "target_ingress_ok": True, "offload_ok": True, "egress_matches": True,
+            "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
+        }
+        for field, value, expected in (
+            ("target_packets", True, "INCOMPLETE"),
+            ("target_packets", -1, "INCOMPLETE"),
+            ("offload_packets", False, "INCOMPLETE"),
+            ("offload_packets", -1, "FAIL"),
+        ):
+            with self.subTest(field=field, value=value):
+                broken = dict(base, **{field: value})
+                self.assertEqual(
+                    evaluate_traffic_suite_status(
+                        True, [broken],
+                        {"status": "PASS", "results": [dict(base)]},
+                    ),
+                    expected,
+                )
+
+    def test_status_gate_fails_closed_for_malformed_result_shapes(self):
+        self.assertEqual(evaluate_traffic_suite_status(True, None, {"status": "PASS", "results": []}), "INCOMPLETE")
+        self.assertEqual(evaluate_traffic_suite_status(True, [], []), "INCOMPLETE")
+        self.assertEqual(
+            evaluate_traffic_suite_status(
+                True, ["PASS"], {"status": "PASS", "results": [{"status": "FAIL"}]}
+            ),
+            "FAIL",
+        )
+        self.assertEqual(
+            evaluate_traffic_suite_status(
+                True, [{"status": "PASS"}], {"status": "PASS", "results": [{"status": "PASS"}]}
+            ),
+            "INCOMPLETE",
+        )
+
+    def test_status_gate_rejects_invalid_expected_case_count(self):
+        evidence = {
+            "status": "PASS", "target_packets": 4, "offload_packets": 0,
+            "target_ingress_ok": True, "offload_ok": True, "egress_matches": True,
+            "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
+        }
+        for count in (0, -1, True, 8.0):
+            with self.subTest(count=count):
+                self.assertEqual(
+                    evaluate_traffic_suite_status(
+                        True, [dict(evidence)], {"status": "PASS", "results": [dict(evidence)]},
+                        expected_case_count=count,
+                    ),
+                    "INCOMPLETE",
+                )
 
 
 if __name__ == "__main__":

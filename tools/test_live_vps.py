@@ -186,7 +186,7 @@ def build_test_cases_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     results = state.get("results", {})
     for phase_name, p_data in results.items():
         if isinstance(p_data, dict):
-            status = p_data.get("status", "PASS")
+            status = p_data.get("status", "INCOMPLETE")
             msg = p_data.get("error") or p_data.get("message") or ""
             cases.append({
                 "name": f"phase_{phase_name}",
@@ -200,7 +200,7 @@ def build_test_cases_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                     cases.append({
                         "name": f"traffic_xray_{xc.get('tag', 'unknown')}",
                         "classname": "live_vps.traffic.xray",
-                        "status": xc.get("status", "PASS"),
+                        "status": xc.get("status", "INCOMPLETE"),
                         "message": xc.get("error") or xc.get("message") or "",
                         "duration": xc.get("duration", "0.0"),
                     })
@@ -208,9 +208,9 @@ def build_test_cases_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                 m_cases = m_res.get("results", []) if isinstance(m_res, dict) else []
                 for mc in m_cases:
                     cases.append({
-                        "name": f"traffic_mihomo_{mc.get('name', 'unknown')}",
+                        "name": f"traffic_mihomo_{mc.get('proxy') or mc.get('name') or 'unknown'}",
                         "classname": "live_vps.traffic.mihomo",
-                        "status": mc.get("status", "PASS"),
+                        "status": mc.get("status", "INCOMPLETE"),
                         "message": mc.get("error") or mc.get("message") or "",
                         "duration": mc.get("duration", "0.0"),
                     })
@@ -219,7 +219,7 @@ def build_test_cases_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                     cases.append({
                         "name": f"negative_{sc.get('id', 'unknown')}",
                         "classname": "live_vps.negative",
-                        "status": sc.get("status", "PASS"),
+                        "status": sc.get("status", "INCOMPLETE"),
                         "message": sc.get("error") or sc.get("message") or "",
                         "duration": sc.get("duration", "0.0"),
                     })
