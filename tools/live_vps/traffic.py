@@ -199,7 +199,8 @@ def run_xray_endpoint_test(
         # Server evidence verification
         if is_worker_endpoint:
             target_ingress_ok = w_delta > 0
-            offload_ok = m_delta <= 5  # Master should not handle data traffic
+            # Worker handles the data traffic; allow normal SSH/API background traffic on Master
+            offload_ok = m_delta < w_delta
         else:
             target_ingress_ok = m_delta > 0
             offload_ok = True
@@ -355,6 +356,17 @@ def run_mihomo_traffic_suite(
             # Select proxy in Mihomo controller
             group_name = urllib.parse.quote(global_group.get("name", "GLOBAL"))
             try:
+                # If running in mode: global and group is not GLOBAL, route GLOBAL to the group first
+                if global_group.get("name") != "GLOBAL":
+                    sel_global = urllib.request.Request(
+                        f"http://127.0.0.1:{ctrl_port}/proxies/GLOBAL",
+                        data=json.dumps({"name": global_group.get("name")}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="PUT",
+                    )
+                    with urllib.request.urlopen(sel_global, timeout=3):
+                        pass
+
                 sel_req = urllib.request.Request(
                     f"http://127.0.0.1:{ctrl_port}/proxies/{group_name}",
                     data=json.dumps({"name": p_name}).encode("utf-8"),
