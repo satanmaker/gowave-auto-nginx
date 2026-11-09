@@ -109,7 +109,7 @@ def write_summary_txt(artifact_dir: Path, data: Dict[str, Any]) -> Path:
     lines.extend([
         "------------------------------------------------------------------",
         f" Control Machine: {data.get('control_machine', {}).get('os', 'Linux')}",
-        f" ACME Mode:      {data.get('trust', {}).get('acme_mode', 'staging')}",
+        f" ACME Mode:      {data.get('trust', {}).get('acme_mode', 'unknown')}",
         "==================================================================",
     ])
 

@@ -74,14 +74,81 @@ from live_vps.reporting import (
 
 
 def get_git_head_commit() -> str:
-    """Get current git HEAD commit SHA."""
+    """Return HEAD only when it represents the exact source archived to the VPS."""
     try:
-        res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(REPO_ROOT), capture_output=True, text=True)
-        if res.returncode == 0:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True,
+        )
+        if status.returncode != 0:
+            return "unknown_commit"
+        if status.stdout.strip():
+            return "dirty_worktree"
+        res = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(REPO_ROOT), capture_output=True, text=True
+        )
+        if res.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", res.stdout.strip()):
             return res.stdout.strip()
     except Exception:
         pass
     return "unknown_commit"
+
+
+def evaluate_preflight_eligibility(
+    config: LiveVPSConfig,
+    *,
+    tools_ok: bool,
+    master_trust_ok: bool,
+    worker_trust_ok: bool,
+    dns_ok: bool,
+    master_root_ok: bool,
+    worker_root_ok: bool,
+    master_baseline: Dict[str, Any],
+    worker_baseline: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Evaluate read-only preflight and fail closed until safety gates are implemented."""
+    vision_requested = bool(config.master_vision_domain and config.worker_vision_domain)
+    master_gate_ok, master_errors = check_disposable_gate(
+        master_baseline, vision_enabled=vision_requested
+    )
+    worker_gate_ok, worker_errors = check_disposable_gate(
+        worker_baseline, vision_enabled=vision_requested
+    )
+    prerequisites_ok = all((
+        tools_ok, master_trust_ok, worker_trust_ok, dns_ok,
+        master_root_ok, worker_root_ok, master_gate_ok, worker_gate_ok,
+    ))
+    # D8/D18 pair-wide locks are not acquired by the CLI and the current
+    # RemotePairLock does not share the ordinary lifecycle lock namespace.
+    remote_pair_lock_supported = False
+    # D19/D20 host-resource before-images and verified two-sided compensation
+    # are not complete. Do not allow a mutating phase without them.
+    transactional_restore_supported = False
+    # Paired Master+Worker Vision setup and route verification are incomplete.
+    vision_supported = not vision_requested
+    blockers = (
+        not remote_pair_lock_supported
+        or not transactional_restore_supported
+        or not vision_supported
+    )
+    status = "FAIL" if not prerequisites_ok else ("INCOMPLETE" if blockers else "PASS")
+    return {
+        "status": status,
+        "vision_requested": vision_requested,
+        "vision_supported": vision_supported,
+        "remote_pair_lock_supported": remote_pair_lock_supported,
+        "transactional_restore_supported": transactional_restore_supported,
+        "tools_ok": tools_ok,
+        "dns_ok": dns_ok,
+        "master_root": master_root_ok,
+        "worker_root": worker_root_ok,
+        "master_gate_ok": master_gate_ok,
+        "worker_gate_ok": worker_gate_ok,
+        "master_gate_errors": master_errors,
+        "worker_gate_errors": worker_errors,
+        "master_baseline": master_baseline,
+        "worker_baseline": worker_baseline,
+    }
 
 
 def build_config_fingerprint(config: LiveVPSConfig) -> str:
@@ -161,6 +228,13 @@ def main() -> int:
         return 1
 
     head_commit = get_git_head_commit()
+    if head_commit == "dirty_worktree":
+        print(
+            "Error: repository worktree is dirty; commit or discard local changes before E2E "
+            "so the recorded commit matches the source archived to Master",
+            file=sys.stderr,
+        )
+        return 1
     if head_commit == "unknown_commit":
         print("Error: cannot determine repository commit; refusing a resumable run", file=sys.stderr)
         return 1
@@ -197,6 +271,7 @@ def main() -> int:
             "repository_commit": head_commit,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "config_fingerprint": build_config_fingerprint(config),
+            "trust": {"acme_mode": config.acme_mode},
             "results": {},
             "overall": "RUNNING",
         }
@@ -323,26 +398,26 @@ def main() -> int:
             dns_details = {name: {"ok": result.ok, "expected_ip": result.expected_ip,
                                   "record_type": result.record_type, "resolved_ips": result.resolved_ips,
                                   "error": result.error} for name, result in dns_chk.items()}
-            preflight_pass = (
-                tools_ok and ssh_local_ok and dns_ok and m_gate_ok and w_gate_ok
-                and root_m_ok and root_w_ok
+            preflight_result = evaluate_preflight_eligibility(
+                config,
+                tools_ok=tools_ok,
+                master_trust_ok=m_key_ok and m_trust_ok,
+                worker_trust_ok=w_key_ok and w_trust_ok,
+                dns_ok=dns_ok,
+                master_root_ok=root_m_ok,
+                worker_root_ok=root_w_ok,
+                master_baseline=m_base,
+                worker_baseline=w_base,
             )
+            preflight_pass = preflight_result["status"] == "PASS"
             state["results"]["preflight"] = {
-                "status": "PASS" if preflight_pass else "FAIL",
-                "tools_ok": tools_ok,
-                "dns_ok": dns_ok,
-                "dns_details": dns_details,
+                **preflight_result,
                 "master_ssh_key_ok": m_key_ok,
                 "worker_ssh_key_ok": w_key_ok,
                 "master_known_hosts_ok": m_trust_ok,
                 "worker_known_hosts_ok": w_trust_ok,
                 "ssh_local_errors": [value for value in (m_key_error, w_key_error, m_trust_error, w_trust_error) if value],
-                "master_root": root_m_ok,
-                "worker_root": root_w_ok,
-                "master_gate_ok": m_gate_ok,
-                "worker_gate_ok": w_gate_ok,
-                "master_baseline": m_base,
-                "worker_baseline": w_base,
+                "dns_details": dns_details,
             }
             save_run_state(artifact_dir, state)
             if not preflight_pass:

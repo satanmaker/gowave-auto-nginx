@@ -63,7 +63,7 @@ jobs:
         env:
           LIVE_VPS_CONFIG: ${{ secrets.LIVE_VPS_CONFIG }}
         run: |
-          XRAY_VERSION="$(printf '%s\\n' "$LIVE_VPS_CONFIG" | awk -F= '$1 == "XRAY_CLIENT_VERSION" {print $2; exit}')"
+          XRAY_VERSION="$(printf '%s\n' "$LIVE_VPS_CONFIG" | awk -F= '$1 == "XRAY_CLIENT_VERSION" {print $2; exit}')"
           test -n "$XRAY_VERSION" || { echo "XRAY_CLIENT_VERSION missing from LIVE_VPS_CONFIG" >&2; exit 1; }
           mkdir -p /tmp/xray-bin
           curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip" -o /tmp/xray.zip
@@ -76,7 +76,7 @@ jobs:
         env:
           LIVE_VPS_CONFIG: ${{ secrets.LIVE_VPS_CONFIG }}
         run: |
-          MIHOMO_VERSION="$(printf '%s\\n' "$LIVE_VPS_CONFIG" | awk -F= '$1 == "MIHOMO_CLIENT_VERSION" {print $2; exit}')"
+          MIHOMO_VERSION="$(printf '%s\n' "$LIVE_VPS_CONFIG" | awk -F= '$1 == "MIHOMO_CLIENT_VERSION" {print $2; exit}')"
           test -n "$MIHOMO_VERSION" || { echo "MIHOMO_CLIENT_VERSION missing from LIVE_VPS_CONFIG" >&2; exit 1; }
           curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/mihomo-linux-amd64-v${MIHOMO_VERSION}.gz" -o /tmp/mihomo.gz
           gunzip /tmp/mihomo.gz
@@ -104,10 +104,10 @@ jobs:
           echo "$WORKER_SSH_KEY" > ~/.ssh/id_worker
           chmod 0600 ~/.ssh/id_worker
 
-          printf '%s\\n' "$MASTER_KNOWN_HOSTS" > ~/.ssh/known_hosts_master
+          printf '%s\n' "$MASTER_KNOWN_HOSTS" > ~/.ssh/known_hosts_master
           chmod 0600 ~/.ssh/known_hosts_master
 
-          printf '%s\\n' "$WORKER_KNOWN_HOSTS" > ~/.ssh/known_hosts_worker
+          printf '%s\n' "$WORKER_KNOWN_HOSTS" > ~/.ssh/known_hosts_worker
           chmod 0600 ~/.ssh/known_hosts_worker
 
           # Apply dispatch inputs and separate per-host SSH credentials.
@@ -131,7 +131,7 @@ jobs:
           lines = [line for line in raw.splitlines() if line.strip() and line.split("=", 1)[0].strip() not in replacements]
           lines.extend(f"{key}={value}" for key, value in replacements.items())
           target = Path("tools/live_vps_config.env")
-          target.write_text("\\n".join(lines) + "\\n", encoding="utf-8")
+          target.write_text("\n".join(lines) + "\n", encoding="utf-8")
           target.chmod(0o600)
           PY
 

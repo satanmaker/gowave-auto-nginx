@@ -36,16 +36,25 @@ def verify_panel_https(
     timeout: int = 10,
 ) -> Dict[str, Any]:
     """Verify GoWave Panel responds over HTTPS with correct certificate and headers."""
-    url = f"https://{panel_domain}/"
+    url = f"https://{panel_domain}/api/nodes"
     try:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, context=ssl_context, timeout=timeout) as resp:
             status = resp.status
             body = resp.read(1024).decode("utf-8", errors="replace")
-            return {"status": "PASS", "http_status": status, "body_snippet": body[:100]}
+            if status in (200, 401):
+                return {"status": "PASS", "http_status": status, "body_snippet": body[:100]}
+            return {
+                "status": "FAIL", "http_status": status,
+                "error": "Panel API endpoint returned an unexpected HTTP status",
+            }
     except urllib.error.HTTPError as e:
-        # e.g. 404 or 401 is still a valid HTTP response from Panel behind NGINX
-        return {"status": "PASS", "http_status": e.code}
+        if e.code == 401:
+            return {"status": "PASS", "http_status": e.code}
+        return {
+            "status": "FAIL", "http_status": e.code,
+            "error": "Panel API endpoint returned an unexpected HTTP status",
+        }
     except Exception as e:
         return {"status": "FAIL", "error": f"Failed connecting to Panel HTTPS: {e}"}
 

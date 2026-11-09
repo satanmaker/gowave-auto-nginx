@@ -157,19 +157,22 @@ class LiveVPSConfig:
 
 
 def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfig:
-    config_path = Path(path).resolve()
+    supplied_path = Path(path)
+    if supplied_path.is_symlink():
+        raise ValueError(f"Configuration file must not be a symlink: {supplied_path}")
+    config_path = supplied_path.resolve()
     if not config_path.is_file():
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
     # Enforce POSIX file permissions: must not be group or world readable/writable/executable
     if not skip_mode_check:
         st = config_path.stat()
-        file_mode = st.st_mode
-        if file_mode & (stat.S_IRWXG | stat.S_IRWXO):
-            oct_mode = oct(file_mode & 0o777)
+        permissions = stat.S_IMODE(st.st_mode)
+        if permissions not in (0o600, 0o400):
+            oct_mode = oct(permissions)
             raise PermissionError(
                 f"Configuration file {config_path} has insecure permissions {oct_mode}. "
-                f"It must have mode 0600 (or 0400) to protect credentials."
+                f"It must have mode 0600 or 0400 to protect credentials."
             )
 
     raw_pairs: Dict[str, str] = {}

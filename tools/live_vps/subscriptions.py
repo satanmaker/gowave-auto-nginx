@@ -3,6 +3,7 @@ Fetches and validates Xray JSON and Mihomo YAML subscriptions with zero secret l
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import subprocess
@@ -29,6 +30,30 @@ def get_default_user_short_uuid(panel_client: E2EPanelClient) -> str:
     return str(short_uuid)
 
 
+def request_subscription_status(
+    panel_domain: str,
+    path: str,
+    ssl_context: ssl.SSLContext,
+    user_agent: Optional[str] = None,
+    timeout: int = 10,
+) -> int:
+    """Send a subscription request with an exactly controlled User-Agent header."""
+    connection = http.client.HTTPSConnection(
+        panel_domain, context=ssl_context, timeout=timeout
+    )
+    try:
+        connection.putrequest("GET", path, skip_accept_encoding=True)
+        if user_agent is not None:
+            connection.putheader("User-Agent", user_agent)
+        connection.putheader("Connection", "close")
+        connection.endheaders()
+        response = connection.getresponse()
+        response.read()
+        return response.status
+    finally:
+        connection.close()
+
+
 def verify_user_agent_policy(
     panel_domain: str,
     short_uuid: str,
@@ -37,23 +62,28 @@ def verify_user_agent_policy(
     """Test User-Agent policy enforcement on subscription endpoint."""
     url = f"https://{panel_domain}/api/sub/{short_uuid}/v2ray-json"
 
-    # 1. Absent User-Agent
-    absent_rejected = False
+    # Missing and explicitly blank User-Agent are distinct policy cases.
     absent_code = None
+    blank_code = None
     absent_error = None
+    blank_error = None
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": ""})
-        # Remove standard python-urllib header
-        del req.headers["User-agent"]
-        with urllib.request.urlopen(req, context=ssl_context, timeout=10) as resp:
-            absent_code = resp.status
-    except urllib.error.HTTPError as e:
-        absent_code = e.code
-        if e.code in (403, 400):
-            absent_rejected = True
+        absent_code = request_subscription_status(
+            panel_domain, f"/api/sub/{short_uuid}/v2ray-json",
+            ssl_context, user_agent=None, timeout=10,
+        )
     except Exception as exc:
-        # Transport/TLS errors do not demonstrate application-level rejection.
         absent_error = f"{type(exc).__name__}: {exc}"
+    try:
+        blank_code = request_subscription_status(
+            panel_domain, f"/api/sub/{short_uuid}/v2ray-json",
+            ssl_context, user_agent="", timeout=10,
+        )
+    except Exception as exc:
+        blank_error = f"{type(exc).__name__}: {exc}"
+
+    absent_rejected = absent_code in (400, 403)
+    blank_rejected = blank_code in (400, 403)
 
     # 2. Valid Xray User-Agent
     xray_accepted = False
@@ -76,13 +106,18 @@ def verify_user_agent_policy(
     except Exception:
         mihomo_accepted = False
 
-    passed = absent_rejected and xray_accepted and mihomo_accepted
-    status = "PASS" if passed else ("INCOMPLETE" if absent_code is None else "FAIL")
+    passed = absent_rejected and blank_rejected and xray_accepted and mihomo_accepted
+    status = "PASS" if passed else (
+        "INCOMPLETE" if absent_code is None or blank_code is None else "FAIL"
+    )
     return {
         "status": status,
         "absent_rejected": absent_rejected,
         "absent_code": absent_code,
         "absent_error": absent_error,
+        "blank_rejected": blank_rejected,
+        "blank_code": blank_code,
+        "blank_error": blank_error,
         "xray_accepted": xray_accepted,
         "mihomo_accepted": mihomo_accepted,
     }
