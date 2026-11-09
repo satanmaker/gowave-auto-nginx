@@ -444,5 +444,66 @@ vision_domain=vision.example.test
                         junit_path.read_text(encoding="utf-8"),
                     )
 
+    def test_managed_deploy_hook_fails_closed_when_snapshot_permissions_fail(self):
+        for fail_on, expected_error in (
+            (2, "Could not secure deploy-hook recovery directory"),
+            (4, "Could not enforce private deploy-hook manifest permissions"),
+        ):
+            with self.subTest(fail_on=fail_on), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                hook_dir = root / "hooks"
+                recovery_root = root / "recovery"
+                hook_file = hook_dir / "gowave-nginx.sh"
+                bin_dir = root / "bin"
+                bin_dir.mkdir()
+                counter = root / "chmod-count"
+                fake_chmod = bin_dir / "chmod"
+                fake_chmod.write_text(
+                    "#!/bin/sh\n"
+                    f"count=0; [ ! -f '{counter}' ] || count=$(cat '{counter}')\n"
+                    "count=$((count + 1))\n"
+                    f"printf '%s\\n' \"$count\" > '{counter}'\n"
+                    f"[ \"$count\" -ne {fail_on} ] || exit 1\n"
+                    "exec /bin/chmod \"$@\"\n"
+                )
+                fake_chmod.chmod(0o755)
+                env = {**os.environ, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"}
+                result = subprocess.run(
+                    [
+                        "bash", "-c",
+                        'source "$1" && install_managed_deploy_hook "$2" "$3" "$4"',
+                        "bash", NGINX_SH, "hook_tx", str(hook_file), str(recovery_root),
+                    ],
+                    env=env, capture_output=True, text=True, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertFalse(hook_file.exists(), "hook must not be installed after permission failure")
+
+    def test_managed_deploy_hook_creates_private_manifest_before_installing_hook(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            hook_dir = root / "hooks"
+            recovery_root = root / "recovery"
+            hook_file = hook_dir / "gowave-nginx.sh"
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$1" && install_managed_deploy_hook "$2" "$3" "$4"',
+                    "bash", NGINX_SH, "hook_tx", str(hook_file), str(recovery_root),
+                ],
+                env=os.environ.copy(), capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = recovery_root / "hook_tx" / "deploy-hook-manifest.json"
+            self.assertTrue(hook_file.is_file())
+            self.assertEqual(hook_file.stat().st_mode & 0o777, 0o755)
+            self.assertEqual((recovery_root / "hook_tx").stat().st_mode & 0o777, 0o700)
+            self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertTrue(data["created_by_tx"])
+            self.assertEqual(data["path"], str(hook_file))
+
+
 if __name__ == "__main__":
     unittest.main()
