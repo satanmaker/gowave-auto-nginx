@@ -582,6 +582,10 @@ rollback_managed_deploy_hook() {
     local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
     local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
     if [[ -z "$transaction_id" ]]; then
+        if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            echo "Error: ACME transaction ID is missing; preserving deploy hook with unknown ownership and reporting incomplete rollback." >&2
+            return 1
+        fi
         return 0
     fi
 
@@ -1337,6 +1341,10 @@ rollback_managed_deploy_hook() {
     local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
     local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
     if [[ -z "$transaction_id" ]]; then
+        if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            echo "Error: ACME transaction ID is missing; preserving deploy hook with unknown ownership and reporting incomplete rollback." >&2
+            return 1
+        fi
         return 0
     fi
 
@@ -2194,6 +2202,10 @@ rollback_managed_deploy_hook() {
     local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
     local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
     if [[ -z "$transaction_id" ]]; then
+        if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            echo "Error: ACME transaction ID is missing; preserving deploy hook with unknown ownership and reporting incomplete rollback." >&2
+            return 1
+        fi
         return 0
     fi
 

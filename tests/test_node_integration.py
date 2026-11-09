@@ -437,6 +437,42 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertNotIn("Remote worker compensation teardown finished.", result.stderr)
             self.assertIn("disable gowave-node.service", log.read_text())
 
+    def test_standalone_rollback_preserves_unowned_deploy_hook_without_transaction_id(self):
+        """Without an ACME transaction ID, an existing deploy hook has unknown ownership."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        remote_start = worker_script.index(
+            "cat <<'ROLLBACK_REMOTE_SCRIPT'",
+            worker_script.index("remote_rollback() {"),
+        )
+        function_start = worker_script.index("rollback_managed_deploy_hook() {", remote_start)
+        function_end = worker_script.index("\n}\n\nrestore_acme_lineage", function_start) + 2
+        self.assertGreater(function_end, function_start)
+        function = worker_script[function_start:function_end]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hook_file = Path(tmpdir) / "gowave-nginx.sh"
+            hook_file.write_text("#!/bin/sh\necho operator-owned\n")
+            recovery_root = Path(tmpdir) / "recovery"
+
+            command = function + '\nrollback_managed_deploy_hook "" "$1" "$2"'
+            result = subprocess.run(
+                ["bash", "-c", command, "bash", str(hook_file), str(recovery_root)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("transaction ID is missing", result.stderr)
+            self.assertTrue(hook_file.is_file(), "unknown-ownership deploy hook must be preserved")
+
+            hook_file.unlink()
+            absent = subprocess.run(
+                ["bash", "-c", command, "bash", str(hook_file), str(recovery_root)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(absent.returncode, 0, absent.stderr)
+
     def test_standalone_acme_restore_fails_closed_on_missing_or_malformed_manifest(self):
         """Missing or invalid lineage metadata must never be interpreted as 'no prior certificate'."""
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
