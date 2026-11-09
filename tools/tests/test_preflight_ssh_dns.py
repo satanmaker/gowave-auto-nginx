@@ -2,6 +2,7 @@
 """Unit tests for tools/live_vps/ssh.py, dns.py, and preflight.py."""
 import tempfile
 import unittest
+from unittest.mock import patch, MagicMock
 from pathlib import Path
 import sys
 
@@ -10,7 +11,8 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 from live_vps.ssh import assert_no_secrets_in_argv
 from live_vps.redaction import register_secret, clear_secrets
-from live_vps.dns import verify_domain_dns
+from live_vps.dns import verify_domain_dns, verify_domain_no_aaaa
+from live_vps.firewall import verify_master_firewall, verify_worker_firewall
 from live_vps.preflight import (
     check_disposable_gate,
     LocalLock,
@@ -41,6 +43,73 @@ class TestPreflightSSHDNS(unittest.TestCase):
         # Less than 2 resolvers raises ValueError
         with self.assertRaises(ValueError):
             verify_domain_dns("example.com", "93.184.216.34", resolvers=["1.1.1.1"])
+
+    @patch("live_vps.dns.resolve_dig")
+    def test_dns_requires_exactly_expected_ip_on_each_resolver(self, resolve):
+        resolve.side_effect = [["203.0.113.10", "203.0.113.11"], ["203.0.113.10"]]
+        result = verify_domain_dns(
+            "panel.example.test", "203.0.113.10", "A", resolvers=["1.1.1.1", "8.8.8.8"]
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("exactly", result.error)
+
+    @patch("live_vps.dns.subprocess.run")
+    def test_dns_ipv6_disabled_requires_no_aaaa_answers(self, run):
+        run.return_value = MagicMock(
+            returncode=0,
+            stdout=";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\\n",
+        )
+        result = verify_domain_no_aaaa("panel.example.test", resolvers=["1.1.1.1", "8.8.8.8"])
+        self.assertTrue(result.ok)
+        run.return_value = MagicMock(
+            returncode=0,
+            stdout=";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\\npanel.example.test. 60 IN AAAA 2001:db8::10\\n",
+        )
+        result = verify_domain_no_aaaa("panel.example.test", resolvers=["1.1.1.1", "8.8.8.8"])
+        self.assertFalse(result.ok)
+        self.assertIn("Unexpected AAAA", result.error)
+
+    @patch("live_vps.firewall.probe_tcp_port", return_value=(False, "REFUSED"))
+    def test_master_firewall_accepts_local_only_bind_not_generic_drop(self, probe):
+        ssh = MagicMock()
+        ssh.run.side_effect = [
+            MagicMock(ok=True, stdout="CONNECTED"),  # loopback
+            MagicMock(ok=True, stdout="LISTEN 0 4096 127.0.0.1:3002 *:*"),  # bind
+            MagicMock(ok=True, stdout="Status: active"),  # UFW
+            MagicMock(ok=True, stdout=""),  # iptables
+        ]
+        result = verify_master_firewall(ssh, "203.0.113.10")
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["local_only_bind"])
+
+    @patch("live_vps.firewall.probe_tcp_port", return_value=(False, "TIMEOUT"))
+    def test_master_firewall_does_not_accept_generic_default_drop(self, probe):
+        ssh = MagicMock()
+        ssh.run.side_effect = [
+            MagicMock(ok=True, stdout="CONNECTED"),
+            MagicMock(ok=True, stdout="LISTEN 0 4096 0.0.0.0:3002 *:*"),
+            MagicMock(ok=True, stdout="Default: deny (incoming)"),
+            MagicMock(ok=True, stdout="-P INPUT DROP"),
+        ]
+        result = verify_master_firewall(ssh, "203.0.113.10")
+        self.assertEqual(result["status"], "INCOMPLETE")
+
+    @patch("live_vps.firewall.probe_tcp_port", return_value=(False, "TIMEOUT"))
+    @patch("live_vps.firewall.get_control_machine_public_ip", return_value="198.51.100.77")
+    def test_worker_firewall_requires_source_specific_master_allow(self, cm_ip, probe):
+        master = MagicMock()
+        master.run.side_effect = [
+            MagicMock(ok=True, stdout="203.0.113.10"),
+            MagicMock(ok=True, stdout="CONNECTED"),
+        ]
+        worker = MagicMock()
+        worker.run.side_effect = [
+            MagicMock(ok=True, stdout="Status: active\\nDefault: deny (incoming)\\n3002/tcp ALLOW IN 203.0.113.10"),
+            MagicMock(ok=True, stdout=""),
+        ]
+        result = verify_worker_firewall(master, worker, "203.0.113.20")
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["worker_allow_list_evidence"])
 
     def test_check_disposable_gate(self):
         # Clean baseline

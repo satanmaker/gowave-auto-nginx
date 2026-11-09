@@ -57,6 +57,26 @@ TEST_TEARDOWN_POLICY=PRESERVE
         self.assertTrue(cfg.TEST_TRAFFIC_VERIFICATION)
         self.assertEqual(cfg.NODE_READY_TIMEOUT, 120)
 
+    def test_lowercase_attributes_and_per_host_ssh_paths(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        content += "\nMASTER_SSH_KEY_PATH=/tmp/master_key\nWORKER_SSH_KEY_PATH=/tmp/worker_key\n"
+        content += "MASTER_KNOWN_HOSTS_PATH=/tmp/master_known\nWORKER_KNOWN_HOSTS_PATH=/tmp/worker_known\n"
+        cfg = load_config(self._write_config(content))
+        self.assertEqual(cfg.master_ip, "93.184.216.34")
+        self.assertEqual(cfg.worker_ip, "93.184.216.35")
+        self.assertEqual(cfg.master_ssh_key_path, "/tmp/master_key")
+        self.assertEqual(cfg.worker_ssh_key_path, "/tmp/worker_key")
+        self.assertEqual(cfg.master_known_hosts_path, "/tmp/master_known")
+        self.assertEqual(cfg.worker_known_hosts_path, "/tmp/worker_known")
+
+    def test_shared_ssh_paths_remain_backward_compatible(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        cfg = load_config(self._write_config(content))
+        self.assertEqual(cfg.master_ssh_key_path, "/tmp/id_rsa")
+        self.assertEqual(cfg.worker_ssh_key_path, "/tmp/id_rsa")
+        self.assertEqual(cfg.master_known_hosts_path, "/tmp/known_hosts")
+        self.assertEqual(cfg.worker_known_hosts_path, "/tmp/known_hosts")
+
     def test_insecure_mode_rejected(self):
         content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
         p = self._write_config(content, mode=0o644)

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import socket
 import ssl
 import subprocess
@@ -19,7 +20,7 @@ from .ssh import SSHClient
 from .panel_api import E2EPanelClient
 from .config import LiveVPSConfig
 from .preflight import check_ssh_trust
-from .dns import verify_domain_dns
+from .dns import verify_domain_dns, verify_domain_no_aaaa
 from .nginx import verify_nginx_config_syntax
 
 
@@ -58,25 +59,45 @@ def run_neg_02_ssh_port_unreachable() -> Dict[str, Any]:
     }
 
 
+
 def run_neg_03_dns_wrong_ip() -> Dict[str, Any]:
-    """NEG-03: Domain resolves to wrong IP address."""
+    """NEG-03: Domain resolves to a different IP on both configured resolvers."""
     check = verify_domain_dns("dns.google", expected_ip="198.51.100.1", record_type="A")
-    return {
-        "scenario": "NEG-03",
-        "name": "Preflight DNS Wrong IP Mismatch",
-        "status": "PASS" if not check.ok else "FAIL",
-        "message": "DNS preflight rejected wrong IP before remote modification",
-    }
+    complete_answers = len(check.resolver_results) >= 2 and all(check.resolver_results.values())
+    if not complete_answers:
+        status = "INCOMPLETE"
+        message = "At least one resolver returned no usable answer; mismatch was not proven"
+    else:
+        status = "PASS" if not check.ok else "FAIL"
+        message = "DNS preflight rejected wrong IP before remote modification" if status == "PASS" else "Expected-IP mismatch was not rejected"
+    return {"scenario": "NEG-03", "name": "Preflight DNS Wrong IP Mismatch",
+            "status": status, "message": message, "resolved_ips": check.resolved_ips,
+            "error": check.error}
 
 
 def run_neg_04_dns_missing_aaaa() -> Dict[str, Any]:
-    """NEG-04: Missing AAAA record when ENABLE_IPV6=true."""
-    check = verify_domain_dns("ipv4.google.com", expected_ip="2001:db8::1", record_type="AAAA")
+    """NEG-04: Prove a resolvable domain has no AAAA where IPv6 is expected."""
+    no_aaaa = verify_domain_no_aaaa("ipv4.google.com")
+    if not no_aaaa.ok:
+        status = "FAIL" if no_aaaa.resolved_ips else "INCOMPLETE"
+        message = ("The DNS fixture unexpectedly publishes AAAA" if no_aaaa.resolved_ips
+                   else "Could not obtain conclusive no-AAAA DNS answers")
+        return {
+            "scenario": "NEG-04", "name": "Preflight DNS Missing AAAA Record",
+            "status": status, "message": message,
+            "resolved_ips": no_aaaa.resolved_ips, "error": no_aaaa.error,
+        }
+    expected = verify_domain_dns(
+        "ipv4.google.com", expected_ip="2001:db8::1", record_type="AAAA"
+    )
+    rejected = not expected.ok and not expected.resolved_ips
     return {
-        "scenario": "NEG-04",
-        "name": "Preflight DNS Missing AAAA Record",
-        "status": "PASS" if not check.ok else "FAIL",
-        "message": "Preflight rejected missing AAAA record when IPv6 enabled",
+        "scenario": "NEG-04", "name": "Preflight DNS Missing AAAA Record",
+        "status": "PASS" if rejected else "FAIL",
+        "message": "IPv6 preflight rejected a confirmed missing AAAA record" if rejected
+                   else "Missing AAAA record was not rejected by expected-IP preflight",
+        "resolver_results": no_aaaa.resolver_results,
+        "error": expected.error,
     }
 
 
@@ -94,39 +115,78 @@ def run_neg_05_acme_install_failure(master_ssh: SSHClient) -> Dict[str, Any]:
     }
 
 
+
 def run_neg_06_nginx_syntax_corruption(master_ssh: SSHClient) -> Dict[str, Any]:
-    """NEG-06: Syntax corruption in NGINX config detected and blocked by nginx -t."""
-    test_conf = "/etc/nginx/conf.d/neg06_corrupt.conf"
-    master_ssh.run(f"echo 'invalid_nginx_directive {{ broken;' > {test_conf}")
+    """NEG-06: Inject syntax corruption using an isolated, collision-free fixture."""
+    create = master_ssh.run("mktemp /etc/nginx/conf.d/neg06_corrupt.XXXXXX.conf")
+    test_conf = create.stdout.strip()
+    if not create.ok or not test_conf.startswith("/etc/nginx/conf.d/neg06_corrupt."):
+        return {
+            "scenario": "NEG-06",
+            "name": "NGINX Config Syntax Corruption",
+            "status": "INCOMPLETE",
+            "message": "Could not allocate isolated NGINX test fixture",
+        }
+
+    write = master_ssh.run(
+        f"printf '%s\\n' 'invalid_nginx_directive {{ broken;' > {shlex.quote(test_conf)}"
+    )
+    if not write.ok:
+        master_ssh.run(f"rm -f -- {shlex.quote(test_conf)}")
+        return {
+            "scenario": "NEG-06",
+            "name": "NGINX Config Syntax Corruption",
+            "status": "INCOMPLETE",
+            "message": "Could not create isolated invalid NGINX fixture",
+        }
+
     try:
         ok, out = verify_nginx_config_syntax(master_ssh)
-        # Should fail with syntax error
         passed = (not ok) and "syntax is ok" not in out
     finally:
-        master_ssh.run(f"rm -f {test_conf}")
+        cleanup = master_ssh.run(f"rm -f -- {shlex.quote(test_conf)}")
 
-    # Re-verify clean syntax
     clean_ok, _ = verify_nginx_config_syntax(master_ssh)
     return {
         "scenario": "NEG-06",
         "name": "NGINX Config Syntax Corruption",
-        "status": "PASS" if (passed and clean_ok) else "FAIL",
-        "message": "nginx -t blocked corrupted configuration and restored cleanly",
+        "status": "PASS" if (passed and clean_ok and cleanup.ok) else "FAIL",
+        "message": "nginx -t blocked isolated corrupted configuration and cleanup restored cleanly",
+        "cleanup_ok": cleanup.ok,
     }
 
 
 def run_neg_07_worker_node_service_stop(worker_ssh: SSHClient, panel_client: E2EPanelClient) -> Dict[str, Any]:
-    """NEG-07: systemctl stop gowave-node on Worker; Panel detects isConnected: false."""
-    worker_ssh.run("systemctl stop gowave-node")
+    """NEG-07: A connected Worker is stopped and Panel reports it offline."""
+    initial = panel_client.get_nodes()
+    initially_connected = any(
+        n.get("name") == "worker-1" and n.get("isConnected") is True for n in initial
+    )
+    if not initially_connected:
+        return {
+            "scenario": "NEG-07",
+            "name": "Worker Node Service Stop Detected by Panel",
+            "status": "INCOMPLETE",
+            "message": "Worker was not connected before service-stop fault injection",
+        }
+
+    stop_result = worker_ssh.run("systemctl stop --no-ask-password gowave-node.service")
+    if not stop_result.ok:
+        return {
+            "scenario": "NEG-07",
+            "name": "Worker Node Service Stop Detected by Panel",
+            "status": "FAIL",
+            "message": "systemctl stop gowave-node.service failed",
+        }
+
     detected_offline = False
     deadline = time.time() + 30.0
     while time.time() < deadline:
         try:
             nodes = panel_client.get_nodes()
-            for n in nodes:
-                if n.get("name") == "worker-1" and n.get("isConnected") is False:
-                    detected_offline = True
-                    break
+            detected_offline = any(
+                n.get("name") == "worker-1" and n.get("isConnected") is False for n in nodes
+            )
         except Exception:
             pass
         if detected_offline:
@@ -137,13 +197,20 @@ def run_neg_07_worker_node_service_stop(worker_ssh: SSHClient, panel_client: E2E
         "scenario": "NEG-07",
         "name": "Worker Node Service Stop Detected by Panel",
         "status": "PASS" if detected_offline else "FAIL",
-        "message": "Panel detected Worker node offline after service stop",
+        "message": "Panel detected Worker node offline after successful service stop",
     }
 
 
 def run_neg_08_worker_node_service_recover(worker_ssh: SSHClient, panel_client: E2EPanelClient) -> Dict[str, Any]:
-    """NEG-08: systemctl start gowave-node on Worker; Panel recovers isConnected: true."""
-    worker_ssh.run("systemctl start gowave-node")
+    """NEG-08: Start Worker service successfully and observe reconnection."""
+    start_result = worker_ssh.run("systemctl start --no-ask-password gowave-node.service")
+    if not start_result.ok:
+        return {
+            "scenario": "NEG-08",
+            "name": "Worker Node Service Recovery",
+            "status": "FAIL",
+            "message": "systemctl start gowave-node.service failed",
+        }
     recovered = panel_client.poll_worker_ready("worker-1", timeout=60, poll_interval=3)
     return {
         "scenario": "NEG-08",
@@ -152,12 +219,12 @@ def run_neg_08_worker_node_service_recover(worker_ssh: SSHClient, panel_client: 
         "message": "Worker recovered and reconnected in Panel after service restart",
     }
 
-
 def run_neg_09_subscription_absent_user_agent(panel_domain: str, short_uuid: str, ssl_context: ssl.SSLContext) -> Dict[str, Any]:
-    """NEG-09: Request subscription without User-Agent against real Panel (rejected)."""
+    """NEG-09: Request subscription without User-Agent against real Panel."""
     url = f"https://{panel_domain}/api/sub/{short_uuid}/v2ray-json"
     rejected = False
     code = None
+    error = None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": ""})
         del req.headers["User-agent"]
@@ -165,87 +232,94 @@ def run_neg_09_subscription_absent_user_agent(panel_domain: str, short_uuid: str
             code = resp.status
     except urllib.error.HTTPError as e:
         code = e.code
-        if e.code in (403, 400):
-            rejected = True
-    except Exception:
-        rejected = True
+        rejected = e.code in (400, 403)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
 
+    status = "PASS" if rejected else ("INCOMPLETE" if code is None else "FAIL")
     return {
         "scenario": "NEG-09",
         "name": "Subscription Absent User-Agent Rejection",
-        "status": "PASS" if rejected else "FAIL",
+        "status": status,
         "code": code,
-        "message": f"Real Panel rejected request without User-Agent (HTTP {code})",
+        "error": error,
+        "message": f"Panel response for missing User-Agent: HTTP {code}" if code is not None
+                   else "Could not obtain an HTTP response; rejection was not proven",
     }
 
 
 def run_neg_10_mtls_forged_certificate(master_ssh: SSHClient, worker_ip: str) -> Dict[str, Any]:
-    """NEG-10: Attempt mTLS to Worker with forged self-signed certificate (handshake rejected)."""
+    """NEG-10: A reachable Worker rejects a forged certificate at TLS handshake."""
     script = f"""
-import os, socket, ssl, subprocess, sys, tempfile
+import socket, ssl, subprocess, sys, tempfile
 with tempfile.TemporaryDirectory() as td:
-    k = os.path.join(td, "f.key")
-    c = os.path.join(td, "f.crt")
+    key = td + "/forged.key"
+    cert = td + "/forged.crt"
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-                    "-keyout", k, "-out", c, "-days", "1", "-subj", "/CN=ForgedClient"],
+                    "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=ForgedClient"],
                    capture_output=True, check=True)
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    ctx.load_cert_chain(c, k)
+    ctx.load_cert_chain(cert, key)
     try:
-        with socket.create_connection(("{worker_ip}", 3002), timeout=5) as s:
-            with ctx.wrap_socket(s, server_hostname="invalid.node.gowave") as tls:
-                tls.sendall(b"GET / HTTP/1.1\\r\\n\\r\\n")
-        print("CONNECTED")
-    except Exception:
-        print("REJECTED")
+        sock = socket.create_connection(("{worker_ip}", 3002), timeout=5)
+    except OSError as exc:
+        print("CONNECT_INCOMPLETE:" + type(exc).__name__)
+        sys.exit(0)
+    try:
+        with sock:
+            try:
+                with ctx.wrap_socket(sock, server_hostname="invalid.node.gowave") as tls:
+                    tls.sendall(b"GET / HTTP/1.1\\r\\nHost: invalid.node.gowave\\r\\nConnection: close\\r\\n\\r\\n")
+                    print("FORGED_CERT_ACCEPTED")
+            except ssl.SSLError as exc:
+                print("TLS_REJECTED:" + type(exc).__name__)
+            except OSError as exc:
+                print("TLS_INCOMPLETE:" + type(exc).__name__)
+    except Exception as exc:
+        print("TLS_INCOMPLETE:" + type(exc).__name__)
 """
-    r = master_ssh.run("python3 -", input_data=script)
-    rejected = r.ok and "REJECTED" in r.stdout
+    result = master_ssh.run("python3 -", input_data=script)
+    rejected = result.ok and "TLS_REJECTED:" in result.stdout
+    incomplete = not result.ok or "INCOMPLETE:" in result.stdout
     return {
         "scenario": "NEG-10",
         "name": "mTLS Forged Client Certificate Handshake Rejection",
-        "status": "PASS" if rejected else "FAIL",
-        "message": "Worker TLS 1.3 listener rejected forged client certificate",
+        "status": "PASS" if rejected else ("INCOMPLETE" if incomplete else "FAIL"),
+        "message": "Worker TLS handshake rejected the forged client certificate" if rejected
+                   else "A reachable Worker did not provide conclusive forged-certificate rejection evidence",
+        "output": result.stdout.strip(),
     }
 
 
 def run_neg_11_backup_corrupted_tar(master_ssh: SSHClient) -> Dict[str, Any]:
-    """NEG-11: Invoke gowave-backup.sh restore with corrupted tar header."""
-    cmd = "echo 'corrupted tar content not gzip' > /tmp/corrupt_backup.tar.gz && /opt/gowave-auto-nginx/assets/backup/gowave-backup.sh restore /tmp/corrupt_backup.tar.gz 2>/dev/null || true; rm -f /tmp/corrupt_backup.tar.gz"
-    r = master_ssh.run(cmd)
-    # The restore script exits non-zero and does not restore
+    """NEG-11 is not implemented as a safe restore fixture yet."""
     return {
         "scenario": "NEG-11",
         "name": "Backup Restore Corrupted Header Rejection",
-        "status": "PASS",
-        "message": "Preflight check rejected corrupted archive header before mutating live data",
+        "status": "INCOMPLETE",
+        "message": "No isolated backup/restore fixture and before/after state assertion exists; scenario intentionally not executed",
     }
 
 
 def run_neg_12_backup_corrupted_sqlite(master_ssh: SSHClient) -> Dict[str, Any]:
-    """NEG-12: SQLite DB file in archive corrupted -> integrity check fails before replacing live DB."""
-    # Test sqlite3 integrity check logic directly
-    cmd = "python3 -c \"import sqlite3; con = sqlite3.connect(':memory:'); print('ok')\""
-    r = master_ssh.run(cmd)
+    """NEG-12 is not implemented as a real corrupted-database restore fixture yet."""
     return {
         "scenario": "NEG-12",
         "name": "Backup Restore Corrupted SQLite DB Integrity Check",
-        "status": "PASS",
-        "message": "SQLite integrity check rejected corrupted DB before replacing live database",
+        "status": "INCOMPLETE",
+        "message": "The current in-memory SQLite smoke test does not exercise backup restore; scenario intentionally not reported as PASS",
     }
 
 
 def run_neg_13_worker_deploy_interrupted_journal(master_ssh: SSHClient) -> Dict[str, Any]:
-    """NEG-13: SSH pipeline interrupted mid-execution leaves journal in uncommitted state."""
-    # Verify Master recovery journal does not have false COMMITTED state
-    r = master_ssh.run("test -f /opt/gowave/journal.json && grep -q 'COMMITTED' /opt/gowave/journal.json || true")
+    """NEG-13 is not implemented as a real interrupted-dispatch recovery test yet."""
     return {
         "scenario": "NEG-13",
         "name": "Interrupted SSH Deployment Journal Integrity",
-        "status": "PASS",
-        "message": "Master recovery journal does not enter false COMMITTED state on interruption",
+        "status": "INCOMPLETE",
+        "message": "No deterministic worker-dispatch interruption and subsequent journal-recovery assertion exists; scenario intentionally not executed",
     }
 
 
@@ -255,27 +329,74 @@ def run_neg_14_duplicate_worker_registration(
     config: LiveVPSConfig,
     panel_client: E2EPanelClient,
 ) -> Dict[str, Any]:
-    """NEG-14: Duplicate node add invocation for same node is idempotent."""
-    # Call node add again for worker-1
-    add_cmd = (
-        f"/opt/gowave-auto-nginx/gowave-auto.sh node add worker-1 "
-        f"{worker_ip} {config.worker_domain} {config.worker_reality_domain} root 22"
+    """NEG-14: Duplicate node add must fail before any Panel API/state mutation."""
+    state_path = "/var/lib/gowave-auto-nginx/state.json"
+    before_state = master_ssh.run(f"sha256sum {shlex.quote(state_path)}")
+    if not before_state.ok or not before_state.stdout.strip():
+        return {"scenario": "NEG-14", "status": "INCOMPLETE",
+                "message": "Could not snapshot state.json before duplicate registration"}
+
+    def api_identity() -> Dict[str, List[str]]:
+        resources = {
+            "nodes": panel_client.get_nodes(),
+            "profiles": panel_client.get_config_profiles(),
+            "squads": panel_client.get_internal_squads(),
+            "hosts": panel_client.get_hosts(),
+        }
+        identity: Dict[str, List[str]] = {}
+        for resource, items in resources.items():
+            ids = []
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ValueError(f"Invalid {resource} item")
+                value = item.get("uuid") or item.get("id")
+                if value is None:
+                    raise ValueError(f"{resource} item has no stable uuid/id")
+                ids.append(str(value))
+            identity[resource] = sorted(ids)
+        return identity
+
+    try:
+        before_api = api_identity()
+    except Exception as exc:
+        return {"scenario": "NEG-14", "status": "INCOMPLETE",
+                "message": f"Could not snapshot Panel API identities: {type(exc).__name__}"}
+
+    argv = [
+        "/opt/gowave-auto-nginx/gowave-auto.sh", "node", "add", "worker-1",
+        worker_ip, config.worker_domain, config.worker_reality_domain,
+        config.worker_ssh_user, str(config.worker_ssh_port),
+    ]
+    add_cmd = " ".join(shlex.quote(value) for value in argv)
+    result = master_ssh.run(add_cmd, timeout=300)
+    after_state = master_ssh.run(f"sha256sum {shlex.quote(state_path)}")
+    try:
+        after_api = api_identity()
+    except Exception as exc:
+        return {"scenario": "NEG-14", "status": "INCOMPLETE",
+                "message": f"Could not verify Panel API identities after duplicate call: {type(exc).__name__}"}
+
+    combined_output = result.stdout + "
+" + result.stderr
+    explicit_duplicate_rejection = (
+        not result.ok and "already registered in state.json" in combined_output
     )
-    r = master_ssh.run(add_cmd, timeout=300)
+    state_unchanged = (
+        after_state.ok and before_state.stdout.split()[0] == after_state.stdout.split()[0]
+    )
+    api_unchanged = before_api == after_api
+    passed = explicit_duplicate_rejection and state_unchanged and api_unchanged
 
-    # Verify nodes list has exactly one worker-1
-    nodes = panel_client.get_nodes()
-    worker_count = sum(1 for n in nodes if n.get("name") == "worker-1")
-
-    passed = worker_count == 1
     return {
         "scenario": "NEG-14",
-        "name": "Duplicate Worker Registration Idempotency",
+        "name": "Duplicate Worker Registration Rejection Before API Mutation",
         "status": "PASS" if passed else "FAIL",
-        "worker_count": worker_count,
-        "message": "Duplicate registration was idempotent; exactly one worker-1 entity exists",
+        "explicit_duplicate_rejection": explicit_duplicate_rejection,
+        "state_unchanged": state_unchanged,
+        "api_ids_unchanged": api_unchanged,
+        "message": "Duplicate registration was rejected before Panel API operations and without state changes"
+                   if passed else "Duplicate registration did not prove fail-fast rejection with unchanged state and API IDs",
     }
-
 
 def run_neg_15_panel_api_forged_jwt(panel_domain: str, ssl_context: ssl.SSLContext) -> Dict[str, Any]:
     """NEG-15: Protected Panel API request with forged JWT returns 401 Unauthorized."""
@@ -293,15 +414,16 @@ def run_neg_15_panel_api_forged_jwt(panel_domain: str, ssl_context: ssl.SSLConte
         status_code = e.code
         if e.code == 401:
             got_401 = True
-    except Exception:
-        pass
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
 
     return {
         "scenario": "NEG-15",
         "name": "Panel API Forged JWT Rejection",
-        "status": "PASS" if got_401 else "FAIL",
+        "status": "PASS" if got_401 else ("INCOMPLETE" if status_code is None else "FAIL"),
         "status_code": status_code,
-        "message": f"Panel returned HTTP {status_code} Unauthorized for forged JWT",
+        "error": error if "error" in locals() else None,
+        "message": f"Panel returned HTTP {status_code} for forged JWT" if status_code is not None else "No HTTP response; JWT rejection was not proven",
     }
 
 
@@ -344,14 +466,37 @@ def run_negative_suite(
     # Execute live / mock scenarios
     if master_ssh:
         scenarios.append(run_neg_05_acme_install_failure(master_ssh))
-        scenarios.append(run_neg_06_nginx_syntax_corruption(master_ssh))
+        neg06 = run_neg_06_nginx_syntax_corruption(master_ssh)
+        scenarios.append(neg06)
+        if neg06.get("cleanup_ok") is False:
+            for index in range(7, 16):
+                scenarios.append({
+                    "scenario": f"NEG-{index:02d}", "status": "INCOMPLETE",
+                    "message": "Skipped because NEG-06 fixture cleanup failed; live host state is not trusted",
+                })
+            passed_count = sum(1 for item in scenarios if item.get("status") == "PASS")
+            failed_count = sum(1 for item in scenarios if item.get("status") == "FAIL")
+            return {"status": "FAIL", "scenarios": scenarios, "passed_count": passed_count,
+                    "failed_count": failed_count, "skipped_count": 0}
     else:
         scenarios.append({"scenario": "NEG-05", "status": "SKIP", "message": "No Master SSH"})
         scenarios.append({"scenario": "NEG-06", "status": "SKIP", "message": "No Master SSH"})
 
     if worker_ssh and panel_client:
-        scenarios.append(run_neg_07_worker_node_service_stop(worker_ssh, panel_client))
-        scenarios.append(run_neg_08_worker_node_service_recover(worker_ssh, panel_client))
+        neg07 = run_neg_07_worker_node_service_stop(worker_ssh, panel_client)
+        scenarios.append(neg07)
+        neg08 = run_neg_08_worker_node_service_recover(worker_ssh, panel_client)
+        scenarios.append(neg08)
+        if neg08.get("status") != "PASS":
+            for index in range(9, 16):
+                scenarios.append({
+                    "scenario": f"NEG-{index:02d}", "status": "INCOMPLETE",
+                    "message": "Skipped because Worker service recovery failed; dependent live cases are unsafe",
+                })
+            passed_count = sum(1 for item in scenarios if item.get("status") == "PASS")
+            failed_count = sum(1 for item in scenarios if item.get("status") == "FAIL")
+            return {"status": "FAIL", "scenarios": scenarios, "passed_count": passed_count,
+                    "failed_count": failed_count, "skipped_count": 0}
     else:
         scenarios.append({"scenario": "NEG-07", "status": "SKIP", "message": "No Worker SSH / Panel"})
         scenarios.append({"scenario": "NEG-08", "status": "SKIP", "message": "No Worker SSH / Panel"})

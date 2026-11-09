@@ -12,6 +12,7 @@ import threading
 import time
 import unittest
 import urllib.error
+from unittest.mock import MagicMock
 from pathlib import Path
 import sys
 
@@ -20,7 +21,9 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT))
 
 from live_vps.deployment import parse_strace_argv_output
-from live_vps.panel_api import E2EPanelClient
+from live_vps.panel_api import E2EPanelClient, read_master_credentials
+from live_vps.mtls import run_mtls_negative_tests
+from live_vps.ssh import SSHResult
 from modules.api_client import GoWaveClient, GoWaveAPIError
 
 
@@ -189,6 +192,64 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
         res = parse_strace_argv_output(trace_envp_only, secrets=["OnlyInEnvp"])
         self.assertEqual(res["status"], "PASS")
         self.assertFalse(res["secret_found"])
+
+    def test_master_credentials_are_read_through_stdin_safe_ssh_and_registered(self):
+        ssh = MagicMock()
+        ssh.run.return_value = SSHResult(
+            returncode=0,
+            stdout="\n".join([
+                "ADMIN_USERNAME=admin",
+                "ADMIN_PASSWORD=SensitivePassword123",
+                "SCOPED_API_TOKEN=ScopedToken123",
+            ]) + "\n",
+            stderr="",
+        )
+        values = read_master_credentials(ssh)
+        self.assertEqual(values["ADMIN_USERNAME"], "admin")
+        self.assertEqual(values["ADMIN_PASSWORD"], "SensitivePassword123")
+        command = ssh.run.call_args.args[0]
+        self.assertIn("test ! -L", command)
+        self.assertIn("regular file:600:0", command)
+        self.assertNotIn("SensitivePassword123", command)
+
+    def test_master_credentials_reject_bad_remote_file_metadata(self):
+        ssh = MagicMock()
+        ssh.run.return_value = SSHResult(returncode=1, stdout="", stderr="metadata mismatch")
+        with self.assertRaises(GoWaveAPIError):
+            read_master_credentials(ssh)
+    def test_mtls_negative_runner_sends_only_secret_on_stdin(self):
+        ssh = MagicMock()
+        secret = "base64-secret-payload"
+        ssh.run.side_effect = [
+            SSHResult(returncode=0, stdout=secret, stderr=""),
+            SSHResult(
+                returncode=0,
+                stdout=json.dumps({
+                    "untrusted_client_rejected": True,
+                    "absent_client_rejected": True,
+                    "mismatched_crypto_failed": True,
+                    "untrusted_ca_rejected": True,
+                    "wrong_sni_rejected": True,
+                }),
+                stderr="",
+            ),
+        ]
+
+        result = run_mtls_negative_tests(ssh, "203.0.113.20")
+        self.assertEqual(result["status"], "PASS")
+        command = ssh.run.call_args.args[0]
+        self.assertTrue(command.startswith("python3 -c "))
+        self.assertNotIn(secret, command)
+        self.assertEqual(ssh.run.call_args.kwargs["input_data"], secret)
+
+    def test_mtls_negative_transport_failure_is_incomplete(self):
+        ssh = MagicMock()
+        ssh.run.side_effect = [
+            SSHResult(returncode=0, stdout="base64-secret", stderr=""),
+            SSHResult(returncode=255, stdout="", stderr="Connection timed out"),
+        ]
+        result = run_mtls_negative_tests(ssh, "203.0.113.20")
+        self.assertEqual(result["status"], "INCOMPLETE")
 
     def test_gowave_client_constructor_extensions(self):
         ctx = ssl.create_default_context()

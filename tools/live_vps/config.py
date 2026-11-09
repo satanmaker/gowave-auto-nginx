@@ -26,6 +26,10 @@ WHITELIST_KEYS = {
     "WORKER_SSH_USER",
     "SSH_KEY_PATH",
     "SSH_KNOWN_HOSTS",
+    "MASTER_SSH_KEY_PATH",
+    "WORKER_SSH_KEY_PATH",
+    "MASTER_KNOWN_HOSTS_PATH",
+    "WORKER_KNOWN_HOSTS_PATH",
     "ACME_MODE",
     "ADMIN_EMAIL",
     "GOWAVE_PANEL_VERSION",
@@ -142,8 +146,11 @@ class LiveVPSConfig:
         return self.values[key]
 
     def __getattr__(self, name: str) -> Any:
-        if name in self.values:
-            return self.values[name]
+        # Canonical storage uses uppercase environment keys; the runner uses
+        # lowercase Python-style attributes. Resolve both consistently.
+        key = name.upper()
+        if key in self.values:
+            return self.values[key]
         raise AttributeError(f"'LiveVPSConfig' has no attribute '{name}'")
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -241,6 +248,12 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
 
     parsed["SSH_KEY_PATH"] = raw_pairs["SSH_KEY_PATH"]
     parsed["SSH_KNOWN_HOSTS"] = raw_pairs["SSH_KNOWN_HOSTS"]
+    # Per-host paths support CI where Master and Worker use separate keys.
+    # Existing local configs continue to use the shared SSH_KEY_PATH/known_hosts.
+    parsed["MASTER_SSH_KEY_PATH"] = raw_pairs.get("MASTER_SSH_KEY_PATH", parsed["SSH_KEY_PATH"])
+    parsed["WORKER_SSH_KEY_PATH"] = raw_pairs.get("WORKER_SSH_KEY_PATH", parsed["SSH_KEY_PATH"])
+    parsed["MASTER_KNOWN_HOSTS_PATH"] = raw_pairs.get("MASTER_KNOWN_HOSTS_PATH", parsed["SSH_KNOWN_HOSTS"])
+    parsed["WORKER_KNOWN_HOSTS_PATH"] = raw_pairs.get("WORKER_KNOWN_HOSTS_PATH", parsed["SSH_KNOWN_HOSTS"])
 
     # ACME mode
     acme_mode = raw_pairs.get("ACME_MODE", "staging").lower()

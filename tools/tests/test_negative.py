@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT))
 
+from live_vps.dns import DNSCheckResult
 from live_vps.negative import (
     run_neg_01_ssh_host_key_absent,
     run_neg_02_ssh_port_unreachable,
@@ -31,15 +32,67 @@ class TestNegativeScenarios(unittest.TestCase):
         self.assertEqual(res["scenario"], "NEG-02")
         self.assertEqual(res["status"], "PASS")
 
-    def test_neg_03_dns_wrong_ip(self):
-        res = run_neg_03_dns_wrong_ip()
-        self.assertEqual(res["scenario"], "NEG-03")
-        self.assertEqual(res["status"], "PASS")
+    @patch("live_vps.negative.verify_domain_dns")
+    def test_neg_03_wrong_ip_with_two_resolver_answers_is_pass(self, verify_dns):
+        verify_dns.return_value = DNSCheckResult(
+            domain="dns.google", expected_ip="198.51.100.1", record_type="A",
+            ok=False, resolved_ips=["8.8.8.8"],
+            resolver_results={"1.1.1.1": ["8.8.8.8"], "8.8.8.8": ["8.8.8.8"]},
+            error="mismatched IP",
+        )
+        self.assertEqual(run_neg_03_dns_wrong_ip()["status"], "PASS")
 
-    def test_neg_04_dns_missing_aaaa(self):
-        res = run_neg_04_dns_missing_aaaa()
-        self.assertEqual(res["scenario"], "NEG-04")
-        self.assertEqual(res["status"], "PASS")
+    @patch("live_vps.negative.verify_domain_dns")
+    def test_neg_03_no_resolver_answers_is_incomplete(self, verify_dns):
+        verify_dns.return_value = DNSCheckResult(
+            domain="dns.google", expected_ip="198.51.100.1", record_type="A",
+            ok=False, resolved_ips=[],
+            resolver_results={"1.1.1.1": [], "8.8.8.8": []}, error="timeout",
+        )
+        self.assertEqual(run_neg_03_dns_wrong_ip()["status"], "INCOMPLETE")
+
+    @patch("live_vps.negative.verify_domain_no_aaaa")
+    @patch("live_vps.negative.verify_domain_dns")
+    def test_neg_04_missing_aaaa_is_pass_only_with_nodata_proof(self, verify_dns, no_aaaa):
+        no_aaaa.return_value = DNSCheckResult(
+            domain="ipv4.google.com", expected_ip="NONE", record_type="AAAA",
+            ok=True, resolved_ips=[], resolver_results={"1.1.1.1": [], "8.8.8.8": []},
+        )
+        verify_dns.return_value = DNSCheckResult(
+            domain="ipv4.google.com", expected_ip="2001:db8::1", record_type="AAAA",
+            ok=False, resolved_ips=[], resolver_results={"1.1.1.1": [], "8.8.8.8": []},
+            error="no AAAA",
+        )
+        self.assertEqual(run_neg_04_dns_missing_aaaa()["status"], "PASS")
+
+    @patch("live_vps.negative.verify_domain_no_aaaa")
+    def test_neg_04_dns_failure_is_incomplete(self, no_aaaa):
+        no_aaaa.return_value = DNSCheckResult(
+            domain="ipv4.google.com", expected_ip="NONE", record_type="AAAA",
+            ok=False, resolved_ips=[], resolver_results={"1.1.1.1": [], "8.8.8.8": []},
+            error="resolver timeout",
+        )
+        self.assertEqual(run_neg_04_dns_missing_aaaa()["status"], "INCOMPLETE")
+
+    def test_unimplemented_backup_and_journal_scenarios_are_not_pass(self):
+        from live_vps.negative import (
+            run_neg_11_backup_corrupted_tar,
+            run_neg_12_backup_corrupted_sqlite,
+            run_neg_13_worker_deploy_interrupted_journal,
+        )
+        ssh = MagicMock()
+        self.assertEqual(run_neg_11_backup_corrupted_tar(ssh)["status"], "INCOMPLETE")
+        self.assertEqual(run_neg_12_backup_corrupted_sqlite(ssh)["status"], "INCOMPLETE")
+        self.assertEqual(run_neg_13_worker_deploy_interrupted_journal(ssh)["status"], "INCOMPLETE")
+
+    def test_neg_10_unreachable_worker_is_incomplete(self):
+        from types import SimpleNamespace
+        from live_vps.negative import run_neg_10_mtls_forged_certificate
+        ssh = MagicMock()
+        ssh.run.return_value = SimpleNamespace(
+            returncode=0, ok=True, stdout="CONNECT_INCOMPLETE:TimeoutError", stderr=""
+        )
+        self.assertEqual(run_neg_10_mtls_forged_certificate(ssh, "203.0.113.20")["status"], "INCOMPLETE")
 
     def test_negative_suite_disabled_produces_incomplete(self):
         config = MagicMock()

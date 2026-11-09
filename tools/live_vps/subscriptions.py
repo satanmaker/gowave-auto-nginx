@@ -40,6 +40,7 @@ def verify_user_agent_policy(
     # 1. Absent User-Agent
     absent_rejected = False
     absent_code = None
+    absent_error = None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": ""})
         # Remove standard python-urllib header
@@ -50,8 +51,9 @@ def verify_user_agent_policy(
         absent_code = e.code
         if e.code in (403, 400):
             absent_rejected = True
-    except Exception:
-        absent_rejected = True
+    except Exception as exc:
+        # Transport/TLS errors do not demonstrate application-level rejection.
+        absent_error = f"{type(exc).__name__}: {exc}"
 
     # 2. Valid Xray User-Agent
     xray_accepted = False
@@ -75,10 +77,12 @@ def verify_user_agent_policy(
         mihomo_accepted = False
 
     passed = absent_rejected and xray_accepted and mihomo_accepted
+    status = "PASS" if passed else ("INCOMPLETE" if absent_code is None else "FAIL")
     return {
-        "status": "PASS" if passed else "FAIL",
+        "status": status,
         "absent_rejected": absent_rejected,
         "absent_code": absent_code,
+        "absent_error": absent_error,
         "xray_accepted": xray_accepted,
         "mihomo_accepted": mihomo_accepted,
     }
