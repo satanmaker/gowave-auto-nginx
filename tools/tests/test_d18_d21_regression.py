@@ -11,6 +11,7 @@ Verifies:
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
 import tempfile
@@ -159,6 +160,36 @@ class TestD18D21RegressionSuite(unittest.TestCase):
                 result = subprocess.run(
                     ["bash", "-c", cmd],
                     input="GOWAVE_LEASE: boolean-pid-token\n",
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Invalid or stale mutation lock lease provided", result.stderr)
+            finally:
+                holder.terminate()
+                holder.wait()
+
+    def test_task_9_7_live_pid_without_lock_fd_is_rejected(self):
+        """A live PID is insufficient: its process must own the canonical lock descriptor."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_file = tmp / "mutation.lock"
+            lease_file = tmp / "lease.json"
+            ready_file = tmp / "holder.ready"
+            holder = _start_lock_holder(lock_file, lease_file, ready_file)
+            try:
+                lease_file.write_text(json.dumps({
+                    "lease_token": "wrong-owner-token",
+                    "holder_pid": os.getpid(),
+                }))
+                cmd = (
+                    f'source "{LOCK_SH}" && '
+                    f'MUTATION_LOCK_FILE="{lock_file}" '
+                    f'MUTATION_LEASE_FILE="{lease_file}" acquire_mutation_lock'
+                )
+                result = subprocess.run(
+                    ["bash", "-c", cmd],
+                    input="GOWAVE_LEASE: wrong-owner-token\n",
                     capture_output=True,
                     text=True,
                 )
