@@ -2059,6 +2059,10 @@ main() {
     fi
 
     _ACME_TX_ID="${ACME_TX_ID:-worker_install_$(date +%s)}"
+    if [[ ! "$_ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
+        echo "Error: Invalid Worker ACME transaction ID." >&2
+        exit 1
+    fi
     snapshot_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN"
     snapshot_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN"
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
@@ -2084,14 +2088,8 @@ main() {
 
     # Disable ERR compensation trap on verified success
     trap - ERR
-    if [[ -n "${_ACME_TX_ID:-}" ]]; then
-        cleanup_acme_snapshot "$_ACME_TX_ID" "$WORKER_DOMAIN"
-        cleanup_acme_snapshot "$_ACME_TX_ID" "$REALITY_DOMAIN"
-        if [[ -n "${VISION_DOMAIN:-}" ]]; then
-            cleanup_acme_snapshot "$_ACME_TX_ID" "$VISION_DOMAIN"
-        fi
-        cleanup_deploy_hook_manifest "$_ACME_TX_ID"
-    fi
+    # Keep the ACME before-image until the controller durably commits NODE_ADD.
+    # The controller calls remote_finalize only after that commit succeeds.
     unset _NODE_SECRET_KEY VERIFY_NODE_MTLS_B64
     echo "GoWave Edge Worker deployment complete (service, NGINX, TLS and mTLS health verified)."
 }
@@ -2134,6 +2132,11 @@ remote_rollback() {
 
         cat <<'ROLLBACK_REMOTE_SCRIPT'
 set -euo pipefail
+
+if [[ -n "${ACME_TX_ID:-}" && ! "$ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
+    echo "Error: Invalid Worker ACME transaction ID." >&2
+    exit 1
+fi
 
 if [[ "$(id -u)" -ne 0 ]]; then
     MUTATION_LOCK_FILE="${MUTATION_LOCK_FILE:-/tmp/gowave-managed-mutation-$(id -u).lock}"
@@ -2507,12 +2510,92 @@ rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1
 rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh || rollback_failed=1
 sysctl --system 2>/dev/null || rollback_failed=1
 
+# Delete the ACME snapshot only after every rollback action has succeeded.
+# Retain it on any failure so an operator can retry or inspect recovery evidence.
+if [[ -n "${ACME_TX_ID:-}" && "$rollback_failed" -eq 0 ]]; then
+    if [[ ! "$ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]] ||
+        [[ -L /var/lib/gowave-auto-nginx || -L /var/lib/gowave-auto-nginx/recovery ||
+           -L "/var/lib/gowave-auto-nginx/recovery/$ACME_TX_ID" ]]; then
+        rollback_failed=1
+    else
+        rm -rf -- "/var/lib/gowave-auto-nginx/recovery/$ACME_TX_ID" || rollback_failed=1
+    fi
+fi
+
 if [[ "$rollback_failed" -ne 0 ]]; then
     echo "Error: Remote worker compensation teardown incomplete; one or more cleanup or restoration operations failed." >&2
     exit 1
 fi
 echo "Remote worker compensation teardown finished." >&2
 ROLLBACK_REMOTE_SCRIPT
+    } | ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" -o ServerAliveInterval=15 -p "$port" "${ssh_user}@${host}" 'bash -s'
+}
+
+remote_finalize() {
+    local host="${1}"
+    local port="${2:-22}"
+    local ssh_user="${3:-root}"
+    local acme_tx_id="${ACME_TX_ID:-}"
+    local known_hosts="${SSH_KNOWN_HOSTS:-/root/.ssh/known_hosts}"
+    if [[ ! "$acme_tx_id" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
+        log_err "A valid Worker ACME transaction ID is required for finalization."
+        return 1
+    fi
+    local host_key="$host"
+    if [[ "$port" != "22" ]]; then
+        host_key="[$host]:$port"
+    fi
+    if [[ ! -s "$known_hosts" ]] || ! ssh-keygen -F "$host_key" -f "$known_hosts" >/dev/null 2>&1; then
+        log_err "SSH host key for $host_key is not pre-pinned in $known_hosts."
+        return 1
+    fi
+
+    {
+        printf 'export ACME_TX_ID=%q\n' "$acme_tx_id"
+        cat <<'FINALIZE_REMOTE_SCRIPT'
+set -euo pipefail
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "Error: Worker snapshot finalization requires root." >&2
+    exit 1
+fi
+if [[ ! "$ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
+    echo "Error: Invalid Worker ACME transaction ID." >&2
+    exit 1
+fi
+recovery_root="/var/lib/gowave-auto-nginx/recovery"
+transaction_dir="$recovery_root/$ACME_TX_ID"
+for path in /var/lib/gowave-auto-nginx "$recovery_root" "$transaction_dir"; do
+    if [[ -L "$path" ]]; then
+        echo "Error: Refusing to finalize a symlinked recovery path." >&2
+        exit 1
+    fi
+done
+if [[ ! -e "$transaction_dir" ]]; then
+    echo "Worker ACME snapshot is already absent." >&2
+    exit 0
+fi
+if [[ ! -d "$transaction_dir" ]]; then
+    echo "Error: Worker ACME snapshot path is not a directory." >&2
+    exit 1
+fi
+lock_dir="/run/lock"
+lock_file="$lock_dir/gowave-managed-mutation.lock"
+if [[ -L "$lock_dir" || -L "$lock_file" ||
+      ( -e "$lock_file" && ! -f "$lock_file" ) ]]; then
+    echo "Error: Mutation lock path is unsafe." >&2
+    exit 1
+fi
+mkdir -p "$lock_dir"
+( umask 077; : >> "$lock_file" )
+chmod 0600 "$lock_file"
+exec 9>>"$lock_file"
+if ! flock -n 9; then
+    echo "Error: Another process currently holds the mutation lock." >&2
+    exit 1
+fi
+rm -rf -- "$transaction_dir"
+echo "Worker ACME recovery snapshot finalized." >&2
+FINALIZE_REMOTE_SCRIPT
     } | ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" -o ServerAliveInterval=15 -p "$port" "${ssh_user}@${host}" 'bash -s'
 }
 
@@ -2529,8 +2612,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             shift
             remote_rollback "$@"
             ;;
+        remote_finalize)
+            shift
+            remote_finalize "$@"
+            ;;
         *)
-            echo "Usage: gowave-node-auto.sh <pack-cover|remote_payload|remote_rollback> [args]"
+            echo "Usage: gowave-node-auto.sh <pack-cover|remote_payload|remote_rollback|remote_finalize> [args]"
             exit 1
             ;;
     esac

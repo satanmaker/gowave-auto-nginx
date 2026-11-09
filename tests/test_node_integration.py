@@ -223,6 +223,42 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertNotIn("certbot delete", acme_cleanup)
         self.assertIn("rollback_failed=1", acme_cleanup)
 
+    def test_node_add_commit_record_failure_compensates_both_sides(self):
+        """A failed durable commit after remote success must roll back Worker and Panel API state."""
+        worker_script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        commit_start = worker_script.index("# 5. Commit transaction")
+        commit_end = worker_script.index('echo "Worker \'$name\' successfully added and deployed."', commit_start)
+        commit_block = worker_script[commit_start:commit_end]
+        self.assertIn("if ! python3 -c", commit_block)
+        self.assertIn('ACME_TX_ID="$acme_tx_id"', commit_block)
+        self.assertIn('remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"', commit_block)
+        self.assertIn("rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE')", commit_block)
+        self.assertIn("return 1", commit_block)
+
+    def test_worker_acme_snapshot_is_retained_until_controller_commit(self):
+        """The remote payload must preserve its ACME before-image until the controller commits."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        main_script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        success_start = worker_script.index("# Disable ERR compensation trap on verified success")
+        success_end = worker_script.index("GoWave Edge Worker deployment complete", success_start)
+        self.assertNotIn("cleanup_acme_snapshot", worker_script[success_start:success_end])
+        self.assertIn("remote_finalize()", worker_script)
+        self.assertIn("remote_finalize)", worker_script)
+        self.assertIn('rm -rf -- "$transaction_dir"', worker_script)
+        self.assertIn("Delete the ACME snapshot only after every rollback action has succeeded", worker_script)
+        rollback_script_start = worker_script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
+        rollback_cleanup_index = worker_script.index("Delete the ACME snapshot only after every rollback action has succeeded", rollback_script_start)
+        rollback_sysctl_index = worker_script.index("sysctl --system 2>/dev/null || rollback_failed=1", rollback_script_start)
+        self.assertGreater(rollback_cleanup_index, rollback_sysctl_index)
+
+        commit_index = main_script.index("# 5. Commit transaction")
+        finalize_index = main_script.index("remote_finalize \"$ip\" \"$ssh_port\" \"$ssh_user\"", commit_index)
+        self.assertGreater(finalize_index, commit_index)
+        self.assertIn('if [[ ! "$_ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]', worker_script)
+        self.assertIn('if [[ -n "${ACME_TX_ID:-}" && ! "$ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]', worker_script)
+        self.assertIn('( -e "$lock_file" && ! -f "$lock_file" )', worker_script)
+        self.assertIn("snapshot could not be finalized; snapshot retained", main_script[finalize_index:])
+
     def test_worker_standalone_remote_rollback_defined(self):
         """gowave-node-auto.sh must provide standalone remote_rollback command."""
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()

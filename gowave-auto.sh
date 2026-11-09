@@ -739,8 +739,9 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
                 return 1
             fi
 
-            # 5. Commit transaction
-            python3 -c "
+            # 5. Commit transaction. If the durable commit record fails after
+            # remote deployment succeeded, compensate both remote and API state.
+            if ! python3 -c "
 import sys, json, time
 for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
     if p not in sys.path:
@@ -750,7 +751,32 @@ jdata = json.load(open('$JOURNAL_FILE'))
 jdata['state'] = 'NODE_ADD_COMMITTED'
 jdata['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 write_journal_atomically('$JOURNAL_FILE', jdata)
-"
+"; then
+                echo "CRITICAL: Worker deployment succeeded but the commit journal could not be persisted; compensating both sides." >&2
+                local rollback_failed=0
+                if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
+                    VISION_DOMAIN="$vision_domain" \
+                    "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
+                    echo "CRITICAL: Remote Worker rollback after commit-record failure was incomplete." >&2
+                    rollback_failed=1
+                fi
+                if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from modules.api_client import rollback_provisioning
+import sys
+sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE') else 1)
+"; then
+                    echo "CRITICAL: API rollback after commit-record failure was incomplete." >&2
+                    rollback_failed=1
+                fi
+                if (( rollback_failed != 0 )); then
+                    echo "CRITICAL: Worker '$name' requires manual recovery; journal retained." >&2
+                fi
+                return 1
+            fi
+            if ! ACME_TX_ID="$acme_tx_id" SSH_KNOWN_HOSTS="$known_hosts" \
+                "$SCRIPT_DIR/gowave-node-auto.sh" remote_finalize "$ip" "$ssh_port" "$ssh_user"; then
+                echo "WARNING: Worker '$name' is committed and deployed, but its ACME recovery snapshot could not be finalized; snapshot retained for manual cleanup." >&2
+            fi
             echo "Worker '$name' successfully added and deployed."
             ;;
         list)
