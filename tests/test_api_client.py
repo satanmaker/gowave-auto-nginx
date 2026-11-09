@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 import http.server
+import io
 import json
 import os
 from pathlib import Path
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.parse
+import urllib.request
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 import sys
@@ -190,6 +194,52 @@ class TestAPIClient(unittest.TestCase):
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
+
+    def test_post_network_failure_is_not_retried(self):
+        client = GoWaveClient("http://panel.example.test")
+        with mock.patch(
+            "modules.api_client.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("response connection lost"),
+        ) as urlopen:
+            with self.assertRaises(Exception):
+                client.request("POST", "/api/nodes", {"name": "worker"})
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_post_401_reauthenticates_once_then_retries_request(self):
+        client = GoWaveClient("http://panel.example.test")
+        client.username = "admin"
+        client.password = "secure-password"
+        unauthorized = urllib.error.HTTPError(
+            "http://panel.example.test/api/nodes", 401, "Unauthorized", {}, io.BytesIO(b'{"error":"unauthorized"}')
+        )
+        login_response = mock.MagicMock()
+        login_response.__enter__.return_value = login_response
+        login_response.read.return_value = b'{"response": {"accessToken": "fresh-token"}}'
+        login_response.headers.get.return_value = "application/json"
+        mutation_response = mock.MagicMock()
+        mutation_response.__enter__.return_value = mutation_response
+        mutation_response.read.return_value = b'{"created": true}'
+        mutation_response.headers.get.return_value = "application/json"
+        with mock.patch(
+            "modules.api_client.urllib.request.urlopen",
+            side_effect=[unauthorized, login_response, mutation_response],
+        ) as urlopen:
+            self.assertEqual(client.request("POST", "/api/nodes", {"name": "worker"}), {"created": True})
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual(client.token, "fresh-token")
+
+    def test_get_network_failure_is_retried(self):
+        client = GoWaveClient("http://panel.example.test")
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok": true}'
+        response.headers.get.return_value = "application/json"
+        with mock.patch(
+            "modules.api_client.urllib.request.urlopen",
+            side_effect=[urllib.error.URLError("temporary network failure"), response],
+        ) as urlopen, mock.patch("modules.api_client.time.sleep"):
+            self.assertEqual(client.request("GET", "/api/nodes"), {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
 
     def test_save_credentials(self):
         with tempfile.TemporaryDirectory() as tmpdir:
