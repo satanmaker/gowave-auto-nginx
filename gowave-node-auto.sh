@@ -717,6 +717,7 @@ remote_payload() {
         printf 'export VISION_DOMAIN=%q\n' "${VISION_DOMAIN:-}"
         printf 'export ADMIN_EMAIL=%q\n' "$admin_email"
         printf 'export GOWAVE_ACME_SERVER=%q\n' "${GOWAVE_ACME_SERVER:-}"
+        printf 'export ACME_TX_ID=%q\n' "${ACME_TX_ID:-}"
         printf 'COVER_REALITY_B64=%q\n' "$cover_b64"
         printf 'COVER_REALITY_SHA256=%q\n' "$cover_sha256"
         # Secret strictly scoped, not exported globally
@@ -1963,7 +1964,7 @@ main() {
         check_acme_lineage "$VISION_DOMAIN" "$effective_acme_server"
     fi
 
-    _ACME_TX_ID="worker_install_$(date +%s)"
+    _ACME_TX_ID="${ACME_TX_ID:-worker_install_$(date +%s)}"
     snapshot_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN"
     snapshot_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN"
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
@@ -2372,18 +2373,18 @@ if [[ -n "${ACME_TX_ID:-}" ]]; then
         restore_acme_lineage "$ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || rollback_failed=1
     fi
 else
-    if [[ -n "${WORKER_DOMAIN:-}" ]]; then
-        certbot delete --cert-name "$WORKER_DOMAIN" --non-interactive 2>/dev/null || true
-        rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || rollback_failed=1
-    fi
-    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        certbot delete --cert-name "$REALITY_DOMAIN" --non-interactive 2>/dev/null || true
-        rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || rollback_failed=1
-    fi
-    if [[ -n "${VISION_DOMAIN:-}" ]]; then
-        certbot delete --cert-name "$VISION_DOMAIN" --non-interactive 2>/dev/null || true
-        rm -rf "/etc/letsencrypt/live/$VISION_DOMAIN" "/etc/letsencrypt/archive/$VISION_DOMAIN" "/etc/letsencrypt/renewal/$VISION_DOMAIN.conf" 2>/dev/null || rollback_failed=1
-    fi
+    # Without the original transaction ID there is no trustworthy snapshot
+    # proving which certificate lineages predate this deployment. Preserve
+    # all existing certificates rather than deleting operator-owned state.
+    for domain in "${WORKER_DOMAIN:-}" "${REALITY_DOMAIN:-}" "${VISION_DOMAIN:-}"; do
+        [[ -n "$domain" ]] || continue
+        if [[ -e "/etc/letsencrypt/live/$domain" ||
+              -e "/etc/letsencrypt/archive/$domain" ||
+              -e "/etc/letsencrypt/renewal/$domain.conf" ]]; then
+            echo "Error: ACME_TX_ID missing; preserving unknown certificate lineage for $domain." >&2
+            rollback_failed=1
+        fi
+    done
 fi
 # 4. Remove UFW rules added for Control Plane. Missing rules are already clean;
 # only attempt deletion when the active ruleset confirms the exact rule exists.

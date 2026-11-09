@@ -193,7 +193,7 @@ class TestNodeIntegration(unittest.TestCase):
         worker_script = (REPO_ROOT / "gowave-auto.sh").read_text()
         secret_index = worker_script.index('if ! secret_key=$(extract_secret_key "$GOWAVE_DIR")')
         api_index = worker_script.index("if ! PYTHONPATH=", secret_index)
-        dispatch_index = worker_script.index('if ! PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key"', api_index)
+        dispatch_index = worker_script.index('if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key"', api_index)
         self.assertLess(secret_index, api_index)
         self.assertLess(api_index, dispatch_index)
 
@@ -202,6 +202,26 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn("write_journal_atomically(journal_path, journal)", transaction_block)
         self.assertNotIn("jdata['state'] = 'NODE_ADD_VERIFYING'", worker_script)
         self.assertNotIn("extract_secret_key", transaction_block)
+
+    def test_worker_rollback_uses_the_original_acme_snapshot_transaction(self):
+        """The controller and remote payload must share the snapshot ID; missing IDs must never delete unknown certs."""
+        main_script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        self.assertIn('local acme_tx_id="worker_install_${name}_$(date +%s)_${BASHPID}"', main_script)
+        self.assertIn('ACME_TX_ID="$acme_tx_id"', main_script)
+        self.assertIn('printf \'export ACME_TX_ID=%q\\n\' "${ACME_TX_ID:-}"', worker_script)
+        self.assertIn('_ACME_TX_ID="${ACME_TX_ID:-worker_install_$(date +%s)}"', worker_script)
+
+        remote_start = worker_script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
+        remote_end = worker_script.index("\nROLLBACK_REMOTE_SCRIPT", remote_start)
+        rollback_script = worker_script[remote_start:remote_end]
+        acme_start = rollback_script.index("# 3. Clean ACME certificates")
+        acme_end = rollback_script.index("# 4. Remove UFW rules", acme_start)
+        acme_cleanup = rollback_script[acme_start:acme_end]
+        self.assertIn('restore_acme_lineage "$ACME_TX_ID" "$WORKER_DOMAIN"', acme_cleanup)
+        self.assertIn("ACME_TX_ID missing; preserving unknown certificate lineage", acme_cleanup)
+        self.assertNotIn("certbot delete", acme_cleanup)
+        self.assertIn("rollback_failed=1", acme_cleanup)
 
     def test_worker_standalone_remote_rollback_defined(self):
         """gowave-node-auto.sh must provide standalone remote_rollback command."""
