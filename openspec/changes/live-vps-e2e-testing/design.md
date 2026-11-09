@@ -29,9 +29,9 @@ See `proposal.md — Why` for motivation. Key implementation constraints derived
 - Single-process Python runner with structured submodule package; each phase has bounded timeout and explicit
   status.
 - Reuse existing crypto/mTLS logic via subprocess, not reimplementation.
-- SSH transport uses system OpenSSH CLI with `StrictHostKeyChecking=yes` and pre-pinned `known_hosts`.
-- E2E v1 connects to both VPS as `root`; the current deployment scripts have no `sudo` execution adapter. Preflight verifies `id -u == 0` on both hosts before acquiring remote locks or mutating either host; non-root SSH accounts fail closed.
-- `SSH_KNOWN_HOSTS` is one configured, pre-pinned file containing both target host keys. Each SSH invocation selects the exact target entry (including `[host]:port` for non-default ports); a second independent file is not required by this contract.
+- The local controller verifies each SSH host key out of band before password authentication, then bootstraps a per-host ephemeral Ed25519 key. The existing runner uses system OpenSSH with `StrictHostKeyChecking=yes` and the controller-generated, host-specific temporary `known_hosts` files.
+- E2E v1 connects to both VPS as `root`; the current deployment scripts have no `sudo` execution adapter. The controller rejects non-root identities before mutation.
+- Temporary SSH keys are guarded by a persistent two-hour remote systemd expiry timer installed before the key is appended. Immediate revocation is independently verified and is a PASS gate; otherwise the overall result is INCOMPLETE.
 - All log output passes through a redaction filter before writing.
 - Teardown is policy-driven and idempotent; it never destroys a VPS not created by this runner.
 - Run-level lock prevents concurrent tests on the same Master/Worker pair.
@@ -47,17 +47,21 @@ See `proposal.md — Why` for motivation. Key implementation constraints derived
 
 ## Decisions
 
-### D1: SSH Transport — System OpenSSH CLI via subprocess, not Paramiko
+### D1: Hybrid SSH Bootstrap and OpenSSH Runner Transport
 
-**Chosen:** `subprocess` with system `ssh` / `scp`, `shell=False`, args as array, timeout mandatory.
+**Chosen:** The local operator controller uses Paramiko only for the initial unauthenticated SSH key exchange,
+out-of-band SHA-256 host-key fingerprint confirmation, and hidden root-password bootstrap. After that it
+installs a per-run Ed25519 public key. The existing E2E runner continues to use system OpenSSH `ssh`/`scp`
+with `shell=False`, argument arrays, mandatory timeouts, `StrictHostKeyChecking=yes`, and controller-generated
+temporary `known_hosts` files pinned to the exact host keys.
 
-**Rationale:** System OpenSSH respects host OS `~/.ssh/known_hosts` format, supports `StrictHostKeyChecking=yes`
-natively, and delegates all host key verification logic to the battle-tested OpenSSH binary. No Python-layer
-re-implementation of SSH crypto. Paramiko requires maintaining its own host key store and has historically
-lagged behind OpenSSH security releases.
+**Rationale:** Passwords never enter argv, environment variables, persistent config, reports, or CI secrets.
+The operator compares the observed fingerprint with the VPS provider's trusted console before any password is
+sent. The long-running runner retains OpenSSH's mature host-key enforcement and uses only short-lived keys.
 
-**Alternatives considered:** Paramiko — rejected because it requires duplicating host key pinning logic and
-introduces an additional crypto dependency. Fabric — rejected as it wraps Paramiko with the same drawback.
+**Alternatives considered:** Permanent GitHub Environment SSH secrets — rejected because they persist target
+credentials in CI and are a poor fit for operator-supplied VPS instances. Trust-on-first-use via `ssh-keyscan`
+— rejected because it does not independently authenticate host identity.
 
 **Security consequence:** Secrets are never placed in argv. Remote commands that require secrets (reading
 credentials, extracting SECRET_KEY) pipe data via stdin or use isolated SSH `cat` commands followed by
@@ -142,22 +146,23 @@ is not guaranteed to be a complete standalone config.
 
 ---
 
-### D5: Server-Side Ingress Evidence and Egress IP Verification
+### D5: Per-Case Packet-Capture Evidence and Egress Verification
 
-**Chosen:** Each endpoint test is executed sequentially with a bounded observation window:
-1. Record baseline packet/byte counters (or start a bounded `tcpdump` capture) on the target VPS public
-   transport listener. In the current NGINX stream topology this is TCP/443; do not assume the four or five
-   logical protocols have distinct public TCP ports. Use the exact configured listener and record the capture
-   filter and interface.
-2. Execute one tunnel request through the selected endpoint and record the client-observed egress IP.
-   Compare it with `EXPECTED_MASTER_EGRESS_IP` or `EXPECTED_WORKER_EGRESS_IP` when configured. If no expected
-   value is configured, query that VPS's direct egress independently and compare, while documenting that
-   this verifies shared egress identity rather than a predeclared address.
-3. Compare post-test ingress evidence with the baseline on the target VPS. For Worker endpoints, verify
-   Worker ingress increases and Master ingress does not increase for the same controlled request. For Master
-   endpoints, verify Master ingress increases. Counter deltas MUST be isolated per test window; unrelated
-   background traffic invalidates ambiguous evidence and produces `INCOMPLETE`, not `PASS`.
-4. If packet capture is used, capture metadata and packet counts only; do not persist payloads or credentials.
+**Chosen:** Every Xray and Mihomo proxy request is bracketed by simultaneous inbound `tcpdump` captures on
+Master and Worker. Each capture is filtered by the control machine's public IPv4 and the exact destination
+port of the tested proxy endpoint; the target's SSH destination port is explicitly excluded. Each remote
+capture has a 45-second hard lifetime.
+
+A case is PASS only when all conditions hold:
+1. The intended VPS captures at least one matching inbound TCP packet.
+2. The other VPS captures zero matching inbound TCP packets (offload detection).
+3. The client-observed egress IPv4 equals the expected egress address of the intended VPS.
+
+Missing `tcpdump`, inability to determine the control machine's public IPv4, invalid endpoint port, or a
+missing/invalid capture summary yields INCOMPLETE. Aggregate `/proc/net/dev` counters are not a fallback
+and cannot produce PASS. Only packet counts and evidence metadata are persisted; no PCAP or payload is
+stored. This attribution requires the control machine to reach both VPS instances from the same public IPv4;
+otherwise the evidence is INCOMPLETE, not PASS.
 
 **Rationale:** Default GoWave Xray templates do not enable the Xray Stats API. The public NGINX stream listener
 is shared by SNI-routed transports, so packet evidence proves traversal to the intended VPS but not by itself
@@ -456,11 +461,12 @@ negative-suite switch, so its effect on the acceptance gate must be normative.
 
 ### D14: Optional Vision Is a Paired, Fail-Closed Capability
 
-**Chosen:** VLESS XTLS Vision is optional at the deployment level, but when enabled it is a required
-capability on both VPS. `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` MUST either both be configured
-or both be absent. A one-sided configuration is invalid and is rejected by the local config parser before
-SSH or any remote modification. This keeps the topology and runtime matrix unambiguous: four inbounds per
-node and sixteen client/runtime cases when disabled; five inbounds per node and twenty cases when enabled.
+**Chosen:** VLESS XTLS Vision is optional and configured independently per VPS. Either
+`MASTER_VISION_DOMAIN`, `WORKER_VISION_DOMAIN`, both, or neither may be set. A configured Vision domain
+adds one endpoint and one inbound only to its corresponding VPS. The default topology has eight logical
+endpoints and sixteen client/runtime cases; one-sided Vision has nine endpoints and eighteen cases; Vision
+on both VPS has ten endpoints and twenty cases. Each domain remains subject to global FQDN uniqueness and
+host-specific DNS/certificate validation.
 
 When the pair is configured:
 
@@ -811,8 +817,8 @@ Phase 0: Preflight
   0.1  Config load + validate (whitelist parser, reserved IP rejection)
   0.2  Acquire the local per-target `fcntl.flock` in the private runtime directory
   0.3  Control Machine tool check (python3, ssh, openssl, curl, dig, xray, mihomo)
-  0.4  SSH trust check (both VPS, StrictHostKeyChecking=yes, exact pinned entries from the single SSH_KNOWN_HOSTS file); verify `id -u == 0` on both hosts using read-only commands and fail before lock acquisition/mutation for non-root identities
-  0.5  Reject identical MASTER_IP/WORKER_IP and duplicate mandatory Panel/REALITY FQDNs; when Vision is enabled require all six FQDNs pairwise unique. Verify DNS (4 mandatory domains plus optional Vision pair, A/AAAA, 2+ resolvers)
+  0.4  Local controller verifies each SSH host-key fingerprint against the provider console before hidden root-password authentication; bootstrap temporary per-host Ed25519 keys and host-specific known_hosts pins; verify root identity before mutation
+  0.5  Reject identical MASTER_IP/WORKER_IP and duplicate configured FQDNs; validate each independently configured Vision domain and its host-specific A/AAAA answers across all configured domains, using 2+ resolvers
   0.6  Baseline snapshot (systemd, listeners, firewall, GoWave dirs)
   0.7  Disposable gate (reject if GoWave present or ports occupied)
   0.8  Port hygiene (11+ required ports checked as free: 80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, 10003; plus 8444 and 9444 when the Vision domain pair is enabled)
@@ -864,15 +870,15 @@ Phase 3: Public mTLS Verification (execute allowed-source probes from Master)
 Phase 4: Panel API Audit
   4.1  GET /api/nodes — 2 nodes, correct addresses, 4 inbounds each (or 5 with the validated Vision pair), isConnected
   4.2  GET /api/config-profiles — 2 profiles, 4 inbounds each (or 5 with the validated Vision pair), computed-config valid JSON
-  4.3  GET /api/internal-squads — Default MVP Squad, 8 inbound UUIDs (or 10 with the validated Vision pair), set equality
-  4.4  GET /api/hosts — 8 hosts (or 10 with the validated Vision pair), all fields verified, fingerprint="firefox", correct node/inbound associations
+  4.3  GET /api/internal-squads — Default MVP Squad, 8 core inbound UUIDs plus one per configured Vision domain (8/9/10 total), set equality
+  4.4  GET /api/hosts — 8 core hosts plus one per configured Vision domain (8/9/10 total), all fields verified, fingerprint="firefox", correct node/inbound associations
 
 Phase 5: Subscriptions
   5.1  GET /api/users/by-username/default-user → shortUuid
   5.2  User-Agent policy (empty, absent, Xray UA, Mihomo UA → check actual Panel response)
-  5.3  Fetch Xray JSON (Xray UA), verify 8 proxy outbounds (or 10 when the paired Vision domains are configured), fingerprint="firefox", headers, no server secrets
+  5.3  Fetch Xray JSON (Xray UA), verify 8 core proxy outbounds plus one per configured Vision domain (8/9/10), fingerprint="firefox", headers, no server secrets
   5.4  Validate with xray run -test (temporary wrapper config)
-  5.5  Fetch Mihomo YAML (Mihomo UA), verify 8 proxies (or 10 when the paired Vision domains are configured), client-fingerprint="firefox", GEOIP rule, headers
+  5.5  Fetch Mihomo YAML (Mihomo UA), verify 8 core proxies plus one per configured Vision domain (8/9/10), client-fingerprint="firefox", GEOIP rule, headers
   5.6  Validate with mihomo -t
   5.7  Verify Mihomo runtime copy binds all local listeners to 127.0.0.1 on collision-free per-run ports;
        preserve proxy/rule semantics and reject externally exposed or non-loopback controllers
@@ -897,9 +903,8 @@ Phase 7: NGINX SNI + REALITY Decoy (+ Optional Vision)
   7.7  cover-reality unique marker file accessible
   7.8  PROXY protocol integrity (inferred from correct Panel, Worker, REALITY, and Vision responses)
 
-Phase 8: Data Plane E2E (8 or 10 logical endpoints × 2 client runtimes = 16 or 20 required cases)
-  8.1  Logical endpoint matrix: Master × {VLESS REALITY, VLESS XHTTP, VLESS WS, Trojan gRPC, and optional VLESS XTLS-Vision when the Vision domain pair is configured}
-       and Worker × the same protocols (8 endpoints by default; 10 when both Vision domains are configured)
+Phase 8: Data Plane E2E (8/9/10 logical endpoints × 2 client runtimes = 16/18/20 required cases)
+  8.1  Logical endpoint matrix: Master and Worker each have four core protocols; add one Vision endpoint only on each VPS whose Vision domain is configured (8 by default, 9 for one-sided Vision, 10 when both are configured)
   8.2  For each logical endpoint, run a real Xray client case and a real Mihomo client case (with firefox fingerprint):
        - Extract the corresponding proxy from the real subscription
        - Build/validate a temporary Xray wrapper config; for Mihomo, create a per-run sanitized copy of
@@ -1042,17 +1047,17 @@ the following strict schema:
 | `MASTER_IP` | IPv4 address | Yes | — | Public IPv4 of Master VPS (disallowed: RFC-1918, loopback, docs); MUST differ from `WORKER_IP` |
 | `MASTER_PANEL_DOMAIN` | FQDN | Yes | — | Domain pointing to Master Panel NGINX HTTPS |
 | `MASTER_REALITY_DOMAIN` | FQDN | Yes | — | Camouflage decoy domain pointing to Master REALITY SNI |
-| `MASTER_VISION_DOMAIN` | FQDN | Conditional pair | — | Master Vision domain; must be set together with `WORKER_VISION_DOMAIN` |
+| `MASTER_VISION_DOMAIN` | FQDN | Optional | — | Optional Master Vision domain; independent of Worker Vision |
 | `MASTER_SSH_PORT` | Integer 1–65535 | No | `22` | Master SSH management port |
 | `MASTER_SSH_USER` | Literal `root` | No | `root` | Master SSH login identity; non-root is unsupported in E2E v1 |
 | `WORKER_IP` | IPv4 address | Yes | — | Public IPv4 of Worker VPS; MUST differ from `MASTER_IP` |
 | `WORKER_DOMAIN` | FQDN | Yes | — | Domain pointing to Worker NGINX HTTPS |
 | `WORKER_REALITY_DOMAIN` | FQDN | Yes | — | Camouflage decoy domain pointing to Worker REALITY SNI |
-| `WORKER_VISION_DOMAIN` | FQDN | Conditional pair | — | Worker Vision domain; must be set together with `MASTER_VISION_DOMAIN` |
+| `WORKER_VISION_DOMAIN` | FQDN | Optional | — | Optional Worker Vision domain; independent of Master Vision |
 | `WORKER_SSH_PORT` | Integer 1–65535 | No | `22` | Worker SSH management port |
 | `WORKER_SSH_USER` | Literal `root` | No | `root` | Worker SSH login identity; non-root is unsupported in E2E v1 |
-| `SSH_KEY_PATH` | File path | Yes | — | Path to private SSH key for authentication |
-| `SSH_KNOWN_HOSTS` | File path | Yes | — | One pre-pinned `known_hosts` file containing both VPS host keys; each connection selects its exact host/port entry |
+| `SSH_KEY_PATH` | File path | Generated by controller | — | Per-run ephemeral Ed25519 private key; never a permanent operator-managed key |
+| `SSH_KNOWN_HOSTS` | File path | Generated by controller | — | Host-specific temporary known_hosts pin generated only after out-of-band fingerprint confirmation |
 | `ACME_MODE` | `staging` \| `production` | No | `staging` | Let's Encrypt endpoint mode |
 | `GOWAVE_PANEL_VERSION` | SemVer / commit | Yes | — | Target GoWave Panel version to pin and verify |
 | `GOWAVE_NODE_VERSION` | SemVer / commit | Yes | — | Target GoWave Node version to pin and verify |
@@ -1154,9 +1159,9 @@ is recorded independently of the rollback success. NEG-13 tests this path explic
 4. Add `tools/live_vps_config.env.example` to repo; add `tools/live_vps_config.env` to `.gitignore`.
 5. Implement `tools/test_live_vps.py` and `tools/live_vps/` package per tasks.md.
 6. Add `docs/LIVE_VPS_TESTING.md`.
-7. Add `.github/workflows/live-vps-e2e.yml` (`workflow_dispatch` only, no auto-trigger on PR).
-8. First run against staging ACME on manually provisioned VPS; validate all phases.
-9. Second run with `ACME_MODE=production` for acceptance certificate.
+7. Remove the credential-bearing `.github/workflows/live-vps-e2e.yml`; retain `.github/workflows/live-vps-unit.yml` for CI.
+8. Add the local operator controller (`python3 tools/run_live_vps.py`) with hidden password prompts, out-of-band host-key confirmation, temporary keys, persistent remote expiry, and immediate revocation.
+9. Run staging acceptance on two fresh disposable VPS instances; production ACME is a separate, explicit operator decision and is not a substitute for staging acceptance.
 
 **Rollback:** Live VPS E2E is entirely additive. Removing `feature/live-vps-e2e-testing` branch leaves the
 existing codebase unchanged. The ACME staging delta is a backward-compatible default-off env var.
@@ -1173,3 +1178,13 @@ existing codebase unchanged. The ACME staging delta is a backward-compatible def
   initial bound, not a measured real-VPS guarantee. Mock integration benchmarks do not establish the latency
   distribution of the pinned Panel/Node pair; staging acceptance MUST record observed registration latency and
   adjust the default or document the evidence before production acceptance.
+
+
+## Implementation synchronization (2026-11-09)
+
+The current implementation supersedes earlier design text in this change: live execution is local via
+`tools/run_live_vps.py`; Paramiko is used only for the initial fingerprint-confirmed password bootstrap,
+while the existing runner uses OpenSSH with ephemeral keys and strict host-key pins. Master and Worker Vision
+are independent optional domains. Per-case data-plane proof uses simultaneous, source-IP- and exact-service-port-
+filtered tcpdump captures on both VPS, with a 45-second remote timeout and no aggregate-counter fallback.
+See `../local-live-vps-controller/design.md` and `docs/LIVE_VPS_TESTING.md` for the current operator contract.
