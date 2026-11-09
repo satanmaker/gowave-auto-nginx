@@ -88,7 +88,13 @@ class GoWaveClient:
 
         req = urllib.request.Request(url, data=encoded_data, headers=req_headers, method=method)
 
-        max_retries = 3
+        # Retrying a mutation after a timeout or 5xx can duplicate a request
+        # that the server already committed but whose response was lost.
+        # Restrict automatic retries to methods with safe/idempotent semantics.
+        retryable_method = method.upper() in {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
+        # Non-idempotent requests still get one retry after an explicit 401:
+        # authentication rejection guarantees the mutation was not accepted.
+        max_retries = 3 if retryable_method else 2
         for attempt in range(max_retries):
             try:
                 urlopen_kwargs = {"timeout": self.timeout}
@@ -113,14 +119,14 @@ class GoWaveClient:
                     continue
 
                 # Handle HTTP 429 Rate Limiting with exponential backoff 2, 4, 8s (or Retry-After header)
-                if e.code == 429 and attempt < max_retries - 1:
+                if retryable_method and e.code == 429 and attempt < max_retries - 1:
                     retry_after = e.headers.get("Retry-After")
                     delay = int(retry_after) if retry_after and retry_after.isdigit() else 2 ** (attempt + 1)
                     time.sleep(delay)
                     continue
 
                 # Handle HTTP 5xx Server Errors (500, 502, 503, 504) with backoff 1, 2, 4s
-                if e.code in (500, 502, 503, 504) and attempt < max_retries - 1:
+                if retryable_method and e.code in (500, 502, 503, 504) and attempt < max_retries - 1:
                     delay = 2 ** attempt
                     time.sleep(delay)
                     continue
@@ -129,7 +135,7 @@ class GoWaveClient:
                 error_msg = f"HTTP {e.code} on {method} {endpoint}: {err_body}"
                 raise GoWaveAPIError(error_msg, status_code=e.code, response_body=err_body) from e
             except (urllib.error.URLError, TimeoutError, ConnectionResetError) as e:
-                if attempt == max_retries - 1:
+                if not retryable_method or attempt == max_retries - 1:
                     raise GoWaveAPIError(f"Network error on {method} {endpoint}: {e}") from e
                 time.sleep(1)
 
