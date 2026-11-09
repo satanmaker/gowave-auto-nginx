@@ -118,7 +118,16 @@ def write_journal_atomically(journal_path, journal_data):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.parent / f"{path.name}.tmp"
 
-    with open(tmp_path, "w") as f:
+    # The journal contains rollback before-images (including private config
+    # material); create it as 0600 before writing and never follow a pre-planted
+    # temporary symlink.
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+        0o600,
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        os.fchmod(f.fileno(), 0o600)
         json.dump(journal_data, f, indent=2)
         f.flush()
         os.fsync(f.fileno())

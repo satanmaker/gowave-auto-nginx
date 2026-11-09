@@ -664,12 +664,22 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
         except ImportError:
             def write_journal_atomically(p, d):
                 tmp = f"{p}.tmp"
-                with open(tmp, "w") as f:
+                fd = os.open(
+                    tmp,
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                    0o600,
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    os.fchmod(f.fileno(), 0o600)
                     json.dump(d, f, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
-                os.chmod(tmp, 0o600)
                 os.replace(tmp, p)
+                dir_fd = os.open(str(Path(p).parent), os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
 
     journal_file = Path(journal_path)
     if not journal_file.exists():

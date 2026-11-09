@@ -3,6 +3,7 @@ import http.server
 import io
 import json
 import os
+import stat
 from pathlib import Path
 import tempfile
 import threading
@@ -16,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 import sys
 sys.path.insert(0, str(REPO_ROOT))
 from modules.api_client import GoWaveAPIError, GoWaveClient, atomic_write_state, save_credentials, rollback_provisioning, _extract_list
+from modules.recovery import write_journal_atomically
 
 
 class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
@@ -240,6 +242,39 @@ class TestAPIClient(unittest.TestCase):
         ) as urlopen, mock.patch("modules.api_client.time.sleep"):
             self.assertEqual(client.request("GET", "/api/nodes"), {"ok": True})
         self.assertEqual(urlopen.call_count, 2)
+
+    def test_recovery_journal_is_created_with_private_permissions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = Path(tmpdir) / "journal.json"
+            tmp_path = Path(f"{journal_path}.tmp")
+            tmp_path.write_text("stale temporary data")
+            tmp_path.chmod(0o644)
+            write_journal_atomically(str(journal_path), {
+                "transaction_id": "provision_private_journal",
+                "op": "provision",
+                "state": "PROVISION_PREPARED",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": {},
+            })
+            self.assertEqual(stat.S_IMODE(journal_path.stat().st_mode), 0o600)
+
+    def test_recovery_journal_refuses_temporary_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = Path(tmpdir) / "journal.json"
+            target = Path(tmpdir) / "do-not-overwrite.txt"
+            tmp_path = Path(f"{journal_path}.tmp")
+            target.write_text("sentinel")
+            tmp_path.symlink_to(target)
+            with self.assertRaises(OSError):
+                write_journal_atomically(str(journal_path), {
+                    "transaction_id": "provision_symlink_journal",
+                    "op": "provision",
+                    "state": "PROVISION_PREPARED",
+                    "timestamp": "2026-11-08T00:00:00Z",
+                    "entities": {},
+                })
+            self.assertEqual(target.read_text(), "sentinel")
+            self.assertTrue(tmp_path.is_symlink())
 
     def test_save_credentials(self):
         with tempfile.TemporaryDirectory() as tmpdir:
