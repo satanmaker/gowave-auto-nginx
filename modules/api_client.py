@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import stat
 import string
 import sys
 import time
@@ -689,12 +690,20 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
                     os.close(dir_fd)
 
     journal_file = Path(journal_path)
-    if not journal_file.exists():
+    if not journal_file.exists() and not journal_file.is_symlink():
         return True
 
     try:
-        with open(journal_file, "r") as f:
-            journal_data = json.load(f)
+        journal_fd = os.open(
+            str(journal_file),
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        with os.fdopen(journal_fd, "r", encoding="utf-8") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise OSError("recovery journal is not a regular file")
+            journal_data = json.load(stream)
+    except FileNotFoundError:
+        return True
     except Exception as e:
         print(f"Warning: Failed to load recovery journal ({type(e).__name__}).", file=sys.stderr)
         return False

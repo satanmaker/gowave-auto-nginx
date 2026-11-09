@@ -616,6 +616,40 @@ class TestAPIClient(unittest.TestCase):
             updated_jdata = json.loads(jfile.read_text())
             self.assertEqual(updated_jdata["state"], "PROVISION_ROLLED_BACK")
 
+    def test_rollback_rejects_dangling_symlink_recovery_journal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            jfile.symlink_to(Path(tmpdir) / "missing-target.json")
+            stderr = io.StringIO()
+
+            with mock.patch("sys.stderr", stderr):
+                result = rollback_provisioning(
+                    str(jfile),
+                    str(Path(tmpdir) / "state.json"),
+                    str(Path(tmpdir) / "missing-credentials.txt"),
+                )
+
+            self.assertFalse(result)
+            self.assertIn("OSError", stderr.getvalue())
+            self.assertTrue(jfile.is_symlink())
+
+    def test_rollback_rejects_non_regular_recovery_journal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.fifo"
+            os.mkfifo(jfile)
+            stderr = io.StringIO()
+
+            with mock.patch("sys.stderr", stderr):
+                result = rollback_provisioning(
+                    str(jfile),
+                    str(Path(tmpdir) / "state.json"),
+                    str(Path(tmpdir) / "missing-credentials.txt"),
+                )
+
+            self.assertFalse(result)
+            self.assertIn("OSError", stderr.getvalue())
+            self.assertTrue(jfile.exists())
+
     def test_rollback_journal_parse_error_does_not_echo_file_contents(self):
         marker = "sensitive-journal-content-marker"
         with tempfile.TemporaryDirectory() as tmpdir:
