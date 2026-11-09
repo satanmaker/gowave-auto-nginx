@@ -463,19 +463,21 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
     def test_panel_client_untrusted_ca_rejection(self):
         untrusted_ctx = ssl.create_default_context(cafile=str(self.untrusted_ca))
         panel_client = E2EPanelClient(panel_domain=f"localhost:{self.port}", ssl_context=untrusted_ctx, timeout=5)
-        with self.assertRaises(Exception) as cm:
+        with self.assertRaises(GoWaveAPIError) as cm:
             panel_client.login("admin", "correct")
         err_str = str(cm.exception).lower()
-        self.assertTrue("certificate verify failed" in err_str or "ssl" in err_str or "untrusted" in err_str)
+        self.assertIn("tls verification error", err_str)
+        self.assertNotIn("certificate verify failed", err_str)
 
     def test_panel_client_hostname_verification(self):
         trusted_ctx = ssl.create_default_context(cafile=str(self.ca_crt))
         # Point to wrong hostname that is not in SAN (127.0.0.1 while SAN has localhost only)
         panel_client = E2EPanelClient(panel_domain=f"127.0.0.1:{self.port}", ssl_context=trusted_ctx, timeout=5)
-        with self.assertRaises(Exception) as cm:
+        with self.assertRaises(GoWaveAPIError) as cm:
             panel_client.login("admin", "correct")
         err_str = str(cm.exception).lower()
-        self.assertTrue("certificate" in err_str or "hostname" in err_str or "match" in err_str)
+        self.assertIn("tls verification error", err_str)
+        self.assertNotIn("127.0.0.1", err_str)
 
     def test_panel_client_timeout_propagation(self):
         trusted_ctx = ssl.create_default_context(cafile=str(self.ca_crt))

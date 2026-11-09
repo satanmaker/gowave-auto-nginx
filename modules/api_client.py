@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import ssl
 import stat
 import string
 import sys
@@ -157,12 +158,22 @@ class GoWaveClient:
                     time.sleep(delay)
                     continue
 
-                # Parse JSON error if available
-                error_msg = f"HTTP {e.code} on {method} {endpoint}: {err_body}"
+                # Keep the raw response available to programmatic callers, but never
+                # include an untrusted response body in an exception string/traceback.
+                error_msg = f"HTTP {e.code} on {method} {endpoint}"
                 raise GoWaveAPIError(error_msg, status_code=e.code, response_body=err_body) from e
             except (urllib.error.URLError, TimeoutError, ConnectionResetError) as e:
                 if not retryable_method or attempt == max_retries - 1:
-                    raise GoWaveAPIError(f"Network error on {method} {endpoint}: {e}") from e
+                    reason = getattr(e, "reason", None)
+                    if isinstance(reason, ssl.SSLCertVerificationError):
+                        category = "TLS verification error"
+                    elif isinstance(reason, ssl.SSLError):
+                        category = "TLS error"
+                    else:
+                        category = type(e).__name__
+                    raise GoWaveAPIError(
+                        f"Network error on {method} {endpoint} ({category})"
+                    ) from None
                 time.sleep(1)
 
     def register_initial_admin(self, username, password):
@@ -185,7 +196,7 @@ class GoWaveClient:
         if isinstance(res, dict):
             token = res.get("response", {}).get("accessToken") or res.get("accessToken")
         if not token:
-            raise GoWaveAPIError(f"Failed to obtain accessToken from login response: {res}")
+            raise GoWaveAPIError("Failed to obtain accessToken from login response")
         self.token = token
         self.token_expiry = time.time() + (12 * 3600) - 300
         return token
@@ -209,7 +220,7 @@ class GoWaveClient:
             public_key = data[0].get("publicKey")
 
         if not private_key or not public_key:
-            raise GoWaveAPIError(f"Invalid x25519 response: {res}")
+            raise GoWaveAPIError("Invalid x25519 response: required key material is missing")
         return {"privateKey": private_key, "publicKey": public_key}
 
     def compile_config_profile(self, node_name, reality_domain, private_key, short_ids=None, public_key=None, vision_domain=None, panel_domain=None):

@@ -826,6 +826,46 @@ class TestAPIClient(unittest.TestCase):
                 self.assertIn("API side effects may exist", journal["rollback_error"])
                 self.assertIn("automatic rollback is unsafe", stderr.getvalue())
 
+    def test_http_error_message_does_not_echo_response_body(self):
+        marker = "private-api-response-secret-marker"
+        http_error = urllib.error.HTTPError(
+            "http://panel.example.test/api/nodes",
+            500,
+            "Internal Server Error",
+            {},
+            io.BytesIO(marker.encode("utf-8")),
+        )
+        client = GoWaveClient("http://panel.example.test")
+        with mock.patch("modules.api_client.urllib.request.urlopen", side_effect=http_error):
+            with self.assertRaises(GoWaveAPIError) as ctx:
+                client.request("POST", "/api/nodes", {"name": "worker-1"})
+        self.assertIn("HTTP 500 on POST /api/nodes", str(ctx.exception))
+        self.assertNotIn(marker, str(ctx.exception))
+        self.assertEqual(ctx.exception.response_body, marker)
+
+    def test_network_error_message_and_traceback_do_not_echo_transport_details(self):
+        marker = "transport-secret-marker"
+        client = GoWaveClient("http://panel.example.test")
+        with mock.patch(
+            "modules.api_client.urllib.request.urlopen",
+            side_effect=urllib.error.URLError(marker),
+        ):
+            with self.assertRaises(GoWaveAPIError) as ctx:
+                client.request("POST", "/api/nodes", {"name": "worker-1"})
+        self.assertNotIn(marker, str(ctx.exception))
+        self.assertIsNone(ctx.exception.__cause__)
+
+    def test_login_and_x25519_errors_do_not_echo_response_payloads(self):
+        marker = "private-key-or-token-marker"
+        client = GoWaveClient("http://panel.example.test")
+        with mock.patch.object(client, "request", return_value={"response": {"message": marker}}):
+            with self.assertRaises(GoWaveAPIError) as login_error:
+                client.login("admin", "password")
+            with self.assertRaises(GoWaveAPIError) as key_error:
+                client.generate_x25519()
+        self.assertNotIn(marker, str(login_error.exception))
+        self.assertNotIn(marker, str(key_error.exception))
+
     def test_empty_prepared_journal_rolls_back_without_api_login(self):
         """A PREPARED journal with no recorded side effects is safe to close without credentials."""
         with tempfile.TemporaryDirectory() as tmpdir:
