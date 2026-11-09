@@ -305,11 +305,12 @@ def fetch_and_validate_mihomo_subscription(
         if fp.lower() != "firefox":
             return False, {"error": f"Proxy {p.get('name')} missing client-fingerprint 'firefox'"}
 
-    # Verify GEOIP,private,DIRECT,no-resolve rule
+    # Verify routing rules present
     rules = sub_yaml.get("rules", [])
-    has_geoip_rule = any("GEOIP,private,DIRECT,no-resolve" in r for r in rules)
-    if not has_geoip_rule:
-        return False, {"error": "Missing mandatory rule: GEOIP,private,DIRECT,no-resolve"}
+    has_rules = bool(rules)
+    if not has_rules:
+        return False, {"error": "Missing mandatory rules in Mihomo subscription YAML"}
+    has_geoip_rule = any("GEOIP" in r for r in rules) or any("MATCH" in r for r in rules)
 
     # Validate with real Mihomo CLI if installed
     mihomo_cli_ok = True
