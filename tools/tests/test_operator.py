@@ -122,6 +122,7 @@ class TestLocalOperator(unittest.TestCase):
             "MASTER_PANEL_DOMAIN": "panel.example.net",
             "MASTER_REALITY_DOMAIN": "reality.example.net",
             "MASTER_VISION_DOMAIN": "vision.example.net",
+            "WORKER_VISION_DOMAIN": "worker-vision.example.org",
             "MASTER_SSH_PORT": "2222",
             "MASTER_SSH_USER": "root",
             "WORKER_IP": "93.184.216.35",
@@ -144,8 +145,19 @@ class TestLocalOperator(unittest.TestCase):
             self.assertEqual(output.stat().st_mode & 0o777, 0o600)
             content = output.read_text(encoding="utf-8")
             self.assertIn("MASTER_VISION_DOMAIN=vision.example.net", content)
-            self.assertNotIn("\nWORKER_VISION_DOMAIN=", content)
+            self.assertIn("WORKER_VISION_DOMAIN=worker-vision.example.org", content)
             self.assertNotIn("PASSWORD", content.upper())
+
+    def test_runner_command_selects_preflight_mode(self):
+        from live_vps.operator import _build_runner_command, TOOLS_DIR
+        command = _build_runner_command(Path("/run/config.env"), "run-123", "preflight")
+        self.assertEqual(command[-4:], ["--mode", "preflight", "--run-id", "run-123"])
+        self.assertIn(str(TOOLS_DIR / "test_live_vps.py"), command)
+
+    def test_runner_command_rejects_unsupported_mode(self):
+        from live_vps.operator import _build_runner_command
+        with self.assertRaises(ValueError):
+            _build_runner_command(Path("/run/config.env"), "run-123", "install")
 
 
 if __name__ == "__main__":

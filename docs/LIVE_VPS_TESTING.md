@@ -20,7 +20,9 @@ python -m pip install -r tools/requirements-live-vps.txt
 python3 tools/run_live_vps.py
 ```
 
-The interactive entrypoint collects Master and Worker public IPv4 addresses, SSH ports and root logins, the five required domain names (Master Panel, Master REALITY, Master Vision; Worker NGINX and Worker REALITY), and ACME registration email. Master Vision and Worker Vision are independently optional in the underlying configuration model; the interactive five-domain flow asks for Master Vision and does not require Worker Vision. The controller defaults to Let's Encrypt staging. Production requires an explicit mode selection and a second typed confirmation.
+The interactive entrypoint collects Master and Worker public IPv4 addresses, SSH ports and root logins, the required Master Panel/REALITY and Worker NGINX/REALITY domains, and independent optional Master/Worker Vision domains. The controller defaults to Let's Encrypt staging. Production requires an explicit mode selection and a second typed confirmation.
+
+Run a non-deploying eligibility check first with `python3 tools/run_live_vps.py --mode preflight`. This performs local tool/DNS checks, bootstraps temporary SSH access only after out-of-band host-key confirmation, executes the runner's read-only remote baseline checks, then revokes the temporary keys. It does not install GoWave or modify GoWave services. Use `--mode full` (the default) only after preflight passes and both targets are confirmed disposable.
 
 ## Authentication and cleanup contract
 
@@ -44,6 +46,12 @@ The interactive entrypoint collects Master and Worker public IPv4 addresses, SSH
 - Captures have a 45-second hard lifetime as a crash-safety bound. Only packet counts and evidence metadata are persisted; packet payloads and PCAP files are not.
 - Attribution assumes the control machine reaches both VPS instances from the same public IPv4 address. If NAT, provider filtering, or network topology prevents that, evidence is INCOMPLETE, never a heuristic PASS.
 - The default teardown policy is PRESERVE: temporary SSH access is revoked, but VPS instances are not destroyed and provider snapshots are not restored automatically. Review the report and remove disposable instances through the provider when appropriate.
+
+## Local Multi-Node Podman transport acceptance
+
+Run `sudo tests/podman_testbed.sh multi-node` on a Linux host with rootful Podman. The target builds the systemd test image and creates an isolated three-container network (Control, Master, Worker). It verifies a pinned-key Master-to-Worker root SSH command, a real TLS 1.3 mTLS request, rejection of absent and untrusted client certificates, and Worker TCP/3002 source filtering (Master allowed, Control dropped). The workflow executes this test on GitHub Actions as a separate job.
+
+This is a transport/firewall integration test, not a substitute for live GoWave acceptance: it does not install the GoWave Panel/Node binaries, register a Worker through the Panel API, validate subscription payloads, or exercise Xray/Mihomo client proxy traffic. Those assertions remain in the two-disposable-VPS Live E2E.
 
 ## Results and acceptance boundary
 

@@ -17,10 +17,16 @@ See `proposal.md — Why` for motivation. Key implementation constraints derived
   production-compatible; the local operator controller selects staging unless production is explicitly chosen.
 - `modules/node.sh` falls back to `curl -fsSL https://raw.githubusercontent.com/aaaSaZaN/gowave-node/main/install.sh`
   when no bundled installer is present; E2E runs must gate on bundled installer with verified SHA256.
-- `tests/podman_testbed.sh multi-node` returns exit `77` — real distributed E2E is not implemented.
+- `tests/podman_testbed.sh multi-node` runs an isolated three-container transport acceptance (pinned SSH, TLS 1.3 mTLS, negative client-certificate cases, and Worker TCP/3002 source filtering). It does not install GoWave Panel/Node or test subscriptions/client proxy traffic; those remain live-VPS acceptance responsibilities.
 - Existing 5-suite CI continues unchanged; Live VPS E2E is a separate acceptance tier.
 
 ---
+
+## Local Multi-Node Podman Test Boundary
+
+The Podman multi-node target creates isolated Control, Master, and Worker systemd containers on a private Podman network. It validates the real SSH trust/command path, TLS 1.3 mutual authentication (positive, absent-certificate, and untrusted-certificate cases), and source-address filtering on Worker TCP/3002. Rootful Podman is required because the test inserts INPUT-chain rules inside the privileged Worker network namespace. The CI job is independent of the live-VPS credentials and never contacts external VPS targets.
+
+This test is intentionally named transport acceptance: it does not start upstream GoWave Panel/Node binaries, create Panel API entities, or validate subscriptions and Xray/Mihomo proxy traffic. Those product-level checks are performed only by the separate live-VPS runner; a Podman transport PASS must not be reported as full GoWave E2E acceptance.
 
 ## Goals / Non-Goals
 
