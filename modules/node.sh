@@ -135,6 +135,17 @@ install_local_node() {
     configure_node_env "$GOWAVE_NODE_INSTALL_DIR" "$secret_key" "$node_port"
     deploy_node_systemd_dropins "$node_port"
 
+    # Install pinned Xray core version if explicitly configured and mismatched
+    if [[ -n "${XRAY_SERVER_VERSION:-}" && -x "$GOWAVE_NODE_INSTALL_DIR/gowave-node" ]]; then
+        local cur_core
+        cur_core=$("$GOWAVE_NODE_INSTALL_DIR/rw-core" version 2>/dev/null || true)
+        if ! echo "$cur_core" | grep -q "${XRAY_SERVER_VERSION#v}"; then
+            echo "Installing explicit Xray server version $XRAY_SERVER_VERSION..."
+            "$GOWAVE_NODE_INSTALL_DIR/gowave-node" core install --version "v${XRAY_SERVER_VERSION#v}" -y 2>/dev/null || \
+            "$GOWAVE_NODE_INSTALL_DIR/gowave-node" core install --version "${XRAY_SERVER_VERSION#v}" -y 2>/dev/null || true
+        fi
+    fi
+
     # Isolate local node from external network access
     if command -v ufw >/dev/null 2>&1; then
         echo "UFW: Enforcing external isolation on port $node_port/tcp..."

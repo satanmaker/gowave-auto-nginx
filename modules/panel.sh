@@ -86,15 +86,41 @@ download_panel_release() {
     fetch_panel_asset() {
         local name="$1"
         local target="$2"
-        if ! curl -fsSL --connect-timeout 15 "$tag_url/$name" -o "$target" 2>/dev/null; then
+        local candidate_urls=()
+        if [[ "$version" == "latest" ]]; then
+            candidate_urls+=("$base_url/latest/download/$name")
+        else
+            candidate_urls+=("$base_url/download/$version/$name")
+            if [[ "$version" == v* ]]; then
+                candidate_urls+=("$base_url/download/${version#v}/$name")
+            else
+                candidate_urls+=("$base_url/download/v${version}/$name")
+            fi
+        fi
+
+        local downloaded=0
+        for u in "${candidate_urls[@]}"; do
+            if curl -fsSL --retry 2 --connect-timeout 15 "$u" -o "$target" 2>/dev/null; then
+                if [[ -s "$target" ]]; then
+                    downloaded=1
+                    break
+                fi
+            fi
+        done
+
+        if [[ "$downloaded" -eq 0 ]]; then
             echo "Direct download failed for $name; attempting GitHub API fallback..."
             local api_url
-            api_url=$(curl -s "https://api.github.com/repos/${GOWAVE_REPO}/releases" | python3 -c "
+            api_url=$(curl -fsSL "https://api.github.com/repos/${GOWAVE_REPO}/releases" 2>/dev/null | python3 -c "
 import sys, json
 try:
     releases = json.load(sys.stdin)
+    v_target = '$version'
+    v_clean = v_target.lstrip('v')
     for r in releases:
-        if '$version' == 'latest' or r.get('tag_name') == '$version':
+        tag = r.get('tag_name', '')
+        tag_clean = tag.lstrip('v')
+        if v_target == 'latest' or tag == v_target or tag_clean == v_clean:
             for a in r.get('assets', []):
                 if a.get('name') == '$name':
                     print(a.get('url'))
@@ -103,9 +129,10 @@ except Exception:
     pass
 " 2>/dev/null || true)
             if [[ -n "$api_url" ]]; then
-                curl -fsSL -H "Accept: application/octet-stream" "$api_url" -o "$target"
+                curl -fsSL --retry 2 -H "Accept: application/octet-stream" "$api_url" -o "$target"
             fi
         fi
+        [[ -s "$target" ]] || return 1
     }
 
     if [[ -z "$bin_source" ]]; then
