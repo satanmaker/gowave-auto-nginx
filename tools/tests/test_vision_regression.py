@@ -277,6 +277,40 @@ vision_domain=vision.example.test
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Could not remove transaction-created renewal config", result.stderr)
 
+    def test_deploy_hook_rollback_rejects_invalid_manifest_and_propagates_remove_failure(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            recovery = root / "recovery"
+            hook = root / "gowave-nginx.sh"
+            hook.write_text("#!/bin/sh\nexit 0\n")
+            tx = "hook_rollback_test"
+            manifest = recovery / tx / "deploy-hook-manifest.json"
+            manifest.parent.mkdir(parents=True)
+            digest = hashlib.sha256(hook.read_bytes()).hexdigest()
+            valid = {"transaction_id": tx, "path": str(hook), "created_by_tx": True, "sha256": digest}
+            manifest.write_text(json.dumps(valid))
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_rm = fake_bin / "rm"
+            fake_rm.write_text("#!/bin/sh\nexit 1\n")
+            fake_rm.chmod(0o755)
+            env = {**os.environ, "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}"}
+            command = ['source "$1" && rollback_managed_deploy_hook "$2" "$3" "$4"', "bash", NGINX_SH, tx, str(hook), str(recovery)]
+            failed_remove = subprocess.run(["bash", "-c", *command], env=env, text=True, capture_output=True, check=False)
+            self.assertNotEqual(failed_remove.returncode, 0)
+            self.assertTrue(hook.exists())
+            manifest.write_text('{ malformed json')
+            invalid_manifest = subprocess.run(["bash", "-c", *command], env=os.environ.copy(), text=True, capture_output=True, check=False)
+            self.assertNotEqual(invalid_manifest.returncode, 0)
+            self.assertTrue(hook.exists())
+            self.assertIn("ownership manifest is invalid", invalid_manifest.stderr)
+            manifest.unlink()
+            missing_manifest = subprocess.run(["bash", "-c", *command], env=os.environ.copy(), text=True, capture_output=True, check=False)
+            self.assertNotEqual(missing_manifest.returncode, 0)
+            self.assertTrue(hook.exists())
+            self.assertIn("exists without an ownership manifest", missing_manifest.stderr)
+
     def test_worker_compensation_removes_vision_artifacts_and_restores_lineage(self):
         """Worker ERR compensation removes the Vision fallback and restores its ACME lineage."""
         node_script = (REPO_ROOT / "gowave-node-auto.sh").read_text(encoding="utf-8")
