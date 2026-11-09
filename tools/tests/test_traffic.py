@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
@@ -13,10 +13,12 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from live_vps.traffic import (
     evaluate_traffic_suite_status,
-    get_server_rx_packets,
-    parse_proc_net_dev_rx_packets,
     classify_server_host,
     run_mihomo_traffic_suite,
+    start_ingress_capture,
+    stop_ingress_capture,
+    finish_pair_ingress,
+    get_xray_server_port,
 )
 
 
@@ -48,12 +50,106 @@ class TestTrafficModule(unittest.TestCase):
         self.assertEqual(status, "FAIL")
 
     def test_status_gate_when_all_pass(self):
+        evidence = {
+            "status": "PASS", "target_packets": 4, "offload_packets": 0,
+            "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
+        }
         status = evaluate_traffic_suite_status(
             test_traffic_verification=True,
-            xray_results=[{"status": "PASS"}, {"status": "PASS"}],
-            mihomo_results={"status": "PASS"},
+            xray_results=[dict(evidence), dict(evidence)],
+            mihomo_results={"status": "PASS", "results": [dict(evidence)]},
         )
         self.assertEqual(status, "PASS")
+
+    def test_status_gate_rejects_pass_without_per_case_ingress_evidence(self):
+        status = evaluate_traffic_suite_status(
+            test_traffic_verification=True,
+            xray_results=[{"status": "PASS"}],
+            mihomo_results={"status": "PASS", "results": [{"status": "PASS"}]},
+        )
+        self.assertEqual(status, "INCOMPLETE")
+
+    def test_status_gate_fails_when_offload_host_received_test_source_packets(self):
+        evidence = {
+            "status": "PASS", "target_packets": 4, "offload_packets": 1,
+            "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
+        }
+        status = evaluate_traffic_suite_status(
+            test_traffic_verification=True,
+            xray_results=[evidence],
+            mihomo_results={"status": "PASS", "results": [evidence]},
+        )
+        self.assertEqual(status, "FAIL")
+
+    def test_observed_case_failure_dominates_incomplete_other_client(self):
+        status = evaluate_traffic_suite_status(
+            test_traffic_verification=True,
+            xray_results=[{"status": "FAIL"}],
+            mihomo_results={"status": "INCOMPLETE", "results": []},
+        )
+        self.assertEqual(status, "FAIL")
+
+
+    def test_xray_server_port_is_extracted_and_validated(self):
+        self.assertEqual(
+            get_xray_server_port({"settings": {"vnext": [{"address": "proxy.test", "port": 443}]}}),
+            443,
+        )
+        self.assertEqual(
+            get_xray_server_port({"settings": {"servers": [{"address": "proxy.test", "port": "8443"}]}}),
+            8443,
+        )
+        self.assertIsNone(get_xray_server_port({"settings": {"vnext": []}}))
+        self.assertIsNone(get_xray_server_port({"settings": {"vnext": [{"port": 70000}]}}))
+        self.assertIsNone(get_xray_server_port({"settings": None}))
+
+    def test_start_ingress_capture_uses_source_filter_and_excludes_ssh_port(self):
+        ssh = MagicMock()
+        ssh.port = 2222
+        ssh.run.return_value = MagicMock(ok=True, stdout="", stderr="")
+        capture = start_ingress_capture(ssh, "198.51.100.25", 443)
+        self.assertIsNotNone(capture)
+        command = ssh.run.call_args.args[0]
+        self.assertIn("timeout --signal=INT 45s tcpdump", command)
+        self.assertIn("tcpdump -nn -i any -Q in -l", command)
+        self.assertIn("src host 198.51.100.25 and tcp and dst port 443 and not dst port 2222", command)
+
+
+    def test_start_ingress_capture_rejects_invalid_or_ssh_target_port(self):
+        ssh = MagicMock()
+        ssh.port = 2222
+        self.assertIsNone(start_ingress_capture(ssh, "198.51.100.25", 0))
+        self.assertIsNone(start_ingress_capture(ssh, "198.51.100.25", 2222))
+        self.assertIsNone(start_ingress_capture(ssh, "not-an-ip", 443))
+        ssh.run.assert_not_called()
+
+    def test_stop_ingress_capture_requires_tcpdump_summary(self):
+        ssh = MagicMock()
+        ssh.run.return_value = MagicMock(ok=True, stdout="3 packets captured\n", stderr="")
+        self.assertEqual(
+            stop_ingress_capture(ssh, {"log_path": "/run/cap.log", "pid_path": "/run/cap.pid"}),
+            3,
+        )
+        ssh.run.return_value = MagicMock(ok=True, stdout="listening on any\n", stderr="")
+        self.assertIsNone(
+            stop_ingress_capture(ssh, {"log_path": "/run/cap.log", "pid_path": "/run/cap.pid"}),
+        )
+
+    def test_finish_pair_ingress_proves_target_and_rejects_offload(self):
+        master = MagicMock()
+        worker = MagicMock()
+        master.run.return_value = MagicMock(ok=True, stdout="0 packets captured\n", stderr="")
+        worker.run.return_value = MagicMock(ok=True, stdout="5 packets captured\n", stderr="")
+        evidence = finish_pair_ingress(
+            master, worker,
+            ({"log_path": "/m.log", "pid_path": "/m.pid"},
+             {"log_path": "/w.log", "pid_path": "/w.pid"}),
+            True,
+        )
+        self.assertEqual(evidence["target_packets"], 5)
+        self.assertEqual(evidence["offload_packets"], 0)
+        self.assertTrue(evidence["target_ingress_ok"])
+        self.assertTrue(evidence["offload_ok"])
 
     def test_empty_xray_evidence_is_incomplete(self):
         self.assertEqual(
@@ -90,30 +186,6 @@ class TestTrafficModule(unittest.TestCase):
         self.assertIs(classify_server_host("203.0.113.20", config), True)
         self.assertIs(classify_server_host("203.0.113.10", config), False)
         self.assertIsNone(classify_server_host("proxy-name-contains-worker", config))
-
-    def test_parse_proc_net_dev_rx_packet_columns_and_interface_filter(self):
-        sample = (
-            "Inter-| Receive | Transmit\n"
-            " face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n"
-            "    lo: 100 999 0 0 0 0 0 0 100 999 0 0 0 0 0 0\n"
-            "  ens3: 2000 7 0 0 0 0 0 0 3000 9 0 0 0 0 0 0\n"
-            "docker0: 4000 100 0 0 0 0 0 0 5000 100 0 0 0 0 0 0\n"
-            " enp1s0: 6000 11 0 0 0 0 0 0 7000 13 0 0 0 0 0 0\n"
-        )
-        self.assertEqual(parse_proc_net_dev_rx_packets(sample), 18)
-
-    def test_get_server_rx_packets_reads_proc_net_dev(self):
-        mock_ssh = MagicMock()
-        mock_ssh.run.return_value = MagicMock(
-            ok=True,
-            stdout=(
-                "Inter-| Receive | Transmit\n"
-                " face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n"
-                "  ens3: 2000 7 0 0 0 0 0 0 3000 9 0 0 0 0 0 0\n"
-            ),
-        )
-        self.assertEqual(get_server_rx_packets(mock_ssh), 7)
-        mock_ssh.run.assert_called_once_with("cat /proc/net/dev")
 
     def test_mihomo_traffic_disabled_config_returns_incomplete(self):
         config = MagicMock()

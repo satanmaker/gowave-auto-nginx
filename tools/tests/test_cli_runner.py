@@ -59,7 +59,7 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
     def test_vision_preflight_passes_when_supported(self):
         config = SimpleNamespace(
             master_vision_domain="vision-master.example.com",
-            worker_vision_domain="vision-worker.example.com",
+            worker_vision_domain=None,
         )
         baseline = {
             "existing_gowave_dirs": [],
@@ -87,15 +87,15 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
         self.assertEqual(get_git_head_commit(), "dirty_worktree")
         run.assert_called_once()
 
-    def test_workflow_writes_real_newlines_to_env_config(self):
-        workflow = (REPO_ROOT / ".github" / "workflows" / "live-vps-e2e.yml").read_text(encoding="utf-8")
-        self.assertIn(r'target.write_text("\n".join(lines) + "\n"', workflow)
-        self.assertNotIn(r'target.write_text("\\n".join(lines) + "\\n"', workflow)
-        self.assertIn(r'''printf '%s\n' "$LIVE_VPS_CONFIG"''', workflow)
-        self.assertIn(r'''MIHOMO_VERSION="$(printf '%s\n' "$LIVE_VPS_CONFIG"''', workflow)
-        self.assertIn(r'''printf '%s\n' "$MASTER_KNOWN_HOSTS"''', workflow)
-        self.assertIn(r'''printf '%s\n' "$WORKER_KNOWN_HOSTS"''', workflow)
-        self.assertNotIn(r'''printf '%s\\n' ''', workflow)
+    def test_live_e2e_uses_local_operator_not_github_secret_inputs(self):
+        workflow = REPO_ROOT / ".github" / "workflows" / "live-vps-e2e.yml"
+        self.assertFalse(workflow.exists())
+        operator = (REPO_ROOT / "tools" / "live_vps" / "operator.py").read_text(encoding="utf-8")
+        self.assertIn("getpass.getpass", operator)
+        self.assertIn("Type the complete fingerprint to confirm this host", operator)
+        self.assertIn("systemctl enable --now", operator)
+        self.assertNotIn("MASTER_SSH_PASSWORD", operator)
+        self.assertNotIn("WORKER_SSH_PASSWORD", operator)
 
     def test_non_vision_preflight_passes_with_integrated_pair_lock(self):
         config = SimpleNamespace(

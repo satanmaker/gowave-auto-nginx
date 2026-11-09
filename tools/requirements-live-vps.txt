@@ -1,0 +1,4 @@
+# Dependencies for the interactive local Live VPS controller.
+# Install in a dedicated virtual environment; the existing E2E runner also requires PyYAML.
+paramiko==3.5.1
+PyYAML==6.0.2
