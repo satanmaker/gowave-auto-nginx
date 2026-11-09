@@ -361,10 +361,9 @@ client = GoWaveClient("http://127.0.0.1:3000")
 client.register_initial_admin(admin_user, admin_password)
 client.login(admin_user, admin_password)
 
-journal["state"] = "PROVISION_APPLYING"
-write_journal_atomically(journal_path, journal)
-
 def persist_transaction_entities(entities):
+    journal["state"] = "PROVISION_APPLYING"
+    journal["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     journal["entities"] = list(entities)
     write_journal_atomically(journal_path, journal)
 
@@ -652,6 +651,8 @@ journal = {
 write_journal_atomically(journal_path, journal)
 
 def persist_transaction_entities(entities):
+    journal["state"] = "NODE_ADD_APPLYING"
+    journal["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     journal["entities"] = list(entities)
     write_journal_atomically(journal_path, journal)
 

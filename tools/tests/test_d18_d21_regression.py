@@ -309,8 +309,8 @@ class TestD18D21RegressionSuite(unittest.TestCase):
         self.assertIn('if [[ "${_COMPENSATED:-0}" -eq 0 ]]; then', node_script)
         self.assertIn("compensate_remote_worker", node_script)
 
-    def test_d20_uncommitted_journal_recovery_reconciles_state(self):
-        """An uncommitted transaction journal is reconciled before new work."""
+    def test_d20_empty_applying_journal_requires_operator_recovery(self):
+        """An empty APPLYING ledger is ambiguous and must not be reported as rolled back."""
 
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
@@ -334,9 +334,10 @@ class TestD18D21RegressionSuite(unittest.TestCase):
                 str(journal_file), str(state_file),
                 base_url="http://127.0.0.1:9999"
             )
-            self.assertTrue(ok)
+            self.assertFalse(ok)
             updated_journal = json.loads(journal_file.read_text())
-            self.assertEqual(updated_journal["state"], "PROVISION_ROLLED_BACK")
+            self.assertEqual(updated_journal["state"], "PROVISION_ROLLBACK_REQUIRED")
+            self.assertIn("API side effects may exist", updated_journal["rollback_error"])
 
     # --------------------------------------------------------------------------
     # D21: Published AAAA Behavior in Both IPv6 Modes

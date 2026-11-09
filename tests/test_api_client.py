@@ -726,6 +726,59 @@ class TestAPIClient(unittest.TestCase):
             self.assertIn("GoWaveAPIError", journal["rollback_errors"][0])
             self.assertIn("HTTP 500", journal["rollback_errors"][0])
 
+    def test_post_persists_transaction_checkpoint_before_network_mutation(self):
+        client = GoWaveClient("http://panel.example.test")
+        callback = mock.Mock()
+        client.transaction_callback = callback
+        response = mock.MagicMock()
+        response.read.return_value = b'{"ok":true}'
+        response.headers.get.return_value = "application/json"
+        opener = mock.MagicMock()
+        opener.__enter__.return_value = response
+
+        with mock.patch("modules.api_client.urllib.request.urlopen", return_value=opener) as urlopen:
+            result = client.request("POST", "/api/nodes", {"name": "worker-1"})
+
+        self.assertEqual(result, {"ok": True})
+        callback.assert_called_once_with([])
+        urlopen.assert_called_once()
+
+    def test_post_aborts_before_network_when_transaction_checkpoint_fails(self):
+        client = GoWaveClient("http://panel.example.test")
+        client.transaction_callback = mock.Mock(side_effect=OSError("journal unavailable"))
+        with mock.patch("modules.api_client.urllib.request.urlopen") as urlopen:
+            with self.assertRaisesRegex(OSError, "journal unavailable"):
+                client.request("POST", "/api/nodes", {"name": "worker-1"})
+        urlopen.assert_not_called()
+
+    def test_empty_applying_journal_requires_manual_rollback(self):
+        cases = (
+            ("provision", "PROVISION_APPLYING", {}, "PROVISION_ROLLBACK_REQUIRED"),
+            ("node_add", "NODE_ADD_APPLYING", [], "NODE_ADD_ROLLBACK_REQUIRED"),
+        )
+        for op, state, entities, expected_state in cases:
+            with self.subTest(op=op), tempfile.TemporaryDirectory() as tmpdir:
+                jfile = Path(tmpdir) / "journal.json"
+                jfile.write_text(json.dumps({
+                    "transaction_id": f"{op}_empty_applying",
+                    "op": op,
+                    "state": state,
+                    "node_name": "worker-1" if op == "node_add" else None,
+                    "timestamp": "2026-11-08T00:00:00Z",
+                    "entities": entities,
+                }))
+                stderr = io.StringIO()
+                with mock.patch("sys.stderr", stderr):
+                    result = rollback_provisioning(
+                        str(jfile), str(Path(tmpdir) / "state.json"),
+                        str(Path(tmpdir) / "missing-credentials.txt"),
+                    )
+                self.assertFalse(result)
+                journal = json.loads(jfile.read_text())
+                self.assertEqual(journal["state"], expected_state)
+                self.assertIn("API side effects may exist", journal["rollback_error"])
+                self.assertIn("automatic rollback is unsafe", stderr.getvalue())
+
     def test_empty_prepared_journal_rolls_back_without_api_login(self):
         """A PREPARED journal with no recorded side effects is safe to close without credentials."""
         with tempfile.TemporaryDirectory() as tmpdir:
