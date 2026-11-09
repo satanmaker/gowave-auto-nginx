@@ -311,6 +311,19 @@ vision_domain=vision.example.test
             self.assertTrue(hook.exists())
             self.assertIn("exists without an ownership manifest", missing_manifest.stderr)
 
+    def test_worker_deploy_hook_rollback_copies_share_strict_contract(self):
+        script = (REPO_ROOT / "gowave-node-auto.sh").read_text(encoding="utf-8")
+        matches = list(re.finditer(r"(?ms)^rollback_managed_deploy_hook\(\) \{\n.*?^\}", script))
+        self.assertEqual(len(matches), 3, "expected local, remote-payload, and standalone rollback copies")
+        for match in matches:
+            function = match.group(0)
+            self.assertIn("expected_tx", function)
+            self.assertIn("ownership manifest is invalid", function)
+            self.assertIn("exists without an ownership manifest", function)
+            self.assertIn("digest mismatch", function)
+            self.assertIn('rm -f "$hook_file" || {', function)
+            self.assertIn('sync "$(dirname "$hook_file")" || {', function)
+
     def test_worker_compensation_removes_vision_artifacts_and_restores_lineage(self):
         """Worker ERR compensation removes the Vision fallback and restores its ACME lineage."""
         node_script = (REPO_ROOT / "gowave-node-auto.sh").read_text(encoding="utf-8")
