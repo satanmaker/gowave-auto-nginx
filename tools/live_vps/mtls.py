@@ -187,7 +187,10 @@ print(json.dumps(results))
         parsed["status"] = "INCOMPLETE"
     elif not all(parsed[key] is True for key in required):
         parsed["status"] = "FAIL"
-    elif parsed.get("wrong_sni_observation", {}).get("outcome") == "TLS_REJECTED":
+    wrong_sni = parsed.get("wrong_sni_observation")
+    if not isinstance(wrong_sni, dict):
+        parsed["status"] = "INCOMPLETE"
+    elif wrong_sni.get("outcome") == "TLS_REJECTED":
         parsed["status"] = "PASS"
     else:
         # We observed the handshake but do not yet prove which application
