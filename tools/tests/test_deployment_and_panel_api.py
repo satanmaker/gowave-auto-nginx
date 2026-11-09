@@ -12,7 +12,7 @@ import threading
 import time
 import unittest
 import urllib.error
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 import sys
 
@@ -23,11 +23,15 @@ sys.path.insert(0, str(REPO_ROOT))
 from live_vps.deployment import parse_strace_argv_output, output_matches_pinned_version
 from live_vps.panel_api import E2EPanelClient, read_master_credentials
 from live_vps.mtls import run_mtls_negative_tests
+from live_vps.nginx import verify_panel_https
+from live_vps.subscriptions import verify_user_agent_policy
 from live_vps.ssh import SSHResult
 from modules.api_client import GoWaveClient, GoWaveAPIError
 
 
 class MockServerHandler(http.server.BaseHTTPRequestHandler):
+    seen_subscription_user_agents = []
+
     def do_POST(self):
         content_len = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_len).decode("utf-8")
@@ -47,6 +51,12 @@ class MockServerHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if self.path.startswith("/api/sub/"):
+            user_agent = self.headers.get("User-Agent")
+            type(self).seen_subscription_user_agents.append(user_agent)
+            self.send_response(403 if user_agent in (None, "") else 200)
+            self.end_headers()
+            return
         if self.path == "/api/slow":
             time.sleep(2)
             self.send_response(200)
@@ -223,6 +233,35 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
         ssh.run.return_value = SSHResult(returncode=1, stdout="", stderr="metadata mismatch")
         with self.assertRaises(GoWaveAPIError):
             read_master_credentials(ssh)
+    def test_subscription_policy_sends_absent_and_blank_user_agent(self):
+        trusted_ctx = ssl.create_default_context(cafile=str(self.ca_crt))
+        MockServerHandler.seen_subscription_user_agents.clear()
+        result = verify_user_agent_policy(
+            f"localhost:{self.port}", "opaque-short-uuid", trusted_ctx
+        )
+        self.assertEqual(result["status"], "PASS")
+        seen = MockServerHandler.seen_subscription_user_agents
+        self.assertIn(None, seen)
+        self.assertIn("", seen)
+        self.assertIn("v2rayNG/1.8.5", seen)
+        self.assertIn("clash.meta", seen)
+
+    def test_panel_https_verifier_rejects_502(self):
+        trusted_ctx = ssl.create_default_context(cafile=str(self.ca_crt))
+        error = urllib.error.HTTPError(
+            f"https://localhost:{self.port}/api/nodes", 502, "Bad Gateway", {}, None
+        )
+        with patch("live_vps.nginx.urllib.request.urlopen", side_effect=error):
+            result = verify_panel_https(f"localhost:{self.port}", trusted_ctx)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["http_status"], 502)
+
+    def test_panel_https_verifier_accepts_panel_api(self):
+        trusted_ctx = ssl.create_default_context(cafile=str(self.ca_crt))
+        result = verify_panel_https(f"localhost:{self.port}", trusted_ctx)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["http_status"], 200)
+
     def test_mtls_negative_runner_sends_only_secret_on_stdin(self):
         ssh = MagicMock()
         secret = "base64-secret-payload"
@@ -248,7 +287,7 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
         self.assertNotIn(secret, command)
         self.assertEqual(ssh.run.call_args.kwargs["input_data"], secret)
 
-    def test_mtls_wrong_sni_accepted_is_incomplete_not_failure(self):
+    def test_mtls_wrong_sni_http_routing_does_not_require_tls_alert(self):
         ssh = MagicMock()
         ssh.run.side_effect = [
             SSHResult(returncode=0, stdout="base64-secret", stderr=""),
@@ -257,12 +296,31 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
                 "absent_client_rejected": True,
                 "mismatched_crypto_failed": True,
                 "untrusted_ca_rejected": True,
-                "wrong_sni_observation": {"outcome": "TLS_ESTABLISHED", "version": "TLSv1.3"},
+                "wrong_sni_observation": {
+                    "outcome": "HTTP_RESPONSE",
+                    "version": "TLSv1.3",
+                    "status_line": "HTTP/1.1 421 Misdirected Request",
+                },
+            }), stderr=""),
+        ]
+        result = run_mtls_negative_tests(ssh, "203.0.113.20")
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["wrong_sni_observation"]["outcome"], "HTTP_RESPONSE")
+
+    def test_mtls_wrong_sni_tls_without_routing_response_is_incomplete(self):
+        ssh = MagicMock()
+        ssh.run.side_effect = [
+            SSHResult(returncode=0, stdout="base64-secret", stderr=""),
+            SSHResult(returncode=0, stdout=json.dumps({
+                "untrusted_client_rejected": True,
+                "absent_client_rejected": True,
+                "mismatched_crypto_failed": True,
+                "untrusted_ca_rejected": True,
+                "wrong_sni_observation": {"outcome": "INCOMPLETE", "error": "no response"},
             }), stderr=""),
         ]
         result = run_mtls_negative_tests(ssh, "203.0.113.20")
         self.assertEqual(result["status"], "INCOMPLETE")
-        self.assertEqual(result["wrong_sni_observation"]["outcome"], "TLS_ESTABLISHED")
 
     def test_mtls_failed_required_check_cannot_be_overridden_by_wrong_sni(self):
         ssh = MagicMock()

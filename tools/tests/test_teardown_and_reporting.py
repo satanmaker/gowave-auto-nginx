@@ -209,6 +209,14 @@ class TestTeardownAndReporting(unittest.TestCase):
         txt_content = txt_path.read_text()
         self.assertNotIn("SuperSecretAdminPassword", txt_content)
 
+    def test_summary_reports_actual_production_acme_mode(self):
+        txt_path = write_summary_txt(self.td_path, {
+            "test_run_id": "run-production",
+            "overall": "INCOMPLETE",
+            "trust": {"acme_mode": "production"},
+        })
+        self.assertIn("ACME Mode:      production", txt_path.read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

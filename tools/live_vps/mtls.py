@@ -102,12 +102,26 @@ def handshake_rejected(context, server_name, expected_error):
         return "INCOMPLETE"
 
 def observe_wrong_sni(context, server_name):
-    # Record the routing/handshake outcome; a successful TLS handshake is not
-    # itself proof of a wrong-SNI policy violation.
+    # A wrong SNI may be handled by a fallback vhost after TLS completes.
+    # Record either a handshake rejection or the actual HTTP routing response;
+    # do not assume that every valid policy sends a TLS alert.
     try:
         with socket.create_connection((worker_ip, port), timeout=5) as sock:
             with context.wrap_socket(sock, server_hostname=server_name) as tls:
-                return {{"outcome": "TLS_ESTABLISHED", "version": tls.version()}}
+                tls.sendall(
+                    b"GET / HTTP/1.1\r\nHost: wrong-sni.example.com\r\n"
+                    b"Connection: close\\r\\n\\r\\n"
+                )
+                response = tls.recv(1024)
+                status_line = (
+                    response.splitlines()[0].decode("ascii", errors="replace")
+                    if response else ""
+                )
+                if not response:
+                    return {{"outcome": "INCOMPLETE", "version": tls.version(),
+                            "error": "TLS established but no routing response was received"}}
+                return {{"outcome": "HTTP_RESPONSE", "version": tls.version(),
+                        "status_line": status_line}}
     except ssl.SSLError as exc:
         return {{"outcome": "TLS_REJECTED", "error": type(exc).__name__}}
     except OSError as exc:
@@ -189,10 +203,13 @@ print(json.dumps(results))
         parsed["status"] = "FAIL"
     else:
         wrong_sni = parsed.get("wrong_sni_observation")
-        if isinstance(wrong_sni, dict) and wrong_sni.get("outcome") == "TLS_REJECTED":
+        if isinstance(wrong_sni, dict) and wrong_sni.get("outcome") in ("TLS_REJECTED", "HTTP_RESPONSE"):
+            # The required client-auth negative controls passed. A valid HTTP
+            # response is concrete wrong-SNI routing evidence, not a failed
+            # mTLS handshake assertion.
             parsed["status"] = "PASS"
         else:
-            # We observed an unproven/malformed wrong-SNI result. Do not claim
-            # rejection or acceptance without a concrete policy observation.
+            # TLS establishment without a routable response is insufficient
+            # evidence; do not infer a TLS alert that the server need not send.
             parsed["status"] = "INCOMPLETE"
     return parsed

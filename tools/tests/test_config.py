@@ -84,6 +84,19 @@ TEST_TEARDOWN_POLICY=PRESERVE
             load_config(p)
         self.assertIn("insecure permissions", str(ctx.exception))
 
+    def test_owner_executable_config_mode_rejected(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        with self.assertRaises(PermissionError):
+            load_config(self._write_config(content, mode=0o700))
+
+    def test_config_symlink_rejected(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        target = self._write_config(content)
+        link = self.tmp / "config-link.env"
+        link.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "must not be a symlink"):
+            load_config(link)
+
     def test_unknown_key_rejected(self):
         content = self.valid_content + "\nUNKNOWN_VARIABLE=foo\n"
         content = content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")

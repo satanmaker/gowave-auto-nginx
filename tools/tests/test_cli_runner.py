@@ -9,6 +9,8 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 import sys
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -18,7 +20,10 @@ sys.path.insert(0, str(REPO_ROOT))
 from live_vps.deployment import ACME_MODE_URLS
 from live_vps.negative import run_negative_suite
 from live_vps.traffic import evaluate_traffic_suite_status
-from test_live_vps import load_run_state, save_run_state, build_config_fingerprint
+from test_live_vps import (
+    load_run_state, save_run_state, build_config_fingerprint,
+    evaluate_preflight_eligibility, get_git_head_commit,
+)
 
 
 class TestCLIRunnerAndIntegration(unittest.TestCase):
@@ -50,6 +55,72 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
         changed_config = type("Config", (), {"values": changed})()
         self.assertEqual(build_config_fingerprint(same), build_config_fingerprint(type("Config", (), {"values": dict(base)})()))
         self.assertNotEqual(build_config_fingerprint(same), build_config_fingerprint(changed_config))
+
+    def test_vision_preflight_is_incomplete_before_mutating_phases(self):
+        config = SimpleNamespace(
+            master_vision_domain="vision-master.example.com",
+            worker_vision_domain="vision-worker.example.com",
+        )
+        baseline = {
+            "existing_gowave_dirs": [],
+            "running_services": [],
+            "listening_ports": [],
+        }
+        result = evaluate_preflight_eligibility(
+            config,
+            tools_ok=True,
+            master_trust_ok=True,
+            worker_trust_ok=True,
+            dns_ok=True,
+            master_root_ok=True,
+            worker_root_ok=True,
+            master_baseline=baseline,
+            worker_baseline=baseline,
+        )
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertTrue(result["vision_requested"])
+        self.assertFalse(result["vision_supported"])
+
+    @patch("test_live_vps.subprocess.run")
+    def test_git_head_rejects_dirty_worktree(self, run):
+        run.return_value = MagicMock(returncode=0, stdout=" M tools/test_live_vps.py\n")
+        self.assertEqual(get_git_head_commit(), "dirty_worktree")
+        run.assert_called_once()
+
+    def test_workflow_writes_real_newlines_to_env_config(self):
+        workflow = (REPO_ROOT / ".github" / "workflows" / "live-vps-e2e.yml").read_text(encoding="utf-8")
+        self.assertIn(r'target.write_text("\n".join(lines) + "\n"', workflow)
+        self.assertNotIn(r'target.write_text("\\n".join(lines) + "\\n"', workflow)
+        self.assertIn(r'''printf '%s\n' "$LIVE_VPS_CONFIG"''', workflow)
+        self.assertIn(r'''MIHOMO_VERSION="$(printf '%s\n' "$LIVE_VPS_CONFIG"''', workflow)
+        self.assertIn(r'''printf '%s\n' "$MASTER_KNOWN_HOSTS"''', workflow)
+        self.assertIn(r'''printf '%s\n' "$WORKER_KNOWN_HOSTS"''', workflow)
+        self.assertNotIn(r'''printf '%s\\n' ''', workflow)
+
+    def test_non_vision_preflight_is_incomplete_until_remote_pair_lock_is_integrated(self):
+        config = SimpleNamespace(
+            master_vision_domain=None,
+            worker_vision_domain=None,
+        )
+        baseline = {
+            "existing_gowave_dirs": [],
+            "running_services": [],
+            "listening_ports": [],
+        }
+        result = evaluate_preflight_eligibility(
+            config,
+            tools_ok=True,
+            master_trust_ok=True,
+            worker_trust_ok=True,
+            dns_ok=True,
+            master_root_ok=True,
+            worker_root_ok=True,
+            master_baseline=baseline,
+            worker_baseline=baseline,
+        )
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertFalse(result["remote_pair_lock_supported"])
+        self.assertFalse(result["transactional_restore_supported"])
 
     def test_run_state_load_rejects_symlink(self):
         target = self.artifact_dir / "target.json"
