@@ -230,8 +230,16 @@ PY
         return 0
     }
 
-    generate_bootstrap_acme_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/00-bootstrap-acme.conf" "/proc/net/if_inet6" "$vision_domain"
-    reload_nginx_strict
+    if ! generate_bootstrap_acme_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/00-bootstrap-acme.conf" "/proc/net/if_inet6" "$vision_domain"; then
+        echo "Error: Failed to generate bootstrap ACME NGINX configuration; rolling back certificate lineages." >&2
+        rollback_acme_lineages
+        return 1
+    fi
+    if ! reload_nginx_strict; then
+        echo "Error: Failed to activate bootstrap ACME NGINX configuration; rolling back certificate lineages." >&2
+        rollback_acme_lineages
+        return 1
+    fi
 
     if ! command -v certbot >/dev/null 2>&1; then
         echo "Error: certbot is required for production TLS certificate acquisition but not installed." >&2

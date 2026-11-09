@@ -84,6 +84,25 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
     def tearDown(self):
         clear_secrets()
 
+    def test_bootstrap_acme_nginx_failures_trigger_lineage_rollback(self):
+        """Bootstrap generation and activation failures must enter the ACME rollback path."""
+        script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        install_start = script.index("cmd_install() {")
+        install_end = script.index("\n}\n", install_start)
+        install = script[install_start:install_end]
+
+        generate_failure = install.index("if ! generate_bootstrap_acme_vhost")
+        reload_failure = install.index("if ! reload_nginx_strict", generate_failure)
+        certbot_step = install.index("if ! command -v certbot", reload_failure)
+        bootstrap = install[generate_failure:certbot_step]
+
+        self.assertIn("rollback_acme_lineages", bootstrap)
+        self.assertIn("Failed to generate bootstrap ACME NGINX configuration", bootstrap)
+        self.assertIn("Failed to activate bootstrap ACME NGINX configuration", bootstrap)
+        self.assertIn("return 1", bootstrap)
+        self.assertEqual(bootstrap.count("generate_bootstrap_acme_vhost"), 1)
+        self.assertEqual(bootstrap.count("reload_nginx_strict"), 1)
+
     def test_pinned_version_match_requires_exact_token(self):
         self.assertTrue(output_matches_pinned_version("GoWave Server v0.4.0", "0.4.0"))
         self.assertTrue(output_matches_pinned_version("Xray 25.10.15 (Xray, Penetrates Everything.)", "25.10.15"))
