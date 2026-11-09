@@ -200,7 +200,15 @@ verify_acme_certificate() {
         echo "Error: Certificate $fullchain is expired or not valid within 24 hours" >&2
         return 1
     fi
-    if ! openssl x509 -checkhost "$domain" -noout -in "$fullchain" >/dev/null 2>&1; then
+    # OpenSSL builds differ in whether -checkhost reports a mismatch via
+    # the exit status. Inspect the explicit result text as well, and fail
+    # closed unless the requested hostname is positively confirmed.
+    local host_check
+    if ! host_check=$(openssl x509 -checkhost "$domain" -noout -in "$fullchain" 2>&1); then
+        echo "Error: Certificate SAN/CN does not cover $domain." >&2
+        return 1
+    fi
+    if [[ "$host_check" != "Hostname $domain does match certificate" ]]; then
         echo "Error: Certificate SAN/CN does not cover $domain." >&2
         return 1
     fi

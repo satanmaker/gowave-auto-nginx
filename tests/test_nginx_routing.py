@@ -266,8 +266,20 @@ class TestNginxRouting(unittest.TestCase):
             subprocess.run([
                 "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                 "-keyout", str(key_file), "-out", str(cert_file),
-                "-days", "30", "-subj", "/CN=wrong.example.com"
+                "-days", "30", "-subj", "/CN=wrong.example.com",
+                "-addext", "subjectAltName=DNS:wrong.example.com"
             ], check=True, stderr=subprocess.DEVNULL)
+            # Assert the fixture itself rejects the requested hostname. This
+            # prevents host OpenSSL configuration from silently adding a
+            # matching SAN and turning the negative case into a false positive.
+            fixture_check = subprocess.run([
+                "openssl", "x509", "-checkhost", "vision.example.com",
+                "-noout", "-in", str(cert_file)
+            ], capture_output=True, text=True)
+            self.assertIn(
+                "Hostname vision.example.com does NOT match certificate",
+                fixture_check.stdout,
+            )
             cmd_wrong_host = f'source "{NGINX_SH}" && verify_acme_certificate "vision.example.com" "{live_dir}"'
             res_wrong_host = subprocess.run(["bash", "-c", cmd_wrong_host], capture_output=True, text=True)
             self.assertNotEqual(res_wrong_host.returncode, 0)
@@ -280,7 +292,8 @@ class TestNginxRouting(unittest.TestCase):
             subprocess.run([
                 "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                 "-keyout", str(key_file), "-out", str(cert_file),
-                "-days", "30", "-subj", "/CN=vision.example.com"
+                "-days", "30", "-subj", "/CN=vision.example.com",
+                "-addext", "subjectAltName=DNS:vision.example.com"
             ], check=True, stderr=subprocess.DEVNULL)
             # Overwrite privkey with alt_key
             key_file.write_bytes(alt_key.read_bytes())
@@ -293,7 +306,8 @@ class TestNginxRouting(unittest.TestCase):
             subprocess.run([
                 "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                 "-keyout", str(key_file), "-out", str(cert_file),
-                "-days", "30", "-subj", "/CN=vision.example.com"
+                "-days", "30", "-subj", "/CN=vision.example.com",
+                "-addext", "subjectAltName=DNS:vision.example.com"
             ], check=True, stderr=subprocess.DEVNULL)
             cmd_valid = f'source "{NGINX_SH}" && verify_acme_certificate "vision.example.com" "{live_dir}"'
             self.assertEqual(subprocess.run(["bash", "-c", cmd_valid], capture_output=True).returncode, 0)
