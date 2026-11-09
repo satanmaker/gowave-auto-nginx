@@ -453,47 +453,147 @@ install_managed_deploy_hook() {
 
     verify_deploy_hook_preflight "$hook_file" "$transaction_id" "$recovery_root" || return 1
 
-    local hook_dir
-    hook_dir=$(dirname "$hook_file")
-    mkdir -p "$hook_dir"
-    chmod 0755 "$hook_dir" 2>/dev/null || true
+    local hook_dir resolved_hook_dir metadata owner mode
+    hook_dir=$(dirname "$hook_file") || return 1
+    resolved_hook_dir=$(realpath -m -- "$hook_dir") || {
+        echo "Error: Could not resolve Certbot deploy-hook directory." >&2
+        return 1
+    }
+    if [[ "$resolved_hook_dir" != "$hook_dir" ]]; then
+        echo "Error: Certbot deploy-hook directory contains a symlink or non-normalized path." >&2
+        return 1
+    fi
+    mkdir -p -- "$hook_dir" || {
+        echo "Error: Could not create Certbot deploy-hook directory." >&2
+        return 1
+    }
+    if [[ ! -d "$hook_dir" || -L "$hook_dir" ]]; then
+        echo "Error: Certbot deploy-hook directory is not a real directory." >&2
+        return 1
+    fi
+    metadata=$(stat -c '%u:%a' -- "$hook_dir") || {
+        echo "Error: Could not verify Certbot deploy-hook directory." >&2
+        return 1
+    }
+    owner="${metadata%%:*}"
+    if [[ "$owner" != "$(id -u)" ]]; then
+        echo "Error: Certbot deploy-hook directory is not owned by the current user." >&2
+        return 1
+    fi
+    chmod 0755 -- "$hook_dir" || {
+        echo "Error: Could not enforce Certbot deploy-hook directory permissions." >&2
+        return 1
+    }
+    metadata=$(stat -c '%u:%a' -- "$hook_dir") || return 1
+    owner="${metadata%%:*}"
+    mode="${metadata#*:}"
+    if [[ "$owner" != "$(id -u)" || "$mode" != "755" ]]; then
+        echo "Error: Certbot deploy-hook directory owner or mode verification failed." >&2
+        return 1
+    fi
 
-    local snap_dir="${recovery_root}/${transaction_id}"
-    mkdir -p "$snap_dir"
-    chmod 0700 "$snap_dir" 2>/dev/null || true
+    local snap_dir="${recovery_root}/${transaction_id}" resolved_snap_dir
+    resolved_snap_dir=$(realpath -m -- "$snap_dir") || {
+        echo "Error: Could not resolve deploy-hook recovery directory." >&2
+        return 1
+    }
+    if [[ "$snap_dir" != /* || "$snap_dir" == "/" || "$resolved_snap_dir" != "$snap_dir" ]]; then
+        echo "Error: Deploy-hook recovery path is not a normalized absolute path without symlinks." >&2
+        return 1
+    fi
+    mkdir -p -- "$snap_dir" || {
+        echo "Error: Could not create deploy-hook recovery directory." >&2
+        return 1
+    }
+    if [[ ! -d "$snap_dir" || -L "$snap_dir" ]]; then
+        echo "Error: Deploy-hook recovery path is not a real directory." >&2
+        return 1
+    fi
+    metadata=$(stat -c '%u:%a' -- "$snap_dir") || {
+        echo "Error: Could not verify deploy-hook recovery directory." >&2
+        return 1
+    }
+    owner="${metadata%%:*}"
+    if [[ "$owner" != "$(id -u)" ]]; then
+        echo "Error: Deploy-hook recovery directory is not owned by the current user." >&2
+        return 1
+    fi
+    chmod 0700 -- "$snap_dir" || {
+        echo "Error: Could not secure deploy-hook recovery directory." >&2
+        return 1
+    }
+    metadata=$(stat -c '%u:%a' -- "$snap_dir") || return 1
+    owner="${metadata%%:*}"
+    mode="${metadata#*:}"
+    if [[ "$owner" != "$(id -u)" || "$mode" != "700" ]]; then
+        echo "Error: Deploy-hook recovery directory owner or mode verification failed." >&2
+        return 1
+    fi
+
     local manifest="${snap_dir}/deploy-hook-manifest.json"
-
     local tmp_file="${hook_file}.tmp.$$"
-    cat > "$tmp_file" <<'EOF'
+    if ! cat > "$tmp_file" <<'EOF'
 #!/bin/sh
 # Managed by GoWave Auto NGINX: Automated ACME Reload Hook
 if nginx -t -q; then
     systemctl reload nginx
 fi
 EOF
-    chmod 0755 "$tmp_file"
-    sync "$tmp_file"
-    mv -f "$tmp_file" "$hook_file"
-    sync "$hook_dir"
+    then
+        echo "Error: Could not write temporary Certbot deploy hook." >&2
+        return 1
+    fi
+    if ! chmod 0755 -- "$tmp_file" || ! sync "$tmp_file"; then
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not secure and sync temporary Certbot deploy hook." >&2
+        return 1
+    fi
 
     local digest
-    digest=$(sha256sum "$hook_file" | awk '{print $1}')
-    python3 - "$manifest" "$transaction_id" "$hook_file" "$digest" <<'PY'
-import json, sys
-manifest_path, tx_id, path, digest = sys.argv[1:5]
-data = {
-    "transaction_id": tx_id,
-    "path": path,
-    "created_by_tx": True,
-    "sha256": digest
-}
-with open(manifest_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2)
-PY
-    chmod 0600 "$manifest" 2>/dev/null || true
+    digest=$(sha256sum "$tmp_file" | awk '{print $1}') || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not calculate Certbot deploy-hook digest." >&2
+        return 1
+    }
+    python3 -c 'import json, os, sys; manifest_path, tx_id, path, digest = sys.argv[1:5]; flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0); fd = os.open(manifest_path, flags, 0o600); stream = os.fdopen(fd, "w", encoding="utf-8"); json.dump({"transaction_id": tx_id, "path": path, "created_by_tx": True, "sha256": digest}, stream, indent=2); stream.flush(); os.fsync(stream.fileno()); stream.close()' "$manifest" "$transaction_id" "$hook_file" "$digest" || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not create deploy-hook ownership manifest safely." >&2
+        return 1
+    }
+    if ! chmod 0600 -- "$manifest"; then
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not enforce private deploy-hook manifest permissions." >&2
+        return 1
+    fi
+    metadata=$(stat -c '%u:%a' -- "$manifest") || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not verify deploy-hook ownership manifest." >&2
+        return 1
+    }
+    owner="${metadata%%:*}"
+    mode="${metadata#*:}"
+    if [[ "$owner" != "$(id -u)" || "$mode" != "600" ]]; then
+        rm -f -- "$tmp_file" || true
+        echo "Error: Deploy-hook manifest owner or mode verification failed." >&2
+        return 1
+    fi
+    sync "$manifest" && sync "$snap_dir" || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not sync deploy-hook ownership manifest." >&2
+        return 1
+    }
+
+    mv -f -- "$tmp_file" "$hook_file" || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not install managed Certbot deploy hook." >&2
+        return 1
+    }
+    sync "$hook_dir" || {
+        echo "Error: Could not sync Certbot deploy-hook directory after installation." >&2
+        return 1
+    }
     echo "Configured managed ACME renewal hook in $hook_file."
 }
-
 rollback_managed_deploy_hook() {
     local transaction_id="$1"
     local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
