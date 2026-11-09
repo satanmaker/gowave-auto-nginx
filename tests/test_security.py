@@ -96,6 +96,12 @@ class TestSecurityModule(unittest.TestCase):
             sysctl_file = tmp / "99-gowave.conf"
             bbr_service = tmp / "bbr-load.service"
             state_file = tmp / "state.json"
+            original_state = {
+                "schemaVersion": 2,
+                "nodes": [{"name": "worker-1", "uuid": "node-1"}],
+                "squadUuid": "squad-1",
+            }
+            state_file.write_text(json.dumps(original_state))
 
             cmd = f'source "{SECURITY_SH}" && configure_bbr_and_mtu "{state_file}" "{sysctl_file}" "{bbr_service}"'
             res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
@@ -114,7 +120,24 @@ class TestSecurityModule(unittest.TestCase):
             if state_file.exists():
                 data = json.loads(state_file.read_text())
                 self.assertIn(data.get("congestionControl"), ("bbr", "cubic"))
+                self.assertEqual(data["nodes"], original_state["nodes"])
+                self.assertEqual(data["squadUuid"], original_state["squadUuid"])
                 self.assertEqual(oct(state_file.stat().st_mode & 0o777), "0o600")
+
+    def test_bbr_state_update_refuses_corrupt_existing_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            state_file = tmp / "state.json"
+            sysctl_file = tmp / "99-gowave.conf"
+            bbr_service = tmp / "bbr-load.service"
+            corrupt = "{broken state"
+            state_file.write_text(corrupt)
+
+            cmd = f'source "{SECURITY_SH}" && configure_bbr_and_mtu "{state_file}" "{sysctl_file}" "{bbr_service}"'
+            result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(state_file.read_text(), corrupt)
 
     def test_log_rotation_and_journal_cap(self):
         with tempfile.TemporaryDirectory() as tmpdir:
