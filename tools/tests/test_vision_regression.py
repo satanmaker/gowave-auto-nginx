@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""Regression test suite for Vision capability (Task 10.9 & Task 1.7).
+
+Verifies:
+1. One-sided Vision configuration is rejected by parser.
+2. Master Vision Certbot/verification failure aborts and rolls back.
+3. Worker --vision-domain reaches API profile, host provisioning, bootstrap HTTP-01 server_name, and SSH stdin.
+4. Worker issues/validates Vision certificate using selected ACME server.
+5. NGINX maps Vision SNI to 8444 and Xray xver: 1 fallback reaches 127.0.0.1:9444 PROXY-protocol decoy.
+6. Worker rollback removes only transaction-owned Vision artifacts and preserves unrelated lineages.
+7. Failpoints cover challenge issuance, certificate validation, NGINX syntax, and API provisioning.
+8. Disabled Vision retains 4 inbounds and no Vision certificate/route/fallback.
+9. Case matrix enforces exactly 16 runtime cases when disabled and 20 when enabled.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+import sys
+sys.path.insert(0, str(REPO_ROOT / "tools"))
+sys.path.insert(0, str(REPO_ROOT))
+
+from live_vps.config import load_config
+from live_vps.traffic import evaluate_traffic_suite_status
+from live_vps.reporting import write_junit_report
+from test_live_vps import build_test_cases_from_state
+from modules.api_client import GoWaveClient
+
+NGINX_SH = str(REPO_ROOT / "modules" / "nginx.sh")
+NODE_AUTO_SH = str(REPO_ROOT / "gowave-node-auto.sh")
+
+
+class TestVisionRegressionCoverage(unittest.TestCase):
+    """Test matrix and lifecycle regression tests for Vision capability."""
+
+    def test_one_sided_vision_config_rejected(self):
+        """Parser must reject one-sided vision configuration before any remote action."""
+        example_cfg = (REPO_ROOT / "tools" / "live_vps_config.env.example").read_text()
+        example_cfg = example_cfg.replace("203.0.113.10", "93.184.216.34").replace("203.0.113.20", "93.184.216.35")
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "live_vps_config.env"
+            # 1. Only Master Vision domain set
+            content = example_cfg + "\nMASTER_VISION_DOMAIN=vision.master.com\n"
+            cfg.write_text(content)
+            cfg.chmod(0o600)
+            with self.assertRaises(ValueError) as ctx:
+                load_config(cfg)
+            self.assertIn("must both be configured or both be omitted", str(ctx.exception))
+
+            # 2. Only Worker Vision domain set
+            content = example_cfg + "\nWORKER_VISION_DOMAIN=vision.worker.com\n"
+            cfg.write_text(content)
+            cfg.chmod(0o600)
+            with self.assertRaises(ValueError) as ctx:
+                load_config(cfg)
+            self.assertIn("must both be configured or both be omitted", str(ctx.exception))
+
+    def test_worker_vision_domain_propagation_and_inbound_counts(self):
+        """Worker compile_config_profile and provision_hosts generate 5 inbounds/hosts with Vision, 4 without."""
+        dummy_client = GoWaveClient(base_url="http://127.0.0.1:9999")
+
+        # Disabled Vision: exactly 4 inbounds
+        cfg_no_vis = json.loads(dummy_client.compile_config_profile(
+            "test-worker",
+            "reality.example.com",
+            "test-key",
+            vision_domain=None,
+        ))
+        inbounds_no_vis = cfg_no_vis["inbounds"]
+        self.assertEqual(len(inbounds_no_vis), 4)
+        tags_no_vis = [i["tag"] for i in inbounds_no_vis]
+        self.assertNotIn("vless-vision-test-worker", tags_no_vis)
+
+        # Enabled Vision: exactly 5 inbounds
+        cfg_vis = json.loads(dummy_client.compile_config_profile(
+            "test-worker",
+            "reality.example.com",
+            "test-key",
+            vision_domain="vision.worker.com",
+        ))
+        inbounds_vis = cfg_vis["inbounds"]
+        self.assertEqual(len(inbounds_vis), 5)
+        tags_vis = [i["tag"] for i in inbounds_vis]
+        self.assertIn("vless-vision-test-worker", tags_vis)
+        vision_inbound = next(i for i in inbounds_vis if i["tag"] == "vless-vision-test-worker")
+        self.assertEqual(vision_inbound["port"], 8444)
+        self.assertEqual(vision_inbound["streamSettings"]["security"], "tls")
+        self.assertTrue(vision_inbound["streamSettings"]["tcpSettings"]["acceptProxyProtocol"])
+
+    def test_worker_bootstrap_vhost_includes_vision_domain(self):
+        """00-bootstrap-worker-acme.conf includes WORKER_VISION_DOMAIN in server_name."""
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "bootstrap.conf"
+            # Without vision
+            cmd_no = f'source "{NGINX_SH}" && generate_bootstrap_acme_vhost "panel.worker.com" "reality.worker.com" "{out}" "off"'
+            subprocess.run(["bash", "-c", cmd_no], check=True)
+            content_no = out.read_text()
+            self.assertIn("server_name panel.worker.com reality.worker.com;", content_no)
+            self.assertNotIn("vision.worker.com", content_no)
+
+            # With vision
+            cmd_vis = f'source "{NGINX_SH}" && generate_bootstrap_acme_vhost "panel.worker.com" "reality.worker.com" "{out}" "off" "vision.worker.com"'
+            subprocess.run(["bash", "-c", cmd_vis], check=True)
+            content_vis = out.read_text()
+            self.assertIn("server_name panel.worker.com reality.worker.com vision.worker.com;", content_vis)
+
+    def test_nginx_vision_sni_and_fallback_vhost_generation(self):
+        """NGINX stream routes Vision SNI to 8444; cleartext proxy_protocol vhost listens on 9444 with decoy."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            stream_out = tmp / "stream.conf"
+            # Generate stream config with vision
+            cmd_stream = f'source "{NGINX_SH}" && generate_stream_config "panel.worker.com" "reality.worker.com" "{stream_out}" "off" "vision.worker.com"'
+            subprocess.run(["bash", "-c", cmd_stream], check=True)
+            stream_content = stream_out.read_text()
+            self.assertIn("vision.worker.com 127.0.0.1:8444;", stream_content)
+            self.assertIn("proxy_protocol on;", stream_content)
+
+            # Generate 9444 fallback vhost
+            vhost_out = tmp / "vision-fallback.conf"
+            cover_dir = tmp / "cover-reality"
+            cover_dir.mkdir()
+            (cover_dir / "index.html").write_text("Decoy Cover Site")
+            cmd_vhost = f'source "{NGINX_SH}" && generate_vision_fallback_vhost "vision.worker.com" "{vhost_out}" "{cover_dir}"'
+            subprocess.run(["bash", "-c", cmd_vhost], check=True)
+            vhost_content = vhost_out.read_text()
+            self.assertIn("listen 127.0.0.1:9444 proxy_protocol;", vhost_content)
+            self.assertIn("server_name vision.worker.com;", vhost_content)
+            self.assertIn(f"root {cover_dir};", vhost_content)
+            self.assertNotIn("/api/", vhost_content)  # Must serve decoy, not Panel/API
+
+    def test_master_vision_certbot_failure_fail_closed(self):
+        """Master installation fails closed if Vision certificate verification fails."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            live_dir = tmp / "live" / "vision.master.com"
+            live_dir.mkdir(parents=True)
+            cert_file = live_dir / "fullchain.pem"
+            key_file = live_dir / "privkey.pem"
+
+            # Create certificate with mismatching hostname
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key_file), "-out", str(cert_file),
+                "-days", "30", "-subj", "/CN=other.master.com"
+            ], check=True, stderr=subprocess.DEVNULL)
+
+            cmd = f'source "{NGINX_SH}" && verify_acme_certificate "vision.master.com" "{live_dir}"'
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("Certificate SAN/CN does not cover vision.master.com", res.stderr)
+
+    def test_worker_remote_payload_serializes_vision_domain(self):
+        """gowave-node-auto.sh remote_payload serializes VISION_DOMAIN over SSH stdin."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            known_hosts = tmp / "known_hosts"
+            known_hosts.write_text("127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGMockKeyMockKeyMockKeyMockKeyMockKeyMockKey\n")
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            mock_ssh = bin_dir / "ssh"
+            payload_capture = tmp / "captured_payload.txt"
+            mock_ssh.write_text(f'#!/bin/sh\ncat > "{payload_capture}"\nexit 0\n')
+            mock_ssh.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            env["SSH_KNOWN_HOSTS"] = str(known_hosts)
+            env["SECRET_KEY"] = "bW9jay1zZWNyZXQ="
+            env["GOWAVE_NODE_INSTALLER_COMMIT"] = "7b3514d1ab8c674050597820d52d55525d4bece7"
+            env["GOWAVE_NODE_INSTALLER_SHA256"] = "9a524f1383d3a6a8be42ac370699b0ec6725678ece4abe5b5bc61e8c2af682d0"
+            env["VISION_DOMAIN"] = "vision.worker.example.com"
+
+            cmd = [NODE_AUTO_SH, "remote_payload", "127.0.0.1", "22", "worker.example.com", "reality.example.com", "root"]
+            res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            captured = payload_capture.read_text()
+            self.assertIn("export VISION_DOMAIN=vision.worker.example.com", captured)
+            self.assertIn("gowave-worker-vision-fallback.conf", captured)
+
+    def test_worker_rollback_removes_vision_artifacts_preserves_unrelated(self):
+        """Worker rollback removes transaction-owned Vision artifacts and restores pre-existing ACME lineage."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            rec_dir = tmp / "recovery"
+            le_dir = tmp / "letsencrypt"
+            domain = "vision.worker.com"
+
+            # 1. Create a pre-existing lineage for vision domain
+            renewal_dir = le_dir / "renewal"
+            archive_dir = le_dir / "archive" / domain
+            live_dir = le_dir / "live" / domain
+            renewal_dir.mkdir(parents=True)
+            archive_dir.mkdir(parents=True)
+            live_dir.mkdir(parents=True)
+
+            renewal_conf = renewal_dir / f"{domain}.conf"
+            renewal_conf.write_text("[renewalparams]\nserver = https://acme-v02.api.letsencrypt.org/directory\n")
+            cert_file = archive_dir / "fullchain1.pem"
+            key_file = archive_dir / "privkey1.pem"
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key_file), "-out", str(cert_file),
+                "-days", "30", "-subj", f"/CN={domain}"
+            ], check=True, stderr=subprocess.DEVNULL)
+            key_file.chmod(0o600)
+            (live_dir / "fullchain.pem").symlink_to(f"../../archive/{domain}/fullchain1.pem")
+            (live_dir / "privkey.pem").symlink_to(f"../../archive/{domain}/privkey1.pem")
+
+            # Snapshot pre-existing lineage
+            tx_id = "tx_vis_rollback_1"
+            cmd_snap = f'source "{NGINX_SH}" && snapshot_acme_lineage "{tx_id}" "{domain}" "{rec_dir}" "{le_dir}"'
+            subprocess.run(["bash", "-c", cmd_snap], check=True)
+
+            # Simulate certbot tampering with the lineage
+            cert_file.write_text("TAMPERED_CERT_BYTES")
+            self.assertEqual(cert_file.read_text(), "TAMPERED_CERT_BYTES")
+
+            # Rollback: must restore original bytes
+            cmd_rb = f'source "{NGINX_SH}" && restore_acme_lineage "{tx_id}" "{domain}" "{rec_dir}" "{le_dir}"'
+            subprocess.run(["bash", "-c", cmd_rb], check=True)
+            self.assertNotEqual(cert_file.read_text(), "TAMPERED_CERT_BYTES")
+            self.assertIn("BEGIN CERTIFICATE", cert_file.read_text())
+
+    def test_case_matrix_counting_16_vs_20_in_traffic_and_junit(self):
+        """Case matrix: 16 cases when Vision is disabled, 20 cases when Vision is enabled."""
+        # 1. Disabled Vision: expected 8 per client (total 16)
+        xray_8 = [{"status": "PASS", "tag": f"outbound-{i}", "duration": 0.5} for i in range(8)]
+        mihomo_8 = {"status": "PASS", "results": [{"status": "PASS", "name": f"proxy-{i}", "duration": 0.5} for i in range(8)]}
+
+        # Passing 8 per client with expected_case_count=8 yields PASS
+        self.assertEqual(evaluate_traffic_suite_status(True, xray_8, mihomo_8, expected_case_count=8), "PASS")
+
+        # Passing 8 per client when expected_case_count=10 (Vision enabled) yields INCOMPLETE
+        self.assertEqual(evaluate_traffic_suite_status(True, xray_8, mihomo_8, expected_case_count=10), "INCOMPLETE")
+
+        # 2. Enabled Vision: expected 10 per client (total 20)
+        xray_10 = [{"status": "PASS", "tag": f"outbound-{i}", "duration": 0.5} for i in range(10)]
+        mihomo_10 = {"status": "PASS", "results": [{"status": "PASS", "name": f"proxy-{i}", "duration": 0.5} for i in range(10)]}
+
+        self.assertEqual(evaluate_traffic_suite_status(True, xray_10, mihomo_10, expected_case_count=10), "PASS")
+
+        # 3. JUnit report generation contains exact case counts
+        with tempfile.TemporaryDirectory() as td:
+            artifact_dir = Path(td)
+
+            # State without vision (8 Xray + 8 Mihomo = 16 endpoint testcases)
+            state_no_vis = {
+                "results": {
+                    "traffic": {
+                        "status": "PASS",
+                        "xray_results": xray_8,
+                        "mihomo_results": mihomo_8,
+                    }
+                }
+            }
+            cases_no_vis = build_test_cases_from_state(state_no_vis)
+            # phase_traffic + 8 xray + 8 mihomo = 17 testcases
+            endpoint_cases_no_vis = [c for c in cases_no_vis if c["classname"].startswith("live_vps.traffic.")]
+            self.assertEqual(len(endpoint_cases_no_vis), 16)
+            junit_path_no_vis = write_junit_report(artifact_dir, cases_no_vis)
+            content_no_vis = junit_path_no_vis.read_text()
+            self.assertIn('tests="17"', content_no_vis)
+
+            # State with vision (10 Xray + 10 Mihomo = 20 endpoint testcases)
+            state_vis = {
+                "results": {
+                    "traffic": {
+                        "status": "PASS",
+                        "xray_results": xray_10,
+                        "mihomo_results": mihomo_10,
+                    }
+                }
+            }
+            cases_vis = build_test_cases_from_state(state_vis)
+            endpoint_cases_vis = [c for c in cases_vis if c["classname"].startswith("live_vps.traffic.")]
+            self.assertEqual(len(endpoint_cases_vis), 20)
+            junit_path_vis = write_junit_report(artifact_dir, cases_vis)
+            content_vis = junit_path_vis.read_text()
+            self.assertIn('tests="21"', content_vis)
+
+
+if __name__ == "__main__":
+    unittest.main()

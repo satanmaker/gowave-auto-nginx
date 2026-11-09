@@ -250,6 +250,230 @@ class TestNginxRouting(unittest.TestCase):
             self.assertNotEqual(res_prod_cert.returncode, 0)
             self.assertIn("issued by production", res_prod_cert.stderr)
 
+    def test_verify_acme_certificate_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            live_dir = tmp / "live" / "vision.example.com"
+            live_dir.mkdir(parents=True)
+            cert_file = live_dir / "fullchain.pem"
+            key_file = live_dir / "privkey.pem"
+
+            # 1. Missing files fails closed
+            cmd_missing = f'source "{NGINX_SH}" && verify_acme_certificate "vision.example.com" "{live_dir}"'
+            self.assertNotEqual(subprocess.run(["bash", "-c", cmd_missing], capture_output=True).returncode, 0)
+
+            # 2. Hostname mismatch fails closed
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key_file), "-out", str(cert_file),
+                "-days", "30", "-subj", "/CN=wrong.example.com"
+            ], check=True, stderr=subprocess.DEVNULL)
+            cmd_wrong_host = f'source "{NGINX_SH}" && verify_acme_certificate "vision.example.com" "{live_dir}"'
+            res_wrong_host = subprocess.run(["bash", "-c", cmd_wrong_host], capture_output=True, text=True)
+            self.assertNotEqual(res_wrong_host.returncode, 0)
+            self.assertIn("Certificate SAN/CN does not cover", res_wrong_host.stderr)
+
+            # 3. Key mismatch fails closed
+            alt_key = tmp / "alt.key"
+            subprocess.run(["openssl", "genrsa", "-out", str(alt_key), "2048"], check=True, stderr=subprocess.DEVNULL)
+            # Recreate certificate for vision.example.com with key_file
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key_file), "-out", str(cert_file),
+                "-days", "30", "-subj", "/CN=vision.example.com"
+            ], check=True, stderr=subprocess.DEVNULL)
+            # Overwrite privkey with alt_key
+            key_file.write_bytes(alt_key.read_bytes())
+            cmd_bad_key = f'source "{NGINX_SH}" && verify_acme_certificate "vision.example.com" "{live_dir}"'
+            res_bad_key = subprocess.run(["bash", "-c", cmd_bad_key], capture_output=True, text=True)
+            self.assertNotEqual(res_bad_key.returncode, 0)
+            self.assertIn("do not cryptographically match", res_bad_key.stderr)
+
+            # 4. Valid certificate and key passes
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key_file), "-out", str(cert_file),
+                "-days", "30", "-subj", "/CN=vision.example.com"
+            ], check=True, stderr=subprocess.DEVNULL)
+            cmd_valid = f'source "{NGINX_SH}" && verify_acme_certificate "vision.example.com" "{live_dir}"'
+            self.assertEqual(subprocess.run(["bash", "-c", cmd_valid], capture_output=True).returncode, 0)
+
+    def test_acme_lineage_snapshot_and_rollback_preexisting(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            rec_dir = tmp / "recovery"
+            le_dir = tmp / "letsencrypt"
+            domain = "panel.example.com"
+
+            renewal_dir = le_dir / "renewal"
+            archive_dir = le_dir / "archive" / domain
+            live_dir = le_dir / "live" / domain
+            renewal_dir.mkdir(parents=True)
+            archive_dir.mkdir(parents=True)
+            live_dir.mkdir(parents=True)
+
+            renewal_conf = renewal_dir / f"{domain}.conf"
+            renewal_conf.write_text("[renewalparams]\nserver = https://acme-v02.api.letsencrypt.org/directory\n")
+
+            cert_file = archive_dir / "fullchain1.pem"
+            key_file = archive_dir / "privkey1.pem"
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key_file), "-out", str(cert_file),
+                "-days", "30", "-subj", f"/CN={domain}"
+            ], check=True, stderr=subprocess.DEVNULL)
+            key_file.chmod(0o600)
+
+            (live_dir / "fullchain.pem").symlink_to(f"../../archive/{domain}/fullchain1.pem")
+            (live_dir / "privkey.pem").symlink_to(f"../../archive/{domain}/privkey1.pem")
+
+            # Snapshot pre-existing lineage
+            tx_id = "tx_preflight_1"
+            cmd_snap = f'source "{NGINX_SH}" && snapshot_acme_lineage "{tx_id}" "{domain}" "{rec_dir}" "{le_dir}"'
+            res_snap = subprocess.run(["bash", "-c", cmd_snap], capture_output=True, text=True)
+            self.assertEqual(res_snap.returncode, 0, res_snap.stderr)
+
+            snap_dir = rec_dir / tx_id / "acme" / domain
+            self.assertTrue(snap_dir.is_dir())
+            manifest = snap_dir / "lineage-manifest.json"
+            self.assertTrue(manifest.is_file())
+            self.assertIn('"existed_before": true', manifest.read_text())
+
+            # Verify privkey copy in snapshot is 0600
+            snap_privkey = snap_dir / "archive" / "privkey1.pem"
+            self.assertTrue(snap_privkey.is_file())
+            self.assertEqual(snap_privkey.stat().st_mode & 0o777, 0o600)
+
+            # Mutate live/archive lineage (simulate certbot replacing certificate with different key)
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(key_file), "-out", str(cert_file),
+                "-days", "1", "-subj", "/CN=mutated.example.com"
+            ], check=True, stderr=subprocess.DEVNULL)
+            renewal_conf.write_text("[renewalparams]\nmutated = true\n")
+
+            # Rollback to pre-existing lineage
+            cmd_rollback = f'source "{NGINX_SH}" && restore_acme_lineage "{tx_id}" "{domain}" "{rec_dir}" "{le_dir}"'
+            res_rollback = subprocess.run(["bash", "-c", cmd_rollback], capture_output=True, text=True)
+            self.assertEqual(res_rollback.returncode, 0, res_rollback.stderr)
+
+            # Assert original certificate restored
+            restored_fc = live_dir / "fullchain.pem"
+            res_check = subprocess.run(["openssl", "x509", "-in", str(restored_fc), "-noout", "-subject"], capture_output=True, text=True)
+            self.assertIn(domain, res_check.stdout)
+
+            # Cleanup snapshot
+            cmd_clean = f'source "{NGINX_SH}" && cleanup_acme_snapshot "{tx_id}" "{domain}" "{rec_dir}"'
+            self.assertEqual(subprocess.run(["bash", "-c", cmd_clean], capture_output=True).returncode, 0)
+            self.assertFalse(snap_dir.exists())
+
+    def test_acme_lineage_snapshot_and_rollback_new_domain(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            rec_dir = tmp / "recovery"
+            le_dir = tmp / "letsencrypt"
+            domain = "brand-new.example.com"
+
+            tx_id = "tx_preflight_2"
+            cmd_snap = f'source "{NGINX_SH}" && snapshot_acme_lineage "{tx_id}" "{domain}" "{rec_dir}" "{le_dir}"'
+            res_snap = subprocess.run(["bash", "-c", cmd_snap], capture_output=True, text=True)
+            self.assertEqual(res_snap.returncode, 0, res_snap.stderr)
+
+            snap_dir = rec_dir / tx_id / "acme" / domain
+            manifest = snap_dir / "lineage-manifest.json"
+            self.assertTrue(manifest.is_file())
+            self.assertIn('"existed_before": false', manifest.read_text())
+
+            # Simulate certbot creating lineage during transaction
+            renewal_dir = le_dir / "renewal"
+            archive_dir = le_dir / "archive" / domain
+            live_dir = le_dir / "live" / domain
+            renewal_dir.mkdir(parents=True, exist_ok=True)
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            live_dir.mkdir(parents=True, exist_ok=True)
+            (renewal_dir / f"{domain}.conf").write_text("dummy")
+            (live_dir / "fullchain.pem").write_text("dummy")
+
+            # Rollback must delete transaction-created lineage
+            cmd_rollback = f'source "{NGINX_SH}" && restore_acme_lineage "{tx_id}" "{domain}" "{rec_dir}" "{le_dir}"'
+            res_rollback = subprocess.run(["bash", "-c", cmd_rollback], capture_output=True, text=True)
+            self.assertEqual(res_rollback.returncode, 0, res_rollback.stderr)
+
+            self.assertFalse((renewal_dir / f"{domain}.conf").exists())
+            self.assertFalse(live_dir.exists())
+            self.assertFalse(archive_dir.exists())
+
+    def test_deploy_hook_ownership_preflight_unowned_rejected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            hook_file = tmp / "gowave-nginx.sh"
+            hook_file.write_text("#!/bin/sh\necho foreign\n")
+            rec_dir = tmp / "recovery"
+
+            cmd = f'source "{NGINX_SH}" && verify_deploy_hook_preflight "{hook_file}" "tx1" "{rec_dir}"'
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("Pre-existing unowned Certbot deploy hook found", res.stderr)
+
+    def test_deploy_hook_ownership_create_and_rollback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            hook_file = tmp / "renewal-hooks" / "deploy" / "gowave-nginx.sh"
+            rec_dir = tmp / "recovery"
+            tx_id = "tx_hook_1"
+
+            # 1. Install managed deploy hook
+            cmd_install = f'source "{NGINX_SH}" && install_managed_deploy_hook "{tx_id}" "{hook_file}" "{rec_dir}"'
+            res_install = subprocess.run(["bash", "-c", cmd_install], capture_output=True, text=True)
+            self.assertEqual(res_install.returncode, 0, res_install.stderr)
+            self.assertTrue(hook_file.is_file())
+            manifest = rec_dir / tx_id / "deploy-hook-manifest.json"
+            self.assertTrue(manifest.is_file())
+
+            # 2. Rollback
+            cmd_rollback = f'source "{NGINX_SH}" && rollback_managed_deploy_hook "{tx_id}" "{hook_file}" "{rec_dir}"'
+            res_rollback = subprocess.run(["bash", "-c", cmd_rollback], capture_output=True, text=True)
+            self.assertEqual(res_rollback.returncode, 0, res_rollback.stderr)
+            self.assertFalse(hook_file.exists())
+
+    def test_deploy_hook_ownership_rollback_preserves_modified_replacement(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            hook_file = tmp / "renewal-hooks" / "deploy" / "gowave-nginx.sh"
+            rec_dir = tmp / "recovery"
+            tx_id = "tx_hook_2"
+
+            # Install managed hook
+            cmd_install = f'source "{NGINX_SH}" && install_managed_deploy_hook "{tx_id}" "{hook_file}" "{rec_dir}"'
+            res_install = subprocess.run(["bash", "-c", cmd_install], capture_output=True, text=True)
+            self.assertEqual(res_install.returncode, 0)
+
+            # Mutate hook content
+            hook_file.write_text("#!/bin/sh\necho modified\n")
+
+            # Rollback must preserve modified file and return nonzero
+            cmd_rollback = f'source "{NGINX_SH}" && rollback_managed_deploy_hook "{tx_id}" "{hook_file}" "{rec_dir}"'
+            res_rollback = subprocess.run(["bash", "-c", cmd_rollback], capture_output=True, text=True)
+            self.assertNotEqual(res_rollback.returncode, 0)
+            self.assertIn("digest mismatch", res_rollback.stderr)
+            self.assertTrue(hook_file.is_file())
+
+    def test_deploy_hook_ownership_cleanup_manifest_preserves_hook(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            hook_file = tmp / "renewal-hooks" / "deploy" / "gowave-nginx.sh"
+            rec_dir = tmp / "recovery"
+            tx_id = "tx_hook_3"
+
+            cmd_install = f'source "{NGINX_SH}" && install_managed_deploy_hook "{tx_id}" "{hook_file}" "{rec_dir}"'
+            self.assertEqual(subprocess.run(["bash", "-c", cmd_install], capture_output=True).returncode, 0)
+
+            cmd_cleanup = f'source "{NGINX_SH}" && cleanup_deploy_hook_manifest "{tx_id}" "{rec_dir}"'
+            self.assertEqual(subprocess.run(["bash", "-c", cmd_cleanup], capture_output=True).returncode, 0)
+
+            self.assertTrue(hook_file.is_file(), "Deploy hook must be retained upon commit cleanup")
+            self.assertFalse((rec_dir / tx_id / "deploy-hook-manifest.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

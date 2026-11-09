@@ -3,6 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${SCRIPT_DIR}/modules/lock.sh"
 RECOVERY_PY="${SCRIPT_DIR}/modules/recovery.py"
 RECOVERY_DIR="${RECOVERY_DIR:-/var/lib/gowave-auto-nginx/recovery}"
 JOURNAL_FILE="${JOURNAL_FILE:-${RECOVERY_DIR}/journal.json}"
@@ -155,6 +156,7 @@ execute_file_rollback() {
 }
 
 recover_boot_files() {
+    acquire_mutation_lock || return 1
     if [[ ! -f "$JOURNAL_FILE" ]]; then
         return 0
     fi
@@ -203,6 +205,7 @@ write_journal_atomically('$JOURNAL_FILE', data)
 }
 
 recover_boot_provision() {
+    acquire_mutation_lock || return 1
     if [[ ! -f "$JOURNAL_FILE" ]]; then
         return 0
     fi
@@ -242,6 +245,7 @@ sys.exit(0 if ok else 1)
 }
 
 switch_channel() {
+    acquire_mutation_lock || return 1
     local target_channel="$1"
     local force="${2:-false}"
     local env_file="$GOWAVE_DIR/.env"

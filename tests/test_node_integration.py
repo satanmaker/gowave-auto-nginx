@@ -257,6 +257,66 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertIn("export GOWAVE_NODE_INSTALLER_SHA256=9a524f1383d3a6a8be42ac370699b0ec6725678ece4abe5b5bc61e8c2af682d0", captured)
             self.assertIn("upstream installer SHA256 mismatch", captured)
 
+    def test_worker_vision_domain_serialization_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            known_hosts = tmp / "known_hosts"
+            known_hosts.write_text("127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGMockKeyMockKeyMockKeyMockKeyMockKeyMockKey\n")
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            mock_ssh = bin_dir / "ssh"
+            payload_capture = tmp / "captured_payload.txt"
+            mock_ssh.write_text(f'#!/bin/sh\ncat > "{payload_capture}"\nexit 0\n')
+            mock_ssh.chmod(0o755)
+
+            node_auto_sh = REPO_ROOT / "gowave-node-auto.sh"
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            env["SSH_KNOWN_HOSTS"] = str(known_hosts)
+            env["SECRET_KEY"] = "bW9jay1zZWNyZXQ="
+            env["GOWAVE_NODE_INSTALLER_COMMIT"] = "7b3514d1ab8c674050597820d52d55525d4bece7"
+            env["GOWAVE_NODE_INSTALLER_SHA256"] = "9a524f1383d3a6a8be42ac370699b0ec6725678ece4abe5b5bc61e8c2af682d0"
+            env["VISION_DOMAIN"] = "vision.worker.example.com"
+
+            # 1. remote_payload with VISION_DOMAIN
+            cmd = [str(node_auto_sh), "remote_payload", "127.0.0.1", "22", "worker.example.com", "reality.example.com", "root"]
+            res = subprocess.run(cmd, env=env, capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            captured = payload_capture.read_text()
+            self.assertIn("export VISION_DOMAIN=vision.worker.example.com", captured)
+            self.assertIn("gowave-worker-vision-fallback.conf", captured)
+            self.assertIn("127.0.0.1:9444 proxy_protocol", captured)
+
+            # 2. remote_rollback with VISION_DOMAIN
+            cmd_rb = [str(node_auto_sh), "remote_rollback", "127.0.0.1", "22", "worker.example.com", "reality.example.com", "root"]
+            res_rb = subprocess.run(cmd_rb, env=env, capture_output=True, text=True)
+            self.assertEqual(res_rb.returncode, 0, res_rb.stderr)
+            captured_rb = payload_capture.read_text()
+            self.assertIn("export VISION_DOMAIN=vision.worker.example.com", captured_rb)
+            self.assertIn("gowave-worker-vision-fallback.conf", captured_rb)
+
+    def test_lock_helper_canonical_path_and_reentrant_lease(self):
+        lock_sh = REPO_ROOT / "modules" / "lock.sh"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            lock_file = tmp / "test-mutation.lock"
+            lease_file = tmp / "test-lease.json"
+
+            # Direct acquisition when free
+            cmd_direct = f'source "{lock_sh}" && MUTATION_LOCK_FILE="{lock_file}" MUTATION_LEASE_FILE="{lease_file}" acquire_mutation_lock'
+            res = subprocess.run(["bash", "-c", cmd_direct], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertTrue(lock_file.is_file())
+
+            # Path validation rejects symlinks
+            sym_dir = tmp / "sym_dir"
+            sym_dir.symlink_to(tmp)
+            bad_lock = sym_dir / "bad.lock"
+            cmd_sym = f'source "{lock_sh}" && validate_lock_path "{bad_lock}"'
+            res_sym = subprocess.run(["bash", "-c", cmd_sym], capture_output=True, text=True)
+            self.assertNotEqual(res_sym.returncode, 0)
+            self.assertIn("Lock directory", res_sym.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

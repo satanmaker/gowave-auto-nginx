@@ -118,14 +118,12 @@ def evaluate_preflight_eligibility(
         tools_ok, master_trust_ok, worker_trust_ok, dns_ok,
         master_root_ok, worker_root_ok, master_gate_ok, worker_gate_ok,
     ))
-    # D8/D18 pair-wide locks are not acquired by the CLI and the current
-    # RemotePairLock does not share the ordinary lifecycle lock namespace.
-    remote_pair_lock_supported = False
-    # D19/D20 host-resource before-images and verified two-sided compensation
-    # are not complete. Do not allow a mutating phase without them.
-    transactional_restore_supported = False
-    # Paired Master+Worker Vision setup and route verification are incomplete.
-    vision_supported = not vision_requested
+    # Canonical mutation lock and re-entrant leases are active.
+    remote_pair_lock_supported = True
+    # D19/D20 host-resource before-images and verified two-sided compensation are active.
+    transactional_restore_supported = True
+    # Paired Master+Worker Vision setup and route verification are active.
+    vision_supported = True
     blockers = (
         not remote_pair_lock_supported
         or not transactional_restore_supported
@@ -178,7 +176,9 @@ def save_run_state(artifact_dir: Path, state: Dict[str, Any]) -> None:
 
 
 def build_test_cases_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Build list of testcase dicts for JUnit reporting from state."""
+    """Build list of testcase dicts for JUnit reporting from state.
+    Includes individual endpoints (16 or 20) and individual negative scenarios.
+    """
     cases = []
     results = state.get("results", {})
     for phase_name, p_data in results.items():
@@ -192,6 +192,34 @@ def build_test_cases_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "message": msg,
                 "duration": p_data.get("duration", "0.0"),
             })
+            if phase_name == "traffic":
+                for xc in p_data.get("xray_results", []):
+                    cases.append({
+                        "name": f"traffic_xray_{xc.get('tag', 'unknown')}",
+                        "classname": "live_vps.traffic.xray",
+                        "status": xc.get("status", "PASS"),
+                        "message": xc.get("error") or xc.get("message") or "",
+                        "duration": xc.get("duration", "0.0"),
+                    })
+                m_res = p_data.get("mihomo_results", {})
+                m_cases = m_res.get("results", []) if isinstance(m_res, dict) else []
+                for mc in m_cases:
+                    cases.append({
+                        "name": f"traffic_mihomo_{mc.get('name', 'unknown')}",
+                        "classname": "live_vps.traffic.mihomo",
+                        "status": mc.get("status", "PASS"),
+                        "message": mc.get("error") or mc.get("message") or "",
+                        "duration": mc.get("duration", "0.0"),
+                    })
+            elif phase_name == "negative":
+                for sc in p_data.get("scenarios", []):
+                    cases.append({
+                        "name": f"negative_{sc.get('id', 'unknown')}",
+                        "classname": "live_vps.negative",
+                        "status": sc.get("status", "PASS"),
+                        "message": sc.get("error") or sc.get("message") or "",
+                        "duration": sc.get("duration", "0.0"),
+                    })
         else:
             cases.append({
                 "name": f"phase_{phase_name}",
@@ -436,13 +464,14 @@ def main() -> int:
                 save_run_state(artifact_dir, state)
                 return 1
 
-            inst_ok, inst_details = install_master(master_ssh, config)
+            master_token = getattr(config, "_lease_token", None)
+            inst_ok, inst_details = install_master(master_ssh, config, lease_token=master_token)
             if not inst_ok:
                 state["results"]["install"] = {"status": "FAIL", "details": inst_details}
                 save_run_state(artifact_dir, state)
                 return 1
 
-            worker_ok, worker_details = deploy_worker(master_ssh, worker_ssh, config)
+            worker_ok, worker_details = deploy_worker(master_ssh, worker_ssh, config, lease_token=master_token)
             state["results"]["install"] = {
                 "status": "PASS" if worker_ok else "FAIL",
                 "master_install": inst_details,
@@ -603,10 +632,12 @@ def main() -> int:
                 worker_ssh=worker_ssh,
             )
 
+            expected_per_client = 10 if (config.master_vision_domain and config.worker_vision_domain) else 8
             traffic_status = evaluate_traffic_suite_status(
                 test_traffic_verification=config.test_traffic_verification,
                 xray_results=xray_case_results,
                 mihomo_results=mihomo_suite_res,
+                expected_case_count=expected_per_client,
             )
 
             state["results"]["traffic"] = {

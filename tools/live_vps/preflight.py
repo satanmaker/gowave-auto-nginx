@@ -282,33 +282,50 @@ class LocalLock:
 
 class RemotePairLock:
     """Authoritative remote locks on Master and Worker held over dedicated SSH sessions.
-    Acquires locks in deterministic host address order.
+    Acquires locks in deterministic host address order and generates re-entrant leases.
     """
 
-    def __init__(self, master_ssh: SSHClient, worker_ssh: SSHClient):
+    def __init__(self, master_ssh: SSHClient, worker_ssh: SSHClient, run_id: str = "live_vps_run"):
         self.clients = [master_ssh, worker_ssh]
         # Sort in deterministic address order to avoid deadlocks
         self.clients.sort(key=lambda c: c.host)
+        self.run_id = run_id
         self._procs: List[subprocess.Popen] = []
+        self.lease_tokens: Dict[str, str] = {}
 
     def acquire(self, timeout: int = 15) -> bool:
-        lock_path = "/run/lock/gowave-live-vps.lock"
+        lock_path = "/run/lock/gowave-managed-mutation.lock"
+        lease_path = "/run/lock/gowave-mutation-lease.json"
         for client in self.clients:
-            cmd = client._build_ssh_cmd(
-                f"mkdir -p /run/lock && exec flock -x -w 5 {lock_path} sleep 86400"
+            holder_py = (
+                "import fcntl, json, os, secrets, sys, time; "
+                "os.makedirs('/run/lock', exist_ok=True); "
+                f"lock_path = '{lock_path}'; lease_path = '{lease_path}'; "
+                "fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600); "
+                "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); "
+                "tok = secrets.token_hex(32); "
+                f"data = {{'run_id': '{self.run_id}', 'host': '{client.host}', 'holder_pid': os.getpid(), 'lease_token': tok}}; "
+                "with open(lease_path, 'w', encoding='utf-8') as f: json.dump(data, f); "
+                "os.chmod(lease_path, 0o600); "
+                "print('LEASE_TOKEN:' + tok, flush=True); "
+                "while True: time.sleep(1)"
             )
+            cmd = client._build_ssh_cmd(f"python3 -c \"{holder_py}\"")
             try:
                 proc = subprocess.Popen(
                     cmd,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    text=True,
                 )
                 self._procs.append(proc)
-                # Brief wait to ensure SSH connect and lock acquisition
-                time.sleep(1.0)
-                if proc.poll() is not None:
-                    # Session exited immediately -> lock failed
+                # Read lease token line from holder stdout
+                line = proc.stdout.readline().strip() if proc.stdout else ""
+                if line.startswith("LEASE_TOKEN:"):
+                    self.lease_tokens[client.host] = line.split(":", 1)[1]
+                else:
+                    # Session exited or failed to acquire lock
                     self.release()
                     return False
             except Exception:
@@ -333,3 +350,4 @@ class RemotePairLock:
                 except Exception:
                     pass
         self._procs.clear()
+        self.lease_tokens.clear()
