@@ -254,6 +254,35 @@ vision_domain=vision.example.test
         self.assertIn("ACME certificate lineage rollback completed successfully", succeeded.stderr)
         self.assertNotIn("CRITICAL: ACME rollback incomplete", succeeded.stderr)
 
+    def test_snapshot_acme_lineage_fails_when_directory_permissions_cannot_be_hardened(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            recovery = root / "recovery"
+            letsencrypt = root / "letsencrypt"
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_chmod = fake_bin / "chmod"
+            fake_chmod.write_text("#!/bin/sh\nexit 1\n")
+            fake_chmod.chmod(0o755)
+            env = {**os.environ, "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}"}
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1" && snapshot_acme_lineage "$2" "$3" "$4" "$5"',
+                 "bash", NGINX_SH, "snapshot_test", "snapshot.example.test", str(recovery), str(letsencrypt)],
+                text=True, capture_output=True, env=env, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Could not secure ACME snapshot directory", result.stderr)
+        for path in (REPO_ROOT / "gowave-node-auto.sh", REPO_ROOT / "modules" / "nginx.sh"):
+            script = path.read_text(encoding="utf-8")
+            starts = [match.start() for match in re.finditer(r"(?m)^snapshot_acme_lineage\(\) \{", script)]
+            self.assertTrue(starts)
+            for start in starts:
+                end = script.index("restore_acme_lineage() {", start)
+                function = script[start:end]
+                self.assertIn('chmod 0700 "$snap_dir" 2>/dev/null || {', function)
+                self.assertIn("os.O_NOFOLLOW", function)
+                self.assertIn("os.fsync", function)
+
     def test_restore_acme_lineage_propagates_removal_failure(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
