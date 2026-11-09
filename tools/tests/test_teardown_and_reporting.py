@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -39,6 +39,18 @@ class TestTeardownAndReporting(unittest.TestCase):
         ok, err = validate_restore_hook("relative/hook.sh", "sha256")
         self.assertFalse(ok)
         self.assertTrue("absolute" in str(err).lower())
+
+    def test_validate_restore_hook_rejects_symlinks(self):
+        target = self.td_path / "restore-target.sh"
+        target.write_text("#!/bin/sh\\nexit 0\\n")
+        target.chmod(0o755)
+        link = self.td_path / "restore-link.sh"
+        link.symlink_to(target)
+
+        ok, error = validate_restore_hook(str(link), hashlib.sha256(target.read_bytes()).hexdigest())
+
+        self.assertFalse(ok)
+        self.assertIn("must not be a symlink", error)
 
     def test_validate_restore_hook_permissions_and_sha256(self):
         hook = self.td_path / "restore.sh"
@@ -76,22 +88,32 @@ class TestTeardownAndReporting(unittest.TestCase):
         self.assertEqual(res["status"], "PASS")
         self.assertEqual(res["policy"], "PRESERVE")
 
-    def test_execute_teardown_restore_snapshot_failures(self):
-        config = MagicMock()
-        config.test_teardown_policy = "RESTORE_SNAPSHOT"
-        config.master_snapshot_id = ""
-        config.worker_snapshot_id = "w-snap"
-        config.restore_hook_path = "/nonexistent/hook.sh"
-        config.restore_hook_sha256 = "123"
+    @patch("live_vps.teardown.subprocess.run")
+    def test_execute_teardown_restore_snapshot_failures_before_hook(self, run_hook):
+        config = SimpleNamespace(
+            test_teardown_policy="RESTORE_SNAPSHOT",
+            master_snapshot_id="",
+            worker_snapshot_id="snap-worker",
+            restore_hook_path="/nonexistent/hook.sh",
+            restore_hook_sha256="123",
+        )
 
-        # Missing snapshot ID
-        res = execute_teardown(config, "run-123")
-        self.assertEqual(res["status"], "TEARDOWN_FAILED")
+        with self.subTest(reason="missing snapshot ID"):
+            result = execute_teardown(config, "run-123")
+            self.assertEqual(result["status"], "TEARDOWN_FAILED")
+            self.assertIn("Missing master_snapshot_id", result["error"])
+            run_hook.assert_not_called()
 
-        # Invalid hook
-        config.master_snapshot_id = "m-snap"
-        res = execute_teardown(config, "run-123")
-        self.assertEqual(res["status"], "TEARDOWN_FAILED")
+        config.master_snapshot_id = "snap-master"
+        with self.subTest(reason="invalid hook"):
+            result = execute_teardown(
+                config, "run-123",
+                master_ssh=MagicMock(), worker_ssh=MagicMock(),
+                pre_baseline_master={}, pre_baseline_worker={},
+            )
+            self.assertEqual(result["status"], "TEARDOWN_FAILED")
+            self.assertIn("Invalid restore hook", result["error"])
+            run_hook.assert_not_called()
 
     @patch("live_vps.teardown.time.sleep")
     @patch("live_vps.teardown.check_disposable_gate", return_value=(True, []))
@@ -139,6 +161,88 @@ class TestTeardownAndReporting(unittest.TestCase):
         self.assertEqual(res["policy"], "RESTORE_SNAPSHOT")
         self.assertEqual(res["captured_baseline_comparison"], "MATCHED")
         self.assertEqual(res["pair_lock_reacquisition"], "NOT_IMPLEMENTED")
+        sleep.assert_called_once_with(5)
+        self.assertEqual(collect_baseline.call_count, 2)
+        self.assertEqual(gate.call_count, 2)
+
+    @patch("live_vps.teardown.collect_remote_baseline")
+    @patch("live_vps.teardown.subprocess.run")
+    def test_restore_hook_failures_never_reconnect_or_report_success(
+        self, run_hook, collect_baseline
+    ):
+        hook = self.td_path / "restore_contract.sh"
+        hook.write_text("#!/bin/sh\\nexit 0\\n")
+        hook.chmod(0o755)
+        sha = hashlib.sha256(hook.read_bytes()).hexdigest()
+        config = SimpleNamespace(
+            test_teardown_policy="RESTORE_SNAPSHOT",
+            master_snapshot_id="snap-master",
+            worker_snapshot_id="snap-worker",
+            restore_hook_path=str(hook),
+            restore_hook_sha256=sha,
+            master_ip="192.0.2.10",
+            worker_ip="192.0.2.20",
+            restore_timeout=10,
+        )
+        ssh = MagicMock()
+        baseline = {"os_kernel": "Linux"}
+        cases = (
+            ("nonzero exit", subprocess.CompletedProcess([], 7, "", "hook failed"), "exited with code 7"),
+            ("invalid JSON", subprocess.CompletedProcess([], 0, "not-json", ""), "non-JSON output"),
+            ("wrong status", subprocess.CompletedProcess([], 0, json.dumps({"status": "FAILED"}), ""), "reported status"),
+            (
+                "snapshot ID mismatch",
+                subprocess.CompletedProcess([], 0, json.dumps({
+                    "status": "RESTORED",
+                    "master_snapshot_id": "wrong-master",
+                    "worker_snapshot_id": "snap-worker",
+                }), ""),
+                "snapshot IDs mismatch",
+            ),
+        )
+        for label, response, expected_error in cases:
+            with self.subTest(response=label):
+                run_hook.reset_mock()
+                collect_baseline.reset_mock()
+                run_hook.return_value = response
+                result = execute_teardown(
+                    config, "run-restore-failure",
+                    master_ssh=ssh, worker_ssh=ssh,
+                    pre_baseline_master=baseline, pre_baseline_worker=baseline,
+                )
+                self.assertEqual(result["status"], "TEARDOWN_FAILED")
+                self.assertIn(expected_error, result["error"])
+                run_hook.assert_called_once()
+                collect_baseline.assert_not_called()
+
+    @patch("live_vps.teardown.collect_remote_baseline")
+    @patch("live_vps.teardown.subprocess.run", side_effect=subprocess.TimeoutExpired("restore", 10))
+    def test_restore_hook_timeout_fails_without_reconnecting(
+        self, run_hook, collect_baseline
+    ):
+        hook = self.td_path / "restore_timeout.sh"
+        hook.write_text("#!/bin/sh\\nexit 0\\n")
+        hook.chmod(0o755)
+        config = SimpleNamespace(
+            test_teardown_policy="RESTORE_SNAPSHOT",
+            master_snapshot_id="snap-master",
+            worker_snapshot_id="snap-worker",
+            restore_hook_path=str(hook),
+            restore_hook_sha256=hashlib.sha256(hook.read_bytes()).hexdigest(),
+            master_ip="192.0.2.10",
+            worker_ip="192.0.2.20",
+            restore_timeout=10,
+        )
+        baseline = {"os_kernel": "Linux"}
+        result = execute_teardown(
+            config, "run-restore-timeout",
+            master_ssh=MagicMock(), worker_ssh=MagicMock(),
+            pre_baseline_master=baseline, pre_baseline_worker=baseline,
+        )
+        self.assertEqual(result["status"], "TEARDOWN_FAILED")
+        self.assertIn("timed out after 10s", result["error"])
+        run_hook.assert_called_once()
+        collect_baseline.assert_not_called()
 
     def test_execute_teardown_restore_requires_both_baselines_before_hook(self):
         config = MagicMock()
@@ -167,47 +271,50 @@ class TestTeardownAndReporting(unittest.TestCase):
         self.assertEqual(content.count("<error "), 2)
 
     def test_reporting_redaction_in_all_outputs(self):
-        register_secret("SuperSecretAdminPassword")
-        register_secret("SensitiveShortUuid999")
-        register_secret("Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.jwtSignature")
+        password = "SuperSecretAdminPassword"
+        uuid = "SensitiveShortUuid999"
+        jwt = "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.jwtSignature"
+        register_secret(password)
+        register_secret(uuid)
+        register_secret(jwt)
 
         data = {
-            "test_run_id": "run-test",
+            "test_run_id": password,
+            "repository_commit": uuid,
             "overall": "PASS",
             "results": {
-                "auth": {
-                    "token": "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.jwtSignature",
-                    "password": "SuperSecretAdminPassword",
-                },
-                "sub": {"uuid": "SensitiveShortUuid999"},
+                "auth": {"token": jwt, "password": password},
+                "subscription": {"uuid": uuid},
             },
         }
 
-        # 1. Result JSON
         json_path = write_result_json(self.td_path, data)
         json_content = json_path.read_text()
-        self.assertNotIn("SuperSecretAdminPassword", json_content)
-        self.assertNotIn("SensitiveShortUuid999", json_content)
-        self.assertNotIn("jwtSignature", json_content)
+        junit_path = write_junit_report(self.td_path, [{
+            "name": "redaction",
+            "classname": "security",
+            "status": "FAIL",
+            "message": f"{password} {uuid} {jwt}",
+            "details": f"{password} {uuid} {jwt}",
+        }])
+        junit_content = junit_path.read_text()
+        summary_path = write_summary_txt(self.td_path, {
+            **data,
+            "control_machine": {"os": jwt},
+            "trust": {"acme_mode": uuid},
+        })
+        summary_content = summary_path.read_text()
 
-        # 2. JUnit XML
-        cases = [
-            {
-                "name": "case_1",
-                "classname": "suite",
-                "status": "FAIL",
-                "message": "Failed with SuperSecretAdminPassword and SensitiveShortUuid999",
-            }
-        ]
-        xml_path = write_junit_report(self.td_path, cases)
-        xml_content = xml_path.read_text()
-        self.assertNotIn("SuperSecretAdminPassword", xml_content)
-        self.assertNotIn("SensitiveShortUuid999", xml_content)
-
-        # 3. Summary TXT
-        txt_path = write_summary_txt(self.td_path, data)
-        txt_content = txt_path.read_text()
-        self.assertNotIn("SuperSecretAdminPassword", txt_content)
+        for output_path, content in (
+            (json_path, json_content),
+            (junit_path, junit_content),
+            (summary_path, summary_content),
+        ):
+            with self.subTest(output=output_path.name):
+                for secret in (password, uuid, "jwtSignature", "eyJhbGciOiJIUzI1NiJ9"):
+                    self.assertNotIn(secret, content)
+                self.assertEqual(output_path.stat().st_mode & 0o777, 0o600)
+                self.assertIn("[REDACTED]", content)
 
     def test_summary_reports_actual_production_acme_mode(self):
         txt_path = write_summary_txt(self.td_path, {
