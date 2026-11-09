@@ -107,11 +107,15 @@ class TestPreflightSSHDNS(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             assert_no_secrets_in_argv(["ssh", "root@example.com", "echo SuperSecretToken12345"])
         self.assertIn("Zero-leak violation", str(ctx.exception))
+        self.assertNotIn("SuperSecretToken12345", str(ctx.exception))
+        self.assertNotIn("echo", str(ctx.exception))
 
         # 3. Prohibited credential parameter flag in argv
         with self.assertRaises(ValueError) as ctx2:
             assert_no_secrets_in_argv(["ssh", "root@example.com", "--admin_password=abc"])
         self.assertIn("Zero-leak violation", str(ctx2.exception))
+        self.assertNotIn("abc", str(ctx2.exception))
+        self.assertNotIn("--admin_password", str(ctx2.exception))
 
     def test_dns_verification_mock(self):
         # Less than 2 resolvers raises ValueError
