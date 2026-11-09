@@ -139,6 +139,19 @@ rules:
         ok, out = verify_nginx_config_syntax(ssh)
         self.assertTrue(ok)
 
+    def test_nginx_reality_fallback_does_not_accept_arbitrary_http_200(self):
+        with patch("socket.create_connection") as mock_conn:
+            mock_tls = MagicMock()
+            mock_tls.recv.side_effect = [
+                b"HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\n\\r\\n{\\\"ok\\\":true}",
+                b"",
+            ]
+            ctx = MagicMock()
+            ctx.wrap_socket.return_value = mock_tls
+            result = verify_reality_decoy_fallback("192.0.2.20", "reality.example.com", ctx)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("did not return decoy", result["error"])
+
     def test_nginx_reality_decoy_rejection_on_gowave_leak(self):
         # If the response contains GoWave Panel API strings, decoy check must FAIL
         with patch("socket.create_connection") as mock_conn:
