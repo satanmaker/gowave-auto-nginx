@@ -188,6 +188,21 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn('awk \'$3 == "443/tcp" { found=1 } END { exit !found }\'', rollback_script)
         self.assertNotIn("rollback_restore_failed", rollback_script)
 
+    def test_node_add_pre_dispatch_failures_stay_inside_api_rollback_boundary(self):
+        """Resolve local prerequisites early and persist VERIFYING inside the guarded API transaction."""
+        worker_script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        secret_index = worker_script.index('if ! secret_key=$(extract_secret_key "$GOWAVE_DIR")')
+        api_index = worker_script.index("if ! PYTHONPATH=", secret_index)
+        dispatch_index = worker_script.index('if ! PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key"', api_index)
+        self.assertLess(secret_index, api_index)
+        self.assertLess(api_index, dispatch_index)
+
+        transaction_block = worker_script[api_index:dispatch_index]
+        self.assertIn('journal["state"] = "NODE_ADD_VERIFYING"', transaction_block)
+        self.assertIn("write_journal_atomically(journal_path, journal)", transaction_block)
+        self.assertNotIn("jdata['state'] = 'NODE_ADD_VERIFYING'", worker_script)
+        self.assertNotIn("extract_secret_key", transaction_block)
+
     def test_worker_standalone_remote_rollback_defined(self):
         """gowave-node-auto.sh must provide standalone remote_rollback command."""
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()

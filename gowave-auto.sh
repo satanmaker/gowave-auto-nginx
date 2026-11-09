@@ -563,6 +563,14 @@ PY
                 return 1
             fi
 
+            # Resolve the local Worker secret before creating any API-side effects.
+            # A local config/read failure must not strand a partially registered node.
+            local secret_key
+            if ! secret_key=$(extract_secret_key "$GOWAVE_DIR"); then
+                echo "Error: unable to extract the Worker secret; no API changes were made." >&2
+                return 1
+            fi
+
             # 2. Register the node using argv for data and FD 3 for the password.
             # User-controlled values are never interpolated into Python source.
             if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - \
@@ -681,6 +689,11 @@ if vision_domain:
 nodes.append(node_entry)
 state_data["nodes"] = nodes
 atomic_write_state(state_data, state_path)
+
+# Record that the local state and API entities are committed before remote dispatch.
+journal["state"] = "NODE_ADD_VERIFYING"
+journal["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+write_journal_atomically(journal_path, journal)
 PY
             then
                 echo "Worker API registration failed; attempting action-aware API rollback." >&2
@@ -695,21 +708,7 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
             fi
 
 
-            # Mark remote side effects as in-flight before dispatch.
-            python3 -c "
-import sys, json, time
-for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
-    if p not in sys.path:
-        sys.path.insert(0, p)
-from modules.recovery import write_journal_atomically
-jdata = json.load(open('$JOURNAL_FILE'))
-jdata['state'] = 'NODE_ADD_VERIFYING'
-jdata['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-write_journal_atomically('$JOURNAL_FILE', jdata)
-"
             # 4. Dispatch remote deployment strictly via SSH stdin
-            local secret_key
-            secret_key=$(extract_secret_key "$GOWAVE_DIR")
             if ! PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
                 XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
                 GOWAVE_ACME_SERVER="${GOWAVE_ACME_SERVER:-}" \
