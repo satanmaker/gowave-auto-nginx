@@ -9,7 +9,7 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
-from live_vps.ssh import assert_no_secrets_in_argv
+from live_vps.ssh import assert_no_secrets_in_argv, SSHClient
 from live_vps.redaction import register_secret, clear_secrets
 from live_vps.dns import verify_domain_dns, verify_domain_no_aaaa
 from live_vps.firewall import verify_master_firewall, verify_worker_firewall
@@ -23,6 +23,28 @@ from live_vps.preflight import (
 class TestPreflightSSHDNS(unittest.TestCase):
     def tearDown(self):
         clear_secrets()
+
+    def test_ssh_client_ignores_ambient_config_and_global_trust(self):
+        client = SSHClient(
+            host="203.0.113.10", port=2222, user="root",
+            key_path="/tmp/master-key", known_hosts="/tmp/pinned-known-hosts",
+        )
+        ssh_cmd = client._build_ssh_cmd("true")
+        for expected in (
+            "/dev/null",
+            "UserKnownHostsFile=/tmp/pinned-known-hosts",
+            "GlobalKnownHostsFile=/dev/null",
+            "StrictHostKeyChecking=yes",
+            "IdentityAgent=none",
+            "IdentitiesOnly=yes",
+            "ProxyCommand=none",
+            "ProxyJump=none",
+            "ClearAllForwardings=yes",
+            "UpdateHostKeys=no",
+        ):
+            self.assertIn(expected, ssh_cmd)
+        self.assertEqual(ssh_cmd[ssh_cmd.index("-F") + 1], "/dev/null")
+        self.assertIn("-i", ssh_cmd)
 
     def test_assert_no_secrets_in_argv(self):
         # 1. Normal safe arguments
