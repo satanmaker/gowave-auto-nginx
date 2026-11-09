@@ -1576,7 +1576,11 @@ run_upstream_node_installer() {
         return 1
     fi
     chmod 0700 "$tmp_inst"
-    if bash "$tmp_inst" </dev/null; then
+    local normalized_node_ver="${GOWAVE_NODE_VERSION:-latest}"
+    if [[ "$normalized_node_ver" != "latest" && "$normalized_node_ver" != v* ]]; then
+        normalized_node_ver="v$normalized_node_ver"
+    fi
+    if GOWAVE_NODE_VERSION="$normalized_node_ver" bash "$tmp_inst" </dev/null; then
         rm -f "$tmp_inst"
     else
         local installer_rc=$?

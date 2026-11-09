@@ -97,6 +97,11 @@ install_local_node() {
         fi
     fi
 
+    local normalized_node_ver="${GOWAVE_NODE_VERSION:-latest}"
+    if [[ "$normalized_node_ver" != "latest" && "$normalized_node_ver" != v* ]]; then
+        normalized_node_ver="v$normalized_node_ver"
+    fi
+
     # Pass SECRET_KEY and NODE_PORT strictly via environment to installer execution
     if [[ -n "$upstream_installer" && -f "$upstream_installer" ]]; then
         if [[ -n "${GOWAVE_NODE_INSTALLER_SHA256:-}" ]]; then
@@ -110,7 +115,7 @@ install_local_node() {
         (
             export SECRET_KEY="$secret_key"
             export NODE_PORT="$node_port"
-            export GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}"
+            export GOWAVE_NODE_VERSION="$normalized_node_ver"
             bash "$upstream_installer" </dev/null
         )
     elif [[ "${GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER:-0}" == "1" ]]; then
@@ -121,7 +126,7 @@ install_local_node() {
         (
             export SECRET_KEY="$secret_key"
             export NODE_PORT="$node_port"
-            export GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}"
+            export GOWAVE_NODE_VERSION="$normalized_node_ver"
             local tmp_inst
             tmp_inst=$(mktemp "/tmp/gowave-node-install-XXXXXX.sh")
             curl -fsSL https://raw.githubusercontent.com/aaaSaZaN/gowave-node/main/install.sh -o "$tmp_inst"
