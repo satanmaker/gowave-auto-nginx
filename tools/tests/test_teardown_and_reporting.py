@@ -6,6 +6,7 @@ import hashlib
 import json
 import subprocess
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -242,6 +243,37 @@ class TestTeardownAndReporting(unittest.TestCase):
         self.assertEqual(result["status"], "TEARDOWN_FAILED")
         self.assertIn("timed out after 10s", result["error"])
         run_hook.assert_called_once()
+        collect_baseline.assert_not_called()
+
+    @patch("live_vps.teardown.collect_remote_baseline")
+    @patch("live_vps.teardown.subprocess.run")
+    def test_restore_hook_rejects_valid_json_that_is_not_an_object(
+        self, run_hook, collect_baseline
+    ):
+        hook = self.td_path / "restore-shape.sh"
+        hook.write_text("#!/bin/sh\\nexit 0\\n")
+        hook.chmod(0o755)
+        config = SimpleNamespace(
+            test_teardown_policy="RESTORE_SNAPSHOT",
+            master_snapshot_id="snap-master",
+            worker_snapshot_id="snap-worker",
+            restore_hook_path=str(hook),
+            restore_hook_sha256=hashlib.sha256(hook.read_bytes()).hexdigest(),
+            master_ip="192.0.2.10",
+            worker_ip="192.0.2.20",
+            restore_timeout=10,
+        )
+        outputs = ("[]", "null", '"RESTORED"', "42")
+        for output in outputs:
+            with self.subTest(output=output):
+                run_hook.return_value = subprocess.CompletedProcess([], 0, output, "")
+                result = execute_teardown(
+                    config, "run-json-shape",
+                    master_ssh=MagicMock(), worker_ssh=MagicMock(),
+                    pre_baseline_master={}, pre_baseline_worker={},
+                )
+                self.assertEqual(result["status"], "TEARDOWN_FAILED")
+                self.assertIn("must be an object", result["error"])
         collect_baseline.assert_not_called()
 
     def test_execute_teardown_restore_requires_both_baselines_before_hook(self):
