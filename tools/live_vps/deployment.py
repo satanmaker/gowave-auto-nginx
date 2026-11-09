@@ -342,6 +342,20 @@ def deploy_worker(
     if not acme_server:
         raise ValueError(f"Invalid ACME mode: {config.acme_mode}")
 
+    # Ensure Worker SSH credentials and known_hosts are staged on Master
+    worker_key_path = Path(config.worker_ssh_key_path or config.ssh_key_path).expanduser()
+    if worker_key_path.is_file():
+        master_ssh.run(
+            "mkdir -p -m 0700 /root/.ssh && cat > /root/.ssh/id_ed25519 && chmod 0600 /root/.ssh/id_ed25519",
+            input_data=worker_key_path.read_text(encoding="utf-8"),
+        )
+    worker_kh_path = Path(config.worker_known_hosts_path or config.ssh_known_hosts).expanduser()
+    if worker_kh_path.is_file():
+        master_ssh.run(
+            "mkdir -p -m 0700 /root/.ssh && cat > /root/.ssh/known_hosts && chmod 0600 /root/.ssh/known_hosts",
+            input_data=worker_kh_path.read_text(encoding="utf-8"),
+        )
+
     # Prepare private trace directory on Master
     master_ssh.run("mkdir -p -m 0700 /run/live_vps_strace && rm -f /run/live_vps_strace/worker_dispatch.trace")
 
@@ -400,10 +414,9 @@ errors = []
 
 with open(trace_path, "r", errors="replace") as f:
     for line in f:
-        if "<unfinished" in line:
-            errors.append("Unfinished syscall")
+        if "resumed>" in line:
             continue
-        m = re.search(r"(?:execve|execveat)\((.*)\)\s*=\s*(-?\d+)", line)
+        m = re.search(r"(?:execve|execveat)\((.*)\)", line)
         if not m:
             continue
         exec_count += 1
@@ -415,6 +428,8 @@ with open(trace_path, "r", errors="replace") as f:
 
         bracket_start = args_str.find("[")
         if bracket_start == -1:
+            if "<unfinished" not in line:
+                errors.append("No argv array found")
             continue
         depth = 0
         bracket_end = -1
@@ -514,18 +529,25 @@ print(json.dumps({
         worker_errors.append("Worker nginx -t failed")
 
     # Deploy hook exists and executable
-    w_hook = worker_ssh.run("test -x /opt/gowave-node/deploy-hook.sh")
+    w_hook = worker_ssh.run(
+        "test -x /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh || test -x /opt/gowave-node/deploy-hook.sh"
+    )
     if not w_hook.ok:
         worker_state_ok = False
-        worker_errors.append("Worker deploy-hook.sh missing or not executable")
+        worker_errors.append("Worker deploy-hook missing or not executable")
 
     # Cover reality assets exist
-    w_cover = worker_ssh.run("test -d /opt/cover-reality && test -f /opt/cover-reality/index.html")
+    w_cover = worker_ssh.run(
+        "(test -d /var/www/gowave-auto-nginx/cover-reality && test -f /var/www/gowave-auto-nginx/cover-reality/index.html) || "
+        "(test -d /opt/cover-reality && test -f /opt/cover-reality/index.html)"
+    )
     if not w_cover.ok:
         worker_state_ok = False
         worker_errors.append("Worker cover-reality assets missing")
 
-    worker_node_ver = worker_ssh.run("/usr/local/bin/gowave-node --version || /usr/local/bin/gowave-node version")
+    worker_node_ver = worker_ssh.run(
+        "/usr/local/bin/gowave-node version || /usr/local/bin/gowave-node --version || /opt/gowave-node/gowave-node version"
+    )
     worker_xray_ver = worker_ssh.run("/opt/gowave-node/rw-core version")
     for component, result, expected in (
         ("node", worker_node_ver, config.gowave_node_version),
