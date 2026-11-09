@@ -7,6 +7,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -21,6 +22,15 @@ ACME_MODE_URLS = {
     "staging": "https://acme-staging-v02.api.letsencrypt.org/directory",
     "production": "https://acme-v02.api.letsencrypt.org/directory",
 }
+
+
+def output_matches_pinned_version(output: str, expected: str) -> bool:
+    """Require the exact configured version token in a tool's version output."""
+    normalized = str(expected).strip().lstrip("vV")
+    if not normalized:
+        return False
+    pattern = rf"(?<![A-Za-z0-9])v?{re.escape(normalized)}(?![A-Za-z0-9])"
+    return re.search(pattern, output or "", flags=re.IGNORECASE) is not None
 
 
 def parse_strace_argv_output(trace_text: str, secrets: List[str]) -> Dict[str, Any]:
@@ -113,14 +123,17 @@ def parse_strace_argv_output(trace_text: str, secrets: List[str]) -> Dict[str, A
 
 def prepare_master_repository(master_ssh: SSHClient, local_repo: Path, target_dir: str = "/opt/gowave-auto-nginx") -> bool:
     """Stream git archive of HEAD to Master VPS and extract into target_dir."""
-    archive_cmd = ["git", "archive", "HEAD"]
+    # git archive defaults to an uncompressed tar stream. Use one matching
+    # extractor: retrying tar -xf after tar -xzf has consumed stdin loses data.
+    archive_cmd = ["git", "archive", "--format=tar", "HEAD"]
     proc = subprocess.Popen(archive_cmd, cwd=str(local_repo), stdout=subprocess.PIPE)
-    tar_bytes = proc.communicate()[0]
-    if proc.returncode != 0:
+    tar_bytes, _ = proc.communicate()
+    if proc.returncode != 0 or not tar_bytes:
         return False
 
+    remote_dir = shlex.quote(target_dir)
     r = master_ssh.run(
-        f"mkdir -p {target_dir} && tar -xzf - -C {target_dir} 2>/dev/null || tar -xf - -C {target_dir}",
+        f"mkdir -p -- {remote_dir} && tar -xf - -C {remote_dir}",
         input_data=tar_bytes,
     )
     return r.ok
@@ -200,12 +213,17 @@ def install_master(
     if not acme_server:
         raise ValueError(f"Invalid ACME mode: {config.acme_mode}")
 
-    # Build environment and command
-    env_vars = (
-        f"export GOWAVE_ACME_SERVER={acme_server}\n"
-        f"export GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1\n"
-        f"export GOWAVE_NODE_INSTALLER_COMMIT={config.gowave_node_installer_commit}\n"
-        f"export GOWAVE_NODE_INSTALLER_SHA256={config.gowave_node_installer_sha256}\n"
+    # Pass immutable release versions and all non-secret arguments explicitly.
+    env_values = {
+        "GOWAVE_ACME_SERVER": acme_server,
+        "GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER": "1",
+        "GOWAVE_NODE_INSTALLER_COMMIT": config.gowave_node_installer_commit,
+        "GOWAVE_NODE_INSTALLER_SHA256": config.gowave_node_installer_sha256,
+        "GOWAVE_PANEL_VERSION": config.gowave_panel_version,
+        "GOWAVE_NODE_VERSION": config.gowave_node_version,
+    }
+    env_vars = "\n".join(
+        f"export {key}={shlex.quote(str(value))}" for key, value in env_values.items()
     )
 
     args = [
@@ -213,12 +231,12 @@ def install_master(
         "install",
         config.master_panel_domain,
         config.master_reality_domain,
-        f"admin@{config.master_panel_domain}",
+        config.admin_email,
     ]
     if config.master_vision_domain:
         args.append(config.master_vision_domain)
 
-    install_cmd = f"{env_vars} {' '.join(args)}"
+    install_cmd = f"{env_vars}\nexec " + " ".join(shlex.quote(str(value)) for value in args)
     r = master_ssh.run(install_cmd, timeout=600)
     if not r.ok:
         return False, {"error": "gowave-auto.sh install exited non-zero", "stderr": r.stderr}
@@ -251,14 +269,33 @@ def install_master(
     if not health_chk.ok or "HEALTHY" not in health_chk.stdout:
         return False, {"error": f"gowave-auto.sh health failed: {health_chk.stdout}"}
 
-    # Interrogate Panel and Node versions
+    # Interrogate exact Panel, Node and Node-managed Xray versions.
     panel_ver_r = master_ssh.run("/opt/gowave/gowave-server --version || /opt/gowave/gowave-server version")
-    node_ver_r = master_ssh.run("/opt/gowave-node/gowave-node --version || /opt/gowave-node/gowave-node version")
+    node_ver_r = master_ssh.run("/usr/local/bin/gowave-node --version || /usr/local/bin/gowave-node version")
+    xray_ver_r = master_ssh.run("/opt/gowave-node/rw-core version")
+    version_checks = {
+        "panel": (panel_ver_r, config.gowave_panel_version),
+        "node": (node_ver_r, config.gowave_node_version),
+        "xray_server": (xray_ver_r, config.xray_server_version),
+    }
+    version_errors = []
+    for component, (result, expected) in version_checks.items():
+        observed = (result.stdout or "") + "\n" + (result.stderr or "")
+        if not result.ok or not output_matches_pinned_version(observed, expected):
+            version_errors.append({
+                "component": component,
+                "expected": expected,
+                "observed": observed.strip()[:300],
+            })
+    if version_errors:
+        return False, {"error": "Installed Master software does not match configured version pins",
+                       "version_errors": version_errors}
 
     details = {
         "status": "PASS",
         "panel_version_output": panel_ver_r.stdout.strip(),
         "node_version_output": node_ver_r.stdout.strip(),
+        "xray_server_version_output": xray_ver_r.stdout.strip(),
     }
     return True, details
 
@@ -291,17 +328,25 @@ def deploy_worker(
     strace_limit = limit_r.stdout.strip() if limit_r.ok else "131072"
 
     # Command to run under strace on Master
-    env_vars = (
-        f"export GOWAVE_ACME_SERVER={acme_server}\n"
-        f"export GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1\n"
-        f"export GOWAVE_NODE_INSTALLER_COMMIT={config.gowave_node_installer_commit}\n"
-        f"export GOWAVE_NODE_INSTALLER_SHA256={config.gowave_node_installer_sha256}\n"
+    env_values = {
+        "GOWAVE_ACME_SERVER": acme_server,
+        "GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER": "1",
+        "GOWAVE_NODE_INSTALLER_COMMIT": config.gowave_node_installer_commit,
+        "GOWAVE_NODE_INSTALLER_SHA256": config.gowave_node_installer_sha256,
+        "GOWAVE_NODE_VERSION": config.gowave_node_version,
+    }
+    env_vars = "\n".join(
+        f"export {key}={shlex.quote(str(value))}" for key, value in env_values.items()
     )
-
+    node_add_args = [
+        f"{target_dir}/gowave-auto.sh", "node", "add", "worker-1",
+        config.worker_ip, config.worker_domain, config.worker_reality_domain,
+        config.worker_ssh_user, str(config.worker_ssh_port),
+    ]
     node_add_cmd = (
-        f"{env_vars} "
-        f"strace -f -v -s {strace_limit} -e trace=execve,execveat -o /run/live_vps_strace/worker_dispatch.trace "
-        f"{target_dir}/gowave-auto.sh node add worker-1 {config.worker_ip} {config.worker_domain} {config.worker_reality_domain} root 22"
+        f"{env_vars}\nstrace -f -v -s {shlex.quote(strace_limit)} "
+        "-e trace=execve,execveat -o /run/live_vps_strace/worker_dispatch.trace "
+        + " ".join(shlex.quote(str(value)) for value in node_add_args)
     )
 
     r = master_ssh.run(node_add_cmd, timeout=600)
@@ -396,17 +441,31 @@ print(json.dumps({
     sec_r = master_ssh.run(f"/opt/gowave/gowave-server rescue --print-secret-key-raw </dev/null 2>/dev/null || true")
     master_secret = sec_r.stdout.strip()
 
-    parse_r = master_ssh.run("python3 -", input_data=f"{master_secret}\n{parse_script}")
-    observer_verdict: Dict[str, Any] = {}
-    try:
-        # Extract json output
-        lines = parse_r.stdout.strip().splitlines()
-        for ln in reversed(lines):
-            if ln.startswith("{") and ln.endswith("}"):
-                observer_verdict = json.loads(ln)
-                break
-    except Exception as e:
-        observer_verdict = {"status": "INCOMPLETE", "error": f"Failed to parse observer JSON: {e}"}
+    if not sec_r.ok or not master_secret:
+        observer_verdict: Dict[str, Any] = {
+            "status": "INCOMPLETE", "error": "Could not obtain Master secret for argv observer"
+        }
+        parse_r = SSHResult(returncode=1, stdout="", stderr="secret extraction failed")
+    else:
+        # python - reads its program from stdin, so source and secret cannot
+        # share that stream. Keep non-secret parser source in -c argv and send
+        # only the secret through stdin.
+        parse_cmd = "python3 -c " + shlex.quote(parse_script)
+        parse_r = master_ssh.run(parse_cmd, input_data=master_secret)
+        observer_verdict = {}
+        if not parse_r.ok:
+            observer_verdict = {"status": "INCOMPLETE", "error": "Remote argv observer process failed"}
+        else:
+            try:
+                lines = parse_r.stdout.strip().splitlines()
+                for ln in reversed(lines):
+                    if ln.startswith("{") and ln.endswith("}"):
+                        observer_verdict = json.loads(ln)
+                        break
+                if not observer_verdict:
+                    observer_verdict = {"status": "INCOMPLETE", "error": "Observer emitted no JSON result"}
+            except Exception as e:
+                observer_verdict = {"status": "INCOMPLETE", "error": f"Failed to parse observer JSON: {e}"}
 
     # Audit Worker host state
     worker_state_ok = True
@@ -436,6 +495,19 @@ print(json.dumps({
     if not w_cover.ok:
         worker_state_ok = False
         worker_errors.append("Worker cover-reality assets missing")
+
+    worker_node_ver = worker_ssh.run("/usr/local/bin/gowave-node --version || /usr/local/bin/gowave-node version")
+    worker_xray_ver = worker_ssh.run("/opt/gowave-node/rw-core version")
+    for component, result, expected in (
+        ("node", worker_node_ver, config.gowave_node_version),
+        ("xray_server", worker_xray_ver, config.xray_server_version),
+    ):
+        observed = (result.stdout or "") + "\n" + (result.stderr or "")
+        if not result.ok or not output_matches_pinned_version(observed, expected):
+            worker_state_ok = False
+            worker_errors.append(
+                f"Worker {component} version mismatch: expected {expected}, observed {observed.strip()[:200]}"
+            )
 
     overall_ok = r.ok and observer_verdict.get("status") == "PASS" and worker_state_ok
     return overall_ok, {

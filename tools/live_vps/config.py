@@ -26,6 +26,10 @@ WHITELIST_KEYS = {
     "WORKER_SSH_USER",
     "SSH_KEY_PATH",
     "SSH_KNOWN_HOSTS",
+    "MASTER_SSH_KEY_PATH",
+    "WORKER_SSH_KEY_PATH",
+    "MASTER_KNOWN_HOSTS_PATH",
+    "WORKER_KNOWN_HOSTS_PATH",
     "ACME_MODE",
     "ADMIN_EMAIL",
     "GOWAVE_PANEL_VERSION",
@@ -61,8 +65,6 @@ MANDATORY_KEYS = {
     "WORKER_IP",
     "WORKER_DOMAIN",
     "WORKER_REALITY_DOMAIN",
-    "SSH_KEY_PATH",
-    "SSH_KNOWN_HOSTS",
     "GOWAVE_PANEL_VERSION",
     "GOWAVE_NODE_VERSION",
     "GOWAVE_NODE_INSTALLER_COMMIT",
@@ -77,6 +79,7 @@ DOMAIN_REGEX = re.compile(
 )
 HEX40_REGEX = re.compile(r"^[0-9a-fA-F]{40}$")
 HEX64_REGEX = re.compile(r"^[0-9a-fA-F]{64}$")
+VERSION_REGEX = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$")
 
 
 def parse_bool(val: str, key_name: str) -> bool:
@@ -142,8 +145,11 @@ class LiveVPSConfig:
         return self.values[key]
 
     def __getattr__(self, name: str) -> Any:
-        if name in self.values:
-            return self.values[name]
+        # Canonical storage uses uppercase environment keys; the runner uses
+        # lowercase Python-style attributes. Resolve both consistently.
+        key = name.upper()
+        if key in self.values:
+            return self.values[key]
         raise AttributeError(f"'LiveVPSConfig' has no attribute '{name}'")
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -151,19 +157,22 @@ class LiveVPSConfig:
 
 
 def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfig:
-    config_path = Path(path).resolve()
+    supplied_path = Path(path)
+    if supplied_path.is_symlink():
+        raise ValueError(f"Configuration file must not be a symlink: {supplied_path}")
+    config_path = supplied_path.resolve()
     if not config_path.is_file():
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
     # Enforce POSIX file permissions: must not be group or world readable/writable/executable
     if not skip_mode_check:
         st = config_path.stat()
-        file_mode = st.st_mode
-        if file_mode & (stat.S_IRWXG | stat.S_IRWXO):
-            oct_mode = oct(file_mode & 0o777)
+        permissions = stat.S_IMODE(st.st_mode)
+        if permissions not in (0o600, 0o400):
+            oct_mode = oct(permissions)
             raise PermissionError(
                 f"Configuration file {config_path} has insecure permissions {oct_mode}. "
-                f"It must have mode 0600 (or 0400) to protect credentials."
+                f"It must have mode 0600 or 0400 to protect credentials."
             )
 
     raw_pairs: Dict[str, str] = {}
@@ -200,6 +209,8 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
     # Target IPs
     parsed["MASTER_IP"] = validate_public_ip(raw_pairs["MASTER_IP"], "MASTER_IP")
     parsed["WORKER_IP"] = validate_public_ip(raw_pairs["WORKER_IP"], "WORKER_IP")
+    if parsed["MASTER_IP"] == parsed["WORKER_IP"]:
+        raise ValueError("MASTER_IP and WORKER_IP must identify different VPS hosts.")
 
     # Target Domains
     parsed["MASTER_PANEL_DOMAIN"] = validate_domain(raw_pairs["MASTER_PANEL_DOMAIN"], "MASTER_PANEL_DOMAIN")
@@ -211,6 +222,12 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
     parsed["WORKER_REALITY_DOMAIN"] = validate_domain(raw_pairs["WORKER_REALITY_DOMAIN"], "WORKER_REALITY_DOMAIN")
     if parsed["WORKER_DOMAIN"].lower() == parsed["WORKER_REALITY_DOMAIN"].lower():
         raise ValueError("WORKER_DOMAIN and WORKER_REALITY_DOMAIN must be different.")
+
+    # Vision is a pair-wide capability. Reject one-sided configuration before SSH.
+    master_vision_set = bool(raw_pairs.get("MASTER_VISION_DOMAIN", "").strip())
+    worker_vision_set = bool(raw_pairs.get("WORKER_VISION_DOMAIN", "").strip())
+    if master_vision_set != worker_vision_set:
+        raise ValueError("MASTER_VISION_DOMAIN and WORKER_VISION_DOMAIN must both be configured or both be omitted.")
 
     # Optional Vision domains
     if "MASTER_VISION_DOMAIN" in raw_pairs and raw_pairs["MASTER_VISION_DOMAIN"]:
@@ -233,14 +250,35 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
     else:
         parsed["WORKER_VISION_DOMAIN"] = None
 
-    # SSH configuration
-    parsed["MASTER_SSH_PORT"] = parse_port(raw_pairs.get("MASTER_SSH_PORT", "22"), "MASTER_SSH_PORT")
-    parsed["MASTER_SSH_USER"] = raw_pairs.get("MASTER_SSH_USER", "root")
-    parsed["WORKER_SSH_PORT"] = parse_port(raw_pairs.get("WORKER_SSH_PORT", "22"), "WORKER_SSH_PORT")
-    parsed["WORKER_SSH_USER"] = raw_pairs.get("WORKER_SSH_USER", "root")
+    domain_values = [
+        parsed["MASTER_PANEL_DOMAIN"], parsed["MASTER_REALITY_DOMAIN"],
+        parsed["WORKER_DOMAIN"], parsed["WORKER_REALITY_DOMAIN"],
+    ]
+    if parsed["MASTER_VISION_DOMAIN"]:
+        domain_values.extend([parsed["MASTER_VISION_DOMAIN"], parsed["WORKER_VISION_DOMAIN"]])
+    normalized_domains = [domain.lower() for domain in domain_values]
+    if len(normalized_domains) != len(set(normalized_domains)):
+        raise ValueError("All configured Master/Worker Panel, REALITY, and Vision domains must be globally distinct.")
 
-    parsed["SSH_KEY_PATH"] = raw_pairs["SSH_KEY_PATH"]
-    parsed["SSH_KNOWN_HOSTS"] = raw_pairs["SSH_KNOWN_HOSTS"]
+    # SSH configuration. E2E v1 deliberately supports root SSH only; no sudo adapter exists.
+    parsed["MASTER_SSH_PORT"] = parse_port(raw_pairs.get("MASTER_SSH_PORT", "22"), "MASTER_SSH_PORT")
+    parsed["WORKER_SSH_PORT"] = parse_port(raw_pairs.get("WORKER_SSH_PORT", "22"), "WORKER_SSH_PORT")
+    parsed["MASTER_SSH_USER"] = raw_pairs.get("MASTER_SSH_USER", "root").strip()
+    parsed["WORKER_SSH_USER"] = raw_pairs.get("WORKER_SSH_USER", "root").strip()
+    if parsed["MASTER_SSH_USER"] != "root" or parsed["WORKER_SSH_USER"] != "root":
+        raise ValueError("E2E v1 requires MASTER_SSH_USER=root and WORKER_SSH_USER=root; sudo fallback is unsupported.")
+
+    # Support per-host credentials without requiring legacy shared paths.
+    parsed["SSH_KEY_PATH"] = raw_pairs.get("SSH_KEY_PATH")
+    parsed["SSH_KNOWN_HOSTS"] = raw_pairs.get("SSH_KNOWN_HOSTS")
+    parsed["MASTER_SSH_KEY_PATH"] = raw_pairs.get("MASTER_SSH_KEY_PATH", parsed["SSH_KEY_PATH"])
+    parsed["WORKER_SSH_KEY_PATH"] = raw_pairs.get("WORKER_SSH_KEY_PATH", parsed["SSH_KEY_PATH"])
+    parsed["MASTER_KNOWN_HOSTS_PATH"] = raw_pairs.get("MASTER_KNOWN_HOSTS_PATH", parsed["SSH_KNOWN_HOSTS"])
+    parsed["WORKER_KNOWN_HOSTS_PATH"] = raw_pairs.get("WORKER_KNOWN_HOSTS_PATH", parsed["SSH_KNOWN_HOSTS"])
+    for key in ("MASTER_SSH_KEY_PATH", "WORKER_SSH_KEY_PATH",
+                "MASTER_KNOWN_HOSTS_PATH", "WORKER_KNOWN_HOSTS_PATH"):
+        if not parsed[key]:
+            raise ValueError(f"{key} (or its shared SSH_KEY_PATH/SSH_KNOWN_HOSTS fallback) is mandatory.")
 
     # ACME mode
     acme_mode = raw_pairs.get("ACME_MODE", "staging").lower()
@@ -249,9 +287,16 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
     parsed["ACME_MODE"] = acme_mode
     parsed["ADMIN_EMAIL"] = raw_pairs.get("ADMIN_EMAIL", "admin@example.com")
 
-    # Version pins
-    parsed["GOWAVE_PANEL_VERSION"] = raw_pairs["GOWAVE_PANEL_VERSION"]
-    parsed["GOWAVE_NODE_VERSION"] = raw_pairs["GOWAVE_NODE_VERSION"]
+    # Version pins must be explicit version/tag identifiers; floating channels are rejected.
+    for version_key in (
+        "GOWAVE_PANEL_VERSION", "GOWAVE_NODE_VERSION",
+        "XRAY_SERVER_VERSION", "XRAY_CLIENT_VERSION", "MIHOMO_CLIENT_VERSION",
+    ):
+        version_value = raw_pairs[version_key].strip()
+        if not VERSION_REGEX.fullmatch(version_value) or version_value.lower() in ("latest", "stable", "main", "master"):
+            raise ValueError(f"{version_key} must be an explicit pinned version/tag, not a floating channel.")
+        parsed[version_key] = version_value
+
 
     commit = raw_pairs["GOWAVE_NODE_INSTALLER_COMMIT"]
     if not HEX40_REGEX.match(commit):
@@ -266,10 +311,6 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
             f"Invalid GOWAVE_NODE_INSTALLER_SHA256: '{sha256}'. Must be an explicit 64-hex SHA256 digest."
         )
     parsed["GOWAVE_NODE_INSTALLER_SHA256"] = sha256
-
-    parsed["XRAY_SERVER_VERSION"] = raw_pairs["XRAY_SERVER_VERSION"]
-    parsed["XRAY_CLIENT_VERSION"] = raw_pairs["XRAY_CLIENT_VERSION"]
-    parsed["MIHOMO_CLIENT_VERSION"] = raw_pairs["MIHOMO_CLIENT_VERSION"]
 
     # IPv6
     enable_ipv6 = parse_bool(raw_pairs.get("ENABLE_IPV6", "false"), "ENABLE_IPV6")
@@ -286,8 +327,14 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
         parsed["WORKER_IPV6"] = raw_pairs.get("WORKER_IPV6")
 
     # Egress expectations
-    parsed["EXPECTED_MASTER_EGRESS_IP"] = raw_pairs.get("EXPECTED_MASTER_EGRESS_IP")
-    parsed["EXPECTED_WORKER_EGRESS_IP"] = raw_pairs.get("EXPECTED_WORKER_EGRESS_IP")
+    parsed["EXPECTED_MASTER_EGRESS_IP"] = (
+        validate_public_ip(raw_pairs["EXPECTED_MASTER_EGRESS_IP"], "EXPECTED_MASTER_EGRESS_IP")
+        if raw_pairs.get("EXPECTED_MASTER_EGRESS_IP") else None
+    )
+    parsed["EXPECTED_WORKER_EGRESS_IP"] = (
+        validate_public_ip(raw_pairs["EXPECTED_WORKER_EGRESS_IP"], "EXPECTED_WORKER_EGRESS_IP")
+        if raw_pairs.get("EXPECTED_WORKER_EGRESS_IP") else None
+    )
 
     # Timeouts
     parsed["NODE_READY_TIMEOUT"] = parse_positive_int(raw_pairs.get("NODE_READY_TIMEOUT", "120"), "NODE_READY_TIMEOUT")

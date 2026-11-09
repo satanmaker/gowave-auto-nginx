@@ -3,6 +3,7 @@ Fetches and validates Xray JSON and Mihomo YAML subscriptions with zero secret l
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import subprocess
@@ -29,6 +30,30 @@ def get_default_user_short_uuid(panel_client: E2EPanelClient) -> str:
     return str(short_uuid)
 
 
+def request_subscription_status(
+    panel_domain: str,
+    path: str,
+    ssl_context: ssl.SSLContext,
+    user_agent: Optional[str] = None,
+    timeout: int = 10,
+) -> int:
+    """Send a subscription request with an exactly controlled User-Agent header."""
+    connection = http.client.HTTPSConnection(
+        panel_domain, context=ssl_context, timeout=timeout
+    )
+    try:
+        connection.putrequest("GET", path, skip_accept_encoding=True)
+        if user_agent is not None:
+            connection.putheader("User-Agent", user_agent)
+        connection.putheader("Connection", "close")
+        connection.endheaders()
+        response = connection.getresponse()
+        response.read()
+        return response.status
+    finally:
+        connection.close()
+
+
 def verify_user_agent_policy(
     panel_domain: str,
     short_uuid: str,
@@ -37,50 +62,86 @@ def verify_user_agent_policy(
     """Test User-Agent policy enforcement on subscription endpoint."""
     url = f"https://{panel_domain}/api/sub/{short_uuid}/v2ray-json"
 
-    # 1. Absent User-Agent
-    absent_rejected = False
+    # Missing and explicitly blank User-Agent are distinct policy cases.
     absent_code = None
+    blank_code = None
+    absent_error = None
+    blank_error = None
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": ""})
-        # Remove standard python-urllib header
-        del req.headers["User-agent"]
-        with urllib.request.urlopen(req, context=ssl_context, timeout=10) as resp:
-            absent_code = resp.status
-    except urllib.error.HTTPError as e:
-        absent_code = e.code
-        if e.code in (403, 400):
-            absent_rejected = True
-    except Exception:
-        absent_rejected = True
+        absent_code = request_subscription_status(
+            panel_domain, f"/api/sub/{short_uuid}/v2ray-json",
+            ssl_context, user_agent=None, timeout=10,
+        )
+    except Exception as exc:
+        absent_error = f"{type(exc).__name__}: {exc}"
+    try:
+        blank_code = request_subscription_status(
+            panel_domain, f"/api/sub/{short_uuid}/v2ray-json",
+            ssl_context, user_agent="", timeout=10,
+        )
+    except Exception as exc:
+        blank_error = f"{type(exc).__name__}: {exc}"
+
+    absent_rejected = absent_code in (400, 403)
+    blank_rejected = blank_code in (400, 403)
 
     # 2. Valid Xray User-Agent
     xray_accepted = False
+    xray_code = None
+    xray_error = None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "v2rayNG/1.8.5"})
         with urllib.request.urlopen(req, context=ssl_context, timeout=10) as resp:
-            if resp.status == 200:
-                xray_accepted = True
-    except Exception:
-        xray_accepted = False
+            xray_code = resp.status
+            xray_accepted = xray_code == 200
+    except urllib.error.HTTPError as exc:
+        xray_code = exc.code
+        xray_error = f"HTTP {exc.code}: {exc.reason}"
+    except Exception as exc:
+        xray_error = f"{type(exc).__name__}: {exc}"
 
     # 3. Valid Mihomo User-Agent
     clash_url = f"https://{panel_domain}/api/sub/{short_uuid}/clash"
     mihomo_accepted = False
+    mihomo_code = None
+    mihomo_error = None
     try:
         req = urllib.request.Request(clash_url, headers={"User-Agent": "clash.meta"})
         with urllib.request.urlopen(req, context=ssl_context, timeout=10) as resp:
-            if resp.status == 200:
-                mihomo_accepted = True
-    except Exception:
-        mihomo_accepted = False
+            mihomo_code = resp.status
+            mihomo_accepted = mihomo_code == 200
+    except urllib.error.HTTPError as exc:
+        mihomo_code = exc.code
+        mihomo_error = f"HTTP {exc.code}: {exc.reason}"
+    except Exception as exc:
+        mihomo_error = f"{type(exc).__name__}: {exc}"
 
-    passed = absent_rejected and xray_accepted and mihomo_accepted
+    # A known policy violation is FAIL even when another probe is inconclusive.
+    # Only missing transport/HTTP evidence without a proven violation is INCOMPLETE.
+    proven_failure = (
+        (absent_code is not None and not absent_rejected)
+        or (blank_code is not None and not blank_rejected)
+        or (xray_code is not None and not xray_accepted)
+        or (mihomo_code is not None and not mihomo_accepted)
+    )
+    missing_evidence = any(
+        code is None for code in (absent_code, blank_code, xray_code, mihomo_code)
+    )
+    status = "FAIL" if proven_failure else ("INCOMPLETE" if missing_evidence else "PASS")
     return {
-        "status": "PASS" if passed else "FAIL",
+        "status": status,
         "absent_rejected": absent_rejected,
         "absent_code": absent_code,
+        "absent_error": absent_error,
+        "blank_rejected": blank_rejected,
+        "blank_code": blank_code,
+        "blank_error": blank_error,
         "xray_accepted": xray_accepted,
+        "xray_code": xray_code,
+        "xray_error": xray_error,
         "mihomo_accepted": mihomo_accepted,
+        "mihomo_code": mihomo_code,
+        "mihomo_error": mihomo_error,
     }
 
 

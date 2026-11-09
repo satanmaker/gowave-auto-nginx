@@ -93,7 +93,12 @@ class TestTeardownAndReporting(unittest.TestCase):
         res = execute_teardown(config, "run-123")
         self.assertEqual(res["status"], "TEARDOWN_FAILED")
 
-    def test_execute_teardown_restore_snapshot_success(self):
+    @patch("live_vps.teardown.time.sleep")
+    @patch("live_vps.teardown.check_disposable_gate", return_value=(True, []))
+    @patch("live_vps.teardown.collect_remote_baseline")
+    def test_execute_teardown_restore_snapshot_is_not_false_pass(
+        self, collect_baseline, gate, sleep
+    ):
         hook = self.td_path / "valid_hook.sh"
         hook_resp = {
             "status": "RESTORED",
@@ -114,9 +119,52 @@ class TestTeardownAndReporting(unittest.TestCase):
         config.restore_hook_sha256 = sha
         config.restore_timeout = 10
 
-        res = execute_teardown(config, "run-123", master_ssh=None, worker_ssh=None)
-        self.assertEqual(res["status"], "PASS")
+        baseline = {
+            "os_kernel": "Linux test 6.1",
+            "running_services": ["ssh.service"],
+            "tcp_listeners_raw": "LISTEN 0 4096 0.0.0.0:22",
+            "listening_ports": [22],
+            "existing_gowave_dirs": [],
+            "firewall_status": "Status: active",
+            "swap_info": "",
+            "key_packages": "openssh-server=1",
+        }
+        collect_baseline.side_effect = [dict(baseline), dict(baseline)]
+        res = execute_teardown(
+            config, "run-123",
+            master_ssh=MagicMock(), worker_ssh=MagicMock(),
+            pre_baseline_master=baseline, pre_baseline_worker=baseline,
+        )
+        self.assertEqual(res["status"], "INCOMPLETE")
         self.assertEqual(res["policy"], "RESTORE_SNAPSHOT")
+        self.assertEqual(res["captured_baseline_comparison"], "MATCHED")
+        self.assertEqual(res["pair_lock_reacquisition"], "NOT_IMPLEMENTED")
+
+    def test_execute_teardown_restore_requires_both_baselines_before_hook(self):
+        config = MagicMock()
+        config.test_teardown_policy = "RESTORE_SNAPSHOT"
+        config.master_snapshot_id = "snap-m"
+        config.worker_snapshot_id = "snap-w"
+        config.restore_hook_path = "/not-invoked"
+        config.restore_hook_sha256 = "0" * 64
+        config.master_ip = "198.51.100.1"
+        config.worker_ip = "198.51.100.2"
+        config.restore_timeout = 10
+        result = execute_teardown(config, "run-123", master_ssh=MagicMock(),
+                                  worker_ssh=MagicMock(), pre_baseline_master={}, pre_baseline_worker=None)
+        self.assertEqual(result["status"], "TEARDOWN_FAILED")
+        self.assertIn("both SSH clients and both saved preflight baselines", result["error"])
+
+    def test_junit_marks_incomplete_and_teardown_failed_as_errors(self):
+        path = write_junit_report(self.td_path, [
+            {"name": "missing-evidence", "classname": "acceptance", "status": "INCOMPLETE",
+             "message": "packet evidence missing"},
+            {"name": "restore", "classname": "teardown", "status": "TEARDOWN_FAILED",
+             "message": "snapshot restoration failed"},
+        ])
+        content = path.read_text()
+        self.assertIn('errors="2"', content)
+        self.assertEqual(content.count("<error "), 2)
 
     def test_reporting_redaction_in_all_outputs(self):
         register_secret("SuperSecretAdminPassword")
@@ -160,6 +208,14 @@ class TestTeardownAndReporting(unittest.TestCase):
         txt_path = write_summary_txt(self.td_path, data)
         txt_content = txt_path.read_text()
         self.assertNotIn("SuperSecretAdminPassword", txt_content)
+
+    def test_summary_reports_actual_production_acme_mode(self):
+        txt_path = write_summary_txt(self.td_path, {
+            "test_run_id": "run-production",
+            "overall": "INCOMPLETE",
+            "trust": {"acme_mode": "production"},
+        })
+        self.assertIn("ACME Mode:      production", txt_path.read_text())
 
 
 if __name__ == "__main__":
