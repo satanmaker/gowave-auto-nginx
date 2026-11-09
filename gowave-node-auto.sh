@@ -1957,45 +1957,128 @@ restore_acme_lineage() {
 
     local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
     local meta_file="${snap_dir}/lineage-manifest.json"
-
-    if [[ ! -f "$meta_file" ]]; then
-        return 0
+    if [[ ! -f "$meta_file" || -L "$meta_file" ]]; then
+        echo "Error: ACME lineage manifest missing or unsafe for $domain" >&2
+        return 1
     fi
 
-    local existed
-    existed=$(python3 -c "import json; print('1' if json.load(open('$meta_file')).get('existed_before') else '0')" 2>/dev/null || echo "0")
+    local manifest_data
+    manifest_data=$(python3 - "$meta_file" "$domain" <<'PY'
+import json
+import sys
+
+path, expected_domain = sys.argv[1:3]
+try:
+    with open(path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict) or data.get("domain") != expected_domain:
+        raise ValueError("manifest root/domain mismatch")
+    existed = data.get("existed_before")
+    if type(existed) is not bool:
+        raise ValueError("existed_before must be a boolean")
+    serial = data.get("serial", "")
+    fingerprint = data.get("fingerprint", "")
+    if not isinstance(serial, str) or not isinstance(fingerprint, str):
+        raise ValueError("certificate metadata must be strings")
+    if existed and (not serial or not fingerprint):
+        raise ValueError("pre-existing lineage snapshot lacks certificate identity")
+    print("1" if existed else "0")
+    print(serial)
+    print(fingerprint)
+except Exception as exc:
+    print(f"Invalid ACME lineage manifest: {type(exc).__name__}", file=sys.stderr)
+    sys.exit(1)
+PY
+    ) || {
+        echo "Error: Refusing ACME rollback for $domain because its snapshot manifest is invalid." >&2
+        return 1
+    }
+
+    local existed serial fingerprint
+    local -a manifest_fields=()
+    mapfile -t manifest_fields <<< "$manifest_data"
+    if [[ "${#manifest_fields[@]}" -ne 3 ]]; then
+        echo "Error: ACME lineage manifest has an invalid field count for $domain." >&2
+        return 1
+    fi
+    existed="${manifest_fields[0]}"
+    serial="${manifest_fields[1]}"
+    fingerprint="${manifest_fields[2]}"
+
     local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
     local live_dir="${letsencrypt_root}/live/${domain}"
     local archive_dir="${letsencrypt_root}/archive/${domain}"
 
     if [[ "$existed" == "0" ]]; then
-        rm -f "$renewal_conf"
-        rm -rf "$live_dir" "$archive_dir"
+        rm -f "$renewal_conf" || return 1
+        rm -rf "$live_dir" "$archive_dir" || return 1
         return 0
     fi
+    if [[ "$existed" != "1" ]]; then
+        echo "Error: Invalid existed_before value for $domain." >&2
+        return 1
+    fi
 
-    mkdir -p "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir"
-    chmod 0755 "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" 2>/dev/null || true
+    mkdir -p "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" || return 1
+    chmod 0755 "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" || return 1
 
     if [[ -f "$snap_dir/renewal.conf" ]]; then
-        cp -p "$snap_dir/renewal.conf" "$renewal_conf"
+        cp -p "$snap_dir/renewal.conf" "$renewal_conf" || return 1
     fi
     if [[ -d "$snap_dir/archive" ]]; then
         local arc
         for arc in "$snap_dir/archive"/*; do
             [[ -f "$arc" ]] || continue
-            cp -p "$arc" "$archive_dir/$(basename "$arc")"
+            cp -p "$arc" "$archive_dir/$(basename "$arc")" || return 1
         done
     fi
     if [[ -d "$snap_dir/live" ]]; then
-        local f
+        local f target
         for f in cert.pem chain.pem fullchain.pem privkey.pem; do
             if [[ -f "$snap_dir/live/${f}.target" ]]; then
-                ln -sf "$(cat "$snap_dir/live/${f}.target")" "$live_dir/$f"
+                target="$(cat "$snap_dir/live/${f}.target")" || return 1
+                [[ -n "$target" && "$target" != /* ]] || {
+                    echo "Error: Unsafe ACME snapshot symlink target for $domain/$f." >&2
+                    return 1
+                }
+                local resolved_target
+                resolved_target="$(realpath -m -- "$live_dir/$target")" || return 1
+                case "$resolved_target" in
+                    "$archive_dir"/*) ;;
+                    *)
+                        echo "Error: ACME snapshot symlink target escapes the archive for $domain/$f." >&2
+                        return 1
+                        ;;
+                esac
+                ln -sf "$target" "$live_dir/$f" || return 1
             elif [[ -f "$snap_dir/live/$f" ]]; then
-                cp -p "$snap_dir/live/$f" "$live_dir/$f"
+                cp -p "$snap_dir/live/$f" "$live_dir/$f" || return 1
             fi
         done
+    fi
+
+    local fullchain="$live_dir/fullchain.pem"
+    local privkey="$live_dir/privkey.pem"
+    if [[ ! -s "$fullchain" || ! -s "$privkey" ]]; then
+        echo "Error: Restored certificate or private key missing for $domain" >&2
+        return 1
+    fi
+    openssl x509 -in "$fullchain" -noout >/dev/null 2>&1 || {
+        echo "Error: Restored certificate for $domain is invalid." >&2
+        return 1
+    }
+    local pub_from_cert pub_from_key cur_serial cur_fingerprint
+    pub_from_cert="$(openssl x509 -in "$fullchain" -noout -pubkey 2>/dev/null)" || return 1
+    pub_from_key="$(openssl pkey -in "$privkey" -pubout 2>/dev/null)" || return 1
+    if [[ -z "$pub_from_cert" || "$pub_from_cert" != "$pub_from_key" ]]; then
+        echo "Error: Restored certificate and private key do not match for $domain." >&2
+        return 1
+    fi
+    cur_serial="$(openssl x509 -in "$fullchain" -noout -serial 2>/dev/null)" || return 1
+    cur_fingerprint="$(openssl x509 -in "$fullchain" -noout -fingerprint -sha256 2>/dev/null)" || return 1
+    if [[ "$cur_serial" != "$serial" || "$cur_fingerprint" != "$fingerprint" ]]; then
+        echo "Error: Restored certificate identity does not match the ACME snapshot for $domain." >&2
+        return 1
     fi
     return 0
 }
@@ -2036,12 +2119,13 @@ if nginx -t >/dev/null 2>&1; then
 fi
 
 # 3. Clean ACME certificates
+rollback_restore_failed=0
 if [[ -n "${ACME_TX_ID:-}" ]]; then
     echo "[ROLLBACK] Restoring ACME lineages via snapshot for transaction $ACME_TX_ID..." >&2
-    restore_acme_lineage "$ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || true
-    restore_acme_lineage "$ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || true
+    restore_acme_lineage "$ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_restore_failed=1
+    restore_acme_lineage "$ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || rollback_restore_failed=1
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
-        restore_acme_lineage "$ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || true
+        restore_acme_lineage "$ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || rollback_restore_failed=1
     fi
 else
     if [[ -n "${WORKER_DOMAIN:-}" ]]; then
@@ -2057,7 +2141,6 @@ else
         rm -rf "/etc/letsencrypt/live/$VISION_DOMAIN" "/etc/letsencrypt/archive/$VISION_DOMAIN" "/etc/letsencrypt/renewal/$VISION_DOMAIN.conf" 2>/dev/null || true
     fi
 fi
-
 # 4. Remove UFW rules added for Control Plane
 if command -v ufw >/dev/null 2>&1; then
     if [[ -n "${PANEL_IP:-}" ]]; then
@@ -2075,6 +2158,10 @@ rm -f /etc/sysctl.d/99-gowave-node.conf
 rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh
 sysctl --system 2>/dev/null || true
 
+if [[ "$rollback_restore_failed" -ne 0 ]]; then
+    echo "Error: Remote worker compensation teardown incomplete; one or more ACME lineages were not restored and verified." >&2
+    exit 1
+fi
 echo "Remote worker compensation teardown finished." >&2
 ROLLBACK_REMOTE_SCRIPT
     } | ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" -o ServerAliveInterval=15 -p "$port" "${ssh_user}@${host}" 'bash -s'
