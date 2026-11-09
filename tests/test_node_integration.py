@@ -163,6 +163,63 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn("remote_rollback|rollback)", worker_script)
         self.assertIn("SSH host key for $host_key is not pre-pinned", worker_script)
 
+    def test_standalone_remote_rollback_aborts_when_mutation_lock_is_held(self):
+        """A failed nonblocking lock acquisition must stop rollback before destructive commands."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            known_hosts = tmp / "known_hosts"
+            known_hosts.write_text("127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGMockKeyMockKeyMockKeyMockKeyMockKeyMockKey\n")
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            marker = tmp / "destructive-command-called"
+            lock_file = tmp / "mutation.lock"
+            lock_file.touch()
+
+            fake_ssh_keygen = bin_dir / "ssh-keygen"
+            fake_ssh_keygen.write_text("#!/bin/sh\nexit 0\n")
+            fake_ssh_keygen.chmod(0o755)
+
+            fake_ssh = bin_dir / "ssh"
+            fake_ssh.write_text("#!/bin/sh\nexec bash -s\n")
+            fake_ssh.chmod(0o755)
+
+            fake_id = bin_dir / "id"
+            fake_id.write_text("#!/bin/sh\necho 0\n")
+            fake_id.chmod(0o755)
+
+            fake_flock = bin_dir / "flock"
+            fake_flock.write_text("#!/bin/sh\nexit 1\n")
+            fake_flock.chmod(0o755)
+
+            fake_chmod = bin_dir / "chmod"
+            fake_chmod.write_text("#!/bin/sh\nexit 0\n")
+            fake_chmod.chmod(0o755)
+
+            for command in ("systemctl", "rm", "sed", "nginx", "certbot", "ufw", "sysctl", "rmdir"):
+                fake = bin_dir / command
+                fake.write_text(f"#!/bin/sh\nprintf '%s\\n' '{command}' >> '{marker}'\nexit 0\n")
+                fake.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            env["SSH_KNOWN_HOSTS"] = str(known_hosts)
+            env["MUTATION_LOCK_FILE"] = str(lock_file)
+
+            cmd = [
+                str(REPO_ROOT / "gowave-node-auto.sh"),
+                "remote_rollback",
+                "127.0.0.1",
+                "22",
+                "worker.example.com",
+                "reality.example.com",
+                "root",
+            ]
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Refusing remote rollback without the mutation lock", result.stderr)
+            self.assertFalse(marker.exists(), "destructive commands ran without owning the mutation lock")
+
     def test_worker_remote_payload_serializes_acme_server(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
