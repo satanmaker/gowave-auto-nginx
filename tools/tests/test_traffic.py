@@ -93,12 +93,12 @@ class TestTrafficModule(unittest.TestCase):
 
     def test_parse_proc_net_dev_rx_packet_columns_and_interface_filter(self):
         sample = (
-            "Inter-| Receive | Transmit\\n"
-            " face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\\n"
-            "    lo: 100 999 0 0 0 0 0 0 100 999 0 0 0 0 0 0\\n"
-            "  ens3: 2000 7 0 0 0 0 0 0 3000 9 0 0 0 0 0 0\\n"
-            "docker0: 4000 100 0 0 0 0 0 0 5000 100 0 0 0 0 0 0\\n"
-            " enp1s0: 6000 11 0 0 0 0 0 0 7000 13 0 0 0 0 0 0\\n"
+            "Inter-| Receive | Transmit\n"
+            " face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n"
+            "    lo: 100 999 0 0 0 0 0 0 100 999 0 0 0 0 0 0\n"
+            "  ens3: 2000 7 0 0 0 0 0 0 3000 9 0 0 0 0 0 0\n"
+            "docker0: 4000 100 0 0 0 0 0 0 5000 100 0 0 0 0 0 0\n"
+            " enp1s0: 6000 11 0 0 0 0 0 0 7000 13 0 0 0 0 0 0\n"
         )
         self.assertEqual(parse_proc_net_dev_rx_packets(sample), 18)
 
@@ -107,9 +107,9 @@ class TestTrafficModule(unittest.TestCase):
         mock_ssh.run.return_value = MagicMock(
             ok=True,
             stdout=(
-                "Inter-| Receive | Transmit\\n"
-                " face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\\n"
-                "  ens3: 2000 7 0 0 0 0 0 0 3000 9 0 0 0 0 0 0\\n"
+                "Inter-| Receive | Transmit\n"
+                " face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed\n"
+                "  ens3: 2000 7 0 0 0 0 0 0 3000 9 0 0 0 0 0 0\n"
             ),
         )
         self.assertEqual(get_server_rx_packets(mock_ssh), 7)

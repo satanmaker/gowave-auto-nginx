@@ -19,7 +19,6 @@ from live_vps.negative import (
     run_neg_02_ssh_port_unreachable,
     run_neg_03_dns_wrong_ip,
     run_neg_04_dns_missing_aaaa,
-    run_negative_suite,
 )
 
 
@@ -98,7 +97,7 @@ class TestNegativeScenarios(unittest.TestCase):
         self.assertEqual(result["status"], "PASS")
         mtls_negative.assert_called_once()
 
-    @patch("live_vps.negative.run_neg_06_nginx_config_syntax_corruption")
+    @patch("live_vps.negative.run_neg_06_nginx_syntax_corruption")
     @patch("live_vps.negative.run_neg_05_acme_install_failure", return_value={"status": "INCOMPLETE"})
     @patch("live_vps.negative.run_neg_04_dns_missing_aaaa", return_value={"status": "PASS"})
     @patch("live_vps.negative.run_neg_03_dns_wrong_ip", return_value={"status": "PASS"})
@@ -115,14 +114,11 @@ class TestNegativeScenarios(unittest.TestCase):
         self.assertTrue(all(item["status"] == "INCOMPLETE" for item in result["scenarios"][5:]))
         neg06.assert_not_called()
 
-    def test_neg_10_unreachable_worker_is_incomplete(self):
-        from types import SimpleNamespace
-        from live_vps.negative import run_neg_10_mtls_forged_certificate
-        ssh = MagicMock()
-        ssh.run.return_value = SimpleNamespace(
-            returncode=0, ok=True, stdout="CONNECT_INCOMPLETE:TimeoutError", stderr=""
-        )
-        self.assertEqual(run_neg_10_mtls_forged_certificate(ssh, "203.0.113.20")["status"], "INCOMPLETE")
+    @patch("live_vps.negative.run_mtls_negative_tests", return_value={"status": "INCOMPLETE", "untrusted_client_rejected": "INCOMPLETE"})
+    def test_neg_10_unreachable_worker_is_incomplete(self, mtls_negative):
+        result = run_neg_10_mtls_forged_certificate(MagicMock(), "203.0.113.20")
+        self.assertEqual(result["status"], "INCOMPLETE")
+        mtls_negative.assert_called_once()
 
     def test_negative_suite_disabled_produces_incomplete(self):
         config = MagicMock()

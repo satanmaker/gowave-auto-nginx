@@ -143,7 +143,7 @@ rules:
         with patch("socket.create_connection") as mock_conn:
             mock_tls = MagicMock()
             mock_tls.recv.side_effect = [
-                b"HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\n\\r\\n{\\\"ok\\\":true}",
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\\\"ok\\\":true}",
                 b"",
             ]
             ctx = MagicMock()
