@@ -94,12 +94,15 @@ results = {{}}
 def handshake_rejected(context, server_name, expected_error):
     try:
         with socket.create_connection((worker_ip, port), timeout=5) as sock:
-            with context.wrap_socket(sock, server_hostname=server_name):
+            with context.wrap_socket(sock, server_hostname=server_name) as tls:
+                # In TLS 1.3 client auth is requested in post-handshake or certificate_request
+                tls.sendall(b\"GET / HTTP/1.1\\r\\nHost: \" + server_name.encode() + b\"\\r\\n\\r\\n\")
+                tls.recv(512)
                 return False
     except expected_error:
         return True
     except OSError:
-        return "INCOMPLETE"
+        return \"INCOMPLETE\"
 
 def observe_wrong_sni(context, server_name):
     # A wrong SNI may be handled by a fallback vhost after TLS completes.
