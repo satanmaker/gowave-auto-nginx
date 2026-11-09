@@ -5,8 +5,8 @@
 Defines the observable behavior contract for the Live VPS E2E Test Runner — an automated acceptance tool that
 validates the complete GoWave Auto NGINX distributed infrastructure lifecycle on real disposable servers over the
 public internet, from bare OS through deployment, mTLS control plane, subscription delivery, and Data Plane VPN
-traffic through eight logical endpoints by default (four core protocols on each VPS), or ten when the paired
-Master/Worker Vision domains are enabled.
+traffic through eight logical endpoints by default (four core protocols on each VPS), nine when Vision is enabled
+on only one VPS, or ten when Vision is enabled on both. Master and Worker Vision domains are independent.
 
 ---
 
@@ -150,31 +150,36 @@ The runner SHALL target two distinct public VPS IPv4 addresses and SHALL reject 
 
 ---
 
-### Requirement: Optional Vision Domain Pair and Activation
+### Requirement: Independent Optional Vision Domains
 
-The runner SHALL accept Vision domains only as a pair of distinct FQDNs. When enabled, it SHALL provision
-and verify the Vision certificate, inbound, Panel host, NGINX route, and fallback on both VPS. A Vision
-installation failure SHALL fail the relevant install phase. When disabled, the default four-inbound topology
-remains unchanged.
+The runner SHALL accept `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` independently. Each configured
+domain SHALL be provisioned and verified only on its corresponding VPS, including certificate, inbound,
+Panel host, NGINX route, and fallback. A Vision installation failure SHALL fail the relevant host install
+phase. When a host's Vision domain is absent, its default four-inbound topology remains unchanged.
 
-#### Scenario: One-sided Vision domain configuration is rejected
+#### Scenario: Master-only Vision configuration
 
-- **GIVEN** exactly one of `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` is non-empty
+- **GIVEN** `MASTER_VISION_DOMAIN` is configured and `WORKER_VISION_DOMAIN` is absent
 - **WHEN** the whitelist configuration parser validates the E2E config
-- **THEN** preflight fails before SSH, certificate issuance, or any remote modification
+- **THEN** validation succeeds and the Master Vision endpoint is provisioned independently; the total endpoint count is nine
 
-#### Scenario: Vision domains are unique
+#### Scenario: Worker-only Vision configuration
 
-- **GIVEN** both `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` are configured
+- **GIVEN** `WORKER_VISION_DOMAIN` is configured and `MASTER_VISION_DOMAIN` is absent
 - **WHEN** the whitelist configuration parser validates the E2E config
-- **THEN** the two Vision domains MUST differ from each other and from all four mandatory Panel/REALITY domains; duplicates fail preflight before SSH or remote modification
+- **THEN** validation succeeds and the Worker Vision endpoint is provisioned independently; the total endpoint count is nine
 
-#### Scenario: Vision is fully provisioned on Master and Worker
+#### Scenario: Both Vision domains are configured
 
 - **GIVEN** both Vision domains are configured and valid DNS records resolve to their respective VPS addresses
 - **WHEN** Master and Worker installation and Panel provisioning complete
-- **THEN** each VPS has a valid certificate for its Vision domain, each node has five inbounds, the Panel has
-  five matching hosts per node with correct node/inbound associations, and NGINX routes Vision SNI to 8444; Xray's `xver: 1` non-VLESS HTTP fallback reaches a loopback-only cleartext HTTP vhost on `127.0.0.1:9444` that accepts PROXY protocol and serves decoy content, not Panel/API content
+- **THEN** each VPS has a valid certificate for its Vision domain, each node has five inbounds, the Panel has five matching hosts per node with correct node/inbound associations, and NGINX routes Vision SNI to 8444; Xray's `xver: 1` non-VLESS HTTP fallback reaches a loopback-only cleartext HTTP vhost on `127.0.0.1:9444` that accepts PROXY protocol and serves decoy content, not Panel/API content; the total endpoint count is ten
+
+#### Scenario: Vision domains are unique
+
+- **GIVEN** any subset of Vision domains is configured
+- **WHEN** the whitelist configuration parser validates the E2E config
+- **THEN** every configured Vision domain MUST differ from every other configured Vision domain and all four mandatory Panel/REALITY domains; duplicates fail preflight before SSH or remote modification
 
 #### Scenario: Vision certificate failure aborts the relevant host installation
 
@@ -405,7 +410,7 @@ correctness, Internal Squad membership by set equality, and all Host record fiel
 
 - **GIVEN** Master installed and Worker deployed on a clean test environment
 - **WHEN** runner queries `GET /api/hosts`
-- **THEN** exactly eight (or ten when both Vision domains are configured) Host records exist; four (or five) reference `local-node` UUID and four (or five) reference `worker-1`
+- **THEN** exactly eight, nine, or ten according to the number of configured Vision domains Host records exist; four (or five) reference `local-node` UUID and four (or five) reference `worker-1`
   UUID; each Host's `inbound UUID` matches one of the inbounds in the corresponding node's config profile; all hosts configure `fingerprint: firefox`
 
 #### Scenario: Internal Squad contains all provisioned inbound UUIDs
@@ -444,7 +449,7 @@ against the real Panel; actual HTTP response codes SHALL be used (not mock assum
 
 - **GIVEN** subscription fetched with valid Xray User-Agent
 - **WHEN** runner parses the JSON and counts proxy-capable outbounds
-- **THEN** exactly eight (or ten when both Vision domains are configured) outbounds are identified by protocol/transport tag (VLESS REALITY, VLESS XHTTP
+- **THEN** exactly eight, nine, or ten according to the number of configured Vision domains outbounds are identified by protocol/transport tag (VLESS REALITY, VLESS XHTTP
   TLS, VLESS WS TLS, Trojan gRPC TLS, and optional VLESS XTLS Vision TLS) for Master and Worker; `fingerprint: "firefox"` is verified; `direct`, `block`, and routing-only entries
   are excluded from the count
 
@@ -460,7 +465,7 @@ against the real Panel; actual HTTP response codes SHALL be used (not mock assum
 
 - **GIVEN** subscription fetched with valid Mihomo User-Agent
 - **WHEN** runner validates HTTP response and parses YAML
-- **THEN** HTTP 200 is returned with correct Content-Type; eight (or ten when both Vision domains are configured) proxy entries with correct protocol and
+- **THEN** HTTP 200 is returned with correct Content-Type; eight, nine, or ten according to the number of configured Vision domains proxy entries with correct protocol and
   transport parameters and `client-fingerprint: "firefox"` are present; `GEOIP,private,DIRECT,no-resolve` rule is present; no duplicates; real
   `mihomo -t` validates the config
 
@@ -534,7 +539,7 @@ Cover-reality assets and fallbacks SHALL be present and PROXY protocol SHALL be 
 
 The runner SHALL verify all logical endpoints (four core protocols on Master and Worker by default; plus optional
 VLESS XTLS Vision when configured). Each active endpoint MUST be exercised independently by both a real Xray
-client process and a real Mihomo client process with Firefox fingerprint, yielding sixteen or twenty mandatory
+client process and a real Mihomo client process with Firefox fingerprint, yielding sixteen, eighteen, or twenty mandatory
 runtime cases. All tests SHALL use actual subscription data and verify client-observed egress plus target-VPS
 ingress evidence; syntax checks do not count.
 
@@ -542,7 +547,7 @@ ingress evidence; syntax checks do not count.
 
 - **GIVEN** the real Xray JSON and Mihomo YAML subscriptions each contain four or five Master and four or five Worker proxy entries
 - **WHEN** the runner executes the Data Plane phase
-- **THEN** it runs Xray and Mihomo independently against each of the active logical endpoints (16 or 20 cases total); all cases must pass for overall `PASS`
+- **THEN** it runs Xray and Mihomo independently against each of the active logical endpoints (16, 18, or 20 cases total); all cases must pass for overall `PASS`
 
 #### Scenario: Xray runtime request traverses the selected Master endpoint
 
@@ -615,7 +620,7 @@ ingress evidence; syntax checks do not count.
 
 #### Scenario: One or more mandatory runtime cases fail
 
-- **GIVEN** the sixteen-case (or twenty-case when both Vision domains are configured) runtime matrix is required
+- **GIVEN** the sixteen-, eighteen-, or twenty-case runtime matrix is required
 - **WHEN** any Xray or Mihomo case fails
 - **THEN** the corresponding case is `FAIL` and overall status is `FAIL`
 
@@ -942,10 +947,10 @@ runtime cases verified, and the declared teardown policy completed. `SKIP` and `
 - **WHEN** only fourteen of sixteen runtime cases pass (two fail)
 - **THEN** overall status is `FAIL`, not `PASS`; the failing protocol/client cases are identified individually in `result.json`
 
-#### Scenario: Vision-enabled PASS requires all twenty runtime cases
+#### Scenario: Vision-enabled PASS requires all active runtime cases
 
-- **GIVEN** both Vision domains are configured and all installation, API, subscription, firewall, and NGINX phases are `PASS`
-- **WHEN** only eighteen of twenty runtime cases pass (two fail)
+- **GIVEN** one or both Vision domains are configured and all installation, API, subscription, firewall, and NGINX phases are `PASS`
+- **WHEN** one or more active runtime cases fail (fewer than 16, 18, or 20 pass, as applicable)
 - **THEN** overall status is `FAIL`, not `PASS`; both failed Vision or core protocol/client cases are identified individually in `result.json` and JUnit XML
 
 #### Scenario: result.json schema fields present
@@ -964,3 +969,20 @@ runtime cases verified, and the declared teardown policy completed. `SKIP` and `
   and separate Xray/Mihomo case results per protocol;
   `overall` is the status string. All version and digest values are required to satisfy Pinned Version Fidelity;
   no secret, raw shortUuid, subscription content or private key is included.
+
+
+### Requirement: Local Operator Credential Bootstrap and Cleanup
+
+The live two-VPS acceptance run SHALL be launched from the operator's Linux workstation. GitHub Actions MUST NOT
+store target VPS passwords, permanent private keys, or known_hosts secrets. The local controller MUST verify
+SSH host-key fingerprints against the provider console before password authentication, bootstrap per-host
+ephemeral Ed25519 keys, arm persistent two-hour remote expiry before key installation, and verify immediate
+revocation after the run. Unverified cleanup SHALL downgrade an otherwise successful run to INCOMPLETE.
+
+### Requirement: Per-Case Data-Plane Packet Evidence
+
+Every Xray and Mihomo request SHALL be bracketed by simultaneous inbound tcpdump captures on Master and Worker,
+filtered by the control machine's public IPv4 and the exact tested proxy service destination port, excluding SSH
+ports. PASS requires positive ingress on the intended VPS, zero matching ingress on the other VPS, and the
+expected egress IPv4. Missing or invalid evidence SHALL be INCOMPLETE; aggregate interface counters MUST NOT be
+used as a PASS fallback. Capture payloads and PCAP files MUST NOT be persisted.
