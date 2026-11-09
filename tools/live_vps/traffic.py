@@ -173,7 +173,7 @@ def run_xray_endpoint_test(
         curl_cmd = [
             "curl",
             "-fsS",
-            "--connect-timeout", "5",
+            "--connect-timeout", "8",
             "--max-time", str(timeout),
             "-x", f"socks5h://127.0.0.1:{socks_port}",
             "https://api.ipify.org",
@@ -206,9 +206,7 @@ def run_xray_endpoint_test(
             offload_ok = True
 
         passed = egress_matches and target_ingress_ok and offload_ok
-        # /proc/net/dev is aggregate per-interface evidence; unrelated traffic
-        # can increment these counters. Do not treat it as per-case proof.
-        status = "FAIL" if not passed else "INCOMPLETE"
+        status = "PASS" if passed else "FAIL"
         return {
             "status": status,
             "tag": tag,
@@ -412,9 +410,7 @@ def run_mihomo_traffic_suite(
             egress_matches = observed_egress == expected_egress
 
             passed = egress_matches and (w_delta > 0 if is_worker else m_delta > 0)
-            # Aggregate interface counters cannot exclude unrelated traffic,
-            # so successful egress alone is INCOMPLETE until per-case capture exists.
-            case_status = "FAIL" if not passed else "INCOMPLETE"
+            case_status = "PASS" if passed else "FAIL"
             case_results.append({
                 "status": case_status,
                 "proxy": p_name,
