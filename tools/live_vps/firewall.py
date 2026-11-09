@@ -5,6 +5,7 @@ and target-side UFW/iptables DROP rule evidence.
 from __future__ import annotations
 
 import socket
+import re
 import subprocess
 import urllib.request
 from typing import Any, Dict, Optional, Tuple
@@ -45,31 +46,70 @@ def verify_master_firewall(
     enable_ipv6: bool = False,
     master_ipv6: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Verify Master TCP/3002 isolation (loopback allowed, external blocked)."""
-    # 1. Loopback probe on Master
-    loop_r = master_ssh.run("python3 -c \"import socket; s = socket.create_connection(('127.0.0.1', 3002), timeout=3); s.close(); print('CONNECTED')\"")
+    """Verify local-only Master control listener and independent external denial."""
+    loop_r = master_ssh.run(
+        "python3 -c \"import socket; s = socket.create_connection(('127.0.0.1', 3002), timeout=3); s.close(); print('CONNECTED')\""
+    )
     loopback_ok = loop_r.ok and "CONNECTED" in loop_r.stdout
+    if not loopback_ok:
+        return {
+            "status": "FAIL",
+            "loopback_accessible": False,
+            "error": "Master TCP/3002 is not reachable through loopback",
+        }
 
-    # 2. External probe from Control Machine
-    ext_ok, ext_reason = probe_tcp_port(master_ip, 3002, timeout=3.0)
+    # A local-only bind is direct evidence that the service is not listening on
+    # the public interface. A generic default-DENY policy alone is insufficient.
+    listeners = master_ssh.run("ss -ltnH 'sport = :3002'")
+    listener_lines = [line.split() for line in listeners.stdout.splitlines() if line.split()]
+    local_addresses = [parts[3] for parts in listener_lines if len(parts) >= 4]
+    local_only_bind = bool(local_addresses) and all(
+        address.startswith("127.") or address.startswith("[::1]:") or address.startswith("::1:")
+        for address in local_addresses
+    )
 
-    # 3. Master-side firewall evidence (port 3002 not open publicly or UFW DROP)
     ufw_r = master_ssh.run("ufw status numbered")
-    iptables_r = master_ssh.run("iptables -S")
+    iptables_r = master_ssh.run("iptables -S INPUT")
+    explicit_deny = bool(
+        re.search(r"\b3002/tcp\s+DENY IN\s+Anywhere", ufw_r.stdout, re.IGNORECASE)
+        or re.search(r"--dport\s+3002.*-j\s+(DROP|REJECT)", iptables_r.stdout)
+    )
 
-    # In Master all-in-one, 3002 is bound to 127.0.0.1 or blocked by UFW default incoming DROP
-    has_ufw_drop = "Default: deny (incoming)" in ufw_r.stdout or "DROP" in iptables_r.stdout
+    ext_ok, ext_reason = probe_tcp_port(master_ip, 3002, timeout=3.0)
+    if enable_ipv6:
+        if not master_ipv6:
+            return {
+                "status": "INCOMPLETE",
+                "error": "ENABLE_IPV6=true but MASTER_IPV6 was not supplied to firewall verification",
+                "loopback_accessible": True,
+            }
+        ipv6_ok, ipv6_reason = probe_tcp_port(master_ipv6, 3002, timeout=3.0)
+        if ipv6_ok:
+            return {"status": "FAIL", "error": "Master TCP/3002 is reachable over public IPv6",
+                    "ipv6_probe_reason": ipv6_reason}
+    else:
+        ipv6_reason = "not enabled"
 
-    passed = loopback_ok and (not ext_ok) and has_ufw_drop
+    if ext_ok:
+        status = "FAIL"
+    elif ext_reason not in ("TIMEOUT", "REFUSED"):
+        status = "INCOMPLETE"
+    elif enable_ipv6 and ipv6_reason not in ("TIMEOUT", "REFUSED"):
+        status = "INCOMPLETE"
+    elif not (local_only_bind or explicit_deny):
+        status = "INCOMPLETE"
+    else:
+        status = "PASS"
+
     return {
-        "status": "PASS" if passed else "FAIL",
+        "status": status,
         "loopback_accessible": loopback_ok,
         "external_blocked": not ext_ok,
         "external_reason": ext_reason,
-        "master_firewall_drop_evidence": has_ufw_drop,
+        "local_only_bind": local_only_bind,
+        "explicit_port_3002_deny": explicit_deny,
+        "ipv6_external_reason": ipv6_reason,
     }
-
-
 def verify_worker_firewall(
     master_ssh: SSHClient,
     worker_ssh: SSHClient,
@@ -77,27 +117,35 @@ def verify_worker_firewall(
     enable_ipv6: bool = False,
     worker_ipv6: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Verify Worker TCP/3002 isolation (positive control from Master allowed,
-    negative probe from Control Machine blocked with target-side evidence).
-    """
-    # 1. Positive control from Master to Worker:3002
+    """Verify Master allow-list access and external TCP/3002 denial on Worker."""
+    master_public_ip_r = master_ssh.run("curl -fsS4 --connect-timeout 5 --max-time 10 https://api.ipify.org")
+    master_public_ip = master_public_ip_r.stdout.strip() if master_public_ip_r.ok else ""
+    if not master_public_ip:
+        return {
+            "status": "INCOMPLETE",
+            "error": "Could not determine Master public egress IP for Worker allow-list verification",
+        }
+
     master_probe = master_ssh.run(
         f"python3 -c \"import socket; s = socket.create_connection(('{worker_ip}', 3002), timeout=5); s.close(); print('CONNECTED')\""
     )
     positive_ok = master_probe.ok and "CONNECTED" in master_probe.stdout
+    if not positive_ok:
+        return {
+            "status": "FAIL",
+            "positive_control_ok": False,
+            "error": "Master could not connect to Worker TCP/3002",
+        }
 
-    # 2. Check Worker UFW allow rule for Master
-    worker_ufw = worker_ssh.run("ufw status numbered")
+    worker_ufw = worker_ssh.run("ufw status verbose")
     worker_iptables = worker_ssh.run("iptables -S")
-
-    # 3. Negative probe from Control Machine
     cm_ip = get_control_machine_public_ip()
-    ext_ok, ext_reason = probe_tcp_port(worker_ip, 3002, timeout=3.0)
-
-    # Check for vantage overlap: Control Machine running on Master VPS
-    master_public_ip_r = master_ssh.run("curl -s4 https://api.ipify.org || true")
-    master_public_ip = master_public_ip_r.stdout.strip()
-    if cm_ip and master_public_ip and cm_ip == master_public_ip:
+    if not cm_ip:
+        return {
+            "status": "INCOMPLETE",
+            "error": "Could not determine Control Machine public IP for external firewall probe",
+        }
+    if cm_ip == master_public_ip:
         return {
             "status": "INCOMPLETE",
             "error": "Control Machine public IP matches Master public IP; separate external vantage required",
@@ -105,14 +153,72 @@ def verify_worker_firewall(
             "master_ip": master_public_ip,
         }
 
-    # Verify Worker-side DROP evidence
-    worker_drop_evidence = "DROP" in worker_iptables.stdout or "deny (incoming)" in worker_ufw.stdout
+    # Require a source-specific allow rule for Master and a default-deny policy;
+    # a generic DROP anywhere in the ruleset is not sufficient evidence.
+    escaped_master = re.escape(master_public_ip)
+    ufw_allow_master = bool(
+        re.search(rf"3002/tcp\s+ALLOW IN\s+{escaped_master}(?:\s|$)", worker_ufw.stdout)
+    )
+    iptables_allow_master = bool(
+        re.search(
+            rf"-A\s+\S+\s+-s\s+{escaped_master}(?:/32)?\s+.*--dport\s+3002\s+.*-j\s+ACCEPT",
+            worker_iptables.stdout,
+        )
+    )
+    default_deny = "Default: deny (incoming)" in worker_ufw.stdout
+    iptables_accept_3002 = [
+        line for line in worker_iptables.stdout.splitlines()
+        if "--dport 3002" in line and "-j ACCEPT" in line
+    ]
+    iptables_broad_allow = any(
+        not re.search(rf"-s\s+{escaped_master}(?:/32)?(?:\s|$)", line)
+        for line in iptables_accept_3002
+    )
+    broad_allow = bool(
+        re.search(r"3002/tcp\s+ALLOW IN\s+Anywhere", worker_ufw.stdout, re.IGNORECASE)
+        or iptables_broad_allow
+    )
+    allow_list_evidence = (ufw_allow_master or iptables_allow_master) and default_deny and not broad_allow
 
-    passed = positive_ok and (not ext_ok) and worker_drop_evidence
+    ext_ok, ext_reason = probe_tcp_port(worker_ip, 3002, timeout=3.0)
+    if ext_ok:
+        return {
+            "status": "FAIL",
+            "positive_control_ok": True,
+            "control_machine_blocked": False,
+            "error": "Worker TCP/3002 is reachable from the external Control Machine",
+        }
+    if ext_reason != "TIMEOUT":
+        status = "INCOMPLETE"
+    elif not allow_list_evidence:
+        status = "INCOMPLETE"
+    else:
+        status = "PASS"
+
+    ipv6_reason = "not enabled"
+    if enable_ipv6:
+        if not worker_ipv6:
+            status = "INCOMPLETE"
+            ipv6_reason = "missing WORKER_IPV6"
+        else:
+            ipv6_ok, ipv6_reason = probe_tcp_port(worker_ipv6, 3002, timeout=3.0)
+            if ipv6_ok:
+                status = "FAIL"
+            elif ipv6_reason != "TIMEOUT":
+                # Refused/unreachable IPv6 does not prove a target firewall drop.
+                status = "INCOMPLETE"
+
     return {
-        "status": "PASS" if passed else "FAIL",
+        "status": status,
         "positive_control_ok": positive_ok,
+        "master_public_ip": master_public_ip,
+        "control_machine_ip": cm_ip,
         "control_machine_blocked": not ext_ok,
         "control_machine_probe_reason": ext_reason,
-        "worker_drop_evidence": worker_drop_evidence,
+        "worker_allow_list_evidence": allow_list_evidence,
+        "ufw_allow_from_master": ufw_allow_master,
+        "iptables_allow_from_master": iptables_allow_master,
+        "ufw_default_deny": default_deny,
+        "broad_allow_rule": broad_allow,
+        "ipv6_external_reason": ipv6_reason,
     }

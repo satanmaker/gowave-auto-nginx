@@ -35,7 +35,7 @@ def write_junit_report(
 
     total_tests = len(test_cases)
     failures = sum(1 for c in test_cases if c.get("status") == "FAIL")
-    errors = sum(1 for c in test_cases if c.get("status") == "ERROR")
+    errors = sum(1 for c in test_cases if c.get("status") in ("ERROR", "INCOMPLETE", "TEARDOWN_FAILED", "UNKNOWN", "RUNNING"))
     skipped = sum(1 for c in test_cases if c.get("status") == "SKIP")
 
     root = ET.Element(
@@ -65,8 +65,9 @@ def write_junit_report(
             msg = redact(case.get("message", "assertion failed"))
             fail_el = ET.SubElement(tc, "failure", attrib={"message": msg})
             fail_el.text = redact(case.get("details", msg))
-        elif status == "ERROR":
-            msg = redact(case.get("message", "test error"))
+        elif status in ("ERROR", "INCOMPLETE", "TEARDOWN_FAILED", "UNKNOWN", "RUNNING"):
+            # Incomplete evidence and failed cleanup must never appear as a pass.
+            msg = redact(case.get("message", status.lower()))
             err_el = ET.SubElement(tc, "error", attrib={"message": msg})
             err_el.text = redact(case.get("details", msg))
         elif status == "SKIP":
@@ -117,6 +118,7 @@ def write_summary_txt(artifact_dir: Path, data: Dict[str, Any]) -> Path:
 
     out_path = artifact_dir / "summary.txt"
     out_path.write_text(sanitized, encoding="utf-8")
+    out_path.chmod(0o600)
     return out_path
 
 
@@ -140,16 +142,22 @@ def collect_diagnostics(
 
     if master_ssh:
         m_dir = diag_dir / "master"
-        m_dir.mkdir(parents=True, exist_ok=True)
+        m_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        m_dir.chmod(0o700)
         for fname, cmd in dump_cmds.items():
             r = master_ssh.run(cmd)
             content = redact(r.stdout + ("\n" + r.stderr if r.stderr else ""))
-            (m_dir / fname).write_text(content, encoding="utf-8")
+            dump_path = m_dir / fname
+            dump_path.write_text(content, encoding="utf-8")
+            dump_path.chmod(0o600)
 
     if worker_ssh:
         w_dir = diag_dir / "worker"
-        w_dir.mkdir(parents=True, exist_ok=True)
+        w_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        w_dir.chmod(0o700)
         for fname, cmd in dump_cmds.items():
             r = worker_ssh.run(cmd)
             content = redact(r.stdout + ("\n" + r.stderr if r.stderr else ""))
-            (w_dir / fname).write_text(content, encoding="utf-8")
+            dump_path = w_dir / fname
+            dump_path.write_text(content, encoding="utf-8")
+            dump_path.chmod(0o600)

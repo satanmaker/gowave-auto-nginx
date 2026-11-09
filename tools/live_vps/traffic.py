@@ -6,11 +6,13 @@ from __future__ import annotations
 
 import json
 import os
+import ipaddress
 import re
 import socket
 import subprocess
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,6 +41,50 @@ def get_server_rx_packets(ssh: SSHClient) -> int:
     if r2.ok and r2.stdout.strip().isdigit():
         return int(r2.stdout.strip())
     return 0
+
+
+
+def get_remote_egress_ip(ssh: SSHClient) -> Optional[str]:
+    """Discover the VPS's actual IPv4 egress address (not its inbound target IP)."""
+    result = ssh.run(
+        "curl --noproxy '*' -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org "
+        "|| curl --noproxy '*' -4fsS --connect-timeout 5 --max-time 10 https://ifconfig.me",
+        timeout=15,
+    )
+    if not result.ok:
+        return None
+    value = result.stdout.strip()
+    try:
+        parsed = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return value if parsed.version == 4 else None
+
+
+def classify_xray_outbound(outbound: Dict[str, Any], config: LiveVPSConfig) -> Optional[bool]:
+    """Return True for Worker, False for Master; unknown endpoints fail closed."""
+    settings = outbound.get("settings") or {}
+    servers = settings.get("vnext") or settings.get("servers") or []
+    host = servers[0].get("address") if servers and isinstance(servers[0], dict) else None
+    return classify_server_host(host, config)
+
+
+def classify_server_host(host: Optional[str], config: LiveVPSConfig) -> Optional[bool]:
+    if not isinstance(host, str) or not host:
+        return None
+    master_hosts = {
+        config.master_ip, config.master_panel_domain, config.master_reality_domain,
+        config.master_vision_domain, config.master_ipv6,
+    }
+    worker_hosts = {
+        config.worker_ip, config.worker_domain, config.worker_reality_domain,
+        config.worker_vision_domain, config.worker_ipv6,
+    }
+    if host in worker_hosts:
+        return True
+    if host in master_hosts:
+        return False
+    return None
 
 
 def run_xray_endpoint_test(
@@ -140,8 +186,11 @@ def run_xray_endpoint_test(
             offload_ok = True
 
         passed = egress_matches and target_ingress_ok and offload_ok
+        # /proc/net/dev is aggregate per-interface evidence; unrelated traffic
+        # can increment these counters. Do not treat it as per-case proof.
+        status = "FAIL" if not passed else "INCOMPLETE"
         return {
-            "status": "PASS" if passed else "FAIL",
+            "status": status,
             "tag": tag,
             "observed_egress": observed_egress,
             "expected_egress": expected_egress_ip,
@@ -150,6 +199,7 @@ def run_xray_endpoint_test(
             "offload_ok": offload_ok,
             "m_delta": m_delta,
             "w_delta": w_delta,
+            "evidence_confidence": "aggregate interface rx_packets; background traffic is not excluded",
         }
     finally:
         if proc:
@@ -200,10 +250,34 @@ def run_mihomo_traffic_suite(
     parsed_yaml["external-controller"] = f"127.0.0.1:{ctrl_port}"
     parsed_yaml["secret"] = ""
 
-    # Ensure proxy groups include GLOBAL selector
-    parsed_yaml["proxy-groups"] = [
-        {"name": "GLOBAL", "type": "select", "proxies": [p["name"] for p in proxies]}
-    ]
+    # Preserve subscription proxy-groups and rules. Replacing them can break
+    # rules that reference existing groups and no longer tests the real profile.
+    groups = parsed_yaml.get("proxy-groups") or []
+    global_group = next(
+        (group for group in groups if isinstance(group, dict)
+         and group.get("name") == "GLOBAL" and group.get("type") == "select"),
+        None,
+    )
+    if global_group is None:
+        return {
+            "status": "INCOMPLETE",
+            "error": "Subscription has no existing GLOBAL select group; refusing to rewrite proxy-groups/rules",
+            "results": [],
+        }
+    group_members = global_group.get("proxies")
+    if not isinstance(group_members, list):
+        return {"status": "FAIL", "error": "GLOBAL proxy group has an invalid proxies list", "results": []}
+    for proxy in proxies:
+        proxy_name = proxy.get("name") if isinstance(proxy, dict) else None
+        if not proxy_name:
+            return {"status": "FAIL", "error": "Subscription contains a proxy without a name", "results": []}
+        if proxy_name not in group_members:
+            group_members.append(proxy_name)
+
+    # Rebind enabled listeners to fresh loopback ports to avoid collisions.
+    for listener_key in ("socks-port", "redir-port", "tproxy-port"):
+        if parsed_yaml.get(listener_key):
+            parsed_yaml[listener_key] = find_free_port()
 
     td = tempfile.TemporaryDirectory(prefix="gowave-e2e-mihomo-")
     tmp_config_path = Path(td.name) / "config.yaml"
@@ -240,8 +314,24 @@ def run_mihomo_traffic_suite(
 
         for p in proxies:
             p_name = p.get("name", "proxy")
-            is_worker = "worker" in p_name.lower()
-            expected_egress = config.expected_worker_egress_ip or config.worker_ip if is_worker else config.expected_master_egress_ip or config.master_ip
+            is_worker = classify_server_host(p.get("server"), config)
+            if is_worker is None:
+                case_results.append({
+                    "status": "INCOMPLETE", "proxy": p_name,
+                    "error": "Cannot identify Master/Worker endpoint from subscription server address",
+                })
+                continue
+            expected_egress = (
+                config.expected_worker_egress_ip or get_remote_egress_ip(worker_ssh)
+                if is_worker else
+                config.expected_master_egress_ip or get_remote_egress_ip(master_ssh)
+            )
+            if not expected_egress:
+                case_results.append({
+                    "status": "INCOMPLETE", "proxy": p_name,
+                    "error": "Could not determine actual target VPS egress IP",
+                })
+                continue
 
             # Select proxy in Mihomo controller
             try:
@@ -291,14 +381,18 @@ def run_mihomo_traffic_suite(
             egress_matches = observed_egress == expected_egress
 
             passed = egress_matches and (w_delta > 0 if is_worker else m_delta > 0)
+            # Aggregate interface counters cannot exclude unrelated traffic,
+            # so successful egress alone is INCOMPLETE until per-case capture exists.
+            case_status = "FAIL" if not passed else "INCOMPLETE"
             case_results.append({
-                "status": "PASS" if passed else "FAIL",
+                "status": case_status,
                 "proxy": p_name,
                 "observed_egress": observed_egress,
                 "expected_egress": expected_egress,
                 "egress_matches": egress_matches,
                 "m_delta": m_delta,
                 "w_delta": w_delta,
+                "evidence_confidence": "aggregate interface rx_packets; background traffic is not excluded",
             })
 
     finally:
@@ -310,9 +404,14 @@ def run_mihomo_traffic_suite(
                 proc.kill()
         td.cleanup()
 
-    all_passed = bool(case_results) and all(c.get("status") == "PASS" for c in case_results)
+    if any(case.get("status") == "FAIL" for case in case_results):
+        suite_status = "FAIL"
+    elif not case_results or any(case.get("status") in ("INCOMPLETE", "SKIP") for case in case_results):
+        suite_status = "INCOMPLETE"
+    else:
+        suite_status = "PASS"
     return {
-        "status": "PASS" if all_passed else "FAIL",
+        "status": suite_status,
         "results": case_results,
     }
 
@@ -331,13 +430,19 @@ def evaluate_traffic_suite_status(
     if mihomo_results and mihomo_results.get("status") == "INCOMPLETE":
         return "INCOMPLETE"
 
-    # Check for any failures
-    for r in xray_results:
-        if r.get("status") != "PASS":
+    # Empty or missing results are missing evidence, not a successful suite.
+    if not xray_results or mihomo_results is None:
+        return "INCOMPLETE"
+
+    for result in xray_results:
+        if result.get("status") == "INCOMPLETE":
+            return "INCOMPLETE"
+        if result.get("status") != "PASS":
             return "FAIL"
 
-    if mihomo_results:
-        if mihomo_results.get("status") != "PASS":
-            return "FAIL"
+    if mihomo_results.get("status") == "INCOMPLETE":
+        return "INCOMPLETE"
+    if mihomo_results.get("status") != "PASS":
+        return "FAIL"
 
     return "PASS"

@@ -7,6 +7,7 @@ import ast
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -113,14 +114,17 @@ def parse_strace_argv_output(trace_text: str, secrets: List[str]) -> Dict[str, A
 
 def prepare_master_repository(master_ssh: SSHClient, local_repo: Path, target_dir: str = "/opt/gowave-auto-nginx") -> bool:
     """Stream git archive of HEAD to Master VPS and extract into target_dir."""
-    archive_cmd = ["git", "archive", "HEAD"]
+    # git archive defaults to an uncompressed tar stream. Use one matching
+    # extractor: retrying tar -xf after tar -xzf has consumed stdin loses data.
+    archive_cmd = ["git", "archive", "--format=tar", "HEAD"]
     proc = subprocess.Popen(archive_cmd, cwd=str(local_repo), stdout=subprocess.PIPE)
-    tar_bytes = proc.communicate()[0]
-    if proc.returncode != 0:
+    tar_bytes, _ = proc.communicate()
+    if proc.returncode != 0 or not tar_bytes:
         return False
 
+    remote_dir = shlex.quote(target_dir)
     r = master_ssh.run(
-        f"mkdir -p {target_dir} && tar -xzf - -C {target_dir} 2>/dev/null || tar -xf - -C {target_dir}",
+        f"mkdir -p -- {remote_dir} && tar -xf - -C {remote_dir}",
         input_data=tar_bytes,
     )
     return r.ok
@@ -396,17 +400,31 @@ print(json.dumps({
     sec_r = master_ssh.run(f"/opt/gowave/gowave-server rescue --print-secret-key-raw </dev/null 2>/dev/null || true")
     master_secret = sec_r.stdout.strip()
 
-    parse_r = master_ssh.run("python3 -", input_data=f"{master_secret}\n{parse_script}")
-    observer_verdict: Dict[str, Any] = {}
-    try:
-        # Extract json output
-        lines = parse_r.stdout.strip().splitlines()
-        for ln in reversed(lines):
-            if ln.startswith("{") and ln.endswith("}"):
-                observer_verdict = json.loads(ln)
-                break
-    except Exception as e:
-        observer_verdict = {"status": "INCOMPLETE", "error": f"Failed to parse observer JSON: {e}"}
+    if not sec_r.ok or not master_secret:
+        observer_verdict: Dict[str, Any] = {
+            "status": "INCOMPLETE", "error": "Could not obtain Master secret for argv observer"
+        }
+        parse_r = SSHResult(returncode=1, stdout="", stderr="secret extraction failed")
+    else:
+        # python - reads its program from stdin, so source and secret cannot
+        # share that stream. Keep non-secret parser source in -c argv and send
+        # only the secret through stdin.
+        parse_cmd = "python3 -c " + shlex.quote(parse_script)
+        parse_r = master_ssh.run(parse_cmd, input_data=master_secret)
+        observer_verdict = {}
+        if not parse_r.ok:
+            observer_verdict = {"status": "INCOMPLETE", "error": "Remote argv observer process failed"}
+        else:
+            try:
+                lines = parse_r.stdout.strip().splitlines()
+                for ln in reversed(lines):
+                    if ln.startswith("{") and ln.endswith("}"):
+                        observer_verdict = json.loads(ln)
+                        break
+                if not observer_verdict:
+                    observer_verdict = {"status": "INCOMPLETE", "error": "Observer emitted no JSON result"}
+            except Exception as e:
+                observer_verdict = {"status": "INCOMPLETE", "error": f"Failed to parse observer JSON: {e}"}
 
     # Audit Worker host state
     worker_state_ok = True

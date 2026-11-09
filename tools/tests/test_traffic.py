@@ -14,6 +14,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from live_vps.traffic import (
     evaluate_traffic_suite_status,
     get_server_rx_packets,
+    classify_server_host,
     run_mihomo_traffic_suite,
 )
 
@@ -52,6 +53,42 @@ class TestTrafficModule(unittest.TestCase):
             mihomo_results={"status": "PASS"},
         )
         self.assertEqual(status, "PASS")
+
+    def test_empty_xray_evidence_is_incomplete(self):
+        self.assertEqual(
+            evaluate_traffic_suite_status(
+                test_traffic_verification=True,
+                xray_results=[],
+                mihomo_results={"status": "PASS"},
+            ),
+            "INCOMPLETE",
+        )
+
+    def test_missing_mihomo_evidence_is_incomplete(self):
+        self.assertEqual(
+            evaluate_traffic_suite_status(
+                test_traffic_verification=True,
+                xray_results=[{"status": "PASS"}],
+                mihomo_results=None,
+            ),
+            "INCOMPLETE",
+        )
+
+    def test_endpoint_classification_uses_server_address_not_tag(self):
+        config = MagicMock()
+        config.master_ip = "203.0.113.10"
+        config.master_panel_domain = "panel.example.test"
+        config.master_reality_domain = "decoy-master.example.test"
+        config.master_vision_domain = None
+        config.master_ipv6 = None
+        config.worker_ip = "203.0.113.20"
+        config.worker_domain = "worker.example.test"
+        config.worker_reality_domain = "decoy-worker.example.test"
+        config.worker_vision_domain = None
+        config.worker_ipv6 = None
+        self.assertIs(classify_server_host("203.0.113.20", config), True)
+        self.assertIs(classify_server_host("203.0.113.10", config), False)
+        self.assertIsNone(classify_server_host("proxy-name-contains-worker", config))
 
     def test_get_server_rx_packets_proc_net_dev(self):
         mock_ssh = MagicMock()

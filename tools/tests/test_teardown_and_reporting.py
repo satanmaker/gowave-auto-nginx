@@ -118,6 +118,17 @@ class TestTeardownAndReporting(unittest.TestCase):
         self.assertEqual(res["status"], "PASS")
         self.assertEqual(res["policy"], "RESTORE_SNAPSHOT")
 
+    def test_junit_marks_incomplete_and_teardown_failed_as_errors(self):
+        path = write_junit_report(self.td_path, [
+            {"name": "missing-evidence", "classname": "acceptance", "status": "INCOMPLETE",
+             "message": "packet evidence missing"},
+            {"name": "restore", "classname": "teardown", "status": "TEARDOWN_FAILED",
+             "message": "snapshot restoration failed"},
+        ])
+        content = path.read_text()
+        self.assertIn('errors="2"', content)
+        self.assertEqual(content.count("<error "), 2)
+
     def test_reporting_redaction_in_all_outputs(self):
         register_secret("SuperSecretAdminPassword")
         register_secret("SensitiveShortUuid999")
