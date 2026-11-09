@@ -516,6 +516,95 @@ class TestAPIClient(unittest.TestCase):
             self.assertEqual(len(updated_sdata["nodes"]), 1)
             self.assertEqual(updated_sdata["nodes"][0]["name"], "local-node")
 
+    def test_node_add_rollback_does_not_report_success_when_local_state_is_corrupt(self):
+        previous_admin = MockGoWaveServer.registered_users.get("admin")
+        previous_node = MockGoWaveServer.nodes.get("node-corrupt-state")
+        def restore_mock_state():
+            if previous_admin is None:
+                MockGoWaveServer.registered_users.pop("admin", None)
+            else:
+                MockGoWaveServer.registered_users["admin"] = previous_admin
+            if previous_node is None:
+                MockGoWaveServer.nodes.pop("node-corrupt-state", None)
+            else:
+                MockGoWaveServer.nodes["node-corrupt-state"] = previous_node
+        self.addCleanup(restore_mock_state)
+        """API entities may be compensated, but corrupt local state keeps the journal rollback-required."""
+        MockGoWaveServer.registered_users["admin"] = "securepass1234567890"
+        MockGoWaveServer.nodes["node-corrupt-state"] = {"name": "worker-corrupt", "uuid": "node-corrupt-state"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            sfile = Path(tmpdir) / "state.json"
+            cfile = Path(tmpdir) / "credentials.txt"
+            save_credentials("admin", "securepass1234567890", "https://panel.example.com", "token-xyz", str(cfile))
+            jfile.write_text(json.dumps({
+                "transaction_id": "node_add_worker-corrupt",
+                "op": "node_add",
+                "state": "NODE_ADD_APPLYING",
+                "node_name": "worker-corrupt",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": [{"type": "node", "uuid": "node-corrupt-state", "action": "created"}],
+            }))
+            sfile.write_text("{not-json")
+
+            result = rollback_provisioning(
+                str(jfile), str(sfile), str(cfile), base_url=f"http://127.0.0.1:{self.port}"
+            )
+
+            self.assertFalse(result)
+            self.assertNotIn("node-corrupt-state", MockGoWaveServer.nodes)
+            journal = json.loads(jfile.read_text())
+            self.assertEqual(journal["state"], "NODE_ADD_ROLLBACK_REQUIRED")
+            self.assertTrue(journal["rollback_errors"])
+            self.assertTrue(any("local state" in error for error in journal["rollback_errors"]))
+
+    def test_node_add_rollback_recovers_from_valid_atomic_state_temp_file(self):
+        previous_admin = MockGoWaveServer.registered_users.get("admin")
+        previous_node = MockGoWaveServer.nodes.get("node-temp-state")
+        def restore_mock_state():
+            if previous_admin is None:
+                MockGoWaveServer.registered_users.pop("admin", None)
+            else:
+                MockGoWaveServer.registered_users["admin"] = previous_admin
+            if previous_node is None:
+                MockGoWaveServer.nodes.pop("node-temp-state", None)
+            else:
+                MockGoWaveServer.nodes["node-temp-state"] = previous_node
+        self.addCleanup(restore_mock_state)
+        """A valid state.json.tmp is used when state.json is corrupt after an interrupted atomic write."""
+        MockGoWaveServer.registered_users["admin"] = "securepass1234567890"
+        MockGoWaveServer.nodes["node-temp-state"] = {"name": "worker-temp", "uuid": "node-temp-state"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            sfile = Path(tmpdir) / "state.json"
+            tmp_state = Path(tmpdir) / "state.json.tmp"
+            cfile = Path(tmpdir) / "credentials.txt"
+            save_credentials("admin", "securepass1234567890", "https://panel.example.com", "token-xyz", str(cfile))
+            jfile.write_text(json.dumps({
+                "transaction_id": "node_add_worker-temp",
+                "op": "node_add",
+                "state": "NODE_ADD_APPLYING",
+                "node_name": "worker-temp",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": [{"type": "node", "uuid": "node-temp-state", "action": "created"}],
+            }))
+            sfile.write_text("{interrupted")
+            tmp_state.write_text(json.dumps({
+                "schemaVersion": 2,
+                "nodes": [{"name": "local-node", "uuid": "node-local"}, {"name": "worker-temp", "uuid": "node-temp-state"}],
+            }))
+
+            result = rollback_provisioning(
+                str(jfile), str(sfile), str(cfile), base_url=f"http://127.0.0.1:{self.port}"
+            )
+
+            self.assertTrue(result)
+            self.assertNotIn("node-temp-state", MockGoWaveServer.nodes)
+            self.assertEqual(json.loads(sfile.read_text())["nodes"], [{"name": "local-node", "uuid": "node-local"}])
+            self.assertEqual(json.loads(jfile.read_text())["state"], "NODE_ADD_ROLLED_BACK")
+
     def test_rollback_preserves_adopted_entities(self):
         """Rollback never deletes entities adopted from prior configurations (C-03)."""
         MockGoWaveServer.registered_users["admin"] = "securepass1234567890"

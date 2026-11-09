@@ -750,25 +750,46 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
             print(f"Warning: Login failed during rollback: {e}", file=sys.stderr)
             return False
 
-    # Check state data if exists
+    # Node-add rollback must also reconcile the local state file. Prefer the
+    # committed state.json, but recover from a valid atomic-write temp file if
+    # the process crashed between writing and replacing it.
     state_file = Path(state_path)
-    state_data = {}
-    if state_file.exists():
-        try:
-            with open(state_file, "r") as f:
-                state_data = json.load(f)
-        except Exception:
-            pass
-
-    tmp_state = state_file.parent / f"{state_file.name}.tmp"
-    if tmp_state.exists():
-        try:
-            with open(tmp_state, "r") as f:
-                tmp_data = json.load(f)
-                if not state_data:
-                    state_data = tmp_data
-        except Exception:
-            pass
+    state_data = None
+    state_source = None
+    state_errors = []
+    worker_name = ""
+    if op == "node_add":
+        worker_name = journal_data.get("node_name", "")
+        if not worker_name:
+            tid = journal_data.get("transaction_id", "")
+            if isinstance(tid, str) and tid.startswith("node_add_"):
+                worker_name = tid[len("node_add_"):]
+        if not isinstance(worker_name, str) or not worker_name:
+            state_errors.append("Node-add journal is missing a valid worker name; local state cannot be reconciled.")
+        tmp_state = state_file.parent / f"{state_file.name}.tmp"
+        candidate_errors = []
+        for candidate in (state_file, tmp_state):
+            if not candidate.exists():
+                continue
+            try:
+                with open(candidate, "r", encoding="utf-8") as stream:
+                    candidate_data = json.load(stream)
+                if not isinstance(candidate_data, dict):
+                    raise ValueError("state root must be a JSON object")
+                nodes = candidate_data.get("nodes")
+                if not isinstance(nodes, list) or any(not isinstance(node, dict) for node in nodes):
+                    raise ValueError("state nodes must be an array of objects")
+                state_data = candidate_data
+                state_source = candidate
+                break
+            except Exception as exc:
+                candidate_errors.append(f"Cannot load valid node-add state from {candidate.name}: {type(exc).__name__}.")
+        if state_data is None:
+            state_errors.extend(candidate_errors)
+            if not candidate_errors:
+                state_errors.append("Node-add state.json and its temporary file are both missing; local state cannot be reconciled.")
+            else:
+                state_errors.append("No valid node-add state file is available; local state cannot be reconciled.")
 
     # Both initial provisioning and worker addition use the same action-aware
     # transaction ledger. Legacy UUID-only journals are deliberately non-destructive.
@@ -787,7 +808,7 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
             print(journal_data["rollback_error"], file=sys.stderr)
             return False
 
-        rollback_errors = []
+        rollback_errors = list(state_errors)
         for item in reversed(entities):
             if not isinstance(item, dict):
                 rollback_errors.append("Invalid entity entry in transaction journal")
@@ -840,14 +861,16 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
                 print(message, file=sys.stderr)
 
         if not rollback_errors and op == "node_add":
-            worker_name = journal_data.get("node_name", "")
-            if not worker_name:
-                tid = journal_data.get("transaction_id", "")
-                if isinstance(tid, str) and tid.startswith("node_add_"):
-                    worker_name = tid[len("node_add_"):]
-            if state_data and "nodes" in state_data and worker_name:
-                state_data["nodes"] = [n for n in state_data["nodes"] if n.get("name") != worker_name]
-                atomic_write_state(state_data, str(state_file))
+            original_nodes = state_data["nodes"]
+            remaining_nodes = [node for node in original_nodes if node.get("name") != worker_name]
+            if remaining_nodes != original_nodes or state_source != state_file:
+                state_data["nodes"] = remaining_nodes
+                try:
+                    atomic_write_state(state_data, str(state_file))
+                except Exception as exc:
+                    rollback_errors.append(
+                        f"Failed to persist reconciled node-add state: {type(exc).__name__}: {exc}"
+                    )
 
         if rollback_errors:
             journal_data["state"] = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
