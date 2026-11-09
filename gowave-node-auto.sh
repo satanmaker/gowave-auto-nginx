@@ -83,6 +83,486 @@ check_acme_lineage() {
     return 0
 }
 
+snapshot_acme_lineage() {
+    local transaction_id="$1"
+    local domain="$2"
+    local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
+    local letsencrypt_root="${4:-/etc/letsencrypt}"
+
+    local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
+    mkdir -p "$snap_dir"
+    chmod 0700 "$snap_dir" 2>/dev/null || true
+
+    local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
+    local live_dir="${letsencrypt_root}/live/${domain}"
+    local meta_file="${snap_dir}/lineage-manifest.json"
+
+    if [[ -f "$renewal_conf" || -d "$live_dir" ]]; then
+        mkdir -p "$snap_dir/archive" "$snap_dir/live"
+        chmod 0700 "$snap_dir/archive" "$snap_dir/live" 2>/dev/null || true
+
+        if [[ -f "$renewal_conf" ]]; then
+            cp -p "$renewal_conf" "$snap_dir/renewal.conf"
+        fi
+
+        local cert_serial=""
+        local cert_fingerprint=""
+        if [[ -d "$live_dir" ]]; then
+            local f
+            for f in cert.pem chain.pem fullchain.pem privkey.pem; do
+                local link_path="${live_dir}/${f}"
+                if [[ -L "$link_path" ]]; then
+                    local target
+                    target=$(readlink "$link_path")
+                    echo "$target" > "$snap_dir/live/${f}.target"
+                    local real_file
+                    real_file=$(realpath -q "$link_path" || true)
+                    if [[ -n "$real_file" && -f "$real_file" ]]; then
+                        local bn
+                        bn=$(basename "$real_file")
+                        cp -p "$real_file" "$snap_dir/archive/$bn"
+                        if [[ "$f" == "privkey.pem" || "$bn" =~ ^privkey ]]; then
+                            chmod 0600 "$snap_dir/archive/$bn" 2>/dev/null || true
+                        fi
+                    fi
+                elif [[ -f "$link_path" ]]; then
+                    cp -p "$link_path" "$snap_dir/live/$f"
+                    if [[ "$f" == "privkey.pem" ]]; then
+                        chmod 0600 "$snap_dir/live/$f" 2>/dev/null || true
+                    fi
+                fi
+            done
+
+            local fc="${live_dir}/fullchain.pem"
+            if [[ -s "$fc" ]]; then
+                cert_serial=$(openssl x509 -in "$fc" -noout -serial 2>/dev/null || true)
+                cert_fingerprint=$(openssl x509 -in "$fc" -noout -fingerprint -sha256 2>/dev/null || true)
+            fi
+        fi
+
+        python3 - "$meta_file" "$domain" "$cert_serial" "$cert_fingerprint" <<'PY'
+import json, sys
+meta_file, domain, serial, fingerprint = sys.argv[1:5]
+data = {
+    "domain": domain,
+    "existed_before": True,
+    "serial": serial,
+    "fingerprint": fingerprint
+}
+with open(meta_file, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+    else
+        python3 - "$meta_file" "$domain" <<'PY'
+import json, sys
+meta_file, domain = sys.argv[1:3]
+data = {
+    "domain": domain,
+    "existed_before": False
+}
+with open(meta_file, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+    fi
+}
+
+restore_acme_lineage() {
+    local transaction_id="$1"
+    local domain="$2"
+    local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
+    local letsencrypt_root="${4:-/etc/letsencrypt}"
+
+    local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
+    local meta_file="${snap_dir}/lineage-manifest.json"
+
+    if [[ ! -f "$meta_file" ]]; then
+        echo "Error: ACME lineage manifest not found for $domain in $snap_dir" >&2
+        return 1
+    fi
+
+    local existed
+    existed=$(python3 -c "import json; print('1' if json.load(open('$meta_file')).get('existed_before') else '0')")
+
+    local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
+    local live_dir="${letsencrypt_root}/live/${domain}"
+    local archive_dir="${letsencrypt_root}/archive/${domain}"
+
+    if [[ "$existed" == "0" ]]; then
+        echo "Removing transaction-created ACME lineage for $domain..." >&2
+        rm -f "$renewal_conf"
+        rm -rf "$live_dir" "$archive_dir"
+        return 0
+    fi
+
+    echo "Restoring pre-existing ACME lineage for $domain from snapshot..." >&2
+    mkdir -p "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir"
+    chmod 0755 "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" 2>/dev/null || true
+
+    if [[ -f "$snap_dir/renewal.conf" ]]; then
+        cp -p "$snap_dir/renewal.conf" "$renewal_conf"
+        chmod 0644 "$renewal_conf" 2>/dev/null || true
+    fi
+
+    if [[ -d "$snap_dir/archive" ]]; then
+        local arc
+        for arc in "$snap_dir/archive"/*; do
+            [[ -f "$arc" ]] || continue
+            local bn
+            bn=$(basename "$arc")
+            cp -p "$arc" "$archive_dir/$bn"
+            if [[ "$bn" =~ ^privkey ]]; then
+                chmod 0600 "$archive_dir/$bn" 2>/dev/null || true
+            else
+                chmod 0644 "$archive_dir/$bn" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    if [[ -d "$snap_dir/live" ]]; then
+        local f
+        for f in cert.pem chain.pem fullchain.pem privkey.pem; do
+            if [[ -f "$snap_dir/live/${f}.target" ]]; then
+                local tgt
+                tgt=$(cat "$snap_dir/live/${f}.target")
+                ln -sf "$tgt" "$live_dir/$f"
+            elif [[ -f "$snap_dir/live/$f" ]]; then
+                cp -p "$snap_dir/live/$f" "$live_dir/$f"
+                if [[ "$f" == "privkey.pem" ]]; then
+                    chmod 0600 "$live_dir/$f" 2>/dev/null || true
+                else
+                    chmod 0644 "$live_dir/$f" 2>/dev/null || true
+                fi
+            fi
+        done
+    fi
+
+    local fullchain="$live_dir/fullchain.pem"
+    local privkey="$live_dir/privkey.pem"
+    if [[ ! -s "$fullchain" || ! -s "$privkey" ]]; then
+        echo "Error: Restored certificate or private key missing for $domain" >&2
+        return 1
+    fi
+
+    if ! openssl x509 -in "$fullchain" -noout 2>/dev/null; then
+        echo "Error: Restored certificate for $domain is corrupted" >&2
+        return 1
+    fi
+
+    local pub_from_cert pub_from_key
+    pub_from_cert=$(openssl x509 -in "$fullchain" -noout -pubkey 2>/dev/null || true)
+    pub_from_key=$(openssl pkey -in "$privkey" -pubout 2>/dev/null || true)
+    if [[ -z "$pub_from_cert" || "$pub_from_cert" != "$pub_from_key" ]]; then
+        echo "Error: Restored certificate and private key public key mismatch for $domain" >&2
+        return 1
+    fi
+
+    local exp_serial exp_fingerprint cur_serial cur_fingerprint
+    exp_serial=$(python3 -c "import json; print(json.load(open('$meta_file')).get('serial', ''))")
+    exp_fingerprint=$(python3 -c "import json; print(json.load(open('$meta_file')).get('fingerprint', ''))")
+    if [[ -n "$exp_serial" ]]; then
+        cur_serial=$(openssl x509 -in "$fullchain" -noout -serial 2>/dev/null || true)
+        if [[ "$cur_serial" != "$exp_serial" ]]; then
+            echo "Error: Restored certificate serial ($cur_serial) does not match snapshot ($exp_serial)" >&2
+            return 1
+        fi
+    fi
+    if [[ -n "$exp_fingerprint" ]]; then
+        cur_fingerprint=$(openssl x509 -in "$fullchain" -noout -fingerprint -sha256 2>/dev/null || true)
+        if [[ "$cur_fingerprint" != "$exp_fingerprint" ]]; then
+            echo "Error: Restored certificate fingerprint ($cur_fingerprint) does not match snapshot ($exp_fingerprint)" >&2
+            return 1
+        fi
+    fi
+
+    echo "ACME lineage for $domain successfully restored and verified." >&2
+    return 0
+}
+
+cleanup_acme_snapshot() {
+    local transaction_id="$1"
+    local domain="$2"
+    local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
+
+    local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
+    if [[ -d "$snap_dir" ]]; then
+        rm -rf "$snap_dir"
+    fi
+}
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    MUTATION_LOCK_FILE="${MUTATION_LOCK_FILE:-/tmp/gowave-managed-mutation-$(id -u).lock}"
+    MUTATION_LEASE_FILE="${MUTATION_LEASE_FILE:-/tmp/gowave-mutation-lease-$(id -u).json}"
+else
+    MUTATION_LOCK_FILE="${MUTATION_LOCK_FILE:-/run/lock/gowave-managed-mutation.lock}"
+    MUTATION_LEASE_FILE="${MUTATION_LEASE_FILE:-/run/lock/gowave-mutation-lease.json}"
+fi
+
+validate_lock_path() {
+    local lock_file="${1:-$MUTATION_LOCK_FILE}"
+    local lock_dir
+    lock_dir="$(dirname "$lock_file")"
+
+    if [[ ! -d "$lock_dir" ]]; then
+        mkdir -p "$lock_dir"
+        chmod 0755 "$lock_dir" 2>/dev/null || true
+    fi
+
+    if [[ -L "$lock_dir" ]]; then
+        echo "Error: Lock directory $lock_dir is a symlink; unsafe." >&2
+        return 1
+    fi
+
+    if [[ -L "$lock_file" ]]; then
+        echo "Error: Lock file $lock_file is a symlink; refusing path substitution." >&2
+        return 1
+    fi
+
+    if [[ -e "$lock_file" && ! -f "$lock_file" ]]; then
+        echo "Error: Lock file $lock_file exists and is not a regular file." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+validate_mutation_lease() {
+    local candidate_token="$1"
+    local lease_file="${2:-$MUTATION_LEASE_FILE}"
+    local lock_file="${3:-$MUTATION_LOCK_FILE}"
+
+    python3 - "$candidate_token" "$lease_file" "$lock_file" <<'PY'
+import json
+import os
+import sys
+
+token, lease_path, lock_path = sys.argv[1:4]
+
+if not os.path.exists(lease_path):
+    sys.exit(1)
+
+if os.path.islink(lease_path):
+    sys.exit(1)
+
+st = os.stat(lease_path)
+if os.geteuid() == 0 and st.st_uid != 0:
+    sys.exit(1)
+
+try:
+    with open(lease_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+expected_token = data.get("lease_token", "")
+holder_pid = data.get("holder_pid")
+
+if not expected_token or expected_token != token:
+    sys.exit(1)
+
+if not holder_pid or not isinstance(holder_pid, int):
+    sys.exit(1)
+
+try:
+    os.kill(holder_pid, 0)
+except OSError:
+    sys.exit(1)
+
+fd_dir = f"/proc/{holder_pid}/fd"
+if os.path.exists(fd_dir):
+    try:
+        real_lock = os.path.realpath(lock_path)
+        has_fd = False
+        for fd in os.listdir(fd_dir):
+            try:
+                target = os.path.realpath(os.path.join(fd_dir, fd))
+                if target == real_lock:
+                    has_fd = True
+                    break
+            except Exception:
+                continue
+        if not has_fd:
+            sys.exit(1)
+    except Exception:
+        pass
+
+sys.exit(0)
+PY
+}
+
+acquire_mutation_lock() {
+    if [[ "${_MUTATION_LOCK_HELD:-0}" -eq 1 || "${_MUTATION_LEASE_VALIDATED:-0}" -eq 1 ]]; then
+        return 0
+    fi
+
+    validate_lock_path "$MUTATION_LOCK_FILE" || return 1
+
+    if [[ ! -f "$MUTATION_LOCK_FILE" ]]; then
+        (
+            umask 0177
+            touch "$MUTATION_LOCK_FILE"
+        ) 2>/dev/null || true
+        chmod 0600 "$MUTATION_LOCK_FILE" 2>/dev/null || true
+    fi
+
+    exec 9>>"$MUTATION_LOCK_FILE"
+    if flock -n 9; then
+        _MUTATION_LOCK_HELD=1
+        return 0
+    fi
+
+    local candidate_token=""
+    if [[ -n "${GOWAVE_LEASE_TOKEN:-}" ]]; then
+        candidate_token="$GOWAVE_LEASE_TOKEN"
+    elif [[ ! -t 0 ]]; then
+        local first_line=""
+        if IFS= read -r -t 1 first_line; then
+            if [[ "$first_line" =~ ^GOWAVE_LEASE:\ *(.*)$ ]]; then
+                candidate_token="${BASH_REMATCH[1]}"
+            fi
+        fi
+    fi
+
+    if [[ -n "$candidate_token" ]]; then
+        if validate_mutation_lease "$candidate_token" "$MUTATION_LEASE_FILE" "$MUTATION_LOCK_FILE"; then
+            _MUTATION_LEASE_VALIDATED=1
+            return 0
+        fi
+        echo "Error: Invalid or stale mutation lock lease provided." >&2
+        return 1
+    fi
+
+    echo "Error: Another process currently holds the mutation lock ($MUTATION_LOCK_FILE)." >&2
+    echo "Refusing concurrent mutation without an authorized re-entrant lease." >&2
+    return 1
+}
+
+verify_deploy_hook_preflight() {
+    local hook_file="${1:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
+    local transaction_id="${2:-}"
+    local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
+
+    if [[ -e "$hook_file" ]] || [[ -L "$hook_file" ]]; then
+        if [[ -n "$transaction_id" ]]; then
+            local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
+            if [[ -f "$manifest" ]]; then
+                local owned
+                owned=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
+                if [[ "$owned" == "1" ]]; then
+                    return 0
+                fi
+            fi
+        fi
+        echo "Error: Pre-existing unowned Certbot deploy hook found at $hook_file. Refusing to overwrite unmanaged host resource." >&2
+        return 1
+    fi
+
+    local hook_dir
+    hook_dir=$(dirname "$hook_file")
+    if [[ -e "$hook_dir" && -L "$hook_dir" ]]; then
+        echo "Error: Certbot renewal hook directory $hook_dir is an unsafe symlink." >&2
+        return 1
+    fi
+    return 0
+}
+
+install_managed_deploy_hook() {
+    local transaction_id="$1"
+    local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
+    local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
+
+    verify_deploy_hook_preflight "$hook_file" "$transaction_id" "$recovery_root" || return 1
+
+    local hook_dir
+    hook_dir=$(dirname "$hook_file")
+    mkdir -p "$hook_dir"
+    chmod 0755 "$hook_dir" 2>/dev/null || true
+
+    local snap_dir="${recovery_root}/${transaction_id}"
+    mkdir -p "$snap_dir"
+    chmod 0700 "$snap_dir" 2>/dev/null || true
+    local manifest="${snap_dir}/deploy-hook-manifest.json"
+
+    local tmp_file="${hook_file}.tmp.$$"
+    cat > "$tmp_file" <<'EOF'
+#!/bin/sh
+# Managed by GoWave Auto NGINX: Automated ACME Reload Hook
+if nginx -t -q; then
+    systemctl reload nginx
+fi
+EOF
+    chmod 0755 "$tmp_file"
+    sync "$tmp_file"
+    mv -f "$tmp_file" "$hook_file"
+    sync "$hook_dir"
+
+    local digest
+    digest=$(sha256sum "$hook_file" | awk '{print $1}')
+    python3 - "$manifest" "$transaction_id" "$hook_file" "$digest" <<'PY'
+import json, sys
+manifest_path, tx_id, path, digest = sys.argv[1:5]
+data = {
+    "transaction_id": tx_id,
+    "path": path,
+    "created_by_tx": True,
+    "sha256": digest
+}
+with open(manifest_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+    chmod 0600 "$manifest" 2>/dev/null || true
+    echo "Configured managed ACME renewal hook in $hook_file."
+}
+
+rollback_managed_deploy_hook() {
+    local transaction_id="$1"
+    local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
+    local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
+
+    local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
+    if [[ ! -f "$manifest" ]]; then
+        return 0
+    fi
+
+    local created_by_tx recorded_sha
+    created_by_tx=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
+    recorded_sha=$(python3 -c "import json; print(json.load(open('$manifest')).get('sha256', ''))" 2>/dev/null || echo "")
+
+    if [[ "$created_by_tx" != "1" ]]; then
+        return 0
+    fi
+
+    if [[ ! -e "$hook_file" && ! -L "$hook_file" ]]; then
+        return 0
+    fi
+
+    if [[ -L "$hook_file" ]]; then
+        echo "Warning: Deploy hook $hook_file is now a symlink; preserving modified object and reporting incomplete recovery." >&2
+        return 1
+    fi
+
+    if [[ ! -f "$hook_file" ]]; then
+        echo "Warning: Deploy hook $hook_file is not a regular file; preserving modified object and reporting incomplete recovery." >&2
+        return 1
+    fi
+
+    local current_sha
+    current_sha=$(sha256sum "$hook_file" | awk '{print $1}')
+    if [[ "$current_sha" != "$recorded_sha" ]]; then
+        echo "Warning: Deploy hook $hook_file was modified after installation (digest mismatch); preserving modified object and reporting incomplete recovery." >&2
+        return 1
+    fi
+
+    rm -f "$hook_file"
+    sync "$(dirname "$hook_file")"
+    return 0
+}
+
+cleanup_deploy_hook_manifest() {
+    local transaction_id="$1"
+    local recovery_root="${2:-/var/lib/gowave-auto-nginx/recovery}"
+    rm -f "${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
+}
+
 # Function to pack cover-reality into base64 string
 pack_cover_reality() {
     local cover_dir="${1:-$SCRIPT_DIR/assets/cover-sites/cover-reality}"
@@ -161,6 +641,7 @@ remote_payload() {
         printf 'export VERIFY_NODE_MTLS_B64=%q\n' "$verifier_b64"
         printf 'export WORKER_DOMAIN=%q\n' "$worker_domain"
         printf 'export REALITY_DOMAIN=%q\n' "$reality_domain"
+        printf 'export VISION_DOMAIN=%q\n' "${VISION_DOMAIN:-}"
         printf 'export ADMIN_EMAIL=%q\n' "$admin_email"
         printf 'export GOWAVE_ACME_SERVER=%q\n' "${GOWAVE_ACME_SERVER:-}"
         printf 'COVER_REALITY_B64=%q\n' "$cover_b64"
@@ -234,6 +715,486 @@ check_acme_lineage() {
     fi
 
     return 0
+}
+
+snapshot_acme_lineage() {
+    local transaction_id="$1"
+    local domain="$2"
+    local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
+    local letsencrypt_root="${4:-/etc/letsencrypt}"
+
+    local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
+    mkdir -p "$snap_dir"
+    chmod 0700 "$snap_dir" 2>/dev/null || true
+
+    local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
+    local live_dir="${letsencrypt_root}/live/${domain}"
+    local meta_file="${snap_dir}/lineage-manifest.json"
+
+    if [[ -f "$renewal_conf" || -d "$live_dir" ]]; then
+        mkdir -p "$snap_dir/archive" "$snap_dir/live"
+        chmod 0700 "$snap_dir/archive" "$snap_dir/live" 2>/dev/null || true
+
+        if [[ -f "$renewal_conf" ]]; then
+            cp -p "$renewal_conf" "$snap_dir/renewal.conf"
+        fi
+
+        local cert_serial=""
+        local cert_fingerprint=""
+        if [[ -d "$live_dir" ]]; then
+            local f
+            for f in cert.pem chain.pem fullchain.pem privkey.pem; do
+                local link_path="${live_dir}/${f}"
+                if [[ -L "$link_path" ]]; then
+                    local target
+                    target=$(readlink "$link_path")
+                    echo "$target" > "$snap_dir/live/${f}.target"
+                    local real_file
+                    real_file=$(realpath -q "$link_path" || true)
+                    if [[ -n "$real_file" && -f "$real_file" ]]; then
+                        local bn
+                        bn=$(basename "$real_file")
+                        cp -p "$real_file" "$snap_dir/archive/$bn"
+                        if [[ "$f" == "privkey.pem" || "$bn" =~ ^privkey ]]; then
+                            chmod 0600 "$snap_dir/archive/$bn" 2>/dev/null || true
+                        fi
+                    fi
+                elif [[ -f "$link_path" ]]; then
+                    cp -p "$link_path" "$snap_dir/live/$f"
+                    if [[ "$f" == "privkey.pem" ]]; then
+                        chmod 0600 "$snap_dir/live/$f" 2>/dev/null || true
+                    fi
+                fi
+            done
+
+            local fc="${live_dir}/fullchain.pem"
+            if [[ -s "$fc" ]]; then
+                cert_serial=$(openssl x509 -in "$fc" -noout -serial 2>/dev/null || true)
+                cert_fingerprint=$(openssl x509 -in "$fc" -noout -fingerprint -sha256 2>/dev/null || true)
+            fi
+        fi
+
+        python3 - "$meta_file" "$domain" "$cert_serial" "$cert_fingerprint" <<'PY'
+import json, sys
+meta_file, domain, serial, fingerprint = sys.argv[1:5]
+data = {
+    "domain": domain,
+    "existed_before": True,
+    "serial": serial,
+    "fingerprint": fingerprint
+}
+with open(meta_file, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+    else
+        python3 - "$meta_file" "$domain" <<'PY'
+import json, sys
+meta_file, domain = sys.argv[1:3]
+data = {
+    "domain": domain,
+    "existed_before": False
+}
+with open(meta_file, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+    fi
+}
+
+restore_acme_lineage() {
+    local transaction_id="$1"
+    local domain="$2"
+    local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
+    local letsencrypt_root="${4:-/etc/letsencrypt}"
+
+    local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
+    local meta_file="${snap_dir}/lineage-manifest.json"
+
+    if [[ ! -f "$meta_file" ]]; then
+        echo "Error: ACME lineage manifest not found for $domain in $snap_dir" >&2
+        return 1
+    fi
+
+    local existed
+    existed=$(python3 -c "import json; print('1' if json.load(open('$meta_file')).get('existed_before') else '0')")
+
+    local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
+    local live_dir="${letsencrypt_root}/live/${domain}"
+    local archive_dir="${letsencrypt_root}/archive/${domain}"
+
+    if [[ "$existed" == "0" ]]; then
+        echo "Removing transaction-created ACME lineage for $domain..." >&2
+        rm -f "$renewal_conf"
+        rm -rf "$live_dir" "$archive_dir"
+        return 0
+    fi
+
+    echo "Restoring pre-existing ACME lineage for $domain from snapshot..." >&2
+    mkdir -p "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir"
+    chmod 0755 "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" 2>/dev/null || true
+
+    if [[ -f "$snap_dir/renewal.conf" ]]; then
+        cp -p "$snap_dir/renewal.conf" "$renewal_conf"
+        chmod 0644 "$renewal_conf" 2>/dev/null || true
+    fi
+
+    if [[ -d "$snap_dir/archive" ]]; then
+        local arc
+        for arc in "$snap_dir/archive"/*; do
+            [[ -f "$arc" ]] || continue
+            local bn
+            bn=$(basename "$arc")
+            cp -p "$arc" "$archive_dir/$bn"
+            if [[ "$bn" =~ ^privkey ]]; then
+                chmod 0600 "$archive_dir/$bn" 2>/dev/null || true
+            else
+                chmod 0644 "$archive_dir/$bn" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    if [[ -d "$snap_dir/live" ]]; then
+        local f
+        for f in cert.pem chain.pem fullchain.pem privkey.pem; do
+            if [[ -f "$snap_dir/live/${f}.target" ]]; then
+                local tgt
+                tgt=$(cat "$snap_dir/live/${f}.target")
+                ln -sf "$tgt" "$live_dir/$f"
+            elif [[ -f "$snap_dir/live/$f" ]]; then
+                cp -p "$snap_dir/live/$f" "$live_dir/$f"
+                if [[ "$f" == "privkey.pem" ]]; then
+                    chmod 0600 "$live_dir/$f" 2>/dev/null || true
+                else
+                    chmod 0644 "$live_dir/$f" 2>/dev/null || true
+                fi
+            fi
+        done
+    fi
+
+    local fullchain="$live_dir/fullchain.pem"
+    local privkey="$live_dir/privkey.pem"
+    if [[ ! -s "$fullchain" || ! -s "$privkey" ]]; then
+        echo "Error: Restored certificate or private key missing for $domain" >&2
+        return 1
+    fi
+
+    if ! openssl x509 -in "$fullchain" -noout 2>/dev/null; then
+        echo "Error: Restored certificate for $domain is corrupted" >&2
+        return 1
+    fi
+
+    local pub_from_cert pub_from_key
+    pub_from_cert=$(openssl x509 -in "$fullchain" -noout -pubkey 2>/dev/null || true)
+    pub_from_key=$(openssl pkey -in "$privkey" -pubout 2>/dev/null || true)
+    if [[ -z "$pub_from_cert" || "$pub_from_cert" != "$pub_from_key" ]]; then
+        echo "Error: Restored certificate and private key public key mismatch for $domain" >&2
+        return 1
+    fi
+
+    local exp_serial exp_fingerprint cur_serial cur_fingerprint
+    exp_serial=$(python3 -c "import json; print(json.load(open('$meta_file')).get('serial', ''))")
+    exp_fingerprint=$(python3 -c "import json; print(json.load(open('$meta_file')).get('fingerprint', ''))")
+    if [[ -n "$exp_serial" ]]; then
+        cur_serial=$(openssl x509 -in "$fullchain" -noout -serial 2>/dev/null || true)
+        if [[ "$cur_serial" != "$exp_serial" ]]; then
+            echo "Error: Restored certificate serial ($cur_serial) does not match snapshot ($exp_serial)" >&2
+            return 1
+        fi
+    fi
+    if [[ -n "$exp_fingerprint" ]]; then
+        cur_fingerprint=$(openssl x509 -in "$fullchain" -noout -fingerprint -sha256 2>/dev/null || true)
+        if [[ "$cur_fingerprint" != "$exp_fingerprint" ]]; then
+            echo "Error: Restored certificate fingerprint ($cur_fingerprint) does not match snapshot ($exp_fingerprint)" >&2
+            return 1
+        fi
+    fi
+
+    echo "ACME lineage for $domain successfully restored and verified." >&2
+    return 0
+}
+
+cleanup_acme_snapshot() {
+    local transaction_id="$1"
+    local domain="$2"
+    local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
+
+    local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
+    if [[ -d "$snap_dir" ]]; then
+        rm -rf "$snap_dir"
+    fi
+}
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    MUTATION_LOCK_FILE="${MUTATION_LOCK_FILE:-/tmp/gowave-managed-mutation-$(id -u).lock}"
+    MUTATION_LEASE_FILE="${MUTATION_LEASE_FILE:-/tmp/gowave-mutation-lease-$(id -u).json}"
+else
+    MUTATION_LOCK_FILE="${MUTATION_LOCK_FILE:-/run/lock/gowave-managed-mutation.lock}"
+    MUTATION_LEASE_FILE="${MUTATION_LEASE_FILE:-/run/lock/gowave-mutation-lease.json}"
+fi
+
+validate_lock_path() {
+    local lock_file="${1:-$MUTATION_LOCK_FILE}"
+    local lock_dir
+    lock_dir="$(dirname "$lock_file")"
+
+    if [[ ! -d "$lock_dir" ]]; then
+        mkdir -p "$lock_dir"
+        chmod 0755 "$lock_dir" 2>/dev/null || true
+    fi
+
+    if [[ -L "$lock_dir" ]]; then
+        echo "Error: Lock directory $lock_dir is a symlink; unsafe." >&2
+        return 1
+    fi
+
+    if [[ -L "$lock_file" ]]; then
+        echo "Error: Lock file $lock_file is a symlink; refusing path substitution." >&2
+        return 1
+    fi
+
+    if [[ -e "$lock_file" && ! -f "$lock_file" ]]; then
+        echo "Error: Lock file $lock_file exists and is not a regular file." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+validate_mutation_lease() {
+    local candidate_token="$1"
+    local lease_file="${2:-$MUTATION_LEASE_FILE}"
+    local lock_file="${3:-$MUTATION_LOCK_FILE}"
+
+    python3 - "$candidate_token" "$lease_file" "$lock_file" <<'PY'
+import json
+import os
+import sys
+
+token, lease_path, lock_path = sys.argv[1:4]
+
+if not os.path.exists(lease_path):
+    sys.exit(1)
+
+if os.path.islink(lease_path):
+    sys.exit(1)
+
+st = os.stat(lease_path)
+if os.geteuid() == 0 and st.st_uid != 0:
+    sys.exit(1)
+
+try:
+    with open(lease_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+expected_token = data.get("lease_token", "")
+holder_pid = data.get("holder_pid")
+
+if not expected_token or expected_token != token:
+    sys.exit(1)
+
+if not holder_pid or not isinstance(holder_pid, int):
+    sys.exit(1)
+
+try:
+    os.kill(holder_pid, 0)
+except OSError:
+    sys.exit(1)
+
+fd_dir = f"/proc/{holder_pid}/fd"
+if os.path.exists(fd_dir):
+    try:
+        real_lock = os.path.realpath(lock_path)
+        has_fd = False
+        for fd in os.listdir(fd_dir):
+            try:
+                target = os.path.realpath(os.path.join(fd_dir, fd))
+                if target == real_lock:
+                    has_fd = True
+                    break
+            except Exception:
+                continue
+        if not has_fd:
+            sys.exit(1)
+    except Exception:
+        pass
+
+sys.exit(0)
+PY
+}
+
+acquire_mutation_lock() {
+    if [[ "${_MUTATION_LOCK_HELD:-0}" -eq 1 || "${_MUTATION_LEASE_VALIDATED:-0}" -eq 1 ]]; then
+        return 0
+    fi
+
+    validate_lock_path "$MUTATION_LOCK_FILE" || return 1
+
+    if [[ ! -f "$MUTATION_LOCK_FILE" ]]; then
+        (
+            umask 0177
+            touch "$MUTATION_LOCK_FILE"
+        ) 2>/dev/null || true
+        chmod 0600 "$MUTATION_LOCK_FILE" 2>/dev/null || true
+    fi
+
+    exec 9>>"$MUTATION_LOCK_FILE"
+    if flock -n 9; then
+        _MUTATION_LOCK_HELD=1
+        return 0
+    fi
+
+    local candidate_token=""
+    if [[ -n "${GOWAVE_LEASE_TOKEN:-}" ]]; then
+        candidate_token="$GOWAVE_LEASE_TOKEN"
+    elif [[ ! -t 0 ]]; then
+        local first_line=""
+        if IFS= read -r -t 1 first_line; then
+            if [[ "$first_line" =~ ^GOWAVE_LEASE:\ *(.*)$ ]]; then
+                candidate_token="${BASH_REMATCH[1]}"
+            fi
+        fi
+    fi
+
+    if [[ -n "$candidate_token" ]]; then
+        if validate_mutation_lease "$candidate_token" "$MUTATION_LEASE_FILE" "$MUTATION_LOCK_FILE"; then
+            _MUTATION_LEASE_VALIDATED=1
+            return 0
+        fi
+        echo "Error: Invalid or stale mutation lock lease provided." >&2
+        return 1
+    fi
+
+    echo "Error: Another process currently holds the mutation lock ($MUTATION_LOCK_FILE)." >&2
+    echo "Refusing concurrent mutation without an authorized re-entrant lease." >&2
+    return 1
+}
+
+verify_deploy_hook_preflight() {
+    local hook_file="${1:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
+    local transaction_id="${2:-}"
+    local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
+
+    if [[ -e "$hook_file" ]] || [[ -L "$hook_file" ]]; then
+        if [[ -n "$transaction_id" ]]; then
+            local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
+            if [[ -f "$manifest" ]]; then
+                local owned
+                owned=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
+                if [[ "$owned" == "1" ]]; then
+                    return 0
+                fi
+            fi
+        fi
+        echo "Error: Pre-existing unowned Certbot deploy hook found at $hook_file. Refusing to overwrite unmanaged host resource." >&2
+        return 1
+    fi
+
+    local hook_dir
+    hook_dir=$(dirname "$hook_file")
+    if [[ -e "$hook_dir" && -L "$hook_dir" ]]; then
+        echo "Error: Certbot renewal hook directory $hook_dir is an unsafe symlink." >&2
+        return 1
+    fi
+    return 0
+}
+
+install_managed_deploy_hook() {
+    local transaction_id="$1"
+    local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
+    local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
+
+    verify_deploy_hook_preflight "$hook_file" "$transaction_id" "$recovery_root" || return 1
+
+    local hook_dir
+    hook_dir=$(dirname "$hook_file")
+    mkdir -p "$hook_dir"
+    chmod 0755 "$hook_dir" 2>/dev/null || true
+
+    local snap_dir="${recovery_root}/${transaction_id}"
+    mkdir -p "$snap_dir"
+    chmod 0700 "$snap_dir" 2>/dev/null || true
+    local manifest="${snap_dir}/deploy-hook-manifest.json"
+
+    local tmp_file="${hook_file}.tmp.$$"
+    cat > "$tmp_file" <<'EOF'
+#!/bin/sh
+# Managed by GoWave Auto NGINX: Automated ACME Reload Hook
+if nginx -t -q; then
+    systemctl reload nginx
+fi
+EOF
+    chmod 0755 "$tmp_file"
+    sync "$tmp_file"
+    mv -f "$tmp_file" "$hook_file"
+    sync "$hook_dir"
+
+    local digest
+    digest=$(sha256sum "$hook_file" | awk '{print $1}')
+    python3 - "$manifest" "$transaction_id" "$hook_file" "$digest" <<'PY'
+import json, sys
+manifest_path, tx_id, path, digest = sys.argv[1:5]
+data = {
+    "transaction_id": tx_id,
+    "path": path,
+    "created_by_tx": True,
+    "sha256": digest
+}
+with open(manifest_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
+    chmod 0600 "$manifest" 2>/dev/null || true
+    echo "Configured managed ACME renewal hook in $hook_file."
+}
+
+rollback_managed_deploy_hook() {
+    local transaction_id="$1"
+    local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
+    local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
+
+    local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
+    if [[ ! -f "$manifest" ]]; then
+        return 0
+    fi
+
+    local created_by_tx recorded_sha
+    created_by_tx=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
+    recorded_sha=$(python3 -c "import json; print(json.load(open('$manifest')).get('sha256', ''))" 2>/dev/null || echo "")
+
+    if [[ "$created_by_tx" != "1" ]]; then
+        return 0
+    fi
+
+    if [[ ! -e "$hook_file" && ! -L "$hook_file" ]]; then
+        return 0
+    fi
+
+    if [[ -L "$hook_file" ]]; then
+        echo "Warning: Deploy hook $hook_file is now a symlink; preserving modified object and reporting incomplete recovery." >&2
+        return 1
+    fi
+
+    if [[ ! -f "$hook_file" ]]; then
+        echo "Warning: Deploy hook $hook_file is not a regular file; preserving modified object and reporting incomplete recovery." >&2
+        return 1
+    fi
+
+    local current_sha
+    current_sha=$(sha256sum "$hook_file" | awk '{print $1}')
+    if [[ "$current_sha" != "$recorded_sha" ]]; then
+        echo "Warning: Deploy hook $hook_file was modified after installation (digest mismatch); preserving modified object and reporting incomplete recovery." >&2
+        return 1
+    fi
+
+    rm -f "$hook_file"
+    sync "$(dirname "$hook_file")"
+    return 0
+}
+
+cleanup_deploy_hook_manifest() {
+    local transaction_id="$1"
+    local recovery_root="${2:-/var/lib/gowave-auto-nginx/recovery}"
+    rm -f "${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
 }
 
 setup_system_prereqs() {
@@ -377,7 +1338,7 @@ configure_edge_nginx() {
     cat > /etc/nginx/conf.d/00-bootstrap-worker-acme.conf <<EOF
 server {
     listen 80;
-    server_name $WORKER_DOMAIN $REALITY_DOMAIN;
+    server_name $WORKER_DOMAIN $REALITY_DOMAIN ${VISION_DOMAIN:-};
     location /.well-known/acme-challenge/ {
         root /var/www/gowave-acme;
     }
@@ -410,6 +1371,15 @@ EOF
         "${certbot_extra_args[@]}"
     _ACME_REALITY_ISSUED=1
 
+    if [[ -n "${VISION_DOMAIN:-}" ]]; then
+        echo "Acquiring Let's Encrypt TLS certificate for Vision ($VISION_DOMAIN)..."
+        certbot certonly --webroot -w /var/www/gowave-acme \
+            -d "$VISION_DOMAIN" --cert-name "$VISION_DOMAIN" \
+            --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring \
+            "${certbot_extra_args[@]}"
+        _ACME_VISION_ISSUED=1
+    fi
+
     rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf
     _NGINX_BOOTSTRAP_CREATED=0
 
@@ -428,16 +1398,12 @@ EOF
     }
     verify_worker_certificate "$WORKER_DOMAIN"
     verify_worker_certificate "$REALITY_DOMAIN"
+    if [[ -n "${VISION_DOMAIN:-}" ]]; then
+        verify_worker_certificate "$VISION_DOMAIN"
+    fi
 
     # Configure automated ACME reload hook for Worker
-    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-    cat > /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh <<'EOF'
-#!/bin/sh
-set -eu
-nginx -t -q
-systemctl reload nginx
-EOF
-    chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh
+    install_managed_deploy_hook "$_ACME_TX_ID" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh"
 
     # Hook top-level stream if missing
     if ! grep -q 'stream-enabled' /etc/nginx/nginx.conf; then
@@ -558,6 +1524,24 @@ server {
 }
 EOF
 
+    if [[ -n "${VISION_DOMAIN:-}" ]]; then
+        cat > /etc/nginx/conf.d/gowave-worker-vision-fallback.conf <<EOF
+# Managed by GoWave Auto NGINX: Worker Edge Vision Fallback Decoy
+server {
+    listen 127.0.0.1:9444 proxy_protocol;
+    server_name $VISION_DOMAIN;
+    server_tokens off;
+
+    set_real_ip_from 127.0.0.1;
+    real_ip_header proxy_protocol;
+
+    root /var/www/gowave-auto-nginx/cover-reality;
+    index index.html;
+    access_log /var/log/nginx/gowave-vision-fallback-access.log;
+}
+EOF
+    fi
+
     nginx -t
     systemctl reload nginx || systemctl restart nginx
     systemctl is-active --quiet nginx || { echo "Fatal: NGINX failed to activate production configuration" >&2; return 1; }
@@ -645,8 +1629,9 @@ compensate_remote_worker() {
         rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf
         rm -f /etc/nginx/conf.d/gowave-worker-https.conf
         rm -f /etc/nginx/conf.d/gowave-worker-decoy.conf
+        rm -f /etc/nginx/conf.d/gowave-worker-vision-fallback.conf
         rm -f /etc/nginx/stream-enabled/gowave-worker-stream.conf
-        rm -f /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh
+        rollback_managed_deploy_hook "${_ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || true
         rm -rf /var/www/gowave-acme
         if [[ "${_STREAM_INCLUDE_ADDED:-0}" -eq 1 ]]; then
             sed -i '\#stream { include /etc/nginx/stream-enabled/\*\.conf; }#d' /etc/nginx/nginx.conf 2>/dev/null || true
@@ -664,15 +1649,24 @@ compensate_remote_worker() {
     fi
 
     # 4. Revert ACME certificates
-    if [[ "${_ACME_WORKER_ISSUED:-0}" -eq 1 ]] && [[ -n "${WORKER_DOMAIN:-}" ]]; then
-        echo "[ROLLBACK] Deleting ACME certificate for $WORKER_DOMAIN..." >&2
-        certbot delete --cert-name "$WORKER_DOMAIN" --non-interactive 2>/dev/null || true
-        rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || true
-    fi
-    if [[ "${_ACME_REALITY_ISSUED:-0}" -eq 1 ]] && [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        echo "[ROLLBACK] Deleting ACME certificate for $REALITY_DOMAIN..." >&2
-        certbot delete --cert-name "$REALITY_DOMAIN" --non-interactive 2>/dev/null || true
-        rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || true
+    if [[ -n "${_ACME_TX_ID:-}" ]]; then
+        echo "[ROLLBACK] Restoring or cleaning up ACME certificates via snapshot..." >&2
+        restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || true
+        restore_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || true
+        if [[ -n "${VISION_DOMAIN:-}" ]]; then
+            restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || true
+        fi
+    else
+        if [[ "${_ACME_WORKER_ISSUED:-0}" -eq 1 ]] && [[ -n "${WORKER_DOMAIN:-}" ]]; then
+            echo "[ROLLBACK] Deleting ACME certificate for $WORKER_DOMAIN..." >&2
+            certbot delete --cert-name "$WORKER_DOMAIN" --non-interactive 2>/dev/null || true
+            rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || true
+        fi
+        if [[ "${_ACME_REALITY_ISSUED:-0}" -eq 1 ]] && [[ -n "${REALITY_DOMAIN:-}" ]]; then
+            echo "[ROLLBACK] Deleting ACME certificate for $REALITY_DOMAIN..." >&2
+            certbot delete --cert-name "$REALITY_DOMAIN" --non-interactive 2>/dev/null || true
+            rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || true
+        fi
     fi
 
     # 5. Revert UFW firewall changes
@@ -741,13 +1735,54 @@ main() {
     _STREAM_INCLUDE_ADDED=0
     _NODE_SERVICE_CONFIGURED=0
 
+    _COMPENSATED=0
+    cleanup_temp_and_secrets() {
+        unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64 2>/dev/null || true
+        rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh 2>/dev/null || true
+    }
+    handle_signal() {
+        local sig="$1"
+        echo "Received signal $sig. Halting and invoking compensation..." >&2
+        if [[ "${_COMPENSATED:-0}" -eq 0 ]]; then
+            _COMPENSATED=1
+            compensate_remote_worker 128
+        fi
+        cleanup_temp_and_secrets
+        exit 128
+    }
+    handle_error() {
+        local exit_code="${1:-1}"
+        if [[ "${_COMPENSATED:-0}" -eq 0 ]]; then
+            _COMPENSATED=1
+            compensate_remote_worker "$exit_code"
+        fi
+        cleanup_temp_and_secrets
+        exit "$exit_code"
+    }
+
+    trap 'handle_signal HUP' HUP
+    trap 'handle_signal INT' INT
+    trap 'handle_signal TERM' TERM
     trap 'exit_code=$?; compensate_remote_worker "$exit_code"; exit "$exit_code"' ERR
-    trap 'unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64; rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh' EXIT HUP INT TERM
+    trap 'cleanup_temp_and_secrets' EXIT
+
+    acquire_mutation_lock
+    verify_deploy_hook_preflight "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" "${_ACME_TX_ID:-}" || return 1
 
     validate_acme_server "${GOWAVE_ACME_SERVER:-}"
     local effective_acme_server="${GOWAVE_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
     check_acme_lineage "$WORKER_DOMAIN" "$effective_acme_server"
     check_acme_lineage "$REALITY_DOMAIN" "$effective_acme_server"
+    if [[ -n "${VISION_DOMAIN:-}" ]]; then
+        check_acme_lineage "$VISION_DOMAIN" "$effective_acme_server"
+    fi
+
+    _ACME_TX_ID="worker_install_$(date +%s)"
+    snapshot_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN"
+    snapshot_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN"
+    if [[ -n "${VISION_DOMAIN:-}" ]]; then
+        snapshot_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN"
+    fi
 
     setup_system_prereqs </dev/null
     configure_host_security </dev/null
@@ -768,6 +1803,14 @@ main() {
 
     # Disable ERR compensation trap on verified success
     trap - ERR
+    if [[ -n "${_ACME_TX_ID:-}" ]]; then
+        cleanup_acme_snapshot "$_ACME_TX_ID" "$WORKER_DOMAIN"
+        cleanup_acme_snapshot "$_ACME_TX_ID" "$REALITY_DOMAIN"
+        if [[ -n "${VISION_DOMAIN:-}" ]]; then
+            cleanup_acme_snapshot "$_ACME_TX_ID" "$VISION_DOMAIN"
+        fi
+        cleanup_deploy_hook_manifest "$_ACME_TX_ID"
+    fi
     unset _NODE_SECRET_KEY VERIFY_NODE_MTLS_B64
     echo "GoWave Edge Worker deployment complete (service, NGINX, TLS and mTLS health verified)."
 }
@@ -805,10 +1848,125 @@ remote_rollback() {
         printf 'export NODE_PORT=%q\n' "$node_port"
         printf 'export WORKER_DOMAIN=%q\n' "$worker_domain"
         printf 'export REALITY_DOMAIN=%q\n' "$reality_domain"
+        printf 'export VISION_DOMAIN=%q\n' "${VISION_DOMAIN:-}"
+        printf 'export ACME_TX_ID=%q\n' "${ACME_TX_ID:-}"
 
         cat <<'ROLLBACK_REMOTE_SCRIPT'
 set -euo pipefail
 
+if [[ "$(id -u)" -ne 0 ]]; then
+    MUTATION_LOCK_FILE="${MUTATION_LOCK_FILE:-/tmp/gowave-managed-mutation-$(id -u).lock}"
+    MUTATION_LEASE_FILE="${MUTATION_LEASE_FILE:-/tmp/gowave-mutation-lease-$(id -u).json}"
+else
+    MUTATION_LOCK_FILE="${MUTATION_LOCK_FILE:-/run/lock/gowave-managed-mutation.lock}"
+    MUTATION_LEASE_FILE="${MUTATION_LEASE_FILE:-/run/lock/gowave-mutation-lease.json}"
+fi
+
+validate_lock_path() {
+    local lock_file="${1:-$MUTATION_LOCK_FILE}"
+    local lock_dir
+    lock_dir="$(dirname "$lock_file")"
+    if [[ ! -d "$lock_dir" ]]; then
+        mkdir -p "$lock_dir"
+        chmod 0755 "$lock_dir" 2>/dev/null || true
+    fi
+    if [[ -L "$lock_dir" || -L "$lock_file" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+acquire_mutation_lock() {
+    validate_lock_path "$MUTATION_LOCK_FILE" || return 1
+    if [[ ! -f "$MUTATION_LOCK_FILE" ]]; then
+        ( umask 0177; touch "$MUTATION_LOCK_FILE" ) 2>/dev/null || true
+        chmod 0600 "$MUTATION_LOCK_FILE" 2>/dev/null || true
+    fi
+    exec 9>>"$MUTATION_LOCK_FILE"
+    flock -n 9 || true
+    return 0
+}
+
+rollback_managed_deploy_hook() {
+    local transaction_id="$1"
+    local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
+    local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
+
+    if [[ -z "$transaction_id" ]]; then
+        return 0
+    fi
+    local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
+    if [[ ! -f "$manifest" ]]; then
+        return 0
+    fi
+    local created_by_tx recorded_sha
+    created_by_tx=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
+    recorded_sha=$(python3 -c "import json; print(json.load(open('$manifest')).get('sha256', ''))" 2>/dev/null || echo "")
+
+    if [[ "$created_by_tx" != "1" || ! -f "$hook_file" ]]; then
+        return 0
+    fi
+    local current_sha
+    current_sha=$(sha256sum "$hook_file" | awk '{print $1}')
+    if [[ "$current_sha" == "$recorded_sha" ]]; then
+        rm -f "$hook_file"
+        sync "$(dirname "$hook_file")"
+    fi
+    return 0
+}
+
+restore_acme_lineage() {
+    local transaction_id="$1"
+    local domain="$2"
+    local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
+    local letsencrypt_root="${4:-/etc/letsencrypt}"
+
+    local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
+    local meta_file="${snap_dir}/lineage-manifest.json"
+
+    if [[ ! -f "$meta_file" ]]; then
+        return 0
+    fi
+
+    local existed
+    existed=$(python3 -c "import json; print('1' if json.load(open('$meta_file')).get('existed_before') else '0')" 2>/dev/null || echo "0")
+    local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
+    local live_dir="${letsencrypt_root}/live/${domain}"
+    local archive_dir="${letsencrypt_root}/archive/${domain}"
+
+    if [[ "$existed" == "0" ]]; then
+        rm -f "$renewal_conf"
+        rm -rf "$live_dir" "$archive_dir"
+        return 0
+    fi
+
+    mkdir -p "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir"
+    chmod 0755 "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" 2>/dev/null || true
+
+    if [[ -f "$snap_dir/renewal.conf" ]]; then
+        cp -p "$snap_dir/renewal.conf" "$renewal_conf"
+    fi
+    if [[ -d "$snap_dir/archive" ]]; then
+        local arc
+        for arc in "$snap_dir/archive"/*; do
+            [[ -f "$arc" ]] || continue
+            cp -p "$arc" "$archive_dir/$(basename "$arc")"
+        done
+    fi
+    if [[ -d "$snap_dir/live" ]]; then
+        local f
+        for f in cert.pem chain.pem fullchain.pem privkey.pem; do
+            if [[ -f "$snap_dir/live/${f}.target" ]]; then
+                ln -sf "$(cat "$snap_dir/live/${f}.target")" "$live_dir/$f"
+            elif [[ -f "$snap_dir/live/$f" ]]; then
+                cp -p "$snap_dir/live/$f" "$live_dir/$f"
+            fi
+        done
+    fi
+    return 0
+}
+
+acquire_mutation_lock
 echo "Executing worker compensation teardown..." >&2
 
 # 1. Stop and disable systemd services
@@ -828,8 +1986,9 @@ rm -f /usr/local/bin/gowave-node /usr/local/bin/xray
 rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf
 rm -f /etc/nginx/conf.d/gowave-worker-https.conf
 rm -f /etc/nginx/conf.d/gowave-worker-decoy.conf
+rm -f /etc/nginx/conf.d/gowave-worker-vision-fallback.conf
 rm -f /etc/nginx/stream-enabled/gowave-worker-stream.conf
-rm -f /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh
+rollback_managed_deploy_hook "${ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || true
 rm -rf /var/www/gowave-acme
 rm -rf /var/www/gowave-auto-nginx/cover-reality
 rmdir /var/www/gowave-auto-nginx 2>/dev/null || true
@@ -843,13 +2002,26 @@ if nginx -t >/dev/null 2>&1; then
 fi
 
 # 3. Clean ACME certificates
-if [[ -n "${WORKER_DOMAIN:-}" ]]; then
-    certbot delete --cert-name "$WORKER_DOMAIN" --non-interactive 2>/dev/null || true
-    rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || true
-fi
-if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-    certbot delete --cert-name "$REALITY_DOMAIN" --non-interactive 2>/dev/null || true
-    rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || true
+if [[ -n "${ACME_TX_ID:-}" ]]; then
+    echo "[ROLLBACK] Restoring ACME lineages via snapshot for transaction $ACME_TX_ID..." >&2
+    restore_acme_lineage "$ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || true
+    restore_acme_lineage "$ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || true
+    if [[ -n "${VISION_DOMAIN:-}" ]]; then
+        restore_acme_lineage "$ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || true
+    fi
+else
+    if [[ -n "${WORKER_DOMAIN:-}" ]]; then
+        certbot delete --cert-name "$WORKER_DOMAIN" --non-interactive 2>/dev/null || true
+        rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || true
+    fi
+    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+        certbot delete --cert-name "$REALITY_DOMAIN" --non-interactive 2>/dev/null || true
+        rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || true
+    fi
+    if [[ -n "${VISION_DOMAIN:-}" ]]; then
+        certbot delete --cert-name "$VISION_DOMAIN" --non-interactive 2>/dev/null || true
+        rm -rf "/etc/letsencrypt/live/$VISION_DOMAIN" "/etc/letsencrypt/archive/$VISION_DOMAIN" "/etc/letsencrypt/renewal/$VISION_DOMAIN.conf" 2>/dev/null || true
+    fi
 fi
 
 # 4. Remove UFW rules added for Control Plane

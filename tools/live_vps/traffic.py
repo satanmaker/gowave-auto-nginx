@@ -440,9 +440,11 @@ def evaluate_traffic_suite_status(
     test_traffic_verification: bool,
     xray_results: List[Dict[str, Any]],
     mihomo_results: Optional[Dict[str, Any]] = None,
+    expected_case_count: Optional[int] = None,
 ) -> str:
     """Evaluate overall status for traffic suite.
     Enforces that disabling traffic verification or Mihomo traffic forces INCOMPLETE, not PASS.
+    Enforces expected active case count (8 per client without Vision, 10 per client with Vision).
     """
     if not test_traffic_verification:
         return "INCOMPLETE"
@@ -453,6 +455,13 @@ def evaluate_traffic_suite_status(
     # Empty or missing results are missing evidence, not a successful suite.
     if not xray_results or mihomo_results is None:
         return "INCOMPLETE"
+
+    if expected_case_count is not None:
+        if len(xray_results) != expected_case_count:
+            return "INCOMPLETE"
+        mihomo_cases = mihomo_results.get("results", []) if isinstance(mihomo_results, dict) else []
+        if len(mihomo_cases) != expected_case_count:
+            return "INCOMPLETE"
 
     for result in xray_results:
         if result.get("status") == "INCOMPLETE":

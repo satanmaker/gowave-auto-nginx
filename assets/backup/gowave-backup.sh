@@ -5,6 +5,7 @@ set -euo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+[[ -f "$SCRIPT_DIR/modules/lock.sh" ]] && source "$SCRIPT_DIR/modules/lock.sh"
 BACKUP_STORE="${BACKUP_STORE:-/var/backups/gowave}"
 RECOVERY_STORE="${RECOVERY_STORE:-/var/lib/gowave-auto-nginx/recovery}"
 JOURNAL_FILE="${JOURNAL_FILE:-${RECOVERY_STORE}/journal.json}"
@@ -389,6 +390,9 @@ cmd_restore() {
     local expected_type="${2:-panel}"
 
     [[ -f "$archive" ]] || die "Archive $archive not found"
+    if command -v acquire_mutation_lock >/dev/null 2>&1; then
+        acquire_mutation_lock || die "Could not acquire host mutation lock"
+    fi
 
     echo "==> Initiating Restore from $archive (type: $expected_type)..."
 

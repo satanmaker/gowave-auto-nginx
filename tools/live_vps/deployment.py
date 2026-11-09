@@ -207,6 +207,7 @@ def install_master(
     master_ssh: SSHClient,
     config: LiveVPSConfig,
     target_dir: str = "/opt/gowave-auto-nginx",
+    lease_token: Optional[str] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Execute gowave-auto.sh install on Master and verify all invariants."""
     acme_server = ACME_MODE_URLS.get(config.acme_mode)
@@ -237,7 +238,8 @@ def install_master(
         args.append(config.master_vision_domain)
 
     install_cmd = f"{env_vars}\nexec " + " ".join(shlex.quote(str(value)) for value in args)
-    r = master_ssh.run(install_cmd, timeout=600)
+    input_data = f"GOWAVE_LEASE: {lease_token}\n" if lease_token else None
+    r = master_ssh.run(install_cmd, input_data=input_data, timeout=600)
     if not r.ok:
         return False, {"error": "gowave-auto.sh install exited non-zero", "stderr": r.stderr}
 
@@ -305,6 +307,7 @@ def deploy_worker(
     worker_ssh: SSHClient,
     config: LiveVPSConfig,
     target_dir: str = "/opt/gowave-auto-nginx",
+    lease_token: Optional[str] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Deploy Worker node from Master VPS under Master-side strace argv observer."""
     # Ensure strace on Master and run acceptance fixtures
@@ -339,17 +342,23 @@ def deploy_worker(
         f"export {key}={shlex.quote(str(value))}" for key, value in env_values.items()
     )
     node_add_args = [
-        f"{target_dir}/gowave-auto.sh", "node", "add", "worker-1",
+        f"{target_dir}/gowave-auto.sh", "node", "add",
+    ]
+    if config.worker_vision_domain:
+        node_add_args.extend(["--vision-domain", config.worker_vision_domain])
+    node_add_args.extend([
+        "worker-1",
         config.worker_ip, config.worker_domain, config.worker_reality_domain,
         config.worker_ssh_user, str(config.worker_ssh_port),
-    ]
+    ])
     node_add_cmd = (
         f"{env_vars}\nstrace -f -v -s {shlex.quote(strace_limit)} "
         "-e trace=execve,execveat -o /run/live_vps_strace/worker_dispatch.trace "
         + " ".join(shlex.quote(str(value)) for value in node_add_args)
     )
 
-    r = master_ssh.run(node_add_cmd, timeout=600)
+    input_data = f"GOWAVE_LEASE: {lease_token}\n" if lease_token else None
+    r = master_ssh.run(node_add_cmd, input_data=input_data, timeout=600)
 
     # Parse strace on Master VPS directly without exfiltrating envp
     parse_script = r"""

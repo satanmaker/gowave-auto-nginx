@@ -56,7 +56,7 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
         self.assertEqual(build_config_fingerprint(same), build_config_fingerprint(type("Config", (), {"values": dict(base)})()))
         self.assertNotEqual(build_config_fingerprint(same), build_config_fingerprint(changed_config))
 
-    def test_vision_preflight_is_incomplete_before_mutating_phases(self):
+    def test_vision_preflight_passes_when_supported(self):
         config = SimpleNamespace(
             master_vision_domain="vision-master.example.com",
             worker_vision_domain="vision-worker.example.com",
@@ -77,9 +77,9 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
             master_baseline=baseline,
             worker_baseline=baseline,
         )
-        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertEqual(result["status"], "PASS")
         self.assertTrue(result["vision_requested"])
-        self.assertFalse(result["vision_supported"])
+        self.assertTrue(result["vision_supported"])
 
     @patch("test_live_vps.subprocess.run")
     def test_git_head_rejects_dirty_worktree(self, run):
@@ -97,7 +97,7 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
         self.assertIn(r'''printf '%s\n' "$WORKER_KNOWN_HOSTS"''', workflow)
         self.assertNotIn(r'''printf '%s\\n' ''', workflow)
 
-    def test_non_vision_preflight_is_incomplete_until_remote_pair_lock_is_integrated(self):
+    def test_non_vision_preflight_passes_with_integrated_pair_lock(self):
         config = SimpleNamespace(
             master_vision_domain=None,
             worker_vision_domain=None,
@@ -118,9 +118,9 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
             master_baseline=baseline,
             worker_baseline=baseline,
         )
-        self.assertEqual(result["status"], "INCOMPLETE")
-        self.assertFalse(result["remote_pair_lock_supported"])
-        self.assertFalse(result["transactional_restore_supported"])
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["remote_pair_lock_supported"])
+        self.assertTrue(result["transactional_restore_supported"])
 
     def test_run_state_load_rejects_symlink(self):
         target = self.artifact_dir / "target.json"
