@@ -128,7 +128,7 @@ command.
 
 ### Requirement: Target Address, Domain, and SSH Identity Safety
 
-The runner SHALL target two distinct public VPS IPv4 addresses and SHALL reject duplicate mandatory Panel/REALITY FQDNs; when Vision is enabled, all six configured FQDNs SHALL be pairwise unique. E2E v1 SHALL connect to both VPS as `root`, because the current installer/orchestrator scripts do not provide a supported non-root `sudo` execution path. These checks SHALL complete before remote locks or any remote modification.
+The runner SHALL target two distinct public VPS IPv4 addresses and SHALL reject duplicate mandatory Panel/REALITY FQDNs; every configured Vision FQDN SHALL also be globally unique against all mandatory and other configured Vision FQDNs. E2E v1 SHALL connect to both VPS as `root`, because the current installer/orchestrator scripts do not provide a supported non-root `sudo` execution path. These checks SHALL complete before remote locks or any remote modification.
 
 #### Scenario: Master and Worker target addresses must differ
 
