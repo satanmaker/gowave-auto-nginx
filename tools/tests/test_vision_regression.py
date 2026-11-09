@@ -182,8 +182,8 @@ class TestVisionRegressionCoverage(unittest.TestCase):
             self.assertIn("export VISION_DOMAIN=vision.worker.example.com", captured)
             self.assertIn("gowave-worker-vision-fallback.conf", captured)
 
-    def test_worker_rollback_removes_vision_artifacts_preserves_unrelated(self):
-        """Worker rollback removes transaction-owned Vision artifacts and restores pre-existing ACME lineage."""
+    def test_acme_snapshot_restores_preexisting_vision_lineage(self):
+        """ACME snapshot recovery restores the original Vision certificate after tampering."""
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             rec_dir = tmp / "recovery"
@@ -226,6 +226,16 @@ class TestVisionRegressionCoverage(unittest.TestCase):
             self.assertNotEqual(cert_file.read_text(), "TAMPERED_CERT_BYTES")
             self.assertIn("BEGIN CERTIFICATE", cert_file.read_text())
 
+    def test_worker_compensation_removes_vision_artifacts_and_restores_lineage(self):
+        """Worker ERR compensation removes the Vision fallback and restores its ACME lineage."""
+        node_script = (REPO_ROOT / "gowave-node-auto.sh").read_text(encoding="utf-8")
+        start = node_script.index("compensate_remote_worker() {")
+        end = node_script.index("\n}\n", start) + len("\n}\n")
+        compensation = node_script[start:end]
+
+        self.assertIn("rm -f /etc/nginx/conf.d/gowave-worker-vision-fallback.conf", compensation)
+        self.assertIn('if [[ -n "${VISION_DOMAIN:-}" ]]; then', compensation)
+        self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN"', compensation)
     def test_case_matrix_counting_16_vs_20_in_traffic_and_junit(self):
         """Case matrix: 16, 18, or 20 cases for zero, one, or two Vision domains."""
         # Every synthetic PASS fixture carries the same mandatory packet-evidence contract.

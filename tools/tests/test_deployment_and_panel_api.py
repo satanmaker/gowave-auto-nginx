@@ -28,6 +28,7 @@ from live_vps.nginx import verify_panel_https
 from live_vps.subscriptions import verify_user_agent_policy
 from live_vps.ssh import SSHResult
 from modules.api_client import GoWaveClient, GoWaveAPIError
+from live_vps.redaction import clear_secrets
 
 
 class MockServerHandler(http.server.BaseHTTPRequestHandler):
@@ -77,6 +78,12 @@ class MockServerHandler(http.server.BaseHTTPRequestHandler):
 
 
 class TestDeploymentAndPanelAPI(unittest.TestCase):
+    def setUp(self):
+        clear_secrets()
+
+    def tearDown(self):
+        clear_secrets()
+
     def test_pinned_version_match_requires_exact_token(self):
         self.assertTrue(output_matches_pinned_version("GoWave Server v0.4.0", "0.4.0"))
         self.assertTrue(output_matches_pinned_version("Xray 25.10.15 (Xray, Penetrates Everything.)", "25.10.15"))
@@ -410,6 +417,29 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
         token = panel_client.login("admin", "correct")
         self.assertEqual(token, "mock-jwt-token-12345")
         self.assertTrue(panel_client.poll_worker_ready("worker-1", timeout=5, poll_interval=1))
+
+    def test_panel_client_worker_poll_returns_false_at_deadline(self):
+        trusted_ctx = ssl.create_default_context(cafile=str(self.ca_crt))
+        panel_client = E2EPanelClient(
+            panel_domain=f"localhost:{self.port}",
+            ssl_context=trusted_ctx,
+            timeout=5,
+        )
+        with (
+            patch.object(panel_client, "get_nodes", return_value=[
+                {"name": "worker-1", "isConnected": False}
+            ]) as get_nodes,
+            patch("live_vps.panel_api.time.time", side_effect=[0.0, 1.0, 6.0]),
+            patch("live_vps.panel_api.time.sleep") as sleep,
+        ):
+            self.assertFalse(
+                panel_client.poll_worker_ready(
+                    "worker-1", timeout=5, poll_interval=1
+                )
+            )
+
+        get_nodes.assert_called_once_with()
+        sleep.assert_called_once_with(1)
 
     def test_panel_client_untrusted_ca_rejection(self):
         untrusted_ctx = ssl.create_default_context(cafile=str(self.untrusted_ca))
