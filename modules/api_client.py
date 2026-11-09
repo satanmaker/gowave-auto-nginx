@@ -736,14 +736,17 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
                 elif line.startswith("Admin Password:"):
                     password = line.split(":", 1)[1].strip()
         except Exception as e:
-            print(f"Warning reading credentials file: {e}", file=sys.stderr)
+            print(f"Warning reading credentials file ({type(e).__name__}).", file=sys.stderr)
 
     if not password:
         env_file = Path("/opt/gowave/.env")
         if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                if line.startswith("ADMIN_PASSWORD="):
-                    password = line.split("=", 1)[1].strip()
+            try:
+                for line in env_file.read_text().splitlines():
+                    if line.startswith("ADMIN_PASSWORD="):
+                        password = line.split("=", 1)[1].strip()
+            except Exception as exc:
+                print(f"Warning reading environment credentials ({type(exc).__name__}).", file=sys.stderr)
     if not password:
         print("Refusing API rollback: no admin password is available.", file=sys.stderr)
         return False
@@ -753,7 +756,9 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
         try:
             client.login(username, password)
         except Exception as e:
-            print(f"Warning: Login failed during rollback: {e}", file=sys.stderr)
+            status = getattr(e, "status_code", None)
+            suffix = f", HTTP {status}" if isinstance(status, int) and not isinstance(status, bool) else ""
+            print(f"Warning: Login failed during rollback ({type(e).__name__}{suffix}).", file=sys.stderr)
             return False
 
     # Node-add rollback must also reconcile the local state file. Prefer the
@@ -862,7 +867,9 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
                     else:
                         raise GoWaveAPIError(f"Unsupported created entity type: {etype}")
             except Exception as e:
-                message = f"Rollback failed for {action} {etype} {uuid}: {e}"
+                status = getattr(e, "status_code", None)
+                suffix = f" (HTTP {status})" if isinstance(status, int) and not isinstance(status, bool) else ""
+                message = f"Rollback failed for {action} {etype} {uuid}: {type(e).__name__}{suffix}"
                 rollback_errors.append(message)
                 print(message, file=sys.stderr)
 
@@ -875,7 +882,7 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
                     atomic_write_state(state_data, str(state_file))
                 except Exception as exc:
                     rollback_errors.append(
-                        f"Failed to persist reconciled node-add state: {type(exc).__name__}: {exc}"
+                        f"Failed to persist reconciled node-add state: {type(exc).__name__}"
                     )
 
         if rollback_errors:
