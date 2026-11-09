@@ -510,8 +510,9 @@ When the pair is configured:
 5. Panel API acceptance MUST verify five inbounds and five corresponding hosts per node, including each
    Vision inbound/host association. The subscription MUST expose one Vision proxy per VPS, and Xray and
    Mihomo MUST each execute the two Vision endpoints as independent runtime cases.
-6. When both Vision domains are absent, the default four-inbound topology remains unchanged: no Vision
-   certificate issuance, no Vision SNI route/fallback, and no Vision subscription endpoint.
+6. When a host's Vision domain is absent, that host retains its default four-inbound topology: no Vision
+   certificate issuance, no Vision SNI route/fallback, and no Vision subscription endpoint. The other host's
+   independently configured Vision endpoint remains enabled.
 
 **Rationale:** The current Master installer suppresses Vision certificate issuance/verification errors, while
 the current Worker dispatch does not propagate the Vision domain into Worker API provisioning or Worker
@@ -898,7 +899,7 @@ Phase 7: NGINX SNI + REALITY Decoy (+ Optional Vision)
   7.2  Worker HTTPS with correct SNI
   7.3  REALITY fallback with REALITY SNI + invalid REALITY params (decoy content on 9443, not GoWave API)
   7.4  Unknown SNI routing (matches NGINX + Xray REALITY fallback behavior)
-  7.5  Optional paired-Vision SNI routing to 8444 and non-VLESS HTTP fallback to decoy on 9444 when configured
+  7.5  Optional per-host Vision SNI routing to 8444 and non-VLESS HTTP fallback to decoy on 9444 on each VPS whose Vision domain is configured
   7.6  nginx -t on both VPS configs
   7.7  cover-reality unique marker file accessible
   7.8  PROXY protocol integrity (inferred from correct Panel, Worker, REALITY, and Vision responses)
@@ -914,8 +915,9 @@ Phase 8: Data Plane E2E (8/9/10 logical endpoints × 2 client runtimes = 16/18/2
        - Send HTTPS request through the selected proxy; verify HTTP response and observed egress IP
        - Verify target VPS ingress evidence in an isolated observation window
        - Stop client and remove temporary configuration
-  8.3  All 16 (or 20) cases are mandatory for overall PASS. If a client runtime is intentionally disabled, mark its
-       cases SKIP and overall status INCOMPLETE. A syntax-only validation is not a runtime traffic pass.
+  8.3  All 16, 18, or 20 cases (according to the number of configured Vision domains) are mandatory for overall
+       PASS. If a client runtime is intentionally disabled, mark its cases SKIP and overall status INCOMPLETE.
+       A syntax-only validation is not a runtime traffic pass.
 
 Phase 9: Negative Tests (NEG-01 .. NEG-15)
   NEG-01..NEG-04 are isolated preflight contract tests using temporary known_hosts/config fixtures and
@@ -1128,10 +1130,12 @@ API schema.
 → Mitigation: Configure at least two independent external IP check endpoints; fall back to the second if the
 first times out.
 
-**[RISK] Server-side inbound counter may not be available if Xray stats API is not enabled in GoWave config**
-→ Mitigation: Runner checks whether stats API is enabled post-installation. If not, falls back to SSH-based
-packet capture (tcpdump on the specific port for the duration of the test request) as server-side evidence.
-Documents this fallback explicitly in the diagnostic report.
+**[RISK] Server-side per-case packet evidence may be unavailable or unattributable**
+→ Mitigation: Every Xray/Mihomo request is bracketed by simultaneous inbound tcpdump captures on both VPS,
+filtered by the control machine's public IPv4 and the exact tested proxy destination port, excluding SSH ports.
+The remote capture is bounded by a 45-second timeout. Missing tcpdump, source-IP identity, endpoint port, or
+valid capture summary yields INCOMPLETE; aggregate interface counters are never a PASS fallback. No PCAP or
+payload is persisted.
 
 **[RISK] Xray and Mihomo binary versions on Control Machine may not match pinned config versions**
 → Mitigation: Preflight checks client versions against `XRAY_CLIENT_VERSION` and `MIHOMO_CLIENT_VERSION`,
