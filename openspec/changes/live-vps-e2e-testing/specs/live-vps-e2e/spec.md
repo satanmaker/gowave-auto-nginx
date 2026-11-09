@@ -974,16 +974,40 @@ the declared teardown policy completed. `SKIP` and `NOT_RUN` are non-passing.
 
 ### Requirement: Local Operator Credential Bootstrap and Cleanup
 
-The live two-VPS acceptance run SHALL be launched from the operator's Linux workstation. GitHub Actions MUST NOT
-store target VPS passwords, permanent private keys, or known_hosts secrets. The local controller MUST verify
-SSH host-key fingerprints against the provider console before password authentication, bootstrap per-host
-ephemeral Ed25519 keys, arm persistent two-hour remote expiry before key installation, and verify immediate
-revocation after the run. Unverified cleanup SHALL downgrade an otherwise successful run to INCOMPLETE.
+Live VPS acceptance SHALL use the local Linux operator controller. GitHub Actions MUST NOT store target VPS
+passwords or permanent SSH private keys. The controller SHALL verify host identity before password auth and
+revoke temporary keys after the run.
+
+#### Scenario: Host identity is verified before password authentication
+
+- **GIVEN** the controller has opened an unauthenticated SSH connection
+- **WHEN** the operator does not confirm the provider-console SHA-256 fingerprint exactly
+- **THEN** the controller aborts before requesting or sending the password
+
+#### Scenario: Temporary access is bounded and revoked
+
+- **GIVEN** the operator has authenticated and the controller is bootstrapping a VPS
+- **WHEN** the temporary public key is installed
+- **THEN** a persistent two-hour remote expiry timer is already enabled
+- **AND** the controller attempts immediate revocation and independently verifies marker removal and timer inactivity
+- **AND** unverified cleanup downgrades an otherwise successful run to INCOMPLETE
 
 ### Requirement: Per-Case Data-Plane Packet Evidence
 
-Every Xray and Mihomo request SHALL be bracketed by simultaneous inbound tcpdump captures on Master and Worker,
-filtered by the control machine's public IPv4 and the exact tested proxy service destination port, excluding SSH
-ports. PASS requires positive ingress on the intended VPS, zero matching ingress on the other VPS, and the
-expected egress IPv4. Missing or invalid evidence SHALL be INCOMPLETE; aggregate interface counters MUST NOT be
-used as a PASS fallback. Capture payloads and PCAP files MUST NOT be persisted.
+Each Xray and Mihomo request SHALL use simultaneous inbound packet captures on both VPS. PASS requires intended
+host ingress, zero matching ingress on the other host, and the expected egress IPv4. Missing evidence SHALL
+be INCOMPLETE; aggregate counters MUST NOT be a PASS fallback. PCAP files and payloads MUST NOT be persisted.
+
+#### Scenario: Selected VPS receives the proxy request
+
+- **GIVEN** a single Xray or Mihomo proxy request is in progress
+- **WHEN** both VPS packet captures are active and filtered by control-machine public IPv4 and exact proxy destination port
+- **THEN** the intended VPS records at least one matching packet and the other VPS records zero
+- **AND** the observed egress IPv4 matches the expected egress of the intended VPS
+
+#### Scenario: Packet evidence is unavailable or ambiguous
+
+- **GIVEN** tcpdump, source-IP identity, endpoint port, or a valid capture summary is unavailable
+- **WHEN** the traffic case is evaluated
+- **THEN** the case is INCOMPLETE and aggregate interface counters MUST NOT be used to mark it PASS
+- **AND** no PCAP or packet payload is persisted
