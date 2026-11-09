@@ -220,6 +220,130 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertIn("Refusing remote rollback without the mutation lock", result.stderr)
             self.assertFalse(marker.exists(), "destructive commands ran without owning the mutation lock")
 
+    def test_standalone_acme_restore_fails_closed_on_missing_or_malformed_manifest(self):
+        """Missing or invalid lineage metadata must never be interpreted as 'no prior certificate'."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        remote_start = worker_script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
+        function_start = worker_script.index("restore_acme_lineage() {", remote_start)
+        function_end = worker_script.index("\n}\n\nacquire_mutation_lock", function_start) + 2
+        self.assertGreater(function_start, remote_start)
+        self.assertGreater(function_end, function_start)
+        restore_function = worker_script[function_start:function_end]
+
+        for manifest_kind in ("missing", "malformed-json", "invalid-boolean"):
+            with self.subTest(manifest_kind=manifest_kind), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                recovery = root / "recovery"
+                letsencrypt = root / "letsencrypt"
+                domain = "worker.example.com"
+                snap_dir = recovery / "txn-1" / "acme" / domain
+                snap_dir.mkdir(parents=True)
+                renewal_dir = letsencrypt / "renewal"
+                live_dir = letsencrypt / "live" / domain
+                archive_dir = letsencrypt / "archive" / domain
+                renewal_dir.mkdir(parents=True)
+                live_dir.mkdir(parents=True)
+                archive_dir.mkdir(parents=True)
+                renewal = renewal_dir / f"{domain}.conf"
+                live_cert = live_dir / "fullchain.pem"
+                archive_cert = archive_dir / "cert1.pem"
+                renewal.write_text("existing renewal configuration")
+                live_cert.write_text("existing live certificate")
+                archive_cert.write_text("existing archived certificate")
+
+                manifest = snap_dir / "lineage-manifest.json"
+                if manifest_kind == "malformed-json":
+                    manifest.write_text("{not-json")
+                elif manifest_kind == "invalid-boolean":
+                    manifest.write_text(json.dumps({
+                        "domain": domain,
+                        "existed_before": "false",
+                    }))
+
+                command = (
+                    restore_function
+                    + "\nrestore_acme_lineage "
+                    + '"txn-1" "'
+                    + domain
+                    + '" "'
+                    + str(recovery)
+                    + '" "'
+                    + str(letsencrypt)
+                    + '"'
+                )
+                result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertTrue(renewal.exists(), "renewal configuration was deleted on invalid manifest")
+                self.assertEqual(live_cert.read_text(), "existing live certificate")
+                self.assertEqual(archive_cert.read_text(), "existing archived certificate")
+
+    def test_standalone_acme_restore_accepts_certbot_archive_relative_symlinks(self):
+        """A valid Certbot-style relative link must resolve inside the archive and pass identity checks."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        remote_start = worker_script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
+        function_start = worker_script.index("restore_acme_lineage() {", remote_start)
+        function_end = worker_script.index("\n}\n\nacquire_mutation_lock", function_start) + 2
+        restore_function = worker_script[function_start:function_end]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            recovery = root / "recovery"
+            letsencrypt = root / "letsencrypt"
+            domain = "worker.example.com"
+            snap_dir = recovery / "txn-1" / "acme" / domain
+            snapshot_archive = snap_dir / "archive"
+            snapshot_live = snap_dir / "live"
+            snapshot_archive.mkdir(parents=True)
+            snapshot_live.mkdir(parents=True)
+
+            generated_cert = root / "fullchain.pem"
+            generated_key = root / "privkey.pem"
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(generated_key), "-out", str(generated_cert),
+                "-subj", f"/CN={domain}", "-days", "1",
+            ], check=True, capture_output=True, text=True)
+
+            (snapshot_archive / "cert1.pem").write_bytes(generated_cert.read_bytes())
+            (snapshot_archive / "privkey1.pem").write_bytes(generated_key.read_bytes())
+            (snapshot_live / "fullchain.pem.target").write_text(f"../../archive/{domain}/cert1.pem")
+            (snapshot_live / "privkey.pem.target").write_text(f"../../archive/{domain}/privkey1.pem")
+
+            serial = subprocess.check_output(
+                ["openssl", "x509", "-in", str(generated_cert), "-noout", "-serial"], text=True
+            ).strip()
+            fingerprint = subprocess.check_output(
+                ["openssl", "x509", "-in", str(generated_cert), "-noout", "-fingerprint", "-sha256"], text=True
+            ).strip()
+            (snap_dir / "lineage-manifest.json").write_text(json.dumps({
+                "domain": domain,
+                "existed_before": True,
+                "serial": serial,
+                "fingerprint": fingerprint,
+            }))
+
+            command = (
+                restore_function
+                + "\nrestore_acme_lineage "
+                + '"txn-1" "'
+                + domain
+                + '" "'
+                + str(recovery)
+                + '" "'
+                + str(letsencrypt)
+                + '"'
+            )
+            result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            restored_fullchain = letsencrypt / "live" / domain / "fullchain.pem"
+            restored_privkey = letsencrypt / "live" / domain / "privkey.pem"
+            self.assertTrue(restored_fullchain.is_symlink())
+            self.assertTrue(restored_privkey.is_symlink())
+            self.assertEqual(restored_fullchain.resolve(), (letsencrypt / "archive" / domain / "cert1.pem").resolve())
+            self.assertEqual(restored_privkey.resolve(), (letsencrypt / "archive" / domain / "privkey1.pem").resolve())
+
     def test_worker_remote_payload_serializes_acme_server(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
