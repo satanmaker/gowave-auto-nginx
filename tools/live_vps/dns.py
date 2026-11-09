@@ -49,8 +49,8 @@ def verify_domain_dns(
 ) -> DNSCheckResult:
     """Verify that domain resolves to expected_ip across at least two independent resolvers."""
     res_list = resolvers or DEFAULT_RESOLVERS
-    if len(res_list) < 2:
-        raise ValueError("At least two independent resolvers are required for DNS preflight verification.")
+    if len(set(res_list)) < 2:
+        raise ValueError("At least two distinct independent resolvers are required for DNS preflight verification.")
 
     resolver_results: Dict[str, List[str]] = {}
     all_resolved = set()
@@ -109,8 +109,8 @@ def verify_domain_no_aaaa(
 ) -> DNSCheckResult:
     """Require authoritative NOERROR/NODATA-style responses with no AAAA data."""
     res_list = resolvers or DEFAULT_RESOLVERS
-    if len(res_list) < 2:
-        raise ValueError("At least two independent resolvers are required for DNS preflight verification.")
+    if len(set(res_list)) < 2:
+        raise ValueError("At least two distinct independent resolvers are required for DNS preflight verification.")
 
     resolver_results: Dict[str, List[str]] = {}
     errors = []

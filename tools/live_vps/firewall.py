@@ -189,7 +189,7 @@ def verify_worker_firewall(
             "control_machine_blocked": False,
             "error": "Worker TCP/3002 is reachable from the external Control Machine",
         }
-    if ext_reason != "TIMEOUT":
+    if ext_reason not in ("TIMEOUT", "REFUSED"):
         status = "INCOMPLETE"
     elif not allow_list_evidence:
         status = "INCOMPLETE"

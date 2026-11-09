@@ -115,6 +115,15 @@ class TestPreflightSSHDNS(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify_domain_dns("example.com", "93.184.216.34", resolvers=["1.1.1.1"])
 
+    def test_dns_requires_two_distinct_resolvers(self):
+        for verifier in (verify_domain_dns, verify_domain_no_aaaa):
+            with self.subTest(verifier=verifier.__name__):
+                with self.assertRaisesRegex(ValueError, "two distinct independent resolvers"):
+                    if verifier is verify_domain_dns:
+                        verifier("panel.example.test", "203.0.113.10", resolvers=["1.1.1.1", "1.1.1.1"])
+                    else:
+                        verifier("panel.example.test", resolvers=["1.1.1.1", "1.1.1.1"])
+
     @patch("live_vps.dns.resolve_dig")
     def test_dns_requires_exactly_expected_ip_on_each_resolver(self, resolve):
         resolve.side_effect = [["203.0.113.10", "203.0.113.11"], ["203.0.113.10"]]
@@ -180,6 +189,24 @@ class TestPreflightSSHDNS(unittest.TestCase):
         ]
         result = verify_worker_firewall(master, worker, "203.0.113.20")
         self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["worker_allow_list_evidence"])
+
+    @patch("live_vps.firewall.probe_tcp_port", return_value=(False, "REFUSED"))
+    @patch("live_vps.firewall.get_control_machine_public_ip", return_value="198.51.100.77")
+    def test_worker_firewall_accepts_refused_external_probe_with_positive_controls(self, cm_ip, probe):
+        master = MagicMock()
+        master.run.side_effect = [
+            MagicMock(ok=True, stdout="CONNECTED"),
+            MagicMock(ok=True, stdout="203.0.113.10"),
+        ]
+        worker = MagicMock()
+        worker.run.side_effect = [
+            MagicMock(ok=True, stdout="Status: active\\nDefault: deny (incoming)\\n3002/tcp ALLOW IN 203.0.113.10"),
+            MagicMock(ok=True, stdout=""),
+        ]
+        result = verify_worker_firewall(master, worker, "203.0.113.20")
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["control_machine_probe_reason"], "REFUSED")
         self.assertTrue(result["worker_allow_list_evidence"])
 
     def test_check_disposable_gate(self):
