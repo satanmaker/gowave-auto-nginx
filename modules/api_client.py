@@ -633,12 +633,19 @@ def atomic_write_state(state_data, state_path="/var/lib/gowave-auto-nginx/state.
     state_data["schemaVersion"] = 2
     state_data["lastUpdated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    with open(tmp_path, "w") as f:
+    # State may be written with elevated privileges; never follow a pre-planted
+    # temporary symlink and apply private permissions before serializing data.
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+        0o600,
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        os.fchmod(f.fileno(), 0o600)
         json.dump(state_data, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
 
-    os.chmod(tmp_path, 0o600)
     os.replace(tmp_path, path)
 
     # Sync parent directory
@@ -925,13 +932,18 @@ ADMIN_PASSWORD={password}
     if token:
         content += f"SCOPED_API_TOKEN={token}\n"
 
-    # Write mode 0600
-    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        os.write(fd, content.encode("utf-8"))
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    # Credentials are secret material: reject temporary symlinks and set
+    # restrictive permissions before writing any bytes.
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+        0o600,
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
 
     os.replace(tmp_path, path)
     dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
