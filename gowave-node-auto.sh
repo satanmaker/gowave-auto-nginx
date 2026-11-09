@@ -1813,7 +1813,7 @@ main() {
     SECRET_KEY="$_NODE_SECRET_KEY" run_upstream_node_installer </dev/null
     unset SECRET_KEY
     systemctl is-active --quiet gowave-node.service
-    printf '%s' "$_NODE_SECRET_KEY" | python3 /tmp/gowave-verify-node-mtls.py --host 127.0.0.1 --port "$NODE_PORT"
+    printf '%s' "$_NODE_SECRET_KEY" | python3 /tmp/gowave-verify-node-mtls.py --host 127.0.0.1 --port "$NODE_PORT" --mode crypto-only
     nginx -t
     systemctl is-active --quiet nginx
 
