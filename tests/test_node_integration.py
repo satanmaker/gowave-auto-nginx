@@ -323,6 +323,67 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertIn("Refusing remote rollback without the mutation lock", result.stderr)
             self.assertFalse(marker.exists(), "destructive commands ran without owning the mutation lock")
 
+    def test_standalone_remote_rollback_reports_service_stop_failure(self):
+        """A failed service stop must make standalone remote rollback fail, not report success."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            known_hosts = tmp / "known_hosts"
+            known_hosts.write_text("127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGMockKeyMockKeyMockKeyMockKeyMockKeyMockKey\n")
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            log = tmp / "commands.log"
+
+            scripts = {
+                "ssh-keygen": "#!/bin/sh\nexit 0\n",
+                "ssh": "#!/bin/sh\nexec bash -s\n",
+                "id": "#!/bin/sh\necho 0\n",
+                "flock": "#!/bin/sh\nexit 0\n",
+                "chmod": "#!/bin/sh\nexit 0\n",
+                "systemctl": (
+                    "#!/bin/sh\n"
+                    "printf '%s\\n' \"$*\" >> '" + str(log) + "'\n"
+                    "case \"$1\" in\n"
+                    "  list-unit-files) echo 'gowave-node.service enabled enabled'; exit 0;;\n"
+                    "  stop) exit 1;;\n"
+                    "  *) exit 0;;\n"
+                    "esac\n"
+                ),
+                "nginx": "#!/bin/sh\nexit 0\n",
+                "ufw": "#!/bin/sh\nexit 0\n",
+                "sysctl": "#!/bin/sh\nexit 0\n",
+                "rm": "#!/bin/sh\nexit 0\n",
+                "rmdir": "#!/bin/sh\nexit 0\n",
+                "sed": "#!/bin/sh\nexit 0\n",
+                "certbot": "#!/bin/sh\nexit 0\n",
+            }
+            for name, content in scripts.items():
+                executable = bin_dir / name
+                executable.write_text(content)
+                executable.chmod(0o755)
+
+            lock_file = tmp / "mutation.lock"
+            lock_file.touch()
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            env["SSH_KNOWN_HOSTS"] = str(known_hosts)
+            env["MUTATION_LOCK_FILE"] = str(lock_file)
+
+            cmd = [
+                str(REPO_ROOT / "gowave-node-auto.sh"),
+                "remote_rollback",
+                "127.0.0.1",
+                "22",
+                "worker.example.com",
+                "reality.example.com",
+                "root",
+            ]
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Remote worker compensation teardown incomplete", result.stderr)
+            self.assertNotIn("Remote worker compensation teardown finished", result.stderr)
+            self.assertIn("stop gowave-node.service", log.read_text())
+
     def test_standalone_acme_restore_fails_closed_on_missing_or_malformed_manifest(self):
         """Missing or invalid lineage metadata must never be interpreted as 'no prior certificate'."""
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
