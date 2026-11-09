@@ -1621,67 +1621,66 @@ compensate_remote_worker() {
         return "$exit_code"
     fi
     _ROLLBACK_IN_PROGRESS=1
+    local rollback_failed=0
     echo "[ROLLBACK] Remote worker deployment failed (exit code: $exit_code). Initiating automated compensating rollback..." >&2
 
     # 1. Stop and remove GoWave Node and Xray systemd services
     if [[ "${_NODE_SERVICE_CONFIGURED:-0}" -eq 1 ]] || systemctl list-unit-files gowave-node.service 2>/dev/null | grep -q gowave-node; then
         echo "[ROLLBACK] Stopping and disabling gowave-node.service and drop-ins..." >&2
-        systemctl stop gowave-node.service 2>/dev/null || true
-        systemctl disable gowave-node.service 2>/dev/null || true
-        systemctl stop xray.service 2>/dev/null || true
-        systemctl disable xray.service 2>/dev/null || true
-        rm -rf /etc/systemd/system/gowave-node.service.d
-        rm -f /etc/systemd/system/gowave-node.service
-        rm -f /etc/systemd/system/remnanode.service
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl reset-failed 2>/dev/null || true
-        rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode
-        rm -f /usr/local/bin/gowave-node /usr/local/bin/xray
+        systemctl stop gowave-node.service 2>/dev/null || rollback_failed=1
+        systemctl disable gowave-node.service 2>/dev/null || rollback_failed=1
+        systemctl stop xray.service 2>/dev/null || rollback_failed=1
+        systemctl disable xray.service 2>/dev/null || rollback_failed=1
+        rm -rf /etc/systemd/system/gowave-node.service.d || rollback_failed=1
+        rm -f /etc/systemd/system/gowave-node.service /etc/systemd/system/remnanode.service || rollback_failed=1
+        systemctl daemon-reload 2>/dev/null || rollback_failed=1
+        rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode || rollback_failed=1
+        rm -f /usr/local/bin/gowave-node /usr/local/bin/xray || rollback_failed=1
     fi
 
     # 2. Revert NGINX and ACME bootstrap
     if [[ "${_NGINX_CONFIGS_CREATED:-0}" -eq 1 ]] || [[ "${_NGINX_BOOTSTRAP_CREATED:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Cleaning up worker NGINX virtual hosts and stream routing..." >&2
-        rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf
-        rm -f /etc/nginx/conf.d/gowave-worker-https.conf
-        rm -f /etc/nginx/conf.d/gowave-worker-decoy.conf
-        rm -f /etc/nginx/conf.d/gowave-worker-vision-fallback.conf
-        rm -f /etc/nginx/stream-enabled/gowave-worker-stream.conf
-        rollback_managed_deploy_hook "${_ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || true
-        rm -rf /var/www/gowave-acme
+        rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf /etc/nginx/conf.d/gowave-worker-https.conf /etc/nginx/conf.d/gowave-worker-decoy.conf /etc/nginx/conf.d/gowave-worker-vision-fallback.conf /etc/nginx/stream-enabled/gowave-worker-stream.conf || rollback_failed=1
+        rollback_managed_deploy_hook "${_ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || rollback_failed=1
+        rm -rf /var/www/gowave-acme || rollback_failed=1
         if [[ "${_STREAM_INCLUDE_ADDED:-0}" -eq 1 ]]; then
-            sed -i '\#stream { include /etc/nginx/stream-enabled/\*\.conf; }#d' /etc/nginx/nginx.conf 2>/dev/null || true
+            sed -i '\#stream { include /etc/nginx/stream-enabled/\*\.conf; }#d' /etc/nginx/nginx.conf 2>/dev/null || rollback_failed=1
         fi
         if nginx -t >/dev/null 2>&1; then
-            systemctl reload nginx 2>/dev/null || true
+            systemctl reload nginx 2>/dev/null || rollback_failed=1
+        else
+            rollback_failed=1
         fi
     fi
 
     # 3. Clean Cover Reality decoy site
     if [[ "${_COVER_UNPACKED:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Removing cover decoy site assets..." >&2
-        rm -rf /var/www/gowave-auto-nginx/cover-reality
-        rmdir /var/www/gowave-auto-nginx 2>/dev/null || true
+        rm -rf /var/www/gowave-auto-nginx/cover-reality || rollback_failed=1
+        if [[ -d /var/www/gowave-auto-nginx ]]; then
+            rmdir /var/www/gowave-auto-nginx 2>/dev/null || rollback_failed=1
+        fi
     fi
 
     # 4. Revert ACME certificates
     if [[ -n "${_ACME_TX_ID:-}" ]]; then
         echo "[ROLLBACK] Restoring or cleaning up ACME certificates via snapshot..." >&2
-        restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || true
-        restore_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || true
+        restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || rollback_failed=1
         if [[ -n "${VISION_DOMAIN:-}" ]]; then
-            restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || true
+            restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || rollback_failed=1
         fi
     else
         if [[ "${_ACME_WORKER_ISSUED:-0}" -eq 1 ]] && [[ -n "${WORKER_DOMAIN:-}" ]]; then
             echo "[ROLLBACK] Deleting ACME certificate for $WORKER_DOMAIN..." >&2
-            certbot delete --cert-name "$WORKER_DOMAIN" --non-interactive 2>/dev/null || true
-            rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || true
+            certbot delete --cert-name "$WORKER_DOMAIN" --non-interactive 2>/dev/null || rollback_failed=1
+            rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || rollback_failed=1
         fi
         if [[ "${_ACME_REALITY_ISSUED:-0}" -eq 1 ]] && [[ -n "${REALITY_DOMAIN:-}" ]]; then
             echo "[ROLLBACK] Deleting ACME certificate for $REALITY_DOMAIN..." >&2
-            certbot delete --cert-name "$REALITY_DOMAIN" --non-interactive 2>/dev/null || true
-            rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || true
+            certbot delete --cert-name "$REALITY_DOMAIN" --non-interactive 2>/dev/null || rollback_failed=1
+            rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || rollback_failed=1
         fi
     fi
 
@@ -1689,46 +1688,73 @@ compensate_remote_worker() {
     if [[ "${_UFW_RULES_CONFIGURED:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Reverting UFW firewall rules..." >&2
         if [[ "${_UFW_WAS_ACTIVE:-0}" -eq 0 ]]; then
-            ufw --force disable 2>/dev/null || true
+            ufw --force disable 2>/dev/null || rollback_failed=1
         else
             if [[ -n "${PANEL_IP:-}" ]]; then
-                ufw delete allow proto tcp from "$PANEL_IP" to any port "${NODE_PORT:-3002}" 2>/dev/null || true
+                ufw delete allow proto tcp from "$PANEL_IP" to any port "${NODE_PORT:-3002}" 2>/dev/null || rollback_failed=1
             fi
             if [[ -n "${PANEL_IPV6:-}" ]]; then
-                ufw delete allow proto tcp from "$PANEL_IPV6" to any port "${NODE_PORT:-3002}" 2>/dev/null || true
+                ufw delete allow proto tcp from "$PANEL_IPV6" to any port "${NODE_PORT:-3002}" 2>/dev/null || rollback_failed=1
             fi
-            ufw delete allow 80/tcp 2>/dev/null || true
-            ufw delete allow 443/tcp 2>/dev/null || true
+            ufw delete allow 80/tcp 2>/dev/null || rollback_failed=1
+            ufw delete allow 443/tcp 2>/dev/null || rollback_failed=1
         fi
     fi
 
     # 6. Revert Swap
     if [[ "${_SWAP_CREATED_BY_US:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Deactivating and removing swapfile..." >&2
-        swapoff /swapfile 2>/dev/null || true
+        local swap_is_inactive=0 active_swaps
+        if active_swaps=$(swapon --noheadings --raw --output NAME 2>/dev/null); then
+            if grep -Fxq /swapfile <<< "$active_swaps"; then
+                if swapoff /swapfile 2>/dev/null; then
+                    swap_is_inactive=1
+                else
+                    rollback_failed=1
+                fi
+            else
+                swap_is_inactive=1
+            fi
+        else
+            rollback_failed=1
+        fi
         if [[ -f /etc/fstab ]]; then
             local swap_tmp
-            swap_tmp=$(mktemp /etc/fstab.gowave.XXXXXX)
-            grep -v -E '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab > "$swap_tmp" || true
-            chmod --reference=/etc/fstab "$swap_tmp"
-            chown --reference=/etc/fstab "$swap_tmp"
-            mv -f "$swap_tmp" /etc/fstab
+            if swap_tmp=$(mktemp /etc/fstab.gowave.XXXXXX); then
+                if grep -v -E '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab > "$swap_tmp" &&
+                    chmod --reference=/etc/fstab "$swap_tmp" &&
+                    chown --reference=/etc/fstab "$swap_tmp" &&
+                    mv -f "$swap_tmp" /etc/fstab; then
+                    :
+                else
+                    rm -f "$swap_tmp"
+                    rollback_failed=1
+                fi
+            else
+                rollback_failed=1
+            fi
         fi
-        rm -f /swapfile
+        if [[ "$swap_is_inactive" -eq 1 ]]; then
+            rm -f /swapfile || rollback_failed=1
+        fi
     fi
 
     # 7. Revert Sysctl
     if [[ "${_SYSCTL_CREATED_BY_US:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Removing sysctl configuration..." >&2
-        rm -f /etc/sysctl.d/99-gowave-node.conf
-        sysctl --system 2>/dev/null || true
+        rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1
+        sysctl --system 2>/dev/null || rollback_failed=1
     fi
 
     # 8. Clean temporary files and unset secrets
     unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64
-    rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh
+    rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh || rollback_failed=1
 
-    echo "[ROLLBACK] Compensating rollback completed on worker host." >&2
+    if [[ "$rollback_failed" -ne 0 ]]; then
+        echo "[ROLLBACK] ERROR: compensating rollback incomplete; one or more cleanup operations failed." >&2
+    else
+        echo "[ROLLBACK] Compensating rollback actions completed on worker host." >&2
+    fi
     return "$exit_code"
 }
 RUNNER_FUNCS

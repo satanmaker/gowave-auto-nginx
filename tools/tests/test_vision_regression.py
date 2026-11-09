@@ -233,7 +233,7 @@ class TestVisionRegressionCoverage(unittest.TestCase):
         end = node_script.index("\n}\n", start) + len("\n}\n")
         compensation = node_script[start:end]
 
-        self.assertIn("rm -f /etc/nginx/conf.d/gowave-worker-vision-fallback.conf", compensation)
+        self.assertIn("/etc/nginx/conf.d/gowave-worker-vision-fallback.conf", compensation)
         self.assertIn('if [[ -n "${VISION_DOMAIN:-}" ]]; then', compensation)
         self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN"', compensation)
     def test_case_matrix_counting_16_vs_20_in_traffic_and_junit(self):
