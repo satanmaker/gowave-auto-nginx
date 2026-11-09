@@ -217,45 +217,49 @@ class TestPreflightSSHDNS(unittest.TestCase):
         self.assertTrue(result["worker_allow_list_evidence"])
 
     def test_check_disposable_gate(self):
-        # Clean baseline
         clean = {
             "existing_gowave_dirs": [],
             "running_services": ["cron.service", "ssh.service"],
             "listening_ports": [22],
         }
-        ok, disqs = check_disposable_gate(clean)
-        self.assertTrue(ok)
-        self.assertEqual(disqs, [])
+        eligible, reasons = check_disposable_gate(clean)
+        self.assertTrue(eligible)
+        self.assertEqual(reasons, [])
 
-        # Dirty baseline: existing directory
-        dirty_dir = {
-            "existing_gowave_dirs": ["/opt/gowave"],
-            "running_services": [],
-            "listening_ports": [22],
-        }
-        ok1, disqs1 = check_disposable_gate(dirty_dir)
-        self.assertFalse(ok1)
-        self.assertTrue(any("Pre-existing GoWave directories" in d for d in disqs1))
-
-        # Dirty baseline: occupied port 443
-        dirty_port = {
-            "existing_gowave_dirs": [],
-            "running_services": [],
-            "listening_ports": [22, 443],
-        }
-        ok2, disqs2 = check_disposable_gate(dirty_port)
-        self.assertFalse(ok2)
-        self.assertTrue(any("Port conflicts" in d for d in disqs2))
-
-        # Dirty baseline: active gowave service
-        dirty_svc = {
-            "existing_gowave_dirs": [],
-            "running_services": ["gowave.service"],
-            "listening_ports": [22],
-        }
-        ok3, disqs3 = check_disposable_gate(dirty_svc)
-        self.assertFalse(ok3)
-        self.assertTrue(any("GoWave systemd service already active" in d for d in disqs3))
+        occupied_baselines = (
+            (
+                "GoWave installation directory",
+                {
+                    "existing_gowave_dirs": ["/opt/gowave"],
+                    "running_services": [],
+                    "listening_ports": [22],
+                },
+                "Pre-existing GoWave directories",
+            ),
+            (
+                "HTTPS listener",
+                {
+                    "existing_gowave_dirs": [],
+                    "running_services": [],
+                    "listening_ports": [22, 443],
+                },
+                "Port conflicts",
+            ),
+            (
+                "GoWave service",
+                {
+                    "existing_gowave_dirs": [],
+                    "running_services": ["gowave.service"],
+                    "listening_ports": [22],
+                },
+                "GoWave systemd service already active",
+            ),
+        )
+        for label, baseline, expected_reason in occupied_baselines:
+            with self.subTest(conflict=label):
+                eligible, reasons = check_disposable_gate(baseline)
+                self.assertFalse(eligible)
+                self.assertTrue(any(expected_reason in reason for reason in reasons))
 
     def test_local_lock(self):
         lock1 = LocalLock("test-target-lock")

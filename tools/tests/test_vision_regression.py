@@ -39,6 +39,15 @@ from modules.api_client import GoWaveClient
 NGINX_SH = str(REPO_ROOT / "modules" / "nginx.sh")
 NODE_AUTO_SH = str(REPO_ROOT / "gowave-node-auto.sh")
 
+PACKET_EVIDENCE = {
+    "target_packets": 3,
+    "offload_packets": 0,
+    "target_ingress_ok": True,
+    "offload_ok": True,
+    "egress_matches": True,
+    "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
+}
+
 
 class TestVisionRegressionCoverage(unittest.TestCase):
     """Test matrix and lifecycle regression tests for Vision capability."""
@@ -363,92 +372,77 @@ vision_domain=vision.example.test
         self.assertIn("/etc/nginx/conf.d/gowave-worker-vision-fallback.conf", compensation)
         self.assertIn('if [[ -n "${VISION_DOMAIN:-}" ]]; then', compensation)
         self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN"', compensation)
-    def test_case_matrix_counting_16_vs_20_in_traffic_and_junit(self):
-        """Case matrix: 16, 18, or 20 cases for zero, one, or two Vision domains."""
-        # Every synthetic PASS fixture carries the same mandatory packet-evidence contract.
-        packet_evidence = {
-            "target_packets": 3, "offload_packets": 0,
-            "target_ingress_ok": True, "offload_ok": True, "egress_matches": True,
-            "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
-        }
-        # 1. Disabled Vision: expected 8 per client (total 16)
-        xray_8 = [{"status": "PASS", "tag": f"outbound-{i}", "duration": 0.5, **packet_evidence} for i in range(8)]
-        mihomo_8 = {"status": "PASS", "results": [{"status": "PASS", "name": f"proxy-{i}", "duration": 0.5, **packet_evidence} for i in range(8)]}
-
-        # Passing 8 per client with expected_case_count=8 yields PASS
-        self.assertEqual(evaluate_traffic_suite_status(True, xray_8, mihomo_8, expected_case_count=8), "PASS")
-
-        # Passing 8 per client when at least one Vision domain is enabled yields INCOMPLETE
-        self.assertEqual(evaluate_traffic_suite_status(True, xray_8, mihomo_8, expected_case_count=10), "INCOMPLETE")
-
-        # 2. Exactly one Vision domain: expected 9 per client (total 18)
-        xray_9 = [{"status": "PASS", "tag": f"outbound-{i}", "duration": 0.5, **packet_evidence} for i in range(9)]
-        mihomo_9 = {"status": "PASS", "results": [{"status": "PASS", "name": f"proxy-{i}", "duration": 0.5, **packet_evidence} for i in range(9)]}
-        self.assertEqual(evaluate_traffic_suite_status(True, xray_9, mihomo_9, expected_case_count=9), "PASS")
-        self.assertEqual(evaluate_traffic_suite_status(True, xray_9, mihomo_9, expected_case_count=10), "INCOMPLETE")
-
-        # 3. Enabled Vision on both hosts: expected 10 per client (total 20)
-        xray_10 = [{"status": "PASS", "tag": f"outbound-{i}", "duration": 0.5, **packet_evidence} for i in range(10)]
-        mihomo_10 = {"status": "PASS", "results": [{"status": "PASS", "name": f"proxy-{i}", "duration": 0.5, **packet_evidence} for i in range(10)]}
-
-        self.assertEqual(evaluate_traffic_suite_status(True, xray_10, mihomo_10, expected_case_count=10), "PASS")
-
-        # 4. JUnit report generation contains exact case counts
+    def test_case_matrix_counts_match_independent_vision_topologies(self):
+        """Traffic and JUnit counts stay aligned for zero, one, or two Vision endpoints."""
         with tempfile.TemporaryDirectory() as td:
             artifact_dir = Path(td)
 
-            # State without vision (8 Xray + 8 Mihomo = 16 endpoint testcases)
-            state_no_vis = {
-                "results": {
-                    "traffic": {
+            for vision_count in range(3):
+                expected_per_client = 8 + vision_count
+                with self.subTest(vision_count=vision_count):
+                    xray_results = [
+                        {
+                            "status": "PASS",
+                            "tag": f"outbound-{index}",
+                            "duration": 0.5,
+                            **PACKET_EVIDENCE,
+                        }
+                        for index in range(expected_per_client)
+                    ]
+                    mihomo_results = {
                         "status": "PASS",
-                        "xray_results": xray_8,
-                        "mihomo_results": mihomo_8,
+                        "results": [
+                            {
+                                "status": "PASS",
+                                "name": f"proxy-{index}",
+                                "duration": 0.5,
+                                **PACKET_EVIDENCE,
+                            }
+                            for index in range(expected_per_client)
+                        ],
                     }
-                }
-            }
-            cases_no_vis = build_test_cases_from_state(state_no_vis)
-            # phase_traffic + 8 xray + 8 mihomo = 17 testcases
-            endpoint_cases_no_vis = [c for c in cases_no_vis if c["classname"].startswith("live_vps.traffic.")]
-            self.assertEqual(len(endpoint_cases_no_vis), 16)
-            junit_path_no_vis = write_junit_report(artifact_dir, cases_no_vis)
-            content_no_vis = junit_path_no_vis.read_text()
-            self.assertIn('tests="17"', content_no_vis)
 
-            # State with exactly one Vision endpoint (9 Xray + 9 Mihomo = 18 endpoint testcases)
-            state_one_vis = {
-                "results": {
-                    "traffic": {
-                        "status": "PASS",
-                        "xray_results": xray_9,
-                        "mihomo_results": mihomo_9,
+                    self.assertEqual(
+                        evaluate_traffic_suite_status(
+                            True,
+                            xray_results,
+                            mihomo_results,
+                            expected_case_count=expected_per_client,
+                        ),
+                        "PASS",
+                    )
+                    self.assertEqual(
+                        evaluate_traffic_suite_status(
+                            True,
+                            xray_results,
+                            mihomo_results,
+                            expected_case_count=expected_per_client + 1,
+                        ),
+                        "INCOMPLETE",
+                    )
+
+                    state = {
+                        "results": {
+                            "traffic": {
+                                "status": "PASS",
+                                "xray_results": xray_results,
+                                "mihomo_results": mihomo_results,
+                            }
+                        }
                     }
-                }
-            }
-            cases_one_vis = build_test_cases_from_state(state_one_vis)
-            endpoint_cases_one_vis = [c for c in cases_one_vis if c["classname"].startswith("live_vps.traffic.")]
-            self.assertEqual(len(endpoint_cases_one_vis), 18)
-            junit_path_one_vis = write_junit_report(artifact_dir, cases_one_vis)
-            content_one_vis = junit_path_one_vis.read_text()
-            self.assertIn('tests="19"', content_one_vis)
+                    cases = build_test_cases_from_state(state)
+                    endpoint_cases = [
+                        case for case in cases
+                        if case["classname"].startswith("live_vps.traffic.")
+                    ]
+                    expected_endpoints = expected_per_client * 2
+                    self.assertEqual(len(endpoint_cases), expected_endpoints)
 
-            # State with vision (10 Xray + 10 Mihomo = 20 endpoint testcases)
-            state_vis = {
-                "results": {
-                    "traffic": {
-                        "status": "PASS",
-                        "xray_results": xray_10,
-                        "mihomo_results": mihomo_10,
-                    }
-                }
-            }
-            cases_vis = build_test_cases_from_state(state_vis)
-            endpoint_cases_vis = [c for c in cases_vis if c["classname"].startswith("live_vps.traffic.")]
-            self.assertEqual(len(endpoint_cases_vis), 20)
-            junit_path_vis = write_junit_report(artifact_dir, cases_vis)
-            content_vis = junit_path_vis.read_text()
-            self.assertIn('tests="21"', content_vis)
-
+                    junit_path = write_junit_report(artifact_dir, cases)
+                    self.assertIn(
+                        f'tests="{expected_endpoints + 1}"',
+                        junit_path.read_text(encoding="utf-8"),
+                    )
 
 if __name__ == "__main__":
     unittest.main()

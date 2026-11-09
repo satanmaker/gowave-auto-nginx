@@ -22,6 +22,21 @@ from live_vps.traffic import (
 )
 
 
+
+def _packet_evidence(**overrides):
+    evidence = {
+        "status": "PASS",
+        "target_packets": 4,
+        "offload_packets": 0,
+        "target_ingress_ok": True,
+        "offload_ok": True,
+        "egress_matches": True,
+        "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
+    }
+    evidence.update(overrides)
+    return evidence
+
+
 class TestTrafficModule(unittest.TestCase):
     def test_status_gate_when_traffic_verification_disabled(self):
         # TEST_TRAFFIC_VERIFICATION=false MUST force INCOMPLETE, never PASS
@@ -50,11 +65,7 @@ class TestTrafficModule(unittest.TestCase):
         self.assertEqual(status, "FAIL")
 
     def test_status_gate_when_all_pass(self):
-        evidence = {
-            "status": "PASS", "target_packets": 4, "offload_packets": 0,
-            "target_ingress_ok": True, "offload_ok": True, "egress_matches": True,
-            "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
-        }
+        evidence = _packet_evidence()
         status = evaluate_traffic_suite_status(
             test_traffic_verification=True,
             xray_results=[dict(evidence), dict(evidence)],
@@ -71,11 +82,7 @@ class TestTrafficModule(unittest.TestCase):
         self.assertEqual(status, "INCOMPLETE")
 
     def test_status_gate_fails_when_offload_host_received_test_source_packets(self):
-        evidence = {
-            "status": "PASS", "target_packets": 4, "offload_packets": 1,
-            "target_ingress_ok": True, "offload_ok": False, "egress_matches": True,
-            "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
-        }
+        evidence = _packet_evidence(offload_packets=1, offload_ok=False)
         status = evaluate_traffic_suite_status(
             test_traffic_verification=True,
             xray_results=[evidence],
@@ -205,11 +212,7 @@ class TestTrafficModule(unittest.TestCase):
 
 
     def test_status_gate_requires_complete_expected_case_matrix_for_both_clients(self):
-        evidence = {
-            "status": "PASS", "target_packets": 4, "offload_packets": 0,
-            "target_ingress_ok": True, "offload_ok": True, "egress_matches": True,
-            "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
-        }
+        evidence = _packet_evidence()
         for count in (8, 9, 10):
             with self.subTest(expected_case_count=count):
                 self.assertEqual(
@@ -238,11 +241,7 @@ class TestTrafficModule(unittest.TestCase):
                 )
 
     def test_status_gate_rejects_inconsistent_precomputed_pass_flags(self):
-        base = {
-            "status": "PASS", "target_packets": 4, "offload_packets": 0,
-            "target_ingress_ok": True, "offload_ok": True, "egress_matches": True,
-            "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
-        }
+        base = _packet_evidence()
         for field, value, expected in (
             ("target_ingress_ok", False, "INCOMPLETE"),
             ("target_ingress_ok", None, "INCOMPLETE"),
@@ -262,11 +261,7 @@ class TestTrafficModule(unittest.TestCase):
                 )
 
     def test_status_gate_rejects_boolean_or_negative_packet_counters(self):
-        base = {
-            "status": "PASS", "target_packets": 4, "offload_packets": 0,
-            "target_ingress_ok": True, "offload_ok": True, "egress_matches": True,
-            "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
-        }
+        base = _packet_evidence()
         for field, value, expected in (
             ("target_packets", True, "INCOMPLETE"),
             ("target_packets", -1, "INCOMPLETE"),
@@ -300,11 +295,7 @@ class TestTrafficModule(unittest.TestCase):
         )
 
     def test_status_gate_rejects_invalid_expected_case_count(self):
-        evidence = {
-            "status": "PASS", "target_packets": 4, "offload_packets": 0,
-            "target_ingress_ok": True, "offload_ok": True, "egress_matches": True,
-            "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
-        }
+        evidence = _packet_evidence()
         for count in (0, -1, True, 8.0):
             with self.subTest(count=count):
                 self.assertEqual(
