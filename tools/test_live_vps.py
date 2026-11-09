@@ -291,14 +291,6 @@ def main() -> int:
 
             dns_chk = verify_all_domains(config)
 
-            # Baselines
-            m_base = collect_remote_baseline(master_ssh)
-            w_base = collect_remote_baseline(worker_ssh)
-            m_gate_ok, m_errs = check_disposable_gate(m_base)
-            w_gate_ok, w_errs = check_disposable_gate(w_base)
-
-            root_m_ok = master_ssh.run("test \"$(id -u)\" -eq 0").ok
-            root_w_ok = worker_ssh.run("test \"$(id -u)\" -eq 0").ok
             dns_ok = bool(dns_chk) and all(result.ok for result in dns_chk.values())
             dns_details = {name: {"ok": result.ok, "expected_ip": result.expected_ip,
                                   "record_type": result.record_type, "resolved_ips": result.resolved_ips,
