@@ -1894,13 +1894,31 @@ validate_lock_path() {
 
 acquire_mutation_lock() {
     validate_lock_path "$MUTATION_LOCK_FILE" || return 1
-    if [[ ! -f "$MUTATION_LOCK_FILE" ]]; then
-        ( umask 0177; touch "$MUTATION_LOCK_FILE" ) 2>/dev/null || true
-        chmod 0600 "$MUTATION_LOCK_FILE" 2>/dev/null || true
+    if [[ ! -e "$MUTATION_LOCK_FILE" ]]; then
+        ( umask 0177; : > "$MUTATION_LOCK_FILE" ) 2>/dev/null || {
+            echo "Error: Cannot create mutation lock file ($MUTATION_LOCK_FILE)." >&2
+            return 1
+        }
     fi
-    exec 9>>"$MUTATION_LOCK_FILE"
-    flock -n 9 || true
+    if [[ -L "$MUTATION_LOCK_FILE" || ! -f "$MUTATION_LOCK_FILE" ]]; then
+        echo "Error: Mutation lock path is not a regular file." >&2
+        return 1
+    fi
+    chmod 0600 "$MUTATION_LOCK_FILE" 2>/dev/null || {
+        echo "Error: Cannot secure mutation lock file ($MUTATION_LOCK_FILE)." >&2
+        return 1
+    }
+    exec 9>>"$MUTATION_LOCK_FILE" || return 1
+    if ! flock -n 9; then
+        echo "Error: Another process currently holds the mutation lock ($MUTATION_LOCK_FILE)." >&2
+        return 1
+    fi
     return 0
+}
+
+acquire_mutation_lock || {
+    echo "Error: Refusing remote rollback without the mutation lock." >&2
+    exit 1
 }
 
 rollback_managed_deploy_hook() {
