@@ -138,6 +138,36 @@ class TestD18D21RegressionSuite(unittest.TestCase):
                 holder.terminate()
                 holder.wait()
 
+    def test_task_9_7_boolean_holder_pid_is_rejected(self):
+        """JSON booleans must not pass the integer PID check for a mutation lease."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_file = tmp / "mutation.lock"
+            lease_file = tmp / "lease.json"
+            ready_file = tmp / "holder.ready"
+            holder = _start_lock_holder(lock_file, lease_file, ready_file)
+            try:
+                lease_file.write_text(json.dumps({
+                    "lease_token": "boolean-pid-token",
+                    "holder_pid": True,
+                }))
+                cmd = (
+                    f'source "{LOCK_SH}" && '
+                    f'MUTATION_LOCK_FILE="{lock_file}" '
+                    f'MUTATION_LEASE_FILE="{lease_file}" acquire_mutation_lock'
+                )
+                result = subprocess.run(
+                    ["bash", "-c", cmd],
+                    input="GOWAVE_LEASE: boolean-pid-token\n",
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Invalid or stale mutation lock lease provided", result.stderr)
+            finally:
+                holder.terminate()
+                holder.wait()
+
     def test_task_9_7_stale_lease_rejected_after_holder_termination(self):
         """A lease with a non-live holder PID is rejected while the lock is held (Task 9.7)."""
         with tempfile.TemporaryDirectory() as td:
