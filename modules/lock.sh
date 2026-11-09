@@ -75,7 +75,7 @@ holder_pid = data.get("holder_pid")
 if not expected_token or expected_token != token:
     sys.exit(1)
 
-if not holder_pid or not isinstance(holder_pid, int):
+if type(holder_pid) is not int or holder_pid <= 0:
     sys.exit(1)
 
 try:
