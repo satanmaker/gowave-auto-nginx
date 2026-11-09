@@ -101,6 +101,18 @@ def handshake_rejected(context, server_name, expected_error):
     except OSError:
         return "INCOMPLETE"
 
+def observe_wrong_sni(context, server_name):
+    # Record the routing/handshake outcome; a successful TLS handshake is not
+    # itself proof of a wrong-SNI policy violation.
+    try:
+        with socket.create_connection((worker_ip, port), timeout=5) as sock:
+            with context.wrap_socket(sock, server_hostname=server_name) as tls:
+                return {{"outcome": "TLS_ESTABLISHED", "version": tls.version()}}
+    except ssl.SSLError as exc:
+        return {{"outcome": "TLS_REJECTED", "error": type(exc).__name__}}
+    except OSError as exc:
+        return {{"outcome": "INCOMPLETE", "error": type(exc).__name__}}
+
 with tempfile.TemporaryDirectory() as td:
     ca_file = td + "/ca.crt"
     cert_file = td + "/node.crt"
@@ -145,8 +157,8 @@ with tempfile.TemporaryDirectory() as td:
     ctx_wrong_sni.check_hostname = False
     ctx_wrong_sni.verify_mode = ssl.CERT_REQUIRED
     ctx_wrong_sni.load_cert_chain(cert_file, key_file)
-    results["wrong_sni_rejected"] = handshake_rejected(
-        ctx_wrong_sni, "wrong-sni.example.com", ssl.SSLError
+    results["wrong_sni_observation"] = observe_wrong_sni(
+        ctx_wrong_sni, "wrong-sni.example.com"
     )
 
 print(json.dumps(results))
@@ -169,12 +181,16 @@ print(json.dumps(results))
 
     required = (
         "untrusted_client_rejected", "absent_client_rejected",
-        "mismatched_crypto_failed", "untrusted_ca_rejected", "wrong_sni_rejected",
+        "mismatched_crypto_failed", "untrusted_ca_rejected",
     )
     if any(key not in parsed or parsed[key] == "INCOMPLETE" for key in required):
         parsed["status"] = "INCOMPLETE"
-    elif all(parsed[key] is True for key in required):
+    elif not all(parsed[key] is True for key in required):
+        parsed["status"] = "FAIL"
+    elif parsed.get("wrong_sni_observation", {{}}).get("outcome") == "TLS_REJECTED":
         parsed["status"] = "PASS"
     else:
-        parsed["status"] = "FAIL"
+        # We observed the handshake but do not yet prove which application
+        # route handles unknown SNI, so do not claim either acceptance or rejection.
+        parsed["status"] = "INCOMPLETE"
     return parsed

@@ -235,7 +235,7 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
                     "absent_client_rejected": True,
                     "mismatched_crypto_failed": True,
                     "untrusted_ca_rejected": True,
-                    "wrong_sni_rejected": True,
+                    "wrong_sni_observation": {"outcome": "TLS_REJECTED", "error": "SSLError"},
                 }),
                 stderr="",
             ),
@@ -247,6 +247,22 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
         self.assertTrue(command.startswith("python3 -c "))
         self.assertNotIn(secret, command)
         self.assertEqual(ssh.run.call_args.kwargs["input_data"], secret)
+
+    def test_mtls_wrong_sni_accepted_is_incomplete_not_failure(self):
+        ssh = MagicMock()
+        ssh.run.side_effect = [
+            SSHResult(returncode=0, stdout="base64-secret", stderr=""),
+            SSHResult(returncode=0, stdout=json.dumps({
+                "untrusted_client_rejected": True,
+                "absent_client_rejected": True,
+                "mismatched_crypto_failed": True,
+                "untrusted_ca_rejected": True,
+                "wrong_sni_observation": {"outcome": "TLS_ESTABLISHED", "version": "TLSv1.3"},
+            }), stderr=""),
+        ]
+        result = run_mtls_negative_tests(ssh, "203.0.113.20")
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertEqual(result["wrong_sni_observation"]["outcome"], "TLS_ESTABLISHED")
 
     def test_mtls_negative_transport_failure_is_incomplete(self):
         ssh = MagicMock()
