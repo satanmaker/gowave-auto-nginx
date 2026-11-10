@@ -17,6 +17,33 @@ import urllib.request
 REPO_ROOT = Path(__file__).resolve().parent.parent
 XRAY_ASSETS_DIR = REPO_ROOT / "assets" / "xray"
 
+# Xray REALITY servers reject ClientHellos without an X25519MLKEM768 key share
+# since Xray v26.9.9 (github.com/xtls/reality 20260908062103). Mihomo clients
+# only send the hybrid share when the proxy carries support-x25519mlkem768,
+# which GoWave emits from the Host record flag mihomoX25519.
+REALITY_MLKEM_MIN_XRAY_VERSION = (26, 9, 9)
+
+
+def parse_core_version(value):
+    parts = []
+    for token in str(value or "").strip().lstrip("vV").split("."):
+        if not token.isdigit():
+            break
+        parts.append(int(token))
+    return tuple(parts)
+
+
+def mihomo_x25519_enabled():
+    override = os.environ.get("GOWAVE_MIHOMO_X25519", "").strip().lower()
+    if override in ("1", "true", "yes", "on"):
+        return True
+    if override in ("0", "false", "no", "off"):
+        return False
+    pinned = parse_core_version(os.environ.get("XRAY_SERVER_VERSION", ""))
+    if not pinned:
+        return True
+    return pinned >= REALITY_MLKEM_MIN_XRAY_VERSION
+
 
 class GoWaveAPIError(Exception):
     def __init__(self, message, status_code=None, response_body=None):
@@ -286,7 +313,6 @@ class GoWaveClient:
                     break
 
         if target_uuid:
-            existing = next(p for p in profiles_list if p.get("uuid") == target_uuid)
             existing = next((p for p in profiles_list if p.get("uuid") == target_uuid), None)
             if not isinstance(existing, dict) or not all(k in existing for k in ("name", "config")):
                 raise GoWaveAPIError(f"Cannot safely update profile {target_uuid}: profile list has no complete rollback configuration snapshot")
@@ -419,6 +445,7 @@ class GoWaveClient:
                 "securityLayer": "DEFAULT",
                 "alpn": "h2,http/1.1",
                 "fingerprint": "firefox",
+                "mihomoX25519": mihomo_x25519_enabled(),
             },
             "vless-vision": {
                 "remark": f"VLESS-Vision-TLS@{node_name}",
@@ -507,15 +534,20 @@ class GoWaveClient:
                 },
                 "isDisabled": False,
             }
+            if "mihomoX25519" in cfg:
+                payload["mihomoX25519"] = cfg["mihomoX25519"]
 
             if remark in existing_by_remark:
                 existing = existing_by_remark[remark]
                 host_uuid = existing.get("uuid")
-                before_fields = (
+                before_fields = [
                     "inbound", "nodes", "remark", "address", "port", "sni",
                     "path", "host", "alpn", "fingerprint", "securityLayer",
                     "internalSquads", "isDisabled",
-                )
+                ]
+                if "mihomoX25519" in payload:
+                    before_fields.append("mihomoX25519")
+                before_fields = tuple(before_fields)
                 if not all(k in existing for k in before_fields):
                     raise GoWaveAPIError(f"Cannot safely update host {host_uuid}: rollback snapshot is incomplete")
                 before = {k: existing[k] for k in before_fields}

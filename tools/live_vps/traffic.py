@@ -258,6 +258,27 @@ def run_mihomo_traffic_suite(
     if not proxies:
         return {"status": "FAIL", "error": "No proxies in subscription YAML"}
 
+    # Xray REALITY servers since v26.9.9 drop ClientHellos without an
+    # X25519MLKEM768 key share, so Mihomo only completes the handshake when the
+    # subscription proxy carries reality-opts.support-x25519mlkem768.
+    reality_without_hybrid = [
+        proxy.get("name")
+        for proxy in proxies
+        if isinstance(proxy, dict)
+        and isinstance(proxy.get("reality-opts"), dict)
+        and proxy["reality-opts"].get("support-x25519mlkem768") is not True
+    ]
+    if reality_without_hybrid:
+        return {
+            "status": "FAIL",
+            "error": (
+                "REALITY proxies are missing reality-opts.support-x25519mlkem768; "
+                "Xray >= 26.9.9 server cores reject non-hybrid ClientHellos"
+            ),
+            "proxies": reality_without_hybrid,
+            "results": [],
+        }
+
     mixed_port = find_free_port()
     ctrl_port = find_free_port()
 

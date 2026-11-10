@@ -305,6 +305,15 @@ def fetch_and_validate_mihomo_subscription(
         if fp.lower() != "firefox":
             return False, {"error": f"Proxy {p.get('name')} missing client-fingerprint 'firefox'"}
 
+    # Xray REALITY servers since v26.9.9 reject ClientHellos without an
+    # X25519MLKEM768 key share, so every REALITY proxy must advertise it.
+    for p in proxies:
+        reality_opts = p.get("reality-opts")
+        if isinstance(reality_opts, dict) and reality_opts.get("support-x25519mlkem768") is not True:
+            return False, {
+                "error": f"Proxy {p.get('name')} missing reality-opts support-x25519mlkem768",
+            }
+
     # Verify routing rules present
     rules = sub_yaml.get("rules", [])
     has_rules = bool(rules)

@@ -100,6 +100,11 @@ For each provisioned MVP protocol profile, the provisioning system SHALL automat
 - **WHEN** Host records are retrieved via `GET /api/hosts` and subscription configurations are rendered
 - **THEN** the REALITY Host record has `securityLayer: "DEFAULT"` resolving to client `security: reality`, while Vision, XHTTP, WS, and Trojan gRPC Host records have `securityLayer: "TLS"` resolving to client `security: tls`, with all hosts configured with `fingerprint: "firefox"`.
 
+#### Scenario: REALITY Host records advertise the X25519MLKEM768 key share
+- **GIVEN** an Xray server core v26.9.9 or newer, whose REALITY server rejects ClientHellos without an X25519MLKEM768 key share
+- **WHEN** the installer provisions the REALITY Host record
+- **THEN** the Host record carries `mihomoX25519: true` so the generated Mihomo subscription emits `reality-opts.support-x25519mlkem768: true`, while for pinned server cores older than v26.9.9 the flag remains `false` and is omitted from the payload.
+
 #### Scenario: Host record presence in subscription output
 - **GIVEN** provisioned Host records for VLESS-REALITY, VLESS-Vision, VLESS-XHTTP, VLESS-WS, and Trojan-gRPC
 - **WHEN** subscription endpoints are queried for an active user belonging to the managed squad

@@ -7,11 +7,20 @@ import tempfile
 import threading
 import unittest
 import urllib.parse
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 import sys
 sys.path.insert(0, str(REPO_ROOT))
-from modules.api_client import GoWaveClient, atomic_write_state, save_credentials, rollback_provisioning, _extract_list
+from modules.api_client import (
+    GoWaveClient,
+    atomic_write_state,
+    save_credentials,
+    rollback_provisioning,
+    mihomo_x25519_enabled,
+    parse_core_version,
+    _extract_list,
+)
 
 
 class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
@@ -340,6 +349,84 @@ class TestAPIClient(unittest.TestCase):
         # Re-provisioning with same remark (triggers PATCH /api/hosts with uuid in body)
         hosts2 = self.client.provision_hosts(prof_uuid, inbounds, "node-patch-test", "squad-patch-test", "vpn.example.com", "cdn.example.com", "patch-test-node")
         self.assertEqual(hosts1, hosts2)
+
+    def test_parse_core_version(self):
+        self.assertEqual(parse_core_version("v26.11.9"), (26, 11, 9))
+        self.assertEqual(parse_core_version("26.9.9"), (26, 9, 9))
+        self.assertEqual(parse_core_version("1.260327.1"), (1, 260327, 1))
+        self.assertEqual(parse_core_version(""), ())
+        self.assertEqual(parse_core_version(None), ())
+
+    def test_mihomo_x25519_defaults_enabled_without_pin(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GOWAVE_MIHOMO_X25519", None)
+            os.environ.pop("XRAY_SERVER_VERSION", None)
+            self.assertTrue(mihomo_x25519_enabled())
+
+    def test_mihomo_x25519_requires_hybrid_capable_server_core(self):
+        # REALITY servers older than 26.9.9 accept classic X25519 key shares only.
+        with patch.dict(os.environ, {"XRAY_SERVER_VERSION": "26.9.8"}, clear=False):
+            os.environ.pop("GOWAVE_MIHOMO_X25519", None)
+            self.assertFalse(mihomo_x25519_enabled())
+        with patch.dict(os.environ, {"XRAY_SERVER_VERSION": "v26.9.9"}, clear=False):
+            self.assertTrue(mihomo_x25519_enabled())
+        with patch.dict(os.environ, {"XRAY_SERVER_VERSION": "26.11.9"}, clear=False):
+            self.assertTrue(mihomo_x25519_enabled())
+
+    def test_mihomo_x25519_explicit_override_wins(self):
+        with patch.dict(os.environ, {"XRAY_SERVER_VERSION": "26.9.8", "GOWAVE_MIHOMO_X25519": "1"}, clear=False):
+            self.assertTrue(mihomo_x25519_enabled())
+        with patch.dict(os.environ, {"XRAY_SERVER_VERSION": "26.11.9", "GOWAVE_MIHOMO_X25519": "0"}, clear=False):
+            self.assertFalse(mihomo_x25519_enabled())
+
+    def test_reality_host_advertises_mihomo_x25519_hybrid(self):
+        """REALITY hosts must carry mihomoX25519 so Mihomo sends an X25519MLKEM768 key share."""
+        self.client.login("admin", "admin-pass-12345")
+        x25519 = self.client.generate_x25519()
+        raw_cfg = self.client.compile_config_profile("hybrid-node", "cdn.example.com", x25519["privateKey"])
+        prof_info = self.client.provision_config_profile("GoWave MVP Unified Profile - hybrid", raw_cfg)
+        prof_uuid = prof_info["profile_uuid"]
+        inbounds = prof_info["inbounds"]
+
+        hosts = self.client.provision_hosts(
+            prof_uuid, inbounds, "node-hybrid", "squad-hybrid",
+            "vpn.example.com", "cdn.example.com", "hybrid-node"
+        )
+
+        remarks = {MockGoWaveServer.hosts[uuid].get("remark"): uuid for uuid in hosts}
+        reality_uuid = remarks[f"VLESS-REALITY-Vision@hybrid-node"]
+        self.assertIs(MockGoWaveServer.hosts[reality_uuid].get("mihomoX25519"), True)
+        for remark, uuid in remarks.items():
+            if remark != f"VLESS-REALITY-Vision@hybrid-node":
+                self.assertNotIn("mihomoX25519", MockGoWaveServer.hosts[uuid], remark)
+
+        # Re-provisioning keeps the flag and records it in the rollback snapshot.
+        self.client.transaction_entities.clear()
+        rehosts = self.client.provision_hosts(
+            prof_uuid, inbounds, "node-hybrid", "squad-hybrid",
+            "vpn.example.com", "cdn.example.com", "hybrid-node"
+        )
+        self.assertEqual(hosts, rehosts)
+        reality_snapshot = next(
+            entry for entry in self.client.transaction_entities
+            if entry["type"] == "host" and entry["uuid"] == reality_uuid and entry["action"] == "updated"
+        )
+        self.assertIn("mihomoX25519", reality_snapshot["before"])
+
+    def test_reality_host_omits_hybrid_flag_for_legacy_core(self):
+        self.client.login("admin", "admin-pass-12345")
+        x25519 = self.client.generate_x25519()
+        raw_cfg = self.client.compile_config_profile("legacy-node", "cdn.example.com", x25519["privateKey"])
+        prof_info = self.client.provision_config_profile("GoWave MVP Unified Profile - legacy", raw_cfg)
+        with patch.dict(os.environ, {"XRAY_SERVER_VERSION": "26.9.8"}, clear=False):
+            os.environ.pop("GOWAVE_MIHOMO_X25519", None)
+            hosts = self.client.provision_hosts(
+                prof_info["profile_uuid"], prof_info["inbounds"], "node-legacy", "squad-legacy",
+                "vpn.example.com", "cdn.example.com", "legacy-node"
+            )
+        remarks = {MockGoWaveServer.hosts[uuid].get("remark"): uuid for uuid in hosts}
+        reality_uuid = remarks["VLESS-REALITY-Vision@legacy-node"]
+        self.assertIs(MockGoWaveServer.hosts[reality_uuid].get("mihomoX25519"), False)
 
     def test_panel_discovers_master_and_worker_nodes(self):
         """Test that Panel registers and discovers both master node and worker node via GET /api/nodes."""

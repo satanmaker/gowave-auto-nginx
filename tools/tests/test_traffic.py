@@ -130,5 +130,37 @@ class TestTrafficModule(unittest.TestCase):
         self.assertTrue(res.get("skipped"))
 
 
+    def test_mihomo_traffic_rejects_reality_proxies_without_hybrid_key_share(self):
+        config = MagicMock()
+        config.test_mihomo_traffic = True
+        subscription = (
+            "proxies:\n"
+            "  - name: reality-legacy\n"
+            "    type: vless\n"
+            "    servername: cdn.example.com\n"
+            "    reality-opts:\n"
+            "      public-key: pk\n"
+            "      short-id: sid\n"
+            "  - name: reality-hybrid\n"
+            "    type: vless\n"
+            "    servername: cdn.example.com\n"
+            "    reality-opts:\n"
+            "      public-key: pk\n"
+            "      short-id: sid\n"
+            "      support-x25519mlkem768: true\n"
+        )
+
+        res = run_mihomo_traffic_suite(
+            subscription_yaml_str=subscription,
+            ca_bundle_path=Path("/tmp/ca.crt"),
+            config=config,
+            master_ssh=MagicMock(),
+            worker_ssh=MagicMock(),
+        )
+        self.assertEqual(res["status"], "FAIL")
+        self.assertEqual(res["proxies"], ["reality-legacy"])
+        self.assertIn("support-x25519mlkem768", res["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
