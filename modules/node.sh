@@ -28,6 +28,48 @@ extract_secret_key() {
     printf '%s' "$secret"
 }
 
+core_version_matches() {
+    local reported="${1:-}"
+    local expected="${2:-}"
+    [[ -n "$expected" ]] || return 1
+    local token
+    for token in $reported; do
+        if [[ "$token" == "$expected" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+ensure_pinned_xray_core() {
+    local node_bin="${1:-$GOWAVE_NODE_INSTALL_DIR/gowave-node}"
+    local core_bin="${2:-$GOWAVE_NODE_INSTALL_DIR/rw-core}"
+
+    if [[ -z "${XRAY_SERVER_VERSION:-}" || ! -x "$node_bin" ]]; then
+        return 0
+    fi
+
+    local expected_core cur_core
+    expected_core="${XRAY_SERVER_VERSION#v}"
+    cur_core=$("$core_bin" version 2>/dev/null || true)
+    if core_version_matches "$cur_core" "$expected_core"; then
+        return 0
+    fi
+
+    echo "Installing explicit Xray server version $XRAY_SERVER_VERSION..."
+    if ! "$node_bin" core install --version "v$expected_core" -y 2>/dev/null && \
+       ! "$node_bin" core install --version "$expected_core" -y 2>/dev/null; then
+        echo "Error: Failed to install requested Xray server version $XRAY_SERVER_VERSION." >&2
+        return 1
+    fi
+    cur_core=$("$core_bin" version 2>/dev/null || true)
+    if core_version_matches "$cur_core" "$expected_core"; then
+        return 0
+    fi
+    echo "Error: Xray server version mismatch after installation: expected $expected_core, got ${cur_core:-unknown}." >&2
+    return 1
+}
+
 configure_node_env() {
     local target_dir="${1:-$GOWAVE_NODE_INSTALL_DIR}"
     local secret_key="$2"
@@ -141,15 +183,7 @@ install_local_node() {
     deploy_node_systemd_dropins "$node_port"
 
     # Install pinned Xray core version if explicitly configured and mismatched
-    if [[ -n "${XRAY_SERVER_VERSION:-}" && -x "$GOWAVE_NODE_INSTALL_DIR/gowave-node" ]]; then
-        local cur_core
-        cur_core=$("$GOWAVE_NODE_INSTALL_DIR/rw-core" version 2>/dev/null || true)
-        if ! echo "$cur_core" | grep -q "${XRAY_SERVER_VERSION#v}"; then
-            echo "Installing explicit Xray server version $XRAY_SERVER_VERSION..."
-            "$GOWAVE_NODE_INSTALL_DIR/gowave-node" core install --version "v${XRAY_SERVER_VERSION#v}" -y 2>/dev/null || \
-            "$GOWAVE_NODE_INSTALL_DIR/gowave-node" core install --version "${XRAY_SERVER_VERSION#v}" -y 2>/dev/null || true
-        fi
-    fi
+    ensure_pinned_xray_core "$GOWAVE_NODE_INSTALL_DIR/gowave-node" "$GOWAVE_NODE_INSTALL_DIR/rw-core" || return 1
 
     # Isolate local node from external network access
     if command -v ufw >/dev/null 2>&1; then
