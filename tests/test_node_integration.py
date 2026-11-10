@@ -317,6 +317,109 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertNotEqual(res_sym.returncode, 0)
             self.assertIn("Lock directory", res_sym.stderr)
 
+    def _runner_functions(self, target: Path) -> Path:
+        """Extract the remote payload helper functions so they can run locally."""
+        script = (REPO_ROOT / "gowave-node-auto.sh").read_text(encoding="utf-8")
+        marker = "cat <<'RUNNER_FUNCS'\n"
+        start = script.index(marker) + len(marker)
+        end = script.index("\nRUNNER_FUNCS\n", start)
+        target.write_text(script[start:end] + "\n", encoding="utf-8")
+        return target
+
+    @staticmethod
+    def _fake_core_tools(tmp: Path, install_rc: int, rewrite_version: bool) -> tuple[Path, Path, Path]:
+        """Build a fake goave-node launcher and a fake rw-core that reports a version file."""
+        version_file = tmp / "core-version.txt"
+        version_file.write_text("25.10.15\n", encoding="utf-8")
+        install_log = tmp / "install-calls.txt"
+        node_bin = tmp / "gowave-node"
+        node_bin.write_text(
+            "#!/bin/sh\n"
+            f'printf "%s\\n" "$*" >> "{install_log}"\n'
+            f"[[ {install_rc} -eq 0 ]] || exit {install_rc}\n"
+            + (f'printf "26.11.9\\n" > "{version_file}"\n' if rewrite_version else "")
+            + "exit 0\n",
+            encoding="utf-8",
+        )
+        node_bin.chmod(0o755)
+        core_bin = tmp / "rw-core"
+        core_bin.write_text(
+            "#!/bin/sh\n"
+            f'printf "Xray %s (Xray, Penetrates Everything.) test-build (go1.27.3 linux/amd64)\\n" "$(cat "{version_file}")"\n',
+            encoding="utf-8",
+        )
+        core_bin.chmod(0o755)
+        return node_bin, core_bin, install_log
+
+    def _run_pinned_core(self, tmp: Path, node_bin: Path, core_bin: Path, version: str = "26.11.9"):
+        funcs = self._runner_functions(tmp / "runner_funcs.sh")
+        cmd = (
+            f'source "{funcs}" && XRAY_SERVER_VERSION="{version}" '
+            f'ensure_pinned_xray_core "{node_bin}" "{core_bin}"'
+        )
+        return subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+
+    def test_pinned_core_crash_is_fatal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=1, rewrite_version=False)
+            res = self._run_pinned_core(tmp, node_bin, core_bin)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("Failed to install requested Xray server version 26.11.9", res.stderr)
+            calls = install_log.read_text(encoding="utf-8")
+            # Both version spellings are attempted before failing closed.
+            self.assertIn("--version v26.11.9", calls)
+            self.assertIn("--version 26.11.9", calls)
+
+    def test_pinned_core_silent_noop_is_fatal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            node_bin, core_bin, _ = self._fake_core_tools(tmp, install_rc=0, rewrite_version=False)
+            res = self._run_pinned_core(tmp, node_bin, core_bin)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("version mismatch after installation", res.stderr)
+            self.assertIn("expected 26.11.9, got Xray 25.10.15", res.stderr)
+
+    def test_pinned_core_version_token_must_match_exactly(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=0, rewrite_version=False)
+            core_bin.write_text(
+                '#!/bin/sh\nprintf "Xray 26.11.90 (Xray, Penetrates Everything.) test-build\\n"\n',
+                encoding="utf-8",
+            )
+            core_bin.chmod(0o755)
+            res = self._run_pinned_core(tmp, node_bin, core_bin)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("version mismatch after installation", res.stderr)
+            self.assertTrue(install_log.exists(), "26.11.90 must not satisfy a 26.11.9 pin")
+
+    def test_pinned_core_already_matching_skips_install(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=1, rewrite_version=False)
+            (tmp / "core-version.txt").write_text("26.11.9\n", encoding="utf-8")
+            res = self._run_pinned_core(tmp, node_bin, core_bin)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertFalse(install_log.exists())
+
+    def test_pinned_core_install_success(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=0, rewrite_version=True)
+            res = self._run_pinned_core(tmp, node_bin, core_bin)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("Installing explicit Xray server version 26.11.9", res.stdout)
+            self.assertIn("--version v26.11.9", install_log.read_text(encoding="utf-8"))
+
+    def test_pinned_core_disabled_without_pin(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=1, rewrite_version=False)
+            res = self._run_pinned_core(tmp, node_bin, core_bin, version="")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertFalse(install_log.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
