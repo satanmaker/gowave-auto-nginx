@@ -1553,6 +1553,48 @@ EOF
     _NGINX_CONFIGS_CREATED=1
 }
 
+core_version_matches() {
+    local reported="${1:-}"
+    local expected="${2:-}"
+    [[ -n "$expected" ]] || return 1
+    local token
+    for token in $reported; do
+        if [[ "$token" == "$expected" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+ensure_pinned_xray_core() {
+    local node_bin="${1:-/opt/gowave-node/gowave-node}"
+    local core_bin="${2:-/opt/gowave-node/rw-core}"
+
+    if [[ -z "${XRAY_SERVER_VERSION:-}" || ! -x "$node_bin" ]]; then
+        return 0
+    fi
+
+    local expected_core cur_core
+    expected_core="${XRAY_SERVER_VERSION#v}"
+    cur_core=$("$core_bin" version 2>/dev/null || true)
+    if core_version_matches "$cur_core" "$expected_core"; then
+        return 0
+    fi
+
+    log_info "Installing explicit Xray server version $XRAY_SERVER_VERSION..."
+    if ! "$node_bin" core install --version "v$expected_core" -y 2>/dev/null && \
+       ! "$node_bin" core install --version "$expected_core" -y 2>/dev/null; then
+        log_err "Failed to install requested Xray server version $XRAY_SERVER_VERSION."
+        return 1
+    fi
+    cur_core=$("$core_bin" version 2>/dev/null || true)
+    if core_version_matches "$cur_core" "$expected_core"; then
+        return 0
+    fi
+    log_err "Xray server version mismatch after installation: expected $expected_core, got ${cur_core:-unknown}."
+    return 1
+}
+
 run_upstream_node_installer() {
     local tmp_inst
     : "${GOWAVE_NODE_INSTALLER_COMMIT:?Pinned upstream installer commit is required}"
@@ -1601,24 +1643,7 @@ Environment="NODE_PORT=$NODE_PORT"
 EOF
 
     # Install pinned Xray core version if explicitly configured and mismatched
-    if [[ -n "${XRAY_SERVER_VERSION:-}" && -x "/opt/gowave-node/gowave-node" ]]; then
-        local cur_core expected_core
-        expected_core="${XRAY_SERVER_VERSION#v}"
-        cur_core=$(/opt/gowave-node/rw-core version 2>/dev/null || true)
-        if ! echo "$cur_core" | grep -Fq "$expected_core"; then
-            log_info "Installing explicit Xray server version $XRAY_SERVER_VERSION..."
-            if ! /opt/gowave-node/gowave-node core install --version "v$expected_core" -y 2>/dev/null && \
-               ! /opt/gowave-node/gowave-node core install --version "$expected_core" -y 2>/dev/null; then
-                log_err "Failed to install requested Xray server version $XRAY_SERVER_VERSION."
-                return 1
-            fi
-            cur_core=$(/opt/gowave-node/rw-core version 2>/dev/null || true)
-            if ! echo "$cur_core" | grep -Fq "$expected_core"; then
-                log_err "Xray server version mismatch after installation: expected $expected_core, got ${cur_core:-unknown}."
-                return 1
-            fi
-        fi
-    fi
+    ensure_pinned_xray_core || return 1
     systemctl daemon-reload
     systemctl restart gowave-node.service
     systemctl is-active --quiet gowave-node.service || {
