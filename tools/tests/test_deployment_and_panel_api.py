@@ -115,7 +115,16 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
         # Generate Server cert with SAN for localhost only
         csr = td_path / "srv.csr"
         ext_conf = td_path / "ext.cnf"
-        ext_conf.write_text("subjectAltName=DNS:localhost\n")
+        # OpenSSL 3.x chain building rejects a leaf without an
+        # authorityKeyIdentifier when the issuing CA publishes a SKI.
+        ext_conf.write_text(
+            "subjectAltName=DNS:localhost\n"
+            "basicConstraints=critical,CA:FALSE\n"
+            "keyUsage=critical,digitalSignature,keyEncipherment\n"
+            "extendedKeyUsage=serverAuth\n"
+            "subjectKeyIdentifier=hash\n"
+            "authorityKeyIdentifier=keyid:always\n"
+        )
         subprocess.run(
             ["openssl", "req", "-newkey", "rsa:2048", "-nodes",
              "-keyout", str(cls.srv_key), "-out", str(csr),
