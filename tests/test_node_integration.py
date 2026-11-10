@@ -420,6 +420,51 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertFalse(install_log.exists())
 
+    def _run_node_sh_pinned_core(self, node_bin: Path, core_bin: Path, version: str = "26.11.9"):
+        cmd = (
+            f'source "{NODE_SH}" && XRAY_SERVER_VERSION="{version}" '
+            f'ensure_pinned_xray_core "{node_bin}" "{core_bin}"'
+        )
+        return subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+
+    def test_node_sh_pinned_core_crash_is_fatal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=1, rewrite_version=False)
+            res = self._run_node_sh_pinned_core(node_bin, core_bin)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("Failed to install requested Xray server version 26.11.9", res.stderr)
+            self.assertIn("--version v26.11.9", install_log.read_text(encoding="utf-8"))
+
+    def test_node_sh_pinned_core_silent_noop_is_fatal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            node_bin, core_bin, _ = self._fake_core_tools(tmp, install_rc=0, rewrite_version=False)
+            res = self._run_node_sh_pinned_core(node_bin, core_bin)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("version mismatch after installation", res.stderr)
+
+    def test_node_sh_pinned_core_version_token_must_match_exactly(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=0, rewrite_version=False)
+            core_bin.write_text(
+                '#!/bin/sh\nprintf "Xray 26.11.90 (Xray, Penetrates Everything.) test-build\\n"\n',
+                encoding="utf-8",
+            )
+            core_bin.chmod(0o755)
+            res = self._run_node_sh_pinned_core(node_bin, core_bin)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertTrue(install_log.exists(), "26.11.90 must not satisfy a 26.11.9 pin")
+
+    def test_node_sh_pinned_core_install_success(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            node_bin, core_bin, _ = self._fake_core_tools(tmp, install_rc=0, rewrite_version=True)
+            res = self._run_node_sh_pinned_core(node_bin, core_bin)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("Installing explicit Xray server version 26.11.9", res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
