@@ -306,13 +306,22 @@ def run_mihomo_traffic_suite(
     env["SSL_CERT_FILE"] = str(ca_bundle_path)
 
     proc: Optional[subprocess.Popen] = None
+    mihomo_log = None
+    mihomo_log_path = Path(td.name) / "mihomo.log"
     case_results: List[Dict[str, Any]] = []
 
+    def mihomo_log_tail() -> str:
+        try:
+            return mihomo_log_path.read_text(encoding="utf-8", errors="replace")[-4000:].strip()
+        except OSError:
+            return ""
+
     try:
+        mihomo_log = mihomo_log_path.open("w", encoding="utf-8")
         proc = subprocess.Popen(
             ["mihomo", "-d", td.name, "-f", str(tmp_config_path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=mihomo_log,
+            stderr=subprocess.STDOUT,
             env=env,
         )
 
@@ -328,7 +337,11 @@ def run_mihomo_traffic_suite(
                 time.sleep(0.05)
 
         if not ready:
-            return {"status": "FAIL", "error": "Mihomo client failed to start"}
+            return {
+                "status": "FAIL",
+                "error": "Mihomo client failed to start",
+                "mihomo_log_tail": mihomo_log_tail(),
+            }
 
         for p in proxies:
             p_name = p.get("name", "proxy")
@@ -374,7 +387,12 @@ def run_mihomo_traffic_suite(
                 with urllib.request.urlopen(sel_req, timeout=3):
                     pass
             except Exception as e:
-                case_results.append({"status": "FAIL", "proxy": p_name, "error": f"Failed selecting proxy: {e}"})
+                case_results.append({
+                    "status": "FAIL",
+                    "proxy": p_name,
+                    "error": f"Failed selecting proxy: {e}",
+                    "mihomo_log_tail": mihomo_log_tail(),
+                })
                 continue
 
             # Ingress baselines
@@ -403,6 +421,7 @@ def run_mihomo_traffic_suite(
                     "status": "FAIL",
                     "proxy": p_name,
                     "error": f"Mihomo tunnel failed: {curl_res.stderr.strip()}",
+                    "mihomo_log_tail": mihomo_log_tail(),
                 })
                 continue
 
@@ -429,6 +448,9 @@ def run_mihomo_traffic_suite(
                 proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                proc.wait()
+        if mihomo_log:
+            mihomo_log.close()
         td.cleanup()
 
     if any(case.get("status") == "FAIL" for case in case_results):
