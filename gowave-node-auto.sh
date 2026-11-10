@@ -1602,12 +1602,21 @@ EOF
 
     # Install pinned Xray core version if explicitly configured and mismatched
     if [[ -n "${XRAY_SERVER_VERSION:-}" && -x "/opt/gowave-node/gowave-node" ]]; then
-        local cur_core
+        local cur_core expected_core
+        expected_core="${XRAY_SERVER_VERSION#v}"
         cur_core=$(/opt/gowave-node/rw-core version 2>/dev/null || true)
-        if ! echo "$cur_core" | grep -q "${XRAY_SERVER_VERSION#v}"; then
+        if ! echo "$cur_core" | grep -Fq "$expected_core"; then
             log_info "Installing explicit Xray server version $XRAY_SERVER_VERSION..."
-            /opt/gowave-node/gowave-node core install --version "v${XRAY_SERVER_VERSION#v}" -y 2>/dev/null || \
-            /opt/gowave-node/gowave-node core install --version "${XRAY_SERVER_VERSION#v}" -y 2>/dev/null || true
+            if ! /opt/gowave-node/gowave-node core install --version "v$expected_core" -y 2>/dev/null && \
+               ! /opt/gowave-node/gowave-node core install --version "$expected_core" -y 2>/dev/null; then
+                log_err "Failed to install requested Xray server version $XRAY_SERVER_VERSION."
+                return 1
+            fi
+            cur_core=$(/opt/gowave-node/rw-core version 2>/dev/null || true)
+            if ! echo "$cur_core" | grep -Fq "$expected_core"; then
+                log_err "Xray server version mismatch after installation: expected $expected_core, got ${cur_core:-unknown}."
+                return 1
+            fi
         fi
     fi
     systemctl daemon-reload
