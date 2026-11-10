@@ -314,7 +314,10 @@ PY
     admin_pass=$(openssl rand -hex 16)
     save_credentials "$admin_user" "$admin_pass" "https://$panel_domain" "" "$CREDENTIALS_FILE"
 
-    if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+    if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
+        GOWAVE_MIHOMO_X25519="${GOWAVE_MIHOMO_X25519:-}" \
+        python3 - \
         "$SCRIPT_DIR" "$panel_domain" "$reality_domain" "$admin_user" \
         "$JOURNAL_FILE" "$STATE_FILE" "$CREDENTIALS_FILE" "$vision_domain" 3<<< "$admin_pass" <<'PY'
 import json
@@ -556,7 +559,10 @@ PY
 
             # 2. Register the node using argv for data and FD 3 for the password.
             # User-controlled values are never interpolated into Python source.
-            if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+            if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+                XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
+                GOWAVE_MIHOMO_X25519="${GOWAVE_MIHOMO_X25519:-}" \
+                python3 - \
                 "$SCRIPT_DIR" "$name" "$ip" "$worker_domain" "$reality_domain" \
                 "$node_port" "$admin_user" "$JOURNAL_FILE" "$STATE_FILE" "$vision_domain" 3<<< "$admin_pass" <<'PY'
 import ipaddress

@@ -109,6 +109,47 @@ rules:
             self.assertEqual(res["proxies_count"], 8)
             self.assertTrue(res["has_geoip_rule"])
 
+    def _mihomo_subscription_with_reality(self, reality_opts: str) -> str:
+        proxies = [
+            "  - name: p1",
+            "    type: vless",
+            "    client-fingerprint: firefox",
+            reality_opts.rstrip("\n"),
+        ]
+        for index in range(2, 9):
+            proxies.extend([
+                f"  - name: p{index}",
+                "    type: vless",
+                "    client-fingerprint: firefox",
+            ])
+        return "\n".join(["proxies:"] + proxies + [
+            "rules:",
+            "  - GEOIP,private,DIRECT,no-resolve",
+            "  - MATCH,DIRECT",
+            "",
+        ])
+
+    def test_mihomo_subscription_requires_reality_hybrid_share(self):
+        ctx = ssl.create_default_context()
+        legacy = (
+            "    reality-opts:\n"
+            "      public-key: pk\n"
+            "      short-id: sid\n"
+        )
+        modern = legacy + "      support-x25519mlkem768: true\n"
+
+        for yaml_text, expected_ok in ((legacy, False), (modern, True)):
+            mock_resp = MagicMock()
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.status = 200
+            mock_resp.read.return_value = self._mihomo_subscription_with_reality(yaml_text).encode("utf-8")
+            with patch("urllib.request.urlopen", return_value=mock_resp), \
+                 patch("subprocess.run", return_value=MagicMock(returncode=0)):
+                ok, res = fetch_and_validate_mihomo_subscription("panel.example.com", "uuid", ctx, has_vision=False)
+            self.assertEqual(ok, expected_ok, res)
+            if not expected_ok:
+                self.assertIn("support-x25519mlkem768", res["error"])
+
     def test_firewall_probe_tcp(self):
         # Probing an unassigned high port on 127.0.0.1 should refuse or timeout
         ok, reason = probe_tcp_port("127.0.0.1", 59999, timeout=0.1)
