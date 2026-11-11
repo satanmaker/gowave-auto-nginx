@@ -17,6 +17,7 @@ def verify_worker_mtls(
     panel_client: Optional[E2EPanelClient] = None,
     port: int = 3002,
     timeout: int = 15,
+    ready_timeout: int = 60,
 ) -> Dict[str, Any]:
     """Execute live mTLS verification from Master to Worker:3002 and audit Panel connection state."""
     # 1. Extract secret key raw on Master
@@ -44,21 +45,13 @@ def verify_worker_mtls(
 
     panel_worker_auth_pass = False
     if panel_client:
-        # Give GoWave node connection up to 10 seconds to register isConnected in Panel
-        import time
-        deadline = time.time() + 10.0
-        while time.time() < deadline:
-            try:
-                nodes = panel_client.get_nodes()
-                for n in nodes:
-                    if n.get("name") == "worker-1" and n.get("isConnected") is True:
-                        panel_worker_auth_pass = True
-                        break
-                if panel_worker_auth_pass:
-                    break
-            except Exception:
-                pass
-            time.sleep(1.0)
+        # The Panel pushes the Node config profile right after registration and the
+        # Node restarts Xray, which drops it from the connected registry for a few
+        # seconds. Reuse the deployment readiness budget instead of a short fixed
+        # window, otherwise a healthy Worker is reported as unauthenticated.
+        panel_worker_auth_pass = panel_client.poll_worker_ready(
+            "worker-1", timeout=ready_timeout, poll_interval=3
+        )
 
     status = "PASS" if (res.ok and payload_crypto_pass and mtls_handshake_pass and worker_http_health_pass and panel_worker_auth_pass) else "FAIL"
 
@@ -68,6 +61,7 @@ def verify_worker_mtls(
         "mtls_handshake_pass": mtls_handshake_pass,
         "worker_http_health_pass": worker_http_health_pass,
         "panel_worker_auth_pass": panel_worker_auth_pass,
+        "panel_worker_ready_timeout": ready_timeout,
         "verifier_exit_code": res.returncode,
     }
 
