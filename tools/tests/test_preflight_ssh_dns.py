@@ -17,6 +17,7 @@ from live_vps.preflight import (
     check_disposable_gate,
     check_private_key_file,
     check_ssh_trust,
+    collect_remote_baseline,
     LocalLock,
     check_control_machine_tools,
 )
@@ -216,11 +217,22 @@ class TestPreflightSSHDNS(unittest.TestCase):
         self.assertEqual(result["control_machine_probe_reason"], "REFUSED")
         self.assertTrue(result["worker_allow_list_evidence"])
 
+    def test_collect_remote_baseline_records_required_target_tools(self):
+        ssh = MagicMock()
+        ssh.run.return_value = MagicMock(ok=True, stdout="tcpdump=ok\ntimeout=missing\n")
+        manifest = collect_remote_baseline(ssh)
+        self.assertEqual(manifest["required_tools"], {"tcpdump": "ok", "timeout": "missing"})
+
+        eligible, reasons = check_disposable_gate(manifest)
+        self.assertFalse(eligible)
+        self.assertTrue(any("timeout" in reason for reason in reasons))
+
     def test_check_disposable_gate(self):
         clean = {
             "existing_gowave_dirs": [],
             "running_services": ["cron.service", "ssh.service"],
             "listening_ports": [22],
+            "required_tools": {"tcpdump": "ok", "timeout": "ok"},
         }
         eligible, reasons = check_disposable_gate(clean)
         self.assertTrue(eligible)
@@ -253,6 +265,16 @@ class TestPreflightSSHDNS(unittest.TestCase):
                     "listening_ports": [22],
                 },
                 "GoWave systemd service already active",
+            ),
+            (
+                "packet capture tool",
+                {
+                    "existing_gowave_dirs": [],
+                    "running_services": [],
+                    "listening_ports": [22],
+                    "required_tools": {"tcpdump": "missing", "timeout": "ok"},
+                },
+                "Missing required target tools",
             ),
         )
         for label, baseline, expected_reason in occupied_baselines:

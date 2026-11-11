@@ -8,7 +8,7 @@ The live two-VPS acceptance run is launched from the operator's Linux workstatio
 - Python 3 and a virtual environment.
 - OpenSSH client tools (ssh, ssh-keygen), curl, dig, openssl, and timeout.
 - Pinned Xray and Mihomo client binaries matching XRAY_CLIENT_VERSION and MIHOMO_CLIENT_VERSION in tools/live_vps_config.env.example.
-- Both freshly provisioned disposable VPS instances must be reachable over SSH and have tcpdump and coreutils timeout installed and executable by root. The controller does not install these target-side tools.
+- Both freshly provisioned disposable VPS instances must be reachable over SSH and have tcpdump and coreutils timeout installed and executable by root. The controller does not install these target-side tools; preflight rejects a target that lacks either one instead of failing later in the traffic phase.
 - DNS records for the five required domains must resolve to the corresponding target IPv4 addresses. Optional Master and Worker Vision domains are independent.
 
 ## Install and launch
