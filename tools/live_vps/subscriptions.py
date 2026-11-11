@@ -20,6 +20,15 @@ from .panel_api import E2EPanelClient
 from .redaction import register_secret
 
 
+def expected_proxy_count(has_vision: bool = False, vision_count: Optional[int] = None) -> int:
+    """Return the expected number of core plus independently configured Vision proxies."""
+    if vision_count is None:
+        return 10 if has_vision else 8
+    if type(vision_count) is not int or vision_count not in (0, 1, 2):
+        raise ValueError("vision_count must be an integer from 0 through 2")
+    return 8 + vision_count
+
+
 def get_default_user_short_uuid(panel_client: E2EPanelClient) -> str:
     """Retrieve default-user shortUuid from Panel and register it in redaction filter."""
     user = panel_client.get_user_by_username("default-user")
@@ -152,6 +161,7 @@ def fetch_and_validate_xray_subscription(
     has_vision: bool = False,
     ca_bundle_path: Optional[Path] = None,
     reality_fingerprint: str = "firefox",
+    vision_count: Optional[int] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Fetch Xray JSON subscription and validate schema, proxy outbounds, and xray run -test."""
     url = f"https://{panel_domain}/api/sub/{short_uuid}/v2ray-json"
@@ -176,31 +186,41 @@ def fetch_and_validate_xray_subscription(
         return False, {"error": f"Malformed Xray subscription JSON: {e}"}
 
     # Filter proxy-capable outbounds: exclude direct, block, dns, etc.
-    if isinstance(sub_json, list):
-        items = sub_json
-    elif isinstance(sub_json, dict):
-        items = sub_json.get("outbounds", [])
-    else:
-        items = []
-
+    # The Panel serves either a single config object or a list of per-profile
+    # configs; both shapes must be validated the same way.
     proxy_outbounds = []
     configs_to_validate = []
+    wrapped_outbounds = []
 
     if isinstance(sub_json, list):
-        for item in sub_json:
-            if isinstance(item, dict):
-                configs_to_validate.append(item)
-                for ob in item.get("outbounds", []):
-                    protocol = ob.get("protocol", "").lower()
-                    if protocol in ("vless", "trojan", "vmess", "shadowsocks"):
-                        proxy_outbounds.append(ob)
+        if not sub_json:
+            return False, {"error": "Xray subscription JSON root must be an object"}
+        profiles = sub_json
+    elif isinstance(sub_json, dict):
+        profiles = [sub_json]
     else:
-        for ob in items:
-            protocol = ob.get("protocol", "").lower()
-            if protocol in ("vless", "trojan", "vmess", "shadowsocks"):
-                proxy_outbounds.append(ob)
+        return False, {"error": "Xray subscription JSON root must be an object"}
 
-    expected_count = 10 if has_vision else 8
+    for profile_index, profile in enumerate(profiles):
+        if not isinstance(profile, dict):
+            return False, {"error": f"Xray subscription profile at index {profile_index} must be an object"}
+        raw_outbounds = profile.get("outbounds", [])
+        if not isinstance(raw_outbounds, list):
+            return False, {"error": f"Xray subscription profile at index {profile_index} outbounds must be a list"}
+        if isinstance(sub_json, list):
+            configs_to_validate.append(profile)
+        else:
+            wrapped_outbounds = raw_outbounds
+        for index, outbound in enumerate(raw_outbounds):
+            if not isinstance(outbound, dict):
+                return False, {"error": f"Xray outbound at index {index} must be an object"}
+            protocol = outbound.get("protocol", "")
+            if not isinstance(protocol, str):
+                return False, {"error": f"Xray outbound at index {index} has an invalid protocol"}
+            if protocol.lower() in ("vless", "trojan", "vmess", "shadowsocks"):
+                proxy_outbounds.append(outbound)
+
+    expected_count = expected_proxy_count(has_vision, vision_count)
     if len(proxy_outbounds) != expected_count:
         return False, {
             "error": f"Expected {expected_count} proxy outbounds, found {len(proxy_outbounds)}",
@@ -210,15 +230,21 @@ def fetch_and_validate_xray_subscription(
     # REALITY hosts use the configured (default firefox) fingerprint; every other
     # transport keeps firefox. Both Xray and mihomo send the hybrid
     # X25519MLKEM768 key share with the modern Firefox uTLS preset.
-    for ob in proxy_outbounds:
-        stream_settings = ob.get("streamSettings", {})
+    for index, outbound in enumerate(proxy_outbounds):
+        stream_settings = outbound.get("streamSettings", {})
+        if not isinstance(stream_settings, dict):
+            return False, {"error": f"Xray outbound at index {index} streamSettings must be an object"}
         security = (stream_settings.get("security") or "").lower()
         tls_settings = stream_settings.get("tlsSettings") or stream_settings.get("realitySettings") or {}
-        fp = (tls_settings.get("fingerprint") or "").lower()
+        if not isinstance(tls_settings, dict):
+            return False, {"error": f"Xray outbound at index {index} TLS settings must be an object"}
+        fingerprint = tls_settings.get("fingerprint", "")
+        if not isinstance(fingerprint, str):
+            return False, {"error": f"Xray outbound at index {index} has an invalid fingerprint"}
         expected_fp = reality_fingerprint if security == "reality" else "firefox"
-        if fp != expected_fp:
+        if fingerprint.lower() != expected_fp.lower():
             return False, {
-                "error": f"Outbound {ob.get('tag')} has fingerprint '{fp}', expected '{expected_fp}'"
+                "error": f"Outbound {outbound.get('tag')} has fingerprint '{fingerprint}', expected '{expected_fp}'"
             }
 
     # Validate with real Xray CLI if installed
@@ -247,7 +273,7 @@ def fetch_and_validate_xray_subscription(
             full_xray_config = {
                 "log": {"loglevel": "warning"},
                 "inbounds": [{"port": 10808, "listen": "127.0.0.1", "protocol": "socks", "settings": {"auth": "noauth"}}],
-                "outbounds": items,
+                "outbounds": wrapped_outbounds,
             }
             with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
                 json.dump(full_xray_config, tf)
@@ -280,6 +306,7 @@ def fetch_and_validate_mihomo_subscription(
     has_vision: bool = False,
     ca_bundle_path: Optional[Path] = None,
     reality_fingerprint: str = "firefox",
+    vision_count: Optional[int] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Fetch Mihomo YAML subscription and validate schema, proxy entries, and mihomo -t."""
     url = f"https://{panel_domain}/api/sub/{short_uuid}/mihomo"
@@ -300,8 +327,16 @@ def fetch_and_validate_mihomo_subscription(
     except Exception as e:
         return False, {"error": f"Malformed Mihomo subscription YAML: {e}"}
 
+    if not isinstance(sub_yaml, dict):
+        return False, {"error": "Mihomo subscription YAML root must be a mapping"}
+
     proxies = sub_yaml.get("proxies", [])
-    expected_count = 10 if has_vision else 8
+    if not isinstance(proxies, list):
+        return False, {"error": "Mihomo subscription proxies must be a list"}
+    try:
+        expected_count = expected_proxy_count(has_vision, vision_count)
+    except ValueError as exc:
+        return False, {"error": str(exc)}
     if len(proxies) != expected_count:
         return False, {
             "error": f"Expected {expected_count} proxies in YAML, found {len(proxies)}",
@@ -311,26 +346,31 @@ def fetch_and_validate_mihomo_subscription(
     # REALITY proxies carry the configured (default firefox) client fingerprint;
     # other proxies stay on firefox. Every REALITY proxy must also advertise the
     # hybrid key share explicitly.
-    for p in proxies:
-        reality_opts = p.get("reality-opts")
+    for index, proxy in enumerate(proxies):
+        if not isinstance(proxy, dict):
+            return False, {"error": f"Mihomo proxy at index {index} must be a mapping"}
+        reality_opts = proxy.get("reality-opts")
         is_reality = isinstance(reality_opts, dict)
-        fp = (p.get("client-fingerprint") or p.get("fingerprint") or "").lower()
+        fingerprint = proxy.get("client-fingerprint") or proxy.get("fingerprint") or ""
+        if not isinstance(fingerprint, str):
+            return False, {"error": f"Mihomo proxy at index {index} has an invalid client-fingerprint"}
         expected_fp = reality_fingerprint if is_reality else "firefox"
-        if fp != expected_fp:
+        if fingerprint.lower() != expected_fp.lower():
             return False, {
-                "error": f"Proxy {p.get('name')} has fingerprint '{fp}', expected '{expected_fp}'"
+                "error": f"Proxy {proxy.get('name')} has fingerprint '{fingerprint}', expected '{expected_fp}'"
             }
         if is_reality and reality_opts.get("support-x25519mlkem768") is not True:
             return False, {
-                "error": f"Proxy {p.get('name')} missing reality-opts support-x25519mlkem768",
+                "error": f"Proxy {proxy.get('name')} missing reality-opts support-x25519mlkem768",
             }
 
     # Verify routing rules present
     rules = sub_yaml.get("rules", [])
-    has_rules = bool(rules)
-    if not has_rules:
-        return False, {"error": "Missing mandatory rules in Mihomo subscription YAML"}
-    has_geoip_rule = any("GEOIP" in r for r in rules) or any("MATCH" in r for r in rules)
+    if not isinstance(rules, list) or any(not isinstance(rule, str) for rule in rules):
+        return False, {"error": "Mihomo subscription rules must be a list of strings"}
+    has_geoip_rule = any("GEOIP" in rule for rule in rules) or any("MATCH" in rule for rule in rules)
+    if not has_geoip_rule:
+        return False, {"error": "Missing mandatory GEOIP or MATCH rule in Mihomo subscription YAML"}
 
     # Validate with real Mihomo CLI if installed
     mihomo_cli_ok = True

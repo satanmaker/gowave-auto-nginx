@@ -23,6 +23,9 @@ from live_vps.preflight import (
 
 
 class TestPreflightSSHDNS(unittest.TestCase):
+    def setUp(self):
+        clear_secrets()
+
     def tearDown(self):
         clear_secrets()
 
@@ -104,16 +107,29 @@ class TestPreflightSSHDNS(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             assert_no_secrets_in_argv(["ssh", "root@example.com", "echo SuperSecretToken12345"])
         self.assertIn("Zero-leak violation", str(ctx.exception))
+        self.assertNotIn("SuperSecretToken12345", str(ctx.exception))
+        self.assertNotIn("echo", str(ctx.exception))
 
         # 3. Prohibited credential parameter flag in argv
         with self.assertRaises(ValueError) as ctx2:
             assert_no_secrets_in_argv(["ssh", "root@example.com", "--admin_password=abc"])
         self.assertIn("Zero-leak violation", str(ctx2.exception))
+        self.assertNotIn("abc", str(ctx2.exception))
+        self.assertNotIn("--admin_password", str(ctx2.exception))
 
     def test_dns_verification_mock(self):
         # Less than 2 resolvers raises ValueError
         with self.assertRaises(ValueError):
             verify_domain_dns("example.com", "93.184.216.34", resolvers=["1.1.1.1"])
+
+    def test_dns_requires_two_distinct_resolvers(self):
+        for verifier in (verify_domain_dns, verify_domain_no_aaaa):
+            with self.subTest(verifier=verifier.__name__):
+                with self.assertRaisesRegex(ValueError, "two distinct independent resolvers"):
+                    if verifier is verify_domain_dns:
+                        verifier("panel.example.test", "203.0.113.10", resolvers=["1.1.1.1", "1.1.1.1"])
+                    else:
+                        verifier("panel.example.test", resolvers=["1.1.1.1", "1.1.1.1"])
 
     @patch("live_vps.dns.resolve_dig")
     def test_dns_requires_exactly_expected_ip_on_each_resolver(self, resolve):
@@ -128,13 +144,13 @@ class TestPreflightSSHDNS(unittest.TestCase):
     def test_dns_ipv6_disabled_requires_no_aaaa_answers(self, run):
         run.return_value = MagicMock(
             returncode=0,
-            stdout=";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\\n",
+            stdout=";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n",
         )
         result = verify_domain_no_aaaa("panel.example.test", resolvers=["1.1.1.1", "8.8.8.8"])
         self.assertTrue(result.ok)
         run.return_value = MagicMock(
             returncode=0,
-            stdout=";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\\npanel.example.test. 60 IN AAAA 2001:db8::10\\n",
+            stdout=";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\npanel.example.test. 60 IN AAAA 2001:db8::10\n",
         )
         result = verify_domain_no_aaaa("panel.example.test", resolvers=["1.1.1.1", "8.8.8.8"])
         self.assertFalse(result.ok)
@@ -175,53 +191,75 @@ class TestPreflightSSHDNS(unittest.TestCase):
         ]
         worker = MagicMock()
         worker.run.side_effect = [
-            MagicMock(ok=True, stdout="Status: active\\nDefault: deny (incoming)\\n3002/tcp ALLOW IN 203.0.113.10"),
+            MagicMock(ok=True, stdout="Status: active\nDefault: deny (incoming)\n3002/tcp ALLOW IN 203.0.113.10"),
             MagicMock(ok=True, stdout=""),
         ]
         result = verify_worker_firewall(master, worker, "203.0.113.20")
         self.assertEqual(result["status"], "PASS")
         self.assertTrue(result["worker_allow_list_evidence"])
 
+    @patch("live_vps.firewall.probe_tcp_port", return_value=(False, "REFUSED"))
+    @patch("live_vps.firewall.get_control_machine_public_ip", return_value="198.51.100.77")
+    def test_worker_firewall_accepts_refused_external_probe_with_positive_controls(self, cm_ip, probe):
+        master = MagicMock()
+        master.run.side_effect = [
+            MagicMock(ok=True, stdout="CONNECTED"),
+            MagicMock(ok=True, stdout="203.0.113.10"),
+        ]
+        worker = MagicMock()
+        worker.run.side_effect = [
+            MagicMock(ok=True, stdout="Status: active\nDefault: deny (incoming)\n3002/tcp ALLOW IN 203.0.113.10"),
+            MagicMock(ok=True, stdout=""),
+        ]
+        result = verify_worker_firewall(master, worker, "203.0.113.20")
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["control_machine_probe_reason"], "REFUSED")
+        self.assertTrue(result["worker_allow_list_evidence"])
+
     def test_check_disposable_gate(self):
-        # Clean baseline
         clean = {
             "existing_gowave_dirs": [],
             "running_services": ["cron.service", "ssh.service"],
             "listening_ports": [22],
         }
-        ok, disqs = check_disposable_gate(clean)
-        self.assertTrue(ok)
-        self.assertEqual(disqs, [])
+        eligible, reasons = check_disposable_gate(clean)
+        self.assertTrue(eligible)
+        self.assertEqual(reasons, [])
 
-        # Dirty baseline: existing directory
-        dirty_dir = {
-            "existing_gowave_dirs": ["/opt/gowave"],
-            "running_services": [],
-            "listening_ports": [22],
-        }
-        ok1, disqs1 = check_disposable_gate(dirty_dir)
-        self.assertFalse(ok1)
-        self.assertTrue(any("Pre-existing GoWave directories" in d for d in disqs1))
-
-        # Dirty baseline: occupied port 443
-        dirty_port = {
-            "existing_gowave_dirs": [],
-            "running_services": [],
-            "listening_ports": [22, 443],
-        }
-        ok2, disqs2 = check_disposable_gate(dirty_port)
-        self.assertFalse(ok2)
-        self.assertTrue(any("Port conflicts" in d for d in disqs2))
-
-        # Dirty baseline: active gowave service
-        dirty_svc = {
-            "existing_gowave_dirs": [],
-            "running_services": ["gowave.service"],
-            "listening_ports": [22],
-        }
-        ok3, disqs3 = check_disposable_gate(dirty_svc)
-        self.assertFalse(ok3)
-        self.assertTrue(any("GoWave systemd service already active" in d for d in disqs3))
+        occupied_baselines = (
+            (
+                "GoWave installation directory",
+                {
+                    "existing_gowave_dirs": ["/opt/gowave"],
+                    "running_services": [],
+                    "listening_ports": [22],
+                },
+                "Pre-existing GoWave directories",
+            ),
+            (
+                "HTTPS listener",
+                {
+                    "existing_gowave_dirs": [],
+                    "running_services": [],
+                    "listening_ports": [22, 443],
+                },
+                "Port conflicts",
+            ),
+            (
+                "GoWave service",
+                {
+                    "existing_gowave_dirs": [],
+                    "running_services": ["gowave.service"],
+                    "listening_ports": [22],
+                },
+                "GoWave systemd service already active",
+            ),
+        )
+        for label, baseline, expected_reason in occupied_baselines:
+            with self.subTest(conflict=label):
+                eligible, reasons = check_disposable_gate(baseline)
+                self.assertFalse(eligible)
+                self.assertTrue(any(expected_reason in reason for reason in reasons))
 
     def test_local_lock(self):
         lock1 = LocalLock("test-target-lock")

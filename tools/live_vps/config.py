@@ -229,12 +229,8 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
     if parsed["WORKER_DOMAIN"].lower() == parsed["WORKER_REALITY_DOMAIN"].lower():
         raise ValueError("WORKER_DOMAIN and WORKER_REALITY_DOMAIN must be different.")
 
-    # Vision is a pair-wide capability. Reject one-sided configuration before SSH.
-    master_vision_set = bool(raw_pairs.get("MASTER_VISION_DOMAIN", "").strip())
-    worker_vision_set = bool(raw_pairs.get("WORKER_VISION_DOMAIN", "").strip())
-    if master_vision_set != worker_vision_set:
-        raise ValueError("MASTER_VISION_DOMAIN and WORKER_VISION_DOMAIN must both be configured or both be omitted.")
-
+    # Master and Worker Vision are independent endpoints. Master-only Vision is
+    # a supported topology; Worker Vision remains independently optional.
     # Optional Vision domains
     if "MASTER_VISION_DOMAIN" in raw_pairs and raw_pairs["MASTER_VISION_DOMAIN"]:
         parsed["MASTER_VISION_DOMAIN"] = validate_domain(raw_pairs["MASTER_VISION_DOMAIN"], "MASTER_VISION_DOMAIN")
@@ -261,10 +257,12 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
         parsed["WORKER_DOMAIN"], parsed["WORKER_REALITY_DOMAIN"],
     ]
     if parsed["MASTER_VISION_DOMAIN"]:
-        domain_values.extend([parsed["MASTER_VISION_DOMAIN"], parsed["WORKER_VISION_DOMAIN"]])
+        domain_values.append(parsed["MASTER_VISION_DOMAIN"])
+    if parsed["WORKER_VISION_DOMAIN"]:
+        domain_values.append(parsed["WORKER_VISION_DOMAIN"])
     normalized_domains = [domain.lower() for domain in domain_values]
     if len(normalized_domains) != len(set(normalized_domains)):
-        raise ValueError("All configured Master/Worker Panel, REALITY, and Vision domains must be globally distinct.")
+        raise ValueError("All configured Master/Worker Panel, REALITY, and independently configured Vision domains must be globally distinct.")
 
     # SSH configuration. E2E v1 deliberately supports root SSH only; no sudo adapter exists.
     parsed["MASTER_SSH_PORT"] = parse_port(raw_pairs.get("MASTER_SSH_PORT", "22"), "MASTER_SSH_PORT")

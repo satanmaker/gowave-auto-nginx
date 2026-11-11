@@ -1,135 +1,74 @@
-# Live VPS End-to-End Testing Guide & Acceptance Gate
+# Local Live VPS E2E Controller
 
-This document serves as the operational guide for executing the GoWave Auto NGINX Live VPS End-to-End Test Runner (`tools/test_live_vps.py`) on disposable real VPS instances over the public internet.
+The live two-VPS acceptance run is launched from the operator's Linux workstation. GitHub Actions runs repository CI and automated tests only; it does not receive target VPS passwords, temporary private keys, or known-hosts secrets.
 
----
+## Prerequisites
 
-## 1. Overview & Architecture
+- Linux control machine and a clean checkout of the tested repository commit.
+- Python 3 and a virtual environment.
+- OpenSSH client tools (ssh, ssh-keygen), curl, dig, openssl, and timeout.
+- Pinned Xray and Mihomo client binaries matching XRAY_CLIENT_VERSION and MIHOMO_CLIENT_VERSION in tools/live_vps_config.env.example.
+- Both freshly provisioned disposable VPS instances must be reachable over SSH and have tcpdump and coreutils timeout installed and executable by root. The controller does not install these target-side tools.
+- DNS records for the five required domains must resolve to the corresponding target IPv4 addresses. Optional Master and Worker Vision domains are independent.
 
-The Live VPS Test Runner executes end-to-end infrastructure lifecycle, deployment, protocol routing, subscription delivery, client Data Plane traffic, fault injection, and teardown across a distributed pair of disposable VPS:
-- **Master VPS**: Runs GoWave Panel, local GoWave Node, NGINX Stream SNI demultiplexer, ACME certificates, and web camouflage.
-- **Worker VPS**: Runs distributed edge GoWave Node, NGINX Stream SNI router, ACME certificates, and camouflage fallback.
-- **Control Machine**: Orchestrator host executing `tools/test_live_vps.py` with pinned client binaries (`xray`, `mihomo`, `ssh`, `openssl`, `dig`).
+## Install and launch
 
----
-
-## 2. VPS Prerequisites & Disposable Gate
-
-The test runner operates exclusively on disposable test servers that pass the read-only Disposable Gate in Phase 0:
-1. **Operating System**: Clean installation of Ubuntu 24.04 LTS, Ubuntu 26.04 LTS, Debian 12 (Bookworm), or Debian 13 (Trixie).
-2. **Access**: Direct root SSH access (`MASTER_SSH_USER=root`, `WORKER_SSH_USER=root`).
-3. **Clean Baseline**:
-   - No existing GoWave directories (`/opt/gowave`, `/opt/gowave-node`, `/var/lib/gowave-auto-nginx`).
-   - No port conflicts on required listening ports (80, 443, 8080, 8443, 8444, 9443, 9444, 3000, 3001).
-   - Unmodified standard firewall state.
-   - Pinned system utilities present (`python3`, `tar`, `curl`, `systemd`).
-
----
-
-## 3. DNS Configuration
-
-All required domains must resolve authoritatively to the public IPv4 (and optionally IPv6) addresses of the corresponding VPS before execution:
-
-| VPS | Mandatory FQDN Role | Example Config Key |
-|---|---|---|
-| **Master** | Panel HTTPS Web UI & API | `MASTER_PANEL_DOMAIN` |
-| **Master** | Camouflage Decoy / REALITY SNI | `MASTER_REALITY_DOMAIN` |
-| **Master** | *(Optional)* VLESS XTLS Vision SNI | `MASTER_VISION_DOMAIN` |
-| **Worker** | Worker HTTPS / Subscription | `WORKER_DOMAIN` |
-| **Worker** | Camouflage Decoy / REALITY SNI | `WORKER_REALITY_DOMAIN` |
-| **Worker** | *(Optional)* VLESS XTLS Vision SNI | `WORKER_VISION_DOMAIN` |
-
-### IPv6 & DNS Consistency Rules
-- If `ENABLE_IPV6=false`, **no** domain may publish an `AAAA` record. Any published `AAAA` record fails preflight before any SSH connection.
-- If `ENABLE_IPV6=true`, all domains must publish matching `AAAA` records resolving strictly to the target VPS IPv6 address.
-- At least two independent public resolvers (e.g. 1.1.1.1, 8.8.8.8) are queried; resolver disagreement or CDN proxying (e.g. Cloudflare proxy orange cloud) fails preflight immediately.
-
----
-
-## 4. SSH Authentication & Host Key Pinning
-
-SSH security requires strict key isolation and host key verification:
-1. **Private Keys**: Mode `0600`, regular non-symlink file owned by runner user.
-2. **Known Hosts**: Pre-pinned host keys for both Master and Worker in `SSH_KNOWN_HOSTS` (or per-host `MASTER_KNOWN_HOSTS_PATH` / `WORKER_KNOWN_HOSTS_PATH`).
-3. **Zero Secrets in Argv**: All secrets, environment variables, and tokens are delivered strictly over SSH `stdin` pipelines or secured temporary files (`0600`), never via CLI arguments.
-
----
-
-## 5. Configuration Setup
-
-Copy the template and configure your test environment:
 ```bash
-cp tools/live_vps_config.env.example tools/live_vps_config.env
-chmod 0600 tools/live_vps_config.env
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r tools/requirements-live-vps.txt
+python3 tools/run_live_vps.py
 ```
-Populate `tools/live_vps_config.env` with your real VPS IP addresses, FQDNs, SSH key paths, and pinned software versions. Note that `tools/live_vps_config.env` is ignored by git and must never be committed.
 
-### REALITY Fingerprint and Client Compatibility
+The interactive entrypoint collects Master and Worker public IPv4 addresses, SSH ports and root logins, the required Master Panel/REALITY and Worker NGINX/REALITY domains, and independent optional Master/Worker Vision domains. The controller defaults to Let's Encrypt staging. Production requires an explicit mode selection and a second typed confirmation.
+
+Run a non-deploying eligibility check first with `python3 tools/run_live_vps.py --mode preflight`. This performs local tool/DNS checks, bootstraps temporary SSH access only after out-of-band host-key confirmation, executes the runner's read-only remote baseline checks, then revokes the temporary keys. It does not install GoWave or modify GoWave services. Use `--mode full` (the default) only after preflight passes and both targets are confirmed disposable.
+
+## Authentication and cleanup contract
+
+- Existing deployment and rollback commands require root. The controller accepts only the root SSH account; it does not silently elevate through sudo.
+- Root password authentication must already be enabled on both SSH servers for initial bootstrap. The controller does not edit sshd configuration or enable password authentication.
+- For each VPS, the controller obtains the SSH host key before authentication, displays its SHA-256 fingerprint, and requires the operator to type the exact fingerprint independently obtained from the VPS provider's trusted console. A mismatch aborts before the password is requested.
+- Passwords are read using a hidden prompt and passed only to the in-memory Paramiko authentication call. They are never written to argv, environment variables, config files, logs, reports, or GitHub Secrets.
+- After host-key verification and password authentication, the controller creates a per-run Ed25519 keypair locally and installs only its public key in root's authorized_keys, using a unique run-specific marker.
+- Before appending that key, it installs and enables a persistent two-hour systemd expiry timer on the VPS. The timer removes only the exact run-specific authorized_keys entry and survives reboot (Persistent=true).
+- Normal exit attempts immediate remote revocation and verifies that the marker is absent and the timer inactive. If cleanup cannot be verified, the report is downgraded to INCOMPLETE; the remote expiry timer remains the bounded fallback.
+- The local private keys, known_hosts files, and generated config live in a mode-0700 temporary directory and are removed when the controller exits.
+- Root password authentication remains enabled after the run. If it was enabled solely for bootstrap, disable it through the provider console or the normal secure administration process.
+
+## Pinned client cores and REALITY fingerprint
+
+The suite tests exactly the pair that GoWave Panel and GoWave Node deploy: `XRAY_SERVER_VERSION` / `XRAY_CLIENT_VERSION` (pinned `26.11.9`) and the upstream `MIHOMO_CLIENT_VERSION` (pinned `1.19.34`). These are the reference cores for every verify and traffic assertion; no alternative client binaries are exercised. Keep `tools/live_vps_config.env` in sync with `tools/live_vps_config.env.example`, otherwise a local run can drift onto an older core than the one the installers ship.
 
 | Key | Default | Purpose |
 |---|---|---|
 | `REALITY_FINGERPRINT` | `firefox` | uTLS preset written to REALITY Host records and asserted by subscription validation |
 
-`firefox` is the default: `metacubex/utls` maps `HelloFirefox_Auto` to Firefox 148, whose ClientHello carries the X25519MLKEM768 key share required by Xray REALITY servers. Xray and mihomo (pinned `1.19.34`) both authenticate against REALITY hosts with this preset, and Vision/XHTTP/WS/Trojan-gRPC hosts use `firefox` as well. `REALITY_FINGERPRINT` remains overridable for client fleets that need a different uTLS preset.
+`firefox` is the default: `metacubex/utls` maps `HelloFirefox_Auto` to Firefox 148, whose ClientHello carries the X25519MLKEM768 key share required by Xray REALITY servers. Xray and mihomo (pinned `1.19.34`) both authenticate against REALITY hosts with this preset, and Vision/XHTTP/WS/Trojan-gRPC hosts use `firefox` as well. `REALITY_FINGERPRINT` remains overridable for client fleets that need a different uTLS preset; when it is overridden, the Mihomo subscription validator rejects any REALITY proxy whose `client-fingerprint` does not match the configured preset.
 
-The suite tests exactly the pair that GoWave Panel and GoWave Node deploy: `XRAY_SERVER_VERSION` / `XRAY_CLIENT_VERSION` (pinned `26.11.9`) and the upstream `MIHOMO_CLIENT_VERSION` (pinned `1.19.34`). These are the reference cores for every verify and traffic assertion; no alternative client binaries are exercised.
+## Test safety and traffic evidence
 
----
+- Use freshly provisioned disposable VPS instances only. Preflight rejects occupied GoWave directories, conflicting services, and required listeners before deployment.
+- DNS validation checks all configured domains and rejects unexpected A/AAAA answers or resolver disagreement.
+- The runner requires pinned software versions, TLS trust, and a clean repository worktree. The local Xray and Mihomo binaries must match their configured versions.
+- Every Xray and Mihomo proxy request is bracketed by simultaneous inbound tcpdump captures on Master and Worker. The filter includes the control machine's public IPv4 and the exact destination port of the tested proxy service, and excludes each host's SSH destination port.
+- A traffic case is PASS only when the intended VPS receives at least one matching inbound packet, the other VPS receives zero matching packets, and the observed egress IPv4 matches the expected VPS egress. Missing or ambiguous evidence is INCOMPLETE; traffic observed on the wrong VPS is FAIL.
+- Captures have a 45-second hard lifetime as a crash-safety bound. Only packet counts and evidence metadata are persisted; packet payloads and PCAP files are not.
+- Attribution assumes the control machine reaches both VPS instances from the same public IPv4 address. If NAT, provider filtering, or network topology prevents that, evidence is INCOMPLETE, never a heuristic PASS.
+- The default teardown policy is PRESERVE: temporary SSH access is revoked, but VPS instances are not destroyed and provider snapshots are not restored automatically. Review the report and remove disposable instances through the provider when appropriate.
 
-## 6. ACME Modes: Staging vs Production
+## Local Multi-Node Podman transport acceptance
 
-- **`ACME_MODE=staging` (Default)**:
-  Uses the Let's Encrypt Staging ACME v2 endpoint (`https://acme-staging-v02.api.letsencrypt.org/directory`).
-  Prevents hitting production rate limits (5 certs per week per domain set). The runner automatically verifies and stages the pinned Let's Encrypt Staging CA bundle (`tools/certs/letsencrypt-staging/`) on the Control Machine and Master VPS.
-- **`ACME_MODE=production`**:
-  Uses the Let's Encrypt Production ACME v2 endpoint.
-  Reserved for final acceptance verification prior to production rollout.
+Run `sudo tests/podman_testbed.sh multi-node` on a Linux host with rootful Podman. The target builds the systemd test image and creates an isolated three-container network (Control, Master, Worker). It verifies a pinned-key Master-to-Worker root SSH command, a real TLS 1.3 mTLS request, rejection of absent and untrusted client certificates, and Worker TCP/3002 source filtering (Master allowed, Control dropped). The workflow executes this test on GitHub Actions as a separate job.
 
----
+This is a transport/firewall integration test, not a substitute for live GoWave acceptance: it does not install the GoWave Panel/Node binaries, register a Worker through the Panel API, validate subscription payloads, or exercise Xray/Mihomo client proxy traffic. Those assertions remain in the two-disposable-VPS Live E2E.
 
-## 7. Execution Modes & CLI Usage
+## Results and acceptance boundary
 
-The CLI `tools/test_live_vps.py` supports atomic execution and progressive phase resume:
+The runner writes artifacts/live-vps/<run-id>/ with JSON, JUnit, summary, and sanitized diagnostics. The controller adds an operator_access_cleanup phase; unverified revocation makes the overall result INCOMPLETE, even if deployment and traffic tests passed.
 
-```bash
-# Full execution across all phases (preflight -> install -> verify -> traffic -> negative -> teardown)
-python3 tools/test_live_vps.py --config tools/live_vps_config.env --mode full
+A green repository CI run validates code and automated tests only. It does not constitute live acceptance. The feature remains pending its first complete ACME staging run on two freshly provisioned disposable VPS instances, including all enabled traffic/negative checks and verified teardown/temporary-key cleanup.
 
-# Phase 0 only: Read-only preflight and baseline capture (outputs generated TEST_RUN_ID)
-python3 tools/test_live_vps.py --config tools/live_vps_config.env --mode preflight
+## Limitations
 
-# Resume subsequent phases using the authenticated run ID:
-python3 tools/test_live_vps.py --config tools/live_vps_config.env --mode install --run-id <RUN_ID>
-python3 tools/test_live_vps.py --config tools/live_vps_config.env --mode verify --run-id <RUN_ID>
-python3 tools/test_live_vps.py --config tools/live_vps_config.env --mode traffic --run-id <RUN_ID>
-python3 tools/test_live_vps.py --config tools/live_vps_config.env --mode negative --run-id <RUN_ID>
-python3 tools/test_live_vps.py --config tools/live_vps_config.env --mode teardown --run-id <RUN_ID>
-```
-
----
-
-## 8. Test Artifacts & Diagnostics
-
-Every run generates an isolated artifact bundle under `artifacts/live-vps/<TEST_RUN_ID>/`:
-- `result.json`: Comprehensive structured machine-readable result of all test phases.
-- `junit.xml`: JUnit-format test suite report for CI integration.
-- `summary.txt`: Human-readable test report.
-- `run-state.json`: State file recording prerequisites, baseline hashes, and phase statuses (mode `0600`).
-- `diagnostics/`: Sanitized logs and system telemetry with all credentials redacted.
-
----
-
-## 9. Pre-Deployment Acceptance Gate Rule
-
-> [!IMPORTANT]
-> **Pre-Deployment Acceptance Gate Requirement (Task 10.11)**
->
-> No release or PR merging `feature/live-vps-e2e-testing` into production/main branches may proceed without satisfying the complete 5-point Pre-Deployment Acceptance Gate:
->
-> 1. **Codebase Implementation Complete**: All tasks across Sections 1 through 10 of OpenSpec change `live-vps-e2e-testing` are implemented and verified in the reviewed commit.
-> 2. **CI Suite Completeness & Pass**: All standard CI suites (`tests/run_ci.py --check-completeness` and `python3 tests/run_ci.py --suite nonroot`) pass with zero errors.
-> 3. **Runner Unit & Integration Tests**: All runner test suites under `tools/tests/` (`python3 -m unittest discover -s tools/tests`) pass with zero errors.
-> 4. **OpenSpec Strict Validation**: Strict validation across all changes and specs (`openspec validate --all --strict`) passes with zero warnings or errors.
-> 5. **Live VPS Staging Run**: A complete ACME staging execution (`--mode full` with `ACME_MODE=staging`) executed on freshly provisioned, disposable VPS instances must achieve an overall verdict of `PASS` with verified teardown.
->
-> *A green mock CI run, documentation-only PR, or simulated unit test run is NOT evidence that the runner is ready for two-VPS rollout.*
+The controller targets Linux and root SSH password bootstrap. It does not provision or destroy VPS instances, change SSH daemon policy, support non-root sudo accounts, or install local Xray/Mihomo binaries or target-side tcpdump automatically. Do not bypass host-key fingerprint confirmation or use production ACME for routine acceptance.

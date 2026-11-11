@@ -62,6 +62,7 @@ from live_vps.traffic import (
     evaluate_traffic_suite_status,
     get_remote_egress_ip,
     classify_xray_outbound,
+    get_control_egress_ip,
 )
 from live_vps.negative import run_negative_suite
 from live_vps.teardown import execute_teardown
@@ -107,12 +108,14 @@ def evaluate_preflight_eligibility(
     worker_baseline: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Evaluate read-only preflight and fail closed until safety gates are implemented."""
-    vision_requested = bool(config.master_vision_domain and config.worker_vision_domain)
+    master_vision_requested = bool(config.master_vision_domain)
+    worker_vision_requested = bool(config.worker_vision_domain)
+    vision_requested = master_vision_requested or worker_vision_requested
     master_gate_ok, master_errors = check_disposable_gate(
-        master_baseline, vision_enabled=vision_requested
+        master_baseline, vision_enabled=master_vision_requested
     )
     worker_gate_ok, worker_errors = check_disposable_gate(
-        worker_baseline, vision_enabled=vision_requested
+        worker_baseline, vision_enabled=worker_vision_requested
     )
     prerequisites_ok = all((
         tools_ok, master_trust_ok, worker_trust_ok, dns_ok,
@@ -183,7 +186,7 @@ def build_test_cases_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     results = state.get("results", {})
     for phase_name, p_data in results.items():
         if isinstance(p_data, dict):
-            status = p_data.get("status", "PASS")
+            status = p_data.get("status", "INCOMPLETE")
             msg = p_data.get("error") or p_data.get("message") or ""
             cases.append({
                 "name": f"phase_{phase_name}",
@@ -197,7 +200,7 @@ def build_test_cases_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                     cases.append({
                         "name": f"traffic_xray_{xc.get('tag', 'unknown')}",
                         "classname": "live_vps.traffic.xray",
-                        "status": xc.get("status", "PASS"),
+                        "status": xc.get("status", "INCOMPLETE"),
                         "message": xc.get("error") or xc.get("message") or "",
                         "duration": xc.get("duration", "0.0"),
                     })
@@ -205,9 +208,9 @@ def build_test_cases_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                 m_cases = m_res.get("results", []) if isinstance(m_res, dict) else []
                 for mc in m_cases:
                     cases.append({
-                        "name": f"traffic_mihomo_{mc.get('name', 'unknown')}",
+                        "name": f"traffic_mihomo_{mc.get('proxy') or mc.get('name') or 'unknown'}",
                         "classname": "live_vps.traffic.mihomo",
-                        "status": mc.get("status", "PASS"),
+                        "status": mc.get("status", "INCOMPLETE"),
                         "message": mc.get("error") or mc.get("message") or "",
                         "duration": mc.get("duration", "0.0"),
                     })
@@ -216,7 +219,7 @@ def build_test_cases_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
                     cases.append({
                         "name": f"negative_{sc.get('id', 'unknown')}",
                         "classname": "live_vps.negative",
-                        "status": sc.get("status", "PASS"),
+                        "status": sc.get("status", "INCOMPLETE"),
                         "message": sc.get("error") or sc.get("message") or "",
                         "duration": sc.get("duration", "0.0"),
                     })
@@ -522,15 +525,15 @@ def main() -> int:
 
             short_uuid = get_default_user_short_uuid(panel_client)
             ua_res = verify_user_agent_policy(config.master_panel_domain, short_uuid, ssl_ctx)
-            vision_enabled = bool(config.master_vision_domain and config.worker_vision_domain)
+            vision_count = int(bool(config.master_vision_domain)) + int(bool(config.worker_vision_domain))
             xray_sub_ok, xray_sub_res = fetch_and_validate_xray_subscription(
                 config.master_panel_domain, short_uuid, ssl_ctx,
-                has_vision=vision_enabled, ca_bundle_path=ca_bundle,
+                vision_count=vision_count, ca_bundle_path=ca_bundle,
                 reality_fingerprint=config.reality_fingerprint,
             )
             mih_sub_ok, mih_sub_res = fetch_and_validate_mihomo_subscription(
                 config.master_panel_domain, short_uuid, ssl_ctx,
-                has_vision=vision_enabled, ca_bundle_path=ca_bundle,
+                vision_count=vision_count, ca_bundle_path=ca_bundle,
                 reality_fingerprint=config.reality_fingerprint,
             )
 
@@ -601,6 +604,9 @@ def main() -> int:
             except Exception:
                 pass
 
+            # Resolve the operator's public IPv4 once; both VPS packet captures use it
+            # to attribute inbound test traffic to this control machine.
+            control_egress_ip = get_control_egress_ip()
             xray_case_results = []
             for ob in xray_raw_outbounds:
                 if ob.get("protocol") in ("vless", "trojan", "vmess", "shadowsocks"):
@@ -630,6 +636,7 @@ def main() -> int:
                         worker_ssh=worker_ssh,
                         is_worker_endpoint=is_worker,
                         acme_mode=config.acme_mode,
+                        source_ip=control_egress_ip,
                     )
                     xray_case_results.append(res)
 
@@ -639,9 +646,10 @@ def main() -> int:
                 config=config,
                 master_ssh=master_ssh,
                 worker_ssh=worker_ssh,
+                source_ip=control_egress_ip,
             )
 
-            expected_per_client = 10 if (config.master_vision_domain and config.worker_vision_domain) else 8
+            expected_per_client = 8 + int(bool(config.master_vision_domain)) + int(bool(config.worker_vision_domain))
             traffic_status = evaluate_traffic_suite_status(
                 test_traffic_verification=config.test_traffic_verification,
                 xray_results=xray_case_results,

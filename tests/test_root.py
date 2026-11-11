@@ -13,7 +13,7 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-from modules.recovery import validate_journal, JournalValidationError
+from modules.recovery import load_journal_file, validate_journal, JournalValidationError
 
 
 class TestRoot(unittest.TestCase):
@@ -21,6 +21,57 @@ class TestRoot(unittest.TestCase):
     def setUp(self):
         if os.geteuid() != 0:
             self.skipTest("Suite root requires root privileges (EUID 0)")
+
+    def test_recovery_journal_loader_rejects_symlink_and_fifo(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            dangling = root / "journal.json"
+            dangling.symlink_to(root / "missing.json")
+            with self.assertRaises(OSError):
+                load_journal_file(dangling)
+
+            fifo = root / "journal.fifo"
+            os.mkfifo(fifo)
+            with self.assertRaises(OSError):
+                load_journal_file(fifo)
+
+    def test_recovery_journal_cli_rejects_dangling_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            dangling = root / "journal.json"
+            dangling.symlink_to(root / "missing.json")
+            result = subprocess.run(
+                ["python3", str(REPO_ROOT / "modules" / "recovery.py"), "--validate-journal", str(dangling)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_boot_recovery_rejects_dangling_journal_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            journal = root / "journal.json"
+            journal.symlink_to(root / "missing.json")
+            env = os.environ.copy()
+            env["JOURNAL_FILE"] = str(journal)
+            env["RECOVERY_DIR"] = str(root / "recovery")
+            env["MUTATION_LOCK_FILE"] = str(root / "mutation.lock")
+            for function in ("recover_boot_files", "recover_boot_provision"):
+                result = subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        f'source "$1/modules/recovery.sh"; {function}',
+                        "test",
+                        str(REPO_ROOT),
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0, function)
+                self.assertIn("recovery journal is a symlink or non-regular file", result.stderr)
+                self.assertTrue(journal.is_symlink())
 
     def test_euid_zero(self):
         """Assert current runner is EUID 0."""

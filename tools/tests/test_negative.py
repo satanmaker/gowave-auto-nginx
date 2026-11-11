@@ -49,10 +49,24 @@ class TestNegativeScenarios(unittest.TestCase):
         self.assertEqual(res["scenario"], "NEG-01")
         self.assertEqual(res["status"], "PASS")
 
-    def test_neg_02_unreachable_port(self):
-        res = run_neg_02_ssh_port_unreachable()
-        self.assertEqual(res["scenario"], "NEG-02")
-        self.assertEqual(res["status"], "PASS")
+    @patch("live_vps.negative.socket.create_connection", side_effect=ConnectionRefusedError)
+    def test_neg_02_refused_connection_is_a_proven_rejection(self, create_connection):
+        result = run_neg_02_ssh_port_unreachable()
+
+        self.assertEqual(result["scenario"], "NEG-02")
+        self.assertEqual(result["status"], "PASS")
+        create_connection.assert_called_once_with(("127.0.0.1", 59998), timeout=0.5)
+
+    @patch("live_vps.negative.socket.create_connection")
+    def test_neg_02_open_port_is_a_negative_test_failure(self, create_connection):
+        connection = MagicMock()
+        create_connection.return_value.__enter__.return_value = connection
+
+        result = run_neg_02_ssh_port_unreachable()
+
+        self.assertEqual(result["scenario"], "NEG-02")
+        self.assertEqual(result["status"], "FAIL")
+        create_connection.assert_called_once_with(("127.0.0.1", 59998), timeout=0.5)
 
     @patch("live_vps.negative.verify_domain_dns")
     def test_neg_03_wrong_ip_with_two_resolver_answers_is_pass(self, verify_dns):

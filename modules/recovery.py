@@ -8,10 +8,12 @@ from datetime import datetime
 import math
 from pathlib import Path
 import shutil
+import stat
 import sqlite3
 import subprocess
 import sys
 import time
+import tempfile
 
 VALID_OPS = {"provision", "node_add", "update", "channel_switch", "restore"}
 OP_ALLOWED_STATES = {
@@ -32,6 +34,18 @@ VALID_STATES = {st for states in OP_ALLOWED_STATES.values() for st in states}
 
 class JournalValidationError(Exception):
     pass
+
+
+def load_journal_file(journal_path):
+    """Load a regular recovery journal without following symlinks or blocking on special files."""
+    fd = os.open(
+        str(journal_path),
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+    )
+    with os.fdopen(fd, "r", encoding="utf-8") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError("recovery journal is not a regular file")
+        return json.load(stream)
 
 
 def validate_journal(journal_data):
@@ -76,8 +90,12 @@ def validate_journal(journal_data):
                     raise JournalValidationError(f"Invalid entity entry at index {index}")
                 if item.get("type") not in {"profile", "node", "squad", "host", "user", "token"}:
                     raise JournalValidationError(f"Unsupported entity type at index {index}")
-                if item.get("action") not in {"created", "updated", "adopted"}:
+                if item.get("action") not in {"created", "updated", "adopted", "pending_create"}:
                     raise JournalValidationError(f"Unsupported entity action at index {index}")
+                if item["action"] == "pending_create":
+                    if set(item) != {"type", "action"}:
+                        raise JournalValidationError(f"Pending create entry has unexpected fields at index {index}")
+                    continue
                 if not isinstance(item.get("uuid"), str) or not item["uuid"].strip():
                     raise JournalValidationError(f"Missing entity UUID at index {index}")
                 if item["action"] == "updated":
@@ -118,7 +136,16 @@ def write_journal_atomically(journal_path, journal_data):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.parent / f"{path.name}.tmp"
 
-    with open(tmp_path, "w") as f:
+    # The journal contains rollback before-images (including private config
+    # material); create it as 0600 before writing and never follow a pre-planted
+    # temporary symlink.
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+        0o600,
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        os.fchmod(f.fileno(), 0o600)
         json.dump(journal_data, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
@@ -240,27 +267,51 @@ def sqlite_online_backup(db_path, backup_dest, gowave_user="gowave"):
     sqlite_preflight_checkpoint(db_file, gowave_user if is_root else None)
 
     # Staged backup into pre-created file
-    staged_file = db_file.parent / f".backup-{int(time.time())}.db"
+    # Use a unique staging file; timestamp-only names collide for concurrent backups.
+    fd, staged_name = tempfile.mkstemp(prefix=".backup-", suffix=".db", dir=str(db_file.parent))
+    os.close(fd)
+    staged_file = Path(staged_name)
 
-    if is_root:
-        # Pre-create with 0640 ownership gowave:gowave
-        subprocess.run(["install", "-o", gowave_user, "-g", gowave_user, "-m", "0640", "/dev/null", str(staged_file)], check=True)
-        # Execute backup under service user privileges
-        backup_cmd = f"sqlite3 '{db_file}' '.backup {staged_file}'"
-        subprocess.run(["runuser", "-u", gowave_user, "--", "bash", "-c", backup_cmd], check=True)
-        # Move into private recovery storage
+    try:
+        if is_root:
+            # The service user performs the SQLite Online Backup, but all paths
+            # are passed as argv rather than interpolated into a shell command.
+            subprocess.run(["chown", f"{gowave_user}:{gowave_user}", str(staged_file)], check=True)
+            os.chmod(str(staged_file), 0o640)
+            backup_script = (
+                "import sqlite3, sys\n"
+                "source = sqlite3.connect(sys.argv[1], timeout=5.0)\n"
+                "destination = sqlite3.connect(sys.argv[2], timeout=5.0)\n"
+                "try:\n"
+                "    source.backup(destination)\n"
+                "finally:\n"
+                "    destination.close()\n"
+                "    source.close()\n"
+            )
+            subprocess.run(
+                ["runuser", "-u", gowave_user, "--", "python3", "-c",
+                 backup_script, str(db_file), str(staged_file)],
+                check=True,
+            )
+        else:
+            # Non-root fallback (for testing/unprivileged execution).
+            bconn = sqlite3.connect(str(staged_file))
+            try:
+                src_conn = sqlite3.connect(str(db_file))
+                try:
+                    src_conn.backup(bconn)
+                finally:
+                    src_conn.close()
+            finally:
+                bconn.close()
+
         shutil.move(str(staged_file), str(dest_file))
         os.chmod(str(dest_file), 0o600)
-    else:
-        # Non-root fallback (for testing/unprivileged execution)
-        bconn = sqlite3.connect(str(dest_file))
+    finally:
         try:
-            src_conn = sqlite3.connect(str(db_file))
-            src_conn.backup(bconn)
-            src_conn.close()
-        finally:
-            bconn.close()
-        os.chmod(str(dest_file), 0o600)
+            staged_file.unlink()
+        except FileNotFoundError:
+            pass
 
     # Verify integrity of destination copy
     dest_conn = sqlite3.connect(str(dest_file))
@@ -276,8 +327,7 @@ def sqlite_online_backup(db_path, backup_dest, gowave_user="gowave"):
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--validate-journal":
-        with open(sys.argv[2]) as f:
-            data = json.load(f)
+        data = load_journal_file(sys.argv[2])
         validate_journal(data)
         print("Journal valid.")
     else:

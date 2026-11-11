@@ -11,9 +11,90 @@ STATE_FILE="${STATE_FILE:-/var/lib/gowave-auto-nginx/state.json}"
 CREDENTIALS_FILE="${CREDENTIALS_FILE:-/root/gowave-credentials.txt}"
 GOWAVE_DIR="${GOWAVE_DIR:-/opt/gowave}"
 
+ensure_private_recovery_directory() {
+    local dir="$1"
+    local current="" component metadata owner mode
+    local -a components=()
+
+    if [[ "$dir" != /* || "$dir" == "/" || "$dir" == *"//"* ]]; then
+        echo "CRITICAL: recovery directory path must be normalized and absolute, not filesystem root." >&2
+        return 1
+    fi
+
+    # Reject symlinks in every existing path component, not only the leaf.
+    IFS='/' read -r -a components <<< "$dir"
+    for component in "${components[@]}"; do
+        [[ -z "$component" ]] && continue
+        if [[ "$component" == "." || "$component" == ".." ]]; then
+            echo "CRITICAL: recovery directory path must not contain dot segments." >&2
+            return 1
+        fi
+        current+="/$component"
+        if [[ -L "$current" ]]; then
+            echo "CRITICAL: recovery directory path contains a symlink: $current" >&2
+            return 1
+        fi
+    done
+
+    mkdir -p -- "$dir" || {
+        echo "CRITICAL: cannot create recovery directory." >&2
+        return 1
+    }
+
+    # Recheck after creation to catch a replaced path before changing permissions.
+    current=""
+    for component in "${components[@]}"; do
+        [[ -z "$component" ]] && continue
+        if [[ "$component" == "." || "$component" == ".." ]]; then
+            echo "CRITICAL: recovery directory path must not contain dot segments." >&2
+            return 1
+        fi
+        current+="/$component"
+        if [[ -L "$current" ]]; then
+            echo "CRITICAL: recovery directory path was replaced by a symlink: $current" >&2
+            return 1
+        fi
+    done
+    if [[ "$dir" == "/" || ! -d "$dir" || -L "$dir" ]]; then
+        echo "CRITICAL: recovery path must be a dedicated real directory, not a filesystem root." >&2
+        return 1
+    fi
+
+    metadata=$(stat -c '%u:%a' -- "$dir") || {
+        echo "CRITICAL: cannot verify recovery directory ownership and permissions." >&2
+        return 1
+    }
+    owner="${metadata%%:*}"
+    if [[ "$owner" != "$(id -u)" ]]; then
+        echo "CRITICAL: recovery directory must be owned by the current user." >&2
+        return 1
+    fi
+
+    chmod 0700 -- "$dir" || {
+        echo "CRITICAL: cannot enforce private recovery directory permissions." >&2
+        return 1
+    }
+    metadata=$(stat -c '%u:%a' -- "$dir") || {
+        echo "CRITICAL: cannot verify recovery directory ownership and permissions." >&2
+        return 1
+    }
+    owner="${metadata%%:*}"
+    mode="${metadata#*:}"
+    if [[ "$owner" != "$(id -u)" || "$mode" != "700" ]]; then
+        echo "CRITICAL: recovery directory must be owned by the current user and have mode 0700." >&2
+        return 1
+    fi
+}
+
 ensure_recovery_dir() {
-    mkdir -p "$RECOVERY_DIR"
-    chmod 0700 "$RECOVERY_DIR" 2>/dev/null || true
+    case "$RECOVERY_DIR" in
+        */recovery) ;;
+        *)
+            echo "CRITICAL: RECOVERY_DIR must name a dedicated 'recovery' directory." >&2
+            return 1
+            ;;
+    esac
+    ensure_private_recovery_directory "$RECOVERY_DIR"
 }
 
 take_preflight_db_snapshot() {
@@ -21,8 +102,7 @@ take_preflight_db_snapshot() {
     local db_path="${2:-$GOWAVE_DIR/gowave.db}"
 
     ensure_recovery_dir
-    mkdir -p "$target_snapshot_dir"
-    chmod 0700 "$target_snapshot_dir" 2>/dev/null || true
+    ensure_private_recovery_directory "$target_snapshot_dir"
 
     echo "Executing transactional SQLite Online Backup..." >&2
     PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
@@ -43,8 +123,7 @@ prepare_update_snapshot() {
     local snap_dir="${RECOVERY_DIR}/update-${ts}"
 
     ensure_recovery_dir
-    mkdir -p "$snap_dir"
-    chmod 0700 "$snap_dir" 2>/dev/null || true
+    ensure_private_recovery_directory "$snap_dir"
 
     echo "Capturing pre-update persistent recovery snapshot in $snap_dir..." >&2
 
@@ -157,8 +236,12 @@ execute_file_rollback() {
 
 recover_boot_files() {
     acquire_mutation_lock || return 1
-    if [[ ! -f "$JOURNAL_FILE" ]]; then
+    if [[ ! -e "$JOURNAL_FILE" && ! -L "$JOURNAL_FILE" ]]; then
         return 0
+    fi
+    if [[ -L "$JOURNAL_FILE" || ! -f "$JOURNAL_FILE" ]]; then
+        echo "CRITICAL: recovery journal is a symlink or non-regular file; refusing automatic recovery." >&2
+        return 1
     fi
 
     echo "Inspecting journal for interrupted file transactions on boot..."
@@ -170,8 +253,8 @@ recover_boot_files() {
     fi
 
     local state snap_dir
-    state=$(python3 -c "import json; print(json.load(open('$JOURNAL_FILE')).get('state', ''))")
-    snap_dir=$(python3 -c "import json; print(json.load(open('$JOURNAL_FILE')).get('snapshot_dir', ''))")
+    state=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "from modules.recovery import load_journal_file; print(load_journal_file('$JOURNAL_FILE').get('state', ''))")
+    snap_dir=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "from modules.recovery import load_journal_file; print(load_journal_file('$JOURNAL_FILE').get('snapshot_dir', ''))")
 
     if [[ "$state" == "APPLYING" || "$state" == "VERIFYING" || "$state" == "ROLLBACK_REQUIRED" ]]; then
         echo "Detected interrupted update/restore in state $state. Performing file rollback..."
@@ -195,7 +278,8 @@ PY
         PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
 import json, sys, time
 from modules.recovery import write_journal_atomically
-data = json.load(open('$JOURNAL_FILE'))
+from modules.recovery import load_journal_file
+data = load_journal_file('$JOURNAL_FILE')
 data['state'] = 'ROLLED_BACK'
 data['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 write_journal_atomically('$JOURNAL_FILE', data)
@@ -206,8 +290,12 @@ write_journal_atomically('$JOURNAL_FILE', data)
 
 recover_boot_provision() {
     acquire_mutation_lock || return 1
-    if [[ ! -f "$JOURNAL_FILE" ]]; then
+    if [[ ! -e "$JOURNAL_FILE" && ! -L "$JOURNAL_FILE" ]]; then
         return 0
+    fi
+    if [[ -L "$JOURNAL_FILE" || ! -f "$JOURNAL_FILE" ]]; then
+        echo "CRITICAL: recovery journal is a symlink or non-regular file; refusing automatic recovery." >&2
+        return 1
     fi
 
     if ! python3 "$RECOVERY_PY" --validate-journal "$JOURNAL_FILE"; then
@@ -216,7 +304,7 @@ recover_boot_provision() {
     fi
 
     local state
-    state=$(python3 -c "import json; print(json.load(open('$JOURNAL_FILE')).get('state', ''))")
+    state=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "from modules.recovery import load_journal_file; print(load_journal_file('$JOURNAL_FILE').get('state', ''))")
 
     if [[ "$state" =~ ^PROVISION_ || "$state" =~ ^NODE_ADD_ ]]; then
         if [[ "$state" != "PROVISION_COMMITTED" && "$state" != "NODE_ADD_COMMITTED" && "$state" != "PROVISION_ROLLED_BACK" && "$state" != "NODE_ADD_ROLLED_BACK" ]]; then
@@ -325,7 +413,8 @@ PY
     PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
 import json, sys, time
 from modules.recovery import write_journal_atomically, prune_snapshots
-data = json.load(open('$JOURNAL_FILE'))
+from modules.recovery import load_journal_file
+data = load_journal_file('$JOURNAL_FILE')
 data['state'] = 'COMMITTED'
 data['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 write_journal_atomically('$JOURNAL_FILE', data)

@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import secrets
+import ssl
+import stat
 import string
 import sys
 import time
@@ -112,6 +114,24 @@ class GoWaveClient:
         if self.transaction_callback is not None:
             self.transaction_callback(self.transaction_entities)
 
+    def _record_pending_create(self, resource_type):
+        """Persist an unresolved create intent before sending a mutating API request."""
+        entry = {"type": resource_type, "action": "pending_create"}
+        self.transaction_entities.append(entry)
+        if self.transaction_callback is not None:
+            self.transaction_callback(self.transaction_entities)
+        return entry
+
+    def _complete_pending_create(self, entry, uuid):
+        if not uuid:
+            raise GoWaveAPIError(
+                f"Cannot complete journaled create for {entry.get('type')}: API response has no UUID"
+            )
+        entry["uuid"] = str(uuid)
+        entry["action"] = "created"
+        if self.transaction_callback is not None:
+            self.transaction_callback(self.transaction_entities)
+
     def request(self, method, endpoint, data=None, headers=None, authenticate=True):
         url = f"{self.base_url}{endpoint}"
         req_headers = {
@@ -136,7 +156,20 @@ class GoWaveClient:
 
         req = urllib.request.Request(url, data=encoded_data, headers=req_headers, method=method)
 
-        max_retries = 3
+        # Persist an APPLYING checkpoint before non-idempotent creates. If the
+        # API commits a POST but the subsequent UUID journal write fails, the
+        # on-disk journal must not still look like a side-effect-free PREPARED
+        # transaction.
+        if method.upper() == "POST" and endpoint not in ("/api/auth/login", "/api/auth/register") and self.transaction_callback is not None:
+            self.transaction_callback(self.transaction_entities)
+
+        # Retrying a mutation after a timeout or 5xx can duplicate a request
+        # that the server already committed but whose response was lost.
+        # Restrict automatic retries to methods with safe/idempotent semantics.
+        retryable_method = method.upper() in {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
+        # Non-idempotent requests still get one retry after an explicit 401:
+        # authentication rejection guarantees the mutation was not accepted.
+        max_retries = 3 if retryable_method else 2
         for attempt in range(max_retries):
             try:
                 urlopen_kwargs = {"timeout": self.timeout}
@@ -161,24 +194,34 @@ class GoWaveClient:
                     continue
 
                 # Handle HTTP 429 Rate Limiting with exponential backoff 2, 4, 8s (or Retry-After header)
-                if e.code == 429 and attempt < max_retries - 1:
+                if retryable_method and e.code == 429 and attempt < max_retries - 1:
                     retry_after = e.headers.get("Retry-After")
                     delay = int(retry_after) if retry_after and retry_after.isdigit() else 2 ** (attempt + 1)
                     time.sleep(delay)
                     continue
 
                 # Handle HTTP 5xx Server Errors (500, 502, 503, 504) with backoff 1, 2, 4s
-                if e.code in (500, 502, 503, 504) and attempt < max_retries - 1:
+                if retryable_method and e.code in (500, 502, 503, 504) and attempt < max_retries - 1:
                     delay = 2 ** attempt
                     time.sleep(delay)
                     continue
 
-                # Parse JSON error if available
-                error_msg = f"HTTP {e.code} on {method} {endpoint}: {err_body}"
+                # Keep the raw response available to programmatic callers, but never
+                # include an untrusted response body in an exception string/traceback.
+                error_msg = f"HTTP {e.code} on {method} {endpoint}"
                 raise GoWaveAPIError(error_msg, status_code=e.code, response_body=err_body) from e
             except (urllib.error.URLError, TimeoutError, ConnectionResetError) as e:
-                if attempt == max_retries - 1:
-                    raise GoWaveAPIError(f"Network error on {method} {endpoint}: {e}") from e
+                if not retryable_method or attempt == max_retries - 1:
+                    reason = getattr(e, "reason", None)
+                    if isinstance(reason, ssl.SSLCertVerificationError):
+                        category = "TLS verification error"
+                    elif isinstance(reason, ssl.SSLError):
+                        category = "TLS error"
+                    else:
+                        category = type(e).__name__
+                    raise GoWaveAPIError(
+                        f"Network error on {method} {endpoint} ({category})"
+                    ) from None
                 time.sleep(1)
 
     def register_initial_admin(self, username, password):
@@ -201,7 +244,7 @@ class GoWaveClient:
         if isinstance(res, dict):
             token = res.get("response", {}).get("accessToken") or res.get("accessToken")
         if not token:
-            raise GoWaveAPIError(f"Failed to obtain accessToken from login response: {res}")
+            raise GoWaveAPIError("Failed to obtain accessToken from login response")
         self.token = token
         self.token_expiry = time.time() + (12 * 3600) - 300
         return token
@@ -225,7 +268,7 @@ class GoWaveClient:
             public_key = data[0].get("publicKey")
 
         if not private_key or not public_key:
-            raise GoWaveAPIError(f"Invalid x25519 response: {res}")
+            raise GoWaveAPIError("Invalid x25519 response: required key material is missing")
         return {"privateKey": private_key, "publicKey": public_key}
 
     def compile_config_profile(self, node_name, reality_domain, private_key, short_ids=None, public_key=None, vision_domain=None, panel_domain=None):
@@ -342,10 +385,11 @@ class GoWaveClient:
             self.request("PATCH", f"/api/config-profiles/{target_uuid}", {"name": profile_name, "config": raw_config_json})
             profile_uuid = target_uuid
         else:
+            pending = self._record_pending_create("profile")
             res = self.request("POST", "/api/config-profiles", {"name": profile_name, "config": raw_config_json})
             data = res.get("response", res)
             profile_uuid = data.get("uuid")
-            self._record_transaction_entity("profile", profile_uuid, "created")
+            self._complete_pending_create(pending, profile_uuid)
 
         # 5-point verification checklist on computed-config
         computed = self.request("GET", f"/api/config-profiles/{profile_uuid}/computed-config")
@@ -419,10 +463,11 @@ class GoWaveClient:
                 res = self.request("PATCH", f"/api/nodes/{found_uuid}", payload)
                 node_uuid = found_uuid
             else:
+                pending = self._record_pending_create("node")
                 res = self.request("POST", "/api/nodes", payload)
                 data = res.get("response", res)
                 node_uuid = data.get("uuid")
-                self._record_transaction_entity("node", node_uuid, "created")
+                self._complete_pending_create(pending, node_uuid)
 
         return node_uuid
 
@@ -446,10 +491,11 @@ class GoWaveClient:
             self._record_transaction_entity("squad", squad_uuid, "updated", before)
             self.request("PATCH", "/api/internal-squads", {"uuid": squad_uuid, "name": squad_name, "inbounds": all_inbounds})
         else:
+            pending = self._record_pending_create("squad")
             res = self.request("POST", "/api/internal-squads", {"name": squad_name, "inbounds": all_inbounds})
             data = res.get("response", res)
             squad_uuid = data.get("uuid")
-            self._record_transaction_entity("squad", squad_uuid, "created")
+            self._complete_pending_create(pending, squad_uuid)
 
         return squad_uuid
 
@@ -576,10 +622,11 @@ class GoWaveClient:
                 payload["uuid"] = host_uuid
                 self.request("PATCH", "/api/hosts", payload)
             else:
+                pending = self._record_pending_create("host")
                 res = self.request("POST", "/api/hosts", payload)
                 data = res.get("response", res)
                 host_uuid = data.get("uuid")
-                self._record_transaction_entity("host", host_uuid, "created")
+                self._complete_pending_create(pending, host_uuid)
 
             created_host_uuids.append(host_uuid)
 
@@ -606,10 +653,11 @@ class GoWaveClient:
             "expireAt": expire_at,
             "activeInternalSquads": [squad_uuid],
         }
+        pending = self._record_pending_create("user")
         res = self.request("POST", "/api/users", payload)
         data = res.get("response", res)
         short_uuid = data.get("shortUuid")
-        self._record_transaction_entity("user", data.get("uuid") or data.get("id"), "created")
+        self._complete_pending_create(pending, data.get("uuid") or data.get("id"))
         return short_uuid
 
     def issue_api_token(self, token_name="gowave-auto-sub-token"):
@@ -626,11 +674,12 @@ class GoWaveClient:
             "scopes": scopes,
             "expiresInDays": 365,
         }
+        pending = self._record_pending_create("token")
         res = self.request("POST", "/api/tokens", payload)
         data = res.get("response", res)
         token_str = data.get("token")
         token_id = data.get("id") or data.get("uuid")
-        self._record_transaction_entity("token", token_id, "created")
+        self._complete_pending_create(pending, token_id)
         return {"token": token_str, "id": token_id}
 
     def delete_token(self, token_id):
@@ -690,12 +739,19 @@ def atomic_write_state(state_data, state_path="/var/lib/gowave-auto-nginx/state.
     state_data["schemaVersion"] = 2
     state_data["lastUpdated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    with open(tmp_path, "w") as f:
+    # State may be written with elevated privileges; never follow a pre-planted
+    # temporary symlink and apply private permissions before serializing data.
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+        0o600,
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        os.fchmod(f.fileno(), 0o600)
         json.dump(state_data, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
 
-    os.chmod(tmp_path, 0o600)
     os.replace(tmp_path, path)
 
     # Sync parent directory
@@ -721,29 +777,47 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
         except ImportError:
             def write_journal_atomically(p, d):
                 tmp = f"{p}.tmp"
-                with open(tmp, "w") as f:
+                fd = os.open(
+                    tmp,
+                    os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                    0o600,
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    os.fchmod(f.fileno(), 0o600)
                     json.dump(d, f, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
-                os.chmod(tmp, 0o600)
                 os.replace(tmp, p)
+                dir_fd = os.open(str(Path(p).parent), os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
 
     journal_file = Path(journal_path)
-    if not journal_file.exists():
+    if not journal_file.exists() and not journal_file.is_symlink():
         return True
 
     try:
-        with open(journal_file, "r") as f:
-            journal_data = json.load(f)
+        journal_fd = os.open(
+            str(journal_file),
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        with os.fdopen(journal_fd, "r", encoding="utf-8") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise OSError("recovery journal is not a regular file")
+            journal_data = json.load(stream)
+    except FileNotFoundError:
+        return True
     except Exception as e:
-        print(f"Warning: Failed to load journal {journal_file}: {e}", file=sys.stderr)
+        print(f"Warning: Failed to load recovery journal ({type(e).__name__}).", file=sys.stderr)
         return False
 
     try:
         from modules.recovery import validate_journal
         validate_journal(journal_data)
     except Exception as e:
-        print(f"Refusing API rollback because journal validation failed: {e}", file=sys.stderr)
+        print(f"Refusing API rollback because journal validation failed ({type(e).__name__}).", file=sys.stderr)
         return False
 
     op = journal_data.get("op", "")
@@ -759,6 +833,18 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
 
     entities = journal_data.get("entities")
     if entities == {} or entities == []:
+        prepared_states = {"PROVISION_PREPARED", "NODE_ADD_PREPARED"}
+        if state not in prepared_states:
+            required_state = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
+            journal_data["state"] = required_state
+            journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            journal_data["rollback_error"] = (
+                "Transaction entered APPLYING/VERIFYING without a durable action ledger; "
+                "API side effects may exist and automatic rollback is unsafe."
+            )
+            write_journal_atomically(str(journal_file), journal_data)
+            print(journal_data["rollback_error"], file=sys.stderr)
+            return False
         journal_data["state"] = "PROVISION_ROLLED_BACK" if op == "provision" else "NODE_ADD_ROLLED_BACK"
         journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         write_journal_atomically(str(journal_file), journal_data)
@@ -777,6 +863,24 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
         print(f"Refusing provisioning rollback for unsupported operation: {op}", file=sys.stderr)
         return False
 
+    pending_create_errors = [
+        f"Unresolved {item.get('type')} create request: API outcome is unknown and no UUID was durably recorded."
+        for item in entities
+        if isinstance(item, dict) and item.get("action") == "pending_create"
+    ]
+    known_mutations = [
+        item for item in entities
+        if isinstance(item, dict) and item.get("action") in ("created", "updated")
+    ]
+    if pending_create_errors and not known_mutations:
+        journal_data["state"] = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
+        journal_data["rollback_errors"] = pending_create_errors
+        journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        write_journal_atomically(str(journal_file), journal_data)
+        for message in pending_create_errors:
+            print(message, file=sys.stderr)
+        return False
+
     # Read credentials
     username = "admin"
     password = ""
@@ -793,15 +897,23 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
                 elif line.startswith("Admin Password:"):
                     password = line.split(":", 1)[1].strip()
         except Exception as e:
-            print(f"Warning reading credentials file: {e}", file=sys.stderr)
+            print(f"Warning reading credentials file ({type(e).__name__}).", file=sys.stderr)
 
     if not password:
         env_file = Path("/opt/gowave/.env")
         if env_file.exists():
-            for line in env_file.read_text().splitlines():
-                if line.startswith("ADMIN_PASSWORD="):
-                    password = line.split("=", 1)[1].strip()
+            try:
+                for line in env_file.read_text().splitlines():
+                    if line.startswith("ADMIN_PASSWORD="):
+                        password = line.split("=", 1)[1].strip()
+            except Exception as exc:
+                print(f"Warning reading environment credentials ({type(exc).__name__}).", file=sys.stderr)
     if not password:
+        errors = pending_create_errors + ["Cannot reconcile recorded API mutations: no admin password is available."]
+        journal_data["state"] = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
+        journal_data["rollback_errors"] = errors
+        journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        write_journal_atomically(str(journal_file), journal_data)
         print("Refusing API rollback: no admin password is available.", file=sys.stderr)
         return False
 
@@ -810,28 +922,56 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
         try:
             client.login(username, password)
         except Exception as e:
-            print(f"Warning: Login failed during rollback: {e}", file=sys.stderr)
+            status = getattr(e, "status_code", None)
+            suffix = f", HTTP {status}" if isinstance(status, int) and not isinstance(status, bool) else ""
+            errors = pending_create_errors + [f"Cannot reconcile recorded API mutations: login failed ({type(e).__name__}{suffix})."]
+            journal_data["state"] = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
+            journal_data["rollback_errors"] = errors
+            journal_data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            write_journal_atomically(str(journal_file), journal_data)
+            print(f"Warning: Login failed during rollback ({type(e).__name__}{suffix}).", file=sys.stderr)
             return False
 
-    # Check state data if exists
+    # Node-add rollback must also reconcile the local state file. Prefer the
+    # committed state.json, but recover from a valid atomic-write temp file if
+    # the process crashed between writing and replacing it.
     state_file = Path(state_path)
-    state_data = {}
-    if state_file.exists():
-        try:
-            with open(state_file, "r") as f:
-                state_data = json.load(f)
-        except Exception:
-            pass
-
-    tmp_state = state_file.parent / f"{state_file.name}.tmp"
-    if tmp_state.exists():
-        try:
-            with open(tmp_state, "r") as f:
-                tmp_data = json.load(f)
-                if not state_data:
-                    state_data = tmp_data
-        except Exception:
-            pass
+    state_data = None
+    state_source = None
+    state_errors = []
+    worker_name = ""
+    if op == "node_add":
+        worker_name = journal_data.get("node_name", "")
+        if not worker_name:
+            tid = journal_data.get("transaction_id", "")
+            if isinstance(tid, str) and tid.startswith("node_add_"):
+                worker_name = tid[len("node_add_"):]
+        if not isinstance(worker_name, str) or not worker_name:
+            state_errors.append("Node-add journal is missing a valid worker name; local state cannot be reconciled.")
+        tmp_state = state_file.parent / f"{state_file.name}.tmp"
+        candidate_errors = []
+        for candidate in (state_file, tmp_state):
+            if not candidate.exists():
+                continue
+            try:
+                with open(candidate, "r", encoding="utf-8") as stream:
+                    candidate_data = json.load(stream)
+                if not isinstance(candidate_data, dict):
+                    raise ValueError("state root must be a JSON object")
+                nodes = candidate_data.get("nodes")
+                if not isinstance(nodes, list) or any(not isinstance(node, dict) for node in nodes):
+                    raise ValueError("state nodes must be an array of objects")
+                state_data = candidate_data
+                state_source = candidate
+                break
+            except Exception as exc:
+                candidate_errors.append(f"Cannot load valid node-add state from {candidate.name}: {type(exc).__name__}.")
+        if state_data is None:
+            state_errors.extend(candidate_errors)
+            if not candidate_errors:
+                state_errors.append("Node-add state.json and its temporary file are both missing; local state cannot be reconciled.")
+            else:
+                state_errors.append("No valid node-add state file is available; local state cannot be reconciled.")
 
     # Both initial provisioning and worker addition use the same action-aware
     # transaction ledger. Legacy UUID-only journals are deliberately non-destructive.
@@ -850,7 +990,7 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
             print(journal_data["rollback_error"], file=sys.stderr)
             return False
 
-        rollback_errors = []
+        rollback_errors = list(state_errors)
         for item in reversed(entities):
             if not isinstance(item, dict):
                 rollback_errors.append("Invalid entity entry in transaction journal")
@@ -858,6 +998,11 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
             action = item.get("action")
             etype = item.get("type")
             uuid = item.get("uuid")
+            if action == "pending_create":
+                rollback_errors.append(
+                    f"Unresolved {etype} create request: API outcome is unknown and no UUID was durably recorded."
+                )
+                continue
             if action not in ("created", "updated", "adopted"):
                 rollback_errors.append(f"Invalid action for entity {etype}: {action}")
                 continue
@@ -898,19 +1043,23 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
                     else:
                         raise GoWaveAPIError(f"Unsupported created entity type: {etype}")
             except Exception as e:
-                message = f"Rollback failed for {action} {etype} {uuid}: {e}"
+                status = getattr(e, "status_code", None)
+                suffix = f" (HTTP {status})" if isinstance(status, int) and not isinstance(status, bool) else ""
+                message = f"Rollback failed for {action} {etype} {uuid}: {type(e).__name__}{suffix}"
                 rollback_errors.append(message)
                 print(message, file=sys.stderr)
 
         if not rollback_errors and op == "node_add":
-            worker_name = journal_data.get("node_name", "")
-            if not worker_name:
-                tid = journal_data.get("transaction_id", "")
-                if isinstance(tid, str) and tid.startswith("node_add_"):
-                    worker_name = tid[len("node_add_"):]
-            if state_data and "nodes" in state_data and worker_name:
-                state_data["nodes"] = [n for n in state_data["nodes"] if n.get("name") != worker_name]
-                atomic_write_state(state_data, str(state_file))
+            original_nodes = state_data["nodes"]
+            remaining_nodes = [node for node in original_nodes if node.get("name") != worker_name]
+            if remaining_nodes != original_nodes or state_source != state_file:
+                state_data["nodes"] = remaining_nodes
+                try:
+                    atomic_write_state(state_data, str(state_file))
+                except Exception as exc:
+                    rollback_errors.append(
+                        f"Failed to persist reconciled node-add state: {type(exc).__name__}"
+                    )
 
         if rollback_errors:
             journal_data["state"] = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
@@ -942,13 +1091,18 @@ ADMIN_PASSWORD={password}
     if token:
         content += f"SCOPED_API_TOKEN={token}\n"
 
-    # Write mode 0600
-    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        os.write(fd, content.encode("utf-8"))
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    # Credentials are secret material: reject temporary symlinks and set
+    # restrictive permissions before writing any bytes.
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+        0o600,
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
 
     os.replace(tmp_path, path)
     dir_fd = os.open(str(path.parent), os.O_DIRECTORY)

@@ -45,11 +45,14 @@ staging and production reuse.
 - **WHEN** the corresponding installation phase runs
 - **THEN** that host's installation fails and rolls back; on Worker, the HTTP-01 bootstrap vhost must have included the Vision name before issuance, and rollback must remove any transaction-created Vision certificate/renewal lineage, stream-map entry, 9444 fallback vhost and generated profile/host state. It MUST preserve pre-existing/unowned lineages and unrelated resources. Deployment MUST NOT proceed with a profile or NGINX route advertising an unusable Vision inbound
 
-#### Scenario: One-sided Vision configuration is rejected before deployment
+#### Scenario: Master and Worker Vision domains are independently optional
 
-- **GIVEN** only one of `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` is configured
-- **WHEN** the runner validates its configuration
-- **THEN** preflight fails before SSH or any remote modification
+- **GIVEN** either, both, or neither of `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` is configured
+- **WHEN** the runner validates its configuration and invokes the corresponding Master/Worker install paths
+- **THEN** preflight accepts each valid independently configured domain
+- **AND** only the host with a configured Vision domain provisions its Vision certificate, inbound, Panel host, NGINX route, and fallback
+- **AND** an unset Vision domain does not block installation on the other host
+- **AND** no Vision artifacts are created on a host whose Vision domain is unset
 
 #### Scenario: Missing or unknown renewal directory fails closed
 

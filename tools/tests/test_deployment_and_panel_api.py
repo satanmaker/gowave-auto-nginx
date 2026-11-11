@@ -28,6 +28,7 @@ from live_vps.nginx import verify_panel_https
 from live_vps.subscriptions import verify_user_agent_policy
 from live_vps.ssh import SSHResult
 from modules.api_client import GoWaveClient, GoWaveAPIError
+from live_vps.redaction import clear_secrets
 
 
 class MockServerHandler(http.server.BaseHTTPRequestHandler):
@@ -77,6 +78,31 @@ class MockServerHandler(http.server.BaseHTTPRequestHandler):
 
 
 class TestDeploymentAndPanelAPI(unittest.TestCase):
+    def setUp(self):
+        clear_secrets()
+
+    def tearDown(self):
+        clear_secrets()
+
+    def test_bootstrap_acme_nginx_failures_trigger_lineage_rollback(self):
+        """Bootstrap generation and activation failures must enter the ACME rollback path."""
+        script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        install_start = script.index("cmd_install() {")
+        install_end = script.index("\n}\n", install_start)
+        install = script[install_start:install_end]
+
+        generate_failure = install.index("if ! generate_bootstrap_acme_vhost")
+        reload_failure = install.index("if ! reload_nginx_strict", generate_failure)
+        certbot_step = install.index("if ! command -v certbot", reload_failure)
+        bootstrap = install[generate_failure:certbot_step]
+
+        self.assertIn("rollback_acme_lineages", bootstrap)
+        self.assertIn("Failed to generate bootstrap ACME NGINX configuration", bootstrap)
+        self.assertIn("Failed to activate bootstrap ACME NGINX configuration", bootstrap)
+        self.assertIn("return 1", bootstrap)
+        self.assertEqual(bootstrap.count("generate_bootstrap_acme_vhost"), 1)
+        self.assertEqual(bootstrap.count("reload_nginx_strict"), 1)
+
     def test_pinned_version_match_requires_exact_token(self):
         self.assertTrue(output_matches_pinned_version("GoWave Server v0.4.0", "0.4.0"))
         self.assertTrue(output_matches_pinned_version("Xray 25.10.15 (Xray, Penetrates Everything.)", "25.10.15"))
@@ -420,22 +446,47 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
         self.assertEqual(token, "mock-jwt-token-12345")
         self.assertTrue(panel_client.poll_worker_ready("worker-1", timeout=5, poll_interval=1))
 
+    def test_panel_client_worker_poll_returns_false_at_deadline(self):
+        trusted_ctx = ssl.create_default_context(cafile=str(self.ca_crt))
+        panel_client = E2EPanelClient(
+            panel_domain=f"localhost:{self.port}",
+            ssl_context=trusted_ctx,
+            timeout=5,
+        )
+        with (
+            patch.object(panel_client, "get_nodes", return_value=[
+                {"name": "worker-1", "isConnected": False}
+            ]) as get_nodes,
+            patch("live_vps.panel_api.time.time", side_effect=[0.0, 1.0, 6.0]),
+            patch("live_vps.panel_api.time.sleep") as sleep,
+        ):
+            self.assertFalse(
+                panel_client.poll_worker_ready(
+                    "worker-1", timeout=5, poll_interval=1
+                )
+            )
+
+        get_nodes.assert_called_once_with()
+        sleep.assert_called_once_with(1)
+
     def test_panel_client_untrusted_ca_rejection(self):
         untrusted_ctx = ssl.create_default_context(cafile=str(self.untrusted_ca))
         panel_client = E2EPanelClient(panel_domain=f"localhost:{self.port}", ssl_context=untrusted_ctx, timeout=5)
-        with self.assertRaises(Exception) as cm:
+        with self.assertRaises(GoWaveAPIError) as cm:
             panel_client.login("admin", "correct")
         err_str = str(cm.exception).lower()
-        self.assertTrue("certificate verify failed" in err_str or "ssl" in err_str or "untrusted" in err_str)
+        self.assertIn("tls verification error", err_str)
+        self.assertNotIn("certificate verify failed", err_str)
 
     def test_panel_client_hostname_verification(self):
         trusted_ctx = ssl.create_default_context(cafile=str(self.ca_crt))
         # Point to wrong hostname that is not in SAN (127.0.0.1 while SAN has localhost only)
         panel_client = E2EPanelClient(panel_domain=f"127.0.0.1:{self.port}", ssl_context=trusted_ctx, timeout=5)
-        with self.assertRaises(Exception) as cm:
+        with self.assertRaises(GoWaveAPIError) as cm:
             panel_client.login("admin", "correct")
         err_str = str(cm.exception).lower()
-        self.assertTrue("certificate" in err_str or "hostname" in err_str or "match" in err_str)
+        self.assertIn("tls verification error", err_str)
+        self.assertNotIn("127.0.0.1", err_str)
 
     def test_panel_client_timeout_propagation(self):
         trusted_ctx = ssl.create_default_context(cafile=str(self.ca_crt))

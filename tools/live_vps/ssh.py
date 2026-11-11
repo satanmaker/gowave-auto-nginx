@@ -30,7 +30,7 @@ def assert_no_secrets_in_argv(args: List[str]) -> None:
         for sec in _SECRETS:
             if sec and sec in arg:
                 raise ValueError(
-                    f"Zero-leak violation: secret detected in command-line argument: {arg[:4]}***"
+                    "Zero-leak violation: registered secret detected in command-line argument"
                 )
 
         # Prohibit dangerous CLI flags that commonly accept passwords/tokens
@@ -46,7 +46,7 @@ def assert_no_secrets_in_argv(args: List[str]) -> None:
             ]
         ):
             raise ValueError(
-                f"Zero-leak violation: argument '{arg}' appears to contain credential parameters in argv"
+                "Zero-leak violation: prohibited credential parameter detected in command-line argument"
             )
 
 

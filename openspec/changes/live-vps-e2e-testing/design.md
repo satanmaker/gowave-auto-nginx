@@ -12,15 +12,21 @@ See `proposal.md — Why` for motivation. Key implementation constraints derived
   the runner reads it from `state.json` via SSH and cross-validates via `GET /api/users/by-username/default-user`.
 - `gowave-auto.sh node add` reads Master egress IP via `curl -s4 https://ifconfig.me` and uses it for Worker
   UFW allowlist; this IP may differ from `MASTER_IP` under NAT/multi-homed setups.
-- `gowave-auto.sh install` calls `certbot certonly --webroot` with no server parameter override; staging
-  support requires a delta to this call.
-- `gowave-node-auto.sh` calls `certbot certonly --webroot` with no server override; same delta needed.
+- The implementation now maps the validated `ACME_MODE` to the exact Let's Encrypt staging or production
+  directory and passes the selected `--server` to Master and Worker Certbot calls. The default remains
+  production-compatible; the local operator controller selects staging unless production is explicitly chosen.
 - `modules/node.sh` falls back to `curl -fsSL https://raw.githubusercontent.com/aaaSaZaN/gowave-node/main/install.sh`
   when no bundled installer is present; E2E runs must gate on bundled installer with verified SHA256.
-- `tests/podman_testbed.sh multi-node` returns exit `77` — real distributed E2E is not implemented.
+- `tests/podman_testbed.sh multi-node` runs an isolated three-container transport acceptance (pinned SSH, TLS 1.3 mTLS, negative client-certificate cases, and Worker TCP/3002 source filtering). It does not install GoWave Panel/Node or test subscriptions/client proxy traffic; those remain live-VPS acceptance responsibilities.
 - Existing 5-suite CI continues unchanged; Live VPS E2E is a separate acceptance tier.
 
 ---
+
+## Local Multi-Node Podman Test Boundary
+
+The Podman multi-node target creates isolated Control, Master, and Worker systemd containers on a private Podman network. It validates the real SSH trust/command path, TLS 1.3 mutual authentication (positive, absent-certificate, and untrusted-certificate cases), and source-address filtering on Worker TCP/3002. Rootful Podman is required because the test inserts INPUT-chain rules inside the privileged Worker network namespace. The CI job is independent of the live-VPS credentials and never contacts external VPS targets.
+
+This test remains intentionally named transport acceptance: it does not start upstream GoWave Panel/Node binaries, create Panel API entities, or validate subscriptions and Xray/Mihomo proxy traffic. A transport PASS must not be reported as full GoWave E2E acceptance. The separate `podman-full-e2e` OpenSpec change defines the planned local product-level Podman acceptance that will add real operator provisioning, Panel/Worker API lifecycle, both Xray and Mihomo subscription/data-plane paths, and node-attributed egress evidence. Until that framework is implemented and its required CI jobs pass, the existing transport test remains the only Multi-Node Podman acceptance and must not be promoted to product E2E. Live VPS acceptance remains responsible for public DNS, public ingress, public ACME, provider firewall behavior, and external Internet reachability that private Podman networks cannot prove.
 
 ## Goals / Non-Goals
 
@@ -29,9 +35,9 @@ See `proposal.md — Why` for motivation. Key implementation constraints derived
 - Single-process Python runner with structured submodule package; each phase has bounded timeout and explicit
   status.
 - Reuse existing crypto/mTLS logic via subprocess, not reimplementation.
-- SSH transport uses system OpenSSH CLI with `StrictHostKeyChecking=yes` and pre-pinned `known_hosts`.
-- E2E v1 connects to both VPS as `root`; the current deployment scripts have no `sudo` execution adapter. Preflight verifies `id -u == 0` on both hosts before acquiring remote locks or mutating either host; non-root SSH accounts fail closed.
-- `SSH_KNOWN_HOSTS` is one configured, pre-pinned file containing both target host keys. Each SSH invocation selects the exact target entry (including `[host]:port` for non-default ports); a second independent file is not required by this contract.
+- The local controller verifies each SSH host key out of band before password authentication, then bootstraps a per-host ephemeral Ed25519 key. The existing runner uses system OpenSSH with `StrictHostKeyChecking=yes` and the controller-generated, host-specific temporary `known_hosts` files.
+- E2E v1 connects to both VPS as `root`; the current deployment scripts have no `sudo` execution adapter. The controller rejects non-root identities before mutation.
+- Temporary SSH keys are guarded by a persistent two-hour remote systemd expiry timer installed before the key is appended. Immediate revocation is independently verified and is a PASS gate; otherwise the overall result is INCOMPLETE.
 - All log output passes through a redaction filter before writing.
 - Teardown is policy-driven and idempotent; it never destroys a VPS not created by this runner.
 - Run-level lock prevents concurrent tests on the same Master/Worker pair.
@@ -47,17 +53,21 @@ See `proposal.md — Why` for motivation. Key implementation constraints derived
 
 ## Decisions
 
-### D1: SSH Transport — System OpenSSH CLI via subprocess, not Paramiko
+### D1: Hybrid SSH Bootstrap and OpenSSH Runner Transport
 
-**Chosen:** `subprocess` with system `ssh` / `scp`, `shell=False`, args as array, timeout mandatory.
+**Chosen:** The local operator controller uses Paramiko only for the initial unauthenticated SSH key exchange,
+out-of-band SHA-256 host-key fingerprint confirmation, and hidden root-password bootstrap. After that it
+installs a per-run Ed25519 public key. The existing E2E runner continues to use system OpenSSH `ssh`/`scp`
+with `shell=False`, argument arrays, mandatory timeouts, `StrictHostKeyChecking=yes`, and controller-generated
+temporary `known_hosts` files pinned to the exact host keys.
 
-**Rationale:** System OpenSSH respects host OS `~/.ssh/known_hosts` format, supports `StrictHostKeyChecking=yes`
-natively, and delegates all host key verification logic to the battle-tested OpenSSH binary. No Python-layer
-re-implementation of SSH crypto. Paramiko requires maintaining its own host key store and has historically
-lagged behind OpenSSH security releases.
+**Rationale:** Passwords never enter argv, environment variables, persistent config, reports, or CI secrets.
+The operator compares the observed fingerprint with the VPS provider's trusted console before any password is
+sent. The long-running runner retains OpenSSH's mature host-key enforcement and uses only short-lived keys.
 
-**Alternatives considered:** Paramiko — rejected because it requires duplicating host key pinning logic and
-introduces an additional crypto dependency. Fabric — rejected as it wraps Paramiko with the same drawback.
+**Alternatives considered:** Permanent GitHub Environment SSH secrets — rejected because they persist target
+credentials in CI and are a poor fit for operator-supplied VPS instances. Trust-on-first-use via `ssh-keyscan`
+— rejected because it does not independently authenticate host identity.
 
 **Security consequence:** Secrets are never placed in argv. Remote commands that require secrets (reading
 credentials, extracting SECRET_KEY) pipe data via stdin or use isolated SSH `cat` commands followed by
@@ -142,22 +152,23 @@ is not guaranteed to be a complete standalone config.
 
 ---
 
-### D5: Server-Side Ingress Evidence and Egress IP Verification
+### D5: Per-Case Packet-Capture Evidence and Egress Verification
 
-**Chosen:** Each endpoint test is executed sequentially with a bounded observation window:
-1. Record baseline packet/byte counters (or start a bounded `tcpdump` capture) on the target VPS public
-   transport listener. In the current NGINX stream topology this is TCP/443; do not assume the four or five
-   logical protocols have distinct public TCP ports. Use the exact configured listener and record the capture
-   filter and interface.
-2. Execute one tunnel request through the selected endpoint and record the client-observed egress IP.
-   Compare it with `EXPECTED_MASTER_EGRESS_IP` or `EXPECTED_WORKER_EGRESS_IP` when configured. If no expected
-   value is configured, query that VPS's direct egress independently and compare, while documenting that
-   this verifies shared egress identity rather than a predeclared address.
-3. Compare post-test ingress evidence with the baseline on the target VPS. For Worker endpoints, verify
-   Worker ingress increases and Master ingress does not increase for the same controlled request. For Master
-   endpoints, verify Master ingress increases. Counter deltas MUST be isolated per test window; unrelated
-   background traffic invalidates ambiguous evidence and produces `INCOMPLETE`, not `PASS`.
-4. If packet capture is used, capture metadata and packet counts only; do not persist payloads or credentials.
+**Chosen:** Every Xray and Mihomo proxy request is bracketed by simultaneous inbound `tcpdump` captures on
+Master and Worker. Each capture is filtered by the control machine's public IPv4 and the exact destination
+port of the tested proxy endpoint; the target's SSH destination port is explicitly excluded. Each remote
+capture has a 45-second hard lifetime.
+
+A case is PASS only when all conditions hold:
+1. The intended VPS captures at least one matching inbound TCP packet.
+2. The other VPS captures zero matching inbound TCP packets (offload detection).
+3. The client-observed egress IPv4 equals the expected egress address of the intended VPS.
+
+Missing `tcpdump`, inability to determine the control machine's public IPv4, invalid endpoint port, or a
+missing/invalid capture summary yields INCOMPLETE. Aggregate `/proc/net/dev` counters are not a fallback
+and cannot produce PASS. Only packet counts and evidence metadata are persisted; no PCAP or payload is
+stored. This attribution requires the control machine to reach both VPS instances from the same public IPv4;
+otherwise the evidence is INCOMPLETE, not PASS.
 
 **Rationale:** Default GoWave Xray templates do not enable the Xray Stats API. The public NGINX stream listener
 is shared by SNI-routed transports, so packet evidence proves traversal to the intended VPS but not by itself
@@ -454,15 +465,16 @@ negative-suite switch, so its effect on the acceptance gate must be normative.
 
 ---
 
-### D14: Optional Vision Is a Paired, Fail-Closed Capability
+### D14: Optional Vision Is an Independent, Fail-Closed Capability
 
-**Chosen:** VLESS XTLS Vision is optional at the deployment level, but when enabled it is a required
-capability on both VPS. `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` MUST either both be configured
-or both be absent. A one-sided configuration is invalid and is rejected by the local config parser before
-SSH or any remote modification. This keeps the topology and runtime matrix unambiguous: four inbounds per
-node and sixteen client/runtime cases when disabled; five inbounds per node and twenty cases when enabled.
+**Chosen:** VLESS XTLS Vision is optional and configured independently per VPS. Either
+`MASTER_VISION_DOMAIN`, `WORKER_VISION_DOMAIN`, both, or neither may be set. A configured Vision domain
+adds one endpoint and one inbound only to its corresponding VPS. The default topology has eight logical
+endpoints and sixteen client/runtime cases; one-sided Vision has nine endpoints and eighteen cases; Vision
+on both VPS has ten endpoints and twenty cases. Each domain remains subject to global FQDN uniqueness and
+host-specific DNS/certificate validation.
 
-When the pair is configured:
+For each host independently, when its corresponding Vision domain is configured:
 
 1. Master installation MUST issue and cryptographically verify the Vision certificate in addition to the
    Panel and REALITY certificates before compiling/provisioning the Master profile. The current best-effort
@@ -501,17 +513,18 @@ When the pair is configured:
    check and record both remote Worker rollback and Panel API rollback results; it MUST NOT suppress a failed
    `remote_rollback` with `|| true`. If either compensation fails, preserve the recovery journal, mark
    rollback incomplete and force the E2E run to `INCOMPLETE`; only verified success of both sides is rollback PASS.
-5. Panel API acceptance MUST verify five inbounds and five corresponding hosts per node, including each
-   Vision inbound/host association. The subscription MUST expose one Vision proxy per VPS, and Xray and
-   Mihomo MUST each execute the two Vision endpoints as independent runtime cases.
-6. When both Vision domains are absent, the default four-inbound topology remains unchanged: no Vision
-   certificate issuance, no Vision SNI route/fallback, and no Vision subscription endpoint.
+5. Panel API acceptance MUST verify four core inbounds and corresponding hosts per node, plus one additional
+   inbound/host only on each VPS whose Vision domain is configured. The subscription MUST expose one Vision
+   proxy for each configured Vision domain, and Xray and Mihomo MUST exercise each such endpoint independently.
+6. When a host's Vision domain is absent, that host retains its default four-inbound topology: no Vision
+   certificate issuance, no Vision SNI route/fallback, and no Vision subscription endpoint. The other host's
+   independently configured Vision endpoint remains enabled.
 
 **Rationale:** The current Master installer suppresses Vision certificate issuance/verification errors, while
 the current Worker dispatch does not propagate the Vision domain into Worker API provisioning or Worker
 certificate issuance. Treating Vision as active after either partial path can create mismatched Master/Worker
-profiles, missing TLS material, or an advertised proxy that cannot accept traffic. Pair validation and
-fail-closed activation make the sixteen-versus-twenty test matrix deterministic.
+profiles, missing TLS material, or an advertised proxy that cannot accept traffic. Host-specific validation and
+fail-closed activation make the sixteen-, eighteen-, or twenty-case test matrix deterministic.
 
 ---
 
@@ -811,11 +824,11 @@ Phase 0: Preflight
   0.1  Config load + validate (whitelist parser, reserved IP rejection)
   0.2  Acquire the local per-target `fcntl.flock` in the private runtime directory
   0.3  Control Machine tool check (python3, ssh, openssl, curl, dig, xray, mihomo)
-  0.4  SSH trust check (both VPS, StrictHostKeyChecking=yes, exact pinned entries from the single SSH_KNOWN_HOSTS file); verify `id -u == 0` on both hosts using read-only commands and fail before lock acquisition/mutation for non-root identities
-  0.5  Reject identical MASTER_IP/WORKER_IP and duplicate mandatory Panel/REALITY FQDNs; when Vision is enabled require all six FQDNs pairwise unique. Verify DNS (4 mandatory domains plus optional Vision pair, A/AAAA, 2+ resolvers)
+  0.4  Local controller verifies each SSH host-key fingerprint against the provider console before hidden root-password authentication; bootstrap temporary per-host Ed25519 keys and host-specific known_hosts pins; verify root identity before mutation
+  0.5  Reject identical MASTER_IP/WORKER_IP and duplicate configured FQDNs; validate each independently configured Vision domain and its host-specific A/AAAA answers across all configured domains, using 2+ resolvers
   0.6  Baseline snapshot (systemd, listeners, firewall, GoWave dirs)
   0.7  Disposable gate (reject if GoWave present or ports occupied)
-  0.8  Port hygiene (11+ required ports checked as free: 80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, 10003; plus 8444 and 9444 when the Vision domain pair is enabled)
+  0.8  Port hygiene (11+ required ports checked as free: 80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, 10003; plus 8444 and 9444 only on each VPS whose Vision domain is configured)
   0.9  Acquire and hold authoritative `flock` sessions on both VPS hosts in deterministic address order;
        preflight-only runs release them on exit; all mutating phases require both locks
   0.10 Re-collect the read-only baseline/disposable gate on both hosts while both locks are held; if any
@@ -829,7 +842,7 @@ Phase 1: Master Installation
   1.3  Run gowave-auto.sh install with `GOWAVE_ACME_SERVER` derived from `ACME_MODE` and
        `GOWAVE_TLS_CA_FILE` pointing to the staged bundle; set `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1`
        and provide the pinned Node installer commit + SHA256;
-       when the validated Vision pair is enabled, pass `VISION_DOMAIN=MASTER_VISION_DOMAIN` in the
+       when `MASTER_VISION_DOMAIN` is configured, pass `VISION_DOMAIN=MASTER_VISION_DOMAIN` in the
        controlled environment and require Master Vision certificate issuance/verification to succeed
   1.4  Verify service states, listeners, TLS certs
   1.5  Verify credentials file (mode, owner, keys present — values not logged)
@@ -842,8 +855,8 @@ Phase 1: Master Installation
 
 Phase 2: Worker Deployment
   2.1  Run `gowave-auto.sh node add worker-1` on Master with the same validated ACME directory and the
-       same Node-installer commit + SHA256 explicitly supplied again for the Worker dispatch; when the
-       validated Vision pair is enabled, pass `--vision-domain WORKER_VISION_DOMAIN` as a named option
+       same Node-installer commit + SHA256 explicitly supplied again for the Worker dispatch; when
+       `WORKER_VISION_DOMAIN` is configured, pass `--vision-domain WORKER_VISION_DOMAIN` as a named option
   2.2  Verify exit code, state.json, process argv observation (SECRET_KEY not in Master-side argv)
   2.3  Verify Worker services, listeners, certs, deploy hook, cover-reality SHA256
   2.4  Poll Panel API isConnected until true (bounded NODE_READY_TIMEOUT)
@@ -862,17 +875,17 @@ Phase 3: Public mTLS Verification (execute allowed-source probes from Master)
   3.7  Run wrong-key local client-load test and wrong-server-CA client-verification test separately
 
 Phase 4: Panel API Audit
-  4.1  GET /api/nodes — 2 nodes, correct addresses, 4 inbounds each (or 5 with the validated Vision pair), isConnected
-  4.2  GET /api/config-profiles — 2 profiles, 4 inbounds each (or 5 with the validated Vision pair), computed-config valid JSON
-  4.3  GET /api/internal-squads — Default MVP Squad, 8 inbound UUIDs (or 10 with the validated Vision pair), set equality
-  4.4  GET /api/hosts — 8 hosts (or 10 with the validated Vision pair), all fields verified, REALITY hosts carrying the configured REALITY fingerprint (`firefox` by default) and TLS hosts `firefox`, correct node/inbound associations
+  4.1  GET /api/nodes — 2 nodes, correct addresses, 4 core inbounds each plus one only on a host with Vision configured, isConnected
+  4.2  GET /api/config-profiles — 2 profiles, 4 core inbounds each plus one only on a host with Vision configured, computed-config valid JSON
+  4.3  GET /api/internal-squads — Default MVP Squad, 8 core inbound UUIDs plus one per configured Vision domain (8/9/10 total), set equality
+  4.4  GET /api/hosts — 8 core hosts plus one per configured Vision domain (8/9/10 total), all fields verified, REALITY hosts carrying the configured REALITY fingerprint (`firefox` by default) and TLS hosts `firefox`, correct node/inbound associations
 
 Phase 5: Subscriptions
   5.1  GET /api/users/by-username/default-user → shortUuid
   5.2  User-Agent policy (empty, absent, Xray UA, Mihomo UA → check actual Panel response)
-  5.3  Fetch Xray JSON (Xray UA), verify 8 proxy outbounds (or 10 when the paired Vision domains are configured), REALITY outbounds carrying the configured REALITY fingerprint (`firefox` by default) and TLS outbounds `fingerprint: "firefox"`, headers, no server secrets
+  5.3  Fetch Xray JSON (Xray UA), verify 8 core proxy outbounds plus one per configured Vision domain (8/9/10), REALITY outbounds carrying the configured REALITY fingerprint (`firefox` by default) and TLS outbounds `fingerprint: "firefox"`, headers, no server secrets
   5.4  Validate with xray run -test (temporary wrapper config)
-  5.5  Fetch Mihomo YAML (Mihomo UA), verify 8 proxies (or 10 when the paired Vision domains are configured), REALITY `client-fingerprint` equal to the configured REALITY fingerprint (`firefox` by default) and TLS transports `firefox`, GEOIP rule, headers
+  5.5  Fetch Mihomo YAML (Mihomo UA), verify 8 core proxies plus one per configured Vision domain (8/9/10), REALITY `client-fingerprint` equal to the configured REALITY fingerprint (`firefox` by default) and TLS transports `firefox`, GEOIP rule, headers
   5.6  Validate with mihomo -t
   5.7  Verify Mihomo runtime copy binds all local listeners to 127.0.0.1 on collision-free per-run ports;
        preserve proxy/rule semantics and reject externally exposed or non-loopback controllers
@@ -892,16 +905,15 @@ Phase 7: NGINX SNI + REALITY Decoy (+ Optional Vision)
   7.2  Worker HTTPS with correct SNI
   7.3  REALITY fallback with REALITY SNI + invalid REALITY params (decoy content on 9443, not GoWave API)
   7.4  Unknown SNI routing (matches NGINX + Xray REALITY fallback behavior)
-  7.5  Optional paired-Vision SNI routing to 8444 and non-VLESS HTTP fallback to decoy on 9444 when configured
+  7.5  Optional per-host Vision SNI routing to 8444 and non-VLESS HTTP fallback to decoy on 9444 on each VPS whose Vision domain is configured
   7.6  nginx -t on both VPS configs
   7.7  cover-reality unique marker file accessible
   7.8  PROXY protocol integrity (inferred from correct Panel, Worker, REALITY, and Vision responses)
 
-Phase 8: Data Plane E2E (8 or 10 logical endpoints × 2 client runtimes = 16 or 20 required cases)
-  8.1  Logical endpoint matrix: Master × {VLESS REALITY, VLESS XHTTP, VLESS WS, Trojan gRPC, and optional VLESS XTLS-Vision when the Vision domain pair is configured}
-       and Worker × the same protocols (8 endpoints by default; 10 when both Vision domains are configured)
-  8.2  For each logical endpoint, run a real Xray client case and a real Mihomo client case (using the
-       configured REALITY fingerprint, `firefox` by default) with exactly the pinned `XRAY_CLIENT_VERSION`
+Phase 8: Data Plane E2E (8/9/10 logical endpoints × 2 client runtimes = 16/18/20 required cases)
+  8.1  Logical endpoint matrix: Master and Worker each have four core protocols; add one Vision endpoint only on each VPS whose Vision domain is configured (8 by default, 9 for one-sided Vision, 10 when both are configured)
+  8.2  For each logical endpoint, run a real Xray client case and a real Mihomo client case using the
+       configured REALITY fingerprint (`firefox` by default) with exactly the pinned `XRAY_CLIENT_VERSION`
        and `MIHOMO_CLIENT_VERSION` binaries that match the cores GoWave Panel and GoWave Node deploy:
        - Extract the corresponding proxy from the real subscription
        - Build/validate a temporary Xray wrapper config; for Mihomo, create a per-run sanitized copy of
@@ -911,8 +923,9 @@ Phase 8: Data Plane E2E (8 or 10 logical endpoints × 2 client runtimes = 16 or 
        - Send HTTPS request through the selected proxy; verify HTTP response and observed egress IP
        - Verify target VPS ingress evidence in an isolated observation window
        - Stop client and remove temporary configuration
-  8.3  All 16 (or 20) cases are mandatory for overall PASS. If a client runtime is intentionally disabled, mark its
-       cases SKIP and overall status INCOMPLETE. A syntax-only validation is not a runtime traffic pass.
+  8.3  All 16, 18, or 20 cases (according to the number of configured Vision domains) are mandatory for overall
+       PASS. If a client runtime is intentionally disabled, mark its cases SKIP and overall status INCOMPLETE.
+       A syntax-only validation is not a runtime traffic pass.
 
 Phase 9: Negative Tests (NEG-01 .. NEG-15)
   NEG-01..NEG-04 are isolated preflight contract tests using temporary known_hosts/config fixtures and
@@ -987,7 +1000,7 @@ is set. When the variable is unset outside the runner, existing production-defau
 1. The runner derives the exact URL once and passes it to `gowave-auto.sh install` and `gowave-auto.sh node add`.
 2. `gowave-auto.sh install` and `domain-change` append `--server "$GOWAVE_ACME_SERVER"` to every Certbot issuance
    call when set. `install` issues two mandatory lineages (Panel and REALITY) and a third Vision lineage only
-   when the validated Vision pair is enabled; `domain-change` applies the selected server to every lineage it
+   when the corresponding host's Vision domain is enabled; `domain-change` applies the selected server to every lineage it
    issues for the domains being changed.
 3. `gowave-auto.sh node add` forwards the same value to `gowave-node-auto.sh remote_payload`.
 4. `remote_payload()` serializes the validated ACME URL and optional Worker Vision domain into the SSH stdin
@@ -1044,17 +1057,17 @@ the following strict schema:
 | `MASTER_IP` | IPv4 address | Yes | — | Public IPv4 of Master VPS (disallowed: RFC-1918, loopback, docs); MUST differ from `WORKER_IP` |
 | `MASTER_PANEL_DOMAIN` | FQDN | Yes | — | Domain pointing to Master Panel NGINX HTTPS |
 | `MASTER_REALITY_DOMAIN` | FQDN | Yes | — | Camouflage decoy domain pointing to Master REALITY SNI |
-| `MASTER_VISION_DOMAIN` | FQDN | Conditional pair | — | Master Vision domain; must be set together with `WORKER_VISION_DOMAIN` |
+| `MASTER_VISION_DOMAIN` | FQDN | Optional | — | Optional Master Vision domain; independent of Worker Vision |
 | `MASTER_SSH_PORT` | Integer 1–65535 | No | `22` | Master SSH management port |
 | `MASTER_SSH_USER` | Literal `root` | No | `root` | Master SSH login identity; non-root is unsupported in E2E v1 |
 | `WORKER_IP` | IPv4 address | Yes | — | Public IPv4 of Worker VPS; MUST differ from `MASTER_IP` |
 | `WORKER_DOMAIN` | FQDN | Yes | — | Domain pointing to Worker NGINX HTTPS |
 | `WORKER_REALITY_DOMAIN` | FQDN | Yes | — | Camouflage decoy domain pointing to Worker REALITY SNI |
-| `WORKER_VISION_DOMAIN` | FQDN | Conditional pair | — | Worker Vision domain; must be set together with `MASTER_VISION_DOMAIN` |
+| `WORKER_VISION_DOMAIN` | FQDN | Optional | — | Optional Worker Vision domain; independent of Master Vision |
 | `WORKER_SSH_PORT` | Integer 1–65535 | No | `22` | Worker SSH management port |
 | `WORKER_SSH_USER` | Literal `root` | No | `root` | Worker SSH login identity; non-root is unsupported in E2E v1 |
-| `SSH_KEY_PATH` | File path | Yes | — | Path to private SSH key for authentication |
-| `SSH_KNOWN_HOSTS` | File path | Yes | — | One pre-pinned `known_hosts` file containing both VPS host keys; each connection selects its exact host/port entry |
+| `SSH_KEY_PATH` | File path | Generated by controller | — | Per-run ephemeral Ed25519 private key; never a permanent operator-managed key |
+| `SSH_KNOWN_HOSTS` | File path | Generated by controller | — | Host-specific temporary known_hosts pin generated only after out-of-band fingerprint confirmation |
 | `ACME_MODE` | `staging` \| `production` | No | `staging` | Let's Encrypt endpoint mode |
 | `GOWAVE_PANEL_VERSION` | SemVer / commit | Yes | — | Target GoWave Panel version to pin and verify |
 | `GOWAVE_NODE_VERSION` | SemVer / commit | Yes | — | Target GoWave Node version to pin and verify |
@@ -1125,10 +1138,12 @@ API schema.
 → Mitigation: Configure at least two independent external IP check endpoints; fall back to the second if the
 first times out.
 
-**[RISK] Server-side inbound counter may not be available if Xray stats API is not enabled in GoWave config**
-→ Mitigation: Runner checks whether stats API is enabled post-installation. If not, falls back to SSH-based
-packet capture (tcpdump on the specific port for the duration of the test request) as server-side evidence.
-Documents this fallback explicitly in the diagnostic report.
+**[RISK] Server-side per-case packet evidence may be unavailable or unattributable**
+→ Mitigation: Every Xray/Mihomo request is bracketed by simultaneous inbound tcpdump captures on both VPS,
+filtered by the control machine's public IPv4 and the exact tested proxy destination port, excluding SSH ports.
+The remote capture is bounded by a 45-second timeout. Missing tcpdump, source-IP identity, endpoint port, or
+valid capture summary yields INCOMPLETE; aggregate interface counters are never a PASS fallback. No PCAP or
+payload is persisted.
 
 **[RISK] Xray and Mihomo binary versions on Control Machine may not match pinned config versions**
 → Mitigation: Preflight checks client versions against `XRAY_CLIENT_VERSION` and `MIHOMO_CLIENT_VERSION`,
@@ -1156,9 +1171,9 @@ is recorded independently of the rollback success. NEG-13 tests this path explic
 4. Add `tools/live_vps_config.env.example` to repo; add `tools/live_vps_config.env` to `.gitignore`.
 5. Implement `tools/test_live_vps.py` and `tools/live_vps/` package per tasks.md.
 6. Add `docs/LIVE_VPS_TESTING.md`.
-7. Add `.github/workflows/live-vps-e2e.yml` (`workflow_dispatch` only, no auto-trigger on PR).
-8. First run against staging ACME on manually provisioned VPS; validate all phases.
-9. Second run with `ACME_MODE=production` for acceptance certificate.
+7. Remove the credential-bearing `.github/workflows/live-vps-e2e.yml`; retain `.github/workflows/live-vps-unit.yml` for CI.
+8. Add the local operator controller (`python3 tools/run_live_vps.py`) with hidden password prompts, out-of-band host-key confirmation, temporary keys, persistent remote expiry, and immediate revocation.
+9. Run staging acceptance on two fresh disposable VPS instances; production ACME is a separate, explicit operator decision and is not a substitute for staging acceptance.
 
 **Rollback:** Live VPS E2E is entirely additive. Removing `feature/live-vps-e2e-testing` branch leaves the
 existing codebase unchanged. The ACME staging delta is a backward-compatible default-off env var.
@@ -1169,9 +1184,21 @@ existing codebase unchanged. The ACME staging delta is a backward-compatible def
 
 - **[RESOLVED] Xray stats API availability:** Codebase audit confirms that GoWave Panel profile templates
   in `assets/xray/` do not configure the Xray Stats gRPC API (`"stats": {}`, `"StatsService"`). Upstream binaries
-  are treated as immutable per AGENTS.md. Therefore, server-side traffic evidence uses iptables/nftables packet
-  counters and temporary SSH packet capture on the target port.
+  are treated as immutable per AGENTS.md. Therefore, server-side traffic evidence uses simultaneous per-case
+  `tcpdump` captures on both VPS, filtered by control-machine source IPv4 and the exact tested proxy destination
+  port while excluding each SSH port. Missing or unattributable capture evidence is INCOMPLETE; aggregate
+  interface/packet counters are not a PASS fallback.
 - **Worker `isConnected` polling behavior:** The 120s `NODE_READY_TIMEOUT` with 5s polling interval is a provisional
   initial bound, not a measured real-VPS guarantee. Mock integration benchmarks do not establish the latency
   distribution of the pinned Panel/Node pair; staging acceptance MUST record observed registration latency and
   adjust the default or document the evidence before production acceptance.
+
+
+## Implementation synchronization (2026-11-09)
+
+The current implementation supersedes earlier design text in this change: live execution is local via
+`tools/run_live_vps.py`; Paramiko is used only for the initial fingerprint-confirmed password bootstrap,
+while the existing runner uses OpenSSH with ephemeral keys and strict host-key pins. Master and Worker Vision
+are independent optional domains. Per-case data-plane proof uses simultaneous, source-IP- and exact-service-port-
+filtered tcpdump captures on both VPS, with a 45-second remote timeout and no aggregate-counter fallback.
+See `../local-live-vps-controller/design.md` and `docs/LIVE_VPS_TESTING.md` for the current operator contract.

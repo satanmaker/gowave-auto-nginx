@@ -211,18 +211,35 @@ PY
     fi
 
     rollback_acme_lineages() {
+        local rollback_failed=0
         echo "ACME acquisition or verification failed. Rolling back certificate lineages..." >&2
-        rollback_managed_deploy_hook "$acme_tx_id" 2>/dev/null || true
-        restore_acme_lineage "$acme_tx_id" "$panel_domain" 2>/dev/null || true
-        restore_acme_lineage "$acme_tx_id" "$reality_domain" 2>/dev/null || true
+        rollback_managed_deploy_hook "$acme_tx_id" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$acme_tx_id" "$panel_domain" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$acme_tx_id" "$reality_domain" 2>/dev/null || rollback_failed=1
         if [[ -n "$vision_domain" ]]; then
-            restore_acme_lineage "$acme_tx_id" "$vision_domain" 2>/dev/null || true
+            restore_acme_lineage "$acme_tx_id" "$vision_domain" 2>/dev/null || rollback_failed=1
         fi
-        rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
+        rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf || rollback_failed=1
+        if [[ "$rollback_failed" -ne 0 ]]; then
+            echo "CRITICAL: ACME rollback incomplete; certificate lineage or deploy-hook restoration failed. Recovery snapshot retained for operator intervention." >&2
+        else
+            echo "ACME certificate lineage rollback completed successfully." >&2
+        fi
+        # Preserve the caller's original deployment failure status; the explicit
+        # diagnostic above distinguishes a complete rollback from partial recovery.
+        return 0
     }
 
-    generate_bootstrap_acme_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/00-bootstrap-acme.conf" "/proc/net/if_inet6" "$vision_domain"
-    reload_nginx_strict
+    if ! generate_bootstrap_acme_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/00-bootstrap-acme.conf" "/proc/net/if_inet6" "$vision_domain"; then
+        echo "Error: Failed to generate bootstrap ACME NGINX configuration; rolling back certificate lineages." >&2
+        rollback_acme_lineages
+        return 1
+    fi
+    if ! reload_nginx_strict; then
+        echo "Error: Failed to activate bootstrap ACME NGINX configuration; rolling back certificate lineages." >&2
+        rollback_acme_lineages
+        return 1
+    fi
 
     if ! command -v certbot >/dev/null 2>&1; then
         echo "Error: certbot is required for production TLS certificate acquisition but not installed." >&2
@@ -348,10 +365,9 @@ client = GoWaveClient("http://127.0.0.1:3000")
 client.register_initial_admin(admin_user, admin_password)
 client.login(admin_user, admin_password)
 
-journal["state"] = "PROVISION_APPLYING"
-write_journal_atomically(journal_path, journal)
-
 def persist_transaction_entities(entities):
+    journal["state"] = "PROVISION_APPLYING"
+    journal["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     journal["entities"] = list(entities)
     write_journal_atomically(journal_path, journal)
 
@@ -516,6 +532,7 @@ cmd_node() {
                 return 1
             fi
             local node_port=3002
+            local acme_tx_id="worker_install_${name}_$(date +%s)_${BASHPID}"
 
             if [[ "$ip" == "$panel_ip" || "$ip" == "127.0.0.1" ]]; then
                 log_warn "Worker IP matches PANEL_IP or 127.0.0.1; enforcing NODE_PORT=3002 to avoid collision with Panel on 3000."
@@ -555,6 +572,14 @@ PY
             if [[ ! -s "$known_hosts" ]] || ! ssh-keygen -F "$host_key" -f "$known_hosts" >/dev/null 2>&1; then
                 echo "Error: SSH host key for $host_key is not pre-pinned in $known_hosts." >&2
                 echo "Verify the fingerprint out of band and add the host key before retrying." >&2
+                return 1
+            fi
+
+            # Resolve the local Worker secret before creating any API-side effects.
+            # A local config/read failure must not strand a partially registered node.
+            local secret_key
+            if ! secret_key=$(extract_secret_key "$GOWAVE_DIR"); then
+                echo "Error: unable to extract the Worker secret; no API changes were made." >&2
                 return 1
             fi
 
@@ -634,6 +659,8 @@ journal = {
 write_journal_atomically(journal_path, journal)
 
 def persist_transaction_entities(entities):
+    journal["state"] = "NODE_ADD_APPLYING"
+    journal["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     journal["entities"] = list(entities)
     write_journal_atomically(journal_path, journal)
 
@@ -680,6 +707,11 @@ if vision_domain:
 nodes.append(node_entry)
 state_data["nodes"] = nodes
 atomic_write_state(state_data, state_path)
+
+# Record that the local state and API entities are committed before remote dispatch.
+journal["state"] = "NODE_ADD_VERIFYING"
+journal["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+write_journal_atomically(journal_path, journal)
 PY
             then
                 echo "Worker API registration failed; attempting action-aware API rollback." >&2
@@ -694,22 +726,8 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
             fi
 
 
-            # Mark remote side effects as in-flight before dispatch.
-            python3 -c "
-import sys, json, time
-for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
-    if p not in sys.path:
-        sys.path.insert(0, p)
-from modules.recovery import write_journal_atomically
-jdata = json.load(open('$JOURNAL_FILE'))
-jdata['state'] = 'NODE_ADD_VERIFYING'
-jdata['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-write_journal_atomically('$JOURNAL_FILE', jdata)
-"
             # 4. Dispatch remote deployment strictly via SSH stdin
-            local secret_key
-            secret_key=$(extract_secret_key "$GOWAVE_DIR")
-            if ! PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
+            if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
                 XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
                 GOWAVE_ACME_SERVER="${GOWAVE_ACME_SERVER:-}" \
                 GOWAVE_NODE_INSTALLER_COMMIT="${GOWAVE_NODE_INSTALLER_COMMIT:-}" \
@@ -718,7 +736,7 @@ write_journal_atomically('$JOURNAL_FILE', jdata)
                 SSH_KNOWN_HOSTS="$known_hosts" "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
                 echo "Remote Worker deployment failed; rolling back Worker host configuration and Panel API entities." >&2
                 local rollback_failed=0
-                if ! PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
+                if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
                     VISION_DOMAIN="$vision_domain" \
                     "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
                     echo "CRITICAL: Remote Worker host rollback failed; manual inspection required." >&2
@@ -738,8 +756,9 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
                 return 1
             fi
 
-            # 5. Commit transaction
-            python3 -c "
+            # 5. Commit transaction. If the durable commit record fails after
+            # remote deployment succeeded, compensate both remote and API state.
+            if ! python3 -c "
 import sys, json, time
 for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
     if p not in sys.path:
@@ -749,7 +768,32 @@ jdata = json.load(open('$JOURNAL_FILE'))
 jdata['state'] = 'NODE_ADD_COMMITTED'
 jdata['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 write_journal_atomically('$JOURNAL_FILE', jdata)
-"
+"; then
+                echo "CRITICAL: Worker deployment succeeded but the commit journal could not be persisted; compensating both sides." >&2
+                local rollback_failed=0
+                if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
+                    VISION_DOMAIN="$vision_domain" \
+                    "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
+                    echo "CRITICAL: Remote Worker rollback after commit-record failure was incomplete." >&2
+                    rollback_failed=1
+                fi
+                if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from modules.api_client import rollback_provisioning
+import sys
+sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE') else 1)
+"; then
+                    echo "CRITICAL: API rollback after commit-record failure was incomplete." >&2
+                    rollback_failed=1
+                fi
+                if (( rollback_failed != 0 )); then
+                    echo "CRITICAL: Worker '$name' requires manual recovery; journal retained." >&2
+                fi
+                return 1
+            fi
+            if ! ACME_TX_ID="$acme_tx_id" SSH_KNOWN_HOSTS="$known_hosts" \
+                "$SCRIPT_DIR/gowave-node-auto.sh" remote_finalize "$ip" "$ssh_port" "$ssh_user"; then
+                echo "WARNING: Worker '$name' is committed and deployed, but its ACME recovery snapshot could not be finalized; snapshot retained for manual cleanup." >&2
+            fi
             echo "Worker '$name' successfully added and deployed."
             ;;
         list)
