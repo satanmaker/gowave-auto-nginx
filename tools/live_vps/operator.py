@@ -174,9 +174,28 @@ def _bootstrap_one(
         if uid_status != 0 or uid_out.strip() != "0":
             raise PermissionError(f"{label}: authenticated account is not root.")
 
-        private_key = paramiko.Ed25519Key.generate()
-        private_key.write_private_key_file(str(private_key_path))
+        subprocess.run(
+            [
+                "ssh-keygen",
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                marker,
+                "-f",
+                str(private_key_path),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=False,
+        )
         os.chmod(private_key_path, 0o600)
+        Path(f"{private_key_path}.pub").unlink(missing_ok=True)
+        private_key = paramiko.Ed25519Key.from_private_key_file(str(private_key_path))
         public_key = _public_key_line(private_key, marker)
 
         sftp = paramiko.SFTPClient.from_transport(transport)

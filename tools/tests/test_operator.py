@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import signal
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -307,14 +308,36 @@ class TestOperatorSecurityLifecycle(unittest.TestCase):
             junit = (artifact_dir / "junit.xml").read_text(encoding="utf-8")
             self.assertIn("still present", junit)
 
-    def _bootstrap(self, td, transport, sftp, private_key, exec_side_effect, fingerprint):
+    def _bootstrap(self, td, transport, sftp, private_key, exec_side_effect, fingerprint,
+                   run_calls=None):
         fake_paramiko = MagicMock()
         fake_paramiko.Transport.return_value = transport
         fake_paramiko.SFTPClient.from_transport.return_value = sftp
-        fake_paramiko.Ed25519Key.generate.return_value = private_key
+
+        class FakeEd25519Key:
+            """Mirrors paramiko 3.5.x, which has no ``Ed25519Key.generate``."""
+
+            @staticmethod
+            def from_private_key_file(path):
+                return private_key
+
+        fake_paramiko.Ed25519Key = FakeEd25519Key
+
+        def fake_run(cmd, **kwargs):
+            if not cmd or cmd[0] != "ssh-keygen":
+                raise AssertionError(f"unexpected subprocess invocation: {cmd}")
+            if run_calls is not None:
+                run_calls.append((list(cmd), kwargs))
+            key_path = Path(cmd[cmd.index("-f") + 1])
+            key_path.parent.mkdir(parents=True, exist_ok=True)
+            key_path.write_text("private-key-material", encoding="utf-8")
+            Path(f"{key_path}.pub").write_text("ssh-ed25519 AAAA test", encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
         with patch("live_vps.operator.paramiko", fake_paramiko), \
                 patch("live_vps.operator.socket.create_connection", return_value=MagicMock()), \
                 patch("live_vps.operator._exec", side_effect=exec_side_effect), \
+                patch("live_vps.operator.subprocess.run", side_effect=fake_run), \
                 patch("builtins.input", return_value=fingerprint), \
                 patch("live_vps.operator.getpass.getpass", return_value="password"):
             return _bootstrap_one(
@@ -352,9 +375,6 @@ class TestOperatorSecurityLifecycle(unittest.TestCase):
                 pass
 
         class FakePrivateKey:
-            def write_private_key_file(self, path):
-                Path(path).write_text("private-key-material", encoding="utf-8")
-
             def get_name(self):
                 return "ssh-ed25519"
 
@@ -374,11 +394,29 @@ class TestOperatorSecurityLifecycle(unittest.TestCase):
                 return 0, "active\n", ""
             return 0, "", ""
 
+        run_calls = []
         with tempfile.TemporaryDirectory() as td:
             target = self._bootstrap(
                 td, transport, FakeSftp(), FakePrivateKey(), fake_exec,
-                _fingerprint(FakeKey()),
+                _fingerprint(FakeKey()), run_calls,
             )
+            self.assertEqual(len(run_calls), 1, "the private key must be generated exactly once")
+            keygen_cmd, keygen_kwargs = run_calls[0]
+            self.assertEqual(keygen_cmd[:4], ["ssh-keygen", "-q", "-t", "ed25519"])
+            self.assertEqual(keygen_cmd[keygen_cmd.index("-N") + 1], "")
+            self.assertEqual(
+                keygen_cmd[keygen_cmd.index("-C") + 1], target["marker"],
+                "the key comment must carry the revocation marker",
+            )
+            key_path = Path(keygen_cmd[keygen_cmd.index("-f") + 1])
+            self.assertTrue(key_path.exists(), "the private key file must be written by ssh-keygen")
+            self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o600)
+            self.assertFalse(
+                Path(f"{key_path}.pub").exists(),
+                "the public key half must not be left behind in the runtime directory",
+            )
+            self.assertIs(keygen_kwargs["shell"], False)
+            self.assertIs(keygen_kwargs["check"], True)
 
         paths = [path for path, _ in writes]
         timer_index = next(i for i, path in enumerate(paths) if path.endswith(".timer"))
