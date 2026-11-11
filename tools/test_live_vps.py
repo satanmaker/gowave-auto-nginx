@@ -642,7 +642,7 @@ def main() -> int:
                         is_worker_endpoint=is_worker,
                         timeout=config.traffic_timeout,
                         acme_mode=config.acme_mode,
-                        source_ip=control_egress_ip,
+                        source_ip=control_ingress_ip,
                     )
                     xray_case_results.append(res)
 
@@ -652,7 +652,7 @@ def main() -> int:
                 config=config,
                 master_ssh=master_ssh,
                 worker_ssh=worker_ssh,
-                source_ip=control_egress_ip,
+                source_ip=control_ingress_ip,
                 timeout=config.traffic_timeout,
             )
 
