@@ -81,7 +81,6 @@ TEST_TEARDOWN_POLICY=PRESERVE
         content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
         cfg = load_config(self._write_config(content))
         self.assertEqual(cfg.reality_fingerprint, "firefox")
-        self.assertIsNone(cfg.alt_mihomo_core)
 
     def test_reality_fingerprint_accepts_chrome_override(self):
         content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
@@ -94,22 +93,6 @@ TEST_TEARDOWN_POLICY=PRESERVE
         content += "\nREALITY_FINGERPRINT=opera\n"
         with self.assertRaises(ValueError):
             load_config(self._write_config(content))
-
-    def test_alt_mihomo_core_requires_absolute_executable(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        relative = self._write_config(content + "\nALT_MIHOMO_CORE=prizrak-core\n")
-        with self.assertRaises(ValueError):
-            load_config(relative)
-
-        missing = self._write_config(content + "\nALT_MIHOMO_CORE=/nonexistent/prizrak-core\n")
-        with self.assertRaises(ValueError):
-            load_config(missing)
-
-        binary = self.tmp / "prizrak-core"
-        binary.write_text("#!/bin/sh\n")
-        binary.chmod(0o755)
-        ok = self._write_config(content + f"\nALT_MIHOMO_CORE={binary}\n")
-        self.assertEqual(load_config(ok).alt_mihomo_core, str(binary))
 
     def test_insecure_mode_rejected(self):
         content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")

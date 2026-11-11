@@ -69,11 +69,10 @@ Populate `tools/live_vps_config.env` with your real VPS IP addresses, FQDNs, SSH
 | Key | Default | Purpose |
 |---|---|---|
 | `REALITY_FINGERPRINT` | `firefox` | uTLS preset written to REALITY Host records and asserted by subscription validation |
-| `ALT_MIHOMO_CORE` | unset | Absolute path to a mihomo-compatible core (for example Prizrak-Core) run as a second traffic client |
 
 `firefox` is the default: `metacubex/utls` maps `HelloFirefox_Auto` to Firefox 148, whose ClientHello carries the X25519MLKEM768 key share required by Xray REALITY servers. Xray and mihomo (pinned `1.19.34`) both authenticate against REALITY hosts with this preset, and Vision/XHTTP/WS/Trojan-gRPC hosts use `firefox` as well. `REALITY_FINGERPRINT` remains overridable for client fleets that need a different uTLS preset.
 
-`ALT_MIHOMO_CORE` keeps the upstream `mihomo` binary as the mandatory client and adds a second, optional suite against the same fetched subscription. Failures of the alternative client are gated the same way once it runs; leaving the key unset skips it entirely.
+The suite tests exactly the pair that GoWave Panel and GoWave Node deploy: `XRAY_SERVER_VERSION` / `XRAY_CLIENT_VERSION` (pinned `26.11.9`) and the upstream `MIHOMO_CLIENT_VERSION` (pinned `1.19.34`). These are the reference cores for every verify and traffic assertion; no alternative client binaries are exercised.
 
 ---
 

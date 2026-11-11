@@ -901,8 +901,8 @@ Phase 8: Data Plane E2E (8 or 10 logical endpoints × 2 client runtimes = 16 or 
   8.1  Logical endpoint matrix: Master × {VLESS REALITY, VLESS XHTTP, VLESS WS, Trojan gRPC, and optional VLESS XTLS-Vision when the Vision domain pair is configured}
        and Worker × the same protocols (8 endpoints by default; 10 when both Vision domains are configured)
   8.2  For each logical endpoint, run a real Xray client case and a real Mihomo client case (using the
-       configured REALITY fingerprint, `firefox` by default). When `ALT_MIHOMO_CORE` is set, replay the same
-       Mihomo cases against that optional second mihomo-compatible core and gate its results identically:
+       configured REALITY fingerprint, `firefox` by default) with exactly the pinned `XRAY_CLIENT_VERSION`
+       and `MIHOMO_CLIENT_VERSION` binaries that match the cores GoWave Panel and GoWave Node deploy:
        - Extract the corresponding proxy from the real subscription
        - Build/validate a temporary Xray wrapper config; for Mihomo, create a per-run sanitized copy of
          the real YAML preserving proxy definitions/rules but assigning free loopback-only mixed/SOCKS/
