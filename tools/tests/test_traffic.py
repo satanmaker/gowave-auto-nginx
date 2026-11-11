@@ -15,7 +15,10 @@ from live_vps.traffic import (
     apply_xray_trust_anchors,
     build_traffic_curl_cmd,
     evaluate_traffic_suite_status,
+    classify_case_status,
     classify_server_host,
+    get_control_ingress_ip,
+    resolve_attribution_source,
     run_mihomo_traffic_suite,
     start_ingress_capture,
     stop_ingress_capture,
@@ -217,6 +220,69 @@ class TestTrafficModule(unittest.TestCase):
         self.assertEqual(evidence["offload_packets"], 0)
         self.assertTrue(evidence["target_ingress_ok"])
         self.assertTrue(evidence["offload_ok"])
+
+    def test_control_ingress_ip_is_taken_from_the_target_ssh_session(self):
+        ssh = MagicMock()
+        ssh.run.return_value = MagicMock(
+            ok=True,
+            stdout="92.62.60.71 51944 203.0.113.5 22\n92.62.60.71 51944 22\n",
+            stderr="",
+        )
+        self.assertEqual(get_control_ingress_ip(ssh), "92.62.60.71")
+        # A public echo service answers from a different carrier-NAT address than the one
+        # that reaches the VPS, so its value must never be requested for the capture filter.
+        self.assertNotIn("ipify", ssh.run.call_args.args[0])
+
+    def test_control_ingress_ip_ignores_unparseable_and_ipv6_answers(self):
+        ssh = MagicMock()
+        ssh.run.return_value = MagicMock(ok=True, stdout="\n2001:db8::1 4000 22\n", stderr="")
+        self.assertIsNone(get_control_ingress_ip(ssh))
+        ssh.run.return_value = MagicMock(ok=False, stdout="", stderr="ssh failed")
+        self.assertIsNone(get_control_ingress_ip(ssh))
+
+    def test_attribution_requires_both_targets_to_see_one_control_address(self):
+        master, worker = MagicMock(), MagicMock()
+        master.run.return_value = MagicMock(ok=True, stdout="92.62.60.71 5000 22\n", stderr="")
+        worker.run.return_value = MagicMock(ok=True, stdout="92.62.60.71 5001 22\n", stderr="")
+        self.assertEqual(resolve_attribution_source(master, worker), ("92.62.60.71", None))
+
+        worker.run.return_value = MagicMock(ok=True, stdout="198.51.100.7 5001 22\n", stderr="")
+        source, error = resolve_attribution_source(master, worker)
+        self.assertIsNone(source)
+        self.assertIn("different public IPv4", error)
+
+        worker.run.return_value = MagicMock(ok=True, stdout="", stderr="")
+        source, error = resolve_attribution_source(master, worker)
+        self.assertIsNone(source)
+        self.assertIn("did not report", error)
+
+    def test_case_status_never_passes_without_proof_of_intended_ingress(self):
+        empty = {
+            "target_packets": 0, "offload_packets": 0,
+            "target_ingress_ok": False, "offload_ok": True,
+        }
+        # The tunnel demonstrably worked, so an empty capture is missing evidence, not a leak.
+        self.assertEqual(classify_case_status(True, empty), "INCOMPLETE")
+        self.assertEqual(
+            classify_case_status(
+                False, dict(empty, target_packets=4, target_ingress_ok=True),
+            ),
+            "FAIL",
+        )
+        self.assertEqual(
+            classify_case_status(
+                True, dict(empty, offload_packets=2, offload_ok=False, target_ingress_ok=True),
+            ),
+            "FAIL",
+        )
+        self.assertEqual(
+            classify_case_status(True, {"target_ingress_ok": True, "offload_ok": True}),
+            "PASS",
+        )
+        self.assertEqual(
+            classify_case_status(None, {"target_ingress_ok": True, "offload_ok": True}),
+            "FAIL",
+        )
 
     def test_empty_xray_evidence_is_incomplete(self):
         self.assertEqual(

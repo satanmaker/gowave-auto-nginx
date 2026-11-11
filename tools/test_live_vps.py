@@ -62,7 +62,7 @@ from live_vps.traffic import (
     evaluate_traffic_suite_status,
     get_remote_egress_ip,
     classify_xray_outbound,
-    get_control_egress_ip,
+    resolve_attribution_source,
 )
 from live_vps.negative import run_negative_suite
 from live_vps.teardown import execute_teardown
@@ -606,9 +606,12 @@ def main() -> int:
             except Exception:
                 pass
 
-            # Resolve the operator's public IPv4 once; both VPS packet captures use it
-            # to attribute inbound test traffic to this control machine.
-            control_egress_ip = get_control_egress_ip()
+            # Attribute inbound test traffic to this control machine using the address the
+            # targets themselves see on our SSH sessions; an external echo service answers
+            # from a different carrier-NAT address than the one that reaches the VPS.
+            control_ingress_ip, attribution_error = resolve_attribution_source(master_ssh, worker_ssh)
+            if attribution_error:
+                print(f"Traffic attribution unavailable: {attribution_error}")
             xray_case_results = []
             for ob in xray_raw_outbounds:
                 if ob.get("protocol") in ("vless", "trojan", "vmess", "shadowsocks"):
