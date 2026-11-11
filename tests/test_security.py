@@ -90,6 +90,30 @@ class TestSecurityModule(unittest.TestCase):
             with self.assertRaises(ValueError):
                 managed.preflight(root=root, files=(), services=())
 
+    def test_dns_drop_in_directory_stays_readable_under_strict_umask(self):
+        """systemd-resolved runs as systemd-resolve and cannot read a 0700 drop-in dir."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("managed", str(MANAGED_PY))
+        managed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(managed)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "etc").mkdir()
+            txn = managed.Transaction(root=root, services=(), files=())
+            previous_umask = os.umask(0o077)
+            try:
+                txn.write("/etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf", managed.DOT)
+            finally:
+                os.umask(previous_umask)
+                txn.temp.cleanup()
+
+            drop_in_dir = root / "etc" / "systemd" / "resolved.conf.d"
+            self.assertEqual(drop_in_dir.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(
+                (drop_in_dir / "90-gowave-auto-nginx.conf").stat().st_mode & 0o777, 0o644
+            )
+
     def test_bbr_and_mtu_configuration(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

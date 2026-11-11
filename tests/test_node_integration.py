@@ -329,6 +329,56 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertIn("flag=0", res.stdout)
             self.assertIn("remains unhardened", res.stderr)
 
+    def test_worker_payload_ships_security_helper_for_dot(self):
+        """The Worker never receives the project checkout, so managed.py must travel with the payload."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        self.assertIn("export SECURITY_HELPER_B64", worker_script)
+        self.assertIn('$SCRIPT_DIR/assets/security/managed.py', worker_script)
+
+        funcs_start = worker_script.index("cat <<'RUNNER_FUNCS'")
+        payload = worker_script[funcs_start:worker_script.index("\nRUNNER_FUNCS\n", funcs_start)]
+        self.assertIn("configure_dot() {", payload)
+        self.assertIn("--prepare-dns", payload)
+
+    def _run_payload_function(self, function: str, body: str, exports: str = "") -> subprocess.CompletedProcess:
+        script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        funcs_start = script.index("cat <<'RUNNER_FUNCS'")
+        payload = script[funcs_start:script.index("\nRUNNER_FUNCS\n", funcs_start)]
+        start = payload.index(function + "() {")
+        end = payload.index("\n}\n", start) + len("\n}\n")
+        prelude = (
+            "set -euo pipefail\n"
+            "log_warn() { printf '[WARN] %s\\n' \"$*\" >&2; }\n"
+            + exports
+            + payload[start:end]
+            + "\n"
+        )
+        return subprocess.run(["bash", "-c", prelude + body], capture_output=True, text=True)
+
+    def test_worker_payload_dot_runs_shipped_security_helper(self):
+        helper = "import json, sys\nprint(json.dumps({'status': 'configured'}))\nsys.exit(0)\n"
+        exports = "export SECURITY_HELPER_B64=%s\n" % base64.b64encode(helper.encode()).decode()
+        temp_helper = Path("/tmp/gowave-managed-security.py")
+        try:
+            res = self._run_payload_function("configure_dot", "configure_dot\n", exports)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn('"status": "configured"', res.stdout)
+            self.assertFalse(temp_helper.exists(), "the streamed helper must not be left behind")
+        finally:
+            temp_helper.unlink(missing_ok=True)
+
+    def test_worker_payload_dot_propagates_helper_failure(self):
+        helper = "import json, sys\nprint(json.dumps({'status': 'failed'}))\nsys.exit(1)\n"
+        exports = "export SECURITY_HELPER_B64=%s\n" % base64.b64encode(helper.encode()).decode()
+        res = self._run_payload_function("configure_dot", "configure_dot\n", exports)
+        self.assertEqual(res.returncode, 1)
+        self.assertIn('"status": "failed"', res.stdout)
+
+    def test_worker_payload_dot_warns_when_helper_not_delivered(self):
+        res = self._run_payload_function("configure_dot", "configure_dot\n")
+        self.assertEqual(res.returncode, 1)
+        self.assertIn("was not delivered", res.stderr)
+
     def test_worker_rollbacks_remove_only_project_owned_dns_drop_in(self):
         """Both rollback paths must gate DNS drop-in removal on the project marker."""
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
