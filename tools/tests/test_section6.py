@@ -39,11 +39,11 @@ class TestSection6Modules(unittest.TestCase):
         ctx = ssl.create_default_context()
         valid_xray_payload = {
             "outbounds": [
-                {"tag": "proxy-1", "protocol": "vless", "streamSettings": {"security": "reality", "realitySettings": {"fingerprint": "chrome"}}},
+                {"tag": "proxy-1", "protocol": "vless", "streamSettings": {"security": "reality", "realitySettings": {"fingerprint": "firefox"}}},
                 {"tag": "proxy-2", "protocol": "vless", "streamSettings": {"tlsSettings": {"fingerprint": "firefox"}}},
                 {"tag": "proxy-3", "protocol": "trojan", "streamSettings": {"tlsSettings": {"fingerprint": "firefox"}}},
                 {"tag": "proxy-4", "protocol": "vmess", "streamSettings": {"tlsSettings": {"fingerprint": "firefox"}}},
-                {"tag": "proxy-5", "protocol": "vless", "streamSettings": {"security": "reality", "realitySettings": {"fingerprint": "chrome"}}},
+                {"tag": "proxy-5", "protocol": "vless", "streamSettings": {"security": "reality", "realitySettings": {"fingerprint": "firefox"}}},
                 {"tag": "proxy-6", "protocol": "vless", "streamSettings": {"tlsSettings": {"fingerprint": "firefox"}}},
                 {"tag": "proxy-7", "protocol": "trojan", "streamSettings": {"tlsSettings": {"fingerprint": "firefox"}}},
                 {"tag": "proxy-8", "protocol": "vmess", "streamSettings": {"tlsSettings": {"fingerprint": "firefox"}}},
@@ -64,7 +64,7 @@ class TestSection6Modules(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(res["proxy_outbounds_count"], 8)
             self.assertEqual(res["fingerprint"], "firefox")
-            self.assertEqual(res["reality_fingerprint"], "chrome")
+            self.assertEqual(res["reality_fingerprint"], "firefox")
 
     def test_mihomo_subscription_parsing(self):
         ctx = ssl.create_default_context()
@@ -110,7 +110,7 @@ rules:
             self.assertEqual(res["proxies_count"], 8)
             self.assertTrue(res["has_geoip_rule"])
 
-    def _mihomo_subscription_with_reality(self, reality_opts: str, fingerprint: str = "chrome") -> str:
+    def _mihomo_subscription_with_reality(self, reality_opts: str, fingerprint: str = "firefox") -> str:
         proxies = [
             "  - name: p1",
             "    type: vless",
@@ -151,8 +151,8 @@ rules:
             if not expected_ok:
                 self.assertIn("support-x25519mlkem768", res["error"])
 
-    def test_mihomo_subscription_rejects_firefox_reality_fingerprint(self):
-        """Upstream mihomo cannot send a PQ keyshare with the Firefox uTLS hello."""
+    def test_mihomo_subscription_rejects_unexpected_reality_fingerprint(self):
+        """A REALITY proxy must advertise the configured (default firefox) uTLS preset."""
         ctx = ssl.create_default_context()
         modern = (
             "    reality-opts:\n"
@@ -164,13 +164,13 @@ rules:
         mock_resp.__enter__.return_value = mock_resp
         mock_resp.status = 200
         mock_resp.read.return_value = self._mihomo_subscription_with_reality(
-            modern, fingerprint="firefox"
+            modern, fingerprint="chrome"
         ).encode("utf-8")
         with patch("urllib.request.urlopen", return_value=mock_resp), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)):
             ok, res = fetch_and_validate_mihomo_subscription("panel.example.com", "uuid", ctx, has_vision=False)
         self.assertFalse(ok)
-        self.assertIn("expected 'chrome'", res["error"])
+        self.assertIn("expected 'firefox'", res["error"])
 
     def test_reality_fingerprint_override_is_honored(self):
         ctx = ssl.create_default_context()

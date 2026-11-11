@@ -20,7 +20,7 @@
       "shortIds": ["SHORT_ID_PLACEHOLDER"],
       "settings": {
         "publicKey": "PUBLIC_KEY_PLACEHOLDER",
-        "fingerprint": "chrome",
+        "fingerprint": "firefox",
         "serverName": "",
         "spiderX": "/"
       }

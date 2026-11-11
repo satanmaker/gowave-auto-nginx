@@ -151,7 +151,7 @@ def fetch_and_validate_xray_subscription(
     ssl_context: ssl.SSLContext,
     has_vision: bool = False,
     ca_bundle_path: Optional[Path] = None,
-    reality_fingerprint: str = "chrome",
+    reality_fingerprint: str = "firefox",
 ) -> Tuple[bool, Dict[str, Any]]:
     """Fetch Xray JSON subscription and validate schema, proxy outbounds, and xray run -test."""
     url = f"https://{panel_domain}/api/sub/{short_uuid}/v2ray-json"
@@ -207,9 +207,9 @@ def fetch_and_validate_xray_subscription(
             "proxy_outbounds": len(proxy_outbounds),
         }
 
-    # REALITY hosts use the configured (default chrome) fingerprint; every other
-    # transport keeps firefox. Upstream mihomo cannot authenticate REALITY with
-    # a Firefox uTLS hello because that preset sends no X25519MLKEM768 share.
+    # REALITY hosts use the configured (default firefox) fingerprint; every other
+    # transport keeps firefox. Both Xray and mihomo send the hybrid
+    # X25519MLKEM768 key share with the modern Firefox uTLS preset.
     for ob in proxy_outbounds:
         stream_settings = ob.get("streamSettings", {})
         security = (stream_settings.get("security") or "").lower()
@@ -279,7 +279,7 @@ def fetch_and_validate_mihomo_subscription(
     ssl_context: ssl.SSLContext,
     has_vision: bool = False,
     ca_bundle_path: Optional[Path] = None,
-    reality_fingerprint: str = "chrome",
+    reality_fingerprint: str = "firefox",
 ) -> Tuple[bool, Dict[str, Any]]:
     """Fetch Mihomo YAML subscription and validate schema, proxy entries, and mihomo -t."""
     url = f"https://{panel_domain}/api/sub/{short_uuid}/mihomo"
@@ -308,9 +308,9 @@ def fetch_and_validate_mihomo_subscription(
             "proxies_count": len(proxies),
         }
 
-    # REALITY proxies carry the configured (default chrome) client fingerprint so
-    # upstream mihomo can send its PQ keyshare; other proxies stay on firefox.
-    # Every REALITY proxy must also advertise the hybrid key share explicitly.
+    # REALITY proxies carry the configured (default firefox) client fingerprint;
+    # other proxies stay on firefox. Every REALITY proxy must also advertise the
+    # hybrid key share explicitly.
     for p in proxies:
         reality_opts = p.get("reality-opts")
         is_reality = isinstance(reality_opts, dict)

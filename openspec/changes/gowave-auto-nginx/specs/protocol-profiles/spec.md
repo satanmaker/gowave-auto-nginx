@@ -88,17 +88,17 @@ The system SHALL manage user inbound access and credential propagation through G
 - **THEN** GoWave resolves all 5 inbounds for the user via squad membership and dispatches the user's VLESS UUID and Trojan password to `gowave-node`, enabling client authentication across all 5 inbounds.
 
 ### Requirement: Automatic GoWave Host Record Provisioning
-For each provisioned MVP protocol profile, the provisioning system SHALL automatically create and verify a corresponding Host entity via GoWave API (`POST /api/hosts`) with public endpoints, node associations, squad permissions, and a `fingerprint` matching the transport: `chrome` by default for REALITY (upstream mihomo only sends its X25519MLKEM768 key share with the Chrome uTLS preset) and `firefox` for every TLS transport.
+For each provisioned MVP protocol profile, the provisioning system SHALL automatically create and verify a corresponding Host entity via GoWave API (`POST /api/hosts`) with public endpoints, node associations, squad permissions, and a `fingerprint` matching the transport: `firefox` by default for REALITY and `firefox` for every TLS transport.
 
 #### Scenario: Automated creation of Host entities with Node and Squad links
 - **GIVEN** an active GoWave Panel with provisioned Config Profiles, Inbounds, and Node
 - **WHEN** Host provisioning executes for each of the 5 MVP protocols
-- **THEN** `POST /api/hosts` is invoked with `inbound.configProfileUuid`, `inbound.configProfileInboundUuid`, canonical `remark` (`<PROTO>@<node-name>`), `address` set to the public hostname, `port` set to 443, `sni`, `path`, the transport-appropriate `"fingerprint"` (`chrome` by default on REALITY, `firefox` elsewhere), `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy, and appropriate `securityLayer` (`DEFAULT` for REALITY, `TLS` for Vision, XHTTP, WS, and Trojan gRPC), and the created hosts are confirmed via `GET /api/hosts`.
+- **THEN** `POST /api/hosts` is invoked with `inbound.configProfileUuid`, `inbound.configProfileInboundUuid`, canonical `remark` (`<PROTO>@<node-name>`), `address` set to the public hostname, `port` set to 443, `sni`, `path`, the transport-appropriate `"fingerprint"` (`firefox` by default on REALITY, `firefox` elsewhere), `"nodes": ["<node-uuid>"]`, `"internalSquads"` policy, and appropriate `securityLayer` (`DEFAULT` for REALITY, `TLS` for Vision, XHTTP, WS, and Trojan gRPC), and the created hosts are confirmed via `GET /api/hosts`.
 
 #### Scenario: Host securityLayer resolution verification
 - **GIVEN** provisioned Host records in GoWave
 - **WHEN** Host records are retrieved via `GET /api/hosts` and subscription configurations are rendered
-- **THEN** the REALITY Host record has `securityLayer: "DEFAULT"` resolving to client `security: reality`, while Vision, XHTTP, WS, and Trojan gRPC Host records have `securityLayer: "TLS"` resolving to client `security: tls`, with REALITY carrying the REALITY fingerprint (`chrome` by default) and Vision, XHTTP, WS, and Trojan gRPC carrying `fingerprint: "firefox"`.
+- **THEN** the REALITY Host record has `securityLayer: "DEFAULT"` resolving to client `security: reality`, while Vision, XHTTP, WS, and Trojan gRPC Host records have `securityLayer: "TLS"` resolving to client `security: tls`, with REALITY carrying the REALITY fingerprint (`firefox` by default) and Vision, XHTTP, WS, and Trojan gRPC carrying `fingerprint: "firefox"`.
 
 #### Scenario: REALITY Host records advertise the X25519MLKEM768 key share
 - **GIVEN** an Xray server core v26.9.9 or newer, whose REALITY server rejects ClientHellos without an X25519MLKEM768 key share
@@ -108,7 +108,7 @@ For each provisioned MVP protocol profile, the provisioning system SHALL automat
 #### Scenario: Host record presence in subscription output
 - **GIVEN** provisioned Host records for VLESS-REALITY, VLESS-Vision, VLESS-XHTTP, VLESS-WS, and Trojan-gRPC
 - **WHEN** subscription endpoints are queried for an active user belonging to the managed squad
-- **THEN** all 5 configured Host endpoints appear in the generated client configurations with correct public hostnames, port 443, paths, `client-fingerprint: "chrome"` on REALITY, and `client-fingerprint: "firefox"` on the TLS transports.
+- **THEN** all 5 configured Host endpoints appear in the generated client configurations with correct public hostnames, port 443, paths, `client-fingerprint: "firefox"` on REALITY, and `client-fingerprint: "firefox"` on the TLS transports.
 
 #### Scenario: Idempotent Host provisioning and atomic rollback
 - **GIVEN** a provisioning operation that experiences an interruption or failure while creating Host records

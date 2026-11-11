@@ -304,10 +304,8 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(hosts_by_remark["VLESS-WS-TLS@local-node"]["securityLayer"], "TLS")
         self.assertEqual(hosts_by_remark["Trojan-gRPC-TLS@local-node"]["securityLayer"], "TLS")
 
-        self.assertEqual(hosts_by_remark["VLESS-REALITY-Vision@local-node"]["fingerprint"], "chrome")
         for remark, host in hosts_by_remark.items():
-            if remark != "VLESS-REALITY-Vision@local-node":
-                self.assertEqual(host["fingerprint"], "firefox")
+            self.assertEqual(host["fingerprint"], "firefox")
 
     def test_user_provisioning_with_squad_assignment(self):
         """User lifecycle creation assigned to Internal Squad with mandatory expireAt."""

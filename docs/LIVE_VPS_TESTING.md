@@ -68,12 +68,10 @@ Populate `tools/live_vps_config.env` with your real VPS IP addresses, FQDNs, SSH
 
 | Key | Default | Purpose |
 |---|---|---|
-| `REALITY_FINGERPRINT` | `chrome` | uTLS preset written to REALITY Host records and asserted by subscription validation |
+| `REALITY_FINGERPRINT` | `firefox` | uTLS preset written to REALITY Host records and asserted by subscription validation |
 | `ALT_MIHOMO_CORE` | unset | Absolute path to a mihomo-compatible core (for example Prizrak-Core) run as a second traffic client |
 
-`chrome` is the default because of a client-side limitation, not a server one: `metacubex/utls` maps `HelloFirefox_Auto` to the Firefox 120 preset, and the X25519MLKEM768 key share exists only in the Chrome 131/133 presets. Upstream mihomo therefore fails REALITY authentication while the subscription advertises `client-fingerprint: firefox`, even with `support-x25519mlkem768: true`. Xray clients accept either preset, and Vision/XHTTP/WS/Trojan-gRPC hosts keep `firefox`.
-
-Set `REALITY_FINGERPRINT=firefox` only for client fleets that ship a post-quantum Firefox ClientHello (Prizrak-Core does). The installer prints a warning for any non-chrome value, and the traffic phase will report FAIL for upstream mihomo in that mode.
+`firefox` is the default: `metacubex/utls` maps `HelloFirefox_Auto` to Firefox 148, whose ClientHello carries the X25519MLKEM768 key share required by Xray REALITY servers. Xray and mihomo (pinned `1.19.34`) both authenticate against REALITY hosts with this preset, and Vision/XHTTP/WS/Trojan-gRPC hosts use `firefox` as well. `REALITY_FINGERPRINT` remains overridable for client fleets that need a different uTLS preset.
 
 `ALT_MIHOMO_CORE` keeps the upstream `mihomo` binary as the mandatory client and adds a second, optional suite against the same fetched subscription. Failures of the alternative client are gated the same way once it runs; leaving the key unset skips it entirely.
 

@@ -31,7 +31,7 @@ GOWAVE_NODE_INSTALLER_COMMIT=7b3514d1ab8c674050597820d52d55525d4bece7
 GOWAVE_NODE_INSTALLER_SHA256=9a524f1383d3a6a8be42ac370699b0ec6725678ece4abe5b5bc61e8c2af682d0
 XRAY_SERVER_VERSION=26.11.9
 XRAY_CLIENT_VERSION=26.11.9
-MIHOMO_CLIENT_VERSION=1.19.33
+MIHOMO_CLIENT_VERSION=1.19.34
 ACME_MODE=staging
 TEST_TEARDOWN_POLICY=PRESERVE
 """
@@ -77,17 +77,17 @@ TEST_TEARDOWN_POLICY=PRESERVE
         self.assertEqual(cfg.master_known_hosts_path, "/tmp/known_hosts")
         self.assertEqual(cfg.worker_known_hosts_path, "/tmp/known_hosts")
 
-    def test_reality_fingerprint_defaults_to_chrome(self):
+    def test_reality_fingerprint_defaults_to_firefox(self):
         content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        cfg = load_config(self._write_config(content))
-        self.assertEqual(cfg.reality_fingerprint, "chrome")
-        self.assertIsNone(cfg.alt_mihomo_core)
-
-    def test_reality_fingerprint_accepts_firefox_override(self):
-        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
-        content += "\nREALITY_FINGERPRINT=Firefox\n"
         cfg = load_config(self._write_config(content))
         self.assertEqual(cfg.reality_fingerprint, "firefox")
+        self.assertIsNone(cfg.alt_mihomo_core)
+
+    def test_reality_fingerprint_accepts_chrome_override(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        content += "\nREALITY_FINGERPRINT=Chrome\n"
+        cfg = load_config(self._write_config(content))
+        self.assertEqual(cfg.reality_fingerprint, "chrome")
 
     def test_reality_fingerprint_rejects_unknown_value(self):
         content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")

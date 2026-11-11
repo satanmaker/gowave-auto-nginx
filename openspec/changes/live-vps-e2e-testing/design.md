@@ -865,14 +865,14 @@ Phase 4: Panel API Audit
   4.1  GET /api/nodes — 2 nodes, correct addresses, 4 inbounds each (or 5 with the validated Vision pair), isConnected
   4.2  GET /api/config-profiles — 2 profiles, 4 inbounds each (or 5 with the validated Vision pair), computed-config valid JSON
   4.3  GET /api/internal-squads — Default MVP Squad, 8 inbound UUIDs (or 10 with the validated Vision pair), set equality
-  4.4  GET /api/hosts — 8 hosts (or 10 with the validated Vision pair), all fields verified, REALITY hosts carrying the configured REALITY fingerprint (`chrome` by default) and TLS hosts `firefox`, correct node/inbound associations
+  4.4  GET /api/hosts — 8 hosts (or 10 with the validated Vision pair), all fields verified, REALITY hosts carrying the configured REALITY fingerprint (`firefox` by default) and TLS hosts `firefox`, correct node/inbound associations
 
 Phase 5: Subscriptions
   5.1  GET /api/users/by-username/default-user → shortUuid
   5.2  User-Agent policy (empty, absent, Xray UA, Mihomo UA → check actual Panel response)
-  5.3  Fetch Xray JSON (Xray UA), verify 8 proxy outbounds (or 10 when the paired Vision domains are configured), REALITY outbounds carrying the configured REALITY fingerprint (`chrome` by default) and TLS outbounds `fingerprint: "firefox"`, headers, no server secrets
+  5.3  Fetch Xray JSON (Xray UA), verify 8 proxy outbounds (or 10 when the paired Vision domains are configured), REALITY outbounds carrying the configured REALITY fingerprint (`firefox` by default) and TLS outbounds `fingerprint: "firefox"`, headers, no server secrets
   5.4  Validate with xray run -test (temporary wrapper config)
-  5.5  Fetch Mihomo YAML (Mihomo UA), verify 8 proxies (or 10 when the paired Vision domains are configured), REALITY `client-fingerprint` equal to the configured REALITY fingerprint (`chrome` by default) and TLS transports `firefox`, GEOIP rule, headers
+  5.5  Fetch Mihomo YAML (Mihomo UA), verify 8 proxies (or 10 when the paired Vision domains are configured), REALITY `client-fingerprint` equal to the configured REALITY fingerprint (`firefox` by default) and TLS transports `firefox`, GEOIP rule, headers
   5.6  Validate with mihomo -t
   5.7  Verify Mihomo runtime copy binds all local listeners to 127.0.0.1 on collision-free per-run ports;
        preserve proxy/rule semantics and reject externally exposed or non-loopback controllers
@@ -901,7 +901,7 @@ Phase 8: Data Plane E2E (8 or 10 logical endpoints × 2 client runtimes = 16 or 
   8.1  Logical endpoint matrix: Master × {VLESS REALITY, VLESS XHTTP, VLESS WS, Trojan gRPC, and optional VLESS XTLS-Vision when the Vision domain pair is configured}
        and Worker × the same protocols (8 endpoints by default; 10 when both Vision domains are configured)
   8.2  For each logical endpoint, run a real Xray client case and a real Mihomo client case (using the
-       configured REALITY fingerprint, `chrome` by default). When `ALT_MIHOMO_CORE` is set, replay the same
+       configured REALITY fingerprint, `firefox` by default). When `ALT_MIHOMO_CORE` is set, replay the same
        Mihomo cases against that optional second mihomo-compatible core and gate its results identically:
        - Extract the corresponding proxy from the real subscription
        - Build/validate a temporary Xray wrapper config; for Mihomo, create a per-run sanitized copy of
