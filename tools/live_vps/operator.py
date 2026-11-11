@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import datetime as dt
 import getpass
+import json
 import os
 import secrets
 import shutil
@@ -259,6 +261,15 @@ def _bootstrap_one(
             if status:
                 raise RuntimeError(f"{label}: could not arm persistent SSH-key expiry timer: {stderr.strip()}")
             timer_armed = True
+            state_status, timer_state, state_error = _exec(
+                transport, f"systemctl is-active '{timer}.timer'"
+            )
+            timer_state = timer_state.strip()
+            if state_status or timer_state != "active":
+                raise RuntimeError(
+                    f"{label}: expiry timer did not report 'active' after arming: "
+                    + (state_error.strip() or timer_state or "no output")
+                )
 
             if ssh_dir_created:
                 status, _, stderr = _exec(transport, "install -d -o root -g root -m 0700 /root/.ssh")
@@ -286,6 +297,8 @@ def _bootstrap_one(
             "host": host, "port": port, "user": username,
             "key_path": private_key_path, "known_hosts": known_hosts_path,
             "marker": marker, "timer": timer,
+            "expiry_deadline_utc": calendar,
+            "timer_state_at_bootstrap": timer_state,
         }
     except BaseException:
         if timer_files_created or timer_armed or key_installed:
@@ -311,26 +324,77 @@ def _bootstrap_one(
         transport.close()
 
 
-def _cleanup_access(target: dict[str, Any]) -> tuple[bool, str]:
+def _cleanup_access(target: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+    """Revoke one target's temporary key and return the evidence the run leaves behind."""
     client = SSHClient(
         host=target["host"], port=target["port"], user=target["user"],
         key_path=target["key_path"], known_hosts=target["known_hosts"],
     )
-    script = f"/usr/local/sbin/{target['timer']}.sh"
-    marker = target["marker"]
-    timer = target["timer"]
-    command = (
-        f"if [ -x '{script}' ]; then /bin/sh '{script}' || true; fi; "
-        f"if grep -Fq -- '{marker}' /root/.ssh/authorized_keys 2>/dev/null; then exit 1; fi; "
-        f"! systemctl is-active --quiet '{timer}.timer'"
-    )
-    result = client.run(command, timeout=30)
-    if result.ok:
-        return True, "temporary SSH key removed and expiry timer disabled"
+    try:
+        script = f"/usr/local/sbin/{target['timer']}.sh"
+        marker = target["marker"]
+        timer = target["timer"]
+        evidence: dict[str, Any] = {
+            "timer_unit": f"{timer}.timer",
+            "expiry_deadline_utc": target.get("expiry_deadline_utc"),
+            "timer_state_at_bootstrap": target.get("timer_state_at_bootstrap"),
+        }
+        present = client.run(f"test -x '{script}'", timeout=30)
+        if present.returncode not in (0, 1):
+            raise RuntimeError(present.stderr.strip() or "SSH connection failed during revocation")
+        evidence["revocation_script_present"] = present.returncode == 0
+        if present.returncode == 0:
+            ran = client.run(f"/bin/sh '{script}' || true", timeout=30)
+            if ran.returncode == 255:
+                raise RuntimeError(ran.stderr.strip() or "SSH connection failed during revocation")
+        marker_check = client.run(
+            f"grep -Fq -- '{marker}' /root/.ssh/authorized_keys 2>/dev/null", timeout=30
+        )
+        timer_check = client.run(f"systemctl is-active --quiet '{timer}.timer'", timeout=30)
+        if 255 in (marker_check.returncode, timer_check.returncode):
+            raise RuntimeError("SSH connection failed while verifying revocation")
+        evidence["key_present"] = marker_check.returncode == 0
+        evidence["timer_active"] = timer_check.returncode == 0
+    finally:
+        client.close()
+
+    if not evidence["key_present"] and not evidence["timer_active"]:
+        return True, "temporary SSH key removed and expiry timer disabled", evidence
+    if evidence["key_present"] and evidence["timer_active"]:
+        return False, (
+            "temporary SSH key is still present and the expiry timer is still active; "
+            "remove it by hand"
+        ), evidence
+    if evidence["key_present"]:
+        return False, (
+            "temporary SSH key is still present; the remote expiry timer remains the fallback"
+        ), evidence
     return False, (
-        "could not verify temporary SSH-key removal; persistent remote expiry timer "
-        "was armed and will remove the key at its scheduled deadline"
-    )
+        "temporary SSH key was removed but the expiry timer is still active"
+    ), evidence
+
+
+def _revoke_all(targets: list[dict[str, Any]]) -> tuple[dict[str, Any], bool]:
+    """Revoke every target, then report. Interruptions cannot skip a host or the record."""
+    results: dict[str, Any] = {}
+    with _defer_termination_signals():
+        for target in reversed(targets):
+            try:
+                ok, message, evidence = _cleanup_access(target)
+            except KeyboardInterrupt:
+                ok, message, evidence = False, (
+                    "revocation was interrupted; the remote expiry timer remains the fallback"
+                ), {}
+            except Exception as exc:
+                ok, message, evidence = False, (
+                    f"cleanup could not be verified ({type(exc).__name__}); "
+                    "remote expiry timer remains the fallback"
+                ), {}
+            entry: dict[str, Any] = {"status": "PASS" if ok else "INCOMPLETE", "message": message}
+            entry.update(evidence)
+            results[target["user"] + "@" + target["host"]] = entry
+            print(f"{target['host']}: {message}")
+    return results, all(item["status"] == "PASS" for item in results.values())
 
 
 def _build_config(template: Path, output: Path, values: dict[str, str]) -> None:
@@ -349,13 +413,46 @@ def _build_config(template: Path, output: Path, values: dict[str, str]) -> None:
     os.chmod(output, 0o600)
 
 
+def _cleanup_summary_message(cleanup: dict[str, Any]) -> str:
+    if cleanup.get("status") == "PASS":
+        return "temporary SSH access removed on every target; expiry timers disabled"
+    failures = [
+        f"{host}: {item.get('message') or 'cleanup was not verified'}"
+        for host, item in (cleanup.get("targets") or {}).items()
+        if item.get("status") != "PASS"
+    ]
+    return "; ".join(failures) or "temporary SSH access cleanup could not be verified"
+
+
+def _write_operator_only_report(artifact_dir: Path, cleanup: dict[str, Any]) -> None:
+    """Record revocation evidence when the runner never wrote a run-state.json."""
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir.chmod(0o700)
+    payload = {
+        "run_state": "absent",
+        "note": (
+            "the runner did not produce run-state.json for this run; "
+            "this file records temporary SSH access revocation only"
+        ),
+        "operator_access_cleanup": cleanup,
+    }
+    out_path = artifact_dir / "operator-access.json"
+    tmp_file = artifact_dir / "operator-access.json.tmp"
+    tmp_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_file.chmod(0o600)
+    os.replace(tmp_file, out_path)
+
+
 def _refresh_report(run_id: str, cleanup: dict[str, Any]) -> None:
     artifact_dir = REPO_ROOT / "artifacts" / "live-vps" / run_id
     state_file = artifact_dir / "run-state.json"
     if not state_file.is_file():
+        _write_operator_only_report(artifact_dir, cleanup)
         return
     state = load_run_state(artifact_dir)
-    state.setdefault("results", {})["operator_access_cleanup"] = cleanup
+    entry = dict(cleanup)
+    entry.setdefault("message", _cleanup_summary_message(cleanup))
+    state.setdefault("results", {})["operator_access_cleanup"] = entry
     if cleanup.get("status") != "PASS" and state.get("overall") == "PASS":
         state["overall"] = "INCOMPLETE"
     save_run_state(artifact_dir, state)
@@ -366,6 +463,30 @@ def _refresh_report(run_id: str, cleanup: dict[str, Any]) -> None:
 
 def _handle_termination(signum: int, frame: Any) -> None:
     raise KeyboardInterrupt(f"received signal {signum}")
+
+
+@contextlib.contextmanager
+def _defer_termination_signals() -> Any:
+    """Ignore termination signals while access is being revoked.
+
+    A second Ctrl-C, SIGHUP, or SIGTERM must not abort the remaining revocations
+    and the report: that is the one path that can leave a privileged key on a
+    host with nothing recording it.
+    """
+    previous: dict[int, Any] = {}
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        try:
+            previous[signum] = signal.signal(signum, signal.SIG_IGN)
+        except (OSError, ValueError):
+            pass
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            try:
+                signal.signal(signum, handler)
+            except (OSError, ValueError):
+                pass
 
 
 def _run_runner(command: list[str], cwd: Path) -> int:
@@ -439,7 +560,6 @@ def run_interactive(acme_mode: str, mode: str = "full") -> int:
 
     run_id = "run-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
     targets: list[dict[str, Any]] = []
-    cleanup_results: dict[str, Any] = {}
     result_code = 1
     runtime_base = os.environ.get("XDG_RUNTIME_DIR")
     if runtime_base:
@@ -526,19 +646,8 @@ def run_interactive(acme_mode: str, mode: str = "full") -> int:
             print(f"Operator setup failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             result_code = 1
         finally:
-            for target in reversed(targets):
-                try:
-                    ok, message = _cleanup_access(target)
-                except Exception as exc:
-                    ok = False
-                    message = f"cleanup could not be verified ({type(exc).__name__}); remote expiry timer remains the fallback"
-                cleanup_results[target["user"] + "@" + target["host"]] = {
-                    "status": "PASS" if ok else "INCOMPLETE",
-                    "message": message,
-                }
-                print(f"{target['host']}: {message}")
             if targets:
-                cleanup_ok = all(item["status"] == "PASS" for item in cleanup_results.values())
+                cleanup_results, cleanup_ok = _revoke_all(targets)
                 try:
                     _refresh_report(run_id, {
                         "status": "PASS" if cleanup_ok else "INCOMPLETE",
