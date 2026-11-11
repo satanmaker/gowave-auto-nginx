@@ -99,6 +99,38 @@ class TestPreflightSSHDNS(unittest.TestCase):
         self.assertEqual(ssh_cmd[ssh_cmd.index("-F") + 1], "/dev/null")
         self.assertIn("-i", ssh_cmd)
 
+    def test_ssh_client_multiplexes_inside_a_private_socket_directory(self):
+        # Hundreds of short-lived sessions per traffic phase made one connection
+        # setup stall long enough to consume a capture RPC's whole budget; a single
+        # reused master channel removes that handshake from every RPC.
+        client = SSHClient(
+            host="203.0.113.10", port=2222, user="root",
+            key_path="/tmp/master-key", known_hosts="/tmp/pinned-known-hosts",
+        )
+        try:
+            ssh_cmd = client._build_ssh_cmd("true")
+            self.assertIn("ControlMaster=auto", ssh_cmd)
+            self.assertIn("ControlPersist=300", ssh_cmd)
+            control_path = next(
+                arg.split("=", 1)[1] for arg in ssh_cmd if arg.startswith("ControlPath=")
+            )
+            socket_dir = Path(control_path).parent
+            self.assertTrue(socket_dir.is_dir())
+            self.assertEqual(socket_dir.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(len(Path(control_path).name), 12)
+            # Ambient configuration must stay excluded even with multiplexing on.
+            self.assertEqual(ssh_cmd[ssh_cmd.index("-F") + 1], "/dev/null")
+        finally:
+            client.close()
+        self.assertFalse(socket_dir.exists())
+
+    def test_ssh_client_can_disable_multiplexing(self):
+        client = SSHClient(host="203.0.113.10", multiplex=False)
+        ssh_cmd = client._build_ssh_cmd("true")
+        self.assertIn("ControlMaster=no", ssh_cmd)
+        self.assertIn("ControlPath=none", ssh_cmd)
+        self.assertIsNone(client._control_dir)
+
     def test_assert_no_secrets_in_argv(self):
         # 1. Normal safe arguments
         assert_no_secrets_in_argv(["ssh", "root@example.com", "systemctl status"])
