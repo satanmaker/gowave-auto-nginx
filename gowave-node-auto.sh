@@ -836,6 +836,13 @@ remote_payload() {
         echo "Error: mTLS verifier is required for remote worker acceptance." >&2
         return 1
     fi
+    local security_helper_b64=""
+    if [[ -f "$SCRIPT_DIR/assets/security/managed.py" ]]; then
+        security_helper_b64=$(base64 -w 0 "$SCRIPT_DIR/assets/security/managed.py")
+    else
+        echo "Error: Host security helper is required for remote worker hardening." >&2
+        return 1
+    fi
 
     # Validate node port and warn on host collisions if worker host matches panel IP
     if [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "$panel_ip" ]]; then
@@ -863,6 +870,7 @@ remote_payload() {
         printf 'export SSH_PORT=%q\n' "$port"
         printf 'export XRAY_SERVER_VERSION=%q\n' "${XRAY_SERVER_VERSION:-}"
         printf 'export VERIFY_NODE_MTLS_B64=%q\n' "$verifier_b64"
+        printf 'export SECURITY_HELPER_B64=%q\n' "$security_helper_b64"
         printf 'export WORKER_DOMAIN=%q\n' "$worker_domain"
         printf 'export REALITY_DOMAIN=%q\n' "$reality_domain"
         printf 'export VISION_DOMAIN=%q\n' "${VISION_DOMAIN:-}"
@@ -1657,6 +1665,26 @@ setup_system_prereqs() {
         curl tar gzip openssl ufw fail2ban iproute2 ca-certificates
 }
 
+configure_dot() {
+    # The shared host-security helper is streamed with the payload because the
+    # Worker never receives the project checkout at /opt/gowave-auto-nginx.
+    echo "Configuring strict DNS-over-TLS via systemd-resolved..."
+    if [[ -z "${SECURITY_HELPER_B64:-}" ]]; then
+        log_warn "Host security helper was not delivered to this Worker."
+        return 1
+    fi
+    local helper=/tmp/gowave-managed-security.py
+    if ! printf '%s' "$SECURITY_HELPER_B64" | base64 -d > "$helper"; then
+        log_warn "Could not materialize the host security helper."
+        return 1
+    fi
+    chmod 0700 "$helper"
+    local rc=0
+    python3 "$helper" --prepare-dns </dev/null || rc=$?
+    rm -f "$helper"
+    return "$rc"
+}
+
 configure_worker_dot() {
     local dot_conf="${1:-/etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf}"
     if [[ -e "$dot_conf" ]]; then
@@ -2265,8 +2293,8 @@ compensate_remote_worker() {
     fi
 
     # 8. Clean temporary files and unset secrets
-    unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64
-    rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh || rollback_failed=1
+    unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64 SECURITY_HELPER_B64
+    rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.py /tmp/gowave-node-install-*.sh || rollback_failed=1
 
     if [[ "$rollback_failed" -ne 0 ]]; then
         echo "[ROLLBACK] ERROR: compensating rollback incomplete; one or more cleanup operations failed." >&2
@@ -2297,8 +2325,8 @@ main() {
 
     _COMPENSATED=0
     cleanup_temp_and_secrets() {
-        unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64 2>/dev/null || true
-        rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh 2>/dev/null || true
+        unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64 SECURITY_HELPER_B64 2>/dev/null || true
+        rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.py /tmp/gowave-node-install-*.sh 2>/dev/null || true
     }
     handle_signal() {
         local sig="$1"
@@ -2369,7 +2397,7 @@ main() {
     trap - ERR
     # Keep the ACME before-image until the controller durably commits NODE_ADD.
     # The controller calls remote_finalize only after that commit succeeds.
-    unset _NODE_SECRET_KEY VERIFY_NODE_MTLS_B64
+    unset _NODE_SECRET_KEY VERIFY_NODE_MTLS_B64 SECURITY_HELPER_B64
     echo "GoWave Edge Worker deployment complete (service, NGINX, TLS and mTLS health verified)."
 }
 main "$@" </dev/null
@@ -2795,7 +2823,7 @@ if [[ -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf ]] &&
     rm -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf || rollback_failed=1
     systemctl restart systemd-resolved 2>/dev/null || rollback_failed=1
 fi
-rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh || rollback_failed=1
+rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.py /tmp/gowave-node-install-*.sh || rollback_failed=1
 sysctl --system 2>/dev/null || rollback_failed=1
 
 # Delete the ACME snapshot only after every rollback action has succeeded.
