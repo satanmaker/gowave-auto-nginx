@@ -24,6 +24,12 @@ from .ssh import SSHClient
 from .config import LiveVPSConfig
 from .tls import verify_staging_roots
 
+# A capture RPC must outlive its connection setup: the control channel stalls
+# occasionally on VPN/carrier-NAT paths, and a budget equal to ConnectTimeout
+# leaves no room for the kill/wait work that produces the packet summary.
+CAPTURE_RPC_TIMEOUT = 20
+CAPTURE_PATH_PREFIX = "/run/gowave-e2e-ingress-"
+
 
 def find_free_port() -> int:
     """Find an available local TCP port on loopback."""
@@ -84,7 +90,7 @@ def start_ingress_capture(ssh: SSHClient, target_port: int) -> Optional[Dict[str
     if target_port == ssh.port:
         return None
     token = uuid.uuid4().hex
-    base = "/run/gowave-e2e-ingress-" + token
+    base = CAPTURE_PATH_PREFIX + token
     log_path, pid_path = base + ".log", base + ".pid"
     capture_filter = "tcp and dst port " + str(target_port) + " and not dst port " + str(ssh.port)
     command = (
@@ -98,13 +104,13 @@ def start_ingress_capture(ssh: SSHClient, target_port: int) -> Optional[Dict[str
         "{ cat " + shlex.quote(log_path) + " 2>/dev/null || true; exit 1; }; "
         "sleep 0.1; done; cat " + shlex.quote(log_path) + " 2>/dev/null || true; exit 1"
     )
-    result = ssh.run(command, timeout=10)
+    result = ssh.run(command, timeout=CAPTURE_RPC_TIMEOUT)
     if not result.ok:
         ssh.run(
             "if [ -f " + shlex.quote(pid_path) + " ]; then kill -INT \"$(cat " +
             shlex.quote(pid_path) + ")\" 2>/dev/null || true; fi; rm -f " +
             shlex.quote(log_path) + " " + shlex.quote(pid_path),
-            timeout=5,
+            timeout=10,
         )
         return None
     return {"log_path": log_path, "pid_path": pid_path}
@@ -143,10 +149,22 @@ def stop_ingress_capture(ssh: SSHClient, capture: Dict[str, str]) -> Optional[Di
         "| sed -E 's/^ *([0-9]+) (.+)$/SOURCE \\2 \\1/' || true; "
         "rm -f " + log_path + " " + pid_path
     )
-    result = ssh.run(command, timeout=10)
+    result = ssh.run(command, timeout=CAPTURE_RPC_TIMEOUT)
     if not result.ok:
         return None
     return parse_ingress_evidence(result.stdout)
+
+
+def sweep_stale_captures(ssh: SSHClient) -> None:
+    """Remove capture logs and pid files an interrupted earlier case left behind.
+
+    Only this suite's own prefix is touched; a leaked capture would otherwise keep
+    recording later cases' packets and make any recovered summary ambiguous.
+    """
+    ssh.run(
+        "rm -f " + CAPTURE_PATH_PREFIX + "*.log " + CAPTURE_PATH_PREFIX + "*.pid",
+        timeout=10,
+    )
 
 
 def capture_pair_ingress(

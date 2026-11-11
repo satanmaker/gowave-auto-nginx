@@ -63,6 +63,7 @@ from live_vps.traffic import (
     get_remote_egress_ip,
     classify_xray_outbound,
     resolve_attribution_source,
+    sweep_stale_captures,
 )
 from live_vps.negative import run_negative_suite
 from live_vps.teardown import execute_teardown
@@ -583,6 +584,11 @@ def main() -> int:
             token = panel_client.login(panel_credentials["ADMIN_USERNAME"], panel_credentials["ADMIN_PASSWORD"])
             short_uuid = get_default_user_short_uuid(panel_client)
 
+            # Drop capture files a previously interrupted case may have leaked; a live
+            # capture would keep recording later cases and blur their attribution.
+            sweep_stale_captures(master_ssh)
+            sweep_stale_captures(worker_ssh)
+
             # Fetch subscriptions
             _, xray_sub_res = fetch_and_validate_xray_subscription(config.master_panel_domain, short_uuid, ssl_ctx, ca_bundle_path=ca_bundle)
             mihomo_sub_url = f"https://{config.master_panel_domain}/api/sub/{short_uuid}/mihomo"
@@ -799,6 +805,8 @@ def main() -> int:
         except Exception as report_error:
             print(f"Failed to persist terminal E2E report: {type(report_error).__name__}", file=sys.stderr)
         finally:
+            master_ssh.close()
+            worker_ssh.close()
             local_lock.release()
 
     print(f"E2E Run completed: {run_id}. Overall status: {overall_status}")

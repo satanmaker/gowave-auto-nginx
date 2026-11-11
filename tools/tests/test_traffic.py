@@ -25,6 +25,8 @@ from live_vps.traffic import (
     stop_ingress_capture,
     finish_pair_ingress,
     get_xray_server_port,
+    sweep_stale_captures,
+    CAPTURE_RPC_TIMEOUT,
 )
 
 
@@ -196,6 +198,23 @@ class TestTrafficModule(unittest.TestCase):
         self.assertIsNone(start_ingress_capture(ssh, 70000))
         self.assertIsNone(start_ingress_capture(ssh, True))
         ssh.run.assert_not_called()
+
+    def test_capture_rpc_budget_outlives_connection_setup(self):
+        # A budget equal to ConnectTimeout left no room for the kill/wait work once a
+        # connection setup stalled, turning a working tunnel into a missing summary.
+        self.assertGreater(CAPTURE_RPC_TIMEOUT, 10)
+
+    def test_sweep_stale_captures_touches_only_the_suite_prefix(self):
+        ssh = MagicMock()
+        ssh.run.return_value = MagicMock(ok=True, stdout="", stderr="")
+        sweep_stale_captures(ssh)
+        command = ssh.run.call_args.args[0]
+        self.assertEqual(
+            command,
+            "rm -f /run/gowave-e2e-ingress-*.log /run/gowave-e2e-ingress-*.pid",
+        )
+        self.assertNotIn("/run/gowave", command.replace("/run/gowave-e2e-ingress-", ""))
+        self.assertEqual(ssh.run.call_args.kwargs.get("timeout"), 10)
 
     def test_stop_ingress_capture_requires_tcpdump_summary(self):
         ssh = MagicMock()

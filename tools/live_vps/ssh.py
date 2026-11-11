@@ -3,8 +3,12 @@ and isolated stdin delivery.
 """
 from __future__ import annotations
 
+import atexit
+import hashlib
 import os
+import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -59,6 +63,8 @@ class SSHClient:
         key_path: Optional[str | Path] = None,
         known_hosts: Optional[str | Path] = None,
         connect_timeout: int = 10,
+        multiplex: bool = True,
+        control_persist: int = 300,
     ):
         self.host = host
         self.port = port
@@ -66,6 +72,48 @@ class SSHClient:
         self.key_path = str(Path(key_path).resolve()) if key_path else None
         self.known_hosts = str(Path(known_hosts).resolve()) if known_hosts else None
         self.connect_timeout = connect_timeout
+        self.multiplex = multiplex
+        self.control_persist = control_persist
+        self._control_dir: Optional[str] = None
+        self._control_path: Optional[str] = None
+        if multiplex:
+            atexit.register(self.close)
+
+    def _control_socket_path(self) -> str:
+        """Return a short socket path inside a private per-client directory.
+
+        A fresh directory per client process means a socket left behind by an earlier
+        or killed run can never be reused; ControlPersist keeps the authenticated
+        channel only for this client's lifetime, which close() ends explicitly.
+        """
+        if self._control_path is None:
+            directory = tempfile.mkdtemp(prefix="gowave-ssh-")
+            os.chmod(directory, 0o700)
+            self._control_dir = directory
+            digest = hashlib.sha256(
+                f"{self.user}@{self.host}:{self.port}".encode("utf-8")
+            ).hexdigest()[:12]
+            self._control_path = os.path.join(directory, digest)
+        return self._control_path
+
+    def close(self) -> None:
+        """Release the multiplexed master connection and remove its private socket."""
+        control_path = self._control_path
+        if control_path:
+            try:
+                subprocess.run(
+                    ["ssh", "-F", "/dev/null", "-o", f"ControlPath={control_path}",
+                     "-O", "exit", f"{self.user}@{self.host}"],
+                    capture_output=True,
+                    timeout=10,
+                    shell=False,
+                )
+            except Exception:
+                pass
+        if self._control_dir:
+            shutil.rmtree(self._control_dir, ignore_errors=True)
+        self._control_dir = None
+        self._control_path = None
 
     def _base_ssh_options(self) -> List[str]:
         """Disable ambient SSH configuration and trust sources; use only explicit pins."""
@@ -86,8 +134,6 @@ class SSHClient:
             "-o", "ProxyCommand=none",
             "-o", "ProxyJump=none",
             "-o", "PermitLocalCommand=no",
-            "-o", "ControlMaster=no",
-            "-o", "ControlPath=none",
             "-o", "PasswordAuthentication=no",
             "-o", "KbdInteractiveAuthentication=no",
             "-o", "GSSAPIAuthentication=no",
@@ -95,6 +141,14 @@ class SSHClient:
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=2",
         ]
+        if self.multiplex:
+            options.extend([
+                "-o", "ControlMaster=auto",
+                "-o", f"ControlPath={self._control_socket_path()}",
+                "-o", f"ControlPersist={self.control_persist}",
+            ])
+        else:
+            options.extend(["-o", "ControlMaster=no", "-o", "ControlPath=none"])
         return options
 
     def _build_ssh_cmd(self, remote_cmd: Optional[str] = None) -> List[str]:
