@@ -173,6 +173,13 @@ def execute_teardown(
             "error": f"Restore hook emitted non-JSON output: {proc.stdout[:200]}",
         }
 
+    if not isinstance(hook_out, dict):
+        return {
+            "status": "TEARDOWN_FAILED",
+            "policy": "RESTORE_SNAPSHOT",
+            "error": "Restore hook JSON output must be an object",
+        }
+
     if hook_out.get("status") != "RESTORED":
         return {
             "status": "TEARDOWN_FAILED",

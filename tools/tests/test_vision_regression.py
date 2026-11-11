@@ -2,7 +2,7 @@
 """Regression test suite for Vision capability (Task 10.9 & Task 1.7).
 
 Verifies:
-1. One-sided Vision configuration is rejected by parser.
+1. Master and Worker Vision domains are configured independently.
 2. Master Vision Certbot/verification failure aborts and rolls back.
 3. Worker --vision-domain reaches API profile, host provisioning, bootstrap HTTP-01 server_name, and SSH stdin.
 4. Worker issues/validates Vision certificate using selected ACME server.
@@ -10,12 +10,14 @@ Verifies:
 6. Worker rollback removes only transaction-owned Vision artifacts and preserves unrelated lineages.
 7. Failpoints cover challenge issuance, certificate validation, NGINX syntax, and API provisioning.
 8. Disabled Vision retains 4 inbounds and no Vision certificate/route/fallback.
-9. Case matrix enforces exactly 16 runtime cases when disabled and 20 when enabled.
+9. Case matrix enforces 16, 18, or 20 runtime cases for zero, one, or two Vision domains.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
+import textwrap
 import subprocess
 import tempfile
 import unittest
@@ -37,31 +39,35 @@ from modules.api_client import GoWaveClient
 NGINX_SH = str(REPO_ROOT / "modules" / "nginx.sh")
 NODE_AUTO_SH = str(REPO_ROOT / "gowave-node-auto.sh")
 
+PACKET_EVIDENCE = {
+    "target_packets": 3,
+    "offload_packets": 0,
+    "target_ingress_ok": True,
+    "offload_ok": True,
+    "egress_matches": True,
+    "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
+}
+
 
 class TestVisionRegressionCoverage(unittest.TestCase):
     """Test matrix and lifecycle regression tests for Vision capability."""
 
-    def test_one_sided_vision_config_rejected(self):
-        """Parser must reject one-sided vision configuration before any remote action."""
+    def test_master_and_worker_vision_domains_are_independent(self):
+        """Parser accepts Master-only and Worker-only Vision topologies."""
         example_cfg = (REPO_ROOT / "tools" / "live_vps_config.env.example").read_text()
         example_cfg = example_cfg.replace("203.0.113.10", "93.184.216.34").replace("203.0.113.20", "93.184.216.35")
         with tempfile.TemporaryDirectory() as td:
             cfg = Path(td) / "live_vps_config.env"
-            # 1. Only Master Vision domain set
-            content = example_cfg + "\nMASTER_VISION_DOMAIN=vision.master.com\n"
-            cfg.write_text(content)
-            cfg.chmod(0o600)
-            with self.assertRaises(ValueError) as ctx:
-                load_config(cfg)
-            self.assertIn("must both be configured or both be omitted", str(ctx.exception))
-
-            # 2. Only Worker Vision domain set
-            content = example_cfg + "\nWORKER_VISION_DOMAIN=vision.worker.com\n"
-            cfg.write_text(content)
-            cfg.chmod(0o600)
-            with self.assertRaises(ValueError) as ctx:
-                load_config(cfg)
-            self.assertIn("must both be configured or both be omitted", str(ctx.exception))
+            for addition, expected_master, expected_worker in (
+                ("\nMASTER_VISION_DOMAIN=vision.master.com\n", "vision.master.com", None),
+                ("\nWORKER_VISION_DOMAIN=vision.worker.com\n", None, "vision.worker.com"),
+            ):
+                with self.subTest(addition=addition):
+                    cfg.write_text(example_cfg + addition)
+                    cfg.chmod(0o600)
+                    parsed = load_config(cfg)
+                    self.assertEqual(parsed.master_vision_domain, expected_master)
+                    self.assertEqual(parsed.worker_vision_domain, expected_worker)
 
     def test_worker_vision_domain_propagation_and_inbound_counts(self):
         """Worker compile_config_profile and provision_hosts generate 5 inbounds/hosts with Vision, 4 without."""
@@ -150,7 +156,8 @@ class TestVisionRegressionCoverage(unittest.TestCase):
             subprocess.run([
                 "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                 "-keyout", str(key_file), "-out", str(cert_file),
-                "-days", "30", "-subj", "/CN=other.master.com"
+                "-days", "30", "-subj", "/CN=other.master.com",
+                "-addext", "subjectAltName=DNS:other.master.com"
             ], check=True, stderr=subprocess.DEVNULL)
 
             cmd = f'source "{NGINX_SH}" && verify_acme_certificate "vision.master.com" "{live_dir}"'
@@ -186,8 +193,8 @@ class TestVisionRegressionCoverage(unittest.TestCase):
             self.assertIn("export VISION_DOMAIN=vision.worker.example.com", captured)
             self.assertIn("gowave-worker-vision-fallback.conf", captured)
 
-    def test_worker_rollback_removes_vision_artifacts_preserves_unrelated(self):
-        """Worker rollback removes transaction-owned Vision artifacts and restores pre-existing ACME lineage."""
+    def test_acme_snapshot_restores_preexisting_vision_lineage(self):
+        """ACME snapshot recovery restores the original Vision certificate after tampering."""
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             rec_dir = tmp / "recovery"
@@ -230,62 +237,272 @@ class TestVisionRegressionCoverage(unittest.TestCase):
             self.assertNotEqual(cert_file.read_text(), "TAMPERED_CERT_BYTES")
             self.assertIn("BEGIN CERTIFICATE", cert_file.read_text())
 
-    def test_case_matrix_counting_16_vs_20_in_traffic_and_junit(self):
-        """Case matrix: 16 cases when Vision is disabled, 20 cases when Vision is enabled."""
-        # 1. Disabled Vision: expected 8 per client (total 16)
-        xray_8 = [{"status": "PASS", "tag": f"outbound-{i}", "duration": 0.5} for i in range(8)]
-        mihomo_8 = {"status": "PASS", "results": [{"status": "PASS", "name": f"proxy-{i}", "duration": 0.5} for i in range(8)]}
+    def test_all_in_one_acme_rollback_reports_partial_failure(self):
+        script = (REPO_ROOT / "gowave-auto.sh").read_text(encoding="utf-8")
+        match = re.search(r"(?ms)^    rollback_acme_lineages\(\) \{\n.*?^    \}", script)
+        self.assertIsNotNone(match, "all-in-one ACME rollback function not found")
+        function = textwrap.dedent(match.group(0))
+        harness = '''
+rollback_managed_deploy_hook() { return 0; }
+restore_acme_lineage() {
+    if [[ "${FAIL_RESTORE:-0}" == "1" && "$2" == "panel.example.test" ]]; then return 1; fi
+    return 0
+}
+rm() { return 0; }
+acme_tx_id=test_tx
+panel_domain=panel.example.test
+reality_domain=reality.example.test
+vision_domain=vision.example.test
+'''
+        failed = subprocess.run(["bash", "-c", harness + "\n" + function + "\nrollback_acme_lineages"], env={**os.environ, "FAIL_RESTORE": "1"}, text=True, capture_output=True, check=False)
+        self.assertEqual(failed.returncode, 0)
+        self.assertIn("CRITICAL: ACME rollback incomplete", failed.stderr)
+        self.assertNotIn("ACME certificate lineage rollback completed successfully", failed.stderr)
+        succeeded = subprocess.run(["bash", "-c", harness + "\n" + function + "\nrollback_acme_lineages"], env={**os.environ, "FAIL_RESTORE": "0"}, text=True, capture_output=True, check=False)
+        self.assertEqual(succeeded.returncode, 0)
+        self.assertIn("ACME certificate lineage rollback completed successfully", succeeded.stderr)
+        self.assertNotIn("CRITICAL: ACME rollback incomplete", succeeded.stderr)
 
-        # Passing 8 per client with expected_case_count=8 yields PASS
-        self.assertEqual(evaluate_traffic_suite_status(True, xray_8, mihomo_8, expected_case_count=8), "PASS")
+    def test_snapshot_acme_lineage_fails_when_directory_permissions_cannot_be_hardened(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            recovery = root / "recovery"
+            letsencrypt = root / "letsencrypt"
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_chmod = fake_bin / "chmod"
+            fake_chmod.write_text("#!/bin/sh\nexit 1\n")
+            fake_chmod.chmod(0o755)
+            env = {**os.environ, "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}"}
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1" && snapshot_acme_lineage "$2" "$3" "$4" "$5"',
+                 "bash", NGINX_SH, "snapshot_test", "snapshot.example.test", str(recovery), str(letsencrypt)],
+                text=True, capture_output=True, env=env, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Could not secure ACME snapshot directory", result.stderr)
+        for path in (REPO_ROOT / "gowave-node-auto.sh", REPO_ROOT / "modules" / "nginx.sh"):
+            script = path.read_text(encoding="utf-8")
+            starts = [match.start() for match in re.finditer(r"(?m)^snapshot_acme_lineage\(\) \{", script)]
+            self.assertTrue(starts)
+            for start in starts:
+                end = script.index("restore_acme_lineage() {", start)
+                function = script[start:end]
+                self.assertIn('chmod 0700 "$snap_dir" 2>/dev/null || {', function)
+                self.assertIn("os.O_NOFOLLOW", function)
+                self.assertIn("os.fsync", function)
 
-        # Passing 8 per client when expected_case_count=10 (Vision enabled) yields INCOMPLETE
-        self.assertEqual(evaluate_traffic_suite_status(True, xray_8, mihomo_8, expected_case_count=10), "INCOMPLETE")
+    def test_restore_acme_lineage_propagates_removal_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            recovery = root / "recovery"
+            letsencrypt = root / "letsencrypt"
+            domain = "new.example.test"
+            manifest = recovery / "tx" / "acme" / domain / "lineage-manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(json.dumps({"domain": domain, "existed_before": False}))
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_rm = fake_bin / "rm"
+            fake_rm.write_text("#!/bin/sh\nexit 1\n")
+            fake_rm.chmod(0o755)
+            env = {**os.environ, "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}"}
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1" && restore_acme_lineage "$2" "$3" "$4" "$5"',
+                 "bash", str(NGINX_SH), "tx", domain, str(recovery), str(letsencrypt)],
+                text=True, capture_output=True, env=env, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Could not remove transaction-created renewal config", result.stderr)
 
-        # 2. Enabled Vision: expected 10 per client (total 20)
-        xray_10 = [{"status": "PASS", "tag": f"outbound-{i}", "duration": 0.5} for i in range(10)]
-        mihomo_10 = {"status": "PASS", "results": [{"status": "PASS", "name": f"proxy-{i}", "duration": 0.5} for i in range(10)]}
+    def test_deploy_hook_rollback_rejects_invalid_manifest_and_propagates_remove_failure(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            recovery = root / "recovery"
+            hook = root / "gowave-nginx.sh"
+            hook.write_text("#!/bin/sh\nexit 0\n")
+            tx = "hook_rollback_test"
+            manifest = recovery / tx / "deploy-hook-manifest.json"
+            manifest.parent.mkdir(parents=True)
+            digest = hashlib.sha256(hook.read_bytes()).hexdigest()
+            valid = {"transaction_id": tx, "path": str(hook), "created_by_tx": True, "sha256": digest}
+            manifest.write_text(json.dumps(valid))
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_rm = fake_bin / "rm"
+            fake_rm.write_text("#!/bin/sh\nexit 1\n")
+            fake_rm.chmod(0o755)
+            env = {**os.environ, "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}"}
+            command = ['source "$1" && rollback_managed_deploy_hook "$2" "$3" "$4"', "bash", NGINX_SH, tx, str(hook), str(recovery)]
+            failed_remove = subprocess.run(["bash", "-c", *command], env=env, text=True, capture_output=True, check=False)
+            self.assertNotEqual(failed_remove.returncode, 0)
+            self.assertTrue(hook.exists())
+            manifest.write_text('{ malformed json')
+            invalid_manifest = subprocess.run(["bash", "-c", *command], env=os.environ.copy(), text=True, capture_output=True, check=False)
+            self.assertNotEqual(invalid_manifest.returncode, 0)
+            self.assertTrue(hook.exists())
+            self.assertIn("ownership manifest is invalid", invalid_manifest.stderr)
+            manifest.unlink()
+            missing_manifest = subprocess.run(["bash", "-c", *command], env=os.environ.copy(), text=True, capture_output=True, check=False)
+            self.assertNotEqual(missing_manifest.returncode, 0)
+            self.assertTrue(hook.exists())
+            self.assertIn("exists without an ownership manifest", missing_manifest.stderr)
 
-        self.assertEqual(evaluate_traffic_suite_status(True, xray_10, mihomo_10, expected_case_count=10), "PASS")
+    def test_worker_deploy_hook_rollback_copies_share_strict_contract(self):
+        script = (REPO_ROOT / "gowave-node-auto.sh").read_text(encoding="utf-8")
+        matches = list(re.finditer(r"(?ms)^rollback_managed_deploy_hook\(\) \{\n.*?^\}", script))
+        self.assertEqual(len(matches), 3, "expected local, remote-payload, and standalone rollback copies")
+        for match in matches:
+            function = match.group(0)
+            self.assertIn("expected_tx", function)
+            self.assertIn("ownership manifest is invalid", function)
+            self.assertIn("exists without an ownership manifest", function)
+            self.assertIn("digest mismatch", function)
+            self.assertIn('rm -f "$hook_file" || {', function)
+            self.assertIn('sync "$(dirname "$hook_file")" || {', function)
 
-        # 3. JUnit report generation contains exact case counts
+    def test_worker_compensation_removes_vision_artifacts_and_restores_lineage(self):
+        """Worker ERR compensation removes the Vision fallback and restores its ACME lineage."""
+        node_script = (REPO_ROOT / "gowave-node-auto.sh").read_text(encoding="utf-8")
+        start = node_script.index("compensate_remote_worker() {")
+        end = node_script.index("\n}\n", start) + len("\n}\n")
+        compensation = node_script[start:end]
+
+        self.assertIn("/etc/nginx/conf.d/gowave-worker-vision-fallback.conf", compensation)
+        self.assertIn('if [[ -n "${VISION_DOMAIN:-}" ]]; then', compensation)
+        self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN"', compensation)
+    def test_case_matrix_counts_match_independent_vision_topologies(self):
+        """Traffic and JUnit counts stay aligned for zero, one, or two Vision endpoints."""
         with tempfile.TemporaryDirectory() as td:
             artifact_dir = Path(td)
 
-            # State without vision (8 Xray + 8 Mihomo = 16 endpoint testcases)
-            state_no_vis = {
-                "results": {
-                    "traffic": {
+            for vision_count in range(3):
+                expected_per_client = 8 + vision_count
+                with self.subTest(vision_count=vision_count):
+                    xray_results = [
+                        {
+                            "status": "PASS",
+                            "tag": f"outbound-{index}",
+                            "duration": 0.5,
+                            **PACKET_EVIDENCE,
+                        }
+                        for index in range(expected_per_client)
+                    ]
+                    mihomo_results = {
                         "status": "PASS",
-                        "xray_results": xray_8,
-                        "mihomo_results": mihomo_8,
+                        "results": [
+                            {
+                                "status": "PASS",
+                                "name": f"proxy-{index}",
+                                "duration": 0.5,
+                                **PACKET_EVIDENCE,
+                            }
+                            for index in range(expected_per_client)
+                        ],
                     }
-                }
-            }
-            cases_no_vis = build_test_cases_from_state(state_no_vis)
-            # phase_traffic + 8 xray + 8 mihomo = 17 testcases
-            endpoint_cases_no_vis = [c for c in cases_no_vis if c["classname"].startswith("live_vps.traffic.")]
-            self.assertEqual(len(endpoint_cases_no_vis), 16)
-            junit_path_no_vis = write_junit_report(artifact_dir, cases_no_vis)
-            content_no_vis = junit_path_no_vis.read_text()
-            self.assertIn('tests="17"', content_no_vis)
 
-            # State with vision (10 Xray + 10 Mihomo = 20 endpoint testcases)
-            state_vis = {
-                "results": {
-                    "traffic": {
-                        "status": "PASS",
-                        "xray_results": xray_10,
-                        "mihomo_results": mihomo_10,
+                    self.assertEqual(
+                        evaluate_traffic_suite_status(
+                            True,
+                            xray_results,
+                            mihomo_results,
+                            expected_case_count=expected_per_client,
+                        ),
+                        "PASS",
+                    )
+                    self.assertEqual(
+                        evaluate_traffic_suite_status(
+                            True,
+                            xray_results,
+                            mihomo_results,
+                            expected_case_count=expected_per_client + 1,
+                        ),
+                        "INCOMPLETE",
+                    )
+
+                    state = {
+                        "results": {
+                            "traffic": {
+                                "status": "PASS",
+                                "xray_results": xray_results,
+                                "mihomo_results": mihomo_results,
+                            }
+                        }
                     }
-                }
-            }
-            cases_vis = build_test_cases_from_state(state_vis)
-            endpoint_cases_vis = [c for c in cases_vis if c["classname"].startswith("live_vps.traffic.")]
-            self.assertEqual(len(endpoint_cases_vis), 20)
-            junit_path_vis = write_junit_report(artifact_dir, cases_vis)
-            content_vis = junit_path_vis.read_text()
-            self.assertIn('tests="21"', content_vis)
+                    cases = build_test_cases_from_state(state)
+                    endpoint_cases = [
+                        case for case in cases
+                        if case["classname"].startswith("live_vps.traffic.")
+                    ]
+                    expected_endpoints = expected_per_client * 2
+                    self.assertEqual(len(endpoint_cases), expected_endpoints)
+
+                    junit_path = write_junit_report(artifact_dir, cases)
+                    self.assertIn(
+                        f'tests="{expected_endpoints + 1}"',
+                        junit_path.read_text(encoding="utf-8"),
+                    )
+
+    def test_managed_deploy_hook_fails_closed_when_snapshot_permissions_fail(self):
+        for fail_on, expected_error in (
+            (2, "Could not secure deploy-hook recovery directory"),
+            (4, "Could not enforce private deploy-hook manifest permissions"),
+        ):
+            with self.subTest(fail_on=fail_on), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                hook_dir = root / "hooks"
+                recovery_root = root / "recovery"
+                hook_file = hook_dir / "gowave-nginx.sh"
+                bin_dir = root / "bin"
+                bin_dir.mkdir()
+                counter = root / "chmod-count"
+                fake_chmod = bin_dir / "chmod"
+                fake_chmod.write_text(
+                    "#!/bin/sh\n"
+                    f"count=0; [ ! -f '{counter}' ] || count=$(cat '{counter}')\n"
+                    "count=$((count + 1))\n"
+                    f"printf '%s\\n' \"$count\" > '{counter}'\n"
+                    f"[ \"$count\" -ne {fail_on} ] || exit 1\n"
+                    "exec /bin/chmod \"$@\"\n"
+                )
+                fake_chmod.chmod(0o755)
+                env = {**os.environ, "PATH": f"{bin_dir}:{os.environ.get('PATH', '')}"}
+                result = subprocess.run(
+                    [
+                        "bash", "-c",
+                        'source "$1" && install_managed_deploy_hook "$2" "$3" "$4"',
+                        "bash", NGINX_SH, "hook_tx", str(hook_file), str(recovery_root),
+                    ],
+                    env=env, capture_output=True, text=True, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_error, result.stderr)
+                self.assertFalse(hook_file.exists(), "hook must not be installed after permission failure")
+
+    def test_managed_deploy_hook_creates_private_manifest_before_installing_hook(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            hook_dir = root / "hooks"
+            recovery_root = root / "recovery"
+            hook_file = hook_dir / "gowave-nginx.sh"
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'source "$1" && install_managed_deploy_hook "$2" "$3" "$4"',
+                    "bash", NGINX_SH, "hook_tx", str(hook_file), str(recovery_root),
+                ],
+                env=os.environ.copy(), capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = recovery_root / "hook_tx" / "deploy-hook-manifest.json"
+            self.assertTrue(hook_file.is_file())
+            self.assertEqual(hook_file.stat().st_mode & 0o777, 0o755)
+            self.assertEqual((recovery_root / "hook_tx").stat().st_mode & 0o777, 0o700)
+            self.assertEqual(manifest.stat().st_mode & 0o777, 0o600)
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertTrue(data["created_by_tx"])
+            self.assertEqual(data["path"], str(hook_file))
 
 
 if __name__ == "__main__":

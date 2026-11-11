@@ -13,6 +13,98 @@ NODE_SH = REPO_ROOT / "modules" / "node.sh"
 
 
 class TestNodeIntegration(unittest.TestCase):
+    def test_recovery_directory_is_created_private_and_owned_by_caller(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            recovery_dir = Path(tmpdir) / "recovery"
+            env = os.environ.copy()
+            env["RECOVERY_DIR"] = str(recovery_dir)
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1/modules/recovery.sh"; ensure_recovery_dir', "test", str(REPO_ROOT)],
+                env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            metadata = recovery_dir.stat()
+            self.assertEqual(metadata.st_uid, os.geteuid())
+            self.assertEqual(metadata.st_mode & 0o777, 0o700)
+
+    def test_recovery_directory_refuses_filesystem_root(self):
+        root_mode = Path("/").stat().st_mode & 0o777
+        env = os.environ.copy()
+        env["RECOVERY_DIR"] = "/"
+        result = subprocess.run(
+            ["bash", "-c", 'source "$1/modules/recovery.sh"; ensure_recovery_dir', "test", str(REPO_ROOT)],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dedicated 'recovery' directory", result.stderr)
+        self.assertEqual(Path("/").stat().st_mode & 0o777, root_mode)
+
+    def test_recovery_directory_does_not_chmod_foreign_owned_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            recovery_dir = root / "recovery"
+            recovery_dir.mkdir(mode=0o755)
+            recovery_dir.chmod(0o755)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            chmod_marker = root / "chmod-called"
+            fake_stat = bin_dir / "stat"
+            fake_stat.write_text("#!/bin/sh\necho 65534:755\n")
+            fake_stat.chmod(0o755)
+            fake_chmod = bin_dir / "chmod"
+            fake_chmod.write_text(f"#!/bin/sh\ntouch '{chmod_marker}'\nexit 0\n")
+            fake_chmod.chmod(0o755)
+
+            env = os.environ.copy()
+            env["RECOVERY_DIR"] = str(recovery_dir)
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1/modules/recovery.sh"; ensure_recovery_dir', "test", str(REPO_ROOT)],
+                env=env, capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must be owned by the current user", result.stderr)
+            self.assertFalse(chmod_marker.exists(), "chmod must not mutate a foreign-owned directory")
+            self.assertEqual(recovery_dir.stat().st_mode & 0o777, 0o755)
+    def test_recovery_directory_rejects_symlink_path_components(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            real_parent = root / "real"
+            real_parent.mkdir()
+            real_parent.chmod(0o755)
+            linked_parent = root / "linked"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+            recovery_dir = linked_parent / "recovery"
+            env = os.environ.copy()
+            env["RECOVERY_DIR"] = str(recovery_dir)
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1/modules/recovery.sh"; ensure_recovery_dir', "test", str(REPO_ROOT)],
+                env=env, capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("recovery directory path contains a symlink", result.stderr)
+            self.assertFalse((real_parent / "recovery").exists())
+            self.assertEqual(real_parent.stat().st_mode & 0o777, 0o755)
+
+    def test_recovery_directory_permission_failure_aborts_snapshot_setup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            recovery_dir = root / "recovery"
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake_chmod = bin_dir / "chmod"
+            fake_chmod.write_text("#!/bin/sh\nexit 1\n")
+            fake_chmod.chmod(0o755)
+            env = os.environ.copy()
+            env["RECOVERY_DIR"] = str(recovery_dir)
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", "-c", 'source "$1/modules/recovery.sh"; ensure_recovery_dir', "test", str(REPO_ROOT)],
+                env=env, capture_output=True, text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot enforce private recovery directory permissions", result.stderr)
+
     def test_vendored_upstream_installer_matches_pinned_commit_digest(self):
         installer = REPO_ROOT / "sources" / "gowave-node" / "install.sh"
         self.assertTrue(installer.is_file(), "Pinned GoWave Node installer must be vendored")
@@ -155,6 +247,135 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn("certbot delete --cert-name \"$WORKER_DOMAIN\"", worker_script)
         self.assertIn("swapoff /swapfile", worker_script)
         self.assertIn("ufw delete allow proto tcp from \"$PANEL_IP\"", worker_script)
+        self.assertIn("local rollback_failed=0", worker_script)
+        self.assertIn("compensating rollback incomplete; one or more cleanup operations failed", worker_script)
+        self.assertIn('if [[ "$swap_is_inactive" -eq 1 ]]; then', worker_script)
+        self.assertIn('active_swaps=$(swapon --noheadings --raw --output NAME 2>/dev/null)', worker_script)
+
+        self.assertNotIn("Compensating rollback completed on worker host.", worker_script)
+        self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_failed=1', worker_script)
+
+    def test_standalone_remote_rollback_reports_non_acme_cleanup_failures(self):
+        """Standalone rollback must fail if service, NGINX, hook, or scratch cleanup is incomplete."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        remote_start = worker_script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
+        remote_end = worker_script.index("\nROLLBACK_REMOTE_SCRIPT", remote_start)
+        rollback_script = worker_script[remote_start:remote_end]
+
+        self.assertIn("rollback_failed=0", rollback_script)
+        self.assertIn('systemctl stop "$unit" 2>/dev/null || rollback_failed=1', rollback_script)
+        self.assertIn('rollback_managed_deploy_hook', rollback_script)
+        self.assertIn('rm -f "$hook_file" || {', rollback_script)
+        self.assertIn('sync "$(dirname "$hook_file")" || {', rollback_script)
+        self.assertIn('type(created) is not bool', rollback_script)
+        self.assertIn(') || {', rollback_script)
+        self.assertIn("nginx -t >/dev/null 2>&1", rollback_script)
+        self.assertIn('systemctl reload nginx 2>/dev/null || rollback_failed=1', rollback_script)
+        self.assertIn('rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1', rollback_script)
+        self.assertIn('sysctl --system 2>/dev/null || rollback_failed=1', rollback_script)
+        self.assertIn("one or more cleanup or restoration operations failed", rollback_script)
+        self.assertIn('ufw status numbered 2>/dev/null', rollback_script)
+        self.assertIn('ufw delete allow 80/tcp 2>/dev/null || rollback_failed=1', rollback_script)
+        self.assertIn('awk \'$3 == "80/tcp" { found=1 } END { exit !found }\'', rollback_script)
+        self.assertIn('awk \'$3 == "443/tcp" { found=1 } END { exit !found }\'', rollback_script)
+        self.assertNotIn("rollback_restore_failed", rollback_script)
+
+    def test_initial_provision_persists_applying_state_at_first_api_mutation(self):
+        auto_script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        prepared_at = auto_script.index('"state": "PROVISION_PREPARED"')
+        callback_at = auto_script.index("def persist_transaction_entities(entities):", prepared_at)
+        callback_end = auto_script.index("\nclient.transaction_callback", callback_at)
+        callback = auto_script[callback_at:callback_end]
+        self.assertIn('journal["state"] = "PROVISION_APPLYING"', callback)
+        self.assertIn('journal["entities"] = list(entities)', callback)
+        self.assertLess(
+            auto_script.index("client.transaction_callback = persist_transaction_entities", callback_at),
+            auto_script.index('client.provision_config_profile("GoWave MVP Unified Profile - local-node"', callback_at),
+        )
+
+    def test_node_add_persists_applying_state_before_first_api_create(self):
+        auto_script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        prepared_at = auto_script.index('"state": "NODE_ADD_PREPARED"')
+        callback_at = auto_script.index("def persist_transaction_entities(entities):", prepared_at)
+        callback_end = auto_script.index("\nclient.transaction_callback", callback_at)
+        callback = auto_script[callback_at:callback_end]
+        self.assertIn('journal["state"] = "NODE_ADD_APPLYING"', callback)
+        self.assertIn('journal["entities"] = list(entities)', callback)
+        self.assertLess(
+            auto_script.index("client.transaction_callback = persist_transaction_entities", callback_at),
+            auto_script.index('client.provision_config_profile(f"GoWave Worker {name} Profile"', callback_at),
+        )
+
+    def test_node_add_pre_dispatch_failures_stay_inside_api_rollback_boundary(self):
+        """Resolve local prerequisites early and persist VERIFYING inside the guarded API transaction."""
+        worker_script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        secret_index = worker_script.index('if ! secret_key=$(extract_secret_key "$GOWAVE_DIR")')
+        api_index = worker_script.index("if ! PYTHONPATH=", secret_index)
+        dispatch_index = worker_script.index('if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key"', api_index)
+        self.assertLess(secret_index, api_index)
+        self.assertLess(api_index, dispatch_index)
+
+        transaction_block = worker_script[api_index:dispatch_index]
+        self.assertIn('journal["state"] = "NODE_ADD_VERIFYING"', transaction_block)
+        self.assertIn("write_journal_atomically(journal_path, journal)", transaction_block)
+        self.assertNotIn("jdata['state'] = 'NODE_ADD_VERIFYING'", worker_script)
+        self.assertNotIn("extract_secret_key", transaction_block)
+
+    def test_worker_rollback_uses_the_original_acme_snapshot_transaction(self):
+        """The controller and remote payload must share the snapshot ID; missing IDs must never delete unknown certs."""
+        main_script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        self.assertIn('local acme_tx_id="worker_install_${name}_$(date +%s)_${BASHPID}"', main_script)
+        self.assertIn('ACME_TX_ID="$acme_tx_id"', main_script)
+        self.assertIn('printf \'export ACME_TX_ID=%q\\n\' "${ACME_TX_ID:-}"', worker_script)
+        self.assertIn('_ACME_TX_ID="${ACME_TX_ID:-worker_install_$(date +%s)}"', worker_script)
+
+        remote_start = worker_script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
+        remote_end = worker_script.index("\nROLLBACK_REMOTE_SCRIPT", remote_start)
+        rollback_script = worker_script[remote_start:remote_end]
+        acme_start = rollback_script.index("# 3. Clean ACME certificates")
+        acme_end = rollback_script.index("# 4. Remove UFW rules", acme_start)
+        acme_cleanup = rollback_script[acme_start:acme_end]
+        self.assertIn('restore_acme_lineage "$ACME_TX_ID" "$WORKER_DOMAIN"', acme_cleanup)
+        self.assertIn("ACME_TX_ID missing; preserving unknown certificate lineage", acme_cleanup)
+        self.assertNotIn("certbot delete", acme_cleanup)
+        self.assertIn("rollback_failed=1", acme_cleanup)
+
+    def test_node_add_commit_record_failure_compensates_both_sides(self):
+        """A failed durable commit after remote success must roll back Worker and Panel API state."""
+        worker_script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        commit_start = worker_script.index("# 5. Commit transaction")
+        commit_end = worker_script.index('echo "Worker \'$name\' successfully added and deployed."', commit_start)
+        commit_block = worker_script[commit_start:commit_end]
+        self.assertIn("if ! python3 -c", commit_block)
+        self.assertIn('ACME_TX_ID="$acme_tx_id"', commit_block)
+        self.assertIn('remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"', commit_block)
+        self.assertIn("rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE')", commit_block)
+        self.assertIn("return 1", commit_block)
+
+    def test_worker_acme_snapshot_is_retained_until_controller_commit(self):
+        """The remote payload must preserve its ACME before-image until the controller commits."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        main_script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        success_start = worker_script.index("# Disable ERR compensation trap on verified success")
+        success_end = worker_script.index("GoWave Edge Worker deployment complete", success_start)
+        self.assertNotIn("cleanup_acme_snapshot", worker_script[success_start:success_end])
+        self.assertIn("remote_finalize()", worker_script)
+        self.assertIn("remote_finalize)", worker_script)
+        self.assertIn('rm -rf -- "$transaction_dir"', worker_script)
+        self.assertIn("Delete the ACME snapshot only after every rollback action has succeeded", worker_script)
+        rollback_script_start = worker_script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
+        rollback_cleanup_index = worker_script.index("Delete the ACME snapshot only after every rollback action has succeeded", rollback_script_start)
+        rollback_sysctl_index = worker_script.index("sysctl --system 2>/dev/null || rollback_failed=1", rollback_script_start)
+        self.assertGreater(rollback_cleanup_index, rollback_sysctl_index)
+
+        commit_index = main_script.index("# 5. Commit transaction")
+        finalize_index = main_script.index("remote_finalize \"$ip\" \"$ssh_port\" \"$ssh_user\"", commit_index)
+        self.assertGreater(finalize_index, commit_index)
+        self.assertIn('if [[ ! "$_ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]', worker_script)
+        self.assertIn('if [[ -n "${ACME_TX_ID:-}" && ! "$ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]', worker_script)
+        self.assertIn('( -e "$lock_file" && ! -f "$lock_file" )', worker_script)
+        self.assertIn("snapshot could not be finalized; snapshot retained", main_script[finalize_index:])
 
     def test_worker_standalone_remote_rollback_defined(self):
         """gowave-node-auto.sh must provide standalone remote_rollback command."""
@@ -162,6 +383,337 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn("remote_rollback()", worker_script)
         self.assertIn("remote_rollback|rollback)", worker_script)
         self.assertIn("SSH host key for $host_key is not pre-pinned", worker_script)
+
+    def test_standalone_remote_rollback_aborts_when_mutation_lock_is_held(self):
+        """A failed nonblocking lock acquisition must stop rollback before destructive commands."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            known_hosts = tmp / "known_hosts"
+            known_hosts.write_text("127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGMockKeyMockKeyMockKeyMockKeyMockKeyMockKey\n")
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            marker = tmp / "destructive-command-called"
+            lock_file = tmp / "mutation.lock"
+            lock_file.touch()
+
+            fake_ssh_keygen = bin_dir / "ssh-keygen"
+            fake_ssh_keygen.write_text("#!/bin/sh\nexit 0\n")
+            fake_ssh_keygen.chmod(0o755)
+
+            fake_ssh = bin_dir / "ssh"
+            fake_ssh.write_text("#!/bin/sh\nexec bash -s\n")
+            fake_ssh.chmod(0o755)
+
+            fake_id = bin_dir / "id"
+            fake_id.write_text("#!/bin/sh\necho 0\n")
+            fake_id.chmod(0o755)
+
+            fake_flock = bin_dir / "flock"
+            fake_flock.write_text("#!/bin/sh\nexit 1\n")
+            fake_flock.chmod(0o755)
+
+            fake_chmod = bin_dir / "chmod"
+            fake_chmod.write_text("#!/bin/sh\nexit 0\n")
+            fake_chmod.chmod(0o755)
+
+            for command in ("systemctl", "rm", "sed", "nginx", "certbot", "ufw", "sysctl", "rmdir"):
+                fake = bin_dir / command
+                fake.write_text(f"#!/bin/sh\nprintf '%s\\n' '{command}' >> '{marker}'\nexit 0\n")
+                fake.chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            env["SSH_KNOWN_HOSTS"] = str(known_hosts)
+            env["MUTATION_LOCK_FILE"] = str(lock_file)
+
+            cmd = [
+                str(REPO_ROOT / "gowave-node-auto.sh"),
+                "remote_rollback",
+                "127.0.0.1",
+                "22",
+                "worker.example.com",
+                "reality.example.com",
+                "root",
+            ]
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Refusing remote rollback without the mutation lock", result.stderr)
+            self.assertFalse(marker.exists(), "destructive commands ran without owning the mutation lock")
+
+    def test_standalone_remote_rollback_reports_service_stop_failure(self):
+        """A failed service stop must make standalone remote rollback fail, not report success."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            known_hosts = tmp / "known_hosts"
+            known_hosts.write_text("127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGMockKeyMockKeyMockKeyMockKeyMockKeyMockKey\n")
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            log = tmp / "commands.log"
+
+            scripts = {
+                "ssh-keygen": "#!/bin/sh\nexit 0\n",
+                "ssh": "#!/bin/sh\nexec bash -s\n",
+                "id": "#!/bin/sh\necho 0\n",
+                "flock": "#!/bin/sh\nexit 0\n",
+                "chmod": "#!/bin/sh\nexit 0\n",
+                "systemctl": (
+                    "#!/bin/sh\n"
+                    "printf '%s\\n' \"$*\" >> '" + str(log) + "'\n"
+                    "case \"$1\" in\n"
+                    "  list-unit-files) echo 'gowave-node.service enabled enabled'; exit 0;;\n"
+                    "  stop) exit 1;;\n"
+                    "  *) exit 0;;\n"
+                    "esac\n"
+                ),
+                "nginx": "#!/bin/sh\nexit 0\n",
+                "ufw": "#!/bin/sh\nexit 0\n",
+                "sysctl": "#!/bin/sh\nexit 0\n",
+                "rm": "#!/bin/sh\nexit 0\n",
+                "rmdir": "#!/bin/sh\nexit 0\n",
+                "sed": "#!/bin/sh\nexit 0\n",
+                "certbot": "#!/bin/sh\nexit 0\n",
+            }
+            for name, content in scripts.items():
+                executable = bin_dir / name
+                executable.write_text(content)
+                executable.chmod(0o755)
+
+            lock_file = tmp / "mutation.lock"
+            lock_file.touch()
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            env["SSH_KNOWN_HOSTS"] = str(known_hosts)
+            env["MUTATION_LOCK_FILE"] = str(lock_file)
+
+            cmd = [
+                str(REPO_ROOT / "gowave-node-auto.sh"),
+                "remote_rollback",
+                "127.0.0.1",
+                "22",
+                "worker.example.com",
+                "reality.example.com",
+                "root",
+            ]
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Remote worker compensation teardown incomplete", result.stderr)
+            self.assertNotIn("Remote worker compensation teardown finished", result.stderr)
+            self.assertIn("stop gowave-node.service", log.read_text())
+
+    def test_standalone_remote_rollback_reports_service_cleanup_failure(self):
+        """A failed stop/disable operation must make standalone rollback fail explicitly."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            known_hosts = tmp / "known_hosts"
+            known_hosts.write_text("127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGMockKeyMockKeyMockKeyMockKeyMockKeyMockKey\n")
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+
+            def fake(name, body):
+                path = bin_dir / name
+                path.write_text("#!/bin/sh\n" + body + "\n")
+                path.chmod(0o755)
+
+            fake("ssh-keygen", "exit 0")
+            fake("ssh", "exec bash -s")
+            fake("id", "echo 0")
+            fake("flock", "exit 0")
+            log = tmp / "systemctl.log"
+            fake("systemctl", (
+                "printf '%s\\n' \"$*\" >> '" + str(log) + "'\n"
+                "case \"$1\" in\n"
+                "    list-unit-files) echo 'gowave-node.service enabled'; exit 0;;\n"
+                "    is-active) exit 3;;\n"
+                "    stop) exit 0;;\n"
+                "    disable) exit 7;;\n"
+                "    *) exit 0;;\n"
+                "esac"
+            ))
+            for command in ("rm", "sed", "nginx", "certbot", "ufw", "sysctl", "rmdir", "chmod"):
+                fake(command, "exit 0")
+
+            lock_file = tmp / "mutation.lock"
+            lock_file.touch()
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            env["SSH_KNOWN_HOSTS"] = str(known_hosts)
+            env["MUTATION_LOCK_FILE"] = str(lock_file)
+
+            result = subprocess.run(
+                [
+                    str(REPO_ROOT / "gowave-node-auto.sh"),
+                    "remote_rollback", "127.0.0.1", "22",
+                    "worker.example.com", "reality.example.com", "root",
+                ],
+                env=env, capture_output=True, text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Remote worker compensation teardown incomplete", result.stderr)
+            self.assertNotIn("Remote worker compensation teardown finished.", result.stderr)
+            self.assertIn("disable gowave-node.service", log.read_text())
+
+    def test_standalone_rollback_preserves_unowned_deploy_hook_without_transaction_id(self):
+        """Without an ACME transaction ID, an existing deploy hook has unknown ownership."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        remote_start = worker_script.index(
+            "cat <<'ROLLBACK_REMOTE_SCRIPT'",
+            worker_script.index("remote_rollback() {"),
+        )
+        function_start = worker_script.index("rollback_managed_deploy_hook() {", remote_start)
+        function_end = worker_script.index("\n}\n\nrestore_acme_lineage", function_start) + 2
+        self.assertGreater(function_end, function_start)
+        function = worker_script[function_start:function_end]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hook_file = Path(tmpdir) / "gowave-nginx.sh"
+            hook_file.write_text("#!/bin/sh\necho operator-owned\n")
+            recovery_root = Path(tmpdir) / "recovery"
+
+            command = function + '\nrollback_managed_deploy_hook "" "$1" "$2"'
+            result = subprocess.run(
+                ["bash", "-c", command, "bash", str(hook_file), str(recovery_root)],
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("transaction ID is missing", result.stderr)
+            self.assertTrue(hook_file.is_file(), "unknown-ownership deploy hook must be preserved")
+
+            hook_file.unlink()
+            absent = subprocess.run(
+                ["bash", "-c", command, "bash", str(hook_file), str(recovery_root)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(absent.returncode, 0, absent.stderr)
+
+    def test_standalone_acme_restore_fails_closed_on_missing_or_malformed_manifest(self):
+        """Missing or invalid lineage metadata must never be interpreted as 'no prior certificate'."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        remote_start = worker_script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
+        function_start = worker_script.index("restore_acme_lineage() {", remote_start)
+        function_end = worker_script.index("\n}\n\nacquire_mutation_lock", function_start) + 2
+        self.assertGreater(function_start, remote_start)
+        self.assertGreater(function_end, function_start)
+        restore_function = worker_script[function_start:function_end]
+
+        for manifest_kind in ("missing", "malformed-json", "invalid-boolean"):
+            with self.subTest(manifest_kind=manifest_kind), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                recovery = root / "recovery"
+                letsencrypt = root / "letsencrypt"
+                domain = "worker.example.com"
+                snap_dir = recovery / "txn-1" / "acme" / domain
+                snap_dir.mkdir(parents=True)
+                renewal_dir = letsencrypt / "renewal"
+                live_dir = letsencrypt / "live" / domain
+                archive_dir = letsencrypt / "archive" / domain
+                renewal_dir.mkdir(parents=True)
+                live_dir.mkdir(parents=True)
+                archive_dir.mkdir(parents=True)
+                renewal = renewal_dir / f"{domain}.conf"
+                live_cert = live_dir / "fullchain.pem"
+                archive_cert = archive_dir / "cert1.pem"
+                renewal.write_text("existing renewal configuration")
+                live_cert.write_text("existing live certificate")
+                archive_cert.write_text("existing archived certificate")
+
+                manifest = snap_dir / "lineage-manifest.json"
+                if manifest_kind == "malformed-json":
+                    manifest.write_text("{not-json")
+                elif manifest_kind == "invalid-boolean":
+                    manifest.write_text(json.dumps({
+                        "domain": domain,
+                        "existed_before": "false",
+                    }))
+
+                command = (
+                    restore_function
+                    + "\nrestore_acme_lineage "
+                    + '"txn-1" "'
+                    + domain
+                    + '" "'
+                    + str(recovery)
+                    + '" "'
+                    + str(letsencrypt)
+                    + '"'
+                )
+                result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertTrue(renewal.exists(), "renewal configuration was deleted on invalid manifest")
+                self.assertEqual(live_cert.read_text(), "existing live certificate")
+                self.assertEqual(archive_cert.read_text(), "existing archived certificate")
+
+    def test_standalone_acme_restore_accepts_certbot_archive_relative_symlinks(self):
+        """A valid Certbot-style relative link must resolve inside the archive and pass identity checks."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        remote_start = worker_script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
+        function_start = worker_script.index("restore_acme_lineage() {", remote_start)
+        function_end = worker_script.index("\n}\n\nacquire_mutation_lock", function_start) + 2
+        restore_function = worker_script[function_start:function_end]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            recovery = root / "recovery"
+            letsencrypt = root / "letsencrypt"
+            domain = "worker.example.com"
+            snap_dir = recovery / "txn-1" / "acme" / domain
+            snapshot_archive = snap_dir / "archive"
+            snapshot_live = snap_dir / "live"
+            snapshot_archive.mkdir(parents=True)
+            snapshot_live.mkdir(parents=True)
+
+            generated_cert = root / "fullchain.pem"
+            generated_key = root / "privkey.pem"
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", str(generated_key), "-out", str(generated_cert),
+                "-subj", f"/CN={domain}", "-days", "1",
+            ], check=True, capture_output=True, text=True)
+
+            (snapshot_archive / "cert1.pem").write_bytes(generated_cert.read_bytes())
+            (snapshot_archive / "privkey1.pem").write_bytes(generated_key.read_bytes())
+            (snapshot_live / "fullchain.pem.target").write_text(f"../../archive/{domain}/cert1.pem")
+            (snapshot_live / "privkey.pem.target").write_text(f"../../archive/{domain}/privkey1.pem")
+
+            serial = subprocess.check_output(
+                ["openssl", "x509", "-in", str(generated_cert), "-noout", "-serial"], text=True
+            ).strip()
+            fingerprint = subprocess.check_output(
+                ["openssl", "x509", "-in", str(generated_cert), "-noout", "-fingerprint", "-sha256"], text=True
+            ).strip()
+            (snap_dir / "lineage-manifest.json").write_text(json.dumps({
+                "domain": domain,
+                "existed_before": True,
+                "serial": serial,
+                "fingerprint": fingerprint,
+            }))
+
+            command = (
+                restore_function
+                + "\nrestore_acme_lineage "
+                + '"txn-1" "'
+                + domain
+                + '" "'
+                + str(recovery)
+                + '" "'
+                + str(letsencrypt)
+                + '"'
+            )
+            result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            restored_fullchain = letsencrypt / "live" / domain / "fullchain.pem"
+            restored_privkey = letsencrypt / "live" / domain / "privkey.pem"
+            self.assertTrue(restored_fullchain.is_symlink())
+            self.assertTrue(restored_privkey.is_symlink())
+            self.assertEqual(restored_fullchain.resolve(), (letsencrypt / "archive" / domain / "cert1.pem").resolve())
+            self.assertEqual(restored_privkey.resolve(), (letsencrypt / "archive" / domain / "privkey1.pem").resolve())
 
     def test_worker_remote_payload_serializes_acme_server(self):
         with tempfile.TemporaryDirectory() as tmpdir:

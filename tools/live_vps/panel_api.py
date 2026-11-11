@@ -46,7 +46,7 @@ class E2EPanelClient:
         if isinstance(resp, dict):
             token = resp.get("accessToken") or resp.get("token") or (resp.get("response", {}).get("accessToken"))
         if not token:
-            raise GoWaveAPIError(f"Login response did not contain an accessToken: {resp}")
+            raise GoWaveAPIError("Login response did not contain an accessToken")
         self.client.token = token
         return token
 
@@ -99,7 +99,7 @@ class E2EPanelClient:
         data = resp.get("response", resp) if isinstance(resp, dict) else resp
         if isinstance(data, dict):
             return data
-        raise GoWaveAPIError(f"User {username} not found or invalid format: {resp}")
+        raise GoWaveAPIError("User lookup returned an invalid response")
 
     def poll_worker_ready(
         self,

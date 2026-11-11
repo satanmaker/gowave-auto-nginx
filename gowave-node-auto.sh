@@ -89,81 +89,128 @@ snapshot_acme_lineage() {
     local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
     local letsencrypt_root="${4:-/etc/letsencrypt}"
 
+    if [[ ! "$transaction_id" =~ ^[A-Za-z0-9._-]+$ || ! "$domain" =~ ^[A-Za-z0-9.-]+$ ]]; then
+        echo "Error: Invalid transaction ID or domain for ACME snapshot." >&2
+        return 1
+    fi
+
     local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
-    mkdir -p "$snap_dir"
-    chmod 0700 "$snap_dir" 2>/dev/null || true
+    mkdir -p "$snap_dir" || { echo "Error: Could not create ACME snapshot directory for $domain." >&2; return 1; }
+    if [[ -L "$snap_dir" ]]; then
+        echo "Error: ACME snapshot directory is an unsafe symlink for $domain." >&2
+        return 1
+    fi
+    chmod 0700 "$snap_dir" 2>/dev/null || { echo "Error: Could not secure ACME snapshot directory for $domain." >&2; return 1; }
 
     local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
     local live_dir="${letsencrypt_root}/live/${domain}"
+    local archive_dir="${letsencrypt_root}/archive/${domain}"
     local meta_file="${snap_dir}/lineage-manifest.json"
+    local existed_before=false cert_serial="" cert_fingerprint=""
 
-    if [[ -f "$renewal_conf" || -d "$live_dir" ]]; then
-        mkdir -p "$snap_dir/archive" "$snap_dir/live"
-        chmod 0700 "$snap_dir/archive" "$snap_dir/live" 2>/dev/null || true
-
-        if [[ -f "$renewal_conf" ]]; then
-            cp -p "$renewal_conf" "$snap_dir/renewal.conf"
+    if [[ -e "$renewal_conf" || -L "$renewal_conf" || -e "$live_dir" || -L "$live_dir" ]]; then
+        if [[ ! -f "$renewal_conf" || -L "$renewal_conf" || ! -d "$live_dir" || -L "$live_dir" ]]; then
+            echo "Error: Existing ACME lineage for $domain is incomplete or unsafe; refusing to snapshot it." >&2
+            return 1
         fi
+        mkdir -p "$snap_dir/archive" "$snap_dir/live" || { echo "Error: Could not create ACME snapshot subdirectories for $domain." >&2; return 1; }
+        chmod 0700 "$snap_dir/archive" "$snap_dir/live" 2>/dev/null || { echo "Error: Could not secure ACME snapshot subdirectories for $domain." >&2; return 1; }
+        cp -p "$renewal_conf" "$snap_dir/renewal.conf" || { echo "Error: Could not snapshot ACME renewal config for $domain." >&2; return 1; }
 
-        local cert_serial=""
-        local cert_fingerprint=""
-        if [[ -d "$live_dir" ]]; then
-            local f
-            for f in cert.pem chain.pem fullchain.pem privkey.pem; do
-                local link_path="${live_dir}/${f}"
-                if [[ -L "$link_path" ]]; then
-                    local target
-                    target=$(readlink "$link_path")
-                    echo "$target" > "$snap_dir/live/${f}.target"
-                    local real_file
-                    real_file=$(realpath -q "$link_path" || true)
-                    if [[ -n "$real_file" && -f "$real_file" ]]; then
-                        local bn
-                        bn=$(basename "$real_file")
-                        cp -p "$real_file" "$snap_dir/archive/$bn"
-                        if [[ "$f" == "privkey.pem" || "$bn" =~ ^privkey ]]; then
-                            chmod 0600 "$snap_dir/archive/$bn" 2>/dev/null || true
-                        fi
-                    fi
-                elif [[ -f "$link_path" ]]; then
-                    cp -p "$link_path" "$snap_dir/live/$f"
-                    if [[ "$f" == "privkey.pem" ]]; then
-                        chmod 0600 "$snap_dir/live/$f" 2>/dev/null || true
-                    fi
+        local archive_real
+        archive_real=$(realpath -e -- "$archive_dir") || { echo "Error: ACME archive directory is missing for existing lineage $domain." >&2; return 1; }
+        local f link_path target real_file bn
+        for f in cert.pem chain.pem fullchain.pem privkey.pem; do
+            link_path="${live_dir}/${f}"
+            if [[ -L "$link_path" ]]; then
+                target=$(readlink "$link_path") || { echo "Error: Could not read ACME symlink $f for $domain." >&2; return 1; }
+                if [[ -z "$target" || "$target" == /* ]]; then
+                    echo "Error: Unsafe ACME symlink target for $domain/$f." >&2
+                    return 1
                 fi
-            done
-
-            local fc="${live_dir}/fullchain.pem"
-            if [[ -s "$fc" ]]; then
-                cert_serial=$(openssl x509 -in "$fc" -noout -serial 2>/dev/null || true)
-                cert_fingerprint=$(openssl x509 -in "$fc" -noout -fingerprint -sha256 2>/dev/null || true)
+                printf '%s\n' "$target" > "$snap_dir/live/${f}.target" || { echo "Error: Could not snapshot ACME symlink target for $domain/$f." >&2; return 1; }
+                chmod 0600 "$snap_dir/live/${f}.target" 2>/dev/null || { echo "Error: Could not secure ACME symlink metadata for $domain/$f." >&2; return 1; }
+                real_file=$(realpath -e -- "$link_path") || { echo "Error: ACME symlink $domain/$f is broken." >&2; return 1; }
+                case "$real_file" in
+                    "$archive_real"/*) ;;
+                    *)
+                        echo "Error: ACME symlink $domain/$f escapes its archive directory." >&2
+                        return 1
+                        ;;
+                esac
+                bn=$(basename "$real_file")
+                cp -p "$real_file" "$snap_dir/archive/$bn" || { echo "Error: Could not snapshot ACME archive file $bn for $domain." >&2; return 1; }
+                if [[ "$bn" =~ ^privkey ]]; then
+                    chmod 0600 "$snap_dir/archive/$bn" 2>/dev/null || { echo "Error: Could not secure snapshotted ACME private key for $domain." >&2; return 1; }
+                else
+                    chmod 0644 "$snap_dir/archive/$bn" 2>/dev/null || { echo "Error: Could not set snapshotted ACME certificate permissions for $domain." >&2; return 1; }
+                fi
+            elif [[ -f "$link_path" ]]; then
+                cp -p "$link_path" "$snap_dir/live/$f" || { echo "Error: Could not snapshot ACME live file $f for $domain." >&2; return 1; }
+                if [[ "$f" == "privkey.pem" ]]; then
+                    chmod 0600 "$snap_dir/live/$f" 2>/dev/null || { echo "Error: Could not secure snapshotted ACME private key for $domain." >&2; return 1; }
+                fi
+            else
+                if [[ "$f" == "fullchain.pem" || "$f" == "privkey.pem" ]]; then
+                    echo "Error: Existing ACME lineage is missing required file $domain/$f." >&2
+                    return 1
+                fi
+                continue
             fi
-        fi
+        done
 
-        python3 - "$meta_file" "$domain" "$cert_serial" "$cert_fingerprint" <<'PY'
-import json, sys
-meta_file, domain, serial, fingerprint = sys.argv[1:5]
-data = {
-    "domain": domain,
-    "existed_before": True,
-    "serial": serial,
-    "fingerprint": fingerprint
-}
-with open(meta_file, "w") as f:
-    json.dump(data, f, indent=2)
-PY
-    else
-        python3 - "$meta_file" "$domain" <<'PY'
-import json, sys
-meta_file, domain = sys.argv[1:3]
-data = {
-    "domain": domain,
-    "existed_before": False
-}
-with open(meta_file, "w") as f:
-    json.dump(data, f, indent=2)
-PY
+        local fullchain="${live_dir}/fullchain.pem" privkey="${live_dir}/privkey.pem"
+        openssl x509 -in "$fullchain" -noout >/dev/null 2>&1 || { echo "Error: Existing ACME certificate is invalid for $domain." >&2; return 1; }
+        local pub_from_cert pub_from_key
+        pub_from_cert=$(openssl x509 -in "$fullchain" -noout -pubkey 2>/dev/null) || { echo "Error: Could not read existing ACME certificate key for $domain." >&2; return 1; }
+        pub_from_key=$(openssl pkey -in "$privkey" -pubout 2>/dev/null) || { echo "Error: Could not read existing ACME private key for $domain." >&2; return 1; }
+        if [[ -z "$pub_from_cert" || "$pub_from_cert" != "$pub_from_key" ]]; then
+            echo "Error: Existing ACME certificate and private key do not match for $domain." >&2
+            return 1
+        fi
+        cert_serial=$(openssl x509 -in "$fullchain" -noout -serial 2>/dev/null) || { echo "Error: Could not read existing ACME certificate serial for $domain." >&2; return 1; }
+        cert_fingerprint=$(openssl x509 -in "$fullchain" -noout -fingerprint -sha256 2>/dev/null) || { echo "Error: Could not read existing ACME certificate fingerprint for $domain." >&2; return 1; }
+        if [[ -z "$cert_serial" || -z "$cert_fingerprint" ]]; then
+            echo "Error: Existing ACME certificate identity metadata is empty for $domain." >&2
+            return 1
+        fi
+        existed_before=true
     fi
+
+    python3 - "$meta_file" "$domain" "$existed_before" "$cert_serial" "$cert_fingerprint" <<'PY'
+import json
+import os
+import sys
+
+meta_file, domain, existed, serial, fingerprint = sys.argv[1:6]
+data = {
+    "domain": domain,
+    "existed_before": existed == "true",
+    "serial": serial,
+    "fingerprint": fingerprint,
+}
+tmp_path = meta_file + ".tmp"
+fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        json.dump(data, stream, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp_path, meta_file)
+    dir_fd = os.open(os.path.dirname(meta_file), os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+except Exception as exc:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    print(f"Failed to persist ACME snapshot manifest: {type(exc).__name__}", file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
 restore_acme_lineage() {
@@ -181,7 +228,20 @@ restore_acme_lineage() {
     fi
 
     local existed
-    existed=$(python3 -c "import json; print('1' if json.load(open('$meta_file')).get('existed_before') else '0')")
+    existed=$(python3 - "$meta_file" "$domain" <<'PY'
+import json, sys
+path, domain = sys.argv[1:3]
+with open(path, encoding="utf-8") as stream:
+    data = json.load(stream)
+if not isinstance(data, dict) or data.get("domain") != domain or type(data.get("existed_before")) is not bool:
+    raise SystemExit(1)
+print("1" if data["existed_before"] else "0")
+PY
+) || { echo "Error: Invalid ACME lineage manifest for $domain" >&2; return 1; }
+if [[ "$existed" != "0" && "$existed" != "1" ]]; then
+    echo "Error: Invalid existed_before marker for $domain" >&2
+    return 1
+fi
 
     local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
     local live_dir="${letsencrypt_root}/live/${domain}"
@@ -189,18 +249,18 @@ restore_acme_lineage() {
 
     if [[ "$existed" == "0" ]]; then
         echo "Removing transaction-created ACME lineage for $domain..." >&2
-        rm -f "$renewal_conf"
-        rm -rf "$live_dir" "$archive_dir"
+        rm -f "$renewal_conf" || { echo "Error: Could not remove transaction-created renewal config for $domain" >&2; return 1; }
+        rm -rf "$live_dir" "$archive_dir" || { echo "Error: Could not remove transaction-created lineage for $domain" >&2; return 1; }
         return 0
     fi
 
     echo "Restoring pre-existing ACME lineage for $domain from snapshot..." >&2
-    mkdir -p "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir"
-    chmod 0755 "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" 2>/dev/null || true
+    mkdir -p "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" || { echo "Error: Could not create ACME restore directories for $domain" >&2; return 1; }
+    chmod 0755 "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" 2>/dev/null || { echo "Error: Could not set ACME directory permissions for $domain" >&2; return 1; }
 
     if [[ -f "$snap_dir/renewal.conf" ]]; then
-        cp -p "$snap_dir/renewal.conf" "$renewal_conf"
-        chmod 0644 "$renewal_conf" 2>/dev/null || true
+        cp -p "$snap_dir/renewal.conf" "$renewal_conf" || { echo "Error: Could not restore renewal config for $domain" >&2; return 1; }
+        chmod 0644 "$renewal_conf" 2>/dev/null || { echo "Error: Could not set renewal config permissions for $domain" >&2; return 1; }
     fi
 
     if [[ -d "$snap_dir/archive" ]]; then
@@ -209,11 +269,11 @@ restore_acme_lineage() {
             [[ -f "$arc" ]] || continue
             local bn
             bn=$(basename "$arc")
-            cp -p "$arc" "$archive_dir/$bn"
+            cp -p "$arc" "$archive_dir/$bn" || { echo "Error: Could not restore ACME archive file $bn for $domain" >&2; return 1; }
             if [[ "$bn" =~ ^privkey ]]; then
-                chmod 0600 "$archive_dir/$bn" 2>/dev/null || true
+                chmod 0600 "$archive_dir/$bn" 2>/dev/null || { echo "Error: Could not secure restored private key $bn for $domain" >&2; return 1; }
             else
-                chmod 0644 "$archive_dir/$bn" 2>/dev/null || true
+                chmod 0644 "$archive_dir/$bn" 2>/dev/null || { echo "Error: Could not set restored certificate permissions for $bn ($domain)" >&2; return 1; }
             fi
         done
     fi
@@ -223,14 +283,14 @@ restore_acme_lineage() {
         for f in cert.pem chain.pem fullchain.pem privkey.pem; do
             if [[ -f "$snap_dir/live/${f}.target" ]]; then
                 local tgt
-                tgt=$(cat "$snap_dir/live/${f}.target")
-                ln -sf "$tgt" "$live_dir/$f"
+                tgt=$(cat "$snap_dir/live/${f}.target") || { echo "Error: Could not read ACME symlink target for $f ($domain)" >&2; return 1; }
+                ln -sf "$tgt" "$live_dir/$f" || { echo "Error: Could not restore ACME symlink $f for $domain" >&2; return 1; }
             elif [[ -f "$snap_dir/live/$f" ]]; then
-                cp -p "$snap_dir/live/$f" "$live_dir/$f"
+                cp -p "$snap_dir/live/$f" "$live_dir/$f" || { echo "Error: Could not restore ACME live file $f for $domain" >&2; return 1; }
                 if [[ "$f" == "privkey.pem" ]]; then
-                    chmod 0600 "$live_dir/$f" 2>/dev/null || true
+                    chmod 0600 "$live_dir/$f" 2>/dev/null || { echo "Error: Could not secure restored live private key for $domain" >&2; return 1; }
                 else
-                    chmod 0644 "$live_dir/$f" 2>/dev/null || true
+                    chmod 0644 "$live_dir/$f" 2>/dev/null || { echo "Error: Could not set restored live certificate permissions for $domain" >&2; return 1; }
                 fi
             fi
         done
@@ -257,17 +317,21 @@ restore_acme_lineage() {
     fi
 
     local exp_serial exp_fingerprint cur_serial cur_fingerprint
-    exp_serial=$(python3 -c "import json; print(json.load(open('$meta_file')).get('serial', ''))")
-    exp_fingerprint=$(python3 -c "import json; print(json.load(open('$meta_file')).get('fingerprint', ''))")
+    exp_serial=$(python3 -c "import json; print(json.load(open('$meta_file', encoding='utf-8')).get('serial', ''))") || { echo "Error: Could not read snapshot certificate serial for $domain" >&2; return 1; }
+    exp_fingerprint=$(python3 -c "import json; print(json.load(open('$meta_file', encoding='utf-8')).get('fingerprint', ''))") || { echo "Error: Could not read snapshot certificate fingerprint for $domain" >&2; return 1; }
+    if [[ -z "$exp_serial" || -z "$exp_fingerprint" ]]; then
+        echo "Error: ACME snapshot is missing certificate identity metadata for $domain" >&2
+        return 1
+    fi
     if [[ -n "$exp_serial" ]]; then
-        cur_serial=$(openssl x509 -in "$fullchain" -noout -serial 2>/dev/null || true)
+        cur_serial=$(openssl x509 -in "$fullchain" -noout -serial 2>/dev/null) || { echo "Error: Could not read restored certificate serial for $domain" >&2; return 1; }
         if [[ "$cur_serial" != "$exp_serial" ]]; then
             echo "Error: Restored certificate serial ($cur_serial) does not match snapshot ($exp_serial)" >&2
             return 1
         fi
     fi
     if [[ -n "$exp_fingerprint" ]]; then
-        cur_fingerprint=$(openssl x509 -in "$fullchain" -noout -fingerprint -sha256 2>/dev/null || true)
+        cur_fingerprint=$(openssl x509 -in "$fullchain" -noout -fingerprint -sha256 2>/dev/null) || { echo "Error: Could not read restored certificate fingerprint for $domain" >&2; return 1; }
         if [[ "$cur_fingerprint" != "$exp_fingerprint" ]]; then
             echo "Error: Restored certificate fingerprint ($cur_fingerprint) does not match snapshot ($exp_fingerprint)" >&2
             return 1
@@ -472,61 +536,213 @@ install_managed_deploy_hook() {
 
     verify_deploy_hook_preflight "$hook_file" "$transaction_id" "$recovery_root" || return 1
 
-    local hook_dir
-    hook_dir=$(dirname "$hook_file")
-    mkdir -p "$hook_dir"
-    chmod 0755 "$hook_dir" 2>/dev/null || true
+    local hook_dir resolved_hook_dir metadata owner mode
+    hook_dir=$(dirname "$hook_file") || return 1
+    resolved_hook_dir=$(realpath -m -- "$hook_dir") || {
+        echo "Error: Could not resolve Certbot deploy-hook directory." >&2
+        return 1
+    }
+    if [[ "$resolved_hook_dir" != "$hook_dir" ]]; then
+        echo "Error: Certbot deploy-hook directory contains a symlink or non-normalized path." >&2
+        return 1
+    fi
+    mkdir -p -- "$hook_dir" || {
+        echo "Error: Could not create Certbot deploy-hook directory." >&2
+        return 1
+    }
+    if [[ ! -d "$hook_dir" || -L "$hook_dir" ]]; then
+        echo "Error: Certbot deploy-hook directory is not a real directory." >&2
+        return 1
+    fi
+    metadata=$(stat -c '%u:%a' -- "$hook_dir") || {
+        echo "Error: Could not verify Certbot deploy-hook directory." >&2
+        return 1
+    }
+    owner="${metadata%%:*}"
+    if [[ "$owner" != "$(id -u)" ]]; then
+        echo "Error: Certbot deploy-hook directory is not owned by the current user." >&2
+        return 1
+    fi
+    chmod 0755 -- "$hook_dir" || {
+        echo "Error: Could not enforce Certbot deploy-hook directory permissions." >&2
+        return 1
+    }
+    metadata=$(stat -c '%u:%a' -- "$hook_dir") || return 1
+    owner="${metadata%%:*}"
+    mode="${metadata#*:}"
+    if [[ "$owner" != "$(id -u)" || "$mode" != "755" ]]; then
+        echo "Error: Certbot deploy-hook directory owner or mode verification failed." >&2
+        return 1
+    fi
 
-    local snap_dir="${recovery_root}/${transaction_id}"
-    mkdir -p "$snap_dir"
-    chmod 0700 "$snap_dir" 2>/dev/null || true
+    local snap_dir="${recovery_root}/${transaction_id}" resolved_snap_dir
+    resolved_snap_dir=$(realpath -m -- "$snap_dir") || {
+        echo "Error: Could not resolve deploy-hook recovery directory." >&2
+        return 1
+    }
+    if [[ "$snap_dir" != /* || "$snap_dir" == "/" || "$resolved_snap_dir" != "$snap_dir" ]]; then
+        echo "Error: Deploy-hook recovery path is not a normalized absolute path without symlinks." >&2
+        return 1
+    fi
+    mkdir -p -- "$snap_dir" || {
+        echo "Error: Could not create deploy-hook recovery directory." >&2
+        return 1
+    }
+    if [[ ! -d "$snap_dir" || -L "$snap_dir" ]]; then
+        echo "Error: Deploy-hook recovery path is not a real directory." >&2
+        return 1
+    fi
+    metadata=$(stat -c '%u:%a' -- "$snap_dir") || {
+        echo "Error: Could not verify deploy-hook recovery directory." >&2
+        return 1
+    }
+    owner="${metadata%%:*}"
+    if [[ "$owner" != "$(id -u)" ]]; then
+        echo "Error: Deploy-hook recovery directory is not owned by the current user." >&2
+        return 1
+    fi
+    chmod 0700 -- "$snap_dir" || {
+        echo "Error: Could not secure deploy-hook recovery directory." >&2
+        return 1
+    }
+    metadata=$(stat -c '%u:%a' -- "$snap_dir") || return 1
+    owner="${metadata%%:*}"
+    mode="${metadata#*:}"
+    if [[ "$owner" != "$(id -u)" || "$mode" != "700" ]]; then
+        echo "Error: Deploy-hook recovery directory owner or mode verification failed." >&2
+        return 1
+    fi
+
     local manifest="${snap_dir}/deploy-hook-manifest.json"
-
     local tmp_file="${hook_file}.tmp.$$"
-    cat > "$tmp_file" <<'EOF'
+    if ! cat > "$tmp_file" <<'EOF'
 #!/bin/sh
 # Managed by GoWave Auto NGINX: Automated ACME Reload Hook
 if nginx -t -q; then
     systemctl reload nginx
 fi
 EOF
-    chmod 0755 "$tmp_file"
-    sync "$tmp_file"
-    mv -f "$tmp_file" "$hook_file"
-    sync "$hook_dir"
+    then
+        echo "Error: Could not write temporary Certbot deploy hook." >&2
+        return 1
+    fi
+    if ! chmod 0755 -- "$tmp_file" || ! sync "$tmp_file"; then
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not secure and sync temporary Certbot deploy hook." >&2
+        return 1
+    fi
 
     local digest
-    digest=$(sha256sum "$hook_file" | awk '{print $1}')
-    python3 - "$manifest" "$transaction_id" "$hook_file" "$digest" <<'PY'
-import json, sys
-manifest_path, tx_id, path, digest = sys.argv[1:5]
-data = {
-    "transaction_id": tx_id,
-    "path": path,
-    "created_by_tx": True,
-    "sha256": digest
-}
-with open(manifest_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2)
-PY
-    chmod 0600 "$manifest" 2>/dev/null || true
+    digest=$(sha256sum "$tmp_file" | awk '{print $1}') || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not calculate Certbot deploy-hook digest." >&2
+        return 1
+    }
+    python3 -c 'import json, os, sys; manifest_path, tx_id, path, digest = sys.argv[1:5]; flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0); fd = os.open(manifest_path, flags, 0o600); stream = os.fdopen(fd, "w", encoding="utf-8"); json.dump({"transaction_id": tx_id, "path": path, "created_by_tx": True, "sha256": digest}, stream, indent=2); stream.flush(); os.fsync(stream.fileno()); stream.close()' "$manifest" "$transaction_id" "$hook_file" "$digest" || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not create deploy-hook ownership manifest safely." >&2
+        return 1
+    }
+    if ! chmod 0600 -- "$manifest"; then
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not enforce private deploy-hook manifest permissions." >&2
+        return 1
+    fi
+    metadata=$(stat -c '%u:%a' -- "$manifest") || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not verify deploy-hook ownership manifest." >&2
+        return 1
+    }
+    owner="${metadata%%:*}"
+    mode="${metadata#*:}"
+    if [[ "$owner" != "$(id -u)" || "$mode" != "600" ]]; then
+        rm -f -- "$tmp_file" || true
+        echo "Error: Deploy-hook manifest owner or mode verification failed." >&2
+        return 1
+    fi
+    sync "$manifest" && sync "$snap_dir" || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not sync deploy-hook ownership manifest." >&2
+        return 1
+    }
+
+    mv -f -- "$tmp_file" "$hook_file" || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not install managed Certbot deploy hook." >&2
+        return 1
+    }
+    sync "$hook_dir" || {
+        echo "Error: Could not sync Certbot deploy-hook directory after installation." >&2
+        return 1
+    }
     echo "Configured managed ACME renewal hook in $hook_file."
 }
-
 rollback_managed_deploy_hook() {
     local transaction_id="$1"
     local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
     local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
-
-    local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
-    if [[ ! -f "$manifest" ]]; then
+    if [[ -z "$transaction_id" ]]; then
+        if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            echo "Error: ACME transaction ID is missing; preserving deploy hook with unknown ownership and reporting incomplete rollback." >&2
+            return 1
+        fi
         return 0
     fi
 
-    local created_by_tx recorded_sha
-    created_by_tx=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
-    recorded_sha=$(python3 -c "import json; print(json.load(open('$manifest')).get('sha256', ''))" 2>/dev/null || echo "")
+    local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
+    if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
+        if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            echo "Error: Deploy hook exists without an ownership manifest; refusing to claim rollback succeeded." >&2
+            return 1
+        fi
+        return 0
+    fi
+    if [[ ! -f "$manifest" || -L "$manifest" ]]; then
+        echo "Error: Deploy-hook rollback manifest is missing, non-regular, or a symlink." >&2
+        return 1
+    fi
 
+    local manifest_data
+    manifest_data=$(python3 - "$manifest" "$transaction_id" "$hook_file" <<'PY'
+import json
+import re
+import sys
+
+path, expected_tx, expected_hook = sys.argv[1:4]
+try:
+    with open(path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict):
+        raise ValueError("manifest root must be an object")
+    if data.get("transaction_id") != expected_tx or data.get("path") != expected_hook:
+        raise ValueError("manifest transaction/path mismatch")
+    created = data.get("created_by_tx")
+    if type(created) is not bool:
+        raise ValueError("created_by_tx must be a boolean")
+    digest = data.get("sha256", "")
+    if not isinstance(digest, str):
+        raise ValueError("sha256 must be a string")
+    if created and not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("created hook digest is invalid")
+    print("1" if created else "0")
+    print(digest)
+except Exception as exc:
+    print(f"Invalid deploy-hook rollback manifest: {type(exc).__name__}", file=sys.stderr)
+    sys.exit(1)
+PY
+    ) || {
+        echo "Error: Refusing deploy-hook rollback because its ownership manifest is invalid." >&2
+        return 1
+    }
+
+    local -a manifest_fields=()
+    mapfile -t manifest_fields <<< "$manifest_data"
+    if [[ "${#manifest_fields[@]}" -ne 2 ]]; then
+        echo "Error: Deploy-hook rollback manifest has an invalid field count." >&2
+        return 1
+    fi
+    local created_by_tx="${manifest_fields[0]}"
+    local recorded_sha="${manifest_fields[1]}"
     if [[ "$created_by_tx" != "1" ]]; then
         return 0
     fi
@@ -534,26 +750,33 @@ rollback_managed_deploy_hook() {
     if [[ ! -e "$hook_file" && ! -L "$hook_file" ]]; then
         return 0
     fi
-
     if [[ -L "$hook_file" ]]; then
         echo "Warning: Deploy hook $hook_file is now a symlink; preserving modified object and reporting incomplete recovery." >&2
         return 1
     fi
-
     if [[ ! -f "$hook_file" ]]; then
         echo "Warning: Deploy hook $hook_file is not a regular file; preserving modified object and reporting incomplete recovery." >&2
         return 1
     fi
 
     local current_sha
-    current_sha=$(sha256sum "$hook_file" | awk '{print $1}')
+    current_sha=$(sha256sum "$hook_file" | awk '{print $1}') || {
+        echo "Error: Could not verify managed deploy-hook digest." >&2
+        return 1
+    }
     if [[ "$current_sha" != "$recorded_sha" ]]; then
         echo "Warning: Deploy hook $hook_file was modified after installation (digest mismatch); preserving modified object and reporting incomplete recovery." >&2
         return 1
     fi
 
-    rm -f "$hook_file"
-    sync "$(dirname "$hook_file")"
+    rm -f "$hook_file" || {
+        echo "Error: Could not remove transaction-owned deploy hook $hook_file." >&2
+        return 1
+    }
+    sync "$(dirname "$hook_file")" || {
+        echo "Error: Could not sync deploy-hook directory after rollback." >&2
+        return 1
+    }
     return 0
 }
 
@@ -645,6 +868,7 @@ remote_payload() {
         printf 'export VISION_DOMAIN=%q\n' "${VISION_DOMAIN:-}"
         printf 'export ADMIN_EMAIL=%q\n' "$admin_email"
         printf 'export GOWAVE_ACME_SERVER=%q\n' "${GOWAVE_ACME_SERVER:-}"
+        printf 'export ACME_TX_ID=%q\n' "${ACME_TX_ID:-}"
         printf 'COVER_REALITY_B64=%q\n' "$cover_b64"
         printf 'COVER_REALITY_SHA256=%q\n' "$cover_sha256"
         # Secret strictly scoped, not exported globally
@@ -728,81 +952,128 @@ snapshot_acme_lineage() {
     local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
     local letsencrypt_root="${4:-/etc/letsencrypt}"
 
+    if [[ ! "$transaction_id" =~ ^[A-Za-z0-9._-]+$ || ! "$domain" =~ ^[A-Za-z0-9.-]+$ ]]; then
+        echo "Error: Invalid transaction ID or domain for ACME snapshot." >&2
+        return 1
+    fi
+
     local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
-    mkdir -p "$snap_dir"
-    chmod 0700 "$snap_dir" 2>/dev/null || true
+    mkdir -p "$snap_dir" || { echo "Error: Could not create ACME snapshot directory for $domain." >&2; return 1; }
+    if [[ -L "$snap_dir" ]]; then
+        echo "Error: ACME snapshot directory is an unsafe symlink for $domain." >&2
+        return 1
+    fi
+    chmod 0700 "$snap_dir" 2>/dev/null || { echo "Error: Could not secure ACME snapshot directory for $domain." >&2; return 1; }
 
     local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
     local live_dir="${letsencrypt_root}/live/${domain}"
+    local archive_dir="${letsencrypt_root}/archive/${domain}"
     local meta_file="${snap_dir}/lineage-manifest.json"
+    local existed_before=false cert_serial="" cert_fingerprint=""
 
-    if [[ -f "$renewal_conf" || -d "$live_dir" ]]; then
-        mkdir -p "$snap_dir/archive" "$snap_dir/live"
-        chmod 0700 "$snap_dir/archive" "$snap_dir/live" 2>/dev/null || true
-
-        if [[ -f "$renewal_conf" ]]; then
-            cp -p "$renewal_conf" "$snap_dir/renewal.conf"
+    if [[ -e "$renewal_conf" || -L "$renewal_conf" || -e "$live_dir" || -L "$live_dir" ]]; then
+        if [[ ! -f "$renewal_conf" || -L "$renewal_conf" || ! -d "$live_dir" || -L "$live_dir" ]]; then
+            echo "Error: Existing ACME lineage for $domain is incomplete or unsafe; refusing to snapshot it." >&2
+            return 1
         fi
+        mkdir -p "$snap_dir/archive" "$snap_dir/live" || { echo "Error: Could not create ACME snapshot subdirectories for $domain." >&2; return 1; }
+        chmod 0700 "$snap_dir/archive" "$snap_dir/live" 2>/dev/null || { echo "Error: Could not secure ACME snapshot subdirectories for $domain." >&2; return 1; }
+        cp -p "$renewal_conf" "$snap_dir/renewal.conf" || { echo "Error: Could not snapshot ACME renewal config for $domain." >&2; return 1; }
 
-        local cert_serial=""
-        local cert_fingerprint=""
-        if [[ -d "$live_dir" ]]; then
-            local f
-            for f in cert.pem chain.pem fullchain.pem privkey.pem; do
-                local link_path="${live_dir}/${f}"
-                if [[ -L "$link_path" ]]; then
-                    local target
-                    target=$(readlink "$link_path")
-                    echo "$target" > "$snap_dir/live/${f}.target"
-                    local real_file
-                    real_file=$(realpath -q "$link_path" || true)
-                    if [[ -n "$real_file" && -f "$real_file" ]]; then
-                        local bn
-                        bn=$(basename "$real_file")
-                        cp -p "$real_file" "$snap_dir/archive/$bn"
-                        if [[ "$f" == "privkey.pem" || "$bn" =~ ^privkey ]]; then
-                            chmod 0600 "$snap_dir/archive/$bn" 2>/dev/null || true
-                        fi
-                    fi
-                elif [[ -f "$link_path" ]]; then
-                    cp -p "$link_path" "$snap_dir/live/$f"
-                    if [[ "$f" == "privkey.pem" ]]; then
-                        chmod 0600 "$snap_dir/live/$f" 2>/dev/null || true
-                    fi
+        local archive_real
+        archive_real=$(realpath -e -- "$archive_dir") || { echo "Error: ACME archive directory is missing for existing lineage $domain." >&2; return 1; }
+        local f link_path target real_file bn
+        for f in cert.pem chain.pem fullchain.pem privkey.pem; do
+            link_path="${live_dir}/${f}"
+            if [[ -L "$link_path" ]]; then
+                target=$(readlink "$link_path") || { echo "Error: Could not read ACME symlink $f for $domain." >&2; return 1; }
+                if [[ -z "$target" || "$target" == /* ]]; then
+                    echo "Error: Unsafe ACME symlink target for $domain/$f." >&2
+                    return 1
                 fi
-            done
-
-            local fc="${live_dir}/fullchain.pem"
-            if [[ -s "$fc" ]]; then
-                cert_serial=$(openssl x509 -in "$fc" -noout -serial 2>/dev/null || true)
-                cert_fingerprint=$(openssl x509 -in "$fc" -noout -fingerprint -sha256 2>/dev/null || true)
+                printf '%s\n' "$target" > "$snap_dir/live/${f}.target" || { echo "Error: Could not snapshot ACME symlink target for $domain/$f." >&2; return 1; }
+                chmod 0600 "$snap_dir/live/${f}.target" 2>/dev/null || { echo "Error: Could not secure ACME symlink metadata for $domain/$f." >&2; return 1; }
+                real_file=$(realpath -e -- "$link_path") || { echo "Error: ACME symlink $domain/$f is broken." >&2; return 1; }
+                case "$real_file" in
+                    "$archive_real"/*) ;;
+                    *)
+                        echo "Error: ACME symlink $domain/$f escapes its archive directory." >&2
+                        return 1
+                        ;;
+                esac
+                bn=$(basename "$real_file")
+                cp -p "$real_file" "$snap_dir/archive/$bn" || { echo "Error: Could not snapshot ACME archive file $bn for $domain." >&2; return 1; }
+                if [[ "$bn" =~ ^privkey ]]; then
+                    chmod 0600 "$snap_dir/archive/$bn" 2>/dev/null || { echo "Error: Could not secure snapshotted ACME private key for $domain." >&2; return 1; }
+                else
+                    chmod 0644 "$snap_dir/archive/$bn" 2>/dev/null || { echo "Error: Could not set snapshotted ACME certificate permissions for $domain." >&2; return 1; }
+                fi
+            elif [[ -f "$link_path" ]]; then
+                cp -p "$link_path" "$snap_dir/live/$f" || { echo "Error: Could not snapshot ACME live file $f for $domain." >&2; return 1; }
+                if [[ "$f" == "privkey.pem" ]]; then
+                    chmod 0600 "$snap_dir/live/$f" 2>/dev/null || { echo "Error: Could not secure snapshotted ACME private key for $domain." >&2; return 1; }
+                fi
+            else
+                if [[ "$f" == "fullchain.pem" || "$f" == "privkey.pem" ]]; then
+                    echo "Error: Existing ACME lineage is missing required file $domain/$f." >&2
+                    return 1
+                fi
+                continue
             fi
-        fi
+        done
 
-        python3 - "$meta_file" "$domain" "$cert_serial" "$cert_fingerprint" <<'PY'
-import json, sys
-meta_file, domain, serial, fingerprint = sys.argv[1:5]
-data = {
-    "domain": domain,
-    "existed_before": True,
-    "serial": serial,
-    "fingerprint": fingerprint
-}
-with open(meta_file, "w") as f:
-    json.dump(data, f, indent=2)
-PY
-    else
-        python3 - "$meta_file" "$domain" <<'PY'
-import json, sys
-meta_file, domain = sys.argv[1:3]
-data = {
-    "domain": domain,
-    "existed_before": False
-}
-with open(meta_file, "w") as f:
-    json.dump(data, f, indent=2)
-PY
+        local fullchain="${live_dir}/fullchain.pem" privkey="${live_dir}/privkey.pem"
+        openssl x509 -in "$fullchain" -noout >/dev/null 2>&1 || { echo "Error: Existing ACME certificate is invalid for $domain." >&2; return 1; }
+        local pub_from_cert pub_from_key
+        pub_from_cert=$(openssl x509 -in "$fullchain" -noout -pubkey 2>/dev/null) || { echo "Error: Could not read existing ACME certificate key for $domain." >&2; return 1; }
+        pub_from_key=$(openssl pkey -in "$privkey" -pubout 2>/dev/null) || { echo "Error: Could not read existing ACME private key for $domain." >&2; return 1; }
+        if [[ -z "$pub_from_cert" || "$pub_from_cert" != "$pub_from_key" ]]; then
+            echo "Error: Existing ACME certificate and private key do not match for $domain." >&2
+            return 1
+        fi
+        cert_serial=$(openssl x509 -in "$fullchain" -noout -serial 2>/dev/null) || { echo "Error: Could not read existing ACME certificate serial for $domain." >&2; return 1; }
+        cert_fingerprint=$(openssl x509 -in "$fullchain" -noout -fingerprint -sha256 2>/dev/null) || { echo "Error: Could not read existing ACME certificate fingerprint for $domain." >&2; return 1; }
+        if [[ -z "$cert_serial" || -z "$cert_fingerprint" ]]; then
+            echo "Error: Existing ACME certificate identity metadata is empty for $domain." >&2
+            return 1
+        fi
+        existed_before=true
     fi
+
+    python3 - "$meta_file" "$domain" "$existed_before" "$cert_serial" "$cert_fingerprint" <<'PY'
+import json
+import os
+import sys
+
+meta_file, domain, existed, serial, fingerprint = sys.argv[1:6]
+data = {
+    "domain": domain,
+    "existed_before": existed == "true",
+    "serial": serial,
+    "fingerprint": fingerprint,
+}
+tmp_path = meta_file + ".tmp"
+fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        os.fchmod(stream.fileno(), 0o600)
+        json.dump(data, stream, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp_path, meta_file)
+    dir_fd = os.open(os.path.dirname(meta_file), os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+except Exception as exc:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    print(f"Failed to persist ACME snapshot manifest: {type(exc).__name__}", file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
 restore_acme_lineage() {
@@ -820,7 +1091,20 @@ restore_acme_lineage() {
     fi
 
     local existed
-    existed=$(python3 -c "import json; print('1' if json.load(open('$meta_file')).get('existed_before') else '0')")
+    existed=$(python3 - "$meta_file" "$domain" <<'PY'
+import json, sys
+path, domain = sys.argv[1:3]
+with open(path, encoding="utf-8") as stream:
+    data = json.load(stream)
+if not isinstance(data, dict) or data.get("domain") != domain or type(data.get("existed_before")) is not bool:
+    raise SystemExit(1)
+print("1" if data["existed_before"] else "0")
+PY
+) || { echo "Error: Invalid ACME lineage manifest for $domain" >&2; return 1; }
+if [[ "$existed" != "0" && "$existed" != "1" ]]; then
+    echo "Error: Invalid existed_before marker for $domain" >&2
+    return 1
+fi
 
     local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
     local live_dir="${letsencrypt_root}/live/${domain}"
@@ -828,18 +1112,18 @@ restore_acme_lineage() {
 
     if [[ "$existed" == "0" ]]; then
         echo "Removing transaction-created ACME lineage for $domain..." >&2
-        rm -f "$renewal_conf"
-        rm -rf "$live_dir" "$archive_dir"
+        rm -f "$renewal_conf" || { echo "Error: Could not remove transaction-created renewal config for $domain" >&2; return 1; }
+        rm -rf "$live_dir" "$archive_dir" || { echo "Error: Could not remove transaction-created lineage for $domain" >&2; return 1; }
         return 0
     fi
 
     echo "Restoring pre-existing ACME lineage for $domain from snapshot..." >&2
-    mkdir -p "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir"
-    chmod 0755 "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" 2>/dev/null || true
+    mkdir -p "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" || { echo "Error: Could not create ACME restore directories for $domain" >&2; return 1; }
+    chmod 0755 "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" 2>/dev/null || { echo "Error: Could not set ACME directory permissions for $domain" >&2; return 1; }
 
     if [[ -f "$snap_dir/renewal.conf" ]]; then
-        cp -p "$snap_dir/renewal.conf" "$renewal_conf"
-        chmod 0644 "$renewal_conf" 2>/dev/null || true
+        cp -p "$snap_dir/renewal.conf" "$renewal_conf" || { echo "Error: Could not restore renewal config for $domain" >&2; return 1; }
+        chmod 0644 "$renewal_conf" 2>/dev/null || { echo "Error: Could not set renewal config permissions for $domain" >&2; return 1; }
     fi
 
     if [[ -d "$snap_dir/archive" ]]; then
@@ -848,11 +1132,11 @@ restore_acme_lineage() {
             [[ -f "$arc" ]] || continue
             local bn
             bn=$(basename "$arc")
-            cp -p "$arc" "$archive_dir/$bn"
+            cp -p "$arc" "$archive_dir/$bn" || { echo "Error: Could not restore ACME archive file $bn for $domain" >&2; return 1; }
             if [[ "$bn" =~ ^privkey ]]; then
-                chmod 0600 "$archive_dir/$bn" 2>/dev/null || true
+                chmod 0600 "$archive_dir/$bn" 2>/dev/null || { echo "Error: Could not secure restored private key $bn for $domain" >&2; return 1; }
             else
-                chmod 0644 "$archive_dir/$bn" 2>/dev/null || true
+                chmod 0644 "$archive_dir/$bn" 2>/dev/null || { echo "Error: Could not set restored certificate permissions for $bn ($domain)" >&2; return 1; }
             fi
         done
     fi
@@ -862,14 +1146,14 @@ restore_acme_lineage() {
         for f in cert.pem chain.pem fullchain.pem privkey.pem; do
             if [[ -f "$snap_dir/live/${f}.target" ]]; then
                 local tgt
-                tgt=$(cat "$snap_dir/live/${f}.target")
-                ln -sf "$tgt" "$live_dir/$f"
+                tgt=$(cat "$snap_dir/live/${f}.target") || { echo "Error: Could not read ACME symlink target for $f ($domain)" >&2; return 1; }
+                ln -sf "$tgt" "$live_dir/$f" || { echo "Error: Could not restore ACME symlink $f for $domain" >&2; return 1; }
             elif [[ -f "$snap_dir/live/$f" ]]; then
-                cp -p "$snap_dir/live/$f" "$live_dir/$f"
+                cp -p "$snap_dir/live/$f" "$live_dir/$f" || { echo "Error: Could not restore ACME live file $f for $domain" >&2; return 1; }
                 if [[ "$f" == "privkey.pem" ]]; then
-                    chmod 0600 "$live_dir/$f" 2>/dev/null || true
+                    chmod 0600 "$live_dir/$f" 2>/dev/null || { echo "Error: Could not secure restored live private key for $domain" >&2; return 1; }
                 else
-                    chmod 0644 "$live_dir/$f" 2>/dev/null || true
+                    chmod 0644 "$live_dir/$f" 2>/dev/null || { echo "Error: Could not set restored live certificate permissions for $domain" >&2; return 1; }
                 fi
             fi
         done
@@ -896,17 +1180,21 @@ restore_acme_lineage() {
     fi
 
     local exp_serial exp_fingerprint cur_serial cur_fingerprint
-    exp_serial=$(python3 -c "import json; print(json.load(open('$meta_file')).get('serial', ''))")
-    exp_fingerprint=$(python3 -c "import json; print(json.load(open('$meta_file')).get('fingerprint', ''))")
+    exp_serial=$(python3 -c "import json; print(json.load(open('$meta_file', encoding='utf-8')).get('serial', ''))") || { echo "Error: Could not read snapshot certificate serial for $domain" >&2; return 1; }
+    exp_fingerprint=$(python3 -c "import json; print(json.load(open('$meta_file', encoding='utf-8')).get('fingerprint', ''))") || { echo "Error: Could not read snapshot certificate fingerprint for $domain" >&2; return 1; }
+    if [[ -z "$exp_serial" || -z "$exp_fingerprint" ]]; then
+        echo "Error: ACME snapshot is missing certificate identity metadata for $domain" >&2
+        return 1
+    fi
     if [[ -n "$exp_serial" ]]; then
-        cur_serial=$(openssl x509 -in "$fullchain" -noout -serial 2>/dev/null || true)
+        cur_serial=$(openssl x509 -in "$fullchain" -noout -serial 2>/dev/null) || { echo "Error: Could not read restored certificate serial for $domain" >&2; return 1; }
         if [[ "$cur_serial" != "$exp_serial" ]]; then
             echo "Error: Restored certificate serial ($cur_serial) does not match snapshot ($exp_serial)" >&2
             return 1
         fi
     fi
     if [[ -n "$exp_fingerprint" ]]; then
-        cur_fingerprint=$(openssl x509 -in "$fullchain" -noout -fingerprint -sha256 2>/dev/null || true)
+        cur_fingerprint=$(openssl x509 -in "$fullchain" -noout -fingerprint -sha256 2>/dev/null) || { echo "Error: Could not read restored certificate fingerprint for $domain" >&2; return 1; }
         if [[ "$cur_fingerprint" != "$exp_fingerprint" ]]; then
             echo "Error: Restored certificate fingerprint ($cur_fingerprint) does not match snapshot ($exp_fingerprint)" >&2
             return 1
@@ -1111,61 +1399,213 @@ install_managed_deploy_hook() {
 
     verify_deploy_hook_preflight "$hook_file" "$transaction_id" "$recovery_root" || return 1
 
-    local hook_dir
-    hook_dir=$(dirname "$hook_file")
-    mkdir -p "$hook_dir"
-    chmod 0755 "$hook_dir" 2>/dev/null || true
+    local hook_dir resolved_hook_dir metadata owner mode
+    hook_dir=$(dirname "$hook_file") || return 1
+    resolved_hook_dir=$(realpath -m -- "$hook_dir") || {
+        echo "Error: Could not resolve Certbot deploy-hook directory." >&2
+        return 1
+    }
+    if [[ "$resolved_hook_dir" != "$hook_dir" ]]; then
+        echo "Error: Certbot deploy-hook directory contains a symlink or non-normalized path." >&2
+        return 1
+    fi
+    mkdir -p -- "$hook_dir" || {
+        echo "Error: Could not create Certbot deploy-hook directory." >&2
+        return 1
+    }
+    if [[ ! -d "$hook_dir" || -L "$hook_dir" ]]; then
+        echo "Error: Certbot deploy-hook directory is not a real directory." >&2
+        return 1
+    fi
+    metadata=$(stat -c '%u:%a' -- "$hook_dir") || {
+        echo "Error: Could not verify Certbot deploy-hook directory." >&2
+        return 1
+    }
+    owner="${metadata%%:*}"
+    if [[ "$owner" != "$(id -u)" ]]; then
+        echo "Error: Certbot deploy-hook directory is not owned by the current user." >&2
+        return 1
+    fi
+    chmod 0755 -- "$hook_dir" || {
+        echo "Error: Could not enforce Certbot deploy-hook directory permissions." >&2
+        return 1
+    }
+    metadata=$(stat -c '%u:%a' -- "$hook_dir") || return 1
+    owner="${metadata%%:*}"
+    mode="${metadata#*:}"
+    if [[ "$owner" != "$(id -u)" || "$mode" != "755" ]]; then
+        echo "Error: Certbot deploy-hook directory owner or mode verification failed." >&2
+        return 1
+    fi
 
-    local snap_dir="${recovery_root}/${transaction_id}"
-    mkdir -p "$snap_dir"
-    chmod 0700 "$snap_dir" 2>/dev/null || true
+    local snap_dir="${recovery_root}/${transaction_id}" resolved_snap_dir
+    resolved_snap_dir=$(realpath -m -- "$snap_dir") || {
+        echo "Error: Could not resolve deploy-hook recovery directory." >&2
+        return 1
+    }
+    if [[ "$snap_dir" != /* || "$snap_dir" == "/" || "$resolved_snap_dir" != "$snap_dir" ]]; then
+        echo "Error: Deploy-hook recovery path is not a normalized absolute path without symlinks." >&2
+        return 1
+    fi
+    mkdir -p -- "$snap_dir" || {
+        echo "Error: Could not create deploy-hook recovery directory." >&2
+        return 1
+    }
+    if [[ ! -d "$snap_dir" || -L "$snap_dir" ]]; then
+        echo "Error: Deploy-hook recovery path is not a real directory." >&2
+        return 1
+    fi
+    metadata=$(stat -c '%u:%a' -- "$snap_dir") || {
+        echo "Error: Could not verify deploy-hook recovery directory." >&2
+        return 1
+    }
+    owner="${metadata%%:*}"
+    if [[ "$owner" != "$(id -u)" ]]; then
+        echo "Error: Deploy-hook recovery directory is not owned by the current user." >&2
+        return 1
+    fi
+    chmod 0700 -- "$snap_dir" || {
+        echo "Error: Could not secure deploy-hook recovery directory." >&2
+        return 1
+    }
+    metadata=$(stat -c '%u:%a' -- "$snap_dir") || return 1
+    owner="${metadata%%:*}"
+    mode="${metadata#*:}"
+    if [[ "$owner" != "$(id -u)" || "$mode" != "700" ]]; then
+        echo "Error: Deploy-hook recovery directory owner or mode verification failed." >&2
+        return 1
+    fi
+
     local manifest="${snap_dir}/deploy-hook-manifest.json"
-
     local tmp_file="${hook_file}.tmp.$$"
-    cat > "$tmp_file" <<'EOF'
+    if ! cat > "$tmp_file" <<'EOF'
 #!/bin/sh
 # Managed by GoWave Auto NGINX: Automated ACME Reload Hook
 if nginx -t -q; then
     systemctl reload nginx
 fi
 EOF
-    chmod 0755 "$tmp_file"
-    sync "$tmp_file"
-    mv -f "$tmp_file" "$hook_file"
-    sync "$hook_dir"
+    then
+        echo "Error: Could not write temporary Certbot deploy hook." >&2
+        return 1
+    fi
+    if ! chmod 0755 -- "$tmp_file" || ! sync "$tmp_file"; then
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not secure and sync temporary Certbot deploy hook." >&2
+        return 1
+    fi
 
     local digest
-    digest=$(sha256sum "$hook_file" | awk '{print $1}')
-    python3 - "$manifest" "$transaction_id" "$hook_file" "$digest" <<'PY'
-import json, sys
-manifest_path, tx_id, path, digest = sys.argv[1:5]
-data = {
-    "transaction_id": tx_id,
-    "path": path,
-    "created_by_tx": True,
-    "sha256": digest
-}
-with open(manifest_path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2)
-PY
-    chmod 0600 "$manifest" 2>/dev/null || true
+    digest=$(sha256sum "$tmp_file" | awk '{print $1}') || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not calculate Certbot deploy-hook digest." >&2
+        return 1
+    }
+    python3 -c 'import json, os, sys; manifest_path, tx_id, path, digest = sys.argv[1:5]; flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0); fd = os.open(manifest_path, flags, 0o600); stream = os.fdopen(fd, "w", encoding="utf-8"); json.dump({"transaction_id": tx_id, "path": path, "created_by_tx": True, "sha256": digest}, stream, indent=2); stream.flush(); os.fsync(stream.fileno()); stream.close()' "$manifest" "$transaction_id" "$hook_file" "$digest" || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not create deploy-hook ownership manifest safely." >&2
+        return 1
+    }
+    if ! chmod 0600 -- "$manifest"; then
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not enforce private deploy-hook manifest permissions." >&2
+        return 1
+    fi
+    metadata=$(stat -c '%u:%a' -- "$manifest") || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not verify deploy-hook ownership manifest." >&2
+        return 1
+    }
+    owner="${metadata%%:*}"
+    mode="${metadata#*:}"
+    if [[ "$owner" != "$(id -u)" || "$mode" != "600" ]]; then
+        rm -f -- "$tmp_file" || true
+        echo "Error: Deploy-hook manifest owner or mode verification failed." >&2
+        return 1
+    fi
+    sync "$manifest" && sync "$snap_dir" || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not sync deploy-hook ownership manifest." >&2
+        return 1
+    }
+
+    mv -f -- "$tmp_file" "$hook_file" || {
+        rm -f -- "$tmp_file" || true
+        echo "Error: Could not install managed Certbot deploy hook." >&2
+        return 1
+    }
+    sync "$hook_dir" || {
+        echo "Error: Could not sync Certbot deploy-hook directory after installation." >&2
+        return 1
+    }
     echo "Configured managed ACME renewal hook in $hook_file."
 }
-
 rollback_managed_deploy_hook() {
     local transaction_id="$1"
     local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
     local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
-
-    local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
-    if [[ ! -f "$manifest" ]]; then
+    if [[ -z "$transaction_id" ]]; then
+        if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            echo "Error: ACME transaction ID is missing; preserving deploy hook with unknown ownership and reporting incomplete rollback." >&2
+            return 1
+        fi
         return 0
     fi
 
-    local created_by_tx recorded_sha
-    created_by_tx=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
-    recorded_sha=$(python3 -c "import json; print(json.load(open('$manifest')).get('sha256', ''))" 2>/dev/null || echo "")
+    local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
+    if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
+        if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            echo "Error: Deploy hook exists without an ownership manifest; refusing to claim rollback succeeded." >&2
+            return 1
+        fi
+        return 0
+    fi
+    if [[ ! -f "$manifest" || -L "$manifest" ]]; then
+        echo "Error: Deploy-hook rollback manifest is missing, non-regular, or a symlink." >&2
+        return 1
+    fi
 
+    local manifest_data
+    manifest_data=$(python3 - "$manifest" "$transaction_id" "$hook_file" <<'PY'
+import json
+import re
+import sys
+
+path, expected_tx, expected_hook = sys.argv[1:4]
+try:
+    with open(path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict):
+        raise ValueError("manifest root must be an object")
+    if data.get("transaction_id") != expected_tx or data.get("path") != expected_hook:
+        raise ValueError("manifest transaction/path mismatch")
+    created = data.get("created_by_tx")
+    if type(created) is not bool:
+        raise ValueError("created_by_tx must be a boolean")
+    digest = data.get("sha256", "")
+    if not isinstance(digest, str):
+        raise ValueError("sha256 must be a string")
+    if created and not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("created hook digest is invalid")
+    print("1" if created else "0")
+    print(digest)
+except Exception as exc:
+    print(f"Invalid deploy-hook rollback manifest: {type(exc).__name__}", file=sys.stderr)
+    sys.exit(1)
+PY
+    ) || {
+        echo "Error: Refusing deploy-hook rollback because its ownership manifest is invalid." >&2
+        return 1
+    }
+
+    local -a manifest_fields=()
+    mapfile -t manifest_fields <<< "$manifest_data"
+    if [[ "${#manifest_fields[@]}" -ne 2 ]]; then
+        echo "Error: Deploy-hook rollback manifest has an invalid field count." >&2
+        return 1
+    fi
+    local created_by_tx="${manifest_fields[0]}"
+    local recorded_sha="${manifest_fields[1]}"
     if [[ "$created_by_tx" != "1" ]]; then
         return 0
     fi
@@ -1173,26 +1613,33 @@ rollback_managed_deploy_hook() {
     if [[ ! -e "$hook_file" && ! -L "$hook_file" ]]; then
         return 0
     fi
-
     if [[ -L "$hook_file" ]]; then
         echo "Warning: Deploy hook $hook_file is now a symlink; preserving modified object and reporting incomplete recovery." >&2
         return 1
     fi
-
     if [[ ! -f "$hook_file" ]]; then
         echo "Warning: Deploy hook $hook_file is not a regular file; preserving modified object and reporting incomplete recovery." >&2
         return 1
     fi
 
     local current_sha
-    current_sha=$(sha256sum "$hook_file" | awk '{print $1}')
+    current_sha=$(sha256sum "$hook_file" | awk '{print $1}') || {
+        echo "Error: Could not verify managed deploy-hook digest." >&2
+        return 1
+    }
     if [[ "$current_sha" != "$recorded_sha" ]]; then
         echo "Warning: Deploy hook $hook_file was modified after installation (digest mismatch); preserving modified object and reporting incomplete recovery." >&2
         return 1
     fi
 
-    rm -f "$hook_file"
-    sync "$(dirname "$hook_file")"
+    rm -f "$hook_file" || {
+        echo "Error: Could not remove transaction-owned deploy hook $hook_file." >&2
+        return 1
+    }
+    sync "$(dirname "$hook_file")" || {
+        echo "Error: Could not sync deploy-hook directory after rollback." >&2
+        return 1
+    }
     return 0
 }
 
@@ -1659,67 +2106,66 @@ compensate_remote_worker() {
         return "$exit_code"
     fi
     _ROLLBACK_IN_PROGRESS=1
+    local rollback_failed=0
     echo "[ROLLBACK] Remote worker deployment failed (exit code: $exit_code). Initiating automated compensating rollback..." >&2
 
     # 1. Stop and remove GoWave Node and Xray systemd services
     if [[ "${_NODE_SERVICE_CONFIGURED:-0}" -eq 1 ]] || systemctl list-unit-files gowave-node.service 2>/dev/null | grep -q gowave-node; then
         echo "[ROLLBACK] Stopping and disabling gowave-node.service and drop-ins..." >&2
-        systemctl stop gowave-node.service 2>/dev/null || true
-        systemctl disable gowave-node.service 2>/dev/null || true
-        systemctl stop xray.service 2>/dev/null || true
-        systemctl disable xray.service 2>/dev/null || true
-        rm -rf /etc/systemd/system/gowave-node.service.d
-        rm -f /etc/systemd/system/gowave-node.service
-        rm -f /etc/systemd/system/remnanode.service
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl reset-failed 2>/dev/null || true
-        rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode
-        rm -f /usr/local/bin/gowave-node /usr/local/bin/xray
+        systemctl stop gowave-node.service 2>/dev/null || rollback_failed=1
+        systemctl disable gowave-node.service 2>/dev/null || rollback_failed=1
+        systemctl stop xray.service 2>/dev/null || rollback_failed=1
+        systemctl disable xray.service 2>/dev/null || rollback_failed=1
+        rm -rf /etc/systemd/system/gowave-node.service.d || rollback_failed=1
+        rm -f /etc/systemd/system/gowave-node.service /etc/systemd/system/remnanode.service || rollback_failed=1
+        systemctl daemon-reload 2>/dev/null || rollback_failed=1
+        rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode || rollback_failed=1
+        rm -f /usr/local/bin/gowave-node /usr/local/bin/xray || rollback_failed=1
     fi
 
     # 2. Revert NGINX and ACME bootstrap
     if [[ "${_NGINX_CONFIGS_CREATED:-0}" -eq 1 ]] || [[ "${_NGINX_BOOTSTRAP_CREATED:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Cleaning up worker NGINX virtual hosts and stream routing..." >&2
-        rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf
-        rm -f /etc/nginx/conf.d/gowave-worker-https.conf
-        rm -f /etc/nginx/conf.d/gowave-worker-decoy.conf
-        rm -f /etc/nginx/conf.d/gowave-worker-vision-fallback.conf
-        rm -f /etc/nginx/stream-enabled/gowave-worker-stream.conf
-        rollback_managed_deploy_hook "${_ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || true
-        rm -rf /var/www/gowave-acme
+        rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf /etc/nginx/conf.d/gowave-worker-https.conf /etc/nginx/conf.d/gowave-worker-decoy.conf /etc/nginx/conf.d/gowave-worker-vision-fallback.conf /etc/nginx/stream-enabled/gowave-worker-stream.conf || rollback_failed=1
+        rollback_managed_deploy_hook "${_ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || rollback_failed=1
+        rm -rf /var/www/gowave-acme || rollback_failed=1
         if [[ "${_STREAM_INCLUDE_ADDED:-0}" -eq 1 ]]; then
-            sed -i '\#stream { include /etc/nginx/stream-enabled/\*\.conf; }#d' /etc/nginx/nginx.conf 2>/dev/null || true
+            sed -i '\#stream { include /etc/nginx/stream-enabled/\*\.conf; }#d' /etc/nginx/nginx.conf 2>/dev/null || rollback_failed=1
         fi
         if nginx -t >/dev/null 2>&1; then
-            systemctl reload nginx 2>/dev/null || true
+            systemctl reload nginx 2>/dev/null || rollback_failed=1
+        else
+            rollback_failed=1
         fi
     fi
 
     # 3. Clean Cover Reality decoy site
     if [[ "${_COVER_UNPACKED:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Removing cover decoy site assets..." >&2
-        rm -rf /var/www/gowave-auto-nginx/cover-reality
-        rmdir /var/www/gowave-auto-nginx 2>/dev/null || true
+        rm -rf /var/www/gowave-auto-nginx/cover-reality || rollback_failed=1
+        if [[ -d /var/www/gowave-auto-nginx ]]; then
+            rmdir /var/www/gowave-auto-nginx 2>/dev/null || rollback_failed=1
+        fi
     fi
 
     # 4. Revert ACME certificates
     if [[ -n "${_ACME_TX_ID:-}" ]]; then
         echo "[ROLLBACK] Restoring or cleaning up ACME certificates via snapshot..." >&2
-        restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || true
-        restore_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || true
+        restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || rollback_failed=1
         if [[ -n "${VISION_DOMAIN:-}" ]]; then
-            restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || true
+            restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || rollback_failed=1
         fi
     else
         if [[ "${_ACME_WORKER_ISSUED:-0}" -eq 1 ]] && [[ -n "${WORKER_DOMAIN:-}" ]]; then
             echo "[ROLLBACK] Deleting ACME certificate for $WORKER_DOMAIN..." >&2
-            certbot delete --cert-name "$WORKER_DOMAIN" --non-interactive 2>/dev/null || true
-            rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || true
+            certbot delete --cert-name "$WORKER_DOMAIN" --non-interactive 2>/dev/null || rollback_failed=1
+            rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || rollback_failed=1
         fi
         if [[ "${_ACME_REALITY_ISSUED:-0}" -eq 1 ]] && [[ -n "${REALITY_DOMAIN:-}" ]]; then
             echo "[ROLLBACK] Deleting ACME certificate for $REALITY_DOMAIN..." >&2
-            certbot delete --cert-name "$REALITY_DOMAIN" --non-interactive 2>/dev/null || true
-            rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || true
+            certbot delete --cert-name "$REALITY_DOMAIN" --non-interactive 2>/dev/null || rollback_failed=1
+            rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || rollback_failed=1
         fi
     fi
 
@@ -1727,46 +2173,73 @@ compensate_remote_worker() {
     if [[ "${_UFW_RULES_CONFIGURED:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Reverting UFW firewall rules..." >&2
         if [[ "${_UFW_WAS_ACTIVE:-0}" -eq 0 ]]; then
-            ufw --force disable 2>/dev/null || true
+            ufw --force disable 2>/dev/null || rollback_failed=1
         else
             if [[ -n "${PANEL_IP:-}" ]]; then
-                ufw delete allow proto tcp from "$PANEL_IP" to any port "${NODE_PORT:-3002}" 2>/dev/null || true
+                ufw delete allow proto tcp from "$PANEL_IP" to any port "${NODE_PORT:-3002}" 2>/dev/null || rollback_failed=1
             fi
             if [[ -n "${PANEL_IPV6:-}" ]]; then
-                ufw delete allow proto tcp from "$PANEL_IPV6" to any port "${NODE_PORT:-3002}" 2>/dev/null || true
+                ufw delete allow proto tcp from "$PANEL_IPV6" to any port "${NODE_PORT:-3002}" 2>/dev/null || rollback_failed=1
             fi
-            ufw delete allow 80/tcp 2>/dev/null || true
-            ufw delete allow 443/tcp 2>/dev/null || true
+            ufw delete allow 80/tcp 2>/dev/null || rollback_failed=1
+            ufw delete allow 443/tcp 2>/dev/null || rollback_failed=1
         fi
     fi
 
     # 6. Revert Swap
     if [[ "${_SWAP_CREATED_BY_US:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Deactivating and removing swapfile..." >&2
-        swapoff /swapfile 2>/dev/null || true
+        local swap_is_inactive=0 active_swaps
+        if active_swaps=$(swapon --noheadings --raw --output NAME 2>/dev/null); then
+            if grep -Fxq /swapfile <<< "$active_swaps"; then
+                if swapoff /swapfile 2>/dev/null; then
+                    swap_is_inactive=1
+                else
+                    rollback_failed=1
+                fi
+            else
+                swap_is_inactive=1
+            fi
+        else
+            rollback_failed=1
+        fi
         if [[ -f /etc/fstab ]]; then
             local swap_tmp
-            swap_tmp=$(mktemp /etc/fstab.gowave.XXXXXX)
-            grep -v -E '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab > "$swap_tmp" || true
-            chmod --reference=/etc/fstab "$swap_tmp"
-            chown --reference=/etc/fstab "$swap_tmp"
-            mv -f "$swap_tmp" /etc/fstab
+            if swap_tmp=$(mktemp /etc/fstab.gowave.XXXXXX); then
+                if grep -v -E '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab > "$swap_tmp" &&
+                    chmod --reference=/etc/fstab "$swap_tmp" &&
+                    chown --reference=/etc/fstab "$swap_tmp" &&
+                    mv -f "$swap_tmp" /etc/fstab; then
+                    :
+                else
+                    rm -f "$swap_tmp"
+                    rollback_failed=1
+                fi
+            else
+                rollback_failed=1
+            fi
         fi
-        rm -f /swapfile
+        if [[ "$swap_is_inactive" -eq 1 ]]; then
+            rm -f /swapfile || rollback_failed=1
+        fi
     fi
 
     # 7. Revert Sysctl
     if [[ "${_SYSCTL_CREATED_BY_US:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Removing sysctl configuration..." >&2
-        rm -f /etc/sysctl.d/99-gowave-node.conf
-        sysctl --system 2>/dev/null || true
+        rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1
+        sysctl --system 2>/dev/null || rollback_failed=1
     fi
 
     # 8. Clean temporary files and unset secrets
     unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64
-    rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh
+    rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh || rollback_failed=1
 
-    echo "[ROLLBACK] Compensating rollback completed on worker host." >&2
+    if [[ "$rollback_failed" -ne 0 ]]; then
+        echo "[ROLLBACK] ERROR: compensating rollback incomplete; one or more cleanup operations failed." >&2
+    else
+        echo "[ROLLBACK] Compensating rollback actions completed on worker host." >&2
+    fi
     return "$exit_code"
 }
 RUNNER_FUNCS
@@ -1831,7 +2304,11 @@ main() {
         check_acme_lineage "$VISION_DOMAIN" "$effective_acme_server"
     fi
 
-    _ACME_TX_ID="worker_install_$(date +%s)"
+    _ACME_TX_ID="${ACME_TX_ID:-worker_install_$(date +%s)}"
+    if [[ ! "$_ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
+        echo "Error: Invalid Worker ACME transaction ID." >&2
+        exit 1
+    fi
     snapshot_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN"
     snapshot_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN"
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
@@ -1857,14 +2334,8 @@ main() {
 
     # Disable ERR compensation trap on verified success
     trap - ERR
-    if [[ -n "${_ACME_TX_ID:-}" ]]; then
-        cleanup_acme_snapshot "$_ACME_TX_ID" "$WORKER_DOMAIN"
-        cleanup_acme_snapshot "$_ACME_TX_ID" "$REALITY_DOMAIN"
-        if [[ -n "${VISION_DOMAIN:-}" ]]; then
-            cleanup_acme_snapshot "$_ACME_TX_ID" "$VISION_DOMAIN"
-        fi
-        cleanup_deploy_hook_manifest "$_ACME_TX_ID"
-    fi
+    # Keep the ACME before-image until the controller durably commits NODE_ADD.
+    # The controller calls remote_finalize only after that commit succeeds.
     unset _NODE_SECRET_KEY VERIFY_NODE_MTLS_B64
     echo "GoWave Edge Worker deployment complete (service, NGINX, TLS and mTLS health verified)."
 }
@@ -1908,6 +2379,11 @@ remote_rollback() {
         cat <<'ROLLBACK_REMOTE_SCRIPT'
 set -euo pipefail
 
+if [[ -n "${ACME_TX_ID:-}" && ! "$ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
+    echo "Error: Invalid Worker ACME transaction ID." >&2
+    exit 1
+fi
+
 if [[ "$(id -u)" -ne 0 ]]; then
     MUTATION_LOCK_FILE="${MUTATION_LOCK_FILE:-/tmp/gowave-managed-mutation-$(id -u).lock}"
     MUTATION_LEASE_FILE="${MUTATION_LEASE_FILE:-/tmp/gowave-mutation-lease-$(id -u).json}"
@@ -1932,40 +2408,133 @@ validate_lock_path() {
 
 acquire_mutation_lock() {
     validate_lock_path "$MUTATION_LOCK_FILE" || return 1
-    if [[ ! -f "$MUTATION_LOCK_FILE" ]]; then
-        ( umask 0177; touch "$MUTATION_LOCK_FILE" ) 2>/dev/null || true
-        chmod 0600 "$MUTATION_LOCK_FILE" 2>/dev/null || true
+    if [[ ! -e "$MUTATION_LOCK_FILE" ]]; then
+        ( umask 0177; : > "$MUTATION_LOCK_FILE" ) 2>/dev/null || {
+            echo "Error: Cannot create mutation lock file ($MUTATION_LOCK_FILE)." >&2
+            return 1
+        }
     fi
-    exec 9>>"$MUTATION_LOCK_FILE"
-    flock -n 9 || true
+    if [[ -L "$MUTATION_LOCK_FILE" || ! -f "$MUTATION_LOCK_FILE" ]]; then
+        echo "Error: Mutation lock path is not a regular file." >&2
+        return 1
+    fi
+    chmod 0600 "$MUTATION_LOCK_FILE" 2>/dev/null || {
+        echo "Error: Cannot secure mutation lock file ($MUTATION_LOCK_FILE)." >&2
+        return 1
+    }
+    exec 9>>"$MUTATION_LOCK_FILE" || return 1
+    if ! flock -n 9; then
+        echo "Error: Another process currently holds the mutation lock ($MUTATION_LOCK_FILE)." >&2
+        return 1
+    fi
     return 0
+}
+
+acquire_mutation_lock || {
+    echo "Error: Refusing remote rollback without the mutation lock." >&2
+    exit 1
 }
 
 rollback_managed_deploy_hook() {
     local transaction_id="$1"
     local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
     local recovery_root="${3:-/var/lib/gowave-auto-nginx/recovery}"
-
     if [[ -z "$transaction_id" ]]; then
+        if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            echo "Error: ACME transaction ID is missing; preserving deploy hook with unknown ownership and reporting incomplete rollback." >&2
+            return 1
+        fi
         return 0
     fi
-    local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
-    if [[ ! -f "$manifest" ]]; then
-        return 0
-    fi
-    local created_by_tx recorded_sha
-    created_by_tx=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
-    recorded_sha=$(python3 -c "import json; print(json.load(open('$manifest')).get('sha256', ''))" 2>/dev/null || echo "")
 
-    if [[ "$created_by_tx" != "1" || ! -f "$hook_file" ]]; then
+    local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
+    if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
+        if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            echo "Error: Deploy hook exists without an ownership manifest; refusing to claim rollback succeeded." >&2
+            return 1
+        fi
         return 0
     fi
-    local current_sha
-    current_sha=$(sha256sum "$hook_file" | awk '{print $1}')
-    if [[ "$current_sha" == "$recorded_sha" ]]; then
-        rm -f "$hook_file"
-        sync "$(dirname "$hook_file")"
+    if [[ ! -f "$manifest" || -L "$manifest" ]]; then
+        echo "Error: Deploy-hook rollback manifest is missing, non-regular, or a symlink." >&2
+        return 1
     fi
+
+    local manifest_data
+    manifest_data=$(python3 - "$manifest" "$transaction_id" "$hook_file" <<'PY'
+import json
+import re
+import sys
+
+path, expected_tx, expected_hook = sys.argv[1:4]
+try:
+    with open(path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict):
+        raise ValueError("manifest root must be an object")
+    if data.get("transaction_id") != expected_tx or data.get("path") != expected_hook:
+        raise ValueError("manifest transaction/path mismatch")
+    created = data.get("created_by_tx")
+    if type(created) is not bool:
+        raise ValueError("created_by_tx must be a boolean")
+    digest = data.get("sha256", "")
+    if not isinstance(digest, str):
+        raise ValueError("sha256 must be a string")
+    if created and not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("created hook digest is invalid")
+    print("1" if created else "0")
+    print(digest)
+except Exception as exc:
+    print(f"Invalid deploy-hook rollback manifest: {type(exc).__name__}", file=sys.stderr)
+    sys.exit(1)
+PY
+    ) || {
+        echo "Error: Refusing deploy-hook rollback because its ownership manifest is invalid." >&2
+        return 1
+    }
+
+    local -a manifest_fields=()
+    mapfile -t manifest_fields <<< "$manifest_data"
+    if [[ "${#manifest_fields[@]}" -ne 2 ]]; then
+        echo "Error: Deploy-hook rollback manifest has an invalid field count." >&2
+        return 1
+    fi
+    local created_by_tx="${manifest_fields[0]}"
+    local recorded_sha="${manifest_fields[1]}"
+    if [[ "$created_by_tx" != "1" ]]; then
+        return 0
+    fi
+
+    if [[ ! -e "$hook_file" && ! -L "$hook_file" ]]; then
+        return 0
+    fi
+    if [[ -L "$hook_file" ]]; then
+        echo "Warning: Deploy hook $hook_file is now a symlink; preserving modified object and reporting incomplete recovery." >&2
+        return 1
+    fi
+    if [[ ! -f "$hook_file" ]]; then
+        echo "Warning: Deploy hook $hook_file is not a regular file; preserving modified object and reporting incomplete recovery." >&2
+        return 1
+    fi
+
+    local current_sha
+    current_sha=$(sha256sum "$hook_file" | awk '{print $1}') || {
+        echo "Error: Could not verify managed deploy-hook digest." >&2
+        return 1
+    }
+    if [[ "$current_sha" != "$recorded_sha" ]]; then
+        echo "Warning: Deploy hook $hook_file was modified after installation (digest mismatch); preserving modified object and reporting incomplete recovery." >&2
+        return 1
+    fi
+
+    rm -f "$hook_file" || {
+        echo "Error: Could not remove transaction-owned deploy hook $hook_file." >&2
+        return 1
+    }
+    sync "$(dirname "$hook_file")" || {
+        echo "Error: Could not sync deploy-hook directory after rollback." >&2
+        return 1
+    }
     return 0
 }
 
@@ -1977,45 +2546,128 @@ restore_acme_lineage() {
 
     local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
     local meta_file="${snap_dir}/lineage-manifest.json"
-
-    if [[ ! -f "$meta_file" ]]; then
-        return 0
+    if [[ ! -f "$meta_file" || -L "$meta_file" ]]; then
+        echo "Error: ACME lineage manifest missing or unsafe for $domain" >&2
+        return 1
     fi
 
-    local existed
-    existed=$(python3 -c "import json; print('1' if json.load(open('$meta_file')).get('existed_before') else '0')" 2>/dev/null || echo "0")
+    local manifest_data
+    manifest_data=$(python3 - "$meta_file" "$domain" <<'PY'
+import json
+import sys
+
+path, expected_domain = sys.argv[1:3]
+try:
+    with open(path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict) or data.get("domain") != expected_domain:
+        raise ValueError("manifest root/domain mismatch")
+    existed = data.get("existed_before")
+    if type(existed) is not bool:
+        raise ValueError("existed_before must be a boolean")
+    serial = data.get("serial", "")
+    fingerprint = data.get("fingerprint", "")
+    if not isinstance(serial, str) or not isinstance(fingerprint, str):
+        raise ValueError("certificate metadata must be strings")
+    if existed and (not serial or not fingerprint):
+        raise ValueError("pre-existing lineage snapshot lacks certificate identity")
+    print("1" if existed else "0")
+    print(serial)
+    print(fingerprint)
+except Exception as exc:
+    print(f"Invalid ACME lineage manifest: {type(exc).__name__}", file=sys.stderr)
+    sys.exit(1)
+PY
+    ) || {
+        echo "Error: Refusing ACME rollback for $domain because its snapshot manifest is invalid." >&2
+        return 1
+    }
+
+    local existed serial fingerprint
+    local -a manifest_fields=()
+    mapfile -t manifest_fields <<< "$manifest_data"
+    if [[ "${#manifest_fields[@]}" -ne 3 ]]; then
+        echo "Error: ACME lineage manifest has an invalid field count for $domain." >&2
+        return 1
+    fi
+    existed="${manifest_fields[0]}"
+    serial="${manifest_fields[1]}"
+    fingerprint="${manifest_fields[2]}"
+
     local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
     local live_dir="${letsencrypt_root}/live/${domain}"
     local archive_dir="${letsencrypt_root}/archive/${domain}"
 
     if [[ "$existed" == "0" ]]; then
-        rm -f "$renewal_conf"
-        rm -rf "$live_dir" "$archive_dir"
+        rm -f "$renewal_conf" || return 1
+        rm -rf "$live_dir" "$archive_dir" || return 1
         return 0
     fi
+    if [[ "$existed" != "1" ]]; then
+        echo "Error: Invalid existed_before value for $domain." >&2
+        return 1
+    fi
 
-    mkdir -p "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir"
-    chmod 0755 "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" 2>/dev/null || true
+    mkdir -p "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" || return 1
+    chmod 0755 "${letsencrypt_root}/renewal" "$live_dir" "$archive_dir" || return 1
 
     if [[ -f "$snap_dir/renewal.conf" ]]; then
-        cp -p "$snap_dir/renewal.conf" "$renewal_conf"
+        cp -p "$snap_dir/renewal.conf" "$renewal_conf" || return 1
     fi
     if [[ -d "$snap_dir/archive" ]]; then
         local arc
         for arc in "$snap_dir/archive"/*; do
             [[ -f "$arc" ]] || continue
-            cp -p "$arc" "$archive_dir/$(basename "$arc")"
+            cp -p "$arc" "$archive_dir/$(basename "$arc")" || return 1
         done
     fi
     if [[ -d "$snap_dir/live" ]]; then
-        local f
+        local f target
         for f in cert.pem chain.pem fullchain.pem privkey.pem; do
             if [[ -f "$snap_dir/live/${f}.target" ]]; then
-                ln -sf "$(cat "$snap_dir/live/${f}.target")" "$live_dir/$f"
+                target="$(cat "$snap_dir/live/${f}.target")" || return 1
+                [[ -n "$target" && "$target" != /* ]] || {
+                    echo "Error: Unsafe ACME snapshot symlink target for $domain/$f." >&2
+                    return 1
+                }
+                local resolved_target
+                resolved_target="$(realpath -m -- "$live_dir/$target")" || return 1
+                case "$resolved_target" in
+                    "$archive_dir"/*) ;;
+                    *)
+                        echo "Error: ACME snapshot symlink target escapes the archive for $domain/$f." >&2
+                        return 1
+                        ;;
+                esac
+                ln -sf "$target" "$live_dir/$f" || return 1
             elif [[ -f "$snap_dir/live/$f" ]]; then
-                cp -p "$snap_dir/live/$f" "$live_dir/$f"
+                cp -p "$snap_dir/live/$f" "$live_dir/$f" || return 1
             fi
         done
+    fi
+
+    local fullchain="$live_dir/fullchain.pem"
+    local privkey="$live_dir/privkey.pem"
+    if [[ ! -s "$fullchain" || ! -s "$privkey" ]]; then
+        echo "Error: Restored certificate or private key missing for $domain" >&2
+        return 1
+    fi
+    openssl x509 -in "$fullchain" -noout >/dev/null 2>&1 || {
+        echo "Error: Restored certificate for $domain is invalid." >&2
+        return 1
+    }
+    local pub_from_cert pub_from_key cur_serial cur_fingerprint
+    pub_from_cert="$(openssl x509 -in "$fullchain" -noout -pubkey 2>/dev/null)" || return 1
+    pub_from_key="$(openssl pkey -in "$privkey" -pubout 2>/dev/null)" || return 1
+    if [[ -z "$pub_from_cert" || "$pub_from_cert" != "$pub_from_key" ]]; then
+        echo "Error: Restored certificate and private key do not match for $domain." >&2
+        return 1
+    fi
+    cur_serial="$(openssl x509 -in "$fullchain" -noout -serial 2>/dev/null)" || return 1
+    cur_fingerprint="$(openssl x509 -in "$fullchain" -noout -fingerprint -sha256 2>/dev/null)" || return 1
+    if [[ "$cur_serial" != "$serial" || "$cur_fingerprint" != "$fingerprint" ]]; then
+        echo "Error: Restored certificate identity does not match the ACME snapshot for $domain." >&2
+        return 1
     fi
     return 0
 }
@@ -2023,80 +2675,177 @@ restore_acme_lineage() {
 acquire_mutation_lock
 echo "Executing worker compensation teardown..." >&2
 
-# 1. Stop and disable systemd services
-systemctl stop gowave-node.service 2>/dev/null || true
-systemctl disable gowave-node.service 2>/dev/null || true
-systemctl stop xray.service 2>/dev/null || true
-systemctl disable xray.service 2>/dev/null || true
-rm -rf /etc/systemd/system/gowave-node.service.d
-rm -f /etc/systemd/system/gowave-node.service
-rm -f /etc/systemd/system/remnanode.service
-systemctl daemon-reload 2>/dev/null || true
-systemctl reset-failed 2>/dev/null || true
-rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode
-rm -f /usr/local/bin/gowave-node /usr/local/bin/xray
+rollback_failed=0
+
+# 1. Stop and disable systemd services that are actually installed or active.
+for unit in gowave-node.service xray.service; do
+    if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "^$unit" ||
+        systemctl is-active --quiet "$unit" 2>/dev/null; then
+        systemctl stop "$unit" 2>/dev/null || rollback_failed=1
+        systemctl disable "$unit" 2>/dev/null || rollback_failed=1
+    fi
+done
+rm -rf /etc/systemd/system/gowave-node.service.d || rollback_failed=1
+rm -f /etc/systemd/system/gowave-node.service /etc/systemd/system/remnanode.service || rollback_failed=1
+systemctl daemon-reload 2>/dev/null || rollback_failed=1
+rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode || rollback_failed=1
+rm -f /usr/local/bin/gowave-node /usr/local/bin/xray || rollback_failed=1
 
 # 2. Remove NGINX worker configs
-rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf
-rm -f /etc/nginx/conf.d/gowave-worker-https.conf
-rm -f /etc/nginx/conf.d/gowave-worker-decoy.conf
-rm -f /etc/nginx/conf.d/gowave-worker-vision-fallback.conf
-rm -f /etc/nginx/stream-enabled/gowave-worker-stream.conf
-rollback_managed_deploy_hook "${ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || true
-rm -rf /var/www/gowave-acme
-rm -rf /var/www/gowave-auto-nginx/cover-reality
-rmdir /var/www/gowave-auto-nginx 2>/dev/null || true
+rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf /etc/nginx/conf.d/gowave-worker-https.conf /etc/nginx/conf.d/gowave-worker-decoy.conf /etc/nginx/conf.d/gowave-worker-vision-fallback.conf /etc/nginx/stream-enabled/gowave-worker-stream.conf || rollback_failed=1
+rollback_managed_deploy_hook "${ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || rollback_failed=1
+rm -rf /var/www/gowave-acme /var/www/gowave-auto-nginx/cover-reality || rollback_failed=1
+if [[ -d /var/www/gowave-auto-nginx ]]; then
+    rmdir /var/www/gowave-auto-nginx 2>/dev/null || true
+fi
 
 # Revert stream include in nginx.conf if stream-enabled is empty
 if [[ -d /etc/nginx/stream-enabled ]] && ! ls -1 /etc/nginx/stream-enabled/*.conf >/dev/null 2>&1; then
-    sed -i '\#stream { include /etc/nginx/stream-enabled/\*\.conf; }#d' /etc/nginx/nginx.conf 2>/dev/null || true
+    sed -i '\#stream { include /etc/nginx/stream-enabled/\*\.conf; }#d' /etc/nginx/nginx.conf 2>/dev/null || rollback_failed=1
 fi
-if nginx -t >/dev/null 2>&1; then
-    systemctl reload nginx 2>/dev/null || true
+if command -v nginx >/dev/null 2>&1; then
+    if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx 2>/dev/null || rollback_failed=1
+    else
+        rollback_failed=1
+    fi
 fi
 
 # 3. Clean ACME certificates
 if [[ -n "${ACME_TX_ID:-}" ]]; then
     echo "[ROLLBACK] Restoring ACME lineages via snapshot for transaction $ACME_TX_ID..." >&2
-    restore_acme_lineage "$ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || true
-    restore_acme_lineage "$ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || true
+    restore_acme_lineage "$ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_failed=1
+    restore_acme_lineage "$ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || rollback_failed=1
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
-        restore_acme_lineage "$ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || true
+        restore_acme_lineage "$ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || rollback_failed=1
     fi
 else
-    if [[ -n "${WORKER_DOMAIN:-}" ]]; then
-        certbot delete --cert-name "$WORKER_DOMAIN" --non-interactive 2>/dev/null || true
-        rm -rf "/etc/letsencrypt/live/$WORKER_DOMAIN" "/etc/letsencrypt/archive/$WORKER_DOMAIN" "/etc/letsencrypt/renewal/$WORKER_DOMAIN.conf" 2>/dev/null || true
-    fi
-    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        certbot delete --cert-name "$REALITY_DOMAIN" --non-interactive 2>/dev/null || true
-        rm -rf "/etc/letsencrypt/live/$REALITY_DOMAIN" "/etc/letsencrypt/archive/$REALITY_DOMAIN" "/etc/letsencrypt/renewal/$REALITY_DOMAIN.conf" 2>/dev/null || true
-    fi
-    if [[ -n "${VISION_DOMAIN:-}" ]]; then
-        certbot delete --cert-name "$VISION_DOMAIN" --non-interactive 2>/dev/null || true
-        rm -rf "/etc/letsencrypt/live/$VISION_DOMAIN" "/etc/letsencrypt/archive/$VISION_DOMAIN" "/etc/letsencrypt/renewal/$VISION_DOMAIN.conf" 2>/dev/null || true
-    fi
+    # Without the original transaction ID there is no trustworthy snapshot
+    # proving which certificate lineages predate this deployment. Preserve
+    # all existing certificates rather than deleting operator-owned state.
+    for domain in "${WORKER_DOMAIN:-}" "${REALITY_DOMAIN:-}" "${VISION_DOMAIN:-}"; do
+        [[ -n "$domain" ]] || continue
+        if [[ -e "/etc/letsencrypt/live/$domain" ||
+              -e "/etc/letsencrypt/archive/$domain" ||
+              -e "/etc/letsencrypt/renewal/$domain.conf" ]]; then
+            echo "Error: ACME_TX_ID missing; preserving unknown certificate lineage for $domain." >&2
+            rollback_failed=1
+        fi
+    done
 fi
-
-# 4. Remove UFW rules added for Control Plane
+# 4. Remove UFW rules added for Control Plane. Missing rules are already clean;
+# only attempt deletion when the active ruleset confirms the exact rule exists.
 if command -v ufw >/dev/null 2>&1; then
-    if [[ -n "${PANEL_IP:-}" ]]; then
-        ufw delete allow proto tcp from "$PANEL_IP" to any port "${NODE_PORT:-3002}" 2>/dev/null || true
+    ufw_rules=$(ufw status numbered 2>/dev/null) || {
+        rollback_failed=1
+        ufw_rules=""
+    }
+    if [[ -n "${PANEL_IP:-}" ]] &&
+        awk -v port="${NODE_PORT:-3002}/tcp" -v ip="$PANEL_IP" '$3 == port && index($0, ip) > 0 { found=1 } END { exit !found }' <<< "$ufw_rules"; then
+        ufw delete allow proto tcp from "$PANEL_IP" to any port "${NODE_PORT:-3002}" 2>/dev/null || rollback_failed=1
     fi
-    if [[ -n "${PANEL_IPV6:-}" ]]; then
-        ufw delete allow proto tcp from "$PANEL_IPV6" to any port "${NODE_PORT:-3002}" 2>/dev/null || true
+    if [[ -n "${PANEL_IPV6:-}" ]] &&
+        awk -v port="${NODE_PORT:-3002}/tcp" -v ip="$PANEL_IPV6" '$3 == port && index($0, ip) > 0 { found=1 } END { exit !found }' <<< "$ufw_rules"; then
+        ufw delete allow proto tcp from "$PANEL_IPV6" to any port "${NODE_PORT:-3002}" 2>/dev/null || rollback_failed=1
     fi
-    ufw delete allow 80/tcp 2>/dev/null || true
-    ufw delete allow 443/tcp 2>/dev/null || true
+    if awk '$3 == "80/tcp" { found=1 } END { exit !found }' <<< "$ufw_rules"; then
+        ufw delete allow 80/tcp 2>/dev/null || rollback_failed=1
+    fi
+    if awk '$3 == "443/tcp" { found=1 } END { exit !found }' <<< "$ufw_rules"; then
+        ufw delete allow 443/tcp 2>/dev/null || rollback_failed=1
+    fi
+fi
+# 5. Clean sysctl and scratch
+rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1
+rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh || rollback_failed=1
+sysctl --system 2>/dev/null || rollback_failed=1
+
+# Delete the ACME snapshot only after every rollback action has succeeded.
+# Retain it on any failure so an operator can retry or inspect recovery evidence.
+if [[ -n "${ACME_TX_ID:-}" && "$rollback_failed" -eq 0 ]]; then
+    if [[ ! "$ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]] ||
+        [[ -L /var/lib/gowave-auto-nginx || -L /var/lib/gowave-auto-nginx/recovery ||
+           -L "/var/lib/gowave-auto-nginx/recovery/$ACME_TX_ID" ]]; then
+        rollback_failed=1
+    else
+        rm -rf -- "/var/lib/gowave-auto-nginx/recovery/$ACME_TX_ID" || rollback_failed=1
+    fi
 fi
 
-# 5. Clean sysctl and scratch
-rm -f /etc/sysctl.d/99-gowave-node.conf
-rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh
-sysctl --system 2>/dev/null || true
-
+if [[ "$rollback_failed" -ne 0 ]]; then
+    echo "Error: Remote worker compensation teardown incomplete; one or more cleanup or restoration operations failed." >&2
+    exit 1
+fi
 echo "Remote worker compensation teardown finished." >&2
 ROLLBACK_REMOTE_SCRIPT
+    } | ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" -o ServerAliveInterval=15 -p "$port" "${ssh_user}@${host}" 'bash -s'
+}
+
+remote_finalize() {
+    local host="${1}"
+    local port="${2:-22}"
+    local ssh_user="${3:-root}"
+    local acme_tx_id="${ACME_TX_ID:-}"
+    local known_hosts="${SSH_KNOWN_HOSTS:-/root/.ssh/known_hosts}"
+    if [[ ! "$acme_tx_id" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
+        log_err "A valid Worker ACME transaction ID is required for finalization."
+        return 1
+    fi
+    local host_key="$host"
+    if [[ "$port" != "22" ]]; then
+        host_key="[$host]:$port"
+    fi
+    if [[ ! -s "$known_hosts" ]] || ! ssh-keygen -F "$host_key" -f "$known_hosts" >/dev/null 2>&1; then
+        log_err "SSH host key for $host_key is not pre-pinned in $known_hosts."
+        return 1
+    fi
+
+    {
+        printf 'export ACME_TX_ID=%q\n' "$acme_tx_id"
+        cat <<'FINALIZE_REMOTE_SCRIPT'
+set -euo pipefail
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "Error: Worker snapshot finalization requires root." >&2
+    exit 1
+fi
+if [[ ! "$ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
+    echo "Error: Invalid Worker ACME transaction ID." >&2
+    exit 1
+fi
+recovery_root="/var/lib/gowave-auto-nginx/recovery"
+transaction_dir="$recovery_root/$ACME_TX_ID"
+for path in /var/lib/gowave-auto-nginx "$recovery_root" "$transaction_dir"; do
+    if [[ -L "$path" ]]; then
+        echo "Error: Refusing to finalize a symlinked recovery path." >&2
+        exit 1
+    fi
+done
+if [[ ! -e "$transaction_dir" ]]; then
+    echo "Worker ACME snapshot is already absent." >&2
+    exit 0
+fi
+if [[ ! -d "$transaction_dir" ]]; then
+    echo "Error: Worker ACME snapshot path is not a directory." >&2
+    exit 1
+fi
+lock_dir="/run/lock"
+lock_file="$lock_dir/gowave-managed-mutation.lock"
+if [[ -L "$lock_dir" || -L "$lock_file" ||
+      ( -e "$lock_file" && ! -f "$lock_file" ) ]]; then
+    echo "Error: Mutation lock path is unsafe." >&2
+    exit 1
+fi
+mkdir -p "$lock_dir"
+( umask 077; : >> "$lock_file" )
+chmod 0600 "$lock_file"
+exec 9>>"$lock_file"
+if ! flock -n 9; then
+    echo "Error: Another process currently holds the mutation lock." >&2
+    exit 1
+fi
+rm -rf -- "$transaction_dir"
+echo "Worker ACME recovery snapshot finalized." >&2
+FINALIZE_REMOTE_SCRIPT
     } | ssh -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$known_hosts" -o ServerAliveInterval=15 -p "$port" "${ssh_user}@${host}" 'bash -s'
 }
 
@@ -2113,8 +2862,12 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
             shift
             remote_rollback "$@"
             ;;
+        remote_finalize)
+            shift
+            remote_finalize "$@"
+            ;;
         *)
-            echo "Usage: gowave-node-auto.sh <pack-cover|remote_payload|remote_rollback> [args]"
+            echo "Usage: gowave-node-auto.sh <pack-cover|remote_payload|remote_rollback|remote_finalize> [args]"
             exit 1
             ;;
     esac

@@ -2,17 +2,17 @@
 """Regression test suite for Decisions D18-D21 (Task 10.10, Task 9.7, Task 8.8, Task 1.9, Task 1.10).
 
 Verifies:
-1. D18: Concurrent ordinary lifecycle & backup commands blocked by held mutation lock; re-entrant stdin lease valid; stale/replayed lease rejected.
-2. D19: Pre-existing Worker sentinels (sysctl, unit, binaries, hook) rejected; package residuals under PRESERVE reported without claiming OS restore.
-3. D20: Signal safety (HUP/INT/TERM), SIGKILL uncommitted journal recovery, per-step rollback failure reporting, dual Worker + API check in orchestrator.
-4. D21: Published AAAA behavior in both IPv6 modes (reject when disabled, exact match when enabled).
-5. Task 9.7: Lock lease invalid after holder loss; competing controller winning lock forces TEARDOWN_FAILED.
+1. D18: Concurrent mutation commands are blocked; authorized re-entrant leases work; stale leases are rejected.
+2. D19: Pre-existing Worker sentinels and unowned deploy hooks are rejected; PRESERVE is not misreported as baseline restoration.
+3. D20: Worker signal traps are present and uncommitted transaction journals can be reconciled.
+4. D21: Published AAAA behavior is checked in both IPv6 modes.
+5. Task 9.7: Dead-holder lease replay is rejected; a competing controller prevents false teardown success.
 """
 from __future__ import annotations
 
 import json
 import os
-import signal
+import shlex
 import subprocess
 import tempfile
 import time
@@ -36,8 +36,51 @@ NGINX_SH = str(REPO_ROOT / "modules" / "nginx.sh")
 NODE_AUTO_SH = str(REPO_ROOT / "gowave-node-auto.sh")
 
 
+def _wait_for_file(path: Path, process: subprocess.Popen, timeout: float = 5.0) -> None:
+    """Wait for a child-process readiness marker without relying on scheduler sleeps."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.is_file():
+            return
+        return_code = process.poll()
+        if return_code is not None:
+            raise AssertionError(f"lock holder exited before readiness (exit={return_code})")
+        time.sleep(0.01)
+    try:
+        process.terminate()
+        process.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        process.kill()
+        process.wait()
+    raise AssertionError(f"lock holder did not become ready within {timeout:.1f}s")
+
+
+def _start_lock_holder(
+    lock_file: Path,
+    lease_file: Path,
+    ready_file: Path,
+    before_ready: str = "",
+) -> subprocess.Popen:
+    """Acquire the mutation lock, publish readiness, and clean up the sleeper on TERM."""
+    setup = f"{before_ready} || exit; " if before_ready else ""
+    script = (
+        f"source {shlex.quote(LOCK_SH)} && "
+        f"MUTATION_LOCK_FILE={shlex.quote(str(lock_file))} "
+        f"MUTATION_LEASE_FILE={shlex.quote(str(lease_file))} "
+        f"acquire_mutation_lock || exit; "
+        f"{setup}"
+        "sleep 30 & child=$!; "
+        "trap 'kill \"$child\" 2>/dev/null || true; "
+        "wait \"$child\" 2>/dev/null || true; exit 0' TERM INT; "
+        f"touch {shlex.quote(str(ready_file))}; wait \"$child\""
+    )
+    process = subprocess.Popen(["bash", "-c", script])
+    _wait_for_file(ready_file, process)
+    return process
+
+
 class TestD18D21RegressionSuite(unittest.TestCase):
-    """End-to-end regression tests for D18-D21 requirements."""
+    """Regression tests for D18-D21 lifecycle and safety requirements."""
 
     # --------------------------------------------------------------------------
     # D18: Shared Mutation Lock, Re-entrant Lease, Stale Lease & Replay Rejection
@@ -50,11 +93,8 @@ class TestD18D21RegressionSuite(unittest.TestCase):
             lock_file = tmp / "mutation.lock"
             lease_file = tmp / "lease.json"
 
-            # Holder process acquires lock and sleeps
-            holder = subprocess.Popen(
-                ["bash", "-c", f'source "{LOCK_SH}" && MUTATION_LOCK_FILE="{lock_file}" MUTATION_LEASE_FILE="{lease_file}" acquire_mutation_lock && sleep 5']
-            )
-            time.sleep(0.3)
+            ready_file = tmp / "holder.ready"
+            holder = _start_lock_holder(lock_file, lease_file, ready_file)
             try:
                 # Concurrent process tries to acquire lock without lease
                 cmd = f'source "{LOCK_SH}" && MUTATION_LOCK_FILE="{lock_file}" MUTATION_LEASE_FILE="{lease_file}" acquire_mutation_lock'
@@ -72,22 +112,17 @@ class TestD18D21RegressionSuite(unittest.TestCase):
             lock_file = tmp / "mutation.lock"
             lease_file = tmp / "lease.json"
 
-            # Holder process acquires lock, writes lease JSON, and sleeps
-            holder_script = f'''
-            source "{LOCK_SH}"
-            MUTATION_LOCK_FILE="{lock_file}"
-            MUTATION_LEASE_FILE="{lease_file}"
-            acquire_mutation_lock
-            python3 -c '
-import json, os, sys
-data = {{"lease_token": "valid-token-123", "holder_pid": os.getppid()}}
-with open("{lease_file}", "w") as f:
-    json.dump(data, f)
-'
-            sleep 5
-            '''
-            holder = subprocess.Popen(["bash", "-c", holder_script])
-            time.sleep(0.4)
+            # The holder writes the lease and readiness marker after lock acquisition.
+            ready_file = tmp / "holder.ready"
+            lease_writer = (
+                "import json, os; "
+                f"open({str(lease_file)!r}, 'w').write(json.dumps("
+                "{'lease_token': 'valid-token-123', 'holder_pid': os.getppid()}))"
+            )
+            holder = _start_lock_holder(
+                lock_file, lease_file, ready_file,
+                before_ready=f"python3 -c {shlex.quote(lease_writer)}",
+            )
             try:
                 # Child delivers matching token on stdin
                 cmd = f'source "{LOCK_SH}" && MUTATION_LOCK_FILE="{lock_file}" MUTATION_LEASE_FILE="{lease_file}" acquire_mutation_lock'
@@ -104,18 +139,75 @@ with open("{lease_file}", "w") as f:
                 holder.terminate()
                 holder.wait()
 
+    def test_task_9_7_boolean_holder_pid_is_rejected(self):
+        """JSON booleans must not pass the integer PID check for a mutation lease."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_file = tmp / "mutation.lock"
+            lease_file = tmp / "lease.json"
+            ready_file = tmp / "holder.ready"
+            holder = _start_lock_holder(lock_file, lease_file, ready_file)
+            try:
+                lease_file.write_text(json.dumps({
+                    "lease_token": "boolean-pid-token",
+                    "holder_pid": True,
+                }))
+                cmd = (
+                    f'source "{LOCK_SH}" && '
+                    f'MUTATION_LOCK_FILE="{lock_file}" '
+                    f'MUTATION_LEASE_FILE="{lease_file}" acquire_mutation_lock'
+                )
+                result = subprocess.run(
+                    ["bash", "-c", cmd],
+                    input="GOWAVE_LEASE: boolean-pid-token\n",
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Invalid or stale mutation lock lease provided", result.stderr)
+            finally:
+                holder.terminate()
+                holder.wait()
+
+    def test_task_9_7_live_pid_without_lock_fd_is_rejected(self):
+        """A live PID is insufficient: its process must own the canonical lock descriptor."""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            lock_file = tmp / "mutation.lock"
+            lease_file = tmp / "lease.json"
+            ready_file = tmp / "holder.ready"
+            holder = _start_lock_holder(lock_file, lease_file, ready_file)
+            try:
+                lease_file.write_text(json.dumps({
+                    "lease_token": "wrong-owner-token",
+                    "holder_pid": os.getpid(),
+                }))
+                cmd = (
+                    f'source "{LOCK_SH}" && '
+                    f'MUTATION_LOCK_FILE="{lock_file}" '
+                    f'MUTATION_LEASE_FILE="{lease_file}" acquire_mutation_lock'
+                )
+                result = subprocess.run(
+                    ["bash", "-c", cmd],
+                    input="GOWAVE_LEASE: wrong-owner-token\n",
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Invalid or stale mutation lock lease provided", result.stderr)
+            finally:
+                holder.terminate()
+                holder.wait()
+
     def test_task_9_7_stale_lease_rejected_after_holder_termination(self):
-        """Replay of lease after holder process exits must fail when lock is held (Task 9.7)."""
+        """A lease with a non-live holder PID is rejected while the lock is held (Task 9.7)."""
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             lock_file = tmp / "mutation.lock"
             lease_file = tmp / "lease.json"
 
-            # Start a holder process to hold the lock
-            holder = subprocess.Popen(
-                ["bash", "-c", f'source "{LOCK_SH}" && MUTATION_LOCK_FILE="{lock_file}" MUTATION_LEASE_FILE="{lease_file}" acquire_mutation_lock && sleep 5']
-            )
-            time.sleep(0.3)
+            ready_file = tmp / "holder.ready"
+            holder = _start_lock_holder(lock_file, lease_file, ready_file)
             try:
                 # Write a stale lease with dead PID
                 stale_lease_data = {
@@ -138,36 +230,41 @@ with open("{lease_file}", "w") as f:
     # --------------------------------------------------------------------------
 
     def test_d19_worker_sentinels_rejected_by_disposable_gate(self):
-        """Disposable gate rejects pre-existing Worker sysctl, binary, or service sentinels."""
-        # 1. Sysctl sentinel
-        baseline_sysctl = {
-            "existing_gowave_dirs": ["/etc/sysctl.d/99-gowave-node.conf"],
-            "running_services": [],
-            "listening_ports": [],
-        }
-        ok, reason = check_disposable_gate(baseline_sysctl)
-        self.assertFalse(ok)
-        self.assertIn("Pre-existing GoWave", str(reason))
-
-        # 2. Binary sentinel
-        baseline_bin = {
-            "existing_gowave_dirs": ["/usr/local/bin/gowave-node"],
-            "running_services": [],
-            "listening_ports": [],
-        }
-        ok_bin, reason_bin = check_disposable_gate(baseline_bin)
-        self.assertFalse(ok_bin)
-        self.assertIn("Pre-existing GoWave", str(reason_bin))
-
-        # 3. Running service sentinel
-        baseline_svc = {
-            "existing_gowave_dirs": [],
-            "running_services": ["gowave-node.service"],
-            "listening_ports": [],
-        }
-        ok_svc, reason_svc = check_disposable_gate(baseline_svc)
-        self.assertFalse(ok_svc)
-        self.assertIn("gowave-node.service", str(reason_svc))
+        """Each pre-existing GoWave-owned path or service blocks disposable eligibility."""
+        sentinels = (
+            (
+                "sysctl configuration",
+                {
+                    "existing_gowave_dirs": ["/etc/sysctl.d/99-gowave-node.conf"],
+                    "running_services": [],
+                    "listening_ports": [],
+                },
+                "Pre-existing GoWave",
+            ),
+            (
+                "worker binary",
+                {
+                    "existing_gowave_dirs": ["/usr/local/bin/gowave-node"],
+                    "running_services": [],
+                    "listening_ports": [],
+                },
+                "Pre-existing GoWave",
+            ),
+            (
+                "worker service",
+                {
+                    "existing_gowave_dirs": [],
+                    "running_services": ["gowave-node.service"],
+                    "listening_ports": [],
+                },
+                "gowave-node.service",
+            ),
+        )
+        for label, baseline, expected_reason in sentinels:
+            with self.subTest(sentinel=label):
+                eligible, reasons = check_disposable_gate(baseline)
+                self.assertFalse(eligible)
+                self.assertIn(expected_reason, str(reasons))
 
     def test_d19_preexisting_deploy_hook_sentinel_fails_closed(self):
         """Pre-existing unowned deploy hook sentinel blocks installation (Task 1.8)."""
@@ -204,20 +301,24 @@ with open("{lease_file}", "w") as f:
         self.assertIn("trap 'handle_signal HUP' HUP", node_script)
         self.assertIn("trap 'handle_signal INT' INT", node_script)
         self.assertIn("trap 'handle_signal TERM' TERM", node_script)
+        self.assertIn(
+            """trap 'exit_code=$?; compensate_remote_worker "$exit_code"; exit "$exit_code"' ERR""",
+            node_script,
+        )
+        self.assertIn("trap 'cleanup_temp_and_secrets' EXIT", node_script)
+        self.assertIn('if [[ "${_COMPENSATED:-0}" -eq 0 ]]; then', node_script)
         self.assertIn("compensate_remote_worker", node_script)
 
-    def test_d20_sigkill_journal_recovery_reconciles_uncommitted_state(self):
-        """SIGKILL recovery: uncommitted transaction journal is reconciled before new work."""
+    def test_d20_empty_applying_journal_requires_operator_recovery(self):
+        """An empty APPLYING ledger is ambiguous and must not be reported as rolled back."""
+
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             journal_file = tmp / "journal.json"
             state_file = tmp / "state.json"
-            creds_file = tmp / "credentials.txt"
-            creds_file.write_text("ADMIN_USERNAME=admin\nADMIN_PASSWORD=pass\n")
-
             # Simulate uncommitted PROVISION_APPLYING state with valid timestamp
             journal_data = {
-                "transaction_id": "tx-sigkill-1",
+                "transaction_id": "tx-uncommitted-1",
                 "op": "provision",
                 "state": "PROVISION_APPLYING",
                 "timestamp": "2026-11-09T08:00:00+00:00",
@@ -230,39 +331,13 @@ with open("{lease_file}", "w") as f:
 
             # rollback_provisioning reconciles uncommitted journal
             ok = rollback_provisioning(
-                str(journal_file), str(state_file), str(creds_file),
+                str(journal_file), str(state_file),
                 base_url="http://127.0.0.1:9999"
             )
-            self.assertTrue(ok)
+            self.assertFalse(ok)
             updated_journal = json.loads(journal_file.read_text())
-            self.assertEqual(updated_journal["state"], "PROVISION_ROLLED_BACK")
-
-    def test_d20_orchestrator_checks_both_worker_and_api_rollback_results(self):
-        """Master orchestrator requires both remote Worker and Panel API rollback to succeed."""
-        def evaluate_dual_rollback(remote_rb_rc: int, api_rb_ok: bool) -> tuple[str, bool]:
-            if remote_rb_rc != 0 or not api_rb_ok:
-                return "INCOMPLETE", False
-            return "PASS", True
-
-        # Case 1: Remote fails, API succeeds -> INCOMPLETE
-        status, ok = evaluate_dual_rollback(remote_rb_rc=1, api_rb_ok=True)
-        self.assertEqual(status, "INCOMPLETE")
-        self.assertFalse(ok)
-
-        # Case 2: Remote succeeds, API fails -> INCOMPLETE
-        status, ok = evaluate_dual_rollback(remote_rb_rc=0, api_rb_ok=False)
-        self.assertEqual(status, "INCOMPLETE")
-        self.assertFalse(ok)
-
-        # Case 3: Both fail -> INCOMPLETE
-        status, ok = evaluate_dual_rollback(remote_rb_rc=1, api_rb_ok=False)
-        self.assertEqual(status, "INCOMPLETE")
-        self.assertFalse(ok)
-
-        # Case 4: Both succeed -> PASS
-        status, ok = evaluate_dual_rollback(remote_rb_rc=0, api_rb_ok=True)
-        self.assertEqual(status, "PASS")
-        self.assertTrue(ok)
+            self.assertEqual(updated_journal["state"], "PROVISION_ROLLBACK_REQUIRED")
+            self.assertIn("API side effects may exist", updated_journal["rollback_error"])
 
     # --------------------------------------------------------------------------
     # D21: Published AAAA Behavior in Both IPv6 Modes

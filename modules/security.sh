@@ -239,31 +239,28 @@ EOF
 
     # Record congestionControl in state_file if directory exists
     if [[ -d "$(dirname "$state_file")" ]]; then
-        python3 -c "
-import json, os
-path = '$state_file'
-data = {'schemaVersion': 2}
+        local module_root
+        module_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)" || return 1
+        python3 - "$state_file" "$selected_cc" "$module_root" <<'PY' || return 1
+import json
+import os
+import sys
+
+path, selected_cc, module_root = sys.argv[1:4]
+sys.path.insert(0, module_root)
+from modules.api_client import atomic_write_state
+
 if os.path.exists(path):
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except Exception:
-        pass
-data['schemaVersion'] = 2
-data['congestionControl'] = '$selected_cc'
-tmp_path = path + '.tmp'
-with open(tmp_path, 'w') as f:
-    json.dump(data, f, indent=2)
-    f.flush()
-    os.fsync(f.fileno())
-os.chmod(tmp_path, 0o600)
-os.replace(tmp_path, path)
-dir_fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_DIRECTORY)
-try:
-    os.fsync(dir_fd)
-finally:
-    os.close(dir_fd)
-"
+    with open(path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict):
+        raise ValueError("state.json root must be a JSON object")
+else:
+    data = {}
+
+data["congestionControl"] = selected_cc
+atomic_write_state(data, path)
+PY
     fi
 }
 

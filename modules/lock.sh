@@ -75,7 +75,7 @@ holder_pid = data.get("holder_pid")
 if not expected_token or expected_token != token:
     sys.exit(1)
 
-if not holder_pid or not isinstance(holder_pid, int):
+if type(holder_pid) is not int or holder_pid <= 0:
     sys.exit(1)
 
 try:
@@ -84,22 +84,25 @@ except OSError:
     sys.exit(1)
 
 fd_dir = f"/proc/{holder_pid}/fd"
-if os.path.exists(fd_dir):
-    try:
-        real_lock = os.path.realpath(lock_path)
-        has_fd = False
-        for fd in os.listdir(fd_dir):
-            try:
-                target = os.path.realpath(os.path.join(fd_dir, fd))
-                if target == real_lock:
-                    has_fd = True
-                    break
-            except Exception:
-                continue
-        if not has_fd:
-            sys.exit(1)
-    except Exception:
-        pass
+try:
+    if not os.path.isdir(fd_dir):
+        sys.exit(1)
+    lock_stat = os.stat(lock_path)
+    has_fd = False
+    for fd in os.listdir(fd_dir):
+        try:
+            fd_path = os.path.join(fd_dir, fd)
+            fd_stat = os.stat(fd_path)
+            if (fd_stat.st_dev, fd_stat.st_ino) == (lock_stat.st_dev, lock_stat.st_ino):
+                has_fd = True
+                break
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            # A descriptor may close while it is being inspected; keep checking.
+            continue
+    if not has_fd:
+        sys.exit(1)
+except (OSError, PermissionError):
+    sys.exit(1)
 
 sys.exit(0)
 PY

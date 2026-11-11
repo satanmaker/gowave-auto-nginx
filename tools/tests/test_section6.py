@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import ssl
 import unittest
 from pathlib import Path
@@ -21,9 +22,15 @@ from live_vps.subscriptions import (
 from live_vps.firewall import probe_tcp_port, verify_master_firewall, verify_worker_firewall
 from live_vps.nginx import verify_nginx_config_syntax, verify_reality_decoy_fallback
 from live_vps.mtls import verify_worker_mtls
+from live_vps.redaction import clear_secrets
 
 
 class TestSection6Modules(unittest.TestCase):
+    def setUp(self):
+        clear_secrets()
+
+    def tearDown(self):
+        clear_secrets()
     def test_subscriptions_short_uuid_redaction(self):
         panel_client = MagicMock()
         panel_client.get_user_by_username.return_value = {"shortUuid": "secret-short-uuid-1234"}
@@ -195,11 +202,32 @@ rules:
         self.assertTrue(ok, res)
         self.assertEqual(res["reality_fingerprint"], "firefox")
 
-    def test_firewall_probe_tcp(self):
-        # Probing an unassigned high port on 127.0.0.1 should refuse or timeout
-        ok, reason = probe_tcp_port("127.0.0.1", 59999, timeout=0.1)
+    @patch("live_vps.firewall.socket.create_connection")
+    def test_firewall_probe_tcp_classifies_connection_outcomes(self, create_connection):
+        create_connection.side_effect = ConnectionRefusedError
+        self.assertEqual(
+            probe_tcp_port("192.0.2.10", 59999, timeout=0.1),
+            (False, "REFUSED"),
+        )
+
+        create_connection.side_effect = socket.timeout
+        self.assertEqual(
+            probe_tcp_port("192.0.2.10", 59999, timeout=0.1),
+            (False, "TIMEOUT"),
+        )
+
+        create_connection.side_effect = OSError("network unreachable")
+        ok, reason = probe_tcp_port("192.0.2.10", 59999, timeout=0.1)
         self.assertFalse(ok)
-        self.assertTrue("REFUSED" in reason or "TIMEOUT" in reason or "ERROR" in reason)
+        self.assertEqual(reason, "ERROR_OSError")
+
+        create_connection.side_effect = None
+        create_connection.return_value.__enter__.return_value = MagicMock()
+        self.assertEqual(
+            probe_tcp_port("192.0.2.10", 59999, timeout=0.1),
+            (True, "CONNECTED"),
+        )
+        self.assertEqual(create_connection.call_count, 4)
 
     def test_firewall_vantage_overlap_incomplete(self):
         master_ssh = MagicMock()
