@@ -257,6 +257,41 @@ class TestBackupFormatV1(unittest.TestCase):
             self.assertEqual(jdata.get("op"), "restore")
             self.assertEqual(jdata.get("state"), "COMMITTED")
 
+    def test_sqlite_preflight_runs_as_service_user_when_requested(self):
+        """Root preflight must not open the service DB with O_CREAT (fs.protected_regular)."""
+        import sys
+        from unittest.mock import patch
+
+        sys.path.insert(0, str(REPO_ROOT))
+        from modules import recovery
+
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with patch.object(recovery, "_service_user_exists", return_value=True), \
+                patch.object(recovery.subprocess, "run", return_value=completed) as run_mock:
+            recovery.sqlite_preflight_checkpoint(Path("/opt/gowave/gowave.db"), "gowave")
+
+        argv = run_mock.call_args[0][0]
+        self.assertEqual(argv[:5], ["runuser", "-u", "gowave", "--", "python3"])
+        self.assertEqual(argv[5], "-c")
+        self.assertIn("wal_checkpoint", argv[6])
+        self.assertEqual(argv[7], "/opt/gowave/gowave.db")
+
+    def test_sqlite_preflight_reports_service_user_failure(self):
+        import sys
+        from unittest.mock import patch
+
+        sys.path.insert(0, str(REPO_ROOT))
+        from modules import recovery
+
+        failed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="attempt to write a readonly database"
+        )
+        with patch.object(recovery, "_service_user_exists", return_value=True), \
+                patch.object(recovery.subprocess, "run", return_value=failed):
+            with self.assertRaises(ValueError) as ctx:
+                recovery.sqlite_preflight_checkpoint(Path("/opt/gowave/gowave.db"), "gowave")
+        self.assertIn("readonly", str(ctx.exception))
+
 
 def io_bytes(b):
     import io
