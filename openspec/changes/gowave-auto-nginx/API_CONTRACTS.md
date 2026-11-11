@@ -143,7 +143,7 @@ The request payload for `POST /api/hosts` MUST strictly follow this exact struct
   "path": null,
   "host": null,
   "alpn": "h2,http/1.1",
-  "fingerprint": "firefox",
+  "fingerprint": "chrome",
   "securityLayer": "DEFAULT",
   "internalSquads": {
     "mode": "ALLOW_ONLY",
@@ -167,7 +167,7 @@ The request payload for `POST /api/hosts` MUST strictly follow this exact struct
 | `path` | `null` | `null` | `"/xhttp-down/"` | `"/ws"` | `"trojan-grpc"` |
 | `host` | `null` | `null` | `"<panel_or_worker_domain>"` | `"<panel_or_worker_domain>"` | `null` |
 | `alpn` | `"h2,http/1.1"` | `"http/1.1"` | `"h2,http/1.1"` | `"http/1.1"` | `"h2"` |
-| `fingerprint`| `"firefox"` | `"firefox"` | `"firefox"` | `"firefox"` | `"firefox"` |
+| `fingerprint`| `"chrome"` | `"firefox"` | `"firefox"` | `"firefox"` | `"firefox"` |
 | `securityLayer` | `"DEFAULT"` | `"TLS"` | `"TLS"` | `"TLS"` | `"TLS"` |
 | `nodes` | `["<node-uuid>"]` | `["<node-uuid>"]` | `["<node-uuid>"]` | `["<node-uuid>"]` | `["<node-uuid>"]` |
 | `internalSquads` | `{"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}` | `{"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}` | `{"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}` | `{"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}` | `{"mode": "ALLOW_ONLY", "squads": ["<squad-uuid>"]}` |

@@ -19,6 +19,7 @@ from modules.api_client import (
     rollback_provisioning,
     mihomo_x25519_enabled,
     parse_core_version,
+    reality_fingerprint,
     _extract_list,
 )
 
@@ -294,9 +295,12 @@ class TestAPIClient(unittest.TestCase):
         hosts = self.client.provision_hosts(prof_uuid, inbounds, node_uuid, squad_uuid, "vpn.example.com", "cdn.example.com")
         self.assertEqual(len(hosts), 4)
 
-        # Check that all hosts strictly use firefox fingerprint
-        for h in MockGoWaveServer.hosts.values():
-            self.assertEqual(h.get("fingerprint"), "firefox")
+        # REALITY uses the mihomo-compatible fingerprint; other hosts stay on firefox
+        fps = {h.get("remark"): h.get("fingerprint") for h in MockGoWaveServer.hosts.values()}
+        self.assertEqual(fps["VLESS-REALITY-Vision@local-node"], "chrome")
+        for remark, fp in fps.items():
+            if remark != "VLESS-REALITY-Vision@local-node":
+                self.assertEqual(fp, "firefox")
 
         # 7. Provision User
         short_uuid = self.client.provision_user("default-user", squad_uuid)
@@ -330,8 +334,11 @@ class TestAPIClient(unittest.TestCase):
         self.assertEqual(len(hosts), 5)
         remarks = {MockGoWaveServer.hosts[h].get("remark") for h in hosts}
         self.assertIn("VLESS-Vision-TLS@vision-node", remarks)
-        for h in hosts:
-            self.assertEqual(MockGoWaveServer.hosts[h].get("fingerprint"), "firefox")
+        fps = {MockGoWaveServer.hosts[h].get("remark"): MockGoWaveServer.hosts[h].get("fingerprint") for h in hosts}
+        self.assertEqual(fps["VLESS-REALITY-Vision@vision-node"], "chrome")
+        for remark, fp in fps.items():
+            if remark != "VLESS-REALITY-Vision@vision-node":
+                self.assertEqual(fp, "firefox")
 
     def test_provision_hosts_idempotent_patch(self):
         """Re-provisioning existing hosts must execute PATCH /api/hosts with uuid in body without 405 error."""
@@ -378,6 +385,20 @@ class TestAPIClient(unittest.TestCase):
             self.assertTrue(mihomo_x25519_enabled())
         with patch.dict(os.environ, {"XRAY_SERVER_VERSION": "26.11.9", "GOWAVE_MIHOMO_X25519": "0"}, clear=False):
             self.assertFalse(mihomo_x25519_enabled())
+
+    def test_reality_fingerprint_defaults_to_chrome(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GOWAVE_REALITY_FINGERPRINT", None)
+            self.assertEqual(reality_fingerprint(), "chrome")
+
+    def test_reality_fingerprint_env_override_is_normalized(self):
+        with patch.dict(os.environ, {"GOWAVE_REALITY_FINGERPRINT": "Firefox"}, clear=False):
+            self.assertEqual(reality_fingerprint(), "firefox")
+
+    def test_reality_fingerprint_rejects_unknown_preset(self):
+        with patch.dict(os.environ, {"GOWAVE_REALITY_FINGERPRINT": "opera"}, clear=False):
+            with self.assertRaises(ValueError):
+                reality_fingerprint()
 
     def test_reality_host_advertises_mihomo_x25519_hybrid(self):
         """REALITY hosts must carry mihomoX25519 so Mihomo sends an X25519MLKEM768 key share."""

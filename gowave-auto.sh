@@ -317,6 +317,7 @@ PY
     if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
         XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
         GOWAVE_MIHOMO_X25519="${GOWAVE_MIHOMO_X25519:-}" \
+        GOWAVE_REALITY_FINGERPRINT="${GOWAVE_REALITY_FINGERPRINT:-}" \
         python3 - \
         "$SCRIPT_DIR" "$panel_domain" "$reality_domain" "$admin_user" \
         "$JOURNAL_FILE" "$STATE_FILE" "$CREDENTIALS_FILE" "$vision_domain" 3<<< "$admin_pass" <<'PY'
@@ -562,6 +563,7 @@ PY
             if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
                 XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
                 GOWAVE_MIHOMO_X25519="${GOWAVE_MIHOMO_X25519:-}" \
+                GOWAVE_REALITY_FINGERPRINT="${GOWAVE_REALITY_FINGERPRINT:-}" \
                 python3 - \
                 "$SCRIPT_DIR" "$name" "$ip" "$worker_domain" "$reality_domain" \
                 "$node_port" "$admin_user" "$JOURNAL_FILE" "$STATE_FILE" "$vision_domain" 3<<< "$admin_pass" <<'PY'
