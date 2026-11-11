@@ -190,6 +190,13 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
         )
         self.assertEqual(status, "INCOMPLETE")
 
+    def test_traffic_phase_uses_target_reported_control_address(self):
+        # A public echo service reports a carrier-NAT address that never reaches the VPS,
+        # so the traffic phase must resolve the source from the targets' SSH sessions.
+        source = (REPO_ROOT / "tools" / "test_live_vps.py").read_text(encoding="utf-8")
+        self.assertIn("resolve_attribution_source(master_ssh, worker_ssh)", source)
+        self.assertNotIn("control_egress_ip", source)
+
     def test_report_builder_fails_closed_on_missing_phase_and_case_status(self):
         cases = build_test_cases_from_state({
             "results": {
