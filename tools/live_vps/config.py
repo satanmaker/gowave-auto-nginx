@@ -304,9 +304,9 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
             raise ValueError(f"{version_key} must be an explicit pinned version/tag, not a floating channel.")
         parsed[version_key] = version_value
 
-    # REALITY Host fingerprint. Upstream mihomo only authenticates REALITY with
-    # the chrome uTLS preset, so this must match what the installer provisions.
-    reality_fp = (raw_pairs.get("REALITY_FINGERPRINT", "chrome").strip().lower() or "chrome")
+    # REALITY Host fingerprint. Defaults to firefox and must match what the
+    # installer provisions; any supported uTLS preset can be pinned explicitly.
+    reality_fp = (raw_pairs.get("REALITY_FINGERPRINT", "firefox").strip().lower() or "firefox")
     if reality_fp not in REALITY_FINGERPRINTS:
         raise ValueError(
             f"Invalid REALITY_FINGERPRINT: '{reality_fp}'. "

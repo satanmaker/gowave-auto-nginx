@@ -406,7 +406,7 @@ correctness, Internal Squad membership by set equality, and all Host record fiel
 - **GIVEN** Master installed and Worker deployed on a clean test environment
 - **WHEN** runner queries `GET /api/hosts`
 - **THEN** exactly eight (or ten when both Vision domains are configured) Host records exist; four (or five) reference `local-node` UUID and four (or five) reference `worker-1`
-  UUID; each Host's `inbound UUID` matches one of the inbounds in the corresponding node's config profile; REALITY hosts carry the configured REALITY fingerprint (`chrome` by
+  UUID; each Host's `inbound UUID` matches one of the inbounds in the corresponding node's config profile; REALITY hosts carry the configured REALITY fingerprint (`firefox` by
 default, overridable via `REALITY_FINGERPRINT`) and every TLS host carries `fingerprint: firefox`
 
 #### Scenario: Internal Squad contains all provisioned inbound UUIDs
@@ -447,7 +447,7 @@ against the real Panel; actual HTTP response codes SHALL be used (not mock assum
 - **WHEN** runner parses the JSON and counts proxy-capable outbounds
 - **THEN** exactly eight (or ten when both Vision domains are configured) outbounds are identified by protocol/transport tag (VLESS REALITY, VLESS XHTTP
   TLS, VLESS WS TLS, Trojan gRPC TLS, and optional VLESS XTLS Vision TLS) for Master and Worker; REALITY
-  outbounds carry the configured REALITY fingerprint (`chrome` by default) and TLS outbounds carry
+  outbounds carry the configured REALITY fingerprint (`firefox` by default) and TLS outbounds carry
   `fingerprint: "firefox"`; `direct`, `block`, and routing-only entries
   are excluded from the count
 
@@ -464,7 +464,7 @@ against the real Panel; actual HTTP response codes SHALL be used (not mock assum
 - **GIVEN** subscription fetched with valid Mihomo User-Agent
 - **WHEN** runner validates HTTP response and parses YAML
 - **THEN** HTTP 200 is returned with correct Content-Type; eight (or ten when both Vision domains are configured) proxy entries with correct protocol and
-  transport parameters, `client-fingerprint: "chrome"` on REALITY and `client-fingerprint: "firefox"` on the
+  transport parameters, `client-fingerprint: "firefox"` on REALITY and `client-fingerprint: "firefox"` on the
   TLS transports are present; `GEOIP,private,DIRECT,no-resolve` rule is present; no duplicates; real
   `mihomo -t` validates the config
 

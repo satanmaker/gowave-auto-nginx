@@ -45,17 +45,14 @@ def mihomo_x25519_enabled():
     return pinned >= REALITY_MLKEM_MIN_XRAY_VERSION
 
 
-# uTLS presets that can be requested from GoWave Host records. Chrome is the
-# default for REALITY because metacubex/utls maps HelloFirefox_Auto to Firefox
-# 120, whose ClientHello carries no X25519MLKEM768 key share. Upstream mihomo
-# therefore fails REALITY authentication with the firefox fingerprint, while
-# Xray clients accept either. Set GOWAVE_REALITY_FINGERPRINT=firefox only for
-# clients that ship a post-quantum Firefox hello (for example Prizrak-Core).
+# uTLS presets that can be requested from GoWave Host records. REALITY hosts
+# default to firefox: metacubex/utls maps HelloFirefox_Auto to Firefox 148 and
+# sends the hybrid X25519MLKEM768 key share, which both Xray and mihomo accept.
 REALITY_FINGERPRINTS = (
     "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq",
     "random", "randomized",
 )
-REALITY_DEFAULT_FINGERPRINT = "chrome"
+REALITY_DEFAULT_FINGERPRINT = "firefox"
 
 
 def reality_fingerprint():
@@ -65,13 +62,6 @@ def reality_fingerprint():
         raise ValueError(
             f"Invalid GOWAVE_REALITY_FINGERPRINT: '{value}'. "
             f"Supported values: {', '.join(REALITY_FINGERPRINTS)}"
-        )
-    if value != "chrome":
-        print(
-            f"Warning: REALITY fingerprint is '{value}'. Upstream mihomo only completes "
-            "REALITY via the chrome uTLS preset; other values require a client that sends "
-            "an X25519MLKEM768 key share for this fingerprint.",
-            file=sys.stderr,
         )
     return value
 

@@ -295,12 +295,10 @@ class TestAPIClient(unittest.TestCase):
         hosts = self.client.provision_hosts(prof_uuid, inbounds, node_uuid, squad_uuid, "vpn.example.com", "cdn.example.com")
         self.assertEqual(len(hosts), 4)
 
-        # REALITY uses the mihomo-compatible fingerprint; other hosts stay on firefox
+        # All transports use the modern Firefox uTLS preset
         fps = {h.get("remark"): h.get("fingerprint") for h in MockGoWaveServer.hosts.values()}
-        self.assertEqual(fps["VLESS-REALITY-Vision@local-node"], "chrome")
         for remark, fp in fps.items():
-            if remark != "VLESS-REALITY-Vision@local-node":
-                self.assertEqual(fp, "firefox")
+            self.assertEqual(fp, "firefox")
 
         # 7. Provision User
         short_uuid = self.client.provision_user("default-user", squad_uuid)
@@ -335,10 +333,8 @@ class TestAPIClient(unittest.TestCase):
         remarks = {MockGoWaveServer.hosts[h].get("remark") for h in hosts}
         self.assertIn("VLESS-Vision-TLS@vision-node", remarks)
         fps = {MockGoWaveServer.hosts[h].get("remark"): MockGoWaveServer.hosts[h].get("fingerprint") for h in hosts}
-        self.assertEqual(fps["VLESS-REALITY-Vision@vision-node"], "chrome")
         for remark, fp in fps.items():
-            if remark != "VLESS-REALITY-Vision@vision-node":
-                self.assertEqual(fp, "firefox")
+            self.assertEqual(fp, "firefox")
 
     def test_provision_hosts_idempotent_patch(self):
         """Re-provisioning existing hosts must execute PATCH /api/hosts with uuid in body without 405 error."""
@@ -386,10 +382,10 @@ class TestAPIClient(unittest.TestCase):
         with patch.dict(os.environ, {"XRAY_SERVER_VERSION": "26.11.9", "GOWAVE_MIHOMO_X25519": "0"}, clear=False):
             self.assertFalse(mihomo_x25519_enabled())
 
-    def test_reality_fingerprint_defaults_to_chrome(self):
+    def test_reality_fingerprint_defaults_to_firefox(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("GOWAVE_REALITY_FINGERPRINT", None)
-            self.assertEqual(reality_fingerprint(), "chrome")
+            self.assertEqual(reality_fingerprint(), "firefox")
 
     def test_reality_fingerprint_env_override_is_normalized(self):
         with patch.dict(os.environ, {"GOWAVE_REALITY_FINGERPRINT": "Firefox"}, clear=False):
