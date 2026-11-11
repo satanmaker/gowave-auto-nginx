@@ -18,6 +18,7 @@ from live_vps.traffic import (
     classify_case_status,
     classify_server_host,
     get_control_ingress_ip,
+    parse_ingress_evidence,
     resolve_attribution_source,
     run_mihomo_traffic_suite,
     start_ingress_capture,
@@ -92,7 +93,7 @@ def _packet_evidence(**overrides):
         "target_ingress_ok": True,
         "offload_ok": True,
         "egress_matches": True,
-        "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
+        "evidence_method": "tcpdump inbound TCP by destination port, attributed to the control IPv4 the target reports",
     }
     evidence.update(overrides)
     return evidence
@@ -173,53 +174,107 @@ class TestTrafficModule(unittest.TestCase):
         self.assertIsNone(get_xray_server_port({"settings": {"vnext": [{"port": 70000}]}}))
         self.assertIsNone(get_xray_server_port({"settings": None}))
 
-    def test_start_ingress_capture_uses_source_filter_and_excludes_ssh_port(self):
+    def test_start_ingress_capture_filters_by_port_only(self):
         ssh = MagicMock()
         ssh.port = 2222
         ssh.run.return_value = MagicMock(ok=True, stdout="", stderr="")
-        capture = start_ingress_capture(ssh, "198.51.100.25", 443)
+        capture = start_ingress_capture(ssh, 443)
         self.assertIsNotNone(capture)
         command = ssh.run.call_args.args[0]
         self.assertIn("timeout --signal=INT 45s tcpdump", command)
         self.assertIn("tcpdump -nn -i any -Q in -l", command)
-        self.assertIn("src host 198.51.100.25 and tcp and dst port 443 and not dst port 2222", command)
-
+        self.assertIn("'tcp and dst port 443 and not dst port 2222'", command)
+        # A source address in the filter is the defect this replaced: VPN and carrier NAT
+        # hand out a different public address per flow, so such a filter captures nothing.
+        self.assertNotIn("src host", command)
 
     def test_start_ingress_capture_rejects_invalid_or_ssh_target_port(self):
         ssh = MagicMock()
         ssh.port = 2222
-        self.assertIsNone(start_ingress_capture(ssh, "198.51.100.25", 0))
-        self.assertIsNone(start_ingress_capture(ssh, "198.51.100.25", 2222))
-        self.assertIsNone(start_ingress_capture(ssh, "not-an-ip", 443))
+        self.assertIsNone(start_ingress_capture(ssh, 0))
+        self.assertIsNone(start_ingress_capture(ssh, 2222))
+        self.assertIsNone(start_ingress_capture(ssh, 70000))
+        self.assertIsNone(start_ingress_capture(ssh, True))
         ssh.run.assert_not_called()
 
     def test_stop_ingress_capture_requires_tcpdump_summary(self):
         ssh = MagicMock()
-        ssh.run.return_value = MagicMock(ok=True, stdout="3 packets captured\n", stderr="")
+        ssh.run.return_value = MagicMock(
+            ok=True,
+            stdout="SUMMARY 3 packets captured\nSOURCE 198.51.100.25 3\n",
+            stderr="",
+        )
         self.assertEqual(
             stop_ingress_capture(ssh, {"log_path": "/run/cap.log", "pid_path": "/run/cap.pid"}),
-            3,
+            {"captured": 3, "sources": {"198.51.100.25": 3}},
         )
-        ssh.run.return_value = MagicMock(ok=True, stdout="listening on any\n", stderr="")
+        ssh.run.return_value = MagicMock(ok=True, stdout="SUMMARY absent\n", stderr="")
         self.assertIsNone(
             stop_ingress_capture(ssh, {"log_path": "/run/cap.log", "pid_path": "/run/cap.pid"}),
         )
 
+    def test_observed_sources_are_parsed_from_the_capture_report(self):
+        report = (
+            "SUMMARY 12 packets captured\n"
+            "SOURCE 92.62.60.71 9\n"
+            "SOURCE 203.0.113.9 2\n"
+            "SOURCE 2001:db8::1 1\n"
+        )
+        self.assertEqual(
+            parse_ingress_evidence(report),
+            {
+                "captured": 12,
+                "sources": {"92.62.60.71": 9, "203.0.113.9": 2, "2001:db8::1": 1},
+            },
+        )
+        self.assertIsNone(parse_ingress_evidence("listening on any\n"))
+
     def test_finish_pair_ingress_proves_target_and_rejects_offload(self):
         master = MagicMock()
         worker = MagicMock()
-        master.run.return_value = MagicMock(ok=True, stdout="0 packets captured\n", stderr="")
-        worker.run.return_value = MagicMock(ok=True, stdout="5 packets captured\n", stderr="")
+        master.run.return_value = MagicMock(
+            ok=True, stdout="SUMMARY 0 packets captured\n", stderr="",
+        )
+        worker.run.return_value = MagicMock(
+            ok=True,
+            stdout="SUMMARY 5 packets captured\nSOURCE 198.51.100.25 5\n",
+            stderr="",
+        )
         evidence = finish_pair_ingress(
             master, worker,
             ({"log_path": "/m.log", "pid_path": "/m.pid"},
              {"log_path": "/w.log", "pid_path": "/w.pid"}),
-            True,
+            True, "198.51.100.25",
         )
         self.assertEqual(evidence["target_packets"], 5)
         self.assertEqual(evidence["offload_packets"], 0)
         self.assertTrue(evidence["target_ingress_ok"])
         self.assertTrue(evidence["offload_ok"])
+        self.assertEqual(evidence["observed_other_sources"], {})
+
+    def test_finish_pair_ingress_reports_the_address_that_actually_arrived(self):
+        # The VPN exit rotated: packets arrived, but from an address other than the one the
+        # target reported for the SSH session. Evidence must name the address it saw.
+        master = MagicMock()
+        worker = MagicMock()
+        master.run.return_value = MagicMock(
+            ok=True, stdout="SUMMARY 0 packets captured\n", stderr="",
+        )
+        worker.run.return_value = MagicMock(
+            ok=True,
+            stdout="SUMMARY 6 packets captured\nSOURCE 195.154.10.20 6\n",
+            stderr="",
+        )
+        evidence = finish_pair_ingress(
+            master, worker,
+            ({"log_path": "/m.log", "pid_path": "/m.pid"},
+             {"log_path": "/w.log", "pid_path": "/w.pid"}),
+            True, "198.51.100.25",
+        )
+        self.assertEqual(evidence["worker_captured"], 6)
+        self.assertEqual(evidence["target_packets"], 0)
+        self.assertEqual(evidence["observed_other_sources"], {"195.154.10.20": 6})
+        self.assertEqual(classify_case_status(True, evidence), "INCOMPLETE")
 
     def test_control_ingress_ip_is_taken_from_the_target_ssh_session(self):
         ssh = MagicMock()

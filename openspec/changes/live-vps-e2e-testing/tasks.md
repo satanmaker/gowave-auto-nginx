@@ -1,7 +1,7 @@
 # Tasks: Live VPS E2E Testing
 
 > **Findings from codebase audit & design.md:**
-> - GoWave Panel profile templates in `assets/xray/` do NOT configure the Xray Stats gRPC API. Upstream binaries are immutable per AGENTS.md. Server-side traffic evidence uses simultaneous per-case `tcpdump` captures on both VPS, filtered by control-machine source IPv4 and the exact tested proxy destination port while excluding SSH ports; protocol identity is established by the selected client outbound and successful request, not by a shared port counter alone. Missing/unattributable capture evidence is INCOMPLETE; aggregate counters are not a PASS fallback.
+> - GoWave Panel profile templates in `assets/xray/` do NOT configure the Xray Stats gRPC API. Upstream binaries are immutable per AGENTS.md. Server-side traffic evidence uses simultaneous per-case `tcpdump` captures on both VPS, filtered by the exact tested proxy destination port while excluding SSH ports and naming no source address; packets are attributed afterwards to the control-machine IPv4 each target reports on the runner's SSH session. Protocol identity is established by the selected client outbound and successful request, not by a shared port counter alone. Missing/unattributable capture evidence is INCOMPLETE; aggregate counters are not a PASS fallback.
 > - When `ACME_MODE=staging`, one mode-0600 scoped CA bundle combines the Control Machine's complete default public roots with the pinned Let's Encrypt Staging chain. Python, curl, Xray and Mihomo all use this same bundle; staging-only trust stores are forbidden because public egress targets must remain trusted.
 > - Worker `NODE_READY_TIMEOUT` default is 120s with 5s fixed-interval polling.
 

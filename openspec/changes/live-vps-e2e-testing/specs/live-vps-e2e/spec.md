@@ -1030,13 +1030,13 @@ be INCOMPLETE; aggregate counters MUST NOT be a PASS fallback. PCAP files and pa
 #### Scenario: Selected VPS receives the proxy request
 
 - **GIVEN** a single Xray or Mihomo proxy request is in progress
-- **WHEN** both VPS packet captures are active and filtered by the control-machine IPv4 that each target reports on the runner's SSH session and the exact proxy destination port
+- **WHEN** both VPS packet captures are active, filtered only by the exact proxy destination port, and their observed source addresses are compared with the control-machine IPv4 each target reports on the runner's SSH session
 - **THEN** the intended VPS records at least one matching packet and the other VPS records zero
 - **AND** the observed egress IPv4 matches the expected egress of the intended VPS
 
 #### Scenario: Packet evidence is unavailable or ambiguous
 
-- **GIVEN** tcpdump, target-reported source-IP identity, endpoint port, or a valid capture summary is unavailable, or both hosts record zero packets while the tunnel carried the request
+- **GIVEN** tcpdump, target-reported source-IP identity, endpoint port, or a valid capture summary is unavailable, or every captured packet came from an address other than the reported control IPv4
 - **WHEN** the traffic case is evaluated
-- **THEN** the case is INCOMPLETE and aggregate interface counters MUST NOT be used to mark it PASS
+- **THEN** the case is INCOMPLETE, the non-matching source addresses are recorded, and aggregate interface counters MUST NOT be used to mark it PASS
 - **AND** no PCAP or packet payload is persisted

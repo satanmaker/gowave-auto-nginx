@@ -155,12 +155,15 @@ is not guaranteed to be a complete standalone config.
 ### D5: Per-Case Packet-Capture Evidence and Egress Verification
 
 **Chosen:** Every Xray and Mihomo proxy request is bracketed by simultaneous inbound `tcpdump` captures on
-Master and Worker. Each capture is filtered by the control machine's IPv4 exactly as each target reports it on
-the runner's own SSH session (`SSH_CONNECTION`) and the exact destination port of the tested proxy endpoint; the
-target's SSH destination port is explicitly excluded. Each remote capture has a 45-second hard lifetime.
+Master and Worker. The capture filter names only the exact destination port of the tested proxy endpoint and
+excludes the target's SSH destination port; it deliberately names no source address. Each remote capture has a
+45-second hard lifetime.
 
-A public echo service is not an acceptable source for that address: carrier-grade NAT pools answer it from a
-different public address than the one that reaches the VPS, so a filter built from it silently captures nothing.
+Attribution is decided after the capture from the source addresses tcpdump actually observed, compared against
+the control machine's IPv4 as each target reports it on the runner's own SSH session (`SSH_CONNECTION`). A public
+echo service is not an acceptable substitute for that address: VPN split tunnelling and carrier-grade NAT pools
+answer different destinations, and sometimes different flows, from different public addresses, so a filter or a
+comparison built from an echo-service value can match none of the packets that actually arrive.
 
 A case is PASS only when all conditions hold:
 1. The intended VPS captures at least one matching inbound TCP packet.
@@ -168,11 +171,12 @@ A case is PASS only when all conditions hold:
 3. The client-observed egress IPv4 equals the expected egress address of the intended VPS.
 
 Missing `tcpdump`, targets that do not report the control machine's IPv4, invalid endpoint port, or a
-missing/invalid capture summary yields INCOMPLETE. An empty capture on both hosts while the tunnel demonstrably
-carried the request is also INCOMPLETE: it proves the filter missed the flow, not that the connection leaked.
-Aggregate `/proc/net/dev` counters are not a fallback and cannot produce PASS. Only packet counts and evidence
-metadata are persisted; no PCAP or payload is stored. This attribution requires both VPS instances to report the
-same control-machine IPv4; otherwise every case is INCOMPLETE, not PASS.
+missing/invalid capture summary yields INCOMPLETE. An empty capture, or one whose every packet came from an
+address other than the reported control IPv4, is also INCOMPLETE and records the addresses it did see
+(`observed_other_sources`): that proves the filter or the NAT mapping moved, not that the connection leaked.
+Aggregate `/proc/net/dev` counters are not a fallback and cannot produce PASS. Only packet counts, source-address
+metadata, and evidence metadata are persisted; no PCAP or payload is stored. This attribution requires both VPS
+instances to report the same control-machine IPv4; otherwise every case is INCOMPLETE, not PASS.
 
 **Rationale:** Default GoWave Xray templates do not enable the Xray Stats API. The public NGINX stream listener
 is shared by SNI-routed transports, so packet evidence proves traversal to the intended VPS but not by itself
@@ -1189,9 +1193,10 @@ existing codebase unchanged. The ACME staging delta is a backward-compatible def
 - **[RESOLVED] Xray stats API availability:** Codebase audit confirms that GoWave Panel profile templates
   in `assets/xray/` do not configure the Xray Stats gRPC API (`"stats": {}`, `"StatsService"`). Upstream binaries
   are treated as immutable per AGENTS.md. Therefore, server-side traffic evidence uses simultaneous per-case
-  `tcpdump` captures on both VPS, filtered by control-machine source IPv4 and the exact tested proxy destination
-  port while excluding each SSH port. Missing or unattributable capture evidence is INCOMPLETE; aggregate
-  interface/packet counters are not a PASS fallback.
+  `tcpdump` captures on both VPS, filtered by the exact tested proxy destination port while excluding each SSH
+  port; source attribution is decided afterwards from the addresses actually captured, compared with the
+  control-machine IPv4 each target reports on the runner's SSH session. Missing or unattributable capture evidence
+  is INCOMPLETE; aggregate interface/packet counters are not a PASS fallback.
 - **Worker `isConnected` polling behavior:** The 120s `NODE_READY_TIMEOUT` with 5s polling interval is a provisional
   initial bound, not a measured real-VPS guarantee. Mock integration benchmarks do not establish the latency
   distribution of the pinned Panel/Node pair; staging acceptance MUST record observed registration latency and
