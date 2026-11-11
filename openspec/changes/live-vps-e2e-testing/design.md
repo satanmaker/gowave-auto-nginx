@@ -155,20 +155,24 @@ is not guaranteed to be a complete standalone config.
 ### D5: Per-Case Packet-Capture Evidence and Egress Verification
 
 **Chosen:** Every Xray and Mihomo proxy request is bracketed by simultaneous inbound `tcpdump` captures on
-Master and Worker. Each capture is filtered by the control machine's public IPv4 and the exact destination
-port of the tested proxy endpoint; the target's SSH destination port is explicitly excluded. Each remote
-capture has a 45-second hard lifetime.
+Master and Worker. Each capture is filtered by the control machine's IPv4 exactly as each target reports it on
+the runner's own SSH session (`SSH_CONNECTION`) and the exact destination port of the tested proxy endpoint; the
+target's SSH destination port is explicitly excluded. Each remote capture has a 45-second hard lifetime.
+
+A public echo service is not an acceptable source for that address: carrier-grade NAT pools answer it from a
+different public address than the one that reaches the VPS, so a filter built from it silently captures nothing.
 
 A case is PASS only when all conditions hold:
 1. The intended VPS captures at least one matching inbound TCP packet.
 2. The other VPS captures zero matching inbound TCP packets (offload detection).
 3. The client-observed egress IPv4 equals the expected egress address of the intended VPS.
 
-Missing `tcpdump`, inability to determine the control machine's public IPv4, invalid endpoint port, or a
-missing/invalid capture summary yields INCOMPLETE. Aggregate `/proc/net/dev` counters are not a fallback
-and cannot produce PASS. Only packet counts and evidence metadata are persisted; no PCAP or payload is
-stored. This attribution requires the control machine to reach both VPS instances from the same public IPv4;
-otherwise the evidence is INCOMPLETE, not PASS.
+Missing `tcpdump`, targets that do not report the control machine's IPv4, invalid endpoint port, or a
+missing/invalid capture summary yields INCOMPLETE. An empty capture on both hosts while the tunnel demonstrably
+carried the request is also INCOMPLETE: it proves the filter missed the flow, not that the connection leaked.
+Aggregate `/proc/net/dev` counters are not a fallback and cannot produce PASS. Only packet counts and evidence
+metadata are persisted; no PCAP or payload is stored. This attribution requires both VPS instances to report the
+same control-machine IPv4; otherwise every case is INCOMPLETE, not PASS.
 
 **Rationale:** Default GoWave Xray templates do not enable the Xray Stats API. The public NGINX stream listener
 is shared by SNI-routed transports, so packet evidence proves traversal to the intended VPS but not by itself

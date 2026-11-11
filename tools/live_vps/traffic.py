@@ -32,18 +32,43 @@ def find_free_port() -> int:
         return int(s.getsockname()[1])
 
 
-def get_control_egress_ip() -> Optional[str]:
-    """Return the public IPv4 address visible to the target VPS."""
-    try:
-        result = subprocess.run(
-            ["curl", "--noproxy", "*", "-4fsS", "--connect-timeout", "5",
-             "--max-time", "10", "https://api.ipify.org"],
-            capture_output=True, text=True, timeout=15, check=False,
-        )
-        address = ipaddress.ip_address(result.stdout.strip())
-        return str(address) if result.returncode == 0 and address.version == 4 else None
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+def get_control_ingress_ip(ssh: SSHClient) -> Optional[str]:
+    """Return the control machine's IPv4 as this target itself observes it.
+
+    A public echo service is not authoritative: carrier-grade NAT pools hand out a
+    different public address per destination, so a filter built from the address that
+    api.ipify.org reports can match none of the packets that actually arrive here.
+    """
+    result = ssh.run('printf "%s\n%s\n" "$SSH_CONNECTION" "$SSH_CLIENT"', timeout=15)
+    if not result.ok:
         return None
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        try:
+            address = ipaddress.ip_address(fields[0])
+        except ValueError:
+            continue
+        if address.version == 4 and not address.is_loopback:
+            return str(address)
+    return None
+
+
+def resolve_attribution_source(
+    master_ssh: SSHClient, worker_ssh: SSHClient,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Return the shared control IPv4 and, when unusable, the reason attribution failed."""
+    master_ip = get_control_ingress_ip(master_ssh)
+    worker_ip = get_control_ingress_ip(worker_ssh)
+    if not master_ip or not worker_ip:
+        return None, "Target VPS did not report the control machine's IPv4 address"
+    if master_ip != worker_ip:
+        return None, (
+            "Control machine reaches Master and Worker from different public IPv4 "
+            f"addresses ({master_ip} vs {worker_ip})"
+        )
+    return master_ip, None
 
 
 def start_ingress_capture(ssh: SSHClient, source_ip: str, target_port: int) -> Optional[Dict[str, str]]:
@@ -137,6 +162,19 @@ def finish_pair_ingress(
         "offload_ok": offload_packets == 0,
         "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
     }
+
+
+def classify_case_status(egress_matches: Any, ingress_evidence: Dict[str, Any]) -> str:
+    """Decide one traffic case from egress and packet evidence, fail closed."""
+    if egress_matches is not True:
+        return "FAIL"
+    if ingress_evidence["offload_ok"] is not True:
+        return "FAIL"
+    if ingress_evidence["target_ingress_ok"] is not True:
+        # The tunnel demonstrably carried the request, so an empty capture on both hosts
+        # means the filter missed the flow rather than that the connection leaked.
+        return "INCOMPLETE"
+    return "PASS"
 
 
 def get_remote_egress_ip(ssh: SSHClient) -> Optional[str]:
@@ -303,7 +341,7 @@ def run_xray_endpoint_test(
 
         if not source_ip:
             return {"status": "INCOMPLETE", "tag": tag,
-                    "error": "Control-machine public IPv4 unavailable for per-case ingress capture"}
+                    "error": "Target VPS did not report the control machine's IPv4 for per-case ingress capture"}
         server_port = get_xray_server_port(outbound) or 0
         captures = capture_pair_ingress(master_ssh, worker_ssh, source_ip, server_port)
         if captures is None:
@@ -332,13 +370,8 @@ def run_xray_endpoint_test(
         if ingress_evidence is None:
             return {"status": "INCOMPLETE", "tag": tag,
                     "error": "Per-case tcpdump capture did not return packet summaries"}
-        passed = (
-            egress_matches
-            and ingress_evidence["target_ingress_ok"]
-            and ingress_evidence["offload_ok"]
-        )
         return {
-            "status": "PASS" if passed else "FAIL",
+            "status": classify_case_status(egress_matches, ingress_evidence),
             "tag": tag,
             "observed_egress": observed_egress,
             "expected_egress": expected_egress_ip,
@@ -547,7 +580,7 @@ def run_mihomo_traffic_suite(
             if not source_ip:
                 case_results.append({
                     "status": "INCOMPLETE", "proxy": p_name,
-                    "error": "Control-machine public IPv4 unavailable for per-case ingress capture",
+                    "error": "Target VPS did not report the control machine's IPv4 for per-case ingress capture",
                 })
                 continue
             try:
@@ -589,13 +622,8 @@ def run_mihomo_traffic_suite(
                     "error": "Per-case tcpdump capture did not return packet summaries",
                 })
                 continue
-            passed = (
-                egress_matches
-                and ingress_evidence["target_ingress_ok"]
-                and ingress_evidence["offload_ok"]
-            )
             case_results.append({
-                "status": "PASS" if passed else "FAIL",
+                "status": classify_case_status(egress_matches, ingress_evidence),
                 "proxy": p_name,
                 "observed_egress": observed_egress,
                 "expected_egress": expected_egress,
