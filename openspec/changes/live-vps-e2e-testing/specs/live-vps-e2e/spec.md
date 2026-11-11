@@ -554,6 +554,12 @@ syntax checks do not count.
 - **WHEN** the runner executes the Data Plane phase
 - **THEN** it runs Xray and Mihomo independently against each of the active logical endpoints (16, 18, or 20 cases total), both clients using the configured REALITY fingerprint (`firefox` by default); all cases must pass for overall `PASS`
 
+#### Scenario: Tunnel setup tolerates one cold resolver stall
+
+- **GIVEN** `TRAFFIC_TIMEOUT` bounds every Xray and Mihomo egress request
+- **WHEN** a client must resolve the target hostname without a cached answer
+- **THEN** the curl connect budget is at least half of `TRAFFIC_TIMEOUT` and never below 10 seconds, so a single 5-second resolver stall cannot fail an otherwise healthy endpoint
+
 #### Scenario: Clients are the cores deployed by Panel and Node
 
 - **GIVEN** the pinned `XRAY_CLIENT_VERSION` and `MIHOMO_CLIENT_VERSION` binaries on the Control Machine

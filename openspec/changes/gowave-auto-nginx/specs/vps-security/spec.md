@@ -35,6 +35,11 @@ The security subsystem SHALL optionally configure `systemd-resolved` with encryp
 - **WHEN** DNS-over-TLS query verification fails
 - **THEN** the drop-in configuration is removed, original DNS settings are restored, and a warning is logged without aborting installation.
 
+#### Scenario: Edge Worker applies the same strict DoT policy
+- **GIVEN** an Edge Worker host being hardened by `gowave-node-auto.sh`
+- **WHEN** host security configuration runs
+- **THEN** the Worker receives the same strict DoT drop-in as the Master, a failed DoT verification is logged as a warning instead of aborting the deployment, and both the compensating and the standalone rollback remove only a drop-in carrying the project marker.
+
 ### Requirement: UFW Firewall Port Lockdown
 The security subsystem SHALL manage UFW rules atomically, opening only necessary ports, whitelisting Control Plane IP for Node ports, and preventing administrator lockout. Because `gowave-node` binds wildcard addresses (`:3002`), UFW rules SHALL explicitly block external inbound traffic on node ports in All-in-One setups.
 

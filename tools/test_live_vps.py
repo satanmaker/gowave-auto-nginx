@@ -635,6 +635,7 @@ def main() -> int:
                         master_ssh=master_ssh,
                         worker_ssh=worker_ssh,
                         is_worker_endpoint=is_worker,
+                        timeout=config.traffic_timeout,
                         acme_mode=config.acme_mode,
                         source_ip=control_egress_ip,
                     )
@@ -647,6 +648,7 @@ def main() -> int:
                 master_ssh=master_ssh,
                 worker_ssh=worker_ssh,
                 source_ip=control_egress_ip,
+                timeout=config.traffic_timeout,
             )
 
             expected_per_client = 8 + int(bool(config.master_vision_domain)) + int(bool(config.worker_vision_domain))

@@ -280,6 +280,65 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn('awk \'$3 == "443/tcp" { found=1 } END { exit !found }\'', rollback_script)
         self.assertNotIn("rollback_restore_failed", rollback_script)
 
+    def _run_worker_dot(self, body: str) -> subprocess.CompletedProcess:
+        script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        start = script.index("configure_worker_dot() {")
+        end = script.index("\n}\n", start) + len("\n}\n")
+        prelude = (
+            "set -euo pipefail\n"
+            "log_warn() { printf '[WARN] %s\\n' \"$*\" >&2; }\n"
+            + script[start:end]
+            + "\n"
+        )
+        return subprocess.run(["bash", "-c", prelude + body], capture_output=True, text=True)
+
+    def test_worker_host_security_enables_strict_dot(self):
+        """Worker hardening must run the DoT helper and track ownership of the drop-in."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        security_start = worker_script.index("configure_host_security() {")
+        security_end = worker_script.index("\nconfigure_firewall() {", security_start)
+        self.assertIn("configure_worker_dot", worker_script[security_start:security_end])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dropin = Path(tmpdir) / "90-gowave-auto-nginx.conf"
+            body = (
+                'configure_dot() { return 0; }\n'
+                f'configure_worker_dot "{dropin}"\n'
+                'echo "flag=${_DOT_CREATED_BY_US:-unset}"\n'
+            )
+            res = self._run_worker_dot(body)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("flag=1", res.stdout)
+
+            dropin.write_text("# Managed by GoWave Auto NGINX: VPS Security\n")
+            res = self._run_worker_dot(body)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("flag=0", res.stdout)
+
+    def test_worker_dot_failure_is_non_fatal_and_not_owned(self):
+        """A DoT failure must warn instead of aborting, and must not claim the drop-in."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dropin = Path(tmpdir) / "90-gowave-auto-nginx.conf"
+            body = (
+                'configure_dot() { return 1; }\n'
+                f'configure_worker_dot "{dropin}"\n'
+                'echo "flag=${_DOT_CREATED_BY_US:-unset}"\n'
+            )
+            res = self._run_worker_dot(body)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("flag=0", res.stdout)
+            self.assertIn("remains unhardened", res.stderr)
+
+    def test_worker_rollbacks_remove_only_project_owned_dns_drop_in(self):
+        """Both rollback paths must gate DNS drop-in removal on the project marker."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        marker_guard = "grep -qF 'Managed by GoWave Auto NGINX: VPS Security' /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf"
+        self.assertEqual(worker_script.count(marker_guard), 2)
+        self.assertEqual(
+            worker_script.count("rm -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf || rollback_failed=1"),
+            2,
+        )
+
     def test_initial_provision_persists_applying_state_at_first_api_mutation(self):
         auto_script = (REPO_ROOT / "gowave-auto.sh").read_text()
         prepared_at = auto_script.index('"state": "PROVISION_PREPARED"')
