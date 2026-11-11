@@ -170,17 +170,50 @@ def prune_snapshots(recovery_dir, max_snapshots=3, max_bytes=5 * 1024 * 1024 * 1
             print(f"Warning: Failed to prune snapshot {item}: {e}", file=sys.stderr)
 
 
-def sqlite_online_backup(db_path, backup_dest, gowave_user="gowave"):
-    """Preflight integrity check, WAL checkpoint, and staged SQLite Online Backup."""
-    db_file = Path(db_path)
-    dest_file = Path(backup_dest)
-    dest_file.parent.mkdir(parents=True, exist_ok=True)
+_SQLITE_PREFLIGHT_SCRIPT = """\
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], timeout=5.0)
+try:
+    cur = conn.cursor()
+    cur.execute("PRAGMA busy_timeout = 5000;")
+    integrity = cur.execute("PRAGMA integrity_check;").fetchall()
+    if not integrity or integrity[0][0] != "ok":
+        raise SystemExit(f"SQLite preflight integrity check failed: {integrity}")
+    cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+finally:
+    conn.close()
+"""
 
-    if not db_file.exists():
-        raise FileNotFoundError(f"Database {db_path} not found")
 
-    # Connect to verify integrity and perform WAL checkpoint
-    conn = sqlite3.connect(str(db_file), timeout=5.0)
+def _service_user_exists(name):
+    try:
+        import pwd
+        pwd.getpwnam(name)
+        return True
+    except (ImportError, KeyError):
+        return False
+
+
+def sqlite_preflight_checkpoint(db_path, gowave_user=None):
+    """Run the integrity check and WAL checkpoint with write access to the database.
+
+    SQLite opens the file with O_CREAT, which the kernel refuses for another
+    user's file inside a sticky directory while fs.protected_regular is set
+    (the Debian/Ubuntu default). When running as root against the service
+    database, the preflight must therefore run under the service account.
+    """
+    if gowave_user and _service_user_exists(gowave_user):
+        result = subprocess.run(
+            ["runuser", "-u", gowave_user, "--", "python3", "-c",
+             _SQLITE_PREFLIGHT_SCRIPT, str(db_path)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip() or "unknown error"
+            raise ValueError(f"SQLite preflight integrity check failed: {detail}")
+        return
+
+    conn = sqlite3.connect(str(db_path), timeout=5.0)
     try:
         cur = conn.cursor()
         cur.execute("PRAGMA busy_timeout = 5000;")
@@ -193,10 +226,22 @@ def sqlite_online_backup(db_path, backup_dest, gowave_user="gowave"):
     finally:
         conn.close()
 
+
+def sqlite_online_backup(db_path, backup_dest, gowave_user="gowave"):
+    """Preflight integrity check, WAL checkpoint, and staged SQLite Online Backup."""
+    db_file = Path(db_path)
+    dest_file = Path(backup_dest)
+    dest_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if not db_file.exists():
+        raise FileNotFoundError(f"Database {db_path} not found")
+
+    is_root = os.geteuid() == 0
+    sqlite_preflight_checkpoint(db_file, gowave_user if is_root else None)
+
     # Staged backup into pre-created file
     staged_file = db_file.parent / f".backup-{int(time.time())}.db"
 
-    is_root = os.geteuid() == 0
     if is_root:
         # Pre-create with 0640 ownership gowave:gowave
         subprocess.run(["install", "-o", gowave_user, "-g", gowave_user, "-m", "0640", "/dev/null", str(staged_file)], check=True)
