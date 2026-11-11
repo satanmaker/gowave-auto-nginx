@@ -45,7 +45,7 @@ PACKET_EVIDENCE = {
     "target_ingress_ok": True,
     "offload_ok": True,
     "egress_matches": True,
-    "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
+    "evidence_method": "tcpdump inbound TCP by destination port, attributed to the control IPv4 the target reports",
 }
 
 

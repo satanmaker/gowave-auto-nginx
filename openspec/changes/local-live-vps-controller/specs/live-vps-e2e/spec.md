@@ -112,8 +112,8 @@ Every Xray and Mihomo traffic case MUST use isolated server-side evidence for th
 
 #### Scenario: Traffic is routed through the selected VPS
 
-- **WHEN** one proxy request is executed with simultaneous packet capture active on Master and Worker, filtered to the exact destination service port used by that proxy
-- **THEN** the intended VPS MUST capture at least one inbound TCP packet sourced from the control machine's IPv4 address as that target reports it on the runner's SSH session
+- **WHEN** one proxy request is executed with simultaneous packet capture active on Master and Worker, filtered to the exact destination service port used by that proxy and to no source address
+- **THEN** the intended VPS MUST capture at least one inbound TCP packet whose source is the control machine's IPv4 address as that target reports it on the runner's SSH session
 - **AND** the other VPS MUST capture zero matching inbound TCP packets
 - **AND** the observed egress IPv4 MUST equal the expected egress address of the intended VPS
 - **AND** the individual case MAY be marked PASS only when all three conditions hold

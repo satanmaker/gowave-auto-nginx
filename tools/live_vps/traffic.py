@@ -71,23 +71,22 @@ def resolve_attribution_source(
     return master_ip, None
 
 
-def start_ingress_capture(ssh: SSHClient, source_ip: str, target_port: int) -> Optional[Dict[str, str]]:
-    """Start header-only capture of inbound TCP packets from this test runner."""
-    try:
-        address = ipaddress.ip_address(source_ip)
-    except ValueError:
-        return None
-    if address.version != 4 or not isinstance(target_port, int) or not 1 <= target_port <= 65535:
+def start_ingress_capture(ssh: SSHClient, target_port: int) -> Optional[Dict[str, str]]:
+    """Start header-only capture of inbound TCP to the tested proxy service port.
+
+    The filter deliberately does not name a source address: a VPN or carrier NAT can
+    present a different public address per flow, and a filter built from any of them
+    would silently capture nothing. Attribution happens after the fact from the
+    addresses tcpdump actually saw.
+    """
+    if type(target_port) is not int or not 1 <= target_port <= 65535:
         return None
     if target_port == ssh.port:
         return None
     token = uuid.uuid4().hex
     base = "/run/gowave-e2e-ingress-" + token
     log_path, pid_path = base + ".log", base + ".pid"
-    capture_filter = (
-        "src host " + str(address) + " and tcp and dst port " + str(target_port)
-        + " and not dst port " + str(ssh.port)
-    )
+    capture_filter = "tcp and dst port " + str(target_port) + " and not dst port " + str(ssh.port)
     command = (
         "set -eu; umask 077; command -v tcpdump >/dev/null 2>&1 || exit 127; command -v timeout >/dev/null 2>&1 || exit 127; "
         "nohup timeout --signal=INT 45s tcpdump -nn -i any -Q in -l " + shlex.quote(capture_filter) +
@@ -111,8 +110,25 @@ def start_ingress_capture(ssh: SSHClient, source_ip: str, target_port: int) -> O
     return {"log_path": log_path, "pid_path": pid_path}
 
 
-def stop_ingress_capture(ssh: SSHClient, capture: Dict[str, str]) -> Optional[int]:
-    """Stop capture and return tcpdump's summary count; absent summary is not evidence."""
+def parse_ingress_evidence(output: str) -> Optional[Dict[str, Any]]:
+    """Parse the stop-capture report into a total count and per-source packet counts."""
+    summary = re.search(r"^SUMMARY (\d+) packets captured$", output, re.MULTILINE)
+    if summary is None:
+        return None
+    sources: Dict[str, int] = {}
+    for match in re.finditer(r"^SOURCE (\S+) (\d+)$", output, re.MULTILINE):
+        count = int(match.group(2))
+        if count > 0:
+            sources[match.group(1)] = sources.get(match.group(1), 0) + count
+    return {"captured": int(summary.group(1)), "sources": sources}
+
+
+def stop_ingress_capture(ssh: SSHClient, capture: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """Stop capture and return its summary count plus per-source packet counts.
+
+    An absent tcpdump summary is not evidence, so a capture that never completed is
+    reported as missing rather than as zero traffic.
+    """
     log_path, pid_path = shlex.quote(capture["log_path"]), shlex.quote(capture["pid_path"])
     command = (
         "set -eu; if [ -f " + pid_path + " ]; then kill -INT \"$(cat " + pid_path +
@@ -120,23 +136,27 @@ def stop_ingress_capture(ssh: SSHClient, capture: Dict[str, str]) -> Optional[in
         "for i in $(seq 1 50); do "
         "grep -q 'packets captured' " + log_path + " 2>/dev/null && break; "
         "sleep 0.1; done; "
-        "cat " + log_path + " 2>/dev/null || true; rm -f " + log_path + " " + pid_path
+        "summary=$(grep -E '^[0-9]+ packets captured$' " + log_path + " 2>/dev/null | tail -n 1 || true); "
+        "printf 'SUMMARY %s\\n' \"${summary:-absent}\"; "
+        "sed -n 's/.* IP6\\{0,1\\} \\([^ ]*\\) > .*/\\1/p' " + log_path + " 2>/dev/null "
+        "| sed -E 's/\\.[0-9]+$//' | sort | uniq -c "
+        "| sed -E 's/^ *([0-9]+) (.+)$/SOURCE \\2 \\1/' || true; "
+        "rm -f " + log_path + " " + pid_path
     )
     result = ssh.run(command, timeout=10)
     if not result.ok:
         return None
-    match = re.search(r"^(\d+) packets captured$", result.stdout, re.MULTILINE)
-    return int(match.group(1)) if match else None
+    return parse_ingress_evidence(result.stdout)
 
 
 def capture_pair_ingress(
-    master_ssh: SSHClient, worker_ssh: SSHClient, source_ip: str, target_port: int,
+    master_ssh: SSHClient, worker_ssh: SSHClient, target_port: int,
 ) -> Optional[Tuple[Dict[str, str], Dict[str, str]]]:
     """Start both target captures before one request to the exact proxy service port."""
-    master_capture = start_ingress_capture(master_ssh, source_ip, target_port)
+    master_capture = start_ingress_capture(master_ssh, target_port)
     if master_capture is None:
         return None
-    worker_capture = start_ingress_capture(worker_ssh, source_ip, target_port)
+    worker_capture = start_ingress_capture(worker_ssh, target_port)
     if worker_capture is None:
         stop_ingress_capture(master_ssh, master_capture)
         return None
@@ -146,21 +166,34 @@ def capture_pair_ingress(
 def finish_pair_ingress(
     master_ssh: SSHClient, worker_ssh: SSHClient,
     captures: Tuple[Dict[str, str], Dict[str, str]], is_worker_endpoint: bool,
+    expected_source: str,
 ) -> Optional[Dict[str, Any]]:
-    master_packets = stop_ingress_capture(master_ssh, captures[0])
-    worker_packets = stop_ingress_capture(worker_ssh, captures[1])
-    if master_packets is None or worker_packets is None:
+    """Stop both captures and attribute matching packets to the control-machine address."""
+    master = stop_ingress_capture(master_ssh, captures[0])
+    worker = stop_ingress_capture(worker_ssh, captures[1])
+    if master is None or worker is None:
         return None
+    master_packets = master["sources"].get(expected_source, 0)
+    worker_packets = worker["sources"].get(expected_source, 0)
     target_packets = worker_packets if is_worker_endpoint else master_packets
     offload_packets = master_packets if is_worker_endpoint else worker_packets
+    foreign: Dict[str, int] = {}
+    for side in (master, worker):
+        for address, count in side["sources"].items():
+            if address != expected_source:
+                foreign[address] = foreign.get(address, 0) + count
     return {
         "master_packets": master_packets,
         "worker_packets": worker_packets,
+        "master_captured": master["captured"],
+        "worker_captured": worker["captured"],
+        "observed_other_sources": dict(sorted(foreign.items(), key=lambda item: -item[1])[:5]),
+        "expected_source_ip": expected_source,
         "target_packets": target_packets,
         "offload_packets": offload_packets,
         "target_ingress_ok": target_packets > 0,
         "offload_ok": offload_packets == 0,
-        "evidence_method": "tcpdump inbound TCP filtered by control-machine public IPv4",
+        "evidence_method": "tcpdump inbound TCP by destination port, attributed to the control IPv4 the target reports",
     }
 
 
@@ -343,7 +376,7 @@ def run_xray_endpoint_test(
             return {"status": "INCOMPLETE", "tag": tag,
                     "error": "Target VPS did not report the control machine's IPv4 for per-case ingress capture"}
         server_port = get_xray_server_port(outbound) or 0
-        captures = capture_pair_ingress(master_ssh, worker_ssh, source_ip, server_port)
+        captures = capture_pair_ingress(master_ssh, worker_ssh, server_port)
         if captures is None:
             return {"status": "INCOMPLETE", "tag": tag,
                     "error": "Cannot start per-case tcpdump capture on both VPS"}
@@ -354,7 +387,7 @@ def run_xray_endpoint_test(
             curl_res = subprocess.run(curl_cmd, capture_output=True, text=True)
         finally:
             ingress_evidence = finish_pair_ingress(
-                master_ssh, worker_ssh, captures, is_worker_endpoint,
+                master_ssh, worker_ssh, captures, is_worker_endpoint, source_ip,
             )
 
         if curl_res.returncode != 0:
@@ -587,7 +620,7 @@ def run_mihomo_traffic_suite(
                 target_port = int(p.get("port"))
             except (TypeError, ValueError):
                 target_port = 0
-            captures = capture_pair_ingress(master_ssh, worker_ssh, source_ip, target_port)
+            captures = capture_pair_ingress(master_ssh, worker_ssh, target_port)
             if captures is None:
                 case_results.append({
                     "status": "INCOMPLETE", "proxy": p_name,
@@ -601,7 +634,7 @@ def run_mihomo_traffic_suite(
                 curl_res = subprocess.run(curl_cmd, capture_output=True, text=True)
             finally:
                 ingress_evidence = finish_pair_ingress(
-                    master_ssh, worker_ssh, captures, is_worker,
+                    master_ssh, worker_ssh, captures, is_worker, source_ip,
                 )
 
             if curl_res.returncode != 0:
