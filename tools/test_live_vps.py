@@ -508,7 +508,9 @@ def main() -> int:
             register_secret(token)
 
             # mTLS verification
-            mtls_res = verify_worker_mtls(master_ssh, config.worker_ip, panel_client)
+            mtls_res = verify_worker_mtls(
+                master_ssh, config.worker_ip, panel_client, ready_timeout=config.node_ready_timeout
+            )
             mtls_negative_res = run_mtls_negative_tests(master_ssh, config.worker_ip)
             fw_m_res = verify_master_firewall(
                 master_ssh, config.master_ip,

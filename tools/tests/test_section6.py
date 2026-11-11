@@ -302,6 +302,64 @@ rules:
         self.assertFalse(res["worker_http_health_pass"])
         self.assertEqual(res["status"], "FAIL")
 
+    def test_mtls_panel_auth_uses_configured_readiness_budget(self):
+        """A Worker that reconnects after applying its config profile must not fail mTLS.
+
+        The Panel restarts Xray on the Node right after registration, so the connected
+        registry is briefly empty; verification has to poll with the deployment budget
+        instead of a short fixed window.
+        """
+        master_ssh = MagicMock()
+        master_ssh.run.side_effect = [
+            MagicMock(ok=True, stdout="dGVzdC1zZWNyZXQ=\n"),  # rescue raw
+            MagicMock(
+                ok=True,
+                stdout=(
+                    "Payload cryptographic verification PASSED\n"
+                    "Handshake SUCCESS: TLSv1.3 negotiated\n"
+                    "Node response: HTTP/1.1 200 OK\n"
+                ),
+                returncode=0,
+            ),
+        ]
+        panel_client = MagicMock()
+        panel_client.poll_worker_ready.return_value = True
+
+        res = verify_worker_mtls(
+            master_ssh, "198.51.100.2", panel_client=panel_client, ready_timeout=120
+        )
+
+        self.assertEqual(res["status"], "PASS")
+        self.assertTrue(res["panel_worker_auth_pass"])
+        self.assertEqual(res["panel_worker_ready_timeout"], 120)
+        panel_client.poll_worker_ready.assert_called_once_with(
+            "worker-1", timeout=120, poll_interval=3
+        )
+
+    def test_mtls_panel_auth_fails_when_worker_never_reconnects(self):
+        master_ssh = MagicMock()
+        master_ssh.run.side_effect = [
+            MagicMock(ok=True, stdout="dGVzdC1zZWNyZXQ=\n"),
+            MagicMock(
+                ok=True,
+                stdout=(
+                    "Payload cryptographic verification PASSED\n"
+                    "Handshake SUCCESS: TLSv1.3 negotiated\n"
+                    "Node response: HTTP/1.1 200 OK\n"
+                ),
+                returncode=0,
+            ),
+        ]
+        panel_client = MagicMock()
+        panel_client.poll_worker_ready.return_value = False
+
+        res = verify_worker_mtls(
+            master_ssh, "198.51.100.2", panel_client=panel_client, ready_timeout=30
+        )
+
+        self.assertEqual(res["status"], "FAIL")
+        self.assertFalse(res["panel_worker_auth_pass"])
+
 
 if __name__ == "__main__":
     unittest.main()
