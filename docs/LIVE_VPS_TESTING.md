@@ -68,7 +68,7 @@ This is a transport/firewall integration test, not a substitute for live GoWave 
 
 The runner writes artifacts/live-vps/<run-id>/ with JSON, JUnit, summary, and sanitized diagnostics. The controller adds an operator_access_cleanup phase; unverified revocation makes the overall result INCOMPLETE, even if deployment and traffic tests passed.
 
-A green repository CI run validates code and automated tests only. It does not constitute live acceptance. The feature remains pending its first complete ACME staging run on two freshly provisioned disposable VPS instances, including all enabled traffic/negative checks and verified teardown/temporary-key cleanup.
+A green repository CI run validates code and automated tests only. It does not constitute live acceptance. The runner's six-phase matrix (preflight, install, verify, traffic, negative, teardown) has completed with overall PASS in ACME staging on two freshly provisioned disposable VPS instances, including all 20 traffic cases with packet evidence, all 15 negative scenarios, and verified teardown. The interactive `python3 tools/run_live_vps.py` bootstrap path — host-key fingerprint confirmation, per-run temporary key installation, immediate revocation, and the two-hour remote expiry fallback — still requires its own acceptance run before that path is considered proven.
 
 ## Limitations
 
