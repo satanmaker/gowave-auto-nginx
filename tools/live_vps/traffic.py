@@ -223,6 +223,23 @@ def get_xray_server_port(outbound: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def build_traffic_curl_cmd(proxy_url: str, timeout: int) -> List[str]:
+    """Curl command for one tunneled egress request.
+
+    The connect budget must survive one cold resolver stall: Go and Xray cache
+    no DNS answers and a single dropped UDP query costs a full 5 seconds before
+    the resolver falls through to the next server.
+    """
+    return [
+        "curl",
+        "-fsS",
+        "--connect-timeout", str(max(10, timeout // 2)),
+        "--max-time", str(timeout),
+        "-x", proxy_url,
+        "https://api.ipify.org",
+    ]
+
+
 def run_xray_endpoint_test(
     outbound: Dict[str, Any],
     ca_bundle_path: Path,
@@ -230,7 +247,7 @@ def run_xray_endpoint_test(
     master_ssh: SSHClient,
     worker_ssh: SSHClient,
     is_worker_endpoint: bool,
-    timeout: int = 15,
+    timeout: int = 30,
     acme_mode: str = "production",
     source_ip: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -294,14 +311,7 @@ def run_xray_endpoint_test(
                     "error": "Cannot start per-case tcpdump capture on both VPS"}
 
         # Execute exactly one request while both VPS captures are active.
-        curl_cmd = [
-            "curl",
-            "-fsS",
-            "--connect-timeout", "8",
-            "--max-time", str(timeout),
-            "-x", f"socks5h://127.0.0.1:{socks_port}",
-            "https://api.ipify.org",
-        ]
+        curl_cmd = build_traffic_curl_cmd(f"socks5h://127.0.0.1:{socks_port}", timeout)
         try:
             curl_res = subprocess.run(curl_cmd, capture_output=True, text=True)
         finally:
@@ -356,6 +366,7 @@ def run_mihomo_traffic_suite(
     master_ssh: SSHClient,
     worker_ssh: SSHClient,
     source_ip: Optional[str] = None,
+    timeout: int = 30,
 ) -> Dict[str, Any]:
     """Execute Mihomo data plane verification across all subscription proxies."""
     if not config.test_mihomo_traffic:
@@ -552,14 +563,7 @@ def run_mihomo_traffic_suite(
                 continue
 
             # Execute exactly one request while both VPS captures are active.
-            curl_cmd = [
-                "curl",
-                "-fsS",
-                "--connect-timeout", "5",
-                "--max-time", "10",
-                "-x", f"http://127.0.0.1:{mixed_port}",
-                "https://api.ipify.org",
-            ]
+            curl_cmd = build_traffic_curl_cmd(f"http://127.0.0.1:{mixed_port}", timeout)
             try:
                 curl_res = subprocess.run(curl_cmd, capture_output=True, text=True)
             finally:

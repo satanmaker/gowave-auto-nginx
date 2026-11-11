@@ -1657,6 +1657,24 @@ setup_system_prereqs() {
         curl tar gzip openssl ufw fail2ban iproute2 ca-certificates
 }
 
+configure_worker_dot() {
+    local dot_conf="${1:-/etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf}"
+    if [[ -e "$dot_conf" ]]; then
+        _DOT_CREATED_BY_US=0
+    else
+        _DOT_CREATED_BY_US=1
+    fi
+    if declare -F configure_dot >/dev/null 2>&1; then
+        if ! configure_dot </dev/null; then
+            log_warn "Strict DNS-over-TLS setup failed; the Worker resolver remains unhardened."
+            _DOT_CREATED_BY_US=0
+        fi
+    else
+        log_warn "DNS-over-TLS helper unavailable; the Worker resolver remains unhardened."
+        _DOT_CREATED_BY_US=0
+    fi
+}
+
 configure_host_security() {
     # Keep MTU/file-limit tuning independent from optional BBR support.
     mkdir -p /etc/sysctl.d
@@ -1716,6 +1734,11 @@ configure_host_security() {
             fi
         fi
     fi
+
+    # Xray and Go cache no resolver answers, so a single dropped UDP/53 query
+    # stalls tunnel setup for the full resolver timeout. Strict DoT uses TCP/853
+    # with retransmission and keeps the Worker's data plane reliable.
+    configure_worker_dot
 }
 
 configure_firewall() {
@@ -2229,6 +2252,16 @@ compensate_remote_worker() {
         echo "[ROLLBACK] Removing sysctl configuration..." >&2
         rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1
         sysctl --system 2>/dev/null || rollback_failed=1
+    fi
+
+    # 7b. Revert the strict DNS-over-TLS drop-in created by this run
+    if [[ "${_DOT_CREATED_BY_US:-0}" -eq 1 ]]; then
+        echo "[ROLLBACK] Removing strict DNS-over-TLS configuration..." >&2
+        if [[ -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf ]] &&
+            grep -qF 'Managed by GoWave Auto NGINX: VPS Security' /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf; then
+            rm -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf || rollback_failed=1
+            systemctl restart systemd-resolved 2>/dev/null || rollback_failed=1
+        fi
     fi
 
     # 8. Clean temporary files and unset secrets
@@ -2755,8 +2788,13 @@ if command -v ufw >/dev/null 2>&1; then
         ufw delete allow 443/tcp 2>/dev/null || rollback_failed=1
     fi
 fi
-# 5. Clean sysctl and scratch
+# 5. Clean sysctl, project-owned DNS drop-in and scratch
 rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1
+if [[ -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf ]] &&
+    grep -qF 'Managed by GoWave Auto NGINX: VPS Security' /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf; then
+    rm -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf || rollback_failed=1
+    systemctl restart systemd-resolved 2>/dev/null || rollback_failed=1
+fi
 rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-node-install-*.sh || rollback_failed=1
 sysctl --system 2>/dev/null || rollback_failed=1
 

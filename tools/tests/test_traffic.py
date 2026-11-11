@@ -13,6 +13,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from live_vps.traffic import (
     apply_xray_trust_anchors,
+    build_traffic_curl_cmd,
     evaluate_traffic_suite_status,
     classify_server_host,
     run_mihomo_traffic_suite,
@@ -21,6 +22,23 @@ from live_vps.traffic import (
     finish_pair_ingress,
     get_xray_server_port,
 )
+
+
+class TestTrafficCurlBudget(unittest.TestCase):
+    def test_connect_budget_survives_one_cold_resolver_stall(self):
+        # Go and Xray cache no DNS answers; one dropped UDP query costs 5s, so a
+        # connect budget below that turns a resolvable host into a curl timeout.
+        cmd = build_traffic_curl_cmd("socks5h://127.0.0.1:1080", 30)
+        connect = int(cmd[cmd.index("--connect-timeout") + 1])
+        self.assertGreater(connect, 5)
+        self.assertLessEqual(connect, 30)
+        self.assertEqual(cmd[cmd.index("--max-time") + 1], "30")
+        self.assertEqual(cmd[cmd.index("-x") + 1], "socks5h://127.0.0.1:1080")
+
+    def test_connect_budget_keeps_a_floor_for_short_timeouts(self):
+        cmd = build_traffic_curl_cmd("http://127.0.0.1:7890", 4)
+        self.assertEqual(int(cmd[cmd.index("--connect-timeout") + 1]), 10)
+        self.assertEqual(cmd[cmd.index("--max-time") + 1], "4")
 
 
 class TestXrayTrustAnchors(unittest.TestCase):
