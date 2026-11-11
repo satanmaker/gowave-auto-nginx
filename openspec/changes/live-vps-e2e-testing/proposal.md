@@ -42,7 +42,9 @@ subscription delivery, and actual Data Plane tunnel traffic — on disposable re
   public mTLS control plane, Panel API cluster structure, subscription delivery policy, UFW firewall isolation,
   NGINX SNI routing and REALITY decoy, and Data Plane traffic through eight logical VPN endpoints by default (four core
   protocols on each VPS), or ten when both Vision domains are configured; each endpoint is exercised by both real
-  Xray and Mihomo client processes using the configured REALITY fingerprint (`firefox` by default) (sixteen or twenty runtime cases), plus an optional second mihomo-compatible client via `ALT_MIHOMO_CORE`.
+  Xray and Mihomo client processes using the configured REALITY fingerprint (`firefox` by default) (sixteen or
+  twenty runtime cases), run with exactly the pinned cores that Panel and Node deploy (`XRAY_CLIENT_VERSION`
+  `26.11.9`, `MIHOMO_CLIENT_VERSION` `1.19.34`).
 
 ### Modified Capabilities
 

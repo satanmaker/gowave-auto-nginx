@@ -2,6 +2,7 @@
 """Unit tests for negative scenarios module and suite status gate."""
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 import sys
@@ -12,6 +13,7 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT))
 
 from live_vps.dns import DNSCheckResult
+from live_vps.ssh import SSHResult
 from live_vps.negative import (
     run_neg_10_mtls_forged_certificate,
     run_negative_suite,
@@ -20,6 +22,25 @@ from live_vps.negative import (
     run_neg_03_dns_wrong_ip,
     run_neg_04_dns_missing_aaaa,
 )
+
+
+class FakeSSH:
+    """Minimal SSH stand-in that answers by matching the remote command text."""
+
+    def __init__(self, handler):
+        self._handler = handler
+        self.calls = []
+
+    def run(self, remote_cmd, input_data=None, timeout=60):
+        self.calls.append(remote_cmd)
+        return self._handler(remote_cmd)
+
+
+STALE_NODE_ADD_JOURNAL = {
+    "op": "node_add",
+    "state": "NODE_ADD_ROLLED_BACK",
+    "node_name": "neg13-interrupt",
+}
 
 
 class TestNegativeScenarios(unittest.TestCase):
@@ -75,16 +96,318 @@ class TestNegativeScenarios(unittest.TestCase):
         )
         self.assertEqual(run_neg_04_dns_missing_aaaa()["status"], "INCOMPLETE")
 
-    def test_unimplemented_backup_and_journal_scenarios_are_not_pass(self):
-        from live_vps.negative import (
-            run_neg_11_backup_corrupted_tar,
-            run_neg_12_backup_corrupted_sqlite,
-            run_neg_13_worker_deploy_interrupted_journal,
+    def test_neg_11_rejects_corrupted_header_before_mutating(self):
+        from live_vps.negative import run_neg_11_backup_corrupted_tar
+
+        def handler(cmd):
+            if "backup --type panel" in cmd:
+                return SSHResult(0, "", "")
+            if cmd.startswith("dd "):
+                return SSHResult(0, "", "")
+            if "sha256sum -- /opt/gowave/gowave.db" in cmd:
+                return SSHResult(0, "dbhash  -\n", "")
+            if "sha256sum -- /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
+                return SSHResult(0, "journalhash  -\n", "")
+            if "systemctl is-active" in cmd:
+                return SSHResult(0, "", "")
+            if " restore " in cmd:
+                return SSHResult(1, "", "Validation Error: truncated header")
+            return SSHResult(0, "", "")
+
+        result = run_neg_11_backup_corrupted_tar(FakeSSH(handler), MagicMock(restore_timeout=120))
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["journal_untouched"])
+        self.assertTrue(result["service_kept_active"])
+
+    def test_neg_11_successful_restore_is_fail(self):
+        from live_vps.negative import run_neg_11_backup_corrupted_tar
+
+        def handler(cmd):
+            if "sha256sum -- /opt/gowave/gowave.db" in cmd:
+                return SSHResult(0, "dbhash  -\n", "")
+            if "sha256sum -- /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
+                return SSHResult(0, "journalhash  -\n", "")
+            if " restore " in cmd:
+                return SSHResult(0, "Restore completed", "")
+            return SSHResult(0, "", "")
+
+        result = run_neg_11_backup_corrupted_tar(FakeSSH(handler), MagicMock(restore_timeout=120))
+        self.assertEqual(result["status"], "FAIL")
+
+    def test_neg_12_rejects_corrupted_database_at_integrity_gate(self):
+        from live_vps.negative import run_neg_12_backup_corrupted_sqlite
+
+        def handler(cmd):
+            if "sha256sum -- /opt/gowave/gowave.db" in cmd:
+                return SSHResult(0, "dbhash  -\n", "")
+            if "sha256sum -- /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
+                return SSHResult(0, "journalhash  -\n", "")
+            if "systemctl is-active" in cmd:
+                return SSHResult(0, "", "")
+            if " restore " in cmd:
+                return SSHResult(1, "", "Pre-restore check failed: staged database integrity check returned: corrupt")
+            return SSHResult(0, "", "")
+
+        result = run_neg_12_backup_corrupted_sqlite(FakeSSH(handler), MagicMock(restore_timeout=120))
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["rejected"])
+        self.assertTrue(result["live_data_unchanged"])
+
+    def test_neg_12_mutated_live_database_is_fail(self):
+        from live_vps.negative import run_neg_12_backup_corrupted_sqlite
+
+        hashes = iter(("before  -", "after  -"))
+
+        def handler(cmd):
+            if "sha256sum -- /opt/gowave/gowave.db" in cmd:
+                return SSHResult(0, next(hashes, "after  -") + "\n", "")
+            if "sha256sum -- /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
+                return SSHResult(0, "journalhash  -\n", "")
+            if " restore " in cmd:
+                return SSHResult(1, "", "Pre-restore check failed: staged database integrity check returned: corrupt")
+            return SSHResult(0, "", "")
+
+        result = run_neg_12_backup_corrupted_sqlite(FakeSSH(handler), MagicMock(restore_timeout=120))
+        self.assertEqual(result["status"], "FAIL")
+
+    def test_neg_13_interrupted_dispatch_leaves_journal_uncommitted(self):
+        from live_vps.negative import run_neg_13_worker_deploy_interrupted_journal
+
+        journal = {"op": "node_add", "state": "NODE_ADD_VERIFYING", "node_name": "neg13-interrupt"}
+        journal_reads = []
+
+        def handler(cmd):
+            if "cat /var/lib/gowave-auto-nginx/state.json" in cmd:
+                return SSHResult(0, json.dumps({"nodes": []}), "")
+            if "nohup setsid" in cmd:
+                return SSHResult(0, "PID:4242\n", "")
+            if "cat /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
+                journal_reads.append(True)
+                served = STALE_NODE_ADD_JOURNAL if len(journal_reads) == 1 else journal
+                return SSHResult(0, json.dumps(served), "")
+            if "kill -0 -4242" in cmd:
+                return SSHResult(1, "", "")
+            if "validate_journal" in cmd:
+                return SSHResult(0, "", "")
+            if "rollback_provisioning" in cmd:
+                journal["state"] = "NODE_ADD_ROLLED_BACK"
+                return SSHResult(0, "", "")
+            return SSHResult(0, "", "")
+
+        config = MagicMock(
+            restore_timeout=120, worker_ssh_user="root", worker_ssh_port=22,
         )
-        ssh = MagicMock()
-        self.assertEqual(run_neg_11_backup_corrupted_tar(ssh)["status"], "INCOMPLETE")
-        self.assertEqual(run_neg_12_backup_corrupted_sqlite(ssh)["status"], "INCOMPLETE")
-        self.assertEqual(run_neg_13_worker_deploy_interrupted_journal(ssh)["status"], "INCOMPLETE")
+        result = run_neg_13_worker_deploy_interrupted_journal(FakeSSH(handler), config)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["post_kill_journal_state"], "NODE_ADD_VERIFYING")
+        self.assertTrue(result["state_restored"])
+        self.assertTrue(result["lock_released"])
+        self.assertEqual(result["rollback_journal_state"], "NODE_ADD_ROLLED_BACK")
+
+    def test_neg_13_dispatch_without_verifying_state_is_incomplete(self):
+        from live_vps.negative import run_neg_13_worker_deploy_interrupted_journal
+
+        journal = {"op": "node_add", "state": "NODE_ADD_COMMITTED", "node_name": "neg13-interrupt"}
+        journal_reads = []
+
+        def handler(cmd):
+            if "cat /var/lib/gowave-auto-nginx/state.json" in cmd:
+                return SSHResult(0, json.dumps({"nodes": []}), "")
+            if "nohup setsid" in cmd:
+                return SSHResult(0, "PID:4242\n", "")
+            if "cat /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
+                journal_reads.append(True)
+                served = STALE_NODE_ADD_JOURNAL if len(journal_reads) == 1 else journal
+                return SSHResult(0, json.dumps(served), "")
+            if "kill -0 4242" in cmd:
+                return SSHResult(1, "", "")
+            if "kill -0 -4242" in cmd:
+                return SSHResult(1, "", "")
+            return SSHResult(0, "", "")
+
+        config = MagicMock(restore_timeout=120, worker_ssh_user="root", worker_ssh_port=22)
+        result = run_neg_13_worker_deploy_interrupted_journal(FakeSSH(handler), config)
+        self.assertEqual(result["status"], "INCOMPLETE")
+
+    def test_neg_13_volatile_state_fields_do_not_mask_restoration(self):
+        from live_vps.negative import run_neg_13_worker_deploy_interrupted_journal
+
+        journal = {"op": "node_add", "state": "NODE_ADD_VERIFYING", "node_name": "neg13-interrupt"}
+        state_reads = []
+        journal_reads = []
+
+        def handler(cmd):
+            if "cat /var/lib/gowave-auto-nginx/state.json" in cmd:
+                state_reads.append(True)
+                stamp = "2026-11-11T20:00:00Z" if len(state_reads) == 1 else "2026-11-11T20:00:05Z"
+                return SSHResult(0, json.dumps(
+                    {"schemaVersion": 2, "lastUpdated": stamp, "nodes": []}
+                ), "")
+            if "nohup setsid" in cmd:
+                return SSHResult(0, "PID:4242\n", "")
+            if "cat /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
+                journal_reads.append(True)
+                served = STALE_NODE_ADD_JOURNAL if len(journal_reads) == 1 else journal
+                return SSHResult(0, json.dumps(served), "")
+            if "kill -0 -4242" in cmd:
+                return SSHResult(1, "", "")
+            if "validate_journal" in cmd:
+                return SSHResult(0, "", "")
+            if "rollback_provisioning" in cmd:
+                journal["state"] = "NODE_ADD_ROLLED_BACK"
+                return SSHResult(0, "", "")
+            return SSHResult(0, "", "")
+
+        config = MagicMock(restore_timeout=120, worker_ssh_user="root", worker_ssh_port=22)
+        result = run_neg_13_worker_deploy_interrupted_journal(FakeSSH(handler), config)
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["state_restored"])
+
+    def test_neg_13_orphan_node_entry_is_not_restored(self):
+        from live_vps.negative import run_neg_13_worker_deploy_interrupted_journal
+
+        journal = {"op": "node_add", "state": "NODE_ADD_VERIFYING", "node_name": "neg13-interrupt"}
+        state_reads = []
+        journal_reads = []
+
+        def handler(cmd):
+            if "cat /var/lib/gowave-auto-nginx/state.json" in cmd:
+                state_reads.append(True)
+                nodes = [] if len(state_reads) == 1 else [{"name": "neg13-interrupt"}]
+                return SSHResult(0, json.dumps({"nodes": nodes}), "")
+            if "nohup setsid" in cmd:
+                return SSHResult(0, "PID:4242\n", "")
+            if "cat /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
+                journal_reads.append(True)
+                served = STALE_NODE_ADD_JOURNAL if len(journal_reads) == 1 else journal
+                return SSHResult(0, json.dumps(served), "")
+            if "kill -0 -4242" in cmd:
+                return SSHResult(1, "", "")
+            if "validate_journal" in cmd:
+                return SSHResult(0, "", "")
+            if "rollback_provisioning" in cmd:
+                journal["state"] = "NODE_ADD_ROLLED_BACK"
+                return SSHResult(0, "", "")
+            return SSHResult(0, "", "")
+
+        config = MagicMock(restore_timeout=120, worker_ssh_user="root", worker_ssh_port=22)
+        result = run_neg_13_worker_deploy_interrupted_journal(FakeSSH(handler), config)
+        self.assertFalse(result["state_restored"])
+        self.assertEqual(result["status"], "INCOMPLETE")
+
+    @patch("live_vps.negative.MUTATION_LOCK_WAIT_SECONDS", 0)
+    def test_neg_13_held_mutation_lock_is_incomplete(self):
+        from live_vps.negative import run_neg_13_worker_deploy_interrupted_journal
+
+        journal = {"op": "node_add", "state": "NODE_ADD_VERIFYING", "node_name": "neg13-interrupt"}
+        journal_reads = []
+
+        def handler(cmd):
+            if "cat /var/lib/gowave-auto-nginx/state.json" in cmd:
+                return SSHResult(0, json.dumps({"nodes": []}), "")
+            if "flock -n /run/lock/gowave-managed-mutation.lock" in cmd:
+                return SSHResult(1, "", "")
+            if "nohup setsid" in cmd:
+                return SSHResult(0, "PID:4242\n", "")
+            if "cat /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
+                journal_reads.append(True)
+                served = STALE_NODE_ADD_JOURNAL if len(journal_reads) == 1 else journal
+                return SSHResult(0, json.dumps(served), "")
+            if "kill -0 -4242" in cmd:
+                return SSHResult(1, "", "")
+            if "validate_journal" in cmd:
+                return SSHResult(0, "", "")
+            if "rollback_provisioning" in cmd:
+                journal["state"] = "NODE_ADD_ROLLED_BACK"
+                return SSHResult(0, "", "")
+            return SSHResult(0, "", "")
+
+        config = MagicMock(restore_timeout=120, worker_ssh_user="root", worker_ssh_port=22)
+        result = run_neg_13_worker_deploy_interrupted_journal(FakeSSH(handler), config)
+        self.assertFalse(result["lock_released"])
+        self.assertEqual(result["status"], "INCOMPLETE")
+
+    @patch("live_vps.negative.MUTATION_LOCK_WAIT_SECONDS", 0)
+    def test_neg_13_reaps_the_orphaned_dispatch_and_passes(self):
+        from live_vps.negative import run_neg_13_worker_deploy_interrupted_journal
+
+        journal = {"op": "node_add", "state": "NODE_ADD_VERIFYING", "node_name": "neg13-interrupt"}
+        journal_reads = []
+        reaped = []
+
+        def handler(cmd):
+            if "cat /var/lib/gowave-auto-nginx/state.json" in cmd:
+                return SSHResult(0, json.dumps({"nodes": []}), "")
+            if "readlink -f" in cmd:
+                reaped.append(True)
+                return SSHResult(0, "", "")
+            if "flock -n /run/lock/gowave-managed-mutation.lock" in cmd:
+                return SSHResult(0 if reaped else 1, "", "")
+            if "nohup setsid" in cmd:
+                return SSHResult(0, "PID:4242\n", "")
+            if "cat /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
+                journal_reads.append(True)
+                served = STALE_NODE_ADD_JOURNAL if len(journal_reads) == 1 else journal
+                return SSHResult(0, json.dumps(served), "")
+            if "kill -0 -4242" in cmd:
+                return SSHResult(1, "", "")
+            if "validate_journal" in cmd:
+                return SSHResult(0, "", "")
+            if "rollback_provisioning" in cmd:
+                journal["state"] = "NODE_ADD_ROLLED_BACK"
+                return SSHResult(0, "", "")
+            return SSHResult(0, "", "")
+
+        config = MagicMock(restore_timeout=120, worker_ssh_user="root", worker_ssh_port=22)
+        result = run_neg_13_worker_deploy_interrupted_journal(FakeSSH(handler), config)
+        self.assertTrue(result["lock_released"])
+        self.assertTrue(result["lock_released_after_reap"])
+        self.assertEqual(result["status"], "PASS")
+
+    @patch("live_vps.negative.MUTATION_LOCK_WAIT_SECONDS", 0)
+    def test_neg_11_held_mutation_lock_skips_the_restore(self):
+        from live_vps.negative import run_neg_11_backup_corrupted_tar
+
+        def handler(cmd):
+            if "flock -n /run/lock/gowave-managed-mutation.lock" in cmd:
+                return SSHResult(1, "", "")
+            if "sha256sum -- /opt/gowave/gowave.db" in cmd:
+                return SSHResult(0, "dbhash  -\n", "")
+            if "sha256sum -- /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
+                return SSHResult(0, "journalhash  -\n", "")
+            return SSHResult(0, "", "")
+
+        fake = FakeSSH(handler)
+        result = run_neg_11_backup_corrupted_tar(fake, MagicMock(restore_timeout=120))
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertFalse(any(" restore " in call for call in fake.calls))
+
+    def test_neg_13_committed_after_interruption_is_fail(self):
+        from live_vps.negative import run_neg_13_worker_deploy_interrupted_journal
+
+        reads = []
+
+        def handler(cmd):
+            if "cat /var/lib/gowave-auto-nginx/state.json" in cmd:
+                return SSHResult(0, json.dumps({"nodes": []}), "")
+            if "nohup setsid" in cmd:
+                return SSHResult(0, "PID:4242\n", "")
+            if "cat /var/lib/gowave-auto-nginx/recovery/journal.json" in cmd:
+                reads.append(True)
+                if len(reads) == 1:
+                    served = STALE_NODE_ADD_JOURNAL
+                else:
+                    state = "NODE_ADD_VERIFYING" if len(reads) == 2 else "NODE_ADD_COMMITTED"
+                    served = {"op": "node_add", "state": state, "node_name": "neg13-interrupt"}
+                return SSHResult(0, json.dumps(served), "")
+            if "kill -0 -4242" in cmd:
+                return SSHResult(1, "", "")
+            return SSHResult(0, "", "")
+
+        config = MagicMock(restore_timeout=120, worker_ssh_user="root", worker_ssh_port=22)
+        result = run_neg_13_worker_deploy_interrupted_journal(FakeSSH(handler), config)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertEqual(result["post_kill_journal_state"], "NODE_ADD_COMMITTED")
 
     @patch("live_vps.negative.run_mtls_negative_tests")
     def test_neg_10_uses_valid_sni_and_trusted_server_path(self, mtls_negative):

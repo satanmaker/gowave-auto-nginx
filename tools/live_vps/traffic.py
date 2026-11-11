@@ -267,13 +267,8 @@ def run_mihomo_traffic_suite(
     config: LiveVPSConfig,
     master_ssh: SSHClient,
     worker_ssh: SSHClient,
-    core_binary: str = "mihomo",
 ) -> Dict[str, Any]:
-    """Execute Mihomo data plane verification across all subscription proxies.
-
-    core_binary allows running the same suite with a mihomo-compatible fork
-    (for example Prizrak-Core) without altering the subscription under test.
-    """
+    """Execute Mihomo data plane verification across all subscription proxies."""
     if not config.test_mihomo_traffic:
         return {
             "status": "INCOMPLETE",
@@ -373,7 +368,7 @@ def run_mihomo_traffic_suite(
     try:
         mihomo_log = mihomo_log_path.open("w", encoding="utf-8")
         proc = subprocess.Popen(
-            [core_binary, "-d", td.name, "-f", str(tmp_config_path)],
+            ["mihomo", "-d", td.name, "-f", str(tmp_config_path)],
             stdout=mihomo_log,
             stderr=subprocess.STDOUT,
             env=env,
@@ -515,7 +510,7 @@ def run_mihomo_traffic_suite(
         suite_status = "PASS"
     return {
         "status": suite_status,
-        "client": Path(core_binary).name,
+        "client": "mihomo",
         "results": case_results,
     }
 
@@ -525,7 +520,6 @@ def evaluate_traffic_suite_status(
     xray_results: List[Dict[str, Any]],
     mihomo_results: Optional[Dict[str, Any]] = None,
     expected_case_count: Optional[int] = None,
-    mihomo_alt_results: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Evaluate overall status for traffic suite.
     Enforces that disabling traffic verification or Mihomo traffic forces INCOMPLETE, not PASS.
@@ -558,15 +552,5 @@ def evaluate_traffic_suite_status(
         return "INCOMPLETE"
     if mihomo_results.get("status") != "PASS":
         return "FAIL"
-
-    # Optional second mihomo-compatible client is gated only when it actually ran.
-    if mihomo_alt_results and not mihomo_alt_results.get("skipped"):
-        alt_cases = mihomo_alt_results.get("results", [])
-        if expected_case_count is not None and len(alt_cases) != expected_case_count:
-            return "INCOMPLETE"
-        if mihomo_alt_results.get("status") == "INCOMPLETE":
-            return "INCOMPLETE"
-        if mihomo_alt_results.get("status") != "PASS":
-            return "FAIL"
 
     return "PASS"

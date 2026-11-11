@@ -547,13 +547,12 @@ evidence; syntax checks do not count.
 - **WHEN** the runner executes the Data Plane phase
 - **THEN** it runs Xray and Mihomo independently against each of the active logical endpoints (16 or 20 cases total); all cases must pass for overall `PASS`
 
-#### Scenario: Optional second mihomo-compatible client suite
+#### Scenario: Clients are the cores deployed by Panel and Node
 
-- **GIVEN** `ALT_MIHOMO_CORE` names an executable mihomo-compatible core (for example Prizrak-Core)
-- **WHEN** the Data Plane phase has produced the fetched Mihomo subscription
-- **THEN** the runner replays the same logical endpoints through that binary and gates its results with the same
-  rules as upstream Mihomo (count mismatch or `INCOMPLETE` → `INCOMPLETE`, any non-`PASS` → `FAIL`), while
-  leaving the key unset records the suite as skipped and does not affect the mandatory matrix
+- **GIVEN** the pinned `XRAY_CLIENT_VERSION` and `MIHOMO_CLIENT_VERSION` binaries on the Control Machine
+- **WHEN** the runner executes the Data Plane phase
+- **THEN** exactly those two pinned cores are exercised against the subscription (no alternative or
+  replacement client binaries), matching the server cores that GoWave Panel and GoWave Node deploy
 
 #### Scenario: Xray runtime request traverses the selected Master endpoint
 
@@ -682,6 +681,8 @@ execute guaranteed cleanup and post-case baseline verification.
 - **WHEN** the runner inspects the recovery journal on Master
 - **THEN** journal state is NOT `COMMITTED`; it is in a failure or recovery-required state requiring operator
   action before the Worker is considered registered
+- **AND** the recorded rollback removes the partial Panel entities and the Worker entry from `state.json`, leaving
+  its content equal to the pre-dispatch snapshot apart from the update timestamp, and releases the host mutation lock
 
 #### Scenario: Preflight, lifecycle, and protocol scenarios verified (NEG-01..NEG-10)
 

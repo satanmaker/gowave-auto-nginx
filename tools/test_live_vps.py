@@ -642,29 +642,17 @@ def main() -> int:
             )
 
             expected_per_client = 10 if (config.master_vision_domain and config.worker_vision_domain) else 8
-            alt_suite_res = None
-            if config.alt_mihomo_core:
-                alt_suite_res = run_mihomo_traffic_suite(
-                    subscription_yaml_str=mihomo_yaml_str,
-                    ca_bundle_path=ca_bundle,
-                    config=config,
-                    master_ssh=master_ssh,
-                    worker_ssh=worker_ssh,
-                    core_binary=config.alt_mihomo_core,
-                )
             traffic_status = evaluate_traffic_suite_status(
                 test_traffic_verification=config.test_traffic_verification,
                 xray_results=xray_case_results,
                 mihomo_results=mihomo_suite_res,
                 expected_case_count=expected_per_client,
-                mihomo_alt_results=alt_suite_res,
             )
 
             state["results"]["traffic"] = {
                 "status": traffic_status,
                 "xray_results": xray_case_results,
                 "mihomo_results": mihomo_suite_res,
-                "mihomo_alt_results": alt_suite_res,
             }
             save_run_state(artifact_dir, state)
 

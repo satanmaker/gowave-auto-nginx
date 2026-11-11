@@ -266,34 +266,482 @@ def run_neg_10_mtls_forged_certificate(master_ssh: SSHClient, worker_ip: str) ->
     }
 
 
-def run_neg_11_backup_corrupted_tar(master_ssh: SSHClient) -> Dict[str, Any]:
-    """NEG-11 is not implemented as a safe restore fixture yet."""
-    return {
-        "scenario": "NEG-11",
-        "name": "Backup Restore Corrupted Header Rejection",
-        "status": "INCOMPLETE",
-        "message": "No isolated backup/restore fixture and before/after state assertion exists; scenario intentionally not executed",
-    }
+GOWAVE_AUTO_DIR = "/opt/gowave-auto-nginx"
+BACKUP_SCRIPT = f"{GOWAVE_AUTO_DIR}/assets/backup/gowave-backup.sh"
+PANEL_DB_PATH = "/opt/gowave/gowave.db"
+RECOVERY_JOURNAL_PATH = "/var/lib/gowave-auto-nginx/recovery/journal.json"
+STATE_FILE_PATH = "/var/lib/gowave-auto-nginx/state.json"
+MUTATION_LOCK_PATH = "/run/lock/gowave-managed-mutation.lock"
+MUTATION_LOCK_WAIT_SECONDS = 60.0
+NEG13_TARGET_IP = "10.255.255.1"
 
 
-def run_neg_12_backup_corrupted_sqlite(master_ssh: SSHClient) -> Dict[str, Any]:
-    """NEG-12 is not implemented as a real corrupted-database restore fixture yet."""
-    return {
-        "scenario": "NEG-12",
-        "name": "Backup Restore Corrupted SQLite DB Integrity Check",
-        "status": "INCOMPLETE",
-        "message": "The current in-memory SQLite smoke test does not exercise backup restore; scenario intentionally not reported as PASS",
-    }
+def _remote_sha256(ssh: SSHClient, path: str) -> Optional[str]:
+    result = ssh.run(f"sha256sum -- {shlex.quote(path)} 2>/dev/null | awk '{{print $1}}'")
+    digest = result.stdout.strip()
+    return digest or None
 
 
-def run_neg_13_worker_deploy_interrupted_journal(master_ssh: SSHClient) -> Dict[str, Any]:
-    """NEG-13 is not implemented as a real interrupted-dispatch recovery test yet."""
-    return {
-        "scenario": "NEG-13",
-        "name": "Interrupted SSH Deployment Journal Integrity",
-        "status": "INCOMPLETE",
-        "message": "No deterministic worker-dispatch interruption and subsequent journal-recovery assertion exists; scenario intentionally not executed",
-    }
+def _service_active(ssh: SSHClient, unit: str) -> bool:
+    return ssh.run(f"systemctl is-active --quiet {shlex.quote(unit)}").ok
+
+
+def _read_remote_journal(ssh: SSHClient) -> Dict[str, Any]:
+    result = ssh.run(f"cat {shlex.quote(RECOVERY_JOURNAL_PATH)} 2>/dev/null || true")
+    try:
+        data = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_remote_state(ssh: SSHClient) -> Optional[Dict[str, Any]]:
+    result = ssh.run(f"cat {shlex.quote(STATE_FILE_PATH)} 2>/dev/null || true")
+    try:
+        data = json.loads(result.stdout)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _state_payload(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop bookkeeping fields that every rollout rewrites.
+
+    ``atomic_write_state`` stamps ``lastUpdated`` (and ``schemaVersion``) on each
+    write, so rollback changes them even when it restores the exact same nodes.
+    """
+    return {key: value for key, value in state.items() if key not in {"lastUpdated", "schemaVersion"}}
+
+
+def _wait_for_mutation_lock(ssh: SSHClient, timeout_seconds: float = 60.0) -> bool:
+    """Wait until no lifecycle command holds the host-wide mutation lock."""
+    lock = shlex.quote(MUTATION_LOCK_PATH)
+    deadline = time.time() + timeout_seconds
+    while True:
+        probe = ssh.run(f"if [ -e {lock} ]; then flock -n {lock} true; fi")
+        if probe.ok:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(2)
+
+
+def _reap_stale_dispatch_holders(ssh: SSHClient) -> None:
+    """Kill leftover dispatch processes that still hold the mutation lock.
+
+    The interrupted Worker dispatch targets an unroutable address, so its ssh
+    child can outlive the killed process group until the TCP connect timeout
+    expires, keeping the inherited lock descriptor open.
+    """
+    ssh.run(
+        f"""
+LOCK={shlex.quote(MUTATION_LOCK_PATH)}
+MARK={shlex.quote(NEG13_TARGET_IP)}
+for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+  [ "$pid" = "$$" ] && continue
+  [ "$pid" = "$PPID" ] && continue
+  cmd=$(tr '\\0' ' ' </proc/$pid/cmdline 2>/dev/null) || continue
+  case "$cmd" in *"$MARK"*) ;; *) continue ;; esac
+  for fd in /proc/$pid/fd/*; do
+    if [ "$(readlink -f "$fd" 2>/dev/null)" = "$LOCK" ]; then
+      kill -KILL "$pid" 2>/dev/null || true
+      break
+    fi
+  done
+done
+true
+"""
+    )
+
+
+def run_neg_11_backup_corrupted_tar(master_ssh: SSHClient, config: LiveVPSConfig) -> Dict[str, Any]:
+    """NEG-11: a corrupted archive header must be rejected before any live mutation."""
+    ts = int(time.time())
+    archive = f"/tmp/neg11-corrupt-header-{ts}.tar.gz"
+    name = "Backup Restore Corrupted Header Rejection"
+    try:
+        created = master_ssh.run(
+            f"{shlex.quote(BACKUP_SCRIPT)} backup --type panel {shlex.quote(archive)}",
+            timeout=config.restore_timeout,
+        )
+        if not created.ok:
+            return {
+                "scenario": "NEG-11",
+                "name": name,
+                "status": "INCOMPLETE",
+                "message": "Could not create the panel backup fixture",
+            }
+
+        corrupted = master_ssh.run(
+            f"dd if=/dev/urandom of={shlex.quote(archive)} bs=512 count=1 conv=notrunc status=none"
+        )
+        if not corrupted.ok:
+            return {
+                "scenario": "NEG-11",
+                "name": name,
+                "status": "INCOMPLETE",
+                "message": "Could not corrupt the archive header fixture",
+            }
+
+        db_before = _remote_sha256(master_ssh, PANEL_DB_PATH)
+        journal_before = _remote_sha256(master_ssh, RECOVERY_JOURNAL_PATH)
+        service_before = _service_active(master_ssh, "gowave.service")
+
+        if not _wait_for_mutation_lock(master_ssh, MUTATION_LOCK_WAIT_SECONDS):
+            return {
+                "scenario": "NEG-11",
+                "name": name,
+                "status": "INCOMPLETE",
+                "message": "Host mutation lock stayed held, so the corrupted-archive restore was never attempted",
+            }
+
+        restore = master_ssh.run(
+            f"{shlex.quote(BACKUP_SCRIPT)} restore {shlex.quote(archive)}",
+            timeout=config.restore_timeout,
+        )
+
+        db_after = _remote_sha256(master_ssh, PANEL_DB_PATH)
+        journal_after = _remote_sha256(master_ssh, RECOVERY_JOURNAL_PATH)
+        service_after = _service_active(master_ssh, "gowave.service")
+
+        output = (restore.stdout or "") + (restore.stderr or "")
+        rejected = (not restore.ok) and (
+            "Validation Error" in output
+            or "ReadError" in output
+            or "gzip" in output
+            or "could not be opened successfully" in output
+            or "truncated header" in output
+        )
+        live_data_unchanged = db_before is not None and db_before == db_after
+        service_kept = service_before and service_after
+        journal_untouched = journal_before is not None and journal_before == journal_after
+        passed = rejected and live_data_unchanged and service_kept and journal_untouched
+
+        if passed:
+            status = "PASS"
+            message = "Corrupted archive header was rejected before stopping services or touching live data"
+        elif "Could not acquire host mutation lock" in output:
+            status = "INCOMPLETE"
+            message = "Restore was blocked by the host mutation lock instead of by archive validation"
+        elif db_before is None or journal_before is None:
+            status = "INCOMPLETE"
+            message = "Could not snapshot live state to prove the restore was rejected before mutation"
+        else:
+            status = "FAIL"
+            message = "Corrupted archive header did not prove fail-closed rejection"
+
+        return {
+            "scenario": "NEG-11",
+            "name": name,
+            "status": status,
+            "rejected": rejected,
+            "live_data_unchanged": live_data_unchanged,
+            "service_kept_active": service_kept,
+            "journal_untouched": journal_untouched,
+            "message": message,
+        }
+    finally:
+        master_ssh.run(f"rm -f -- {shlex.quote(archive)}")
+
+
+def run_neg_12_backup_corrupted_sqlite(master_ssh: SSHClient, config: LiveVPSConfig) -> Dict[str, Any]:
+    """NEG-12: a checksum-valid archive with a corrupted SQLite DB must fail the integrity gate."""
+    ts = int(time.time())
+    valid_archive = f"/tmp/neg12-valid-{ts}.tar.gz"
+    corrupted_archive = f"/tmp/neg12-corrupt-db-{ts}.tar.gz"
+    name = "Backup Restore Corrupted SQLite DB Integrity Check"
+    try:
+        created = master_ssh.run(
+            f"{shlex.quote(BACKUP_SCRIPT)} backup --type panel {shlex.quote(valid_archive)}",
+            timeout=config.restore_timeout,
+        )
+        if not created.ok:
+            return {
+                "scenario": "NEG-12",
+                "name": name,
+                "status": "INCOMPLETE",
+                "message": "Could not create the panel backup fixture",
+            }
+
+        build_script = f"""python3 - {shlex.quote(valid_archive)} {shlex.quote(corrupted_archive)} <<'PY'
+import hashlib, io, json, os, sys, tarfile
+
+src, dst = sys.argv[1], sys.argv[2]
+db_member = "files/opt/gowave/gowave.db"
+db_meta_path = "opt/gowave/gowave.db"
+payload = b"SQLite format 3\\x00" + os.urandom(8192)
+digest = hashlib.sha256(payload).hexdigest()
+
+with tarfile.open(src, "r:gz") as tar, tarfile.open(dst, "w:gz") as out:
+    members = tar.getmembers()
+    meta_member = next((m for m in members if m.name in ("meta.json", "./meta.json")), None)
+    if meta_member is None:
+        sys.exit("meta.json missing from source archive")
+    meta = json.loads(tar.extractfile(meta_member).read().decode("utf-8"))
+    patched = False
+    for entry in meta.get("files", []):
+        if entry.get("path") == db_meta_path:
+            entry["sha256"] = digest
+            patched = True
+    if not patched:
+        sys.exit("gowave.db entry missing from meta.json files list")
+    meta_bytes = json.dumps(meta, indent=2).encode("utf-8")
+    meta_member.size = len(meta_bytes)
+    out.addfile(meta_member, io.BytesIO(meta_bytes))
+    for m in members:
+        if m is meta_member:
+            continue
+        if m.name == db_member:
+            m.size = len(payload)
+            out.addfile(m, io.BytesIO(payload))
+        elif m.isreg():
+            out.addfile(m, tar.extractfile(m))
+        else:
+            out.addfile(m)
+print("corrupted-db archive built")
+PY"""
+        built = master_ssh.run(build_script, timeout=config.restore_timeout)
+        if not built.ok:
+            return {
+                "scenario": "NEG-12",
+                "name": name,
+                "status": "INCOMPLETE",
+                "message": "Could not build a checksum-valid archive with a corrupted SQLite database",
+            }
+
+        db_before = _remote_sha256(master_ssh, PANEL_DB_PATH)
+        journal_before = _remote_sha256(master_ssh, RECOVERY_JOURNAL_PATH)
+        service_before = _service_active(master_ssh, "gowave.service")
+
+        if not _wait_for_mutation_lock(master_ssh, MUTATION_LOCK_WAIT_SECONDS):
+            return {
+                "scenario": "NEG-12",
+                "name": name,
+                "status": "INCOMPLETE",
+                "message": "Host mutation lock stayed held, so the corrupted-database restore was never attempted",
+            }
+
+        restore = master_ssh.run(
+            f"{shlex.quote(BACKUP_SCRIPT)} restore {shlex.quote(corrupted_archive)}",
+            timeout=config.restore_timeout,
+        )
+
+        db_after = _remote_sha256(master_ssh, PANEL_DB_PATH)
+        journal_after = _remote_sha256(master_ssh, RECOVERY_JOURNAL_PATH)
+        service_after = _service_active(master_ssh, "gowave.service")
+
+        output = (restore.stdout or "") + (restore.stderr or "")
+        rejected = (not restore.ok) and (
+            "staged database integrity check" in output
+            or "Pre-restore check failed" in output
+        )
+        live_data_unchanged = db_before is not None and db_before == db_after
+        service_kept = service_before and service_after
+        journal_untouched = journal_before is not None and journal_before == journal_after
+        passed = rejected and live_data_unchanged and service_kept and journal_untouched
+
+        if passed:
+            status = "PASS"
+            message = "Staged SQLite integrity check rejected the corrupted database before stopping or replacing the live DB"
+        elif "Could not acquire host mutation lock" in output:
+            status = "INCOMPLETE"
+            message = "Restore was blocked by the host mutation lock instead of by the integrity gate"
+        elif db_before is None or journal_before is None:
+            status = "INCOMPLETE"
+            message = "Could not snapshot live state to prove the restore was rejected before mutation"
+        else:
+            status = "FAIL"
+            message = "Corrupted SQLite database did not prove fail-closed rejection"
+
+        return {
+            "scenario": "NEG-12",
+            "name": name,
+            "status": status,
+            "rejected": rejected,
+            "live_data_unchanged": live_data_unchanged,
+            "service_kept_active": service_kept,
+            "journal_untouched": journal_untouched,
+            "message": message,
+        }
+    finally:
+        for path in (valid_archive, corrupted_archive):
+            master_ssh.run(f"rm -f -- {shlex.quote(path)}")
+
+
+def run_neg_13_worker_deploy_interrupted_journal(
+    master_ssh: SSHClient,
+    config: LiveVPSConfig,
+) -> Dict[str, Any]:
+    """NEG-13: an interrupted Worker dispatch must leave a non-COMMITTED recovery journal."""
+    name = "Interrupted SSH Deployment Journal Integrity"
+    node_name = "neg13-interrupt"
+    known_hosts = "/root/.ssh/known_hosts"
+    known_hosts_backup = "/tmp/neg13-known-hosts.bak"
+    dummy_key = "/tmp/neg13-dummy-ed25519"
+    log_path = "/tmp/neg13-node-add.log"
+
+    state_before = _read_remote_state(master_ssh)
+    if state_before is None:
+        return {
+            "scenario": "NEG-13",
+            "name": name,
+            "status": "INCOMPLETE",
+            "message": "Could not snapshot state.json before the interrupted dispatch",
+        }
+
+    journal_before = _read_remote_journal(master_ssh)
+
+    prepared = master_ssh.run(
+        f"cp -p {shlex.quote(known_hosts)} {shlex.quote(known_hosts_backup)} && "
+        f"rm -f {shlex.quote(dummy_key)} {shlex.quote(dummy_key)}.pub {shlex.quote(log_path)} && "
+        f"ssh-keygen -q -t ed25519 -N '' -f {shlex.quote(dummy_key)} >/dev/null 2>&1 && "
+        f"awk '{{print \"{NEG13_TARGET_IP}\" \" \" $1 \" \" $2}}' {shlex.quote(dummy_key)}.pub >> {shlex.quote(known_hosts)}"
+    )
+    if not prepared.ok:
+        master_ssh.run(
+            f"rm -f {shlex.quote(dummy_key)} {shlex.quote(dummy_key)}.pub {shlex.quote(known_hosts_backup)}"
+        )
+        return {
+            "scenario": "NEG-13",
+            "name": name,
+            "status": "INCOMPLETE",
+            "message": "Could not pin a throwaway host key for the interrupted dispatch target",
+        }
+
+    pid: Optional[str] = None
+    try:
+        add_args = " ".join(
+            shlex.quote(value)
+            for value in (
+                node_name, NEG13_TARGET_IP, "neg13-test.example.com", "neg13-reality.example.com",
+                config.worker_ssh_user, str(config.worker_ssh_port),
+            )
+        )
+        start = master_ssh.run(
+            f"cd {shlex.quote(GOWAVE_AUTO_DIR)} && "
+            f"nohup setsid ./gowave-auto.sh node add {add_args} "
+            f">{shlex.quote(log_path)} 2>&1 </dev/null & echo \"PID:$!\""
+        )
+        for token in (start.stdout or "").split():
+            if token.startswith("PID:") and token[4:].isdigit():
+                pid = token[4:]
+                break
+        if pid is None:
+            return {
+                "scenario": "NEG-13",
+                "name": name,
+                "status": "INCOMPLETE",
+                "message": "Could not start the Worker dispatch detached on Master",
+            }
+
+        observed_state: Optional[str] = None
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            journal = _read_remote_journal(master_ssh)
+            if (
+                journal
+                and journal != journal_before
+                and journal.get("op") == "node_add"
+                and journal.get("node_name") == node_name
+            ):
+                observed_state = journal.get("state")
+                if observed_state == "NODE_ADD_VERIFYING":
+                    break
+            if not master_ssh.run(f"kill -0 {shlex.quote(pid)} 2>/dev/null").ok:
+                break
+            time.sleep(1)
+
+        if observed_state != "NODE_ADD_VERIFYING":
+            master_ssh.run(f"kill -KILL -{shlex.quote(pid)} 2>/dev/null || true")
+            return {
+                "scenario": "NEG-13",
+                "name": name,
+                "status": "INCOMPLETE",
+                "message": "Dispatch never reached NODE_ADD_VERIFYING, so no interruption could be proven",
+                "observed_journal_state": observed_state,
+            }
+
+        master_ssh.run(
+            f"kill -TERM -{pid} 2>/dev/null || true; sleep 1; kill -KILL -{pid} 2>/dev/null || true"
+        )
+        group_alive = master_ssh.run(f"kill -0 -{pid} 2>/dev/null").ok
+        lock_released = _wait_for_mutation_lock(master_ssh, MUTATION_LOCK_WAIT_SECONDS)
+        lock_released_after_reap = False
+        if not lock_released:
+            _reap_stale_dispatch_holders(master_ssh)
+            lock_released = _wait_for_mutation_lock(master_ssh, MUTATION_LOCK_WAIT_SECONDS)
+            lock_released_after_reap = lock_released
+
+        journal_after = _read_remote_journal(master_ssh)
+        post_kill_state = journal_after.get("state")
+        journal_valid = master_ssh.run(
+            "PYTHONPATH=/opt/gowave-auto-nginx python3 - "
+            f"{shlex.quote(RECOVERY_JOURNAL_PATH)} <<'PY'\n"
+            "import json, sys\n"
+            "from modules.recovery import validate_journal\n"
+            "validate_journal(json.load(open(sys.argv[1], encoding='utf-8')))\n"
+            "PY"
+        ).ok
+        rollback = master_ssh.run(
+            "PYTHONPATH=/opt/gowave-auto-nginx python3 -c "
+            "\"import sys; from modules.api_client import rollback_provisioning; "
+            "sys.exit(0 if rollback_provisioning() else 1)\""
+        )
+        rolled_back_state = _read_remote_journal(master_ssh).get("state")
+        state_after = _read_remote_state(master_ssh)
+        state_restored = state_after is not None and _state_payload(state_after) == _state_payload(state_before)
+
+        interrupted = not group_alive
+        journal_not_committed = (
+            post_kill_state is not None
+            and post_kill_state != "NODE_ADD_COMMITTED"
+            and journal_valid
+        )
+        api_rolled_back = rollback.ok and rolled_back_state in (
+            "NODE_ADD_ROLLED_BACK", "NODE_ADD_ROLLBACK_REQUIRED",
+        )
+        passed = interrupted and lock_released and journal_not_committed and state_restored and api_rolled_back
+
+        if passed:
+            status = "PASS"
+            message = (
+                "Interrupted dispatch left the journal non-COMMITTED and rollback removed the partial API entities"
+            )
+        elif post_kill_state == "NODE_ADD_COMMITTED":
+            status = "FAIL"
+            message = "Interrupted dispatch reached NODE_ADD_COMMITTED"
+        elif not lock_released:
+            status = "INCOMPLETE"
+            message = "Killed dispatch kept the host mutation lock held, so later scenarios could not run"
+        else:
+            status = "INCOMPLETE"
+            message = "Interruption was observed but its journal/state evidence is incomplete"
+
+        return {
+            "scenario": "NEG-13",
+            "name": name,
+            "status": status,
+            "observed_journal_state": observed_state,
+            "post_kill_journal_state": post_kill_state,
+            "journal_valid": journal_valid,
+            "interruption_confirmed": interrupted,
+            "lock_released": lock_released,
+            "lock_released_after_reap": lock_released_after_reap,
+            "state_restored": state_restored,
+            "api_rollback": rollback.ok,
+            "rollback_journal_state": rolled_back_state,
+            "message": message,
+        }
+    finally:
+        kill_group = f"kill -KILL -{pid} 2>/dev/null || true; " if pid else ""
+        master_ssh.run(
+            f"{kill_group}"
+            f"if [ -f {shlex.quote(known_hosts_backup)} ]; then "
+            f"cat {shlex.quote(known_hosts_backup)} > {shlex.quote(known_hosts)}; "
+            f"rm -f {shlex.quote(known_hosts_backup)}; fi; "
+            f"rm -f {shlex.quote(dummy_key)} {shlex.quote(dummy_key)}.pub {shlex.quote(log_path)}"
+        )
+        _reap_stale_dispatch_holders(master_ssh)
 
 
 def run_neg_14_duplicate_worker_registration(
@@ -496,9 +944,9 @@ def run_negative_suite(
 
     if master_ssh:
         scenarios.append(run_neg_10_mtls_forged_certificate(master_ssh, config.worker_ip))
-        scenarios.append(run_neg_11_backup_corrupted_tar(master_ssh))
-        scenarios.append(run_neg_12_backup_corrupted_sqlite(master_ssh))
-        scenarios.append(run_neg_13_worker_deploy_interrupted_journal(master_ssh))
+        scenarios.append(run_neg_11_backup_corrupted_tar(master_ssh, config))
+        scenarios.append(run_neg_12_backup_corrupted_sqlite(master_ssh, config))
+        scenarios.append(run_neg_13_worker_deploy_interrupted_journal(master_ssh, config))
     else:
         for sid in ("NEG-10", "NEG-11", "NEG-12", "NEG-13"):
             scenarios.append({"scenario": sid, "status": "SKIP", "message": "No Master SSH"})
