@@ -406,7 +406,8 @@ correctness, Internal Squad membership by set equality, and all Host record fiel
 - **GIVEN** Master installed and Worker deployed on a clean test environment
 - **WHEN** runner queries `GET /api/hosts`
 - **THEN** exactly eight (or ten when both Vision domains are configured) Host records exist; four (or five) reference `local-node` UUID and four (or five) reference `worker-1`
-  UUID; each Host's `inbound UUID` matches one of the inbounds in the corresponding node's config profile; all hosts configure `fingerprint: firefox`
+  UUID; each Host's `inbound UUID` matches one of the inbounds in the corresponding node's config profile; REALITY hosts carry the configured REALITY fingerprint (`chrome` by
+default, overridable via `REALITY_FINGERPRINT`) and every TLS host carries `fingerprint: firefox`
 
 #### Scenario: Internal Squad contains all provisioned inbound UUIDs
 
@@ -445,7 +446,9 @@ against the real Panel; actual HTTP response codes SHALL be used (not mock assum
 - **GIVEN** subscription fetched with valid Xray User-Agent
 - **WHEN** runner parses the JSON and counts proxy-capable outbounds
 - **THEN** exactly eight (or ten when both Vision domains are configured) outbounds are identified by protocol/transport tag (VLESS REALITY, VLESS XHTTP
-  TLS, VLESS WS TLS, Trojan gRPC TLS, and optional VLESS XTLS Vision TLS) for Master and Worker; `fingerprint: "firefox"` is verified; `direct`, `block`, and routing-only entries
+  TLS, VLESS WS TLS, Trojan gRPC TLS, and optional VLESS XTLS Vision TLS) for Master and Worker; REALITY
+  outbounds carry the configured REALITY fingerprint (`chrome` by default) and TLS outbounds carry
+  `fingerprint: "firefox"`; `direct`, `block`, and routing-only entries
   are excluded from the count
 
 #### Scenario: Xray JSON subscription headers and content verified
@@ -461,7 +464,8 @@ against the real Panel; actual HTTP response codes SHALL be used (not mock assum
 - **GIVEN** subscription fetched with valid Mihomo User-Agent
 - **WHEN** runner validates HTTP response and parses YAML
 - **THEN** HTTP 200 is returned with correct Content-Type; eight (or ten when both Vision domains are configured) proxy entries with correct protocol and
-  transport parameters and `client-fingerprint: "firefox"` are present; `GEOIP,private,DIRECT,no-resolve` rule is present; no duplicates; real
+  transport parameters, `client-fingerprint: "chrome"` on REALITY and `client-fingerprint: "firefox"` on the
+  TLS transports are present; `GEOIP,private,DIRECT,no-resolve` rule is present; no duplicates; real
   `mihomo -t` validates the config
 
 ---
@@ -532,17 +536,24 @@ Cover-reality assets and fallbacks SHALL be present and PROXY protocol SHALL be 
 
 ### Requirement: Data Plane E2E Traffic Through All VPN Endpoints
 
-The runner SHALL verify all logical endpoints (four core protocols on Master and Worker by default; plus optional
-VLESS XTLS Vision when configured). Each active endpoint MUST be exercised independently by both a real Xray
-client process and a real Mihomo client process with Firefox fingerprint, yielding sixteen or twenty mandatory
-runtime cases. All tests SHALL use actual subscription data and verify client-observed egress plus target-VPS
-ingress evidence; syntax checks do not count.
+The runner SHALL verify every configured logical endpoint. Each endpoint MUST be exercised independently by a
+real Xray client process and a real Mihomo client process, yielding sixteen or twenty mandatory runtime cases.
+All tests SHALL use actual subscription data and verify client-observed egress plus target-VPS ingress
+evidence; syntax checks do not count.
 
 #### Scenario: All active logical endpoints are exercised by both clients
 
 - **GIVEN** the real Xray JSON and Mihomo YAML subscriptions each contain four or five Master and four or five Worker proxy entries
 - **WHEN** the runner executes the Data Plane phase
 - **THEN** it runs Xray and Mihomo independently against each of the active logical endpoints (16 or 20 cases total); all cases must pass for overall `PASS`
+
+#### Scenario: Optional second mihomo-compatible client suite
+
+- **GIVEN** `ALT_MIHOMO_CORE` names an executable mihomo-compatible core (for example Prizrak-Core)
+- **WHEN** the Data Plane phase has produced the fetched Mihomo subscription
+- **THEN** the runner replays the same logical endpoints through that binary and gates its results with the same
+  rules as upstream Mihomo (count mismatch or `INCOMPLETE` → `INCOMPLETE`, any non-`PASS` → `FAIL`), while
+  leaving the key unset records the suite as skipped and does not affect the mandatory matrix
 
 #### Scenario: Xray runtime request traverses the selected Master endpoint
 
@@ -583,6 +594,15 @@ ingress evidence; syntax checks do not count.
 - **THEN** each client validates both a Let's Encrypt Staging endpoint and an ordinary public-CA endpoint
   (including the public HTTPS egress probe); an untrusted test CA is rejected; `allowInsecure` and
   `skip-cert-verify` are prohibited
+
+#### Scenario: Xray TLS outbounds carry explicit Staging trust anchors
+
+- **GIVEN** `ACME_MODE=staging` and the runner has built its scoped combined CA bundle
+- **WHEN** the runner prepares an Xray outbound whose `streamSettings.security` is `tls`
+- **THEN** it appends one `{"usage": "verify", "certificateFile": <staged bundle path>}` entry per pinned
+  Staging root to `streamSettings.tlsSettings.certificates`, because Xray ignores `SSL_CERT_FILE` and reads
+  only hardcoded system CA paths; REALITY outbounds are left unmodified since they trust the pinned key
+  instead of a CA chain; `allowInsecure` stays absent, and in `ACME_MODE=production` no anchors are injected
 
 #### Scenario: Staging CA material is pinned and reproducible
 

@@ -39,6 +39,8 @@ WHITELIST_KEYS = {
     "XRAY_SERVER_VERSION",
     "XRAY_CLIENT_VERSION",
     "MIHOMO_CLIENT_VERSION",
+    "REALITY_FINGERPRINT",
+    "ALT_MIHOMO_CORE",
     "ENABLE_IPV6",
     "MASTER_IPV6",
     "WORKER_IPV6",
@@ -80,6 +82,11 @@ DOMAIN_REGEX = re.compile(
 HEX40_REGEX = re.compile(r"^[0-9a-fA-F]{40}$")
 HEX64_REGEX = re.compile(r"^[0-9a-fA-F]{64}$")
 VERSION_REGEX = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$")
+
+REALITY_FINGERPRINTS = (
+    "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq",
+    "random", "randomized",
+)
 
 
 def parse_bool(val: str, key_name: str) -> bool:
@@ -297,6 +304,32 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
             raise ValueError(f"{version_key} must be an explicit pinned version/tag, not a floating channel.")
         parsed[version_key] = version_value
 
+    # REALITY Host fingerprint. Upstream mihomo only authenticates REALITY with
+    # the chrome uTLS preset, so this must match what the installer provisions.
+    reality_fp = (raw_pairs.get("REALITY_FINGERPRINT", "chrome").strip().lower() or "chrome")
+    if reality_fp not in REALITY_FINGERPRINTS:
+        raise ValueError(
+            f"Invalid REALITY_FINGERPRINT: '{reality_fp}'. "
+            f"Supported values: {', '.join(REALITY_FINGERPRINTS)}"
+        )
+    parsed["REALITY_FINGERPRINT"] = reality_fp
+
+    # Optional second mihomo-compatible client (for example Prizrak-Core) that
+    # exercises the same subscription without replacing the upstream client.
+    alt_core = raw_pairs.get("ALT_MIHOMO_CORE", "").strip()
+    if alt_core:
+        alt_path = Path(alt_core)
+        if not alt_path.is_absolute():
+            raise ValueError(f"ALT_MIHOMO_CORE must be an absolute path: '{alt_path}'")
+        if alt_path.is_symlink():
+            raise ValueError(f"ALT_MIHOMO_CORE must not be a symlink: '{alt_path}'")
+        if not alt_path.is_file():
+            raise ValueError(f"ALT_MIHOMO_CORE regular file not found: '{alt_path}'")
+        if not os.access(str(alt_path), os.X_OK):
+            raise ValueError(f"ALT_MIHOMO_CORE is not executable: '{alt_path}'")
+        parsed["ALT_MIHOMO_CORE"] = str(alt_path)
+    else:
+        parsed["ALT_MIHOMO_CORE"] = None
 
     commit = raw_pairs["GOWAVE_NODE_INSTALLER_COMMIT"]
     if not HEX40_REGEX.match(commit):

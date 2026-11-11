@@ -12,12 +12,53 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT))
 
 from live_vps.traffic import (
+    apply_xray_trust_anchors,
     evaluate_traffic_suite_status,
     get_server_rx_packets,
     parse_proc_net_dev_rx_packets,
     classify_server_host,
     run_mihomo_traffic_suite,
 )
+
+
+class TestXrayTrustAnchors(unittest.TestCase):
+    def _tls_outbound(self):
+        return {
+            "tag": "proxy",
+            "protocol": "vless",
+            "streamSettings": {
+                "network": "tcp",
+                "security": "tls",
+                "tlsSettings": {"serverName": "dns.example.test", "fingerprint": "firefox"},
+            },
+        }
+
+    def test_production_mode_leaves_outbound_untouched(self):
+        outbound = self._tls_outbound()
+        self.assertIs(apply_xray_trust_anchors(outbound, "production"), outbound)
+
+    def test_staging_mode_injects_verified_roots_without_mutating_input(self):
+        outbound = self._tls_outbound()
+        roots = [(Path(f"/tmp/root-{i}.pem"), {}) for i in range(4)]
+        with patch("live_vps.traffic.verify_staging_roots", return_value=roots):
+            result = apply_xray_trust_anchors(outbound, "staging")
+
+        certs = result["streamSettings"]["tlsSettings"]["certificates"]
+        self.assertEqual(len(certs), 4)
+        self.assertTrue(all(c["usage"] == "verify" for c in certs))
+        self.assertEqual(
+            [c["certificateFile"] for c in certs],
+            [str(p) for p, _ in roots],
+        )
+        self.assertNotIn("certificates", outbound["streamSettings"]["tlsSettings"])
+
+    def test_staging_mode_skips_reality_and_plaintext_outbounds(self):
+        for security in ("reality", "none"):
+            outbound = self._tls_outbound()
+            outbound["streamSettings"]["security"] = security
+            with patch("live_vps.traffic.verify_staging_roots") as roots:
+                self.assertIs(apply_xray_trust_anchors(outbound, "staging"), outbound)
+                roots.assert_not_called()
 
 
 class TestTrafficModule(unittest.TestCase):

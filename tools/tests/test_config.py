@@ -77,6 +77,40 @@ TEST_TEARDOWN_POLICY=PRESERVE
         self.assertEqual(cfg.master_known_hosts_path, "/tmp/known_hosts")
         self.assertEqual(cfg.worker_known_hosts_path, "/tmp/known_hosts")
 
+    def test_reality_fingerprint_defaults_to_chrome(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        cfg = load_config(self._write_config(content))
+        self.assertEqual(cfg.reality_fingerprint, "chrome")
+        self.assertIsNone(cfg.alt_mihomo_core)
+
+    def test_reality_fingerprint_accepts_firefox_override(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        content += "\nREALITY_FINGERPRINT=Firefox\n"
+        cfg = load_config(self._write_config(content))
+        self.assertEqual(cfg.reality_fingerprint, "firefox")
+
+    def test_reality_fingerprint_rejects_unknown_value(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        content += "\nREALITY_FINGERPRINT=opera\n"
+        with self.assertRaises(ValueError):
+            load_config(self._write_config(content))
+
+    def test_alt_mihomo_core_requires_absolute_executable(self):
+        content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
+        relative = self._write_config(content + "\nALT_MIHOMO_CORE=prizrak-core\n")
+        with self.assertRaises(ValueError):
+            load_config(relative)
+
+        missing = self._write_config(content + "\nALT_MIHOMO_CORE=/nonexistent/prizrak-core\n")
+        with self.assertRaises(ValueError):
+            load_config(missing)
+
+        binary = self.tmp / "prizrak-core"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        ok = self._write_config(content + f"\nALT_MIHOMO_CORE={binary}\n")
+        self.assertEqual(load_config(ok).alt_mihomo_core, str(binary))
+
     def test_insecure_mode_rejected(self):
         content = self.valid_content.replace("198.51.100.1", "93.184.216.34").replace("198.51.100.2", "93.184.216.35")
         p = self._write_config(content, mode=0o644)

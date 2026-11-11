@@ -20,6 +20,7 @@ import yaml
 
 from .ssh import SSHClient
 from .config import LiveVPSConfig
+from .tls import verify_staging_roots
 
 
 def find_free_port() -> int:
@@ -107,6 +108,31 @@ def classify_server_host(host: Optional[str], config: LiveVPSConfig) -> Optional
     return None
 
 
+def apply_xray_trust_anchors(outbound: Dict[str, Any], acme_mode: str) -> Dict[str, Any]:
+    """Declare Staging trust anchors inside Xray tlsSettings.
+
+    Xray builds its certificate pool from a hardcoded system path list and ignores
+    SSL_CERT_FILE, so a Staging leaf chain cannot be verified via the environment.
+    tlsSettings.certificates with usage=verify is Xray's supported trust-anchor input.
+    """
+    if acme_mode.lower() != "staging":
+        return outbound
+    if (outbound.get("streamSettings") or {}).get("security") != "tls":
+        return outbound
+
+    anchors = [str(pem_path) for pem_path, _meta in verify_staging_roots()]
+    if not anchors:
+        return outbound
+
+    result = json.loads(json.dumps(outbound))
+    tls_settings = result.setdefault("streamSettings", {}).setdefault("tlsSettings", {})
+    existing = tls_settings.get("certificates") or []
+    tls_settings["certificates"] = existing + [
+        {"usage": "verify", "certificateFile": path} for path in anchors
+    ]
+    return result
+
+
 def run_xray_endpoint_test(
     outbound: Dict[str, Any],
     ca_bundle_path: Path,
@@ -115,10 +141,12 @@ def run_xray_endpoint_test(
     worker_ssh: SSHClient,
     is_worker_endpoint: bool,
     timeout: int = 15,
+    acme_mode: str = "production",
 ) -> Dict[str, Any]:
     """Execute a single tunnel test through Xray client for one active outbound."""
     socks_port = find_free_port()
     tag = outbound.get("tag", "proxy")
+    full_outbound = apply_xray_trust_anchors(outbound, acme_mode)
 
     full_config = {
         "log": {"loglevel": "warning"},
@@ -130,7 +158,7 @@ def run_xray_endpoint_test(
                 "settings": {"auth": "noauth", "udp": False},
             }
         ],
-        "outbounds": [outbound, {"protocol": "freedom", "tag": "direct"}],
+        "outbounds": [full_outbound, {"protocol": "freedom", "tag": "direct"}],
     }
 
     # Write temporary mode-0600 config
@@ -239,8 +267,13 @@ def run_mihomo_traffic_suite(
     config: LiveVPSConfig,
     master_ssh: SSHClient,
     worker_ssh: SSHClient,
+    core_binary: str = "mihomo",
 ) -> Dict[str, Any]:
-    """Execute Mihomo data plane verification across all subscription proxies."""
+    """Execute Mihomo data plane verification across all subscription proxies.
+
+    core_binary allows running the same suite with a mihomo-compatible fork
+    (for example Prizrak-Core) without altering the subscription under test.
+    """
     if not config.test_mihomo_traffic:
         return {
             "status": "INCOMPLETE",
@@ -258,9 +291,9 @@ def run_mihomo_traffic_suite(
     if not proxies:
         return {"status": "FAIL", "error": "No proxies in subscription YAML"}
 
-    # Xray REALITY servers since v26.9.9 drop ClientHellos without an
-    # X25519MLKEM768 key share, so Mihomo only completes the handshake when the
-    # subscription proxy carries reality-opts.support-x25519mlkem768.
+    # Mihomo only keeps the X25519MLKEM768 key share while the proxy carries
+    # reality-opts.support-x25519mlkem768; without it REALITY authentication
+    # fails. This is a client-side requirement, not a server-side one.
     reality_without_hybrid = [
         proxy.get("name")
         for proxy in proxies
@@ -340,7 +373,7 @@ def run_mihomo_traffic_suite(
     try:
         mihomo_log = mihomo_log_path.open("w", encoding="utf-8")
         proc = subprocess.Popen(
-            ["mihomo", "-d", td.name, "-f", str(tmp_config_path)],
+            [core_binary, "-d", td.name, "-f", str(tmp_config_path)],
             stdout=mihomo_log,
             stderr=subprocess.STDOUT,
             env=env,
@@ -482,6 +515,7 @@ def run_mihomo_traffic_suite(
         suite_status = "PASS"
     return {
         "status": suite_status,
+        "client": Path(core_binary).name,
         "results": case_results,
     }
 
@@ -491,6 +525,7 @@ def evaluate_traffic_suite_status(
     xray_results: List[Dict[str, Any]],
     mihomo_results: Optional[Dict[str, Any]] = None,
     expected_case_count: Optional[int] = None,
+    mihomo_alt_results: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Evaluate overall status for traffic suite.
     Enforces that disabling traffic verification or Mihomo traffic forces INCOMPLETE, not PASS.
@@ -523,5 +558,15 @@ def evaluate_traffic_suite_status(
         return "INCOMPLETE"
     if mihomo_results.get("status") != "PASS":
         return "FAIL"
+
+    # Optional second mihomo-compatible client is gated only when it actually ran.
+    if mihomo_alt_results and not mihomo_alt_results.get("skipped"):
+        alt_cases = mihomo_alt_results.get("results", [])
+        if expected_case_count is not None and len(alt_cases) != expected_case_count:
+            return "INCOMPLETE"
+        if mihomo_alt_results.get("status") == "INCOMPLETE":
+            return "INCOMPLETE"
+        if mihomo_alt_results.get("status") != "PASS":
+            return "FAIL"
 
     return "PASS"

@@ -151,6 +151,7 @@ def fetch_and_validate_xray_subscription(
     ssl_context: ssl.SSLContext,
     has_vision: bool = False,
     ca_bundle_path: Optional[Path] = None,
+    reality_fingerprint: str = "chrome",
 ) -> Tuple[bool, Dict[str, Any]]:
     """Fetch Xray JSON subscription and validate schema, proxy outbounds, and xray run -test."""
     url = f"https://{panel_domain}/api/sub/{short_uuid}/v2ray-json"
@@ -206,13 +207,19 @@ def fetch_and_validate_xray_subscription(
             "proxy_outbounds": len(proxy_outbounds),
         }
 
-    # Verify fingerprint: "firefox"
+    # REALITY hosts use the configured (default chrome) fingerprint; every other
+    # transport keeps firefox. Upstream mihomo cannot authenticate REALITY with
+    # a Firefox uTLS hello because that preset sends no X25519MLKEM768 share.
     for ob in proxy_outbounds:
         stream_settings = ob.get("streamSettings", {})
+        security = (stream_settings.get("security") or "").lower()
         tls_settings = stream_settings.get("tlsSettings") or stream_settings.get("realitySettings") or {}
-        fp = tls_settings.get("fingerprint", "")
-        if fp.lower() != "firefox":
-            return False, {"error": f"Outbound {ob.get('tag')} missing fingerprint 'firefox': {fp}"}
+        fp = (tls_settings.get("fingerprint") or "").lower()
+        expected_fp = reality_fingerprint if security == "reality" else "firefox"
+        if fp != expected_fp:
+            return False, {
+                "error": f"Outbound {ob.get('tag')} has fingerprint '{fp}', expected '{expected_fp}'"
+            }
 
     # Validate with real Xray CLI if installed
     xray_cli_ok = True
@@ -261,6 +268,7 @@ def fetch_and_validate_xray_subscription(
         "status": "PASS",
         "proxy_outbounds_count": len(proxy_outbounds),
         "fingerprint": "firefox",
+        "reality_fingerprint": reality_fingerprint,
         "xray_cli_validated": xray_cli_ok,
     }
 
@@ -271,6 +279,7 @@ def fetch_and_validate_mihomo_subscription(
     ssl_context: ssl.SSLContext,
     has_vision: bool = False,
     ca_bundle_path: Optional[Path] = None,
+    reality_fingerprint: str = "chrome",
 ) -> Tuple[bool, Dict[str, Any]]:
     """Fetch Mihomo YAML subscription and validate schema, proxy entries, and mihomo -t."""
     url = f"https://{panel_domain}/api/sub/{short_uuid}/mihomo"
@@ -299,17 +308,19 @@ def fetch_and_validate_mihomo_subscription(
             "proxies_count": len(proxies),
         }
 
-    # Verify client-fingerprint: "firefox"
-    for p in proxies:
-        fp = p.get("client-fingerprint") or p.get("fingerprint") or ""
-        if fp.lower() != "firefox":
-            return False, {"error": f"Proxy {p.get('name')} missing client-fingerprint 'firefox'"}
-
-    # Xray REALITY servers since v26.9.9 reject ClientHellos without an
-    # X25519MLKEM768 key share, so every REALITY proxy must advertise it.
+    # REALITY proxies carry the configured (default chrome) client fingerprint so
+    # upstream mihomo can send its PQ keyshare; other proxies stay on firefox.
+    # Every REALITY proxy must also advertise the hybrid key share explicitly.
     for p in proxies:
         reality_opts = p.get("reality-opts")
-        if isinstance(reality_opts, dict) and reality_opts.get("support-x25519mlkem768") is not True:
+        is_reality = isinstance(reality_opts, dict)
+        fp = (p.get("client-fingerprint") or p.get("fingerprint") or "").lower()
+        expected_fp = reality_fingerprint if is_reality else "firefox"
+        if fp != expected_fp:
+            return False, {
+                "error": f"Proxy {p.get('name')} has fingerprint '{fp}', expected '{expected_fp}'"
+            }
+        if is_reality and reality_opts.get("support-x25519mlkem768") is not True:
             return False, {
                 "error": f"Proxy {p.get('name')} missing reality-opts support-x25519mlkem768",
             }
@@ -346,6 +357,7 @@ def fetch_and_validate_mihomo_subscription(
         "status": "PASS",
         "proxies_count": len(proxies),
         "fingerprint": "firefox",
+        "reality_fingerprint": reality_fingerprint,
         "has_geoip_rule": True,
         "mihomo_cli_validated": mihomo_cli_ok,
     }

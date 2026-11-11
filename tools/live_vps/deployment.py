@@ -233,6 +233,7 @@ def install_master(
         "GOWAVE_PANEL_VERSION": config.gowave_panel_version,
         "GOWAVE_NODE_VERSION": config.gowave_node_version,
         "XRAY_SERVER_VERSION": config.xray_server_version,
+        "GOWAVE_REALITY_FINGERPRINT": config.reality_fingerprint,
     }
     env_vars = "\n".join(
         f"export {key}={shlex.quote(str(value))}" for key, value in env_values.items()
@@ -371,6 +372,7 @@ def deploy_worker(
         "GOWAVE_NODE_INSTALLER_SHA256": config.gowave_node_installer_sha256,
         "GOWAVE_NODE_VERSION": config.gowave_node_version,
         "XRAY_SERVER_VERSION": config.xray_server_version,
+        "GOWAVE_REALITY_FINGERPRINT": config.reality_fingerprint,
     }
     env_vars = "\n".join(
         f"export {key}={shlex.quote(str(value))}" for key, value in env_values.items()
