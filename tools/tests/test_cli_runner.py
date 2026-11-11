@@ -40,6 +40,7 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
             "existing_gowave_dirs": [],
             "running_services": [],
             "listening_ports": [],
+            "required_tools": {"tcpdump": "ok", "timeout": "ok"},
         }
         arguments = {
             "tools_ok": True,

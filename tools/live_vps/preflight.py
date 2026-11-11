@@ -215,6 +215,16 @@ def collect_remote_baseline(ssh: SSHClient) -> Dict[str, Any]:
     r = ssh.run("dpkg-query -W -f='${binary:Package}=${Version}\n' 2>/dev/null | grep -E '^(nginx|certbot|python3|ufw|fail2ban)' || true")
     manifest["key_packages"] = r.stdout.strip()
 
+    # 9. Target-side tools required by the traffic phase (the controller never installs them)
+    r = ssh.run(
+        "for t in tcpdump timeout; do "
+        "if command -v \"$t\" >/dev/null 2>&1; then echo \"$t=ok\"; else echo \"$t=missing\"; fi; "
+        "done"
+    )
+    manifest["required_tools"] = dict(
+        line.split("=", 1) for line in r.stdout.splitlines() if "=" in line
+    )
+
     return manifest
 
 
@@ -242,6 +252,14 @@ def check_disposable_gate(manifest: Dict[str, Any], vision_enabled: bool = False
     conflicts = required.intersection(listening)
     if conflicts:
         disqualifications.append(f"Port conflicts detected; required ports already occupied: {sorted(conflicts)}")
+
+    # Check 4: Target-side tools the traffic phase needs; the controller never installs them
+    tools = manifest.get("required_tools") or {}
+    missing_tools = [tool for tool in ("tcpdump", "timeout") if tools.get(tool) != "ok"]
+    if missing_tools:
+        disqualifications.append(
+            "Missing required target tools (install them before the run): " + ", ".join(missing_tools)
+        )
 
     return len(disqualifications) == 0, disqualifications
 
