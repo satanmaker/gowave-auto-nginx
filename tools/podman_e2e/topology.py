@@ -578,6 +578,30 @@ class AioTopology:
             timeout=timeout,
         )
 
+    def prohibited_facts(self, timeout: int = 300) -> Any:
+        """Run the policy probe: a permitted control, then a destination the product denies.
+
+        The prohibited destination is the endpoint's private face, which the
+        product's own routing sends to its block outbound, and the record is read
+        from the public face, which the client reaches directly. A destination
+        the product excludes can therefore only be proven denied by asking the
+        endpoint what it did not receive.
+        """
+        self.engine_client()
+        return self.podman.exec(
+            self.engine_client_name,
+            [
+                "python3", TRAFFIC_PROBE_SCRIPT,
+                "--scope", "prohibited",
+                "--payload-dir", SECRETS_MOUNT,
+                "--ca", f"{CA_MOUNT}/{ISSUED_ROOT_NAME}",
+                "--destination", f"{self.plan.echo_ip}:{ECHO_HTTP_PORT}",
+                "--report-destination", f"{self.plan.data_echo_ip}:{ECHO_HTTP_PORT}",
+            ],
+            check=False,
+            timeout=timeout,
+        )
+
     def client_http(
         self,
         url: str,

@@ -412,6 +412,131 @@ def probe_product(context, facts, returncode=0):
     return product, podman
 
 
+class TestNegativeCases(unittest.TestCase):
+    """The negative cases: a refusal only counts against a working control."""
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def policy_product(self, facts):
+        product, _ = installed_product(self.context, [])
+        product._subscriptions = {"xray-json": {}}
+        product.host.prohibited_facts = lambda timeout=300: subprocess.CompletedProcess(
+            ["python3", "traffic_probe.py"], 0, json.dumps(facts), "",
+        )
+        return product
+
+    def test_prohibited_destination_requires_a_refusal_and_an_empty_record(self):
+        product = self.policy_product({
+            "engine": "xray", "network": "tcp", "control_delivered": True,
+            "delivered": False, "status": 503, "reason": "HTTP 503 without an endpoint report",
+            "endpoint_records": 6, "recorded_request_ids": 0,
+        })
+        evidence = aio.case_negative_destination(product)
+        self.assertTrue(evidence["control_delivered"])
+        self.assertFalse(evidence["delivered"])
+        self.assertEqual(evidence["status"], 503)
+
+    def test_a_prohibited_destination_that_was_delivered_fails_the_case(self):
+        product = self.policy_product({
+            "engine": "xray", "network": "tcp", "control_delivered": True,
+            "delivered": True, "status": 200, "recorded_request_ids": 0,
+        })
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_negative_destination(product)
+        self.assertIn("was delivered", str(caught.exception))
+
+    def test_a_control_that_never_arrived_fails_before_the_denial_counts(self):
+        product = self.policy_product({
+            "engine": "xray", "network": "tcp", "control_delivered": False,
+            "delivered": False, "recorded_request_ids": 0,
+        })
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_negative_destination(product)
+        self.assertIn("would prove nothing", str(caught.exception))
+
+    def test_port_case_requires_the_foreign_listener_to_be_a_conflict(self):
+        output = "foreign=refused managed=accepted released=accepted port=9444\n"
+        product, _ = installed_product(self.context, [(output, 0)])
+        evidence = aio.case_foreign_listener(product)
+        self.assertEqual(evidence["port"], 9444)
+        self.assertEqual(evidence["managed_listener"], "accepted")
+
+    def test_port_case_fails_when_a_foreign_listener_is_forgiven(self):
+        output = "foreign=accepted managed=accepted released=accepted port=9444\n"
+        product, _ = installed_product(self.context, [(output, 0)])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_foreign_listener(product)
+        self.assertIn("was accepted as no conflict", str(caught.exception))
+
+    def test_port_case_fails_when_the_product_is_its_own_conflict(self):
+        output = "foreign=refused managed=refused released=accepted port=9444\n"
+        product, _ = installed_product(self.context, [(output, 0)])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_foreign_listener(product)
+        self.assertIn("own listener on 443", str(caught.exception))
+
+    def test_acme_case_requires_both_directions_and_the_unchanged_default(self):
+        output = (
+            "fixture_without_optin=refused arbitrary_in_test_mode=refused "
+            "unpinned_ca=refused letsencrypt_production=accepted\n"
+        )
+        product, _ = installed_product(self.context, [(output, 0)])
+        evidence = aio.case_acme_fail_closed(product)
+        self.assertEqual(evidence["unpinned_ca"], "refused")
+        self.assertEqual(evidence["letsencrypt_production"], "accepted")
+
+    def test_acme_case_fails_when_test_mode_widens_the_allowlist(self):
+        output = (
+            "fixture_without_optin=refused arbitrary_in_test_mode=accepted "
+            "unpinned_ca=refused letsencrypt_production=accepted\n"
+        )
+        product, _ = installed_product(self.context, [(output, 0)])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_acme_fail_closed(product)
+        self.assertIn("arbitrary ACME URL", str(caught.exception))
+
+    def test_dependency_case_needs_the_public_surface_to_fail_and_recover(self):
+        product, podman = installed_product(self.context, [
+            ("inactive\n", 0),
+            ("login=200 api=200 token_length=64\n", 0),
+            ("active\n", 0),
+        ])
+        product.host.client_reports = [
+            {"url": f"{aio.PUBLIC_PANEL}/", "returncode": 0, "stdout": "{}", "stderr": "",
+             "probe": {"status": 200}},
+            {"url": f"{aio.PUBLIC_PANEL}/", "returncode": 1, "stdout": "{}", "stderr": "",
+             "probe": {"error": "ConnectionRefusedError: [Errno 111] Connection refused"}},
+            {"url": f"{aio.PUBLIC_PANEL}/", "returncode": 0, "stdout": "{}", "stderr": "",
+             "probe": {"status": 200}},
+        ]
+        evidence = aio.case_public_dependency(product)
+        self.assertEqual(evidence["panel_loopback_login"], "200")
+        self.assertEqual(evidence["public_before"], 200)
+        self.assertIn("systemctl stop nginx", podman.scripts[0])
+        self.assertIn("systemctl start nginx", podman.scripts[2])
+
+    def test_dependency_case_fails_when_443_still_answers_without_nginx(self):
+        product, _ = installed_product(self.context, [("inactive\n", 0)])
+        product.host.client_reports = [
+            {"url": f"{aio.PUBLIC_PANEL}/", "returncode": 0, "stdout": "{}", "stderr": "",
+             "probe": {"status": 200}},
+            {"url": f"{aio.PUBLIC_PANEL}/", "returncode": 0, "stdout": "{}", "stderr": "",
+             "probe": {"status": 200}},
+        ]
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_public_dependency(product)
+        self.assertIn("does not depend on it", str(caught.exception))
+
+    def test_the_host_scripts_the_negative_cases_run_are_valid_bash(self):
+        for script in (aio.FOREIGN_LISTENER_SCRIPT, aio.ACME_FAIL_CLOSED_SCRIPT):
+            result = subprocess.run(["bash", "-n"], input=script, text=True,
+                                    capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class TestPanelApiCases(unittest.TestCase):
     def setUp(self):
         self.context, self.tmp = make_context()

@@ -45,7 +45,7 @@
 - [x] 4.5b Decode the base64 share-link list and assert one link per proxy entry with the expected protocol, host, SNI, and fingerprint, and prove an Xray-family client imports it while the raw JSON body imports nothing.
 - [x] 4.6 Transfer verifiable payloads through every applicable supported protocol/configuration.
 - [x] 4.7 Verify revocation, restart recovery, and repeated provisioning/idempotency.
-- [ ] 4.8 Add negative configuration and dependency-failure scenarios.
+- [x] 4.8 Add negative configuration and dependency-failure scenarios.
 - [ ] 4.9 Execute and assert the complete All-in-One matrix with both Xray and Mihomo: exactly 8 positive transfer cases without Vision and 10 with Vision; fail on missing or unexplained extra cases.
 
 ## 5. Multi-Node product E2E

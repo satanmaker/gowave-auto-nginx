@@ -474,6 +474,64 @@ class TestTrafficProbeRevocation(unittest.TestCase):
         self.assertIn("destination address is required", str(caught.exception))
 
 
+class TestTrafficProbeProhibited(unittest.TestCase):
+    """The policy scope: a denial counts only after the permitted control arrived."""
+
+    PROHIBITED = "10.89.0.30:18080"
+    PERMITTED = "203.0.114.30:18080"
+
+    def delivered(self):
+        return {
+            "engine": "xray", "tag": "vless-reality-tcp", "network": "tcp",
+            "request_id": "xray-control", "delivered": True, "status": 200,
+            "request_id_match": True, "body_match": True, "source_ip": PLAN.data_target_ip,
+        }
+
+    def refused(self):
+        return traffic_probe.refusal(
+            "xray", {"tag": "vless-reality-tcp", "network": "tcp"},
+            "xray-prohibited", None, "HTTP 503 without an endpoint report",
+        )
+
+    def run_scope(self, control, attempt, recorded=("xray-control",), destination=None):
+        sequence = [control, attempt]
+        with tempfile.TemporaryDirectory() as workdir:
+            with mock.patch.object(traffic_probe, "xray_transfers",
+                                   lambda *a, **k: list(sequence.pop(0))), \
+                    mock.patch.object(
+                        traffic_probe, "echo_diagnostics",
+                        lambda *a, **k: {"requests": [{"request_id": rid} for rid in recorded]},
+                    ):
+                return traffic_probe.prohibited(
+                    "/secrets", "/fixtures/ca/root.pem",
+                    destination if destination is not None else self.PROHIBITED,
+                    Path(workdir), report_destination=self.PERMITTED,
+                )
+
+    def test_a_refused_prohibited_destination_is_a_result_when_the_control_arrived(self):
+        facts = self.run_scope([self.delivered()], [self.refused()])
+        self.assertTrue(facts["control_delivered"])
+        self.assertFalse(facts["delivered"])
+        self.assertEqual(facts["recorded_request_ids"], 0)
+        self.assertIn("503", facts["reason"])
+
+    def test_a_control_that_never_reached_the_endpoint_proves_nothing(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_scope([self.refused()], [self.refused()], recorded=())
+        self.assertIn("would prove nothing", str(caught.exception))
+
+    def test_the_scope_fails_when_the_endpoint_recorded_a_prohibited_request(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_scope([self.delivered()], [self.refused()],
+                           recorded=("xray-control", "xray-prohibited"))
+        self.assertIn("recorded a payload sent to a destination", str(caught.exception))
+
+    def test_the_scope_refuses_to_run_without_a_destination(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_scope([self.delivered()], [self.refused()], destination="")
+        self.assertIn("prohibited destination is required", str(caught.exception))
+
+
 class TestTrafficProbeReadiness(unittest.TestCase):
     """The readiness scope: one tunnel, judged by what the endpoint recorded."""
 

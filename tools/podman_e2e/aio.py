@@ -134,6 +134,120 @@ INVENTORY_SCRIPT = (
     f"stat -c '%U %a' {CREDENTIALS_FILE} 2>/dev/null || echo missing\n"
 )
 
+# A unit that reports active is not a service that serves again; the returned
+# dependency is followed to a deadline like every other readiness signal.
+RECOVERY_TIMEOUT_SECONDS = 180
+RECOVERY_INTERVAL_SECONDS = 5
+
+# Preflight's port guard, exercised on the installed host. The port to hold is
+# discovered instead of hardcoded: the topology's own configuration decides which
+# declared ports are free, and a fixed choice would assert the container layout
+# rather than the guard. 443 is the control: the product holds it, so it must not
+# be reported as a conflict.
+FOREIGN_LISTENER_SCRIPT = r"""
+set -uo pipefail
+source /repo/modules/preflight.sh
+candidate=""
+for port in "${PREFLIGHT_REQUIRED_PORTS[@]}"; do
+    if ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then
+        continue
+    fi
+    if python3 - "$port" <<'PY' 2>/dev/null
+import socket, sys
+sock = socket.socket()
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(("127.0.0.1", int(sys.argv[1])))
+sock.close()
+PY
+    then
+        candidate="$port"
+        break
+    fi
+done
+if [[ -z "$candidate" ]]; then
+    echo "error=no-free-declared-port"
+    exit 2
+fi
+python3 - "$candidate" <<'PY' &
+import socket, sys, time
+sock = socket.socket()
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(("127.0.0.1", int(sys.argv[1])))
+sock.listen(4)
+time.sleep(120)
+PY
+holder=$!
+trap 'kill "$holder" 2>/dev/null || true' EXIT
+for _ in $(seq 1 50); do
+    if ss -Hltn "sport = :$candidate" 2>/dev/null | grep -q .; then
+        break
+    fi
+    sleep 0.1
+done
+if check_port_availability "$candidate" >/dev/null 2>&1; then
+    echo "foreign=accepted"
+else
+    echo "foreign=refused"
+fi
+if check_port_availability 443 >/dev/null 2>&1; then
+    echo "managed=accepted"
+else
+    echo "managed=refused"
+fi
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+for _ in $(seq 1 50); do
+    if ! ss -Hltn "sport = :$candidate" 2>/dev/null | grep -q .; then
+        break
+    fi
+    sleep 0.1
+done
+if check_port_availability "$candidate" >/dev/null 2>&1; then
+    echo "released=accepted"
+else
+    echo "released=refused"
+fi
+printf 'port=%s\n' "$candidate"
+"""
+
+# The ACME allowlist, asked directly instead of by running an install: the four
+# answers together are the contract, and one of them alone would pass while the
+# fixture became an arbitrary-URL option. The CA file is a real regular file with
+# a digest that cannot match, so the refusal comes from the pin and not from a
+# missing path.
+ACME_FAIL_CLOSED_SCRIPT = r"""
+set -uo pipefail
+source /repo/modules/nginx.sh
+endpoint="$GOWAVE_ACME_TEST_ENDPOINT"
+ca_file=/etc/hostname
+digest=$(printf '%064d' 0)
+if GOWAVE_ACME_TEST_MODE=0 GOWAVE_ACME_SERVER="$endpoint" \
+    validate_acme_server "$endpoint" >/dev/null 2>&1; then
+    echo "fixture_without_optin=accepted"
+else
+    echo "fixture_without_optin=refused"
+fi
+if GOWAVE_ACME_TEST_MODE=1 \
+    validate_acme_server https://acme.example.invalid/directory >/dev/null 2>&1; then
+    echo "arbitrary_in_test_mode=accepted"
+else
+    echo "arbitrary_in_test_mode=refused"
+fi
+if GOWAVE_ACME_TEST_MODE=1 GOWAVE_ACME_TEST_CA_FILE="$ca_file" \
+    GOWAVE_ACME_TEST_CA_SHA256="$digest" \
+    validate_acme_server "$endpoint" >/dev/null 2>&1; then
+    echo "unpinned_ca=accepted"
+else
+    echo "unpinned_ca=refused"
+fi
+if GOWAVE_ACME_TEST_MODE=0 \
+    validate_acme_server https://acme-v02.api.letsencrypt.org/directory >/dev/null 2>&1; then
+    echo "letsencrypt_production=accepted"
+else
+    echo "letsencrypt_production=refused"
+fi
+"""
+
 
 class AioProduct:
     """One disposable AIO host, installed once by the real operator."""
@@ -269,6 +383,22 @@ class AioProduct:
             return json.loads(result.stdout or "")
         except json.JSONDecodeError:
             require(case_id, False, f"the traffic probe did not print JSON: {(result.stdout or '')[:400]}")
+            return {}
+
+    def prohibited_facts(self, case_id: str) -> Dict[str, Any]:
+        """Run the policy probe: one permitted control, one destination the product denies."""
+        host = self.require_installed()
+        result = host.prohibited_facts()
+        detail = (result.stderr or result.stdout or "").strip()[-2000:]
+        require(
+            case_id,
+            result.returncode == 0,
+            f"the policy probe exited {result.returncode}: {detail}",
+        )
+        try:
+            return json.loads(result.stdout or "")
+        except json.JSONDecodeError:
+            require(case_id, False, f"the policy probe did not print JSON: {(result.stdout or '')[:400]}")
             return {}
 
     def wait_tunnel_ready(self, case_id: str, payload_dir: Optional[str] = None) -> Dict[str, Any]:
@@ -1022,6 +1152,141 @@ def case_idempotent(product: AioProduct) -> Dict[str, Any]:
     }
 
 
+def case_negative_destination(product: AioProduct) -> Dict[str, Any]:
+    """AIO-NEG-DEST: a destination the product's egress policy excludes is denied.
+
+    The product compiles one routing rule that sends private and loopback
+    destinations to its block outbound, and the same subscription is used for
+    both halves of this case. The permitted control must arrive first: a refusal
+    that also happens on a working destination is a broken tunnel, not a policy.
+    """
+    product.subscription_payloads("AIO-NEG-DEST")
+    facts = product.prohibited_facts("AIO-NEG-DEST")
+    require("AIO-NEG-DEST", facts.get("control_delivered") is True,
+            "the permitted control transfer did not reach the endpoint, so a refusal of the "
+            "prohibited destination would prove nothing")
+    require("AIO-NEG-DEST", facts.get("delivered") is False,
+            "a payload addressed to a private destination the product's routing excludes was "
+            f"delivered (status {facts.get('status')!r})")
+    require("AIO-NEG-DEST", facts.get("recorded_request_ids") == 0,
+            f"the endpoint recorded {facts.get('recorded_request_ids')!r} request(s) sent to a "
+            "destination the product excludes")
+    return {
+        "engine": facts.get("engine"),
+        "network": facts.get("network"),
+        "control_delivered": facts.get("control_delivered"),
+        "delivered": facts.get("delivered"),
+        "status": facts.get("status"),
+        "reason": facts.get("reason"),
+        "endpoint_records": facts.get("endpoint_records"),
+    }
+
+
+def case_foreign_listener(product: AioProduct) -> Dict[str, Any]:
+    """AIO-NEG-PORT: preflight refuses a foreign listener and keeps the product's own.
+
+    A repeated install legitimately rediscovers the product on the ports it is
+    about to check, so the port guard has exactly two jobs and both are asserted
+    here on the installed host: a port this topology leaves free, held by a
+    process outside the managed units, must be a conflict, and 443 — held by the
+    product's own NGINX — must not be one.
+    """
+    result = product.host_script(FOREIGN_LISTENER_SCRIPT, timeout=240)
+    require("AIO-NEG-PORT", result.returncode == 0,
+            f"the port-conflict probe failed: {(result.stderr or result.stdout or '').strip()[-600:]}")
+    values = _parse_key_values(result.stdout or "")
+    require("AIO-NEG-PORT", values.get("port", "").isdigit(),
+            f"the probe found no declared port to hold: {values}")
+    require("AIO-NEG-PORT", values.get("foreign") == "refused",
+            f"a foreign listener on port {values.get('port')} was accepted as no conflict")
+    require("AIO-NEG-PORT", values.get("managed") == "accepted",
+            "the product's own listener on 443 was reported as a port conflict")
+    require("AIO-NEG-PORT", values.get("released") == "accepted",
+            f"port {values.get('port')} stayed a conflict after the foreign listener exited")
+    return {
+        "port": int(values["port"]),
+        "foreign_listener": values.get("foreign"),
+        "managed_listener": values.get("managed"),
+        "after_release": values.get("released"),
+    }
+
+
+def case_acme_fail_closed(product: AioProduct) -> Dict[str, Any]:
+    """AIO-NEG-ACME: the local ACME fixture is reachable only through its pinned opt-in.
+
+    Both directions are asserted, because only the pair is safe: enabling test
+    mode must not turn the fixture into an arbitrary-URL option, and the fixture
+    must stay unusable without it. The production directory has to remain
+    accepted, which is what keeps the default path unchanged.
+    """
+    result = product.host_script(ACME_FAIL_CLOSED_SCRIPT)
+    require("AIO-NEG-ACME", result.returncode == 0,
+            f"the ACME validation probe failed: {(result.stderr or result.stdout or '').strip()[-600:]}")
+    values = _parse_key_values(result.stdout or "")
+    require("AIO-NEG-ACME", values.get("fixture_without_optin") == "refused",
+            "the local ACME fixture endpoint was accepted without GOWAVE_ACME_TEST_MODE=1")
+    require("AIO-NEG-ACME", values.get("arbitrary_in_test_mode") == "refused",
+            "an arbitrary ACME URL was accepted inside test mode")
+    require("AIO-NEG-ACME", values.get("unpinned_ca") == "refused",
+            "test mode accepted a CA file whose digest does not match the pinned one")
+    require("AIO-NEG-ACME", values.get("letsencrypt_production") == "accepted",
+            "the production ACME directory was rejected, so the default path changed")
+    return {
+        "fixture_without_optin": values.get("fixture_without_optin"),
+        "arbitrary_in_test_mode": values.get("arbitrary_in_test_mode"),
+        "unpinned_ca": values.get("unpinned_ca"),
+        "letsencrypt_production": values.get("letsencrypt_production"),
+    }
+
+
+def case_public_dependency(product: AioProduct) -> Dict[str, Any]:
+    """AIO-NEG-DEP: the public surface fails with its NGINX dependency and recovers.
+
+    NGINX is what terminates 443 and hands the SNI to the Panel and to Xray, so
+    taking it down must remove the public surface while the Panel's loopback API
+    keeps answering. The restart is then followed to a deadline rather than
+    assumed: a unit that reports active before its listeners are bound would
+    otherwise pass, and the recovered public call has to be the same request the
+    stopped dependency broke.
+    """
+    host = product.require_installed()
+    before = host.client_http(f"{PUBLIC_PANEL}/", expect_status=200, timeout=30)
+    require("AIO-NEG-DEP", before["returncode"] == 0,
+            f"the public surface did not answer before the dependency was removed: "
+            f"{before['probe'].get('error')}")
+
+    stopped = product.host_script("systemctl stop nginx; systemctl is-active nginx || true")
+    require("AIO-NEG-DEP", stopped.returncode == 0,
+            f"NGINX did not stop: {(stopped.stderr or '').strip()[-400:]}")
+    down = host.client_http(f"{PUBLIC_PANEL}/", expect_status=200, timeout=20)
+    require("AIO-NEG-DEP", down["returncode"] != 0,
+            "the public surface still answered with NGINX stopped, so 443 does not depend on it")
+
+    loopback = product.host_script(panel_probe_script())
+    values = _parse_key_values(loopback.stdout or "")
+    require("AIO-NEG-DEP", values.get("login") == "200",
+            f"the Panel itself stopped answering when NGINX stopped: login {values.get('login')!r}")
+
+    started = product.host_script("systemctl start nginx; systemctl is-active nginx || true")
+    require("AIO-NEG-DEP", (started.stdout or "").strip() == "active",
+            f"NGINX did not come back active: {(started.stdout or '').strip()!r}")
+
+    def recovered() -> bool:
+        probe = host.client_http(f"{PUBLIC_PANEL}/", expect_status=200, timeout=20)
+        return probe["returncode"] == 0
+
+    ready = wait_until(recovered, RECOVERY_TIMEOUT_SECONDS, "the public surface after NGINX returned",
+                       interval_seconds=RECOVERY_INTERVAL_SECONDS)
+    require("AIO-NEG-DEP", ready,
+            f"the public surface did not recover within {RECOVERY_TIMEOUT_SECONDS}s of NGINX restarting")
+    return {
+        "public_before": before["probe"].get("status"),
+        "public_without_dependency": "failed",
+        "panel_loopback_login": values.get("login"),
+        "public_after_recovery": 200,
+    }
+
+
 def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
     """SUB-SERVED: every served representation is fetched and loaded by its real client.
 
@@ -1351,4 +1616,10 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04") -> List[Case]:
              + TRAFFIC_TIMEOUT_SECONDS),
         Case("AIO-IDEMPOTENT", "aio", lambda context: case_idempotent(product),
              timeout_seconds=INSTALL_TIMEOUT_SECONDS + TRAFFIC_TIMEOUT_SECONDS),
+        Case("AIO-NEG-DEST", "aio", lambda context: case_negative_destination(product),
+             timeout_seconds=TRAFFIC_TIMEOUT_SECONDS),
+        Case("AIO-NEG-PORT", "aio", lambda context: case_foreign_listener(product), timeout_seconds=300),
+        Case("AIO-NEG-ACME", "aio", lambda context: case_acme_fail_closed(product), timeout_seconds=300),
+        Case("AIO-NEG-DEP", "aio", lambda context: case_public_dependency(product),
+             timeout_seconds=RECOVERY_TIMEOUT_SECONDS + 300),
     ]

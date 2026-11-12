@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 23
-  total: 148
+  podman_first: 27
+  total: 152
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3359,6 +3359,74 @@ cases:
     0600 and still authenticating, the already served subscription carrying the same credentials, and
     both pinned clients still transferring payloads.
   assertion_sha256: 02d887aee1d22f0524d61b876e748c36ddeec9947e4a14fba98f4bce65832914
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: AIO-NEG-DEST
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: One served outbound carries a payload to the permitted public endpoint first, then a payload
+    addressed to the endpoint's private face — which the product's own routing sends to its block outbound
+    — is refused, and the endpoint's record read directly does not contain the prohibited request id.
+  assertion_sha256: 2c64a684463dbd921d5508e443aa77b6b95e1b682e74b7f3094beb875764c1e1
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: AIO-NEG-PORT
+  requirement: All-in-One Master VPS Installation Verification
+  live_scenario: null
+  assertion: On the installed host the product's port preflight reports a declared port held by a process
+    outside the managed units as a conflict, does not report 443 held by the product's own NGINX as one,
+    and stops reporting the borrowed port once the foreign listener exits.
+  assertion_sha256: 6d9eb24a97446b2d1edd3f8ba2b8f7a193413bc5b561fccc749f828873f571d7
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: AIO-NEG-ACME
+  requirement: Fail-closed local ACME test mode
+  live_scenario: null
+  assertion: The local ACME fixture endpoint is refused without GOWAVE_ACME_TEST_MODE=1, an arbitrary
+    directory URL is refused inside test mode, a CA whose digest does not match the pinned one is refused,
+    and the production ACME directory is still accepted.
+  assertion_sha256: 00b0e75ae034896e13ca372e4edcee0ae5640ffb340e014861fa3703fec8fd84
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Independent All-in-One Acceptance Topology
+- id: AIO-NEG-DEP
+  requirement: Security and network isolation verification
+  live_scenario: null
+  assertion: With the product's NGINX unit stopped, the public HTTPS surface stops answering from the
+    independent Control Machine while the Panel's loopback API still authenticates, and after the unit
+    is started the same public call succeeds again inside one bounded deadline.
+  assertion_sha256: b2341c365fe95a47b51d60e20d85e975ddb046b56aaf3f2ecdcab8182b9a1453
   runs_in:
   - podman
   state: incubating
