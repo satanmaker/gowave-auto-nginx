@@ -20,7 +20,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.podman_e2e import matrix, multi_node, panel_surface, topology  # noqa: E402
+from tools.podman_e2e import (  # noqa: E402
+    acme_fixture, matrix, multi_node, panel_surface, topology,
+)
 
 PASSWORD = "pw-do-not-print"
 TOKEN = "token-do-not-print"
@@ -138,9 +140,13 @@ def healthy_cluster(vision=False, worker_vision=False):
     ]
     hosts = []
     for index, inbound in enumerate(master):
+        # The Master's optional Vision inbound is published under the Master's
+        # Vision domain; every other Master host is dialled on the Panel domain.
+        vision_host = vision and index == len(master) - 1
         hosts.append(host_record(
             multi_node.LOCAL_NODE_NAME, MASTER_NODE_UUID, MASTER_PROFILE_UUID, inbound,
-            topology.PANEL_DOMAIN, "DEFAULT" if index == 0 else "TLS",
+            topology.VISION_DOMAIN if vision_host else topology.PANEL_DOMAIN,
+            "DEFAULT" if index == 0 else "TLS",
         ))
     for index, inbound in enumerate(worker):
         # The optional Vision inbound is published under the Worker's Vision
@@ -189,6 +195,92 @@ class _ClusterProduct(multi_node.MultiNodeProduct):
 
     def panel_cluster(self, case_id):
         return {"login": {"status": 200}, "cluster": self.cluster}
+
+
+def applied_inbounds(vision: bool):
+    """The inbounds a node's own applied config carries, in the probe's shape."""
+    inbounds = []
+    for entry in matrix.inbounds(matrix.load(), vision=vision):
+        template = json.loads((REPO_ROOT / entry["template"]).read_text(encoding="utf-8"))
+        stream = template.get("streamSettings") or {}
+        inbounds.append({
+            "tag": f"{entry['tag']}-node",
+            "type": template.get("protocol"),
+            "port": template.get("port"),
+            "listen": str(template.get("listen") or ""),
+            "network": stream.get("network") or "tcp",
+            "security": stream.get("security") or "none",
+        })
+    return inbounds
+
+
+def vision_node_facts(domain, vision):
+    """What one node's own probe reports for the Vision name it was asked about."""
+    port = multi_node.vision_identity(matrix.load())["port"]
+    facts = {
+        "domain": domain,
+        "port": port,
+        "certificate": {
+            "lineage": f"/etc/letsencrypt/live/{domain}",
+            "present": False,
+            "host_ok": False,
+            "valid": False,
+            "issuer": "",
+            "renewal_server": "",
+        },
+        "nginx": {
+            "stream_routes": [],
+            "stream_vision_targets": [],
+            "vhost_files": [],
+            "vision_named_files": [],
+        },
+        "applied": {"parsed": True, "inbounds": applied_inbounds(vision)},
+    }
+    if vision:
+        facts["certificate"] = {
+            "lineage": f"/etc/letsencrypt/live/{domain}",
+            "present": True,
+            "host_ok": True,
+            "valid": True,
+            "issuer": "issuer=CN = Pebble Intermediate CA",
+            "renewal_server": acme_fixture.ACME_DIRECTORY_URL,
+        }
+        facts["nginx"] = {
+            "stream_routes": [
+                {"file": "gowave-stream.conf", "target": f"127.0.0.1:{port};"},
+            ],
+            "stream_vision_targets": ["gowave-stream.conf"],
+            "vhost_files": ["gowave-vision-fallback.conf"],
+            "vision_named_files": ["gowave-vision-fallback.conf"],
+        }
+    return facts
+
+
+def cluster_node_facts(vision, worker_vision):
+    return {
+        "master": vision_node_facts(topology.VISION_DOMAIN, vision),
+        "worker": vision_node_facts(topology.WORKER_VISION_DOMAIN, worker_vision),
+    }
+
+
+class _VisionProduct(_ClusterProduct):
+    """The installed product with the per-node filesystem probe replaced.
+
+    The probe reads inside a node's container, so the test supplies what each
+    node would report and records which node was asked about which name.
+    """
+
+    def __init__(self, cluster, node_facts, vision=False, worker_vision=False):
+        super().__init__(cluster, vision=vision, worker_vision=worker_vision)
+        self.node_facts = node_facts
+        self.vision_probes = []
+
+    def require_worker(self):
+        return self.topology
+
+    def node_vision_facts(self, case_id, node, domain, port):
+        self.vision_probes.append((node, domain, port))
+        return self.node_facts[node]
 
 
 class TestClusterScope(unittest.TestCase):
@@ -661,6 +753,139 @@ class TestClusterCases(unittest.TestCase):
         with self.assertRaises(AssertionError) as caught:
             self._run(multi_node.case_cluster_nodes, cluster)
         self.assertIn("no published host references the Worker", str(caught.exception))
+
+
+class TestVisionCase(unittest.TestCase):
+    """MN-VISION: the four combinations, and the defect each one rules out."""
+
+    def _run(self, vision=False, worker_vision=False, cluster=None, node_facts=None):
+        product = _VisionProduct(
+            cluster if cluster is not None
+            else healthy_cluster(vision=vision, worker_vision=worker_vision),
+            cluster_node_facts(vision, worker_vision) if node_facts is None else node_facts,
+            vision=vision, worker_vision=worker_vision,
+        )
+        return multi_node.case_vision_independence(product), product
+
+    def test_each_combination_checks_both_nodes_against_their_own_names(self):
+        for vision, worker_vision, combination in (
+            (False, False, "neither"),
+            (True, False, "master-only"),
+            (False, True, "worker-only"),
+            (True, True, "both"),
+        ):
+            with self.subTest(combination=combination):
+                evidence, product = self._run(vision, worker_vision)
+                self.assertEqual(evidence["combination"], combination)
+                self.assertIs(evidence["master_vision_enabled"], vision)
+                self.assertIs(evidence["worker_vision_enabled"], worker_vision)
+                port = evidence["vision_internal_port"]
+                self.assertEqual(product.vision_probes, [
+                    ("master", topology.VISION_DOMAIN, port),
+                    ("worker", topology.WORKER_VISION_DOMAIN, port),
+                ])
+
+    def test_a_node_without_vision_is_proven_to_have_no_endpoint_under_its_name(self):
+        evidence, _product = self._run(False, False)
+        self.assertIs(evidence["master_certificate"], False)
+        self.assertIs(evidence["worker_certificate"], False)
+        self.assertEqual(evidence["master_declared_vision_inbounds"], 0)
+        self.assertEqual(evidence["worker_declared_vision_inbounds"], 0)
+        self.assertEqual(evidence["master_applied_vision_inbounds"], 0)
+        self.assertEqual(evidence["worker_applied_vision_inbounds"], 0)
+
+    def test_the_inbound_is_matched_by_its_transport_not_by_its_tag(self):
+        cluster = healthy_cluster(vision=True)
+        vision_spec = cluster["nodes"]["records"][0]["inbound_specs"][-1]
+        vision_spec["tag"] = "renamed-by-the-panel"
+        evidence, _product = self._run(True, False, cluster=cluster)
+        self.assertEqual(evidence["master_declared_vision_inbounds"], 1)
+
+    def test_an_inbound_with_another_transport_port_is_not_taken_for_vision(self):
+        cluster = healthy_cluster(vision=True)
+        cluster["nodes"]["records"][0]["inbound_specs"][-1]["port"] = 9999
+        with self.assertRaises(AssertionError) as caught:
+            self._run(True, False, cluster=cluster)
+        self.assertIn("declares 0 Vision inbounds", str(caught.exception))
+
+    def test_a_vision_host_bound_to_another_node_is_refused(self):
+        cluster = healthy_cluster(vision=True)
+        master_vision_host = next(
+            record for record in cluster["hosts"]["records"]
+            if record["address"] == topology.VISION_DOMAIN
+        )
+        master_vision_host["nodes"] = [panel_surface.identifier(WORKER_NODE_UUID)]
+        with self.assertRaises(AssertionError) as caught:
+            self._run(True, False, cluster=cluster)
+        self.assertIn("owns 0 Panel hosts", str(caught.exception))
+
+    def test_a_certificate_that_does_not_cover_the_domain_is_refused(self):
+        facts = cluster_node_facts(True, False)
+        facts["master"]["certificate"]["host_ok"] = False
+        with self.assertRaises(AssertionError) as caught:
+            self._run(True, False, node_facts=facts)
+        self.assertIn("does not cover the name", str(caught.exception))
+
+    def test_a_route_pointing_at_another_port_is_refused(self):
+        facts = cluster_node_facts(True, False)
+        facts["master"]["nginx"]["stream_routes"] = [
+            {"file": "gowave-stream.conf", "target": "127.0.0.1:9444;"},
+        ]
+        with self.assertRaises(AssertionError) as caught:
+            self._run(True, False, node_facts=facts)
+        self.assertIn("instead of exactly one 127.0.0.1:8444; route", str(caught.exception))
+
+    def test_a_renewal_server_from_another_acme_directory_is_refused(self):
+        facts = cluster_node_facts(True, False)
+        facts["master"]["certificate"]["renewal_server"] = (
+            "https://acme-v02.api.letsencrypt.org/directory"
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self._run(True, False, node_facts=facts)
+        self.assertIn("renewal config asks", str(caught.exception))
+
+    def test_an_applied_config_without_the_vision_inbound_is_refused(self):
+        facts = cluster_node_facts(True, False)
+        facts["master"]["applied"]["inbounds"] = applied_inbounds(False)
+        with self.assertRaises(AssertionError) as caught:
+            self._run(True, False, node_facts=facts)
+        self.assertIn("carries 0 Vision inbounds", str(caught.exception))
+
+    def test_an_applied_config_that_does_not_parse_is_refused(self):
+        facts = cluster_node_facts(True, False)
+        facts["worker"]["applied"] = {"parsed": False, "inbounds": []}
+        with self.assertRaises(AssertionError) as caught:
+            self._run(True, False, node_facts=facts)
+        self.assertIn("no parseable applied config", str(caught.exception))
+
+    def test_a_worker_carrying_a_certificate_without_vision_is_refused(self):
+        facts = cluster_node_facts(False, False)
+        facts["worker"]["certificate"].update({
+            "present": True,
+            "host_ok": True,
+            "valid": True,
+            "renewal_server": acme_fixture.ACME_DIRECTORY_URL,
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self._run(False, False, node_facts=facts)
+        self.assertIn("holds a certificate", str(caught.exception))
+
+    def test_a_node_that_still_routes_vision_without_it_is_refused(self):
+        facts = cluster_node_facts(False, False)
+        facts["worker"]["nginx"]["stream_routes"] = [
+            {"file": "gowave-worker-stream.conf", "target": "127.0.0.1:8444;"},
+        ]
+        facts["worker"]["nginx"]["stream_vision_targets"] = ["gowave-worker-stream.conf"]
+        with self.assertRaises(AssertionError) as caught:
+            self._run(False, False, node_facts=facts)
+        self.assertIn("routes Vision traffic", str(caught.exception))
+
+    def test_a_worker_that_keeps_a_vision_vhost_without_it_is_refused(self):
+        facts = cluster_node_facts(False, True)
+        facts["master"]["nginx"]["vision_named_files"] = ["gowave-vision-fallback.conf"]
+        with self.assertRaises(AssertionError) as caught:
+            self._run(False, True, node_facts=facts)
+        self.assertIn("keeps Vision vhosts", str(caught.exception))
 
 
 if __name__ == "__main__":

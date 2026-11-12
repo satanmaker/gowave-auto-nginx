@@ -774,14 +774,21 @@ class TestMultiNodeSuite(unittest.TestCase):
         ids = [case.id for case in multi_node.cases(self.podman)]
         self.assertEqual(ids[16:18], ["WRK-05", "WRK-06"])
 
+    def test_the_vision_independence_case_follows_the_worker_config(self):
+        # 5.10: the per-node Vision proof reads the config WRK-06 has just
+        # compared, so it runs once that assignment is established and before any
+        # data plane traffic.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertEqual(ids[16:19], ["WRK-05", "WRK-06", multi_node.VISION_CASE_ID])
+
     def test_the_data_plane_cases_follow_the_worker_audit(self):
         # 5.7: a payload has to traverse the Worker too, so the matrix tuples of
         # both nodes run once the Worker's own config is applied.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[18], "MN-DP-master-REALITY-xray")
-        self.assertEqual(ids[25], "MN-DP-master-TROJAN-GRPC-mihomo")
-        self.assertEqual(ids[26], "MN-DP-worker-REALITY-xray")
-        self.assertEqual(ids[33], "MN-DP-worker-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[19], "MN-DP-master-REALITY-xray")
+        self.assertEqual(ids[26], "MN-DP-master-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[27], "MN-DP-worker-REALITY-xray")
+        self.assertEqual(ids[34], "MN-DP-worker-TROJAN-GRPC-mihomo")
 
     def test_every_node_contributes_its_own_matrix_tuples(self):
         data = matrix.load()
@@ -839,7 +846,7 @@ class TestMultiNodeSuite(unittest.TestCase):
         # cluster's, so the two shared subscription cases run after every node
         # they depend on exists.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[34:36], ["SUB-SERVED", "SUB-B64"])
+        self.assertEqual(ids[35:37], ["SUB-SERVED", "SUB-B64"])
 
     def test_the_lifecycle_cases_run_last_because_they_fault_the_worker(self):
         # 5.9: revocation and the Worker's own stop/start/restart change the

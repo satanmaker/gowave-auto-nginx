@@ -323,6 +323,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "topology": ["multi-node"],
         "promotion_target": "Negative Scenario and Fault Injection Tests",
     },
+    {
+        "id": "MN-VISION",
+        "requirement": "Independent Optional Vision Domains",
+        "assertion": "In each of the four per-node Vision combinations, every node is checked against its own Vision domain alone: a configured node declares exactly one Vision inbound and one disabled-free Panel host bound to it under its own name, holds a certificate covering that name that renews from this run's ACME directory, routes the name to its Vision inbound and runs that inbound in its applied config; an unconfigured node has none of those under its own name, so swapping the two nodes' Vision configuration fails.",
+        "topology": ["multi-node"],
+        "promotion_target": "Independent Optional Vision Domains",
+    },
 ]
 
 SCENARIO_RE = re.compile(r"^#### Scenario:\s*(.+?)\s*$")
