@@ -157,7 +157,7 @@ class TestNginxRouting(unittest.TestCase):
             self.assertIn("--accent2:#14876f", css)
 
             for page in cover_dir.rglob("*"):
-                if page.suffix in {".html", ".css"}:
+                if page.suffix in {".html", ".css", ".svg"}:
                     self.assertNotIn("{{", page.read_text(), f"unrendered placeholder in {page}")
 
     def test_cover_domain_reaches_the_decoy_and_redirects_http(self):

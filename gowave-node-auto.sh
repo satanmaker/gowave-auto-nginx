@@ -1907,9 +1907,9 @@ render_cover_site() {
             return 1
         fi
         chmod 0644 "$tmp" && mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
-    done < <(find "$cover_root" -type f \( -name '*.html' -o -name '*.css' \) -print)
+    done < <(find "$cover_root" -type f \( -name '*.html' -o -name '*.css' -o -name '*.svg' \) -print)
 
-    if grep -rq '{{' "$cover_root" --include='*.html' --include='*.css'; then
+    if grep -rq '{{' "$cover_root" --include='*.html' --include='*.css' --include='*.svg'; then
         echo "Error: camouflage site still contains unrendered placeholders under $cover_root" >&2
         return 1
     fi
@@ -1942,6 +1942,16 @@ configure_edge_nginx() {
     # Port 80 ACME webroot vhost. It stays in place after issuance: certbot's
     # HTTP-01 renewal revalidates through this same path, so removing it makes
     # every later `certbot renew` fail with a 404.
+    local cover_http_redirect=""
+    if [[ -n "$cover_domain" ]]; then
+        # Keep the plain-HTTP visit to the camouflage apex as ordinary as the
+        # Master's: redirect to HTTPS instead of dropping the connection.
+        local cover_regex="${cover_domain//./\\.}"
+        cover_http_redirect="        if (\$host ~* ^(${cover_regex}|www\\.${cover_regex})\$) {
+            return 301 https://\$host\$request_uri;
+        }
+"
+    fi
     cat > /etc/nginx/conf.d/00-worker-acme-challenge.conf <<EOF
 # Managed by GoWave Auto NGINX: Worker Port 80 ACME Challenge
 server {
@@ -1951,7 +1961,7 @@ server {
         root /var/www/gowave-acme;
     }
     location / {
-        return 444;
+${cover_http_redirect}        return 444;
     }
 }
 EOF

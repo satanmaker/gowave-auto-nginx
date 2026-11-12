@@ -103,9 +103,9 @@ render_cover_site() {
             return 1
         fi
         chmod 0644 "$tmp" && mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
-    done < <(find "$cover_root" -type f \( -name '*.html' -o -name '*.css' \) -print)
+    done < <(find "$cover_root" -type f \( -name '*.html' -o -name '*.css' -o -name '*.svg' \) -print)
 
-    if grep -rq '{{' "$cover_root" --include='*.html' --include='*.css'; then
+    if grep -rq '{{' "$cover_root" --include='*.html' --include='*.css' --include='*.svg'; then
         echo "Error: camouflage site still contains unrendered placeholders under $cover_root" >&2
         return 1
     fi
