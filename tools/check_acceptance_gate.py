@@ -22,13 +22,14 @@ def run_command(cmd: list[str], desc: str) -> tuple[bool, str]:
     return True, proc.stdout
 
 
-def verify_live_staging_run() -> tuple[bool, str]:
-    artifacts_dir = REPO_ROOT / "artifacts" / "live-vps"
+def verify_live_staging_run(artifacts_dir: Path | None = None) -> tuple[bool, str]:
+    if artifacts_dir is None:
+        artifacts_dir = REPO_ROOT / "artifacts" / "live-vps"
     if not artifacts_dir.exists():
         return False, "No artifacts/live-vps directory found; live VPS staging run has not been executed."
 
     valid_runs = []
-    for run_dir in artifacts_dir.iterdir():
+    for run_dir in sorted(artifacts_dir.iterdir()):
         if not run_dir.is_dir():
             continue
         result_file = run_dir / "result.json"
@@ -37,10 +38,12 @@ def verify_live_staging_run() -> tuple[bool, str]:
         try:
             with open(result_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("overall_status") == "PASS" and data.get("acme_mode") == "staging":
-                teardown = data.get("phases", {}).get("teardown", {})
-                if teardown.get("status") == "PASS":
-                    valid_runs.append(data.get("run_id", run_dir.name))
+            overall = data.get("overall") or data.get("overall_status")
+            acme_mode = (data.get("trust") or {}).get("acme_mode") or data.get("acme_mode")
+            phases = data.get("results") or data.get("phases") or {}
+            teardown = phases.get("teardown") or {}
+            if overall == "PASS" and acme_mode == "staging" and teardown.get("status") == "PASS":
+                valid_runs.append(data.get("test_run_id") or data.get("run_id") or run_dir.name)
         except Exception:
             continue
 
