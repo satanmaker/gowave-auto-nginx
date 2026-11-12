@@ -30,9 +30,9 @@
 - [x] 3.2 Add Pebble or equivalent local ACME fixture and trusted test CA.
 - [x] 3.3 Add external HTTP/HTTPS echo/egress service with unique request IDs, payload verification, and source/path evidence.
 - [x] 3.4 Add controlled fault switches for fixture unavailability, latency, and error responses.
-- [ ] 3.5 Verify fixtures are isolated from public DNS, production ACME, and external VPS targets.
+- [x] 3.5 Verify fixtures are isolated from public DNS, production ACME, and external VPS targets.
 - [x] 3.6 Implement and test the narrow test-only ACME opt-in in both Master and Worker validation/lineage paths: exact Pebble endpoint plus pinned CA only; SSH-stdin propagation; scoped Certbot/client CA trust; no global trust changes; production/Staging defaults unchanged; arbitrary URLs rejected even when test mode is enabled.
-- [ ] 3.7 Make the fixture CA usable by both client engines without global trust: inject `tlsSettings.certificates` entries with `usage: verify` into every Xray TLS outbound, because Xray ignores `SSL_CERT_FILE`, and pass the scoped bundle to Mihomo, curl, and the Python clients. Assert that a missing anchor fails the case with a chain error rather than passing silently.
+- [x] 3.7 Make the fixture CA usable by both client engines without global trust: inject `tlsSettings.certificates` entries with `usage: verify` into every Xray TLS outbound, because Xray ignores `SSL_CERT_FILE`, and pass the scoped bundle to Mihomo, curl, and the Python clients. Assert that a missing anchor fails the case with a chain error rather than passing silently.
 
 ## 4. All-in-One product E2E
 

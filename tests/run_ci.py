@@ -23,6 +23,8 @@ SUITES = {
         "test_user_links.TestUserLinks",
         "test_podman_address.TestPodmanAddressOverride",
         "test_podman_acme_fixture.TestPodmanAcmeFixture",
+        "test_podman_fixture_isolation.TestPodmanFixtureIsolation",
+        "test_podman_client_trust.TestPodmanClientTrust",
         "test_podman_cleanup.TestPodmanStaleRunRecovery",
         "test_fixture_dns.TestDnsFixture",
         "test_fixture_echo.TestEchoFixture",
