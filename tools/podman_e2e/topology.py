@@ -1,18 +1,21 @@
 """Disposable Podman topology for the All-in-One product E2E.
 
 The host, its resolver, and its ACME directory are all run-scoped containers on
-one private network. The operator under test sees an ordinary fresh VPS: it
-installs its own packages, manages its own systemd units, and requests a
+a private control network. The operator under test sees an ordinary fresh VPS:
+it installs its own packages, manages its own systemd units, and requests a
 certificate from the pinned fixture endpoint. Nothing on the workstation (or on
 any real host) is touched.
 
-The subnet is allocated at run time instead of hard-coded: ``podman network
-create`` fails when a candidate /24 overlaps a network the workstation already
-has (a previous suite run, a developer network, a VPN), so the plan walks a
-fixed candidate range and picks the first free block. Addresses inside the block
-are fixed offsets, so a case can still assert which node answered a connection.
-The private-address override handed to the operator is the same narrow,
-test-only path the installer already validates.
+A second, internal network carries the addresses the product is asked to reach
+as if they were on the public internet, because it forwards only destinations it
+reads as public (see the notes on ``DATA_PREFIX_CANDIDATES``). Both subnets are
+allocated at run time instead of hard-coded: ``podman network create`` fails
+when a candidate /24 overlaps a network the workstation already has (a previous
+suite run, a developer network, a VPN), so the plan walks a fixed candidate
+range per network and picks the first free block. Addresses inside each block
+are fixed offsets, so a case can still assert which node answered a connection,
+and on which of its two addresses. The private-address override handed to the
+operator is the same narrow, test-only path the installer already validates.
 """
 from __future__ import annotations
 
@@ -26,9 +29,34 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from tools.podman_e2e import acme_fixture, client_image, target_image
 
-# 10.90.0.0/24 .. 10.254.0.0/24: the private range container networks live in.
-# Every candidate is checked against the host before it is claimed.
-PREFIX_CANDIDATES = tuple(f"10.{second}.0.0/24" for second in range(90, 255))
+# Two networks, because one block cannot satisfy both ends of the run.
+#
+# The control network is private: the product resolves its own address through a
+# test-only override that refuses anything but a private address (so an operator
+# can never pass a public IP off as a NAT-ed host), and every fixture, both
+# probes, and the ACME directory live on it.
+CONTROL_PREFIX_CANDIDATES = ("10.89.0.0/24", "10.90.0.0/24", "10.91.0.0/24")
+
+# The data network must carry real public addresses, because two independent
+# guards otherwise swallow the payload before it can prove egress:
+#   * the node's routing sends private and loopback destinations to its block
+#     outbound, so a payload addressed into 10/8 returns 503 and never leaves;
+#   * the engine's freedom outbound applies an implicit final rule for
+#     vless/trojan/shadowsocks inbounds that blackholes every destination the
+#     IANA special-purpose registry lists (RFC 5737 documentation blocks,
+#     198.18.0.0/15 benchmarking, 240.0.0.0/4 reserved, multicast), and a
+#     blackholed stream is drained until the block duration expires, so the
+#     client hangs instead of failing fast. Pinning this against Xray 26.11.9
+#     cost a full debugging pass: proxy/freedom getDefaultFinalRule returns
+#     defaultBlockPrivateRule -> geodata.GetPrivateIPMatcher.
+# Candidates are therefore global unicast space, which both guards forward. The
+# data network is created internal, so it is a bridge with a connected route and
+# no gateway: the node's dial is delivered locally and there is no route by which
+# a packet addressed into the block could leave the workstation, even though the
+# bytes look routable. Each candidate sits next to a documentation block so it is
+# easy to recognise in an evidence file, and the allocator skips any block the
+# workstation or another Podman network already claims.
+DATA_PREFIX_CANDIDATES = ("203.0.114.0/24", "198.51.101.0/24", "192.0.3.0/24")
 
 DNS_OFFSET = 53
 TARGET_OFFSET = 10
@@ -46,10 +74,16 @@ HOST_RESOLV_CONF = Path("/etc/resolv.conf")
 
 FIXTURE_IMAGE = "fixture-echo"
 DNS_FIXTURE_SCRIPT = "/repo/tests/fixtures/dns_server.py"
+ECHO_FIXTURE_SCRIPT = "/repo/tests/fixtures/echo_server.py"
 REPO_IN_CONTAINER = "/repo"
 CA_MOUNT = "/fixtures/ca"
 CA_FILE_NAME = "fixture-ca.crt"
 ISSUED_ROOT_NAME = "issued-root.pem"
+ECHO_MOUNT = "/fixtures/echo"
+ECHO_HTTP_PORT = 18080
+ECHO_HTTPS_PORT = 18443
+ECHO_CERT_NAME = "echo.crt"
+ECHO_KEY_NAME = "echo.key"
 
 PANEL_DOMAIN = "panel.testbed.internal"
 REALITY_DOMAIN = "reality.testbed.internal"
@@ -64,6 +98,9 @@ HTTP_PROBE_SCRIPT = f"{REPO_IN_CONTAINER}/tools/podman_e2e/http_probe.py"
 # The probe the engine role runs: it consumes the Panel payloads with the pinned
 # client binaries and reports facts only.
 SUBSCRIPTION_PROBE_SCRIPT = f"{REPO_IN_CONTAINER}/tools/podman_e2e/subscription_probe.py"
+# The probe that sends payloads through the served outbounds with the same
+# binaries, from the same role.
+TRAFFIC_PROBE_SCRIPT = f"{REPO_IN_CONTAINER}/tools/podman_e2e/traffic_probe.py"
 # Payloads are fetched on the host (the subscription routes are loopback-only)
 # and mounted into the engine container; they are never printed or copied into
 # the artifact directory.
@@ -79,12 +116,19 @@ class TopologyError(RuntimeError):
 
 @dataclass(frozen=True)
 class NetworkPlan:
-    """One /24 plus the fixed host offsets the fixtures occupy inside it."""
+    """Two /24s with the fixed host offsets the fixtures occupy inside them.
+
+    ``subnet`` reaches the product and every fixture; ``data_subnet`` carries the
+    public address the data plane is asked to reach, so the two roles that touch
+    it (the installed host and the endpoint, plus the engine client that
+    calibrates the source attribution) need that block and nothing else.
+    """
 
     subnet: str
+    data_subnet: str = DATA_PREFIX_CANDIDATES[0]
 
-    def _address(self, host: int) -> str:
-        network = ipaddress.ip_network(self.subnet, strict=False)
+    def _address(self, host: int, network_block: str = "") -> str:
+        network = ipaddress.ip_network(network_block or self.subnet, strict=False)
         return str(network.network_address + host)
 
     @property
@@ -111,6 +155,18 @@ class NetworkPlan:
     def engine_client_ip(self) -> str:
         return self._address(ENGINE_CLIENT_OFFSET)
 
+    @property
+    def data_target_ip(self) -> str:
+        return self._address(TARGET_OFFSET, self.data_subnet)
+
+    @property
+    def data_echo_ip(self) -> str:
+        return self._address(ECHO_OFFSET, self.data_subnet)
+
+    @property
+    def data_engine_client_ip(self) -> str:
+        return self._address(ENGINE_CLIENT_OFFSET, self.data_subnet)
+
 
 def _overlaps(candidate: ipaddress.IPv4Network, used: Sequence[str]) -> bool:
     for entry in used:
@@ -123,14 +179,21 @@ def _overlaps(candidate: ipaddress.IPv4Network, used: Sequence[str]) -> bool:
     return False
 
 
-def allocate_plan(used_subnets: Sequence[str]) -> NetworkPlan:
-    """First candidate /24 that does not overlap any network the host already has."""
-    for candidate in PREFIX_CANDIDATES:
+def _first_free(candidates: Sequence[str], used_subnets: Sequence[str], role: str) -> str:
+    for candidate in candidates:
         network = ipaddress.ip_network(candidate, strict=False)
         if not _overlaps(network, used_subnets):
-            return NetworkPlan(subnet=str(network))
+            return str(network)
     raise TopologyError(
-        f"no free /24 left in {PREFIX_CANDIDATES[0]}..{PREFIX_CANDIDATES[-1]} for the run network"
+        f"no free /24 left in {', '.join(candidates)} for the {role} network"
+    )
+
+
+def allocate_plan(used_subnets: Sequence[str]) -> NetworkPlan:
+    """Pick one free /24 per network, avoiding what the host already claims."""
+    return NetworkPlan(
+        subnet=_first_free(CONTROL_PREFIX_CANDIDATES, used_subnets, "control"),
+        data_subnet=_first_free(DATA_PREFIX_CANDIDATES, used_subnets, "data"),
     )
 
 
@@ -228,13 +291,16 @@ class AioTopology:
     _ca_dir: Optional[Path] = None
     _issued_root: str = ""
     _clean_facts: Dict[str, Any] = field(default_factory=dict)
+    echo_dir: Optional[Path] = None
 
     def __post_init__(self) -> None:
         target_image.distribution(self.distribution)
         self.context = self.podman.context
         self.network = self.context.resource_name("e2e-net")
+        self.data_network = self.context.resource_name("e2e-data")
         self.dns_name = self.context.resource_name("dns")
         self.target_name = self.context.resource_name("aio")
+        self.echo_name = self.context.resource_name("echo")
         self.client_name = self.context.resource_name("client")
         self.engine_client_name = self.context.resource_name("engines")
         self.payload_dir = self.context.secret_dir / "subscriptions"
@@ -252,9 +318,13 @@ class AioTopology:
             )
         self.payload_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.podman.network_create(self.network, self.plan.subnet, disable_dns=True)
+        self.podman.network_create(
+            self.data_network, self.plan.data_subnet, disable_dns=True, internal=True,
+        )
         self._start_dns()
         self._start_acme()
         self._start_target()
+        self._start_echo()
         self._start_client()
         return self
 
@@ -324,7 +394,61 @@ class AioTopology:
         )
         self.started.append(self.target_name)
         self.podman.wait_systemd(self.target_name, timeout_seconds=180)
+        # The public address the data plane dials out from, added after start so
+        # the container keeps the private default route it installs packages over.
+        self.podman.network_connect(self.target_name, self.data_network, ip=self.plan.data_target_ip)
         self._clean_facts = target_image.assert_clean(self.podman, self.target_name)
+
+    def _start_echo(self) -> None:
+        """The controlled endpoint the data plane has to reach.
+
+        It is on the run network with its own address, so what it records about a
+        request — the request id, the body digest, and the source address — is the
+        only evidence that a payload actually travelled: a client that never
+        connected cannot make it record anything.
+        """
+        if self._ca_dir is None or self.acme is None or self.acme.ca is None:
+            raise TopologyError("the echo fixture needs the fixture CA, which the target start creates")
+        leaf = acme_fixture.generate_leaf(
+            self.acme.ca.directory, "echo", ("DNS:" + ECHO_HOST,),
+        )
+        for source, name in ((leaf["cert"], ECHO_CERT_NAME), (leaf["key"], ECHO_KEY_NAME)):
+            destination = self._ca_dir / name
+            destination.write_bytes(source.read_bytes())
+            destination.chmod(0o644)
+        directory = self.context.secret_dir / "echo"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.echo_dir = directory
+        self.podman.run(
+            name=self.echo_name,
+            image_alias=FIXTURE_IMAGE,
+            network=self.network,
+            aliases=(ECHO_HOST,),
+            privileged=False,
+            volumes=(
+                f"{self._ca_dir}:{CA_MOUNT}:ro,Z",
+                f"{directory}:{ECHO_MOUNT}:Z",
+            ),
+            command=(
+                "python3", ECHO_FIXTURE_SCRIPT,
+                "--http-port", str(ECHO_HTTP_PORT),
+                "--https-port", str(ECHO_HTTPS_PORT),
+                "--control", f"{ECHO_MOUNT}/control.json",
+                "--log", f"{ECHO_MOUNT}/requests.jsonl",
+                "--cert", f"{CA_MOUNT}/{ECHO_CERT_NAME}",
+                "--key", f"{CA_MOUNT}/{ECHO_KEY_NAME}",
+            ),
+            systemd="false",
+            extra_args=(
+                "--ip", self.plan.echo_ip,
+                "--dns", self.plan.dns_ip,
+            ),
+        )
+        self.started.append(self.echo_name)
+        # Both faces: the private one the fixtures resolve, and the public one the
+        # installed node is asked to reach through the tunnel it was issued.
+        self.podman.network_connect(self.echo_name, self.data_network, ip=self.plan.data_echo_ip)
+        self.podman.wait_tcp(self.echo_name, "127.0.0.1", ECHO_HTTP_PORT, timeout_seconds=60)
 
     def _start_client(self) -> None:
         """The Control Machine role: independent of the host it probes.
@@ -362,8 +486,17 @@ class AioTopology:
         The payload directory is mounted read-only: the Panel's subscription
         routes are loopback-only, so the host fetches them and the engines
         consume exactly the bytes the Panel served.
+
+        The Panel's own names are pinned in the container's hosts file because the
+        served Mihomo template resolves proxy servers through public nameservers,
+        which cannot answer for the run's private zone. That is client-side name
+        resolution in place of public DNS, not a rewrite of what the Panel issued:
+        the outbound fields stay exactly as served.
         """
         self._engine_image = client_image.build(self.podman)
+        domains = [self.panel_domain, self.reality_domain]
+        if self.vision_domain:
+            domains.append(self.vision_domain)
         self.podman.run(
             name=self.engine_client_name,
             image_alias=self._engine_image,
@@ -378,9 +511,19 @@ class AioTopology:
             extra_args=(
                 "--ip", self.plan.engine_client_ip,
                 "--dns", self.plan.dns_ip,
+                *[
+                    option
+                    for name in domains
+                    for option in ("--add-host", f"{name}:{self.plan.target_ip}")
+                ],
             ),
         )
         self.started.append(self.engine_client_name)
+        # The control transfer has to address the same literal the tunnel does, so
+        # the source each one leaves behind is a like-for-like comparison.
+        self.podman.network_connect(
+            self.engine_client_name, self.data_network, ip=self.plan.data_engine_client_ip,
+        )
 
     def subscription_facts(self, scope: str, timeout: int = 300) -> Any:
         """Run the engine-side subscription probe and return the completed process."""
@@ -392,6 +535,27 @@ class AioTopology:
                 "--scope", scope,
                 "--payload-dir", SECRETS_MOUNT,
                 "--ca", f"{CA_MOUNT}/{ISSUED_ROOT_NAME}",
+            ],
+            check=False,
+            timeout=timeout,
+        )
+
+    def traffic_facts(self, scope: str, timeout: int = 900) -> Any:
+        """Run the engine-side traffic probe against the controlled endpoint.
+
+        The destination is the endpoint's public address, not the private one the
+        fixtures resolve: both of the product's guards pass a global destination
+        and would drop or blackhole a private one.
+        """
+        self.engine_client()
+        return self.podman.exec(
+            self.engine_client_name,
+            [
+                "python3", TRAFFIC_PROBE_SCRIPT,
+                "--scope", scope,
+                "--payload-dir", SECRETS_MOUNT,
+                "--ca", f"{CA_MOUNT}/{ISSUED_ROOT_NAME}",
+                "--destination", f"{self.plan.data_echo_ip}:{ECHO_HTTP_PORT}",
             ],
             check=False,
             timeout=timeout,
@@ -508,6 +672,10 @@ class AioTopology:
             "subnet": self.plan.subnet,
             "target_ip": self.plan.target_ip,
             "target_container": self.target_name,
+            "data_network": self.data_network,
+            "data_subnet": self.plan.data_subnet,
+            "data_target_ip": self.plan.data_target_ip,
+            "data_echo_ip": self.plan.data_echo_ip,
             "client_ip": self.plan.client_ip,
             "client_container": self.client_name,
             "panel_domain": self.panel_domain,

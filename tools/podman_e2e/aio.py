@@ -91,6 +91,14 @@ EXPECTED_FINGERPRINT = "firefox"
 
 UA_REFUSAL_STATUS = 403
 
+# The transports the core inbound set carries, and the two pinned clients that
+# have to traverse each of them. A Vision install adds a fifth transport, which is
+# what makes the matrix 8 or 10 tuples rather than a fixed list.
+TRAFFIC_NETWORKS: Sequence[str] = ("grpc", "tcp", "ws", "xhttp")
+TRAFFIC_ENGINES: Sequence[str] = ("mihomo", "xray")
+# Two engines over four transports, run sequentially on one client container.
+TRAFFIC_TIMEOUT_SECONDS = 900
+
 
 class AioProduct:
     """One disposable AIO host, installed once by the real operator."""
@@ -190,6 +198,22 @@ class AioProduct:
             return json.loads(result.stdout or "")
         except json.JSONDecodeError:
             require(case_id, False, f"the client probe did not print JSON: {(result.stdout or '')[:400]}")
+            return {}
+
+    def traffic_facts(self, case_id: str, scope: str) -> Dict[str, Any]:
+        """Run the engine-side traffic probe and return what the endpoint recorded."""
+        host = self.require_installed()
+        result = host.traffic_facts(scope)
+        detail = (result.stderr or result.stdout or "").strip()[-2000:]
+        require(
+            case_id,
+            result.returncode == 0,
+            f"the traffic probe exited {result.returncode}: {detail}",
+        )
+        try:
+            return json.loads(result.stdout or "")
+        except json.JSONDecodeError:
+            require(case_id, False, f"the traffic probe did not print JSON: {(result.stdout or '')[:400]}")
             return {}
 
 
@@ -748,6 +772,73 @@ def case_share_links(product: AioProduct) -> Dict[str, Any]:
     }
 
 
+def case_traffic(product: AioProduct) -> Dict[str, Any]:
+    """AIO-TRAFFIC: every served outbound carries a unique payload to the endpoint.
+
+    The engines run from the Control Machine, so a transfer that shows up at the
+    endpoint with the installed host as its source address traversed the product;
+    the same request sent straight from the client is recorded as its own source,
+    which is what makes that attribution meaningful. A 200 alone is not proof: the
+    endpoint has to echo the request id and the digest of the body it received.
+    """
+    product.subscription_payloads("AIO-TRAFFIC")
+    host = product.require_installed()
+    facts = product.traffic_facts("AIO-TRAFFIC", "traffic")
+
+    transfers = facts.get("transfers") or []
+    require("AIO-TRAFFIC", transfers, "no served outbound was exercised, so the data plane was not proven")
+    require("AIO-TRAFFIC", facts.get("missing_request_ids") == 0,
+            f"{facts.get('missing_request_ids')!r} payload(s) never reached the controlled endpoint")
+    for item in transfers:
+        tuple_id = f"{item.get('engine')}/{item.get('network')}"
+        require("AIO-TRAFFIC", item.get("status") == 200,
+                f"the {tuple_id} transfer returned {item.get('status')!r} instead of 200")
+        require("AIO-TRAFFIC", item.get("request_id_match"),
+                f"the endpoint did not echo the {tuple_id} request id")
+        require("AIO-TRAFFIC", item.get("body_match"),
+                f"the endpoint did not receive the exact {tuple_id} payload")
+        require("AIO-TRAFFIC", item.get("source_ip") == host.plan.data_target_ip,
+                f"the {tuple_id} transfer left from {item.get('source_ip')!r} instead of the installed "
+                f"host {host.plan.data_target_ip!r}, so it did not traverse the product")
+
+    for engine in TRAFFIC_ENGINES:
+        observed = sorted({str(item.get("network")) for item in transfers if item.get("engine") == engine})
+        require("AIO-TRAFFIC", observed == list(TRAFFIC_NETWORKS),
+                f"the {engine} client covered {observed} instead of every core transport "
+                f"{list(TRAFFIC_NETWORKS)}")
+        realities = [
+            item for item in transfers
+            if item.get("engine") == engine and item.get("security") == "reality"
+        ]
+        require("AIO-TRAFFIC", len(realities) == 1,
+                f"the {engine} client exercised {len(realities)} REALITY outbounds, expected exactly one")
+        for item in transfers:
+            if item.get("engine") != engine or item.get("security") == "none":
+                continue
+            require("AIO-TRAFFIC", item.get("sni"),
+                    f"the {engine}/{item.get('network')} outbound carries no SNI, so the served profile "
+                    "cannot address the inbound it was issued for")
+
+    require("AIO-TRAFFIC", facts.get("direct_source_ip") == host.plan.data_engine_client_ip,
+            f"the control request left from {facts.get('direct_source_ip')!r} instead of the client "
+            f"{host.plan.data_engine_client_ip!r}, so source attribution was not calibrated")
+    require("AIO-TRAFFIC", facts.get("echo_records") >= len(transfers),
+            f"the endpoint recorded {facts.get('echo_records')!r} request(s) for {len(transfers)} "
+            "transfer(s)")
+
+    return {
+        "transfer_count": facts.get("transfer_count"),
+        "engines": ",".join(facts.get("engines") or []),
+        "networks": ",".join(facts.get("networks") or []),
+        "tuples": ",".join(
+            f"{item.get('engine')}:{item.get('network')}:{item.get('security')}" for item in transfers
+        ),
+        "source_ips": ",".join(facts.get("source_ips") or []),
+        "direct_source_ip": facts.get("direct_source_ip"),
+        "echo_records": facts.get("echo_records"),
+    }
+
+
 def case_json_shapes(product: AioProduct) -> Dict[str, Any]:
     """SUB-JSON-SHAPES: the served and the alternate `/v2ray-json` shape both load.
 
@@ -810,4 +901,6 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04") -> List[Case]:
         Case("SUB-UA-BLANK", "aio", lambda context: case_user_agent_blank(product), timeout_seconds=300),
         Case("SUB-B64", "aio", lambda context: case_share_links(product), timeout_seconds=300),
         Case("SUB-JSON-SHAPES", "aio", lambda context: case_json_shapes(product), timeout_seconds=300),
+        Case("AIO-TRAFFIC", "aio", lambda context: case_traffic(product),
+             timeout_seconds=TRAFFIC_TIMEOUT_SECONDS),
     ]

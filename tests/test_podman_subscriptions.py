@@ -1198,6 +1198,7 @@ class RecordingPodman:
         self.artifacts = Path(tempfile.mkdtemp(prefix="gowave-subscription-topology-"))
         self.context = RunContext(topology="aio", artifact_root=self.artifacts, budget_seconds=3600)
         self.networks = []
+        self.connects = []
         self.runs = []
         self.builds = []
         self.execs = []
@@ -1206,8 +1207,12 @@ class RecordingPodman:
     def network_subnets(self):
         return []
 
-    def network_create(self, name, subnet=None, disable_dns=False):
-        self.networks.append((name, subnet, disable_dns))
+    def network_create(self, name, subnet=None, disable_dns=False, internal=False):
+        self.networks.append((name, subnet, disable_dns, internal))
+        return name
+
+    def network_connect(self, name, network, ip=None):
+        self.connects.append((name, network, ip))
         return name
 
     def run(self, **kwargs):

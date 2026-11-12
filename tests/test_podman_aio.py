@@ -33,14 +33,19 @@ class FakePodman:
         self.install_output = install_output
         self.installs = []
         self.networks = []
+        self.connects = []
         self.started = []
         self.waits = []
 
     def network_subnets(self):
         return []
 
-    def network_create(self, name, subnet=None, disable_dns=False):
-        self.networks.append((name, subnet, disable_dns))
+    def network_create(self, name, subnet=None, disable_dns=False, internal=False):
+        self.networks.append((name, subnet, disable_dns, internal))
+        return name
+
+    def network_connect(self, name, network, ip=None):
+        self.connects.append((name, network, ip))
         return name
 
     def build(self, tag, base_alias, containerfile, context_dir=None):
@@ -73,7 +78,7 @@ class FakePodman:
 
 def fake_create(self):
     """Stand-in for the container setup; the topology itself has its own suite."""
-    self.plan = topology.NetworkPlan("10.90.0.0/24")
+    self.plan = topology.NetworkPlan("203.0.114.0/24")
     self.acme = None
     return self
 

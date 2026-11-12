@@ -168,6 +168,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Real Subscription Delivery and User-Agent Policy",
     },
     {
+        "id": "AIO-TRAFFIC",
+        "requirement": "Real client data-plane verification",
+        "assertion": "The pinned Xray and Mihomo clients consume the Panel-issued subscriptions and send a unique payload through every core transport, and the controlled endpoint echoes each request id and body digest while recording the installed host, not the client, as the source.",
+        "topology": ["aio"],
+        "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
+    },
+    {
         "id": "NGX-COVER-DERIVE",
         "requirement": "Camouflage decoy and certificate lineage",
         "assertion": "The cover apex is the last two labels of panel_domain and a domain with fewer than three labels produces no cover lineage and is handled explicitly.",

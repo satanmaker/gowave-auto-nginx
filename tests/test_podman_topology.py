@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Suite nonroot: the AIO topology uses only run-scoped, private, pinned pieces."""
+"""Suite nonroot: the AIO topology uses only run-scoped, pinned, two-network pieces."""
+import ipaddress
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ class FakePodman:
         self.artifacts = Path(tempfile.mkdtemp(prefix="gowave-topology-"))
         self.context = RunContext(topology="aio", artifact_root=self.artifacts, budget_seconds=3600)
         self.networks = []
+        self.connects = []
         self.used_subnets = ["10.89.0.0/24", "10.90.0.0/24", "10.88.0.0/16"]
         self.runs = []
         self.waits = []
@@ -33,8 +35,12 @@ class FakePodman:
     def network_subnets(self):
         return list(self.used_subnets)
 
-    def network_create(self, name, subnet=None, disable_dns=False):
-        self.networks.append((name, subnet, disable_dns))
+    def network_create(self, name, subnet=None, disable_dns=False, internal=False):
+        self.networks.append((name, subnet, disable_dns, internal))
+        return name
+
+    def network_connect(self, name, network, ip=None):
+        self.connects.append((name, network, ip))
         return name
 
     def run(self, **kwargs):
@@ -87,15 +93,46 @@ class TestPodmanTopology(unittest.TestCase):
         return instance, podman
 
     def test_plan_skips_subnets_already_claimed_on_the_host(self):
-        plan = topology.allocate_plan(["10.89.0.0/24", "10.90.0.0/24"])
-        self.assertEqual(plan.subnet, "10.91.0.0/24")
-        self.assertEqual(plan.dns_ip, "10.91.0.53")
-        self.assertEqual(plan.target_ip, "10.91.0.10")
-        self.assertEqual(plan.pebble_ip, "10.91.0.20")
-        self.assertEqual(plan.echo_ip, "10.91.0.30")
-        overlapping = topology.allocate_plan(["10.91.0.0/20"])
-        self.assertNotEqual(overlapping.subnet, "10.91.0.0/24")
-        self.assertEqual(topology.allocate_plan([]).subnet, "10.90.0.0/24")
+        plan = topology.allocate_plan(["203.0.114.0/24"])
+        self.assertEqual(plan.data_subnet, "198.51.101.0/24")
+        self.assertEqual(plan.data_echo_ip, "198.51.101.30")
+        self.assertEqual(topology.allocate_plan([]).data_subnet, "203.0.114.0/24")
+        control = topology.allocate_plan(["10.89.0.0/24", "10.90.0.0/24"])
+        self.assertEqual(control.subnet, "10.91.0.0/24")
+        self.assertEqual(control.dns_ip, "10.91.0.53")
+        self.assertEqual(control.target_ip, "10.91.0.10")
+        self.assertEqual(control.pebble_ip, "10.91.0.20")
+        self.assertEqual(control.echo_ip, "10.91.0.30")
+
+    def test_the_control_network_is_private_and_the_data_network_is_public(self):
+        # The product resolves its own address through a test-only override that
+        # accepts a private address only, so the control network has to be private.
+        for candidate in topology.CONTROL_PREFIX_CANDIDATES:
+            self.assertTrue(
+                ipaddress.ip_network(candidate).is_private,
+                f"{candidate} is not private, so the installer would reject the override",
+            )
+        # A data-plane destination cannot be private or documented: the node blocks
+        # private ranges, and the engine's freedom outbound blackholes everything the
+        # IANA special-purpose registry lists while draining the stream until its
+        # block duration expires, so a payload addressed there hangs instead of
+        # recording an egress.
+        documentation = {"192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"}
+        for candidate in topology.DATA_PREFIX_CANDIDATES:
+            network = ipaddress.ip_network(candidate)
+            self.assertTrue(
+                network.is_global,
+                f"{candidate} is not global unicast, so the engine would blackhole it",
+            )
+            self.assertNotIn(str(network), documentation)
+        plan = topology.allocate_plan([])
+        self.assertEqual(plan.subnet, "10.89.0.0/24")
+        self.assertEqual(plan.data_subnet, "203.0.114.0/24")
+        self.assertNotEqual(plan.data_target_ip, plan.target_ip)
+        self.assertFalse(
+            ipaddress.ip_network(plan.subnet).overlaps(ipaddress.ip_network(plan.data_subnet)),
+            "the two networks must never share a block",
+        )
 
     def test_zone_points_every_name_into_the_run(self):
         plan = topology.NetworkPlan(subnet="10.89.0.0/24")
@@ -135,12 +172,25 @@ class TestPodmanTopology(unittest.TestCase):
         self.assertEqual(command[command.index("--zone") + 1], "/fixtures/dns/zone.json")
         self.assertEqual(command[command.index("--out-of-zone") + 1], "refused")
 
-    def test_create_builds_one_private_network_and_three_containers(self):
+    def test_create_builds_two_networks_and_three_containers(self):
         instance, podman = self.create()
         self.assertEqual(instance.plan.subnet, "10.91.0.0/24")
-        self.assertEqual(len(podman.networks), 1)
-        self.assertEqual(podman.networks[0][1], "10.91.0.0/24")
-        self.assertTrue(podman.networks[0][2], "the run network must not install its own resolver")
+        self.assertEqual(len(podman.networks), 2)
+        control, data = podman.networks
+        self.assertEqual(control[1], "10.91.0.0/24")
+        self.assertTrue(control[2], "the run network must not install its own resolver")
+        self.assertFalse(control[3], "the control network keeps the gateway the host installs packages over")
+        self.assertEqual(data[1], "203.0.114.0/24")
+        self.assertTrue(data[2])
+        self.assertTrue(data[3], "the data network must have no gateway, so nothing it carries can be routed")
+        self.assertEqual(
+            podman.connects,
+            [
+                (instance.target_name, instance.data_network, instance.plan.data_target_ip),
+                (instance.echo_name, instance.data_network, instance.plan.data_echo_ip),
+            ],
+            "the host and the endpoint are the only roles the data plane needs before the engines start",
+        )
         dns = run_for(podman.runs, instance.dns_name)
         self.assertEqual(dns["image_alias"], topology.FIXTURE_IMAGE)
         self.assertFalse(dns["privileged"])
