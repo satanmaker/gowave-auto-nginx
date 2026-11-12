@@ -17,6 +17,7 @@ SUITES = {
         "test_security.TestSecurityModule",
         "test_panel_deployment.TestPanelDeployment",
         "test_node_integration.TestNodeIntegration",
+        "test_node_integration.TestWorkerPayloadBootstrap",
         "test_node_integration.TestLocalNodeIdempotency",
         "test_nginx_routing.TestNginxRouting",
         "test_nonroot_lint.TestNonrootLint",

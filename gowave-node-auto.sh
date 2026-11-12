@@ -1827,6 +1827,46 @@ setup_system_prereqs() {
         curl tar gzip openssl ufw fail2ban iproute2 ca-certificates
 }
 
+# The mutation lease and the ACME lineage snapshots are python3, and every
+# certificate check they make is openssl. Both arrive with setup_system_prereqs,
+# yet the snapshots run before it: on a minimal host the transaction died at its
+# first Python call and took the compensation down with it, leaving the Worker
+# half-provisioned. modules/os.sh bootstraps this same set on the Master before
+# its prerequisites; the Worker gets the payload without the checkout, so the
+# list is repeated here instead of sourced.
+get_bootstrap_packages() {
+    cat <<'EOF'
+python3
+iproute2
+curl
+ca-certificates
+openssl
+EOF
+}
+
+missing_bootstrap_packages() {
+    local pkg
+    for pkg in "$@"; do
+        [[ -z "$pkg" || "$pkg" =~ ^# ]] && continue
+        if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+            printf '%s\n' "$pkg"
+        fi
+    done
+}
+
+bootstrap_early_tools() {
+    local packages=() missing=()
+    mapfile -t packages < <(get_bootstrap_packages)
+    mapfile -t missing < <(missing_bootstrap_packages "${packages[@]}")
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        return 0
+    fi
+    echo "[INFO] Bootstrapping early tools required before prerequisites: ${missing[*]}..."
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+}
+
 configure_dot() {
     # The shared host-security helper is streamed with the payload because the
     # Worker never receives the project checkout at /opt/gowave-auto-nginx.
@@ -2662,6 +2702,10 @@ main() {
     trap 'exit_code=$?; compensate_remote_worker "$exit_code"; exit "$exit_code"' ERR
     trap 'cleanup_temp_and_secrets' EXIT
 
+    # Before the lease and the snapshots, not after: both are python3, and a
+    # snapshot that dies for a missing interpreter has no snapshot to roll back
+    # to, which is exactly how this Worker ended up half-provisioned.
+    bootstrap_early_tools </dev/null
     acquire_mutation_lock
     verify_deploy_hook_preflight "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" "${_ACME_TX_ID:-}" || return 1
 
@@ -3040,6 +3084,15 @@ PY
     fi
     return 0
 }
+
+# The compensation is python3 too, so a Worker left without an interpreter
+# cannot even be cleaned up. This is best effort: a host whose package manager
+# is broken still deserves the rest of the teardown attempt.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "[ROLLBACK] Bootstrapping python3 so the compensation can run..." >&2
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 openssl || true
+fi
 
 acquire_mutation_lock
 echo "Executing worker compensation teardown..." >&2
