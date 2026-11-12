@@ -76,6 +76,14 @@ class TestPodmanAcmeFixture(unittest.TestCase):
         self.assertEqual(host_match.returncode, 0, host_match.stderr)
         self.assertIn("BEGIN CERTIFICATE", ca.root_pem)
 
+    def test_issued_leafs_carry_key_identifiers(self):
+        ca = acme_fixture.generate_fixture_ca(self.workdir())
+        leaf_text = openssl("x509", "-in", str(ca.directory / "pebble.crt"), "-noout", "-text").stdout
+        self.assertIn("Authority Key Identifier", leaf_text)
+        self.assertIn("Subject Key Identifier", leaf_text)
+        root_text = openssl("x509", "-in", str(ca.root_cert), "-noout", "-text").stdout
+        self.assertIn("Subject Key Identifier", root_text)
+
     def test_private_keys_are_never_group_or_world_readable(self):
         ca = acme_fixture.generate_fixture_ca(self.workdir())
         self.assertEqual((ca.root_key.stat().st_mode & 0o777), 0o600)
