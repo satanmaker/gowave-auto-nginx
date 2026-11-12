@@ -212,7 +212,14 @@ PY
 
     # Step 1: Preflight Environment Inspection
     check_os
-    if command -v systemctl >/dev/null 2>&1; then
+    # A repeat install finds NGINX already serving the managed stream config.
+    # Taking it down there is downtime for a live target, and the ACME stage
+    # relies on that running vhost to answer challenges from the same webroot.
+    local managed_nginx_in_place=0
+    if [[ -f /etc/nginx/stream-enabled/gowave-stream.conf && -f /etc/nginx/conf.d/gowave-http.conf ]]; then
+        managed_nginx_in_place=1
+    fi
+    if (( managed_nginx_in_place == 0 )) && command -v systemctl >/dev/null 2>&1; then
         systemctl stop nginx 2>/dev/null || true
     fi
     run_preflight_panel
@@ -255,15 +262,22 @@ PY
         return 0
     }
 
-    if ! generate_bootstrap_acme_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/00-bootstrap-acme.conf" "/proc/net/if_inet6" "$vision_domain" "$cover_domain"; then
-        echo "Error: Failed to generate bootstrap ACME NGINX configuration; rolling back certificate lineages." >&2
-        rollback_acme_lineages
-        return 1
-    fi
-    if ! reload_nginx_strict; then
-        echo "Error: Failed to activate bootstrap ACME NGINX configuration; rolling back certificate lineages." >&2
-        rollback_acme_lineages
-        return 1
+    if (( managed_nginx_in_place == 1 )); then
+        # The managed :80 vhost already answers ACME challenges for these names
+        # from the same webroot, so a bootstrap vhost would only duplicate every
+        # server name NGINX is serving.
+        true
+    else
+        if ! generate_bootstrap_acme_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/00-bootstrap-acme.conf" "/proc/net/if_inet6" "$vision_domain" "$cover_domain"; then
+            echo "Error: Failed to generate bootstrap ACME NGINX configuration; rolling back certificate lineages." >&2
+            rollback_acme_lineages
+            return 1
+        fi
+        if ! reload_nginx_strict; then
+            echo "Error: Failed to activate bootstrap ACME NGINX configuration; rolling back certificate lineages." >&2
+            rollback_acme_lineages
+            return 1
+        fi
     fi
 
     if ! command -v certbot >/dev/null 2>&1; then
@@ -360,10 +374,23 @@ PY
 
     # Step 9: REST API Provisioning
     echo "Executing REST API bootstrapping and MVP profile provisioning..."
+    # A repeated install must keep the credentials the running Panel accepts: a
+    # freshly generated password would be refused by the existing admin, and the
+    # credentials file would no longer hold the password the operator needs.
     local admin_user="admin"
-    local admin_pass
-    admin_pass=$(openssl rand -hex 16)
-    save_credentials "$admin_user" "$admin_pass" "https://$panel_domain" "" "$CREDENTIALS_FILE"
+    local admin_pass=""
+    if [[ -r "$CREDENTIALS_FILE" ]]; then
+        local stored_user
+        stored_user=$(grep -s '^ADMIN_USERNAME=' "$CREDENTIALS_FILE" | cut -d= -f2- || true)
+        admin_pass=$(grep -s '^ADMIN_PASSWORD=' "$CREDENTIALS_FILE" | cut -d= -f2- || true)
+        if [[ -n "$stored_user" ]]; then
+            admin_user="$stored_user"
+        fi
+    fi
+    if [[ -z "$admin_pass" ]]; then
+        admin_pass=$(openssl rand -hex 16)
+        save_credentials "$admin_user" "$admin_pass" "https://$panel_domain" "" "$CREDENTIALS_FILE"
+    fi
 
     if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
         XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
@@ -406,12 +433,41 @@ def persist_transaction_entities(entities):
     write_journal_atomically(journal_path, journal)
 
 client.transaction_callback = persist_transaction_entities
-x25519 = client.generate_x25519()
+
+
+def stored_credentials(path):
+    values = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                key, separator, value = line.partition("=")
+                if separator:
+                    values[key.strip()] = value.strip()
+    except FileNotFoundError:
+        pass
+    return values
+
+
+PROFILE_NAME = "GoWave MVP Unified Profile - local-node"
+
+# A repeated install reuses the REALITY material and the API token the installed
+# Panel already publishes: new keys would invalidate every subscription already
+# served, and a new token would leave a duplicate behind.
+installed_material = client.existing_reality_material(PROFILE_NAME, reality_domain)
+if installed_material:
+    x25519 = {
+        "privateKey": installed_material["privateKey"],
+        "publicKey": installed_material["publicKey"],
+    }
+    short_ids = installed_material["shortIds"]
+else:
+    x25519 = client.generate_x25519()
+    short_ids = None
 raw_config = client.compile_config_profile(
-    "local-node", reality_domain, x25519["privateKey"],
+    "local-node", reality_domain, x25519["privateKey"], short_ids=short_ids,
     public_key=x25519.get("publicKey"), vision_domain=vision_domain, panel_domain=panel_domain
 )
-profile = client.provision_config_profile("GoWave MVP Unified Profile - local-node", raw_config)
+profile = client.provision_config_profile(PROFILE_NAME, raw_config)
 profile_uuid = profile["profile_uuid"]
 inbounds = profile["inbounds"]
 inbound_uuids = [item["uuid"] for item in inbounds]
@@ -434,7 +490,9 @@ journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
 
 short_uuid = client.provision_user("default-user", squad_uuid)
-token_info = client.issue_api_token()
+token_info = client.ensure_api_token(
+    existing_token=stored_credentials(credentials_path).get("SCOPED_API_TOKEN", "")
+)
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
 
@@ -486,12 +544,13 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
         return 1
     fi
 
+    # The deploy-hook ownership manifest stays behind after commit: it is the
+    # host-local record that lets a later install recognise the hook it wrote.
     cleanup_acme_snapshot "$acme_tx_id" "$panel_domain"
     cleanup_acme_snapshot "$acme_tx_id" "$reality_domain"
     if [[ -n "$vision_domain" ]]; then
         cleanup_acme_snapshot "$acme_tx_id" "$vision_domain"
     fi
-    cleanup_deploy_hook_manifest "$acme_tx_id"
 
     echo "================================================================================"
     echo "                   GoWave Auto NGINX Installation Complete                      "

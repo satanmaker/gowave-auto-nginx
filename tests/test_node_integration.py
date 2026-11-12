@@ -423,7 +423,7 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn('journal["entities"] = list(entities)', callback)
         self.assertLess(
             auto_script.index("client.transaction_callback = persist_transaction_entities", callback_at),
-            auto_script.index('client.provision_config_profile("GoWave MVP Unified Profile - local-node"', callback_at),
+            auto_script.index("client.provision_config_profile(PROFILE_NAME", callback_at),
         )
 
     def test_node_add_persists_applying_state_before_first_api_create(self):
@@ -1015,14 +1015,14 @@ class TestNodeIntegration(unittest.TestCase):
     def _fake_core_tools(tmp: Path, install_rc: int, rewrite_version: bool) -> tuple[Path, Path, Path]:
         """Build a fake goave-node launcher and a fake rw-core that reports a version file."""
         version_file = tmp / "core-version.txt"
-        version_file.write_text("25.10.15\n", encoding="utf-8")
+        version_file.write_text("1.2.2\n", encoding="utf-8")
         install_log = tmp / "install-calls.txt"
         node_bin = tmp / "gowave-node"
         node_bin.write_text(
             "#!/bin/sh\n"
             f'printf "%s\\n" "$*" >> "{install_log}"\n'
             f"[[ {install_rc} -eq 0 ]] || exit {install_rc}\n"
-            + (f'printf "26.11.9\\n" > "{version_file}"\n' if rewrite_version else "")
+            + (f'printf "1.2.3\\n" > "{version_file}"\n' if rewrite_version else "")
             + "exit 0\n",
             encoding="utf-8",
         )
@@ -1036,7 +1036,7 @@ class TestNodeIntegration(unittest.TestCase):
         core_bin.chmod(0o755)
         return node_bin, core_bin, install_log
 
-    def _run_pinned_core(self, tmp: Path, node_bin: Path, core_bin: Path, version: str = "26.11.9"):
+    def _run_pinned_core(self, tmp: Path, node_bin: Path, core_bin: Path, version: str = "1.2.3"):
         funcs = self._runner_functions(tmp / "runner_funcs.sh")
         cmd = (
             f'source "{funcs}" && XRAY_SERVER_VERSION="{version}" '
@@ -1050,11 +1050,11 @@ class TestNodeIntegration(unittest.TestCase):
             node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=1, rewrite_version=False)
             res = self._run_pinned_core(tmp, node_bin, core_bin)
             self.assertNotEqual(res.returncode, 0)
-            self.assertIn("Failed to install requested Xray server version 26.11.9", res.stderr)
+            self.assertIn("Failed to install requested Xray server version 1.2.3", res.stderr)
             calls = install_log.read_text(encoding="utf-8")
             # Both version spellings are attempted before failing closed.
-            self.assertIn("--version v26.11.9", calls)
-            self.assertIn("--version 26.11.9", calls)
+            self.assertIn("--version v1.2.3", calls)
+            self.assertIn("--version 1.2.3", calls)
 
     def test_pinned_core_silent_noop_is_fatal(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1063,27 +1063,27 @@ class TestNodeIntegration(unittest.TestCase):
             res = self._run_pinned_core(tmp, node_bin, core_bin)
             self.assertNotEqual(res.returncode, 0)
             self.assertIn("version mismatch after installation", res.stderr)
-            self.assertIn("expected 26.11.9, got Xray 25.10.15", res.stderr)
+            self.assertIn("expected 1.2.3, got Xray 1.2.2", res.stderr)
 
     def test_pinned_core_version_token_must_match_exactly(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=0, rewrite_version=False)
             core_bin.write_text(
-                '#!/bin/sh\nprintf "Xray 26.11.90 (Xray, Penetrates Everything.) test-build\\n"\n',
+                '#!/bin/sh\nprintf "Xray 1.2.30 (Xray, Penetrates Everything.) test-build\\n"\n',
                 encoding="utf-8",
             )
             core_bin.chmod(0o755)
             res = self._run_pinned_core(tmp, node_bin, core_bin)
             self.assertNotEqual(res.returncode, 0)
             self.assertIn("version mismatch after installation", res.stderr)
-            self.assertTrue(install_log.exists(), "26.11.90 must not satisfy a 26.11.9 pin")
+            self.assertTrue(install_log.exists(), "1.2.30 must not satisfy a 1.2.3 pin")
 
     def test_pinned_core_already_matching_skips_install(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=1, rewrite_version=False)
-            (tmp / "core-version.txt").write_text("26.11.9\n", encoding="utf-8")
+            (tmp / "core-version.txt").write_text("1.2.3\n", encoding="utf-8")
             res = self._run_pinned_core(tmp, node_bin, core_bin)
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertFalse(install_log.exists())
@@ -1094,8 +1094,8 @@ class TestNodeIntegration(unittest.TestCase):
             node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=0, rewrite_version=True)
             res = self._run_pinned_core(tmp, node_bin, core_bin)
             self.assertEqual(res.returncode, 0, res.stderr)
-            self.assertIn("Installing explicit Xray server version 26.11.9", res.stdout)
-            self.assertIn("--version v26.11.9", install_log.read_text(encoding="utf-8"))
+            self.assertIn("Installing explicit Xray server version 1.2.3", res.stdout)
+            self.assertIn("--version v1.2.3", install_log.read_text(encoding="utf-8"))
 
     def test_pinned_core_disabled_without_pin(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1105,7 +1105,17 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertFalse(install_log.exists())
 
-    def _run_node_sh_pinned_core(self, node_bin: Path, core_bin: Path, version: str = "26.11.9"):
+    def test_pinned_core_disabled_for_the_latest_channel(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=1, rewrite_version=False)
+            for channel in ("latest", "LATEST", "vlatest"):
+                with self.subTest(channel=channel):
+                    res = self._run_pinned_core(tmp, node_bin, core_bin, version=channel)
+                    self.assertEqual(res.returncode, 0, res.stderr)
+                    self.assertFalse(install_log.exists(), channel)
+
+    def _run_node_sh_pinned_core(self, node_bin: Path, core_bin: Path, version: str = "1.2.3"):
         cmd = (
             f'source "{NODE_SH}" && XRAY_SERVER_VERSION="{version}" '
             f'ensure_pinned_xray_core "{node_bin}" "{core_bin}"'
@@ -1118,8 +1128,8 @@ class TestNodeIntegration(unittest.TestCase):
             node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=1, rewrite_version=False)
             res = self._run_node_sh_pinned_core(node_bin, core_bin)
             self.assertNotEqual(res.returncode, 0)
-            self.assertIn("Failed to install requested Xray server version 26.11.9", res.stderr)
-            self.assertIn("--version v26.11.9", install_log.read_text(encoding="utf-8"))
+            self.assertIn("Failed to install requested Xray server version 1.2.3", res.stderr)
+            self.assertIn("--version v1.2.3", install_log.read_text(encoding="utf-8"))
 
     def test_node_sh_pinned_core_silent_noop_is_fatal(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1134,13 +1144,13 @@ class TestNodeIntegration(unittest.TestCase):
             tmp = Path(tmpdir)
             node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=0, rewrite_version=False)
             core_bin.write_text(
-                '#!/bin/sh\nprintf "Xray 26.11.90 (Xray, Penetrates Everything.) test-build\\n"\n',
+                '#!/bin/sh\nprintf "Xray 1.2.30 (Xray, Penetrates Everything.) test-build\\n"\n',
                 encoding="utf-8",
             )
             core_bin.chmod(0o755)
             res = self._run_node_sh_pinned_core(node_bin, core_bin)
             self.assertNotEqual(res.returncode, 0)
-            self.assertTrue(install_log.exists(), "26.11.90 must not satisfy a 26.11.9 pin")
+            self.assertTrue(install_log.exists(), "1.2.30 must not satisfy a 1.2.3 pin")
 
     def test_node_sh_pinned_core_install_success(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1148,7 +1158,113 @@ class TestNodeIntegration(unittest.TestCase):
             node_bin, core_bin, _ = self._fake_core_tools(tmp, install_rc=0, rewrite_version=True)
             res = self._run_node_sh_pinned_core(node_bin, core_bin)
             self.assertEqual(res.returncode, 0, res.stderr)
-            self.assertIn("Installing explicit Xray server version 26.11.9", res.stdout)
+            self.assertIn("Installing explicit Xray server version 1.2.3", res.stdout)
+
+    def test_node_sh_pinned_core_disabled_for_the_latest_channel(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            node_bin, core_bin, install_log = self._fake_core_tools(tmp, install_rc=1, rewrite_version=False)
+            res = self._run_node_sh_pinned_core(node_bin, core_bin, version="latest")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertFalse(install_log.exists())
+
+
+class TestLocalNodeIdempotency(unittest.TestCase):
+    """A repeated install must not restart a node that is already serving.
+
+    The Panel pushes the Xray configuration to a node and never re-reads it: a
+    restarted node reports itself alive while its core waits for a push the Panel
+    only sends to a node it sees go offline. The install therefore has to leave a
+    serving node alone instead of replaying the upstream installer's restart.
+    """
+
+    def _fake_tools(self, tmp: Path, status_rc: int = 0) -> Path:
+        install_dir = tmp / "opt_gowave_node"
+        install_dir.mkdir()
+        node_bin = install_dir / "gowave-node"
+        node_bin.write_text(
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            '  version) echo "gowave-node v1.0.5" ;;\n'
+            f'  status) exit {status_rc} ;;\n'
+            "esac\n",
+            encoding="utf-8",
+        )
+        node_bin.chmod(0o755)
+        (install_dir / ".env").write_text("SECRET_KEY=secret\nNODE_PORT=3002\n", encoding="utf-8")
+
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        systemctl = bin_dir / "systemctl"
+        systemctl.write_text(
+            "#!/bin/sh\n"
+            '[ "$1" = "is-active" ] || exit 0\n'
+            '[ "${FAKE_SERVICE_ACTIVE:-1}" = "1" ]\n',
+            encoding="utf-8",
+        )
+        systemctl.chmod(0o755)
+        timeout = bin_dir / "timeout"
+        timeout.write_text('#!/bin/sh\nshift\nexec "$@"\n', encoding="utf-8")
+        timeout.chmod(0o755)
+        # The install runs as root; the guard checks for it before claiming a node
+        # is already serving, so the fixture reports a privileged caller.
+        id_bin = bin_dir / "id"
+        id_bin.write_text('#!/bin/sh\n[ "$1" = "-u" ] && { echo 0; exit 0; }\nexec /usr/bin/id "$@"\n', encoding="utf-8")
+        id_bin.chmod(0o755)
+        return install_dir
+
+    def _run(self, tmp: Path, install_dir: Path, expected: str = "latest", active: str = "1"):
+        env = os.environ.copy()
+        env["PATH"] = f"{tmp / 'bin'}:{env['PATH']}"
+        env["FAKE_SERVICE_ACTIVE"] = active
+        cmd = (
+            f'source "{NODE_SH}" && GOWAVE_NODE_INSTALL_DIR="{install_dir}" '
+            f'local_node_is_serving 3002 "{expected}"'
+        )
+        return subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env)
+
+    def test_serving_node_is_reused(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            res = self._run(tmp, self._fake_tools(tmp))
+            self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_inactive_service_is_reinstalled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            res = self._run(tmp, self._fake_tools(tmp), active="0")
+            self.assertNotEqual(res.returncode, 0)
+
+    def test_explicit_pin_must_match_the_installed_node(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            install_dir = self._fake_tools(tmp)
+            self.assertNotEqual(self._run(tmp, install_dir, expected="v9.9.9").returncode, 0)
+            self.assertEqual(self._run(tmp, install_dir, expected="v1.0.5").returncode, 0)
+            self.assertEqual(self._run(tmp, install_dir, expected="1.0.5").returncode, 0)
+
+    def test_node_without_a_serving_core_is_reinstalled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            res = self._run(tmp, self._fake_tools(tmp, status_rc=1))
+            self.assertNotEqual(res.returncode, 0)
+
+    def test_node_bound_to_another_port_is_reinstalled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            install_dir = self._fake_tools(tmp)
+            (install_dir / ".env").write_text("SECRET_KEY=secret\nNODE_PORT=3099\n", encoding="utf-8")
+            self.assertNotEqual(self._run(tmp, install_dir).returncode, 0)
+
+    def test_install_local_node_guards_the_installer_and_the_restart(self):
+        text = NODE_SH.read_text(encoding="utf-8")
+        install = text.split("install_local_node() {", 1)[1]
+        self.assertIn('if local_node_is_serving "$node_port" "$normalized_node_ver"; then', install)
+        self.assertIn("node_restart_required=0", install)
+        self.assertLess(install.index("if (( node_restart_required == 1 )); then"),
+                        install.index('bash "$upstream_installer" </dev/null'))
+        self.assertIn("if (( node_restart_required == 1 )) && "
+                      '[[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then', install)
 
 
 if __name__ == "__main__":

@@ -539,6 +539,50 @@ EOF
     echo "Generated $out_file."
 }
 
+deploy_hook_owned_by_prior_transaction() {
+    local hook_file="$1"
+    local recovery_root="$2"
+
+    if [[ ! -f "$hook_file" || -L "$hook_file" ]]; then
+        return 1
+    fi
+    if [[ ! -d "$recovery_root" || -L "$recovery_root" ]]; then
+        return 1
+    fi
+    local digest
+    digest=$(sha256sum -- "$hook_file" 2>/dev/null | awk '{print $1}' || true)
+    if [[ -z "$digest" ]]; then
+        return 1
+    fi
+    local manifest
+    for manifest in "${recovery_root}"/*/deploy-hook-manifest.json; do
+        if [[ ! -f "$manifest" || -L "$manifest" ]]; then
+            continue
+        fi
+        if python3 - "$manifest" "$hook_file" "$digest" <<'PY'
+import json
+import sys
+
+manifest_path, hook_path, digest = sys.argv[1:4]
+try:
+    with open(manifest_path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if (
+    isinstance(data, dict)
+    and data.get("created_by_tx") is True
+    and data.get("path") == hook_path
+    and data.get("sha256") == digest
+) else 1)
+PY
+        then
+            return 0
+        fi
+    done
+    return 1
+}
+
 verify_deploy_hook_preflight() {
     local hook_file="${1:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
     local transaction_id="${2:-}"
@@ -554,6 +598,13 @@ verify_deploy_hook_preflight() {
                     return 0
                 fi
             fi
+        fi
+        # A repeated install finds the hook an earlier transaction installed. It is
+        # only recognised as ours when that transaction recorded this exact path and
+        # the file still hashes to what was recorded, so a hook written or edited by
+        # someone else stays a refusal rather than a file this product overwrites.
+        if deploy_hook_owned_by_prior_transaction "$hook_file" "$recovery_root"; then
+            return 0
         fi
         echo "Error: Pre-existing unowned Certbot deploy hook found at $hook_file. Refusing to overwrite unmanaged host resource." >&2
         return 1
@@ -810,12 +861,6 @@ PY
         return 1
     }
     return 0
-}
-
-cleanup_deploy_hook_manifest() {
-    local transaction_id="$1"
-    local recovery_root="${2:-/var/lib/gowave-auto-nginx/recovery}"
-    rm -f "${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
 }
 
 configure_certbot_deploy_hook() {
