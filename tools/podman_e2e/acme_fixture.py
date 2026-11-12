@@ -197,9 +197,14 @@ def ca_der_digest(ca_file: Path) -> str:
         return "sha256:" + hashlib.sha256(Path(handle.name).read_bytes()).hexdigest()
 
 
-def fetch_issued_root(host: str = FIXTURE_HOST, ca_file: Optional[Path] = None, timeout: int = 30) -> str:
+def fetch_issued_root(
+    host: str = FIXTURE_HOST,
+    ca_file: Optional[Path] = None,
+    timeout: int = 30,
+    port: int = MANAGEMENT_PORT,
+) -> str:
     """Fetch Pebble's issuing root over the CA-trusted management endpoint."""
-    url = f"https://{host}:{MANAGEMENT_PORT}/roots/0"
+    url = f"https://{host}:{port}/roots/0"
     context = ssl.create_default_context(cafile=str(ca_file)) if ca_file is not None else ssl.create_default_context()
     context.check_hostname = True
     context.verify_mode = ssl.CERT_REQUIRED
@@ -225,13 +230,25 @@ def trust_environment(ca_file: Path) -> Dict[str, str]:
 class AcmeFixture:
     """Pebble started as a run-scoped container beside the topology."""
 
-    def __init__(self, podman, network: str, directory: Optional[Path] = None, host_alias: str = FIXTURE_HOST) -> None:
+    def __init__(
+        self,
+        podman,
+        network: str,
+        directory: Optional[Path] = None,
+        host_alias: str = FIXTURE_HOST,
+        extra_args: Sequence[str] = (),
+        management_host_port: Optional[int] = None,
+    ) -> None:
         self.podman = podman
         self.context = podman.context
         self.network = network
         self.name = self.context.resource_name("acme-pebble")
         self.directory = Path(directory) if directory else self.context.secret_dir / "acme"
         self.host_alias = host_alias
+        self.extra_args = tuple(extra_args)
+        # The harness runs outside the topology network, so the management API is
+        # published on loopback and reached by the leaf's IP SAN.
+        self.management_host_port = management_host_port
         self.ca: Optional[FixtureCA] = None
         self._root_pem: Optional[str] = None
 
@@ -246,9 +263,16 @@ class AcmeFixture:
             volumes=(f"{self.directory}:{CONTAINER_FIXTURE_DIR}:ro,Z",),
             command=("-config", f"{CONTAINER_FIXTURE_DIR}/pebble-config.json"),
             systemd="false",
+            extra_args=self._podman_args(),
         )
         self.context.add_cleanup(self.stop)
         return self
+
+    def _podman_args(self) -> Sequence[str]:
+        args = list(self.extra_args)
+        if self.management_host_port:
+            args += ["-p", f"127.0.0.1:{self.management_host_port}:{MANAGEMENT_PORT}"]
+        return tuple(args)
 
     def wait_ready(self, timeout_seconds: int = 120) -> None:
         self.podman.wait_tcp(self.name, self.host_alias, ACME_PORT, timeout_seconds=timeout_seconds)
@@ -263,7 +287,10 @@ class AcmeFixture:
 
     def issued_root(self) -> str:
         if self._root_pem is None:
-            self._root_pem = fetch_issued_root(self.host_alias, self.ca_file())
+            if self.management_host_port:
+                self._root_pem = fetch_issued_root("127.0.0.1", self.ca_file(), port=self.management_host_port)
+            else:
+                self._root_pem = fetch_issued_root(self.host_alias, self.ca_file())
         return self._root_pem
 
     def stop(self) -> None:

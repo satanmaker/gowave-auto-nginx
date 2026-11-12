@@ -110,8 +110,11 @@ class TestPodmanFixtureIsolation(unittest.TestCase):
         code = executable_source(HARNESS_DIR / "acme_fixture.py")
         for forbidden in ("os.environ", "os.getenv", "getenv("):
             self.assertNotIn(forbidden, code)
-        parameters = set(inspect.signature(acme_fixture.AcmeFixture.__init__).parameters)
-        self.assertEqual(parameters, {"self", "podman", "network", "directory", "host_alias"})
+        parameters = list(inspect.signature(acme_fixture.AcmeFixture.__init__).parameters)
+        self.assertEqual(
+            parameters,
+            ["self", "podman", "network", "directory", "host_alias", "extra_args", "management_host_port"],
+        )
         fixture = acme_fixture.AcmeFixture(StubPodman(), "net")
         self.assertEqual(fixture.directory_url(), acme_fixture.ACME_DIRECTORY_URL)
 
@@ -120,7 +123,7 @@ class TestPodmanFixtureIsolation(unittest.TestCase):
         urls = set(re.findall(r"https://[^\s\"']+", code))
         self.assertEqual(
             urls,
-            {"https://{host}:{MANAGEMENT_PORT}/roots/0", "https://{FIXTURE_HOST}:{ACME_PORT}/dir"},
+            {"https://{host}:{port}/roots/0", "https://{FIXTURE_HOST}:{ACME_PORT}/dir"},
         )
         for url in urls:
             self.assertNotIn("letsencrypt.org", url)
