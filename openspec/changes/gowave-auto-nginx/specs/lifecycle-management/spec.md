@@ -90,20 +90,30 @@ The lifecycle manager SHALL enforce a retention policy keeping the last 3 recove
 - **THEN** the oldest snapshot is safely removed, keeping exactly 3 snapshots, and free disk space is verified.
 
 ### Requirement: Atomic Domain Reconfiguration with Rollback
-The manager SHALL support changing the panel domain or REALITY domain with DNS preflight validation, proper variable scoping (`new_panel_domain` and `new_reality_domain`), rolling back cleanly if certificate issuance fails.
+The manager SHALL support changing the panel domain or REALITY domain with DNS preflight validation, proper variable scoping (`new_panel_domain` and `new_reality_domain`), recomputing the camouflage apex from the new panel domain, reissuing the REALITY lineage with `--expand` so it also carries the apex and `www.<apex>`, verifying that SAN before deploying production vhosts, and rolling back cleanly if certificate issuance or SAN validation fails.
 
 #### Scenario: Failed domain change rollback
 - **GIVEN** an operator requesting a domain change to `new.example.com`
 - **WHEN** ACME challenge verification fails due to misconfigured DNS
 - **THEN** NGINX configurations and `.env` are restored to the previous domain, NGINX is reloaded, and active traffic to the old domain continues uninterrupted.
 
+#### Scenario: Domain change carries the camouflage apex along
+- **GIVEN** an operator changing the panel domain from `dns.old.example` to `panel.new.example`, with the new camouflage apex `new.example` resolving to this host
+- **WHEN** the manager provisions certificates for the new names
+- **THEN** it derives the new camouflage apex `new.example`, issues the panel lineage for `panel.new.example`, issues the REALITY lineage for the REALITY domain together with `new.example` and `www.new.example` using `--expand`, verifies the REALITY certificate covers that apex SAN, deploys stream, port 80, and decoy vhosts naming the new apex and `www.<apex>`, and rolls the whole change back if issuance or SAN verification fails.
+
 ### Requirement: Safe and Targeted Component Uninstallation
-The uninstall command SHALL inspect `# Managed by GoWave Auto NGINX` ownership markers and remove only project-managed units, configurations, and data directories without purging system packages or modifying user home directories.
+The uninstall command SHALL remove only project-managed systemd units, NGINX vhosts, and the managed stream include block, SHALL stop and disable the managed services, and SHALL preserve application data, Worker binaries, certificates, backups, and recovery state without purging system packages or modifying user home directories.
 
 #### Scenario: Clean component removal
 - **GIVEN** an installed GoWave Auto NGINX instance
-- **WHEN** `gowave-auto.sh uninstall --confirm` is executed
-- **THEN** `gowave` and `gowave-node` systemd units are stopped and disabled, NGINX project vhosts and `# Managed by GoWave Auto NGINX` stream blocks in `/etc/nginx/nginx.conf` are cleanly removed, `/opt/gowave` and `/opt/gowave-node` are deleted, and system-wide packages (Python, systemd, SSH, base NGINX) remain intact.
+- **WHEN** `gowave-auto.sh uninstall --yes` is executed
+- **THEN** `gowave.service` and `gowave-node.service` are stopped and disabled, the managed unit files (`gowave`, `gowave-node`, both recovery units, and `bbr-load.service`) are removed, NGINX project vhosts and `# Managed by GoWave Auto NGINX` stream blocks in `/etc/nginx/nginx.conf` are cleanly removed, and system-wide packages (Python, systemd, SSH, base NGINX, Certbot) remain installed and intact.
+
+#### Scenario: Application data survives uninstallation
+- **GIVEN** an installed GoWave Auto NGINX instance with an active database, certificates, and recovery snapshots
+- **WHEN** `gowave-auto.sh uninstall --yes` completes
+- **THEN** `/opt/gowave`, `/opt/gowave-node`, `/var/lib/gowave-auto-nginx`, `/var/www/gowave-auto-nginx`, and `/var/www/gowave-acme` remain on disk, are reported to the operator for manual review, and are not recursively deleted, because no verified installer ownership marker exists for them.
 
 ### Requirement: Local Multi-Distribution Podman Testbed Gate
 The verification harness SHALL provide `tests/podman_testbed.sh` executing containerized pre-flight tests with PID 1 systemd across all 4 supported operating systems (Ubuntu 24.04, Ubuntu 26.04, Debian 12, Debian 13), requiring 100% pass rate across the 8-stage verification pipeline prior to VPS deployment.
