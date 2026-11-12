@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from . import matrix, panel_surface, topology
 from .podman import wait_until
@@ -271,11 +271,28 @@ class AioProduct:
         self.outcome: Optional[topology.InstallOutcome] = None
         self._subscriptions: Optional[Dict[str, Any]] = None
         self._subscription_error = ""
+        self.subscription_inbounds_override: Optional[List[Dict[str, Any]]] = None
 
     @property
     def inbound_count(self) -> int:
         """How many inbounds this install carries, per the selected configuration."""
         return len(matrix.inbounds(self.matrix, self.vision))
+
+    def subscription_inbounds(self) -> List[Dict[str, Any]]:
+        """The inbounds a client of this Panel should be served.
+
+        One install publishes its own node, so the answer is its own matrix
+        inbounds. A Panel that also runs a Worker publishes the inbounds of every
+        node in the client's squad, and says so by setting the override.
+        """
+        if self.subscription_inbounds_override is not None:
+            return list(self.subscription_inbounds_override)
+        return matrix.inbounds(self.matrix, self.vision)
+
+    @property
+    def subscription_inbound_count(self) -> int:
+        """How many inbounds the served subscription must describe."""
+        return len(self.subscription_inbounds())
 
     def declare_data_plane(self, case_ids: Sequence[str]) -> None:
         """Record the data-plane cases the suite declared, for the matrix count case."""
@@ -570,10 +587,16 @@ def identity_probe_script() -> str:
 
 
 # ---------------------------------------------------------------------- cases
+def required_subscription_hosts(product: AioProduct) -> Set[str]:
+    """The names the served subscription must dial, from the topology's own nodes."""
+    domains = product.require_installed().subscription_domains()
+    return set(domains.get("required_hosts") or set())
+
+
 def subscription_protocol_counts(product: AioProduct) -> Dict[str, int]:
-    """How many share links each protocol owes, counted from the matrix inbounds."""
+    """How many share links each protocol owes, counted from the served inbounds."""
     counts: Dict[str, int] = {}
-    for inbound in matrix.inbounds(product.matrix, product.vision):
+    for inbound in product.subscription_inbounds():
         protocol = str(inbound.get("subscription_protocol"))
         counts[protocol] = counts.get(protocol, 0) + 1
     return counts
@@ -1361,15 +1384,15 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
 
     base64 = loaded.get("base64") or {}
     require("SUB-SERVED", base64.get("decoded"), "the base64 subscription did not decode")
-    require("SUB-SERVED", base64.get("link_count") == product.inbound_count,
+    require("SUB-SERVED", base64.get("link_count") == product.subscription_inbound_count,
             f"the base64 list carries {base64.get('link_count')!r} links, expected one per inbound "
-            f"({product.inbound_count})")
+            f"({product.subscription_inbound_count})")
 
     xray_json = loaded.get("xray_json") or {}
     shape = xray_json.get("shape")
     require("SUB-SERVED", shape in ("list", "object"),
             f"the Xray JSON is neither a config object nor a profile list (shape {shape!r})")
-    expected_entries = product.inbound_count if shape == "list" else 1
+    expected_entries = product.subscription_inbound_count if shape == "list" else 1
     require("SUB-SERVED", xray_json.get("entries") == expected_entries,
             f"the Xray JSON {shape} carries {xray_json.get('entries')!r} profile(s), "
             f"expected {expected_entries}")
@@ -1384,7 +1407,7 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
             "before Xray accepted it, so it is not a runnable config")
 
     for name, proxies, expected_types, reason in (
-        ("mihomo", product.inbound_count, MIHOMO_PROXY_TYPES, "one per inbound"),
+        ("mihomo", product.subscription_inbound_count, MIHOMO_PROXY_TYPES, "one per inbound"),
         ("clash", CLASH_PROXIES, CLASH_PROXY_TYPES, "the trojan subset GenerateClash keeps"),
     ):
         record = loaded.get(name) or {}
@@ -1398,6 +1421,18 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
                 f"{list(expected_types)!r}")
         require("SUB-SERVED", record.get("match_rule"),
                 f"the {name} YAML has no MATCH rule, so a client would route nothing through it")
+
+    # A subscription that loads is not yet a subscription for this cluster: the
+    # YAML has to address the Worker too, or the client would only ever reach the
+    # Master. Every name the run configured for its nodes must appear as a server.
+    mihomo_servers = {
+        str(entry.get("server") or "")
+        for entry in (loaded.get("mihomo") or {}).get("proxy_details") or []
+    }
+    missing_servers = sorted(required_subscription_hosts(product) - mihomo_servers)
+    require("SUB-SERVED", not missing_servers,
+            f"the Mihomo YAML addresses {sorted(mihomo_servers)} but never "
+            f"{', '.join(missing_servers)}, so the client it configures cannot reach that node")
 
     singbox = loaded.get("singbox") or {}
     require("SUB-SERVED", singbox.get("parsed"), "the sing-box JSON did not parse")
@@ -1422,6 +1457,7 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
         evidence[f"{name}_proxy_types"] = ",".join(record.get("proxy_types") or [])
         evidence[f"{name}_groups"] = record.get("groups")
         evidence[f"{name}_match_rule"] = record.get("match_rule")
+    evidence["mihomo_servers"] = ",".join(sorted(mihomo_servers))
     evidence["singbox_outbounds"] = singbox.get("outbounds")
     return evidence
 
@@ -1468,9 +1504,9 @@ def case_share_links(product: AioProduct) -> Dict[str, Any]:
     facts = product.engine_facts("SUB-B64", "share-links")
 
     expected_protocols = subscription_protocol_counts(product)
-    require("SUB-B64", facts.get("link_count") == product.inbound_count,
+    require("SUB-B64", facts.get("link_count") == product.subscription_inbound_count,
             f"the base64 list carries {facts.get('link_count')!r} links, expected one per inbound "
-            f"({product.inbound_count})")
+            f"({product.subscription_inbound_count})")
     require("SUB-B64", facts.get("protocols") == expected_protocols,
             f"the link list carries protocols {facts.get('protocols')!r} instead of the inbound "
             f"set's own {expected_protocols!r}")
@@ -1485,19 +1521,31 @@ def case_share_links(product: AioProduct) -> Dict[str, Any]:
             f"{EXPECTED_FINGERPRINT!r}")
     require("SUB-B64", facts.get("credential_present"),
             "at least one link carries no client credential, so it could not be imported")
-    allowed_hosts = {host.panel_domain, host.reality_domain}
-    if host.vision_domain:
-        allowed_hosts.add(host.vision_domain)
+    domains = host.subscription_domains()
+    allowed_hosts = set(domains.get("allowed") or set())
     unknown_hosts = sorted(set(facts.get("hosts") or []) - allowed_hosts)
     require("SUB-B64", not unknown_hosts,
             f"the links point at hosts this run never configured: {', '.join(unknown_hosts)}")
     unknown_snis = sorted(set(facts.get("snis") or []) - allowed_hosts)
     require("SUB-B64", not unknown_snis,
             f"the links name SNIs this run never configured: {', '.join(unknown_snis)}")
+    # Importing the list proves it is well formed; it does not prove the list is
+    # this cluster's. Every node the run configured has to be dialled by name,
+    # and has to present the SNI its own inbound was issued for.
+    required_hosts = set(domains.get("required_hosts") or set())
+    unserved = sorted(required_hosts - set(facts.get("hosts") or []))
+    require("SUB-B64", not unserved,
+            f"no link dials {', '.join(unserved)}, so the served list omits a node the run "
+            "provisioned")
+    required_snis = set(domains.get("required_snis") or set())
+    unsnid = sorted(required_snis - set(facts.get("snis") or []))
+    require("SUB-B64", not unsnid,
+            f"no link carries the SNI {', '.join(unsnid)}, so the inbound it was issued for is "
+            "unreachable through the list")
 
-    require("SUB-B64", facts.get("xray_outbounds") == product.inbound_count,
+    require("SUB-B64", facts.get("xray_outbounds") == product.subscription_inbound_count,
             f"Xray imported {facts.get('xray_outbounds')!r} outbounds from the link list")
-    require("SUB-B64", facts.get("cross_representation_issued") == product.inbound_count,
+    require("SUB-B64", facts.get("cross_representation_issued") == product.subscription_inbound_count,
             f"the Xray JSON publishes {facts.get('cross_representation_issued')!r} proxy outbounds")
     require(
         "SUB-B64",

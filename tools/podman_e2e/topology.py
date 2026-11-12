@@ -27,7 +27,7 @@ import socket
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from tools.podman_e2e import acme_fixture, client_image, target_image
 
@@ -523,6 +523,38 @@ class AioTopology:
             self._start_engine_client()
         return self.engine_client_name
 
+    def engine_hosts(self) -> Dict[str, str]:
+        """The names the engines resolve, and the address each one has to reach.
+
+        The served Mihomo template resolves proxy servers through public
+        nameservers, which cannot answer for the run's private zone, so the names
+        the Panel issued are pinned in the client container's hosts file. That is
+        client-side name resolution in place of public DNS, not a rewrite of what
+        the Panel served.
+        """
+        domains = [self.panel_domain, self.reality_domain]
+        if self.vision_domain:
+            domains.append(self.vision_domain)
+        return {domain: str(self.plan.target_ip) for domain in domains}
+
+    def subscription_domains(self) -> Dict[str, Set[str]]:
+        """The names a client's subscription may address, and the ones it must.
+
+        A share link dials one name and presents another: the TLS-carrying
+        inbounds are addressed by the node's own public name, while a REALITY
+        inbound is addressed by the same name and presents its own SNI. The
+        Vision inbound is the exception that carries its own name in both, so a
+        node is fully published only when every configured name appears on the
+        side it belongs to.
+        """
+        allowed = set(self.engine_hosts())
+        required_hosts = {self.panel_domain}
+        required_snis = {self.reality_domain}
+        if self.vision_domain:
+            required_hosts.add(self.vision_domain)
+            required_snis.add(self.vision_domain)
+        return {"allowed": allowed, "required_hosts": required_hosts, "required_snis": required_snis}
+
     def _start_engine_client(self) -> None:
         """Start the pinned client engines, with no product code in the container.
 
@@ -537,9 +569,6 @@ class AioTopology:
         the outbound fields stay exactly as served.
         """
         self._engine_image = client_image.build(self.podman)
-        domains = [self.panel_domain, self.reality_domain]
-        if self.vision_domain:
-            domains.append(self.vision_domain)
         self.podman.run(
             name=self.engine_client_name,
             image_alias=self._engine_image,
@@ -556,8 +585,8 @@ class AioTopology:
                 "--dns", self.plan.dns_ip,
                 *[
                     option
-                    for name in domains
-                    for option in ("--add-host", f"{name}:{self.plan.target_ip}")
+                    for name, address in self.engine_hosts().items()
+                    for option in ("--add-host", f"{name}:{address}")
                 ],
             ),
         )
@@ -859,6 +888,32 @@ class MultiNodeTopology(AioTopology):
         if self.worker_vision_domain:
             records[self.worker_vision_domain] = {"A": [self.plan.worker_ip]}
         return data
+
+    def worker_domains(self) -> Set[str]:
+        """The names the Worker is published under, if the run configured them."""
+        return {
+            domain for domain in (
+                self.worker_domain, self.worker_reality_domain, self.worker_vision_domain,
+            )
+            if domain
+        }
+
+    def engine_hosts(self) -> Dict[str, str]:
+        """The Master's names plus the Worker's, each pinned to the node serving it."""
+        hosts = super().engine_hosts()
+        for domain in self.worker_domains():
+            hosts[domain] = str(self.plan.worker_ip)
+        return hosts
+
+    def subscription_domains(self) -> Dict[str, Set[str]]:
+        """A subscription for this cluster has to publish the Worker, not just the Master."""
+        domains = super().subscription_domains()
+        domains["required_hosts"] = set(domains["required_hosts"]) | {self.worker_domain}
+        domains["required_snis"] = set(domains["required_snis"]) | {self.worker_reality_domain}
+        if self.worker_vision_domain:
+            domains["required_hosts"].add(self.worker_vision_domain)
+            domains["required_snis"].add(self.worker_vision_domain)
+        return domains
 
     def create(self) -> "MultiNodeTopology":
         super().create()

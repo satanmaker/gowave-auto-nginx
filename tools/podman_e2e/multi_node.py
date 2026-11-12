@@ -33,6 +33,10 @@ MTLS_TIMEOUT_SECONDS = 300
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 WORKER_REPORT_TIMEOUT_SECONDS = 120
+# The subscription cases build the engine image on first use, fetch five
+# representations from the Panel, and run Xray and Mihomo over each of them.
+SUB_SERVED_TIMEOUT_SECONDS = 900
+SUB_SHARE_LINK_TIMEOUT_SECONDS = 600
 
 # The name the installer gives the node the Panel runs on. Without it, a cluster
 # audit could be satisfied by any two nodes rather than the ones the product
@@ -382,6 +386,12 @@ class MultiNodeProduct:
         self.matrix = matrix_data.load()
         self.master = aio.AioProduct(
             podman, distribution, vision=vision, install_case_id=INSTALL_CASE_ID,
+        )
+        # The default client's subscription carries every node in its squad, so
+        # the Panel publishes both nodes' inbounds, not only the Master's.
+        self.master.subscription_inbounds_override = (
+            matrix_data.inbounds(self.matrix, vision=vision)
+            + matrix_data.inbounds(self.matrix, vision=worker_vision)
         )
         self.topology: Optional[topology.MultiNodeTopology] = None
         self.node_add_outcome: Optional[topology.InstallOutcome] = None
@@ -1600,4 +1610,8 @@ def cases(
              timeout_seconds=WORKER_STATE_TIMEOUT_SECONDS),
         Case(WORKER_CONFIG_CASE_ID, "multi-node", lambda context: case_worker_config(product),
              timeout_seconds=WORKER_STATE_TIMEOUT_SECONDS),
+        Case("SUB-SERVED", "multi-node", lambda context: aio.case_subscriptions(product.master),
+             timeout_seconds=SUB_SERVED_TIMEOUT_SECONDS),
+        Case("SUB-B64", "multi-node", lambda context: aio.case_share_links(product.master),
+             timeout_seconds=SUB_SHARE_LINK_TIMEOUT_SECONDS),
     ]
