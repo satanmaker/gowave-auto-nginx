@@ -355,6 +355,7 @@ def scan_mihomo(text: str) -> Dict[str, Any]:
     return {
         "proxies": len(proxies),
         "proxy_types": sorted({entry.get("type", "") for entry in proxies if entry.get("type")}),
+        "proxy_details": proxies,
         "groups": groups,
         "rules": rules,
         "match_rule": match_rule,

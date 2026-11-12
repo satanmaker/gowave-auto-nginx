@@ -15,7 +15,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "tests"))
 
-from tools.podman_e2e import acme_fixture  # noqa: E402
+from tools.podman_e2e import acme_fixture, topology  # noqa: E402
 
 HARNESS_DIR = REPO_ROOT / "tools" / "podman_e2e"
 FIXTURE_DIR = REPO_ROOT / "tests" / "fixtures"
@@ -145,8 +145,29 @@ class TestPodmanFixtureIsolation(unittest.TestCase):
                 self.assertNotIn(forbidden, code, f"{path.name} must not modify global CA trust")
 
     def test_harness_binds_only_private_or_loopback_addresses(self):
+        # The data plane is the single exception, and it is not a hole in this rule:
+        # its block is named in one constant, is attached to an internal bridge with
+        # no gateway, and carries only the installed host and the controlled
+        # endpoint, so a packet addressed into it has no route off the workstation.
+        # Everything else in the harness still names private or loopback only.
+        data_plane = {
+            str(ipaddress.ip_network(candidate).network_address)
+            for candidate in topology.DATA_PREFIX_CANDIDATES
+        }
         for path in python_sources(HARNESS_DIR) + python_sources(FIXTURE_DIR):
-            self.assertEqual(public_addresses(path.read_text(encoding="utf-8")), [], path.name)
+            allowed = data_plane if path.name == "topology.py" else set()
+            found = [address for address in public_addresses(path.read_text(encoding="utf-8"))
+                     if address not in allowed]
+            self.assertEqual(found, [], path.name)
+
+    def test_the_data_plane_block_is_the_only_public_literal_the_harness_names(self):
+        text = (HARNESS_DIR / "topology.py").read_text(encoding="utf-8")
+        expected = sorted(
+            str(ipaddress.ip_network(candidate).network_address)
+            for candidate in topology.DATA_PREFIX_CANDIDATES
+        )
+        self.assertEqual(sorted(public_addresses(text)), expected)
+        self.assertEqual(len(expected), 3, "keep the exception to one small, auditable list")
 
     def test_harness_never_reaches_a_remote_host_over_ssh(self):
         for path in python_sources(HARNESS_DIR):

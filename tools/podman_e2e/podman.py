@@ -117,19 +117,45 @@ class Podman:
             "--label", f"gowave.e2e.started={self._started_epoch}",
         ]
 
-    def network_create(self, name: str, subnet: Optional[str] = None, disable_dns: bool = False) -> str:
+    def network_create(
+        self,
+        name: str,
+        subnet: Optional[str] = None,
+        disable_dns: bool = False,
+        internal: bool = False,
+    ) -> str:
         """Create the run network.
 
         ``disable_dns`` stops netavark from installing its own resolver at the
         gateway. That resolver ignores per-container ``--dns`` entirely, which
         would make the fixture zone unreachable as the authoritative source.
+
+        ``internal`` leaves the network without a gateway, so it carries a
+        connected route and nothing else: no default route can displace the run
+        network's, and no packet addressed into it can be forwarded off the host.
         """
         args = ["network", "create", *self._ownership_labels()]
         if subnet:
             args += ["--subnet", subnet]
         if disable_dns:
             args.append("--disable-dns")
+        if internal:
+            args.append("--internal")
         args.append(name)
+        self._run(args)
+        return name
+
+    def network_connect(self, name: str, network: str, ip: Optional[str] = None) -> str:
+        """Attach a running container to another run network.
+
+        A second interface is how one role carries both a private control
+        address and a public one; attaching after start keeps the container's
+        original default route and resolver untouched.
+        """
+        args = ["network", "connect"]
+        if ip:
+            args += ["--ip", ip]
+        args += [network, name]
         self._run(args)
         return name
 

@@ -154,16 +154,18 @@ class TestPodmanClientTrust(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_mihomo_config_points_at_the_mounted_fixture_ca(self):
-        config = client_trust.apply_mihomo_trust_anchors({"proxies": [], "rules": ["MATCH,DIRECT"]})
-        self.assertEqual(config["tls"][client_trust.MIHOMO_CA_KEY], [client_trust.CONTAINER_CA_FILE])
+    def test_mihomo_anchor_is_embedded_because_the_key_takes_pem_documents(self):
+        pem = client_trust.ca_pem(self.ca_file)
+        config = client_trust.apply_mihomo_trust_anchors({"proxies": [], "rules": ["MATCH,DIRECT"]}, self.ca_file)
+        self.assertEqual(config["tls"][client_trust.MIHOMO_CA_KEY], [pem])
+        self.assertIn("BEGIN CERTIFICATE", config["tls"][client_trust.MIHOMO_CA_KEY][0])
         self.assertEqual(client_trust.CONTAINER_CA_FILE, "/fixtures/ca/fixture-ca.crt")
-        custom = client_trust.apply_mihomo_trust_anchors({}, "/run/ca.pem")
-        self.assertEqual(custom["tls"][client_trust.MIHOMO_CA_KEY], ["/run/ca.pem"])
         with self.assertRaises(client_trust.ClientTrustError):
-            client_trust.apply_mihomo_trust_anchors({"tls": "not-a-mapping"})
+            client_trust.apply_mihomo_trust_anchors({"tls": "not-a-mapping"}, self.ca_file)
         with self.assertRaises(client_trust.ClientTrustError):
             client_trust.apply_mihomo_trust_anchors({}, "")
+        with self.assertRaises(client_trust.ClientTrustError):
+            client_trust.apply_mihomo_trust_anchors({"proxies": []}, "/fixtures/ca/absent.crt")
 
     def test_real_mihomo_accepts_the_trust_block(self):
         mihomo = shutil.which("mihomo")
@@ -175,12 +177,16 @@ class TestPodmanClientTrust(unittest.TestCase):
             "rules": ["MATCH,DIRECT"],
         }, str(self.ca_file))
         path = self.directory.root / "mihomo-config.yaml"
+        anchor = "\n".join(
+            f"      {line}" for line in config["tls"][client_trust.MIHOMO_CA_KEY][0].splitlines()
+        )
         path.write_text(
             "\n".join([
                 f"mixed-port: {config['mixed-port']}",
                 "tls:",
                 f"  {client_trust.MIHOMO_CA_KEY}:",
-                f"    - {config['tls'][client_trust.MIHOMO_CA_KEY][0]}",
+                "    - |",
+                anchor,
                 "proxies: []",
                 "rules:",
                 "  - MATCH,DIRECT",

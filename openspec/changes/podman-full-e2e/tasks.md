@@ -43,7 +43,7 @@
 - [x] 4.5 Obtain every served representation from the real Panel with a client-identifying User-Agent: the base64 share-link list, the Xray JSON config object or profile list (validated in both shapes), and the Mihomo YAML. Load the Mihomo YAML in Mihomo and consume the Xray representations without replacing the Panel-issued outbound.
 - [x] 4.5a Test absent-header and blank-header behavior against the pinned Panel policy, which rejects both with 403; do not collapse the two cases into one probe.
 - [x] 4.5b Decode the base64 share-link list and assert one link per proxy entry with the expected protocol, host, SNI, and fingerprint, and prove an Xray-family client imports it while the raw JSON body imports nothing.
-- [ ] 4.6 Transfer verifiable payloads through every applicable supported protocol/configuration.
+- [x] 4.6 Transfer verifiable payloads through every applicable supported protocol/configuration.
 - [ ] 4.7 Verify revocation, restart recovery, and repeated provisioning/idempotency.
 - [ ] 4.8 Add negative configuration and dependency-failure scenarios.
 - [ ] 4.9 Execute and assert the complete All-in-One matrix with both Xray and Mihomo: exactly 8 positive transfer cases without Vision and 10 with Vision; fail on missing or unexplained extra cases.

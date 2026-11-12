@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 19
-  total: 144
+  podman_first: 20
+  total: 145
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3296,6 +3296,23 @@ cases:
   driver: null
   driver_status: planned
   promotion_target: Real Subscription Delivery and User-Agent Policy
+- id: AIO-TRAFFIC
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: The pinned Xray and Mihomo clients consume the Panel-issued subscriptions and send a unique
+    payload through every core transport, and the controlled endpoint echoes each request id and body
+    digest while recording the installed host, not the client, as the source.
+  assertion_sha256: 4bd2214e14a2f9b95c800cd85bc27213864fdcb16fb30d83712dae2447c68717
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: NGX-COVER-DERIVE
   requirement: Camouflage decoy and certificate lineage
   live_scenario: null

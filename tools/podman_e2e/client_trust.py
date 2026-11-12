@@ -7,7 +7,8 @@ deliberate:
   ``SSL_CERT_FILE``, so the anchor must be declared inside the outbound as
   ``tlsSettings.certificates`` with ``usage: verify``;
 * Mihomo reads the extra anchor from ``tls.custom-certifactes`` (the upstream key
-  really is spelled that way) and otherwise uses the system pool.
+  really is spelled that way), and that key takes PEM documents rather than
+  paths, so the anchor is embedded in the generated config.
 
 curl and the Python clients honour the scoped ``CURL_CA_BUNDLE`` /
 ``REQUESTS_CA_BUNDLE`` / ``SSL_CERT_FILE`` environment, so nothing outside the
@@ -106,19 +107,21 @@ def unanchored_tls_outbounds(config: Dict[str, Any]) -> List[str]:
     return unanchored
 
 
-def apply_mihomo_trust_anchors(config: Dict[str, Any], ca_path: str = CONTAINER_CA_FILE) -> Dict[str, Any]:
-    """Point Mihomo at the mounted fixture CA through its ``tls`` block.
+def apply_mihomo_trust_anchors(config: Dict[str, Any], ca_file: Union[str, Path] = CONTAINER_CA_FILE) -> Dict[str, Any]:
+    """Put the fixture anchor where Mihomo actually reads one.
 
-    Mihomo declares ``custom-certifactes`` as a list of file paths, so the anchor
-    is always emitted as a one-element list.
+    ``tls.custom-certifactes`` is a list of PEM *documents*, not of paths: Mihomo
+    feeds each entry straight to ``AppendCertsFromPEM``, so a mounted path is
+    rejected with a warning and every TLS outbound silently stays on the system
+    pool. The anchor is therefore embedded, which is why this helper reads the
+    file instead of naming it.
     """
-    if not ca_path:
-        raise ClientTrustError("Mihomo trust anchor path must not be empty")
+    pem = ca_pem(ca_file)
     result = copy.deepcopy(config)
     tls_block = result.setdefault("tls", {})
     if not isinstance(tls_block, dict):
         raise ClientTrustError("Mihomo config 'tls' must be a mapping")
-    tls_block[MIHOMO_CA_KEY] = [ca_path]
+    tls_block[MIHOMO_CA_KEY] = [pem]
     return result
 
 
