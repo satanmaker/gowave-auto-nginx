@@ -64,6 +64,14 @@ class BudgetExhausted(Exception):
     pass
 
 
+class CaseBlocked(Exception):
+    """The case could not observe the product because its prerequisite failed.
+
+    Reported as BLOCKED rather than FAIL: collapsing the two would turn one real
+    defect (say, a failed install) into six invented ones.
+    """
+
+
 class CaseTimeout(Exception):
     pass
 
@@ -209,6 +217,8 @@ class Runner:
                     result = CaseResult(case.id, case.topology, status, message=f"{reason} after {timeout:.0f}s")
                 except AssertionError as exc:
                     result = CaseResult(case.id, case.topology, FAIL, message=str(exc))
+                except CaseBlocked as exc:
+                    result = CaseResult(case.id, case.topology, BLOCKED, message=str(exc))
                 except BudgetExhausted as exc:
                     result = CaseResult(case.id, case.topology, INCOMPLETE, message=str(exc))
                 except Exception as exc:  # unexpected harness error is never PASS

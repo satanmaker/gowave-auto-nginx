@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from tools.podman_e2e import aio, catalog, target_image, topology  # noqa: E402
-from tools.podman_e2e.runner import Case, RunContext  # noqa: E402
+from tools.podman_e2e.runner import Case, CaseBlocked, RunContext  # noqa: E402
 
 INSTALL_OUTPUT = (
     "Configured /opt/gowave/.env with mode 0640.\n"
@@ -125,9 +125,9 @@ class TestAioSuite(unittest.TestCase):
         self.assertEqual(len(podman.installs), 1)
         self.assertIs(product.require_installed(), product.host)
 
-    def test_later_cases_cannot_run_before_the_install(self):
+    def test_later_cases_are_blocked_before_the_install(self):
         product = aio.AioProduct(FakePodman(self.context))
-        with self.assertRaises(AssertionError) as caught:
+        with self.assertRaises(CaseBlocked) as caught:
             product.require_installed()
         self.assertIn(aio.INSTALL_CASE_ID, str(caught.exception))
 
@@ -140,6 +140,15 @@ class TestAioSuite(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("exit 1", message)
         self.assertIn("ACME acquisition failed", message)
+
+    def test_cases_after_a_failed_install_are_blocked(self):
+        podman = FakePodman(self.context, install_returncode=1, install_output="ACME acquisition failed\n")
+        product = aio.AioProduct(podman)
+        with self.assertRaises(AssertionError):
+            product.install()
+        with self.assertRaises(CaseBlocked) as caught:
+            product.require_installed()
+        self.assertIn("had nothing to verify", str(caught.exception))
 
     def test_suite_declares_only_aio_cases_that_exist_in_the_catalog(self):
         podman = FakePodman(self.context)
@@ -160,6 +169,181 @@ class TestAioSuite(unittest.TestCase):
         self.assertEqual(case.topology, "aio")
         self.assertGreater(case.timeout_seconds, 0)
         self.assertLessEqual(case.timeout_seconds, aio.INSTALL_TIMEOUT_SECONDS)
+
+
+class ScriptedPodman:
+    """Podman stub that returns prepared host-script results in order."""
+
+    def __init__(self, context, results):
+        self.context = context
+        self.results = list(results)
+        self.scripts = []
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
+        self.scripts.append(script)
+        stdout, returncode = self.results.pop(0)
+        return subprocess.CompletedProcess(["bash", "-lc", script], returncode, stdout, "")
+
+
+class StubHost:
+    """The installed host, without containers, for the per-case probes."""
+
+    def __init__(self, target_name="aio-1", panel_domain=aio.PANEL_DOMAIN):
+        self.target_name = target_name
+        self.panel_domain = panel_domain
+        self.reality_domain = aio.REALITY_DOMAIN
+        self.client_reports = []
+
+    def client_http(self, url, **kwargs):
+        report = self.client_reports.pop(0)
+        return report
+
+
+def installed_product(context, results):
+    podman = ScriptedPodman(context, results)
+    product = aio.AioProduct(podman)
+    product.host = StubHost()
+    product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
+    return product, podman
+
+
+SOCKET_LISTING = (
+    "LISTEN 0 511 0.0.0.0:443 0.0.0.0:*\n"
+    "LISTEN 0 511 127.0.0.1:3000 0.0.0.0:*\n"
+    "LISTEN 0 511 127.0.0.1:3002 0.0.0.0:*\n"
+)
+
+
+class TestAioVerificationCases(unittest.TestCase):
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def test_package_case_requires_every_harness_declared_prerequisite(self):
+        installed = "".join(f"installed={name}\n" for name in aio.REQUIRED_PACKAGES)
+        product, _ = installed_product(self.context, [(installed, 0)])
+        evidence = aio.case_packages(product)
+        self.assertEqual(evidence["missing_packages"], [])
+        self.assertEqual(len(evidence["installed_packages"]), len(aio.REQUIRED_PACKAGES))
+
+    def test_missing_prerequisite_fails_the_case(self):
+        output = "".join(f"installed={name}\n" for name in aio.REQUIRED_PACKAGES if name != "fail2ban")
+        product, _ = installed_product(self.context, [(output + "missing=fail2ban\n", 0)])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_packages(product)
+        self.assertIn("fail2ban", str(caught.exception))
+
+    def test_service_case_requires_active_units_and_correct_listeners(self):
+        output = "active\nactive\nactive\nactive\n---\n" + SOCKET_LISTING
+        product, _ = installed_product(self.context, [(output, 0)])
+        evidence = aio.case_services(product)
+        self.assertTrue(all(state == "active" for state in evidence["units"].values()))
+        self.assertEqual(evidence["listeners"], sorted([
+            "0.0.0.0:443", "127.0.0.1:3000", "127.0.0.1:3002",
+        ]))
+
+    def test_inactive_unit_fails_the_service_case(self):
+        output = "active\nactive\ninactive\nactive\n---\n" + SOCKET_LISTING
+        product, _ = installed_product(self.context, [(output, 0)])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_services(product)
+        self.assertIn("nginx.service=inactive", str(caught.exception))
+
+    def test_loopback_only_listener_is_not_a_public_443(self):
+        listing = (
+            "LISTEN 0 511 127.0.0.1:443 0.0.0.0:*\n"
+            "LISTEN 0 511 127.0.0.1:3000 0.0.0.0:*\n"
+            "LISTEN 0 511 127.0.0.1:3002 0.0.0.0:*\n"
+        )
+        output = "active\nactive\nactive\nactive\n---\n" + listing
+        product, _ = installed_product(self.context, [(output, 0)])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_services(product)
+        self.assertIn("publicly on 443", str(caught.exception))
+
+    def test_credentials_case_rejects_a_world_readable_file(self):
+        product, _ = installed_product(self.context, [("root 644 128\n1\n1\n1\n0\n", 0)])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_credentials(product)
+        self.assertIn("mode", str(caught.exception))
+
+    def test_credentials_case_never_returns_secret_values(self):
+        product, _ = installed_product(self.context, [("root 600 128\n1\n1\n1\n0\n", 0)])
+        evidence = aio.case_credentials(product)
+        self.assertEqual(
+            sorted(evidence),
+            [
+                "has_admin_password", "has_admin_username", "has_scoped_api_token",
+                "has_short_uuid_key", "mode", "owner",
+            ],
+        )
+        self.assertTrue(all(isinstance(value, (bool, str)) for value in evidence.values()))
+
+    def test_panel_case_needs_an_authenticated_call_and_a_public_https_view(self):
+        product, _ = installed_product(self.context, [("login=200 api=200 token_length=64\n", 0)])
+        product.host.client_reports = [{
+            "url": f"{aio.PUBLIC_PANEL}/",
+            "returncode": 0,
+            "stdout": "{}",
+            "stderr": "",
+            "probe": {"status": 200, "peer": {"tls_version": "TLSv1.3", "san": [aio.PANEL_DOMAIN]}},
+        }]
+        evidence = aio.case_panel_ready(product)
+        self.assertEqual(evidence["loopback_api"], "200")
+        self.assertEqual(evidence["public_status"], 200)
+
+    def test_panel_case_fails_when_the_public_probe_is_not_trusted(self):
+        product, _ = installed_product(self.context, [("login=200 api=200 token_length=64\n", 0)])
+        product.host.client_reports = [{
+            "url": f"{aio.PUBLIC_PANEL}/",
+            "returncode": 1,
+            "stdout": "{}",
+            "stderr": "",
+            "probe": {"error": "SSLCertVerificationError: certificate verify failed"},
+        }]
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_panel_ready(product)
+        self.assertIn("certificate verify failed", str(caught.exception))
+
+    def test_tls_case_rejects_a_lineage_that_does_not_verify(self):
+        product, _ = installed_product(self.context, [("", 1), ("", 1)])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_tls_and_identity(product)
+        self.assertIn(aio.PANEL_DOMAIN, str(caught.exception))
+
+    def test_tls_case_reports_the_api_sourced_short_uuid(self):
+        product, _ = installed_product(self.context, [
+            ("panel.testbed.internal does match certificate\n", 0),
+            ("reality.testbed.internal does match certificate\n", 0),
+            ("short_uuid_length=12\nusername_present=True\n", 0),
+            ("0\n", 0),
+        ])
+        evidence = aio.case_tls_and_identity(product)
+        self.assertEqual(evidence["short_uuid_length"], "12")
+        self.assertEqual(evidence["short_uuid_source"], "api")
+        self.assertFalse(evidence["credentials_short_uuid_key"])
+
+    def test_panel_probe_scripts_are_valid_bash(self):
+        # The probes are generated shell; a quoting mistake would only surface
+        # after a full install, so the syntax is checked without one.
+        for script in (aio.panel_probe_script(), aio.identity_probe_script()):
+            proc = subprocess.run(["bash", "-n", "-c", script], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertNotIn("Authorization: Bearer $token", script)
+
+    def test_panel_probe_accepts_the_wrapped_token_shape(self):
+        # The Panel answers {"response": {"accessToken": ...}}; a probe that only
+        # looked at the top level would authenticate with an empty bearer token.
+        script = aio.panel_probe_script()
+        self.assertIn('nested.get(\'accessToken\')', script)
+
+    def test_harness_package_list_matches_the_operator_prerequisites(self):
+        operator = (REPO_ROOT / "modules" / "os.sh").read_text(encoding="utf-8")
+        function = operator.split("get_required_packages() {", 1)[1]
+        block = function.split("cat <<'EOF'", 1)[1].split("EOF", 1)[0]
+        declared = [line.strip() for line in block.splitlines() if line.strip()]
+        self.assertEqual(tuple(declared), tuple(aio.REQUIRED_PACKAGES))
 
 
 if __name__ == "__main__":

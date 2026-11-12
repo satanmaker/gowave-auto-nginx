@@ -112,6 +112,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "All-in-One Master VPS Installation Verification",
     },
     {
+        "id": "AIO-PACKAGES",
+        "requirement": "All-in-One Master VPS Installation Verification",
+        "assertion": "Every prerequisite the operator documents as its own responsibility is installed by that operator on a clean host, checked against a harness-owned package list rather than the product's own claim.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
         "id": "SUB-B64",
         "requirement": "Panel subscription representations",
         "assertion": "The base64 share-link list at /api/sub/<shortUuid> contains one link per proxy entry with the expected protocol, host, SNI and firefox fingerprint, and an Xray-family client imports it while the raw JSON body imports nothing.",
