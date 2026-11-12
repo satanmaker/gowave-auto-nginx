@@ -43,7 +43,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -452,6 +452,16 @@ def transfer_matrix(
     }
 
 
+def matches_tuple(label: Dict[str, str], network: str, security: str) -> bool:
+    """Whether a served outbound is the one matrix tuple names.
+
+    The matrix identifies an inbound by its transport and security layer, which
+    is what separates the five inbounds: tcp/reality is REALITY, xhttp/tls, ws/tls
+    and grpc/tls are the three TLS transports, and tcp/tls is Vision.
+    """
+    return str(label.get("network")) == network and str(label.get("security")) == security
+
+
 def xray_transfers(
     payload_dir: str,
     ca_file: str,
@@ -460,19 +470,27 @@ def xray_transfers(
     expect_refusal: bool = False,
     timeout: int = REQUEST_TIMEOUT_SECONDS,
     limit: Optional[int] = None,
+    match: Optional[Callable[[Dict[str, str]], bool]] = None,
 ) -> List[Dict[str, Any]]:
     """Run every served Xray profile and send a payload through each.
 
     ``limit`` runs only the first profiles, which the readiness scope uses to
-    probe one tunnel instead of the whole matrix.
+    probe one tunnel instead of the whole matrix. ``match`` selects profiles by
+    their served label, so a matrix case runs exactly the tuple it names while
+    every profile stays a complete config.
     """
     raw = subscription_probe.read_payload(payload_dir, "xray-json")
     shape, profiles = subscription_probe.load_profiles(raw)
     transfers: List[Dict[str, Any]] = []
+    matched = 0
     for index, profile in enumerate(profiles):
-        if limit is not None and index >= limit:
-            break
         prepared, wrapped = subscription_probe.prepare_config(profile, ca_file)
+        label = xray_label(prepared)
+        if match is not None and not match(label):
+            continue
+        if limit is not None and matched >= limit:
+            break
+        matched += 1
         if wrapped:
             raise SystemExit(
                 f"the served Xray {shape} profile {index} is not a complete config: it needed a "
@@ -480,7 +498,6 @@ def xray_transfers(
             )
         path = workdir / f"traffic-xray-{index}.json"
         write_private(path, json.dumps(prepared))
-        label = xray_label(prepared)
         try:
             with Engine(
                 [XRAY_BINARY, "run", "-c", str(path)],
@@ -555,13 +572,22 @@ def mihomo_transfers(
     workdir: Path,
     expect_refusal: bool = False,
     timeout: int = REQUEST_TIMEOUT_SECONDS,
+    match: Optional[Callable[[Dict[str, str]], bool]] = None,
 ) -> List[Dict[str, Any]]:
-    """Load the served Mihomo YAML and send a payload through every proxy it declares."""
+    """Load the served Mihomo YAML and send a payload through every proxy it declares.
+
+    ``match`` selects the proxies a matrix tuple names; the YAML is still loaded
+    as served, so the selection never rewrites what the Panel issued.
+    """
     text = subscription_probe.read_payload(payload_dir, "mihomo")
     served = subscription_probe.scan_mihomo(text)
     proxies = served.get("proxy_details") or []
     if not proxies:
         raise SystemExit("the served Mihomo YAML declares no proxy to send a payload through")
+    if match is not None:
+        proxies = [proxy for proxy in proxies if match(mihomo_label(proxy))]
+        if not proxies:
+            return []
     config = workdir / "traffic-mihomo.yaml"
     write_private(config, mihomo_config(text, ca_file))
     home = workdir / "traffic-mihomo-home"
@@ -798,10 +824,65 @@ def _recorded_request_ids(destination: str) -> set:
     }
 
 
+def transfer_one(
+    payload_dir: str,
+    ca_file: str,
+    destination: str,
+    workdir: Path,
+    engine: str,
+    network: str,
+    security: str,
+) -> Dict[str, Any]:
+    """Send one payload through exactly the matrix tuple the arguments name.
+
+    The matrix identifies an inbound by its transport and security layer, and one
+    client by its engine. A tuple that resolves to no outbound, or to more than
+    one, is a matrix/representation disagreement and fails here instead of being
+    papered over by running whatever happened to be first: an unexplained extra
+    case and a missing one are both count drift.
+
+    The verdict stays with the caller — this returns what the endpoint recorded.
+    A connection failure still raises, because that names the engine's own log,
+    which is the only place the reason a tunnel did not accept a payload exists.
+    """
+    if not destination:
+        raise SystemExit("a destination address is required: the payload needs somewhere to go")
+    if engine not in ("xray", "mihomo"):
+        raise SystemExit(f"unknown matrix client {engine!r}: the probe runs the pinned engines only")
+
+    def selected(label: Dict[str, str]) -> bool:
+        return matches_tuple(label, network, security)
+
+    if engine == "xray":
+        found = xray_transfers(payload_dir, ca_file, destination, workdir, match=selected)
+    else:
+        found = mihomo_transfers(payload_dir, ca_file, destination, workdir, match=selected)
+    if len(found) != 1:
+        raise SystemExit(
+            f"the served {engine} representation declares {len(found)} {network}/{security} outbound(s) "
+            "for the matrix tuple, expected exactly one"
+        )
+    item = found[0]
+    return {
+        "outbounds": len(found),
+        "engine": item.get("engine"),
+        "tag": item.get("tag"),
+        "network": item.get("network"),
+        "security": item.get("security"),
+        "sni": item.get("sni"),
+        "status": item.get("status"),
+        "delivered": bool(item.get("delivered")),
+        "request_id_match": bool(item.get("request_id_match")),
+        "body_match": bool(item.get("body_match")),
+        "source_ip": item.get("source_ip") or "",
+        "reason": item.get("reason", ""),
+    }
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Send payloads through the Panel-issued outbounds")
     parser.add_argument("--scope", required=True,
-                        choices=("traffic", "revoked", "warmup", "prohibited"))
+                        choices=("traffic", "revoked", "warmup", "prohibited", "transfer"))
     parser.add_argument("--payload-dir", default="/secrets")
     parser.add_argument("--ca", required=True)
     parser.add_argument("--destination", default="")
@@ -810,6 +891,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Where the prohibited scope reads the endpoint's own record, when it is not "
              "reachable at the prohibited destination",
     )
+    parser.add_argument(
+        "--engine", default="",
+        help="The matrix client of the transfer scope: xray or mihomo",
+    )
+    parser.add_argument("--network", default="", help="The matrix transport of the transfer scope")
+    parser.add_argument("--security", default="", help="The matrix security layer of the transfer scope")
     parser.add_argument("--workdir", default="")
     args = parser.parse_args(argv)
 
@@ -818,6 +905,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         facts = prohibited(
             args.payload_dir, args.ca, args.destination, workdir,
             report_destination=args.report_destination,
+        )
+    elif args.scope == "transfer":
+        facts = transfer_one(
+            args.payload_dir, args.ca, args.destination, workdir,
+            args.engine, args.network, args.security,
         )
     else:
         scopes = {

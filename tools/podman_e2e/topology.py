@@ -578,6 +578,33 @@ class AioTopology:
             timeout=timeout,
         )
 
+    def transfer_facts(
+        self, engine: str, network: str, security: str, timeout: int = 300,
+    ) -> Any:
+        """Run one matrix tuple: one client through one inbound, to the endpoint.
+
+        The tuple is named by the transport and security layer the matrix
+        declares, not by an outbound tag: the Panel tags every host outbound
+        ``proxy``, so only the transport pair identifies the inbound the client
+        was issued.
+        """
+        self.engine_client()
+        return self.podman.exec(
+            self.engine_client_name,
+            [
+                "python3", TRAFFIC_PROBE_SCRIPT,
+                "--scope", "transfer",
+                "--payload-dir", SECRETS_MOUNT,
+                "--ca", f"{CA_MOUNT}/{ISSUED_ROOT_NAME}",
+                "--destination", f"{self.plan.data_echo_ip}:{ECHO_HTTP_PORT}",
+                "--engine", engine,
+                "--network", network,
+                "--security", security,
+            ],
+            check=False,
+            timeout=timeout,
+        )
+
     def prohibited_facts(self, timeout: int = 300) -> Any:
         """Run the policy probe: a permitted control, then a destination the product denies.
 

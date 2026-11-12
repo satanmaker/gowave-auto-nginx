@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 27
-  total: 152
+  podman_first: 37
+  total: 162
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3296,23 +3296,6 @@ cases:
   driver: null
   driver_status: planned
   promotion_target: Real Subscription Delivery and User-Agent Policy
-- id: AIO-TRAFFIC
-  requirement: Real client data-plane verification
-  live_scenario: null
-  assertion: The pinned Xray and Mihomo clients consume the Panel-issued subscriptions and send a unique
-    payload through every core transport, and the controlled endpoint echoes each request id and body
-    digest while recording the installed host, not the client, as the source.
-  assertion_sha256: 4bd2214e14a2f9b95c800cd85bc27213864fdcb16fb30d83712dae2447c68717
-  runs_in:
-  - podman
-  state: incubating
-  environment: container
-  topology:
-  - aio
-  gate: pre-push
-  driver: null
-  driver_status: planned
-  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-REVOKE
   requirement: Real client data-plane verification
   live_scenario: null
@@ -3606,3 +3589,201 @@ cases:
   driver: null
   driver_status: planned
   promotion_target: Result Status Semantics
+- id: AIO-DP-REALITY-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: The xray client consumes the Panel-issued REALITY outbound — vless over tcp with the reality
+    security layer — sends a unique payload through it, and the controlled endpoint echoes the request
+    id and body digest while recording the installed host, not the client, as the source, under the REALITY
+    inbound's own SNI.
+  assertion_sha256: 8434be64c4c7332fc758463f4a005a29e66a740e1d1d1a6bb17b552c70a0d4a4
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: AIO-DP-REALITY-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: The mihomo client consumes the Panel-issued REALITY outbound — vless over tcp with the reality
+    security layer — sends a unique payload through it, and the controlled endpoint echoes the request
+    id and body digest while recording the installed host, not the client, as the source, under the REALITY
+    inbound's own SNI.
+  assertion_sha256: 9109ec28c542f465a094bae7adbe81b04ae34f81401db38031a4c9e22fbe4b18
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: AIO-DP-XHTTP-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: The xray client consumes the Panel-issued XHTTP outbound — vless over xhttp with the tls
+    security layer — sends a unique payload through it, and the controlled endpoint echoes the request
+    id and body digest while recording the installed host, not the client, as the source, under the XHTTP
+    inbound's own SNI.
+  assertion_sha256: f4bb525648eddf82a22f31cf98c83b1e97d5c773500989b3b685c43d7df82770
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: AIO-DP-XHTTP-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: The mihomo client consumes the Panel-issued XHTTP outbound — vless over xhttp with the tls
+    security layer — sends a unique payload through it, and the controlled endpoint echoes the request
+    id and body digest while recording the installed host, not the client, as the source, under the XHTTP
+    inbound's own SNI.
+  assertion_sha256: ddde01a5ee913018258d86426db589c2cb34d6a05a83ed1cb6ac3c6b3614abd4
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: AIO-DP-WS-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: The xray client consumes the Panel-issued WS outbound — vless over ws with the tls security
+    layer — sends a unique payload through it, and the controlled endpoint echoes the request id and body
+    digest while recording the installed host, not the client, as the source, under the WS inbound's own
+    SNI.
+  assertion_sha256: 1125dd5dbfbd2d6cb2a13294b54ee95c5b509a70092e554205f541b5415ffd2b
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: AIO-DP-WS-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: The mihomo client consumes the Panel-issued WS outbound — vless over ws with the tls security
+    layer — sends a unique payload through it, and the controlled endpoint echoes the request id and body
+    digest while recording the installed host, not the client, as the source, under the WS inbound's own
+    SNI.
+  assertion_sha256: 684524a839dc53c12aa90bd7a6c168cde19e20548f9593cb5f8456ea7b5448a8
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: AIO-DP-TROJAN-GRPC-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: The xray client consumes the Panel-issued TROJAN-GRPC outbound — trojan over grpc with the
+    tls security layer — sends a unique payload through it, and the controlled endpoint echoes the request
+    id and body digest while recording the installed host, not the client, as the source, under the TROJAN-GRPC
+    inbound's own SNI.
+  assertion_sha256: 4ce083ce43b047c50dfadecccd201afd7932269e8b4459164fe233dff8db1ab2
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: AIO-DP-TROJAN-GRPC-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: The mihomo client consumes the Panel-issued TROJAN-GRPC outbound — trojan over grpc with
+    the tls security layer — sends a unique payload through it, and the controlled endpoint echoes the
+    request id and body digest while recording the installed host, not the client, as the source, under
+    the TROJAN-GRPC inbound's own SNI.
+  assertion_sha256: 4022d20cf706c0cbc37924dd0b4250a73c4de5d9fbc4da5031fc9e2b1e99f4f3
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: AIO-DP-VISION-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: The xray client consumes the Panel-issued VISION outbound — vless over tcp with the tls security
+    layer — sends a unique payload through it, and the controlled endpoint echoes the request id and body
+    digest while recording the installed host, not the client, as the source, under the VISION inbound's
+    own SNI.
+  assertion_sha256: d9cac5da14a9819e70a545b62f75ca8c704c0c044c9721242fede85a4107de8a
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: AIO-DP-VISION-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: The mihomo client consumes the Panel-issued VISION outbound — vless over tcp with the tls
+    security layer — sends a unique payload through it, and the controlled endpoint echoes the request
+    id and body digest while recording the installed host, not the client, as the source, under the VISION
+    inbound's own SNI.
+  assertion_sha256: 6cb0d03b7282b1ad0c59b3abfb1971fccc95bb43d61ff245516ebc8e6fa956a7
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: AIO-MATRIX
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: The executed positive data-plane cases are exactly the matrix tuples for the selected Vision
+    configuration — 8 without the optional inbound and 10 with it — and a count that disagrees with the
+    matrix, a declared case the matrix does not enumerate, or a tuple that produced no result fails the
+    run instead of being counted as green.
+  assertion_sha256: a8ba9ea5178eaa6c6d829bd6c508f93ec7955592ef849201f9b6bb0287364c8b
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints

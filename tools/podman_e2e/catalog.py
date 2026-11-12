@@ -23,6 +23,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import yaml
 
+from . import matrix as matrix_data
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 LIVE_SPEC = REPO_ROOT / "openspec" / "specs" / "live-vps-e2e" / "spec.md"
 CATALOG_PATH = REPO_ROOT / "tests" / "cases" / "catalog.yaml"
@@ -168,13 +170,6 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Real Subscription Delivery and User-Agent Policy",
     },
     {
-        "id": "AIO-TRAFFIC",
-        "requirement": "Real client data-plane verification",
-        "assertion": "The pinned Xray and Mihomo clients consume the Panel-issued subscriptions and send a unique payload through every core transport, and the controlled endpoint echoes each request id and body digest while recording the installed host, not the client, as the source.",
-        "topology": ["aio"],
-        "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
-    },
-    {
         "id": "AIO-REVOKE",
         "requirement": "Real client data-plane verification",
         "assertion": "A subscription is served, updated through PATCH and captured once one real transfer proves the Panel's asynchronous user push reached the node, the documented revoke action rotates the credentials and the subscription path with the old path returning 404, and freshly started engines replaying the pre-revocation payload deliver nothing while the controlled endpoint records none of their request ids.",
@@ -299,6 +294,47 @@ SCENARIO_RE = re.compile(r"^#### Scenario:\s*(.+?)\s*$")
 REQUIREMENT_RE = re.compile(r"^### Requirement:\s*(.+?)\s*$")
 
 
+def data_plane_cases() -> List[Dict[str, Any]]:
+    """One Podman-first catalog entry per matrix tuple, generated from the matrix.
+
+    The All-in-One matrix cases are not hand-written: the case id, the transport
+    and the client come from the matrix, so a tuple the suite runs and a tuple the
+    catalog advertises cannot drift apart. The optional Vision tuples are listed
+    even though a Vision-less run does not execute them — a catalog is the set of
+    cases a topology may run, and the run's own count case decides which of them
+    the selected configuration owed.
+    """
+    data = matrix_data.load()
+    entries: List[Dict[str, Any]] = []
+    for inbound, client in matrix_data.tuples(data, vision=True):
+        entries.append({
+            "id": matrix_data.case_id(data, matrix_data.AIO, str(inbound["id"]), client),
+            "requirement": "Real client data-plane verification",
+            "assertion": (
+                f"The {client} client consumes the Panel-issued {inbound['id']} outbound — "
+                f"{inbound['protocol']} over {inbound['transport']} with the {inbound['security']} "
+                "security layer — sends a unique payload through it, and the controlled endpoint "
+                "echoes the request id and body digest while recording the installed host, not the "
+                f"client, as the source, under the {inbound['id']} inbound's own SNI."
+            ),
+            "topology": ["aio"],
+            "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
+        })
+    entries.append({
+        "id": "AIO-MATRIX",
+        "requirement": "Real client data-plane verification",
+        "assertion": (
+            "The executed positive data-plane cases are exactly the matrix tuples for the selected "
+            "Vision configuration — 8 without the optional inbound and 10 with it — and a count that "
+            "disagrees with the matrix, a declared case the matrix does not enumerate, or a tuple that "
+            "produced no result fails the run instead of being counted as green."
+        ),
+        "topology": ["aio"],
+        "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
+    })
+    return entries
+
+
 @dataclass
 class LiveScenario:
     requirement: str
@@ -410,7 +446,8 @@ def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
         case["promotion_target"] = None
         cases.append(case)
 
-    for extra in PODMAN_FIRST_CASES:
+    extras = PODMAN_FIRST_CASES + data_plane_cases()
+    for extra in extras:
         cases.append({
             "id": extra["id"],
             "requirement": extra["requirement"],
@@ -432,7 +469,7 @@ def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
         "container": sum(1 for c in cases if c["live_scenario"] and c["environment"] == "container"),
         "partial": sum(1 for c in cases if c["environment"] == "partial"),
         "live_only": sum(1 for c in cases if c["environment"] == "live-only"),
-        "podman_first": len(PODMAN_FIRST_CASES),
+        "podman_first": len(extras),
         "total": len(cases),
     }
     spec_sha = hashlib.sha256(spec_path.read_bytes()).hexdigest()

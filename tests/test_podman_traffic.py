@@ -28,6 +28,7 @@ from tools.podman_e2e import (  # noqa: E402
     acme_fixture,
     aio,
     client_trust,
+    matrix,
     subscription_probe,
     target_image,
     topology,
@@ -39,12 +40,25 @@ PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
 CLIENT_SECRET = "client-subscription-payload-do-not-print"
 
 PLAN = topology.NetworkPlan(subnet="203.0.114.0/24")
-CORE = (
-    ("tcp", "reality", topology.REALITY_DOMAIN),
-    ("ws", "tls", topology.PANEL_DOMAIN),
-    ("grpc", "tls", topology.PANEL_DOMAIN),
-    ("xhttp", "tls", topology.PANEL_DOMAIN),
-)
+MATRIX = matrix.load()
+
+
+def served_sni(inbound):
+    """The domain the matrix inbound is issued for, as the testbed names it."""
+    if inbound.get("id") == matrix.VISION_INBOUND:
+        return topology.VISION_DOMAIN
+    if inbound.get("security") == "reality":
+        return topology.REALITY_DOMAIN
+    return topology.PANEL_DOMAIN
+
+
+def core_tuples():
+    """(network, security, sni) for every non-optional matrix inbound."""
+    return [
+        (str(inbound["transport"]), str(inbound["security"]), served_sni(inbound))
+        for inbound in matrix.inbounds(MATRIX, vision=False)
+    ]
+
 
 XRAY_CONFIG = {
     "inbounds": [
@@ -89,7 +103,7 @@ SERVED_MIHOMO = "\n".join([
 def traffic_transfers():
     transfers = []
     for engine in aio.TRAFFIC_ENGINES:
-        for network, security, sni in CORE:
+        for network, security, sni in core_tuples():
             transfers.append({
                 "engine": engine,
                 "tag": f"{engine}-{network}",
@@ -190,7 +204,7 @@ class TestTrafficProbeHelpers(unittest.TestCase):
         )
         self.assertEqual(matrix["transfer_count"], 8)
         self.assertEqual(matrix["engines"], sorted(aio.TRAFFIC_ENGINES))
-        self.assertEqual(matrix["networks"], sorted(aio.TRAFFIC_NETWORKS))
+        self.assertEqual(matrix["networks"], sorted({network for network, _security, _sni in core_tuples()}))
         self.assertEqual(matrix["source_ips"], [PLAN.target_ip])
         self.assertEqual(matrix["direct_source_ip"], PLAN.engine_client_ip)
         self.assertEqual(matrix["missing_request_ids"], 0)
@@ -201,6 +215,16 @@ class TestTrafficProbeHelpers(unittest.TestCase):
         matrix = traffic_probe.transfer_matrix(transfers, {"requests": recorded}, PLAN.engine_client_ip)
         self.assertEqual(matrix["missing_request_ids"], 1)
         self.assertEqual(matrix["echo_records"], len(transfers) - 1)
+
+    def test_the_matrix_tuple_is_the_transport_and_security_pair(self):
+        reality = {"network": "tcp", "security": "reality"}
+        vision = {"network": "tcp", "security": "tls"}
+        self.assertTrue(traffic_probe.matches_tuple(reality, "tcp", "reality"))
+        self.assertFalse(traffic_probe.matches_tuple(reality, "tcp", "tls"))
+        self.assertFalse(traffic_probe.matches_tuple(vision, "tcp", "reality"))
+        self.assertTrue(traffic_probe.matches_tuple(vision, "tcp", "tls"))
+        self.assertFalse(traffic_probe.matches_tuple({}, "tcp", "tls"),
+                         "an unlabelled outbound must not match a tuple")
 
     def test_the_probe_refuses_to_run_without_a_destination(self):
         with tempfile.TemporaryDirectory() as workdir:
@@ -406,6 +430,80 @@ class TestTrafficProbeTransfer(unittest.TestCase):
         self.assertEqual(report["reason"], "ECONNREFUSED")
 
 
+class TestTrafficProbeTransferOne(unittest.TestCase):
+    """The transfer scope runs one matrix tuple and rejects an ambiguous match."""
+
+    def labels(self):
+        return [
+            {"engine": "xray", "tag": "proxy", "network": "tcp", "security": "reality",
+             "sni": topology.REALITY_DOMAIN, "status": 200, "delivered": True,
+             "request_id_match": True, "body_match": True, "source_ip": PLAN.data_target_ip},
+            {"engine": "xray", "tag": "proxy", "network": "ws", "security": "tls",
+             "sni": topology.PANEL_DOMAIN, "status": 200, "delivered": True,
+             "request_id_match": True, "body_match": True, "source_ip": PLAN.data_target_ip},
+        ]
+
+    def fake(self, labels, calls=None):
+        def transfers(payload_dir, ca_file, destination, workdir, match=None, **_kwargs):
+            selected = [item for item in labels if match is None or match(item)]
+            if calls is not None:
+                calls.append(selected)
+            return selected
+        return transfers
+
+    def run_one(self, labels, network="tcp", security="reality", calls=None):
+        with tempfile.TemporaryDirectory() as workdir:
+            with mock.patch.object(traffic_probe, "xray_transfers",
+                                   self.fake(labels, calls)):
+                return traffic_probe.transfer_one(
+                    "/secrets", "/fixtures/ca/root.pem", "203.0.114.30:18080", Path(workdir),
+                    "xray", network, security,
+                )
+
+    def test_the_scope_sends_through_the_one_outbound_the_tuple_names(self):
+        calls = []
+        facts = self.run_one(self.labels(), network="ws", security="tls", calls=calls)
+        self.assertEqual([item["tag"] for item in calls[0]], ["proxy"])
+        self.assertEqual(calls[0][0]["network"], "ws")
+        self.assertEqual(facts["outbounds"], 1)
+        self.assertEqual(facts["network"], "ws")
+        self.assertEqual(facts["security"], "tls")
+        self.assertEqual(facts["sni"], topology.PANEL_DOMAIN)
+        self.assertTrue(facts["delivered"])
+        self.assertEqual(facts["source_ip"], PLAN.data_target_ip)
+        self.assertEqual(facts["reason"], "")
+
+    def test_a_tuple_no_outbound_matches_is_a_missing_case_not_a_free_pass(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_one(self.labels(), network="grpc", security="tls")
+        self.assertIn("declares 0 grpc/tls outbound(s)", str(caught.exception))
+
+    def test_two_outbounds_matching_one_tuple_is_unexplained_representation(self):
+        labels = self.labels()
+        labels.append(dict(labels[0], tag="second"))
+        with self.assertRaises(SystemExit) as caught:
+            self.run_one(labels)
+        self.assertIn("declares 2 tcp/reality outbound(s)", str(caught.exception))
+
+    def test_the_scope_refuses_an_engine_the_matrix_does_not_pin(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            with self.assertRaises(SystemExit) as caught:
+                traffic_probe.transfer_one(
+                    "/secrets", "/fixtures/ca/root.pem", "203.0.114.30:18080", Path(workdir),
+                    "sing-box", "tcp", "tls",
+                )
+        self.assertIn("unknown matrix client 'sing-box'", str(caught.exception))
+
+    def test_the_scope_needs_a_destination_like_every_other_scope(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            with self.assertRaises(SystemExit) as caught:
+                traffic_probe.transfer_one(
+                    "/secrets", "/fixtures/ca/root.pem", "", Path(workdir),
+                    "xray", "tcp", "reality",
+                )
+        self.assertIn("destination address is required", str(caught.exception))
+
+
 class TestTrafficProbeRevocation(unittest.TestCase):
     """The revoked scope retries propagation and never trusts an error message."""
 
@@ -604,43 +702,72 @@ class ScriptedPodman:
 class StubEngineHost:
     """The installed host, without containers, plus the engine-side probes."""
 
-    def __init__(self, facts=None, returncode=0, stdout=None, bodies=None):
+    def __init__(self, facts=None, returncode=0, stdout=None, bodies=None, vision=False):
         self.target_name = "aio-1"
         self.panel_domain = aio.PANEL_DOMAIN
         self.reality_domain = aio.REALITY_DOMAIN
-        self.vision_domain = None
+        self.vision_domain = topology.VISION_DOMAIN if vision else None
         self.plan = PLAN
         self.scopes = []
         self.payload_dirs = []
+        self.transfers = []
         self.facts = facts
         self.returncode = returncode
         self.stdout = stdout
         self.bodies = bodies or {}
 
-    def traffic_facts(self, scope, timeout=900, payload_dir=None):
-        self.scopes.append(scope)
-        self.payload_dirs.append(payload_dir)
-        if scope in self.bodies:
-            body, returncode = json.dumps(self.bodies[scope]), 0
-        else:
-            body = self.stdout if self.stdout is not None else json.dumps(self.facts or {})
-            returncode = self.returncode
+    def _probe(self, body, returncode):
         return subprocess.CompletedProcess(
             ["python3", "traffic_probe.py"], returncode, body,
             "" if returncode == 0 else "the endpoint never answered",
         )
 
+    def traffic_facts(self, scope, timeout=900, payload_dir=None):
+        self.scopes.append(scope)
+        self.payload_dirs.append(payload_dir)
+        if scope in self.bodies:
+            return self._probe(json.dumps(self.bodies[scope]), 0)
+        body = self.stdout if self.stdout is not None else json.dumps(self.facts or {})
+        return self._probe(body, self.returncode)
 
-def installed_product(context, facts=None, returncode=0, stdout=None, bodies=None):
+    def transfer_facts(self, engine, network, security, timeout=300):
+        self.transfers.append((engine, network, security))
+        body = self.stdout if self.stdout is not None else json.dumps(self.facts or {})
+        return self._probe(body, self.returncode)
+
+
+def data_plane_facts(**overrides):
+    """What the transfer scope prints for one fully recorded matrix tuple."""
+    facts = {
+        "outbounds": 1,
+        "engine": "xray",
+        "tag": "proxy",
+        "network": "tcp",
+        "security": "reality",
+        "sni": topology.REALITY_DOMAIN,
+        "status": 200,
+        "delivered": True,
+        "request_id_match": True,
+        "body_match": True,
+        "source_ip": PLAN.data_target_ip,
+        "reason": "",
+    }
+    facts.update(overrides)
+    return facts
+
+
+def installed_product(context, facts=None, returncode=0, stdout=None, bodies=None, vision=False):
     podman = ScriptedPodman(context)
-    product = aio.AioProduct(podman)
-    product.host = StubEngineHost(facts=facts, returncode=returncode, stdout=stdout, bodies=bodies)
+    product = aio.AioProduct(podman, vision=vision)
+    product.host = StubEngineHost(
+        facts=facts, returncode=returncode, stdout=stdout, bodies=bodies, vision=vision,
+    )
     product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
     return product, podman
 
 
-class TestTrafficCase(unittest.TestCase):
-    """AIO-TRAFFIC accepts only what the endpoint recorded."""
+class TestDataPlaneCase(unittest.TestCase):
+    """AIO-DP-<inbound>-<client>: one matrix tuple, proven by the endpoint."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -649,34 +776,45 @@ class TestTrafficCase(unittest.TestCase):
             topology="aio",
             artifact_root=Path(self.tmp.name),
             budget_seconds=900,
-            run_id="podman-traffic-test-000000",
+            run_id="podman-data-plane-test-000000",
         )
         self.addCleanup(self.context.run_cleanup)
 
-    def reject(self, expected, mutate=None, facts=None):
-        data = traffic_facts() if facts is None else facts
-        if mutate is not None:
-            mutate(data)
+    def inbound(self, inbound_id):
+        return matrix.inbound(MATRIX, inbound_id)
+
+    def run_case(self, inbound_id="REALITY", client="xray", facts=None, **product_kwargs):
+        inbound = self.inbound(inbound_id)
+        if facts is None:
+            facts = data_plane_facts(
+                network=str(inbound["transport"]),
+                security=str(inbound["security"]),
+                sni=served_sni(inbound),
+            )
+        product, podman = installed_product(self.context, facts=facts, **product_kwargs)
+        evidence = aio.case_data_plane(product, inbound, client)
+        return evidence, product, podman
+
+    def reject(self, expected, inbound_id="REALITY", client="xray", facts=None, **kwargs):
+        data = data_plane_facts(**kwargs)
+        if facts is not None:
+            data = facts
         product, _ = installed_product(self.context, facts=data)
         with self.assertRaises(AssertionError) as caught:
-            aio.case_traffic(product)
+            aio.case_data_plane(product, self.inbound(inbound_id), client)
         self.assertIn(expected, str(caught.exception))
 
-    def test_the_case_accepts_a_matrix_every_recorded_transfer_supports(self):
-        product, podman = installed_product(self.context, facts=traffic_facts())
-        evidence = aio.case_traffic(product)
-        self.assertEqual(evidence["transfer_count"], 8)
-        self.assertEqual(evidence["engines"], "mihomo,xray")
-        self.assertEqual(evidence["networks"], ",".join(sorted(aio.TRAFFIC_NETWORKS)))
-        self.assertEqual(
-            evidence["tuples"],
-            "mihomo:tcp:reality,mihomo:ws:tls,mihomo:grpc:tls,mihomo:xhttp:tls,"
-            "xray:tcp:reality,xray:ws:tls,xray:grpc:tls,xray:xhttp:tls",
-        )
-        self.assertEqual(evidence["source_ips"], PLAN.target_ip)
-        self.assertEqual(evidence["direct_source_ip"], PLAN.engine_client_ip)
-        self.assertEqual(evidence["echo_records"], 8)
-        self.assertEqual(product.host.scopes, ["traffic"])
+    def test_the_case_accepts_a_tuple_the_endpoint_fully_recorded(self):
+        evidence, product, podman = self.run_case()
+        self.assertEqual(evidence["inbound"], "REALITY")
+        self.assertEqual(evidence["client"], "xray")
+        self.assertEqual(evidence["transport"], "tcp/reality")
+        self.assertEqual(evidence["tag"], "proxy")
+        self.assertEqual(evidence["sni"], topology.REALITY_DOMAIN)
+        self.assertEqual(evidence["status"], 200)
+        self.assertEqual(evidence["source_ip"], PLAN.data_target_ip)
+        self.assertEqual(evidence["outbounds"], 1)
+        self.assertEqual(product.host.transfers, [("xray", "tcp", "reality")])
         self.assertIn("--scope subscriptions", podman.scripts[0])
         for value in evidence.values():
             self.assertIsInstance(
@@ -684,83 +822,194 @@ class TestTrafficCase(unittest.TestCase):
                 "evidence is flattened to strings by the runner, so it must hold primitives",
             )
 
-    def test_the_case_fails_when_no_outbound_was_exercised(self):
-        self.reject("no served outbound was exercised",
-                    mutate=lambda data: data.update(transfers=[], transfer_count=0))
+    def test_the_matrix_decides_the_transport_and_security_the_probe_runs(self):
+        evidence, product, _ = self.run_case(inbound_id="XHTTP", client="mihomo")
+        self.assertEqual(product.host.transfers, [("mihomo", "xhttp", "tls")])
+        self.assertEqual(evidence["transport"], "xhttp/tls")
+        self.assertEqual(evidence["sni"], topology.PANEL_DOMAIN)
 
-    def test_the_case_fails_when_a_payload_never_reached_the_endpoint(self):
-        self.reject("never reached the controlled endpoint",
-                    mutate=lambda data: data.update(missing_request_ids=1))
+    def test_the_vision_tuple_is_served_under_the_vision_domain(self):
+        facts = data_plane_facts(
+            engine="mihomo", network="tcp", security="tls", sni=topology.VISION_DOMAIN,
+        )
+        evidence, product, _ = self.run_case(
+            inbound_id="VISION", client="mihomo", facts=facts, vision=True,
+        )
+        self.assertEqual(product.inbound_count, 5)
+        self.assertEqual(product.host.transfers, [("mihomo", "tcp", "tls")])
+        self.assertEqual(evidence["sni"], topology.VISION_DOMAIN)
+
+    def test_the_case_fails_when_the_tuple_matches_more_than_one_outbound(self):
+        self.reject("expected exactly one", outbounds=2)
+
+    def test_the_case_fails_when_the_payload_never_reached_the_endpoint(self):
+        self.reject("never reached the controlled endpoint: connection refused",
+                    delivered=False, status=None, reason="connection refused")
 
     def test_the_case_fails_when_the_endpoint_rejected_the_transfer(self):
-        self.reject("instead of 200",
-                    mutate=lambda data: data["transfers"][0].update(status=502))
+        self.reject("instead of 200", status=502)
 
     def test_the_case_fails_when_the_request_id_was_not_echoed(self):
-        self.reject("did not echo the mihomo/tcp request id",
-                    mutate=lambda data: data["transfers"][0].update(request_id_match=False))
+        self.reject("did not echo the REALITY request id", request_id_match=False)
 
     def test_the_case_fails_when_the_payload_digest_did_not_match(self):
-        self.reject("did not receive the exact mihomo/tcp payload",
-                    mutate=lambda data: data["transfers"][0].update(body_match=False))
+        self.reject("did not receive the exact REALITY payload", body_match=False)
 
     def test_the_case_fails_when_the_transfer_left_from_the_client(self):
-        self.reject("did not traverse the product",
-                    mutate=lambda data: data["transfers"][0].update(source_ip=PLAN.engine_client_ip))
+        self.reject("did not traverse the product", source_ip=PLAN.engine_client_ip)
 
-    def test_the_case_fails_when_an_engine_missed_a_core_transport(self):
-        self.reject("instead of every core transport",
-                    mutate=lambda data: data.update(
-                        transfers=[item for item in data["transfers"]
-                                   if not (item["engine"] == "xray" and item["network"] == "ws")],
-                    ))
-
-    def test_the_case_fails_when_an_engine_exercised_more_than_one_reality_outbound(self):
-        self.reject("expected exactly one",
-                    mutate=lambda data: data["transfers"][1].update(
-                        security="reality", sni=topology.PANEL_DOMAIN,
-                    ))
-
-    def test_the_case_fails_when_a_secured_outbound_carries_no_sni(self):
-        self.reject("carries no SNI",
-                    mutate=lambda data: data["transfers"][1].update(sni=""))
-
-    def test_the_case_fails_when_the_control_request_came_from_the_product(self):
-        self.reject("source attribution was not calibrated",
-                    mutate=lambda data: data.update(direct_source_ip=PLAN.target_ip))
-
-    def test_the_case_fails_when_the_endpoint_recorded_fewer_requests(self):
-        self.reject("recorded",
-                    mutate=lambda data: data.update(echo_records=1))
+    def test_the_case_fails_when_the_outbound_carries_another_inbounds_sni(self):
+        self.reject(
+            f"carries SNI {topology.PANEL_DOMAIN!r} instead of the {topology.REALITY_DOMAIN!r}",
+            sni=topology.PANEL_DOMAIN,
+        )
 
     def test_the_case_fails_when_the_probe_exits_non_zero(self):
         product, _ = installed_product(self.context, returncode=1)
         with self.assertRaises(AssertionError) as caught:
-            aio.case_traffic(product)
-        self.assertIn("traffic probe exited 1", str(caught.exception))
+            aio.case_data_plane(product, self.inbound("REALITY"), "xray")
+        self.assertIn("transfer probe exited 1", str(caught.exception))
         self.assertIn("the endpoint never answered", str(caught.exception))
 
     def test_the_case_fails_when_the_probe_prints_no_json(self):
-        product, _ = installed_product(self.context, stdout="transfers: 8")
+        product, _ = installed_product(self.context, stdout="outbounds: 1")
         with self.assertRaises(AssertionError) as caught:
-            aio.case_traffic(product)
+            aio.case_data_plane(product, self.inbound("REALITY"), "xray")
         self.assertIn("did not print JSON", str(caught.exception))
 
     def test_the_case_is_blocked_when_the_payloads_were_never_fetched(self):
-        product, podman = installed_product(self.context, facts=traffic_facts())
+        product, podman = installed_product(self.context, facts=data_plane_facts())
         product._subscription_error = "the subscription probe exited 1"
         with self.assertRaises(CaseBlocked) as caught:
-            aio.case_traffic(product)
+            aio.case_data_plane(product, self.inbound("REALITY"), "xray")
         self.assertIn("SUB-SERVED", str(caught.exception))
         self.assertEqual(podman.scripts, [])
-        self.assertEqual(product.host.scopes, [])
+        self.assertEqual(product.host.transfers, [])
 
-    def test_the_case_is_part_of_the_aio_suite_with_its_own_budget(self):
-        podman = ScriptedPodman(self.context)
-        cases = {case.id: case for case in aio.cases(podman)}
-        self.assertIn("AIO-TRAFFIC", cases)
-        self.assertEqual(cases["AIO-TRAFFIC"].topology, "aio")
-        self.assertEqual(cases["AIO-TRAFFIC"].timeout_seconds, aio.TRAFFIC_TIMEOUT_SECONDS)
+    def test_the_case_records_its_own_verdict_for_the_count_case(self):
+        product, _ = installed_product(self.context, facts=data_plane_facts())
+        aio._data_plane_case(product, self.inbound("REALITY"), "xray")
+        self.assertEqual(product.data_plane_results["AIO-DP-REALITY-xray"], "PASS")
+
+        failing, _ = installed_product(self.context, facts=data_plane_facts(outbounds=2))
+        with self.assertRaises(AssertionError):
+            aio._data_plane_case(failing, self.inbound("REALITY"), "xray")
+        self.assertEqual(failing.data_plane_results["AIO-DP-REALITY-xray"], "FAIL")
+
+
+class TestMatrixCase(unittest.TestCase):
+    """AIO-MATRIX: the positive cases are exactly the matrix tuples for the run."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.context = RunContext(
+            topology="aio",
+            artifact_root=Path(self.tmp.name),
+            budget_seconds=900,
+            run_id="podman-matrix-test-000000",
+        )
+        self.addCleanup(self.context.run_cleanup)
+
+    def expected_ids(self, product):
+        return [
+            matrix.case_id(product.matrix, "aio", str(inbound["id"]), client)
+            for inbound, client in matrix.tuples(product.matrix, product.vision)
+        ]
+
+    def product(self, vision=False, declared=None, results=None):
+        product, _ = installed_product(self.context, vision=vision)
+        expected = self.expected_ids(product)
+        product.declare_data_plane(expected if declared is None else declared)
+        product.data_plane_results = dict(
+            results if results is not None else {case_id: "PASS" for case_id in expected}
+        )
+        return product, expected
+
+    def reject(self, expected_text, vision=False, declared=None, results=None):
+        product, _ = self.product(vision=vision, declared=declared, results=results)
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_matrix(product)
+        self.assertIn(expected_text, str(caught.exception))
+
+    def test_the_vision_less_run_owes_the_eight_non_optional_tuples(self):
+        product, expected = self.product()
+        evidence = aio.case_matrix(product)
+        self.assertEqual(len(expected), 8)
+        self.assertEqual(evidence["vision"], "disabled")
+        self.assertEqual(evidence["inbounds"], 4)
+        self.assertEqual(evidence["clients"], 2)
+        self.assertEqual(evidence["expected_positive_cases"], 8)
+        self.assertEqual(evidence["declared_cases"], 8)
+        self.assertEqual(evidence["executed_cases"], 8)
+        self.assertEqual(evidence["passed_cases"], 8)
+
+    def test_the_vision_run_owes_ten_tuples(self):
+        product, expected = self.product(vision=True)
+        evidence = aio.case_matrix(product)
+        self.assertEqual(len(expected), 10)
+        self.assertIn("AIO-DP-VISION-xray", expected)
+        self.assertIn("AIO-DP-VISION-mihomo", expected)
+        self.assertEqual(evidence["vision"], "enabled")
+        self.assertEqual(evidence["inbounds"], 5)
+        self.assertEqual(evidence["expected_positive_cases"], 10)
+
+    def test_a_declared_case_the_matrix_never_enumerates_fails_the_run(self):
+        _, expected = self.product()
+        self.reject("unexplained ['AIO-DP-REALITY-singbox']",
+                    declared=expected + ["AIO-DP-REALITY-singbox"])
+
+    def test_a_matrix_tuple_the_suite_never_declared_fails_the_run(self):
+        _, expected = self.product()
+        self.reject("missing ['AIO-DP-WS-mihomo']", declared=[case_id for case_id in expected
+                                                             if case_id != "AIO-DP-WS-mihomo"])
+
+    def test_a_declared_case_that_produced_no_result_fails_the_run(self):
+        results = {case_id: "PASS" for case_id in self.expected_ids(self.product()[0])}
+        del results["AIO-DP-XHTTP-xray"]
+        self.reject("produced no result: AIO-DP-XHTTP-xray", results=results)
+
+    def test_a_failed_tuple_fails_the_run_even_when_the_count_matches(self):
+        results = {case_id: "PASS" for case_id in self.expected_ids(self.product()[0])}
+        results["AIO-DP-REALITY-mihomo"] = "FAIL"
+        self.reject("did not pass: AIO-DP-REALITY-mihomo", results=results)
+
+    def test_a_case_outside_the_matrix_is_not_counted_as_a_green_one(self):
+        _, expected = self.product()
+        results = {case_id: "PASS" for case_id in expected}
+        results["AIO-DP-EXTRA-xray"] = "PASS"
+        self.reject("but the matrix declares 8", results=results)
+
+    def test_a_matrix_count_its_own_inbounds_do_not_produce_fails_the_run(self):
+        product, _ = self.product()
+        product.matrix["topologies"]["aio"]["positive_case_counts"]["disabled"] = 9
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_matrix(product)
+        self.assertIn("declares 9 positive case(s)", str(caught.exception))
+
+    def test_the_suite_declares_one_case_per_matrix_tuple_and_the_count_case(self):
+        cases = {case.id: case for case in aio.cases(ScriptedPodman(self.context))}
+        expected = {
+            matrix.case_id(MATRIX, "aio", str(inbound["id"]), client)
+            for inbound, client in matrix.tuples(MATRIX, vision=False)
+        }
+        data_plane = {case_id for case_id in cases if case_id.startswith("AIO-DP-")}
+        self.assertEqual(data_plane, expected)
+        self.assertNotIn("AIO-TRAFFIC", cases)
+        self.assertIn("AIO-MATRIX", cases)
+        self.assertEqual(cases["AIO-MATRIX"].timeout_seconds, 120)
+        for case_id in data_plane:
+            self.assertEqual(cases[case_id].timeout_seconds, aio.DATA_PLANE_TIMEOUT_SECONDS)
+
+    def test_the_suite_declares_the_vision_tuples_only_when_vision_is_selected(self):
+        cases = {case.id: case for case in aio.cases(ScriptedPodman(self.context), vision=True)}
+        expected = {
+            matrix.case_id(MATRIX, "aio", str(inbound["id"]), client)
+            for inbound, client in matrix.tuples(MATRIX, vision=True)
+        }
+        self.assertEqual(len(expected), 10)
+        self.assertEqual({case_id for case_id in cases if case_id.startswith("AIO-DP-")}, expected)
+
 
 
 class TestRevocationCase(unittest.TestCase):
@@ -807,15 +1056,16 @@ class TestRevocationCase(unittest.TestCase):
         return {"delete_status": 204, "after_delete_status": 404}
 
     def revoked_facts(self):
+        inbounds = matrix.inbounds(MATRIX, vision=False)
         attempts = [{"engine": engine, "tag": f"{engine}-tcp", "network": "tcp",
                      "request_id": f"{engine}-req", "delivered": False, "status": None,
                      "reason": "ConnectionRefusedError"}
-                    for engine in aio.TRAFFIC_ENGINES for _ in range(aio.CORE_INBOUNDS)]
+                    for engine in aio.TRAFFIC_ENGINES for _ in inbounds]
         return {
             "attempts": attempts,
             "attempt_count": len(attempts),
             "engines": sorted(aio.TRAFFIC_ENGINES),
-            "networks": sorted(aio.TRAFFIC_NETWORKS),
+            "networks": sorted({str(inbound["transport"]) for inbound in inbounds}),
             "refused": len(attempts),
             "delivered": 0,
             "rounds": 2,
@@ -1114,6 +1364,20 @@ class TestTrafficTopology(unittest.TestCase):
         self.assertEqual(argv[argv.index("--destination") + 1],
                          f"{self.instance.plan.data_echo_ip}:{topology.ECHO_HTTP_PORT}")
         self.assertNotIn(CLIENT_SECRET, " ".join(argv))
+
+    def test_the_transfer_scope_names_exactly_one_matrix_tuple(self):
+        self.instance.transfer_facts("xray", "tcp", "reality")
+        name, argv = self.podman.execs[-1]
+        self.assertEqual(name, self.instance.engine_client_name)
+        self.assertEqual(argv[:2], ["python3", topology.TRAFFIC_PROBE_SCRIPT])
+        self.assertEqual(argv[argv.index("--scope") + 1], "transfer")
+        self.assertEqual(argv[argv.index("--engine") + 1], "xray")
+        self.assertEqual(argv[argv.index("--network") + 1], "tcp")
+        self.assertEqual(argv[argv.index("--security") + 1], "reality")
+        self.assertEqual(argv[argv.index("--payload-dir") + 1], topology.SECRETS_MOUNT)
+        self.assertEqual(argv[argv.index("--ca") + 1], f"{topology.CA_MOUNT}/{topology.ISSUED_ROOT_NAME}")
+        self.assertEqual(argv[argv.index("--destination") + 1],
+                         f"{self.instance.plan.data_echo_ip}:{topology.ECHO_HTTP_PORT}")
 
     def test_the_engine_client_reaches_both_the_control_plane_and_the_endpoint(self):
         self.instance.engine_client()

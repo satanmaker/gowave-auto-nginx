@@ -65,7 +65,6 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **SUB-UA-ABSENT** — promotion target: Real Subscription Delivery and User-Agent Policy
 - **SUB-UA-BLANK** — promotion target: Real Subscription Delivery and User-Agent Policy
 - **SUB-JSON-SHAPES** — promotion target: Real Subscription Delivery and User-Agent Policy
-- **AIO-TRAFFIC** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-REVOKE** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-RESTART** — promotion target: All-in-One Master VPS Installation Verification
 - **AIO-IDEMPOTENT** — promotion target: All-in-One Master VPS Installation Verification
@@ -83,3 +82,14 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **GATE-COVERAGE** — promotion target: Result Status Semantics
 - **GATE-PREPUSH** — promotion target: Result Status Semantics
 - **GATE-DIVERGENCE** — promotion target: Result Status Semantics
+- **AIO-DP-REALITY-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **AIO-DP-REALITY-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **AIO-DP-XHTTP-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **AIO-DP-XHTTP-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **AIO-DP-WS-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **AIO-DP-WS-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **AIO-DP-TROJAN-GRPC-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **AIO-DP-TROJAN-GRPC-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **AIO-DP-VISION-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **AIO-DP-VISION-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **AIO-MATRIX** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
