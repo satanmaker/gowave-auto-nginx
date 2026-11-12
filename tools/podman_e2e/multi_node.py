@@ -53,11 +53,16 @@ WORKER_SERVICE_TIMEOUT_SECONDS = 300
 # The lifecycle cases drive one real tuple rather than the whole matrix: the
 # engine is the one whose single-transfer path the probe already reports on.
 LIFECYCLE_CLIENT = "xray"
-# Each lifecycle case pays for a baseline transfer, the fault, and a recovery
-# poll, besides the bounded waits above; the case budget has to cover all three
-# or a slow engine start would read as a product failure.
-OUTAGE_CASE_TIMEOUT_SECONDS = OUTAGE_TIMEOUT_SECONDS + 3 * aio.DATA_PLANE_TIMEOUT_SECONDS
-RESTART_CASE_TIMEOUT_SECONDS = RESTART_TIMEOUT_SECONDS + 3 * aio.DATA_PLANE_TIMEOUT_SECONDS
+# Each lifecycle case pays for the Panel's two connection windows, the Master's
+# control dial and a baseline/recovery transfer besides the bounded waits above;
+# the case budget has to cover all of them or a slow engine start would read as a
+# product failure.
+OUTAGE_CASE_TIMEOUT_SECONDS = (
+    2 * OUTAGE_TIMEOUT_SECONDS + 3 * aio.DATA_PLANE_TIMEOUT_SECONDS
+)
+RESTART_CASE_TIMEOUT_SECONDS = (
+    2 * RESTART_TIMEOUT_SECONDS + 3 * aio.DATA_PLANE_TIMEOUT_SECONDS
+)
 # The subscription cases build the engine image on first use, fetch five
 # representations from the Panel, and run Xray and Mihomo over each of them.
 SUB_SERVED_TIMEOUT_SECONDS = 900
@@ -949,6 +954,44 @@ class MultiNodeProduct:
             f"{'connected' if expected else 'offline'}",
         )
         return observed
+
+    def wait_for_worker_peer(
+        self, case_id: str, timeout_seconds: int = RESTART_TIMEOUT_SECONDS,
+    ) -> Dict[str, Any]:
+        """Wait until the Master's own dial to the Worker is live again.
+
+        The Panel's connected flag is not that evidence. A short restart can
+        complete inside one heartbeat, so the flag stays set while the Master's
+        mTLS connection is still down; only the sockets on the Worker itself say
+        when the control plane is back. Run 20261112T230625-a64b2235 measured
+        exactly that gap: MN-OUTAGE had 10.89.0.10 among its peers after a 17.4 s
+        recovery, while MN-RESTART read the peer set 1.2 s after the restart and
+        found none — the node had re-registered, the Master had not re-dialled.
+        """
+        host = self.require_installed()
+        master_address = host.plan.target_ip
+        started_at = time.monotonic()
+        seen: Dict[str, Any] = {}
+
+        def dialled() -> bool:
+            seen.clear()
+            seen.update(self.worker_control_facts(case_id))
+            return master_address in (seen.get("peers") or [])
+
+        ready = wait_until(
+            dialled, timeout_seconds, f"{case_id} Master control connection",
+            interval_seconds=RECOVERY_INTERVAL_SECONDS,
+        )
+        require(
+            case_id,
+            ready,
+            f"the Master's control connection to the Worker did not come back within "
+            f"{timeout_seconds}s of the unit coming up again; the Worker observed "
+            f"peers {seen.get('peers') or 'none'} from {master_address}",
+        )
+        facts = self.worker_address_facts(case_id)
+        facts["peer_wait_seconds"] = round(time.monotonic() - started_at, 1)
+        return facts
 
     def worker_service(self, action: str, case_id: str) -> Dict[str, Any]:
         """Run the operator's own systemctl action on the Worker's supervising unit.
@@ -2141,9 +2184,9 @@ def case_worker_outage(product: MultiNodeProduct) -> Dict[str, Any]:
 
     recovered_at = time.monotonic()
     product.wait_for_worker_connection(OUTAGE_CASE_ID, True, RESTART_TIMEOUT_SECONDS)
-    # A connected node is not yet a serving one: the Panel has to re-apply the
-    # Worker's users, and its own control channel has to be established again.
-    healthy = product.worker_address_facts(OUTAGE_CASE_ID)
+    # A connected node is not yet a serving one: the Master's own control dial has
+    # to come back before the Panel can re-apply the Worker's users.
+    healthy = product.wait_for_worker_peer(OUTAGE_CASE_ID, RESTART_TIMEOUT_SECONDS)
 
     attempt: Dict[str, Any] = {}
 
@@ -2193,6 +2236,7 @@ def case_worker_outage(product: MultiNodeProduct) -> Dict[str, Any]:
         "master_control_status": control.get("status"),
         "master_control_source_ip": control.get("source_ip"),
         "control_peers": ",".join(healthy.get("peers") or []),
+        "control_plane_seconds": healthy.get("peer_wait_seconds"),
         "recovered_source_ip": attempt.get("source_ip"),
         "recovery_seconds": round(time.monotonic() - recovered_at, 1),
     }
@@ -2270,7 +2314,9 @@ def case_worker_restart(product: MultiNodeProduct) -> Dict[str, Any]:
         f"the Panel records a node status message after the restart: "
         f"{(after.get('state') or {}).get('status_message')!r}",
     )
-    healthy = product.worker_address_facts(RESTART_CASE_ID)
+    # The Panel's flag survives a restart this short, so the dial has to be seen on
+    # the Worker itself before the case may call the control plane recovered.
+    healthy = product.wait_for_worker_peer(RESTART_CASE_ID, RESTART_TIMEOUT_SECONDS)
 
     recovered_at = time.monotonic()
     attempt: Dict[str, Any] = {}
@@ -2317,6 +2363,7 @@ def case_worker_restart(product: MultiNodeProduct) -> Dict[str, Any]:
         "panel_inbound_count": len(after.get("inbounds") or []),
         "panel_node_version": (after.get("versions") or {}).get("node"),
         "control_peers": ",".join(healthy.get("peers") or []),
+        "control_plane_seconds": healthy.get("peer_wait_seconds"),
         "recovered_status": attempt.get("status"),
         "recovered_source_ip": attempt.get("source_ip"),
         "recovery_seconds": round(time.monotonic() - recovered_at, 1),

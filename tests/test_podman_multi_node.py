@@ -1215,7 +1215,7 @@ class _LifecycleProduct(multi_node.MultiNodeProduct):
     """
 
     def __init__(self, transfers=(), services=(), panel_connected=True, before=None,
-                 main_pid="4242", healthy=None):
+                 main_pid="4242", healthy=None, peer_sets=None):
         self._root = tempfile.TemporaryDirectory()
         super().__init__(_StubPodman(Path(self._root.name)))
         self.topology = type("Host", (), {
@@ -1228,7 +1228,12 @@ class _LifecycleProduct(multi_node.MultiNodeProduct):
         self.worker_template = dict(self.before_record)
         self.panel_connected = panel_connected
         self.main_pid = main_pid
-        self.healthy = healthy or {"peers": ["10.89.0.10"], "node_service": "active"}
+        self.master_address = self.topology.plan.target_ip
+        self.healthy = healthy or {"peers": [self.master_address], "node_service": "active"}
+        # One entry per control-probe poll; the last entry repeats, so a test scripts
+        # "down, then up" by giving two sets and a permanent state by giving one.
+        self.peer_sets = [list(entry) for entry in (peer_sets or [[self.master_address]])]
+        self.peer_calls = 0
         self._transfers = list(transfers)
         self._services = list(services)
         self.transfer_calls = []
@@ -1260,6 +1265,14 @@ class _LifecycleProduct(multi_node.MultiNodeProduct):
 
     def worker_main_pid(self, case_id):
         return self.main_pid
+
+    def worker_control_facts(self, case_id, timeout=120):
+        self.peer_calls += 1
+        peers = self.peer_sets.pop(0) if len(self.peer_sets) > 1 else self.peer_sets[0]
+        return {
+            "peers": list(peers), "node_service": "active",
+            "listeners": [str(multi_node.NODE_PORT)], "firewall": {},
+        }
 
     def worker_address_facts(self, case_id):
         return dict(self.healthy)
@@ -1399,11 +1412,11 @@ class TestWorkerOutageCase(unittest.TestCase):
         self.assertIn("left the Worker at 'failed'", str(caught.exception))
 
     def panel_and_dead_data_plane(self, *actions):
-        """Let the Panel wait follow a scripted state, but never let the data plane return."""
+        """Let the connection waits follow a scripted state, but never let the data plane return."""
         pending = list(actions)
 
         def poll(predicate, timeout_seconds, description, **kwargs):
-            if "Worker connection" in description:
+            if "connection" in description:
                 if pending:
                     pending.pop(0)()
                 return predicate()
@@ -1435,6 +1448,42 @@ class TestWorkerOutageCase(unittest.TestCase):
             with self.assertRaises(AssertionError) as caught:
                 product.wait_for_worker_connection(multi_node.OUTAGE_CASE_ID, False, 1)
         self.assertIn("still reports", str(caught.exception))
+
+
+class TestWorkerPeerWait(unittest.TestCase):
+    """The control dial is waited for, never inferred from the Panel's flag."""
+
+    def product(self, **kwargs):
+        product = _LifecycleProduct(**kwargs)
+        self.addCleanup(product.cleanup)
+        return product
+
+    def poll(self, attempts=8):
+        def poll(predicate, timeout_seconds, description, **kwargs):
+            for _ in range(attempts):
+                if predicate():
+                    return True
+            return False
+
+        return poll
+
+    def test_the_dial_is_polled_until_the_masters_address_appears(self):
+        master = topology.allocate_plan([]).target_ip
+        product = self.product(peer_sets=[[], ["10.89.0.44"], [master]])
+        with unittest.mock.patch.object(multi_node, "wait_until", self.poll()):
+            facts = product.wait_for_worker_peer(multi_node.RESTART_CASE_ID, 30)
+        self.assertEqual(product.peer_calls, 3, "a peer set without the Master is not the answer")
+        self.assertEqual(facts["peers"], [master])
+        self.assertIn("peer_wait_seconds", facts)
+
+    def test_a_dial_that_never_returns_fails_with_the_peers_it_saw(self):
+        product = self.product(peer_sets=[[]])
+        with unittest.mock.patch.object(multi_node, "wait_until", self.poll()):
+            with self.assertRaises(AssertionError) as caught:
+                product.wait_for_worker_peer(multi_node.RESTART_CASE_ID, 30)
+        message = str(caught.exception)
+        self.assertIn("did not come back within 30s", message)
+        self.assertIn("peers none", message)
 
 
 class TestWorkerRestartCase(unittest.TestCase):
@@ -1515,11 +1564,11 @@ class TestWorkerRestartCase(unittest.TestCase):
         self.assertIn("node status message", str(caught.exception))
 
     def panel_and_dead_data_plane(self, *actions):
-        """Let the Panel wait follow a scripted state, but never let the data plane return."""
+        """Let the connection waits follow a scripted state, but never let the data plane return."""
         pending = list(actions)
 
         def poll(predicate, timeout_seconds, description, **kwargs):
-            if "Worker connection" in description:
+            if "connection" in description:
                 if pending:
                     pending.pop(0)()
                 return predicate()

@@ -74,6 +74,7 @@ SUITES = {
         "test_podman_multi_node.TestMultiNodeCounts",
         "test_podman_multi_node.TestMultiNodeSuite",
         "test_podman_multi_node.TestWorkerOutageCase",
+        "test_podman_multi_node.TestWorkerPeerWait",
         "test_podman_multi_node.TestWorkerRestartCase",
         "test_podman_multi_node.TestWorkerUnitControl",
         "test_podman_denial.TestDenialParsers",
