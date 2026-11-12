@@ -18,7 +18,7 @@ import ipaddress
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import aio, matrix as matrix_data, mtls, topology
 from tools.podman_e2e.podman import wait_until
@@ -387,6 +387,10 @@ class MultiNodeProduct:
         self.master = aio.AioProduct(
             podman, distribution, vision=vision, install_case_id=INSTALL_CASE_ID,
         )
+        # The data-plane body is shared with the All-in-One suite, but its case ids
+        # belong to this topology: a cluster case names its node, because both
+        # nodes serve the same transport/security pairs.
+        self.master.case_topology = matrix_data.MULTI_NODE
         # The default client's subscription carries every node in its squad, so
         # the Panel publishes both nodes' inbounds, not only the Master's.
         self.master.subscription_inbounds_override = (
@@ -401,8 +405,6 @@ class MultiNodeProduct:
         self.worker_report_timeout = WORKER_REPORT_TIMEOUT_SECONDS
         self.worker_report_interval = NODE_HEALTH_INTERVAL_SECONDS
         self.trust: Dict[str, Any] = {}
-        self.declared_data_plane: List[str] = []
-        self.data_plane_results: Dict[str, str] = {}
 
     # ------------------------------------------------------------- identities
     @property
@@ -437,10 +439,23 @@ class MultiNodeProduct:
         return len(matrix_data.inbounds(self.matrix, vision=self.worker_vision))
 
     def declare_data_plane(self, case_ids: Sequence[str]) -> None:
-        self.declared_data_plane = list(case_ids)
+        """Record the declared matrix cases; the registry lives on the Master product.
+
+        The shared data-plane body runs against that product, so keeping one
+        registry means the count case reads exactly what the cases recorded.
+        """
+        self.master.declare_data_plane(case_ids)
 
     def record_data_plane(self, case_id: str, status: str) -> None:
-        self.data_plane_results[case_id] = status
+        self.master.record_data_plane(case_id, status)
+
+    @property
+    def declared_data_plane(self) -> List[str]:
+        return self.master.declared_data_plane
+
+    @property
+    def data_plane_results(self) -> Dict[str, str]:
+        return self.master.data_plane_results
 
     # ------------------------------------------------------------------ setup
     def install(self) -> Dict[str, Any]:
@@ -1569,6 +1584,24 @@ def case_worker_config(product: MultiNodeProduct) -> Dict[str, Any]:
     }
 
 
+def data_plane_cases(product: MultiNodeProduct) -> List[Tuple[str, Dict[str, Any], str, str]]:
+    """Every matrix tuple this cluster owes: each node's inbounds, both clients.
+
+    The node is part of the tuple, not of the payload: both nodes serve the same
+    transport/security pairs, so a case that named only the pair would run
+    whichever outbound matched first. Each node contributes the inbounds its own
+    Vision configuration gave it, which is what makes the count 16, 18 or 20.
+    """
+    cases = []
+    for node, node_vision in (("master", product.vision), ("worker", product.worker_vision)):
+        for inbound, client in matrix_data.tuples(product.matrix, node_vision):
+            case_id = matrix_data.case_id(
+                product.matrix, matrix_data.MULTI_NODE, str(inbound["id"]), client, node=node,
+            )
+            cases.append((case_id, inbound, client, node))
+    return cases
+
+
 def cases(
     podman: Any, distribution: str = "ubuntu-24.04",
     vision: bool = False, worker_vision: bool = False,
@@ -1577,7 +1610,9 @@ def cases(
     product = MultiNodeProduct(
         podman, distribution, vision=vision, worker_vision=worker_vision,
     )
-    return [
+    data_plane = data_plane_cases(product)
+    product.declare_data_plane([case_id for case_id, _inbound, _client, _node in data_plane])
+    suite = [
         Case(INSTALL_CASE_ID, "multi-node", lambda context: product.install(),
              timeout_seconds=aio.INSTALL_TIMEOUT_SECONDS),
         Case(NODE_ADD_CASE_ID, "multi-node", lambda context: case_worker_registration(product),
@@ -1610,8 +1645,18 @@ def cases(
              timeout_seconds=WORKER_STATE_TIMEOUT_SECONDS),
         Case(WORKER_CONFIG_CASE_ID, "multi-node", lambda context: case_worker_config(product),
              timeout_seconds=WORKER_STATE_TIMEOUT_SECONDS),
+    ]
+    for case_id, inbound, client, node in data_plane:
+        suite.append(Case(
+            case_id, "multi-node",
+            lambda context, inbound=inbound, client=client, node=node: aio._data_plane_case(
+                product.master, inbound, client, node=node),
+            timeout_seconds=aio.DATA_PLANE_TIMEOUT_SECONDS,
+        ))
+    suite.extend([
         Case("SUB-SERVED", "multi-node", lambda context: aio.case_subscriptions(product.master),
              timeout_seconds=SUB_SERVED_TIMEOUT_SECONDS),
         Case("SUB-B64", "multi-node", lambda context: aio.case_share_links(product.master),
              timeout_seconds=SUB_SHARE_LINK_TIMEOUT_SECONDS),
-    ]
+    ])
+    return suite

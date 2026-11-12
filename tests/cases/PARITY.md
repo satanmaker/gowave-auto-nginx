@@ -78,6 +78,7 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **NGX-WORKER-ACME80** — promotion target: Distributed Worker VPS Deployment Verification
 - **TLS-VERIFY-ANCHORS** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **PODNET-MASTER-ADDR** — promotion target: Distributed Worker VPS Deployment Verification
+- **WRK-06** — promotion target: Distributed Worker VPS Deployment Verification
 - **ACME-REJECT-ARB** — promotion target: Global Certbot Deploy Hook Ownership
 - **GATE-BUDGET** — promotion target: Result Status Semantics
 - **GATE-COVERAGE** — promotion target: Result Status Semantics
@@ -94,3 +95,23 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **AIO-DP-VISION-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-VISION-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-MATRIX** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-master-REALITY-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-master-REALITY-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-master-XHTTP-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-master-XHTTP-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-master-WS-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-master-WS-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-master-TROJAN-GRPC-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-master-TROJAN-GRPC-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-master-VISION-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-master-VISION-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-worker-REALITY-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-worker-REALITY-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-worker-XHTTP-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-worker-XHTTP-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-worker-WS-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-worker-WS-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-worker-TROJAN-GRPC-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-worker-TROJAN-GRPC-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-worker-VISION-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-DP-worker-VISION-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints

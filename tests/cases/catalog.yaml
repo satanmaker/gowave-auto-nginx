@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 38
-  total: 163
+  podman_first: 59
+  total: 184
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3521,6 +3521,23 @@ cases:
   driver: null
   driver_status: planned
   promotion_target: Distributed Worker VPS Deployment Verification
+- id: WRK-06
+  requirement: Distributed Worker VPS Deployment Verification
+  live_scenario: null
+  assertion: 'The config the Worker node actually loaded is the one the Panel assigned to it: every declared
+    inbound matches on tag, protocol, port, transport, and security layer, the applied config declares
+    outbounds, and the runtime directory, applied config, and settings file are private.'
+  assertion_sha256: b8bfd93dfec6957016ad5e6b32cca21fd6260eb320cef19a0ee66ac2a78c8a2c
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Distributed Worker VPS Deployment Verification
 - id: ACME-REJECT-ARB
   requirement: Fail-closed local ACME test mode
   live_scenario: null
@@ -3800,6 +3817,386 @@ cases:
   environment: container
   topology:
   - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-master-REALITY-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The xray client consumes the Panel-issued REALITY outbound of the master node — vless over
+    tcp with the reality security layer — sends a unique payload through it, and the controlled endpoint
+    echoes the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: b324aa1ff1ccf69ddeca611f48bc781697c5b3517105ec2e353a203247b38604
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-master-REALITY-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The mihomo client consumes the Panel-issued REALITY outbound of the master node — vless
+    over tcp with the reality security layer — sends a unique payload through it, and the controlled endpoint
+    echoes the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: 3781901625252430f5813216ce03be72be57cc3b0d2a8757a45621c504fcb290
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-master-XHTTP-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The xray client consumes the Panel-issued XHTTP outbound of the master node — vless over
+    xhttp with the tls security layer — sends a unique payload through it, and the controlled endpoint
+    echoes the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: ff3dcd62d77780cee77612ca30a390790d19d5296df5cf22061bed530962040d
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-master-XHTTP-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The mihomo client consumes the Panel-issued XHTTP outbound of the master node — vless over
+    xhttp with the tls security layer — sends a unique payload through it, and the controlled endpoint
+    echoes the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: 5ae18375563f27e4f518bfd0ac10b3ee02cd1940b4ca4f0830e1c14b45af4266
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-master-WS-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The xray client consumes the Panel-issued WS outbound of the master node — vless over ws
+    with the tls security layer — sends a unique payload through it, and the controlled endpoint echoes
+    the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: 1250efe0720725d8c44feda6667b287ef61988df592ed20f1ee43e8c1834006e
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-master-WS-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The mihomo client consumes the Panel-issued WS outbound of the master node — vless over
+    ws with the tls security layer — sends a unique payload through it, and the controlled endpoint echoes
+    the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: ba4405e253e821308302ba7acb298b1c4d434aeeb2c3aba0d1d7e76699290ddc
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-master-TROJAN-GRPC-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The xray client consumes the Panel-issued TROJAN-GRPC outbound of the master node — trojan
+    over grpc with the tls security layer — sends a unique payload through it, and the controlled endpoint
+    echoes the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: 9c326833ee5577a00eab50275eba80c5d2217b3471ce8f8d94d3e506a193ec85
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-master-TROJAN-GRPC-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The mihomo client consumes the Panel-issued TROJAN-GRPC outbound of the master node — trojan
+    over grpc with the tls security layer — sends a unique payload through it, and the controlled endpoint
+    echoes the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: bb052c929c7c9c9d4b074a23e405ca62d92070152c6229c1f9db6d8fbb2134bf
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-master-VISION-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The xray client consumes the Panel-issued VISION outbound of the master node — vless over
+    tcp with the tls security layer — sends a unique payload through it, and the controlled endpoint echoes
+    the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: 2c34f77ca267a43bcc391dc09781f408aa937b7950c6d2eab7c44e2462d19e6a
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-master-VISION-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The mihomo client consumes the Panel-issued VISION outbound of the master node — vless over
+    tcp with the tls security layer — sends a unique payload through it, and the controlled endpoint echoes
+    the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: 6b66fe5b7019536a7db30fc8977cb78a859792d7cd486adf73ed0b49b7205fcb
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-worker-REALITY-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The xray client consumes the Panel-issued REALITY outbound of the worker node — vless over
+    tcp with the reality security layer — sends a unique payload through it, and the controlled endpoint
+    echoes the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: 2cc2ed71485cb68c024b693caca92295f7e02b2f5753471d494e2f6bff6b6e00
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-worker-REALITY-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The mihomo client consumes the Panel-issued REALITY outbound of the worker node — vless
+    over tcp with the reality security layer — sends a unique payload through it, and the controlled endpoint
+    echoes the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: 0af3ab2134f859c02f22431ae3124a0af17fe65c2157692af1726d6f3dfd25d0
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-worker-XHTTP-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The xray client consumes the Panel-issued XHTTP outbound of the worker node — vless over
+    xhttp with the tls security layer — sends a unique payload through it, and the controlled endpoint
+    echoes the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: 5b42b30f20317d681eecdcadb0d75ef779818ef917f420af080b95a5199d4703
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-worker-XHTTP-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The mihomo client consumes the Panel-issued XHTTP outbound of the worker node — vless over
+    xhttp with the tls security layer — sends a unique payload through it, and the controlled endpoint
+    echoes the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: 1a6d7a03dc52458b5e0ba10a2c80e01e13184d897e8adcd5b140bc426051c641
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-worker-WS-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The xray client consumes the Panel-issued WS outbound of the worker node — vless over ws
+    with the tls security layer — sends a unique payload through it, and the controlled endpoint echoes
+    the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: d83e7414cddeff3e4e087afb9728aca35a862412444bb7d37bf090bc44658dba
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-worker-WS-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The mihomo client consumes the Panel-issued WS outbound of the worker node — vless over
+    ws with the tls security layer — sends a unique payload through it, and the controlled endpoint echoes
+    the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: 7668b56e116c9911fda8d0ab3f5953bf940b7c67470a11a47eee7a375e09b904
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-worker-TROJAN-GRPC-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The xray client consumes the Panel-issued TROJAN-GRPC outbound of the worker node — trojan
+    over grpc with the tls security layer — sends a unique payload through it, and the controlled endpoint
+    echoes the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: 7b442ee236ef9c0e49e1dddccbdcb2a063be3b95bd1df2946bb7fdd9e29ad1b0
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-worker-TROJAN-GRPC-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The mihomo client consumes the Panel-issued TROJAN-GRPC outbound of the worker node — trojan
+    over grpc with the tls security layer — sends a unique payload through it, and the controlled endpoint
+    echoes the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: add726e6be5a1cc2283de80749bcdcbd3d83dfa60d2fb2d3bb1e6aa75a96e172
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-worker-VISION-xray
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The xray client consumes the Panel-issued VISION outbound of the worker node — vless over
+    tcp with the tls security layer — sends a unique payload through it, and the controlled endpoint echoes
+    the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: 09a7a1fc698ce48369378051030cc6f2c44c8f8a70f7b0eba16612949700f7a6
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-DP-worker-VISION-mihomo
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: 'The mihomo client consumes the Panel-issued VISION outbound of the worker node — vless over
+    tcp with the tls security layer — sends a unique payload through it, and the controlled endpoint echoes
+    the request id and body digest while recording that node''s own egress address, not the client''s,
+    under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
+    so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
+  assertion_sha256: fbf117a9c165e88a069fe58538250ac509bcf4375ec4d83235e30761e18bc83b
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
   gate: pre-push
   driver: null
   driver_status: planned

@@ -555,6 +555,28 @@ class AioTopology:
             required_snis.add(self.vision_domain)
         return {"allowed": allowed, "required_hosts": required_hosts, "required_snis": required_snis}
 
+    def node_names(self, node: str = "") -> Dict[str, str]:
+        """The names one node is dialled by, and the SNI its REALITY inbound presents.
+
+        A cluster serves the same transport/security pairs on both nodes, so a
+        data-plane case has to say which node it means. The All-in-One topology
+        is a single node, which the empty name and the explicit ``local`` both
+        select.
+        """
+        if node not in ("", "local"):
+            raise TopologyError(f"the All-in-One topology has one node, not {node!r}")
+        return {
+            "dial": self.panel_domain,
+            "reality": self.reality_domain,
+            "vision": self.vision_domain or "",
+        }
+
+    def node_data_ip(self, node: str = "") -> str:
+        """The source address traffic through this node's inbounds has to leave from."""
+        if node not in ("", "local"):
+            raise TopologyError(f"the All-in-One topology has one node, not {node!r}")
+        return str(self.plan.data_target_ip)
+
     def _start_engine_client(self) -> None:
         """Start the pinned client engines, with no product code in the container.
 
@@ -640,7 +662,7 @@ class AioTopology:
         )
 
     def transfer_facts(
-        self, engine: str, network: str, security: str, timeout: int = 300,
+        self, engine: str, network: str, security: str, timeout: int = 300, host: str = "",
     ) -> Any:
         """Run one matrix tuple: one client through one inbound, to the endpoint.
 
@@ -648,6 +670,10 @@ class AioTopology:
         declares, not by an outbound tag: the Panel tags every host outbound
         ``proxy``, so only the transport pair identifies the inbound the client
         was issued.
+
+        ``host`` names the node the tuple belongs to. A cluster serves the same
+        transport/security pair on both nodes, so without it the probe would run
+        the Master's outbound and call it the Worker's.
         """
         self.engine_client()
         return self.podman.exec(
@@ -661,6 +687,7 @@ class AioTopology:
                 "--engine", engine,
                 "--network", network,
                 "--security", security,
+                *(["--host", host] if host else []),
             ],
             check=False,
             timeout=timeout,
@@ -914,6 +941,31 @@ class MultiNodeTopology(AioTopology):
             domains["required_hosts"].add(self.worker_vision_domain)
             domains["required_snis"].add(self.worker_vision_domain)
         return domains
+
+    def node_names(self, node: str = "") -> Dict[str, str]:
+        """The names the named node is dialled by, and the SNI its REALITY inbound presents.
+
+        Both nodes carry the same inbounds, so the names are what tell their
+        tuples apart: a Worker case that dialled the Master's name would prove
+        the Master.
+        """
+        if node in ("", "master"):
+            return super().node_names()
+        if node == "worker":
+            return {
+                "dial": self.worker_domain,
+                "reality": self.worker_reality_domain,
+                "vision": self.worker_vision_domain or "",
+            }
+        raise TopologyError(f"the Multi-Node topology has a Master and a Worker, not {node!r}")
+
+    def node_data_ip(self, node: str = "") -> str:
+        """The source address the named node's inbounds have to leave from."""
+        if node in ("", "master"):
+            return super().node_data_ip()
+        if node == "worker":
+            return str(self.plan.data_worker_ip)
+        raise TopologyError(f"the Multi-Node topology has a Master and a Worker, not {node!r}")
 
     def create(self) -> "MultiNodeTopology":
         super().create()

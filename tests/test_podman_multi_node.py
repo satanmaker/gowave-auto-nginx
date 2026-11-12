@@ -751,12 +751,72 @@ class TestMultiNodeSuite(unittest.TestCase):
         ids = [case.id for case in multi_node.cases(self.podman)]
         self.assertEqual(ids[14:16], ["WRK-05", "WRK-06"])
 
+    def test_the_data_plane_cases_follow_the_worker_audit(self):
+        # 5.7: a payload has to traverse the Worker too, so the matrix tuples of
+        # both nodes run once the Worker's own config is applied.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertEqual(ids[16], "MN-DP-master-REALITY-xray")
+        self.assertEqual(ids[23], "MN-DP-master-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[24], "MN-DP-worker-REALITY-xray")
+        self.assertEqual(ids[31], "MN-DP-worker-TROJAN-GRPC-mihomo")
+
+    def test_every_node_contributes_its_own_matrix_tuples(self):
+        data = matrix.load()
+        ids = {case.id for case in multi_node.cases(self.podman)}
+        expected = {
+            matrix.case_id(data, "multi-node", str(inbound["id"]), client, node=node)
+            for node in (matrix.load()["topologies"]["multi-node"]["nodes"])
+            for inbound, client in matrix.tuples(data, vision=False)
+        }
+        self.assertEqual(len(expected), 16)
+        self.assertTrue(expected <= ids, f"missing: {sorted(expected - ids)}")
+
+    def test_the_data_plane_count_is_the_matrix_positive_count(self):
+        for vision, worker_vision, count in (
+            (False, False, 16), (True, False, 18), (False, True, 18), (True, True, 20),
+        ):
+            suite = multi_node.cases(self.podman, vision=vision, worker_vision=worker_vision)
+            data_plane = [case.id for case in suite if case.id.startswith("MN-DP-")]
+            self.assertEqual(len(data_plane), count, (vision, worker_vision))
+            self.assertEqual(len(set(data_plane)), count, "no tuple may be counted twice")
+
+    def test_the_vision_tuples_are_only_on_the_node_that_was_configured(self):
+        master_only = [case.id for case in multi_node.cases(self.podman, vision=True)]
+        self.assertIn("MN-DP-master-VISION-xray", master_only)
+        self.assertNotIn("MN-DP-worker-VISION-xray", master_only)
+        worker_only = [case.id for case in multi_node.cases(self.podman, worker_vision=True)]
+        self.assertIn("MN-DP-worker-VISION-xray", worker_only)
+        self.assertNotIn("MN-DP-master-VISION-xray", worker_only)
+        self.assertEqual(
+            len([case_id for case_id in worker_only if case_id.startswith("MN-DP-")]), 18,
+        )
+
+    def test_the_suite_declares_exactly_the_data_plane_cases_it_runs(self):
+        suite = multi_node.cases(self.podman)
+        product = multi_node.MultiNodeProduct(self.podman)
+        declared = {case_id for case_id, _inbound, _client, _node in
+                    multi_node.data_plane_cases(product)}
+        self.assertEqual(
+            declared,
+            {case.id for case in suite if case.id.startswith("MN-DP-")},
+        )
+
+    def test_the_declared_cases_live_in_one_registry_on_the_master(self):
+        product = multi_node.MultiNodeProduct(self.podman)
+        product.declare_data_plane(["MN-DP-master-REALITY-xray"])
+        self.assertEqual(product.declared_data_plane, ["MN-DP-master-REALITY-xray"])
+        self.assertEqual(product.master.declared_data_plane,
+                         ["MN-DP-master-REALITY-xray"])
+        product.record_data_plane("MN-DP-master-REALITY-xray", "PASS")
+        self.assertEqual(product.data_plane_results,
+                         {"MN-DP-master-REALITY-xray": "PASS"})
+
     def test_the_subscription_representations_close_the_suite(self):
         # 5.6: what the Panel serves a client has to be both loadable and this
         # cluster's, so the two shared subscription cases run last, after every
         # node they depend on exists.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[16:], ["SUB-SERVED", "SUB-B64"])
+        self.assertEqual(ids[-2:], ["SUB-SERVED", "SUB-B64"])
 
 
 class TestMtlsVerifierReport(unittest.TestCase):

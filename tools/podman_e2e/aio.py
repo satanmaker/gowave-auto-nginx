@@ -250,6 +250,11 @@ fi
 class AioProduct:
     """One disposable AIO host, installed once by the real operator."""
 
+    # The matrix topology this install's case ids are named after. A product that
+    # installs more than one host overrides it, so the same data-plane body names
+    # its cases after its own topology instead of borrowing the AIO ids.
+    case_topology = "aio"
+
     def __init__(
         self, podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False,
         install_case_id: str = INSTALL_CASE_ID,
@@ -416,17 +421,25 @@ class AioProduct:
             scope, payload_dir=payload_dir,
         ))
 
-    def transfer_facts(self, case_id: str, inbound_id: str, client: str) -> Dict[str, Any]:
+    def transfer_facts(
+        self, case_id: str, inbound_id: str, client: str, node: str = "",
+    ) -> Dict[str, Any]:
         """Run exactly one matrix tuple: one client through one inbound.
 
         The matrix, not the case body, decides the transport and security layer,
         so a matrix edit that renames or re-transports an inbound changes what the
         case exercises instead of leaving the case asserting the old shape.
+
+        ``node`` names the host the tuple belongs to. A cluster serves the same
+        transport/security pairs on both nodes, so the probe is narrowed by the
+        node's own dial name; otherwise it would run the first match and call it
+        this one.
         """
         host = self.require_installed()
         inbound = matrix.inbound(self.matrix, inbound_id)
         return self._probe_json(case_id, "the transfer probe", host.transfer_facts(
             client, str(inbound["transport"]), str(inbound["security"]),
+            host=matrix_expectations(self, inbound, node)["server"],
         ))
 
     def prohibited_facts(self, case_id: str) -> Dict[str, Any]:
@@ -602,14 +615,27 @@ def subscription_protocol_counts(product: AioProduct) -> Dict[str, int]:
     return counts
 
 
-def matrix_sni(product: AioProduct, inbound: Dict[str, Any]) -> str:
-    """The SNI the matrix tuple is served under: the domain the inbound was issued for."""
+def matrix_expectations(
+    product: AioProduct, inbound: Dict[str, Any], node: str = "",
+) -> Dict[str, str]:
+    """The name, SNI and egress address one matrix tuple has to be served under.
+
+    A tuple names an inbound by transport and security layer, and a cluster
+    carries the same layers on both nodes, so the node decides every fact the
+    case asserts: the name a share link dials (which also selects the outbound),
+    the SNI the inbound presents, and the address the payload has to leave from.
+    REALITY dials the node's TLS name and presents its own SNI; the Vision
+    inbound is the one that carries the node's Vision name on both sides.
+    """
     host = product.require_installed()
+    names = host.node_names(node)
     if str(inbound.get("id")) == matrix.VISION_INBOUND:
-        return str(host.vision_domain or "")
+        return {"server": names["vision"], "sni": names["vision"],
+                "source_ip": host.node_data_ip(node)}
     if str(inbound.get("security")) == "reality":
-        return str(host.reality_domain)
-    return str(host.panel_domain)
+        return {"server": names["dial"], "sni": names["reality"],
+                "source_ip": host.node_data_ip(node)}
+    return {"server": names["dial"], "sni": names["dial"], "source_ip": host.node_data_ip(node)}
 
 
 def case_packages(product: AioProduct) -> Dict[str, Any]:
@@ -1577,8 +1603,13 @@ def case_share_links(product: AioProduct) -> Dict[str, Any]:
     }
 
 
-def case_data_plane(product: AioProduct, inbound: Dict[str, Any], client: str) -> Dict[str, Any]:
-    """AIO-DP-<inbound>-<client>: one matrix tuple carries a payload through the product.
+def case_data_plane(
+    product: AioProduct, inbound: Dict[str, Any], client: str, node: str = "",
+) -> Dict[str, Any]:
+    """One matrix tuple carries a payload through the product it belongs to.
+
+    The case id comes from the matrix topology the product names (``AIO-DP-…``
+    for one host, ``MN-DP-<node>-…`` for a cluster).
 
     The engines run from the Control Machine, so a transfer that shows up at the
     endpoint with the installed host as its source address traversed the product.
@@ -1589,12 +1620,16 @@ def case_data_plane(product: AioProduct, inbound: Dict[str, Any], client: str) -
 
     Exactly one served outbound may match the tuple: the matrix names one inbound
     per transport and security layer, so a second match is a representation the
-    matrix does not explain and must not be counted as this case.
+    matrix does not explain and must not be counted as this case. In a cluster
+    the node is part of the tuple for the same reason: both nodes serve the same
+    layers, so the outbound, the SNI and the egress address all have to be that
+    node's.
     """
-    case_id = matrix.case_id(product.matrix, "aio", str(inbound["id"]), client)
+    case_id = matrix.case_id(product.matrix, product.case_topology, str(inbound["id"]), client,
+                             node=node)
     product.subscription_payloads(case_id)
-    host = product.require_installed()
-    facts = product.transfer_facts(case_id, str(inbound["id"]), client)
+    expectations = matrix_expectations(product, inbound, node)
+    facts = product.transfer_facts(case_id, str(inbound["id"]), client, node=node)
 
     transport = f"{inbound['transport']}/{inbound['security']}"
     require(case_id, int(facts.get("outbounds") or 0) == 1,
@@ -1609,31 +1644,40 @@ def case_data_plane(product: AioProduct, inbound: Dict[str, Any], client: str) -
             f"the endpoint did not echo the {inbound['id']} request id")
     require(case_id, facts.get("body_match"),
             f"the endpoint did not receive the exact {inbound['id']} payload")
-    require(case_id, facts.get("source_ip") == host.plan.data_target_ip,
-            f"the {inbound['id']} payload left from {facts.get('source_ip')!r} instead of the "
-            f"installed host {host.plan.data_target_ip!r}, so it did not traverse the product")
-    sni = matrix_sni(product, inbound)
-    require(case_id, facts.get("sni") == sni,
-            f"the served {client} outbound carries SNI {facts.get('sni')!r} instead of the {sni!r} "
-            f"the {inbound['id']} inbound was issued for")
+    require(case_id, facts.get("server") == expectations["server"],
+            f"the served {client} outbound dials {facts.get('server')!r} instead of "
+            f"{expectations['server']!r}, so it is not the {inbound['id']} inbound of this node")
+    require(case_id, facts.get("source_ip") == expectations["source_ip"],
+            f"the {inbound['id']} payload left from {facts.get('source_ip')!r} instead of "
+            f"{expectations['source_ip']!r}, so it did not traverse the product")
+    require(case_id, facts.get("sni") == expectations["sni"],
+            f"the served {client} outbound carries SNI {facts.get('sni')!r} instead of the "
+            f"{expectations['sni']!r} the {inbound['id']} inbound was issued for")
 
-    return {
+    evidence = {
         "inbound": inbound["id"],
         "client": client,
         "transport": transport,
         "tag": facts.get("tag"),
+        "server": facts.get("server"),
         "sni": facts.get("sni"),
         "status": facts.get("status"),
         "source_ip": facts.get("source_ip"),
         "outbounds": facts.get("outbounds"),
     }
+    if node:
+        evidence["node"] = node
+    return evidence
 
 
-def _data_plane_case(product: AioProduct, inbound: Dict[str, Any], client: str) -> Dict[str, Any]:
+def _data_plane_case(
+    product: AioProduct, inbound: Dict[str, Any], client: str, node: str = "",
+) -> Dict[str, Any]:
     """Run one matrix tuple and record its own verdict for the count case."""
-    case_id = matrix.case_id(product.matrix, "aio", str(inbound["id"]), client)
+    case_id = matrix.case_id(product.matrix, product.case_topology, str(inbound["id"]), client,
+                             node=node)
     try:
-        evidence = case_data_plane(product, inbound, client)
+        evidence = case_data_plane(product, inbound, client, node=node)
     except AssertionError:
         product.record_data_plane(case_id, "FAIL")
         raise
