@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT))
 
-from live_vps.deployment import parse_strace_argv_output, output_matches_pinned_version
+from live_vps.deployment import parse_strace_argv_output, output_matches_expected_version
 from live_vps.panel_api import E2EPanelClient, read_master_credentials
 from live_vps.mtls import run_mtls_negative_tests
 from live_vps.nginx import verify_panel_https
@@ -103,11 +103,45 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
         self.assertEqual(bootstrap.count("generate_bootstrap_acme_vhost"), 1)
         self.assertEqual(bootstrap.count("reload_nginx_strict"), 1)
 
-    def test_pinned_version_match_requires_exact_token(self):
-        self.assertTrue(output_matches_pinned_version("GoWave Server v0.4.0", "0.4.0"))
-        self.assertTrue(output_matches_pinned_version("Xray 25.10.15 (Xray, Penetrates Everything.)", "25.10.15"))
-        self.assertFalse(output_matches_pinned_version("GoWave Server v0.4.10", "0.4.1"))
-        self.assertFalse(output_matches_pinned_version("version output unavailable", "0.4.0"))
+    def test_repeat_install_leaves_managed_nginx_running(self):
+        """A repeat install must not take down the vhost that already serves the target."""
+        script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        install_start = script.index("cmd_install() {")
+        install_end = script.index("\n}\n", install_start)
+        install = script[install_start:install_end]
+
+        guard = install.index("local managed_nginx_in_place=0")
+        stop = install.index("systemctl stop nginx")
+        preflight = install.index("run_preflight_panel")
+        self.assertLess(guard, stop, "the managed-config probe must precede the NGINX stop")
+        self.assertLess(stop, preflight, "the NGINX stop belongs to the preflight step")
+
+        self.assertIn(
+            "[[ -f /etc/nginx/stream-enabled/gowave-stream.conf && -f /etc/nginx/conf.d/gowave-http.conf ]]",
+            install,
+        )
+        self.assertIn("if (( managed_nginx_in_place == 0 ))", install)
+        # The ACME stage must not add a competing :80 vhost beside the managed one.
+        self.assertIn("if (( managed_nginx_in_place == 1 ))", install)
+
+    def test_panel_binary_is_replaced_by_rename(self):
+        """A running Panel locks its own inode, so the binary is staged and renamed over."""
+        script = (REPO_ROOT / "modules" / "panel.sh").read_text()
+        self.assertIn('mv -f "$staged_server" "$target_dir/gowave-server"', script)
+        self.assertNotIn('cp "$tmp_dir/gowave-server" "$target_dir/gowave-server"', script)
+
+    def test_version_output_matches_an_explicit_tag(self):
+        # Fixture versions, chosen only to exercise token boundaries.
+        self.assertTrue(output_matches_expected_version("GoWave Server v9.9.9", "9.9.9"))
+        self.assertTrue(output_matches_expected_version("Xray 3.4.5 (Xray, Penetrates Everything.)", "3.4.5"))
+        self.assertFalse(output_matches_expected_version("GoWave Server v9.9.99", "9.9.9"))
+        self.assertFalse(output_matches_expected_version("version output unavailable", "9.9.9"))
+
+    def test_latest_channel_accepts_the_installed_version(self):
+        self.assertTrue(output_matches_expected_version("GoWave Server v3.4.5", "latest"))
+        self.assertTrue(output_matches_expected_version("Xray 26.11.9 (Xray, Penetrates Everything.)", "LATEST"))
+        self.assertTrue(output_matches_expected_version("Mihomo v2.0.1 linux amd64", ""))
+        self.assertFalse(output_matches_expected_version("version output unavailable", "latest"))
 
     @classmethod
     def setUpClass(cls):

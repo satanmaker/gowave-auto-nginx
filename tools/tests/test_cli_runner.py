@@ -69,11 +69,11 @@ class TestCLIRunnerAndIntegration(unittest.TestCase):
         self.assertIsNone(ACME_MODE_URLS.get("http://arbitrary-acme.org"))
 
     def test_config_fingerprint_covers_all_parsed_values(self):
-        base = {"MASTER_IP": "93.184.216.34", "GOWAVE_PANEL_VERSION": "0.4.0",
-                "XRAY_SERVER_VERSION": "25.10.15", "TEST_NEGATIVE_SUITE": True}
+        base = {"MASTER_IP": "93.184.216.34", "GOWAVE_PANEL_VERSION": "latest",
+                "XRAY_SERVER_VERSION": "latest", "TEST_NEGATIVE_SUITE": True}
         original = SimpleNamespace(values=dict(base))
         reordered = SimpleNamespace(values=dict(reversed(list(base.items()))))
-        changed = SimpleNamespace(values={**base, "GOWAVE_PANEL_VERSION": "0.4.1"})
+        changed = SimpleNamespace(values={**base, "GOWAVE_PANEL_VERSION": "v9.9.9"})
 
         self.assertEqual(build_config_fingerprint(original), build_config_fingerprint(reordered))
         self.assertNotEqual(build_config_fingerprint(original), build_config_fingerprint(changed))

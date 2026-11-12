@@ -2366,12 +2366,15 @@ ensure_pinned_xray_core() {
     local node_bin="${1:-/opt/gowave-node/gowave-node}"
     local core_bin="${2:-/opt/gowave-node/rw-core}"
 
-    if [[ -z "${XRAY_SERVER_VERSION:-}" || ! -x "$node_bin" ]]; then
+    # "latest" is the shipped default: it means the core the node installation
+    # already brought is the one to keep, not a version to reinstall.
+    local requested="${XRAY_SERVER_VERSION:-}"
+    if [[ -z "$requested" || "${requested,,}" == "latest" || "${requested,,}" == "vlatest" || ! -x "$node_bin" ]]; then
         return 0
     fi
 
     local expected_core cur_core
-    expected_core="${XRAY_SERVER_VERSION#v}"
+    expected_core="${requested#v}"
     cur_core=$("$core_bin" version 2>/dev/null || true)
     if core_version_matches "$cur_core" "$expected_core"; then
         return 0

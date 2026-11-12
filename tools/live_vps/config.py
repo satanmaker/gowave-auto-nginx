@@ -291,14 +291,23 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
     parsed["ACME_MODE"] = acme_mode
     parsed["ADMIN_EMAIL"] = raw_pairs.get("ADMIN_EMAIL", "admin@example.com")
 
-    # Version pins must be explicit version/tag identifiers; floating channels are rejected.
+    # Component versions follow the upstream release channel by default: "latest"
+    # is the documented value, and the runner then verifies that each component
+    # reports some version instead of comparing it to a hardcoded tag. An explicit
+    # version/tag is still accepted for a deliberate pin; other floating names are
+    # rejected because they are not channels the upstream projects publish.
     for version_key in (
         "GOWAVE_PANEL_VERSION", "GOWAVE_NODE_VERSION",
         "XRAY_SERVER_VERSION", "XRAY_CLIENT_VERSION", "MIHOMO_CLIENT_VERSION",
     ):
         version_value = raw_pairs[version_key].strip()
-        if not VERSION_REGEX.fullmatch(version_value) or version_value.lower() in ("latest", "stable", "main", "master"):
-            raise ValueError(f"{version_key} must be an explicit pinned version/tag, not a floating channel.")
+        if version_value.lower() == "latest":
+            parsed[version_key] = "latest"
+            continue
+        if not VERSION_REGEX.fullmatch(version_value) or version_value.lower() in ("stable", "main", "master"):
+            raise ValueError(
+                f"{version_key} must be 'latest' or an explicit version/tag, not a floating channel."
+            )
         parsed[version_key] = version_value
 
     # REALITY Host fingerprint. Defaults to firefox and must match what the

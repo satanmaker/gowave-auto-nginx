@@ -7,7 +7,7 @@ The live two-VPS acceptance run is launched from the operator's Linux workstatio
 - Linux control machine and a clean checkout of the tested repository commit.
 - Python 3 and a virtual environment.
 - OpenSSH client tools (ssh, ssh-keygen), curl, dig, openssl, and timeout.
-- Pinned Xray and Mihomo client binaries matching XRAY_CLIENT_VERSION and MIHOMO_CLIENT_VERSION in tools/live_vps_config.env.example.
+- Xray and Mihomo client binaries on the Control Machine. `XRAY_CLIENT_VERSION` and `MIHOMO_CLIENT_VERSION` default to `latest`, so preflight accepts the installed builds; set an explicit tag there to require one.
 - Both freshly provisioned disposable VPS instances must be reachable over SSH and have tcpdump and coreutils timeout installed and executable by root. The controller does not install these target-side tools; preflight rejects a target that lacks either one instead of failing later in the traffic phase.
 - DNS records for the five required domains must resolve to the corresponding target IPv4 addresses. Optional Master and Worker Vision domains are independent.
 
@@ -36,15 +36,15 @@ Run a non-deploying eligibility check first with `python3 tools/run_live_vps.py 
 - The local private keys, known_hosts files, and generated config live in a mode-0700 temporary directory and are removed when the controller exits.
 - Root password authentication remains enabled after the run. If it was enabled solely for bootstrap, disable it through the provider console or the normal secure administration process.
 
-## Pinned client cores and REALITY fingerprint
+## Component versions and REALITY fingerprint
 
-The suite tests exactly the pair that GoWave Panel and GoWave Node deploy: `XRAY_SERVER_VERSION` / `XRAY_CLIENT_VERSION` (pinned `26.11.9`) and the upstream `MIHOMO_CLIENT_VERSION` (pinned `1.19.34`). These are the reference cores for every verify and traffic assertion; no alternative client binaries are exercised. Keep `tools/live_vps_config.env` in sync with `tools/live_vps_config.env.example`, otherwise a local run can drift onto an older core than the one the installers ship.
+Every component version defaults to `latest`, matching what the installers ship: `GOWAVE_PANEL_VERSION`, `GOWAVE_NODE_VERSION`, `XRAY_SERVER_VERSION`, `XRAY_CLIENT_VERSION` and `MIHOMO_CLIENT_VERSION`. With a floating channel the deployment step asserts that each component reports a version and records what it reported, instead of comparing it to a hardcoded tag; an explicit version/tag is still accepted when a run has to reproduce a specific release. Keep `tools/live_vps_config.env` in sync with `tools/live_vps_config.env.example` so the run does not start from a stale pin.
 
 | Key | Default | Purpose |
 |---|---|---|
 | `REALITY_FINGERPRINT` | `firefox` | uTLS preset written to REALITY Host records and asserted by subscription validation |
 
-`firefox` is the default: `metacubex/utls` maps `HelloFirefox_Auto` to Firefox 148, whose ClientHello carries the X25519MLKEM768 key share required by Xray REALITY servers. Xray and mihomo (pinned `1.19.34`) both authenticate against REALITY hosts with this preset, and Vision/XHTTP/WS/Trojan-gRPC hosts use `firefox` as well. `REALITY_FINGERPRINT` remains overridable for client fleets that need a different uTLS preset; when it is overridden, the Mihomo subscription validator rejects any REALITY proxy whose `client-fingerprint` does not match the configured preset.
+`firefox` is the default: `metacubex/utls` maps `HelloFirefox_Auto` to Firefox 148, whose ClientHello carries the X25519MLKEM768 key share required by Xray REALITY servers. Xray and mihomo both authenticate against REALITY hosts with this preset, and Vision/XHTTP/WS/Trojan-gRPC hosts use `firefox` as well. `REALITY_FINGERPRINT` remains overridable for client fleets that need a different uTLS preset; when it is overridden, the Mihomo subscription validator rejects any REALITY proxy whose `client-fingerprint` does not match the configured preset.
 
 ## Test safety and traffic evidence
 
