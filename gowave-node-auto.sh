@@ -1837,8 +1837,11 @@ configure_edge_nginx() {
     mkdir -p /etc/nginx/stream-enabled /etc/nginx/conf.d /var/www/gowave-acme
     chmod 0755 /var/www/gowave-acme
 
-    # Certbot issuance via webroot
-    cat > /etc/nginx/conf.d/00-bootstrap-worker-acme.conf <<EOF
+    # Port 80 ACME webroot vhost. It stays in place after issuance: certbot's
+    # HTTP-01 renewal revalidates through this same path, so removing it makes
+    # every later `certbot renew` fail with a 404.
+    cat > /etc/nginx/conf.d/00-worker-acme-challenge.conf <<EOF
+# Managed by GoWave Auto NGINX: Worker Port 80 ACME Challenge
 server {
     listen 80;
     server_name $WORKER_DOMAIN $REALITY_DOMAIN ${VISION_DOMAIN:-};
@@ -1882,9 +1885,6 @@ EOF
             "${certbot_extra_args[@]}"
         _ACME_VISION_ISSUED=1
     fi
-
-    rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf
-    _NGINX_BOOTSTRAP_CREATED=0
 
     verify_worker_certificate() {
         local domain="$1" cert="/etc/letsencrypt/live/$1/fullchain.pem" key="/etc/letsencrypt/live/$1/privkey.pem"
@@ -2177,7 +2177,7 @@ compensate_remote_worker() {
     # 2. Revert NGINX and ACME bootstrap
     if [[ "${_NGINX_CONFIGS_CREATED:-0}" -eq 1 ]] || [[ "${_NGINX_BOOTSTRAP_CREATED:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Cleaning up worker NGINX virtual hosts and stream routing..." >&2
-        rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf /etc/nginx/conf.d/gowave-worker-https.conf /etc/nginx/conf.d/gowave-worker-decoy.conf /etc/nginx/conf.d/gowave-worker-vision-fallback.conf /etc/nginx/stream-enabled/gowave-worker-stream.conf || rollback_failed=1
+        rm -f /etc/nginx/conf.d/00-worker-acme-challenge.conf /etc/nginx/conf.d/00-bootstrap-worker-acme.conf /etc/nginx/conf.d/gowave-worker-https.conf /etc/nginx/conf.d/gowave-worker-decoy.conf /etc/nginx/conf.d/gowave-worker-vision-fallback.conf /etc/nginx/stream-enabled/gowave-worker-stream.conf || rollback_failed=1
         rollback_managed_deploy_hook "${_ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || rollback_failed=1
         rm -rf /var/www/gowave-acme || rollback_failed=1
         if [[ "${_STREAM_INCLUDE_ADDED:-0}" -eq 1 ]]; then
@@ -2753,7 +2753,7 @@ rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode || rollback_failed=1
 rm -f /usr/local/bin/gowave-node /usr/local/bin/xray || rollback_failed=1
 
 # 2. Remove NGINX worker configs
-rm -f /etc/nginx/conf.d/00-bootstrap-worker-acme.conf /etc/nginx/conf.d/gowave-worker-https.conf /etc/nginx/conf.d/gowave-worker-decoy.conf /etc/nginx/conf.d/gowave-worker-vision-fallback.conf /etc/nginx/stream-enabled/gowave-worker-stream.conf || rollback_failed=1
+rm -f /etc/nginx/conf.d/00-worker-acme-challenge.conf /etc/nginx/conf.d/00-bootstrap-worker-acme.conf /etc/nginx/conf.d/gowave-worker-https.conf /etc/nginx/conf.d/gowave-worker-decoy.conf /etc/nginx/conf.d/gowave-worker-vision-fallback.conf /etc/nginx/stream-enabled/gowave-worker-stream.conf || rollback_failed=1
 rollback_managed_deploy_hook "${ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || rollback_failed=1
 rm -rf /var/www/gowave-acme /var/www/gowave-auto-nginx/cover-reality || rollback_failed=1
 if [[ -d /var/www/gowave-auto-nginx ]]; then
