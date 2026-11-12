@@ -34,4 +34,4 @@
 - [x] 4.5 Run the full unittest suite and all repository CI checks on the PR head; resolve every regression.
 - [x] 4.6 Replace aggregate `/proc/net/dev` traffic heuristics with per-case packet capture on both VPS instances, filtered by control-machine source IPv4 and the exact proxy destination port; require target ingress, zero offload ingress, and matching egress for every Xray/Mihomo case.
 - [x] 4.7 Add regression tests for capture lifecycle, SSH-port exclusion, missing evidence, and offload detection.
-- [ ] 4.8 Perform a complete live ACME staging run against two freshly provisioned disposable VPS instances and verify remote expiry/cleanup before marking the overall feature accepted.
+- [x] 4.8 Perform a complete live ACME staging run against two freshly provisioned disposable VPS instances and verify remote expiry/cleanup before marking the overall feature accepted.
