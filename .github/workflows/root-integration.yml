@@ -32,6 +32,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends nginx libnginx-mod-stream sqlite3 openssl curl ufw fail2ban certbot tar gzip
 
+      # The suite imports every test module before it runs, and the protocol
+      # matrix and the served-payload probes parse YAML, so the interpreter that
+      # runs the unprivileged suite needs PyYAML.
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check PyYAML
+
       - name: Run Suite Root (EUID 0)
         run: |
           sudo python3 tests/run_ci.py --suite root
