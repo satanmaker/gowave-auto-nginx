@@ -37,6 +37,8 @@ ECHO_OFFSET = 30
 
 DNS_PORT = 53
 DNS_ZONE_TTL = 30
+DNS_ZONE_SUFFIX = "testbed.internal"
+HOST_RESOLV_CONF = Path("/etc/resolv.conf")
 
 FIXTURE_IMAGE = "fixture-echo"
 DNS_FIXTURE_SCRIPT = "/repo/tests/fixtures/dns_server.py"
@@ -107,6 +109,30 @@ def allocate_plan(used_subnets: Sequence[str]) -> NetworkPlan:
     )
 
 
+def egress_resolvers(resolv_conf: Path = HOST_RESOLV_CONF) -> List[str]:
+    """Real resolvers the disposable host may use for names outside the fixture zone.
+
+    The fixture answers its own zone authoritatively and refuses everything else,
+    so the target falls through to these servers for package mirrors and release
+    downloads exactly like a fresh VPS. Loopback entries are dropped: they point
+    at the workstation's stub resolver, which does not exist in the container.
+    """
+    try:
+        text = resolv_conf.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    resolvers: List[str] = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0] == "nameserver":
+            address = fields[1]
+            if address.startswith("127.") or address.startswith("169.254.") or address == "::1":
+                continue
+            if address not in resolvers:
+                resolvers.append(address)
+    return resolvers
+
+
 def free_loopback_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -130,13 +156,15 @@ def zone(plan: NetworkPlan) -> Dict[str, Any]:
     }
 
 
-def dns_command(zone_path: str, log_path: str) -> Sequence[str]:
+def dns_command(zone_path: str, log_path: str, out_of_zone: str = "refused") -> Sequence[str]:
     return (
         "python3", DNS_FIXTURE_SCRIPT,
         "--listen", "0.0.0.0",
         "--port", str(DNS_PORT),
         "--zone", zone_path,
         "--log", log_path,
+        "--suffix", DNS_ZONE_SUFFIX,
+        "--out-of-zone", out_of_zone,
     )
 
 
@@ -168,6 +196,7 @@ class AioTopology:
     vision_domain: Optional[str] = None
     admin_email: str = "e2e@testbed.internal"
     plan: Optional[NetworkPlan] = None
+    egress_resolvers: Optional[List[str]] = None
     started: List[str] = field(default_factory=list)
     acme: Optional[acme_fixture.AcmeFixture] = None
     _ca_dir: Optional[Path] = None
@@ -182,10 +211,16 @@ class AioTopology:
         self.target_name = self.context.resource_name("aio")
         if self.plan is None:
             self.plan = allocate_plan(self.podman.network_subnets())
+        if self.egress_resolvers is None:
+            self.egress_resolvers = egress_resolvers()
 
     # ------------------------------------------------------------------ setup
     def create(self) -> "AioTopology":
-        self.podman.network_create(self.network, self.plan.subnet)
+        if not self.egress_resolvers:
+            raise TopologyError(
+                f"no egress resolver found in {HOST_RESOLV_CONF}; the disposable host could not install packages"
+            )
+        self.podman.network_create(self.network, self.plan.subnet, disable_dns=True)
         self._start_dns()
         self._start_acme()
         self._start_target()
@@ -242,7 +277,11 @@ class AioTopology:
             volumes=(f"{self._ca_dir}:{CA_MOUNT}:ro,Z",),
             environment=self.install_environment(),
             systemd="always",
-            extra_args=("--ip", self.plan.target_ip, "--dns", self.plan.dns_ip),
+            extra_args=(
+                "--ip", self.plan.target_ip,
+                "--dns", self.plan.dns_ip,
+                *[option for resolver in self.egress_resolvers for option in ("--dns", resolver)],
+            ),
         )
         self.started.append(self.target_name)
         self.podman.wait_systemd(self.target_name, timeout_seconds=180)
@@ -310,6 +349,11 @@ class AioTopology:
             "vision_domain": self.vision_domain or "",
             "acme_endpoint": acme_fixture.ACME_DIRECTORY_URL,
             "acme_fixture": self.acme.evidence() if self.acme else {},
+            "resolvers": {
+                "fixture": self.plan.dns_ip,
+                "fixture_zone": DNS_ZONE_SUFFIX,
+                "egress": list(self.egress_resolvers or []),
+            },
             "pre_install": self._clean_facts,
             "images_resolved": dict(self.context.environment.get("images_resolved") or {}),
         }

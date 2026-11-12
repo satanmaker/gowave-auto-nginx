@@ -141,6 +141,10 @@ cmd_install() {
             read -r -p "Enter Vision domain (e.g. vision.example.com): " vision_domain
         fi
     fi
+    # Input validation and the camouflage probe need a handful of tools that
+    # install_prerequisites would install later; get them first so a bare host
+    # fails for a product reason rather than a missing interpreter.
+    bootstrap_early_tools || return 1
     python3 - "$panel_domain" "$reality_domain" "$vision_domain" <<'PY'
 import re, sys
 panel, reality, *extra = sys.argv[1:]

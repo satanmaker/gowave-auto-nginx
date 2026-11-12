@@ -234,20 +234,52 @@ openssh-client
 EOF
 }
 
-check_prerequisites() {
-    local missing=()
-    while IFS= read -r pkg || [[ -n "$pkg" ]]; do
+# Packages the arguments-validation and address-resolution steps need before
+# install_prerequisites runs. Every one of them ships with a stock supported
+# image; the list exists so a minimal container is not failed blind.
+get_bootstrap_packages() {
+    cat <<'EOF'
+python3
+iproute2
+curl
+ca-certificates
+openssl
+EOF
+}
+
+missing_packages() {
+    local pkg
+    for pkg in "$@"; do
         [[ -z "$pkg" || "$pkg" =~ ^# ]] && continue
         if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
-            missing+=("$pkg")
+            printf '%s\n' "$pkg"
         fi
-    done < <(get_required_packages)
+    done
+}
+
+check_prerequisites() {
+    local packages=() missing=()
+    mapfile -t packages < <(get_required_packages)
+    mapfile -t missing < <(missing_packages "${packages[@]}")
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         printf '%s\n' "${missing[@]}"
         return 1
     fi
     return 0
+}
+
+bootstrap_early_tools() {
+    local packages=() missing=()
+    mapfile -t packages < <(get_bootstrap_packages)
+    mapfile -t missing < <(missing_packages "${packages[@]}")
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        return 0
+    fi
+    echo "Bootstrapping early tools required before prerequisites: ${missing[*]}..."
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
 }
 
 install_prerequisites() {

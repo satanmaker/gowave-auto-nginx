@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parent.parent / "modules" / "os.sh"
+OPERATOR_PATH = Path(__file__).resolve().parent.parent / "gowave-auto.sh"
 
 
 class TestOSDetection(unittest.TestCase):
@@ -127,6 +128,25 @@ class TestOSDetection(unittest.TestCase):
             self.assertEqual(res.returncode, 0)
             conf = (apt_dir / "99zz-gowave-auto-nginx").read_text()
             self.assertIn('Unattended-Upgrade::Automatic-Reboot "false";', conf)
+
+    def test_install_bootstraps_tools_before_validating_arguments(self):
+        """cmd_install validates arguments and probes the cover apex before prerequisites."""
+        script = OPERATOR_PATH.read_text(encoding="utf-8")
+        start = script.index("cmd_install() {")
+        body = script[start:start + 4000]
+        bootstrap = body.index("bootstrap_early_tools || return 1")
+        validator = body.index("python3 - \"$panel_domain\"")
+        cover = body.index("server_ip=$(resolve_panel_ipv4)")
+        self.assertLess(bootstrap, validator)
+        self.assertLess(bootstrap, cover)
+
+    def test_bootstrap_packages_are_part_of_the_prerequisite_inventory(self):
+        required = set(self.run_bash_fn("get_required_packages").stdout.split())
+        bootstrap = set(self.run_bash_fn("get_bootstrap_packages").stdout.split())
+        self.assertTrue(bootstrap)
+        self.assertLessEqual(bootstrap, required)
+        self.assertIn("python3", bootstrap)
+        self.assertIn("iproute2", bootstrap)
 
     def test_required_packages_inventory(self):
         res = self.run_bash_fn("get_required_packages")

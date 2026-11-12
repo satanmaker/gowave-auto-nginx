@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Sequence
 
+from .podman import wait_until
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 ACME_TEMPLATE_DIR = REPO_ROOT / "tests" / "fixtures" / "acme"
 PEBBLE_CONFIG_TEMPLATE = ACME_TEMPLATE_DIR / "pebble-config.json"
@@ -275,7 +277,30 @@ class AcmeFixture:
         return tuple(args)
 
     def wait_ready(self, timeout_seconds: int = 120) -> None:
+        """Readiness is observed from outside: the pinned Pebble image has no shell.
+
+        Executing a probe inside the container would need ``bash`` or ``sh``,
+        which the image does not ship, so a published management port is polled
+        over loopback TLS with the fixture CA pinned; that also proves the
+        directory is serving trusted TLS before the operator runs.
+        """
+        if self.management_host_port:
+            if not wait_until(self._management_root, timeout_seconds, f"Pebble fixture {self.name}"):
+                raise AcmeFixtureError(
+                    f"Pebble management API on 127.0.0.1:{self.management_host_port} did not become ready "
+                    f"within {timeout_seconds}s"
+                )
+            return
         self.podman.wait_tcp(self.name, self.host_alias, ACME_PORT, timeout_seconds=timeout_seconds)
+
+    def _management_root(self) -> bool:
+        try:
+            self._root_pem = fetch_issued_root(
+                "127.0.0.1", self.ca_file(), timeout=5, port=self.management_host_port,
+            )
+        except AcmeFixtureError:
+            return False
+        return True
 
     def directory_url(self) -> str:
         return ACME_DIRECTORY_URL
