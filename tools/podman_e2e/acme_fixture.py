@@ -47,6 +47,13 @@ CHALLENGE_TLS_PORT = 443
 
 CONTAINER_FIXTURE_DIR = "/fixtures/acme"
 
+# Pebble rejects a percentage of requests with ``badNonce`` by default (5%) so
+# that ACME client retry logic can be exercised. That is a feature of Pebble's
+# own test suite, not of the product under test: here it would turn one install
+# in twenty into a failure that says nothing about GoWave. The knob is set to
+# zero so a certificate request either works or does not, deterministically.
+FIXTURE_ENVIRONMENT = {"PEBBLE_WFE_NONCEREJECT": "0"}
+
 # Must stay byte-identical to GOWAVE_ACME_TEST_ENDPOINT in modules/nginx.sh and
 # gowave-node-auto.sh; a divergence would make test mode unreachable rather than
 # silently insecure, and the consistency test fails on drift.
@@ -267,6 +274,7 @@ class AcmeFixture:
             aliases=(self.host_alias,),
             privileged=False,
             volumes=(f"{self.directory}:{CONTAINER_FIXTURE_DIR}:ro,Z",),
+            environment=dict(FIXTURE_ENVIRONMENT),
             command=("-config", f"{CONTAINER_FIXTURE_DIR}/pebble-config.json"),
             systemd="false",
             extra_args=self._podman_args(),

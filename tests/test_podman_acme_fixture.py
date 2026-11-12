@@ -194,6 +194,9 @@ class TestPodmanAcmeFixture(unittest.TestCase):
         self.assertEqual(run["aliases"], (acme_fixture.FIXTURE_HOST,))
         self.assertEqual(run["systemd"], "false")
         self.assertEqual(run["command"], ("-config", "/fixtures/acme/pebble-config.json"))
+        # Pebble's own badNonce injection would fail one install in twenty for a
+        # reason that has nothing to do with the product, so the fixture disables it.
+        self.assertEqual(run["environment"], {"PEBBLE_WFE_NONCEREJECT": "0"})
         self.assertEqual(
             run["volumes"],
             (f"{context.secret_dir / 'acme'}:{acme_fixture.CONTAINER_FIXTURE_DIR}:ro,Z",),
