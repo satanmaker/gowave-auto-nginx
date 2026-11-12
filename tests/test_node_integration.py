@@ -12,6 +12,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 NODE_SH = REPO_ROOT / "modules" / "node.sh"
 
 
+def node_sh_without_bundle(directory: Path) -> Path:
+    """Copy the Node module so its SCRIPT_DIR carries no local installer bundle."""
+    copy = directory / "repo" / "modules" / "node.sh"
+    copy.parent.mkdir(parents=True)
+    copy.write_bytes(NODE_SH.read_bytes())
+    return copy
+
+
 class TestNodeIntegration(unittest.TestCase):
     def test_recovery_directory_is_created_private_and_owned_by_caller(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -105,9 +113,16 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("cannot enforce private recovery directory permissions", result.stderr)
 
-    def test_vendored_upstream_installer_matches_pinned_commit_digest(self):
-        installer = REPO_ROOT / "sources" / "gowave-node" / "install.sh"
-        self.assertTrue(installer.is_file(), "Pinned GoWave Node installer must be vendored")
+    def test_the_upstream_node_installer_is_pinned_not_vendored(self):
+        tracked = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "ls-files", "--", "sources/gowave-node/install.sh"],
+            capture_output=True, text=True,
+        )
+        if tracked.returncode == 0:
+            self.assertEqual(
+                tracked.stdout.strip(), "",
+                "the upstream Node installer must stay out of git; the commit pin is the authority",
+            )
         config = REPO_ROOT / "tools" / "live_vps_config.env.example"
         values = {}
         for line in config.read_text(encoding="utf-8").splitlines():
@@ -118,8 +133,6 @@ class TestNodeIntegration(unittest.TestCase):
         expected_digest = values.get("GOWAVE_NODE_INSTALLER_SHA256", "")
         self.assertRegex(commit, r"^[0-9a-fA-F]{40}$")
         self.assertRegex(expected_digest, r"^[0-9a-fA-F]{64}$")
-        actual_digest = hashlib.sha256(installer.read_bytes()).hexdigest()
-        self.assertEqual(actual_digest, expected_digest)
 
     def test_extract_secret_key(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -876,32 +889,40 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertIn("export GOWAVE_ACME_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory", captured)
             self.assertIn('--server "$GOWAVE_ACME_SERVER"', captured)
 
-    def test_node_installer_e2e_gate_bundled_required(self):
+    def test_the_node_installer_gate_requires_a_pinned_verified_installer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             fake_installer = tmp / "install.sh"
             fake_installer.write_text("#!/bin/sh\nexit 0\n")
             fake_installer.chmod(0o755)
-            import hashlib
             real_sha = hashlib.sha256(fake_installer.read_bytes()).hexdigest()
 
-            # Case 1: Missing installer when required
-            cmd_missing = f'source "{NODE_SH}" && GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1 GOWAVE_NODE_INSTALLER_SHA256="{real_sha}" install_local_node "secret" 3002 "{tmp}/nonexistent.sh"'
+            # Case 1: an explicitly supplied installer that does not exist is never
+            # silently replaced by a download.
+            cmd_missing = f'source "{NODE_SH}" && GOWAVE_NODE_REQUIRE_PINNED_INSTALLER=1 GOWAVE_NODE_INSTALLER_SHA256="{real_sha}" install_local_node "secret" 3002 "{tmp}/nonexistent.sh"'
             res_missing = subprocess.run(["bash", "-c", cmd_missing], capture_output=True, text=True)
             self.assertNotEqual(res_missing.returncode, 0)
-            self.assertIn("bundled installer is absent", res_missing.stderr)
+            self.assertIn("GoWave Node installer not found", res_missing.stderr)
 
-            # Case 2: Missing SHA256 env var when required
-            cmd_nosha = f'source "{NODE_SH}" && GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1 GOWAVE_NODE_INSTALLER_SHA256="" install_local_node "secret" 3002 "{fake_installer}"'
-            res_nosha = subprocess.run(["bash", "-c", cmd_nosha], capture_output=True, text=True)
-            self.assertNotEqual(res_nosha.returncode, 0)
-            self.assertIn("GOWAVE_NODE_INSTALLER_SHA256 is not set", res_nosha.stderr)
+            # Case 2: the gate without a pinned commit fails closed before any
+            # execution; the legacy flag name keeps the same guarantee.
+            isolated = node_sh_without_bundle(tmp)
+            for flag in ("GOWAVE_NODE_REQUIRE_PINNED_INSTALLER", "GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER"):
+                with self.subTest(flag=flag):
+                    cmd_unpinned = f'source "{isolated}" && {flag}=1 install_local_node "secret" 3002'
+                    res_unpinned = subprocess.run(["bash", "-c", cmd_unpinned], capture_output=True, text=True)
+                    self.assertNotEqual(res_unpinned.returncode, 0)
+                    self.assertIn(
+                        "GOWAVE_NODE_INSTALLER_COMMIT must be a 40-character hex commit SHA",
+                        res_unpinned.stderr,
+                    )
 
-            # Case 3: Mismatched SHA256
-            cmd_badsha = f'source "{NODE_SH}" && GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1 GOWAVE_NODE_INSTALLER_SHA256="0000000000000000000000000000000000000000000000000000000000000000" install_local_node "secret" 3002 "{fake_installer}"'
+            # Case 3: bytes that do not match the pinned digest are rejected before
+            # the installer is executed.
+            cmd_badsha = f'source "{NODE_SH}" && GOWAVE_NODE_REQUIRE_PINNED_INSTALLER=1 GOWAVE_NODE_INSTALLER_SHA256="{"0" * 64}" install_local_node "secret" 3002 "{fake_installer}"'
             res_badsha = subprocess.run(["bash", "-c", cmd_badsha], capture_output=True, text=True)
             self.assertNotEqual(res_badsha.returncode, 0)
-            self.assertIn("Bundled installer SHA256 mismatch", res_badsha.stderr)
+            self.assertIn("Node installer SHA256 mismatch", res_badsha.stderr)
 
     def test_worker_remote_payload_validates_and_serializes_installer_pins(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1172,6 +1193,93 @@ class TestNodeIntegration(unittest.TestCase):
             res = self._run_node_sh_pinned_core(node_bin, core_bin, version="latest")
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertFalse(install_log.exists())
+
+
+class TestPinnedNodeInstaller(unittest.TestCase):
+    """The pinned commit and digest are the installer contract, not a vendored file."""
+
+    COMMIT = "7b3514d1ab8c674050597820d52d55525d4bece7"
+
+    def _stub_curl(self, directory: Path, body: bytes):
+        bin_dir = directory / "bin"
+        bin_dir.mkdir()
+        payload = directory / "upstream.sh"
+        payload.write_bytes(body)
+        args_log = directory / "curl-args.txt"
+        curl = bin_dir / "curl"
+        curl.write_text(
+            "#!/bin/sh\n"
+            f'printf \'%s\\n\' "$@" >> "{args_log}"\n'
+            f'while [ "$#" -gt 0 ]; do if [ "$1" = "-o" ]; then cp "{payload}" "$2"; fi; shift; done\n'
+        )
+        curl.chmod(0o755)
+        return bin_dir, args_log
+
+    def _fetch(self, script: Path, dest: Path, extra):
+        env = os.environ.copy()
+        for key in ("GOWAVE_NODE_INSTALLER_COMMIT", "GOWAVE_NODE_INSTALLER_SHA256"):
+            env.pop(key, None)
+        env.update(extra)
+        return subprocess.run(
+            ["bash", "-c", f'source "{script}" && fetch_pinned_node_installer "{dest}"'],
+            env=env, capture_output=True, text=True,
+        )
+
+    def test_the_pinned_installer_is_fetched_from_the_commit_and_verified(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            body = b"#!/bin/sh\nexit 0\n"
+            bin_dir, args_log = self._stub_curl(tmp, body)
+            dest = tmp / "installer.sh"
+            result = self._fetch(NODE_SH, dest, {
+                "GOWAVE_NODE_INSTALLER_COMMIT": self.COMMIT,
+                "GOWAVE_NODE_INSTALLER_SHA256": hashlib.sha256(body).hexdigest(),
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            })
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(dest.read_bytes(), body)
+            self.assertEqual(dest.stat().st_mode & 0o777, 0o700)
+            self.assertIn(
+                f"https://raw.githubusercontent.com/aaaSaZaN/gowave-node/{self.COMMIT}/install.sh",
+                args_log.read_text().splitlines(),
+            )
+
+    def test_the_fetched_installer_must_match_the_pinned_digest(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bin_dir, _ = self._stub_curl(tmp, b"#!/bin/sh\nexit 0\n")
+            dest = tmp / "installer.sh"
+            result = self._fetch(NODE_SH, dest, {
+                "GOWAVE_NODE_INSTALLER_COMMIT": self.COMMIT,
+                "GOWAVE_NODE_INSTALLER_SHA256": "0" * 64,
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            })
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Node installer SHA256 mismatch", result.stderr)
+            self.assertFalse(dest.exists(), "a mismatched download must not be left behind")
+
+    def test_the_pin_is_validated_before_any_download(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bin_dir, args_log = self._stub_curl(tmp, b"#!/bin/sh\nexit 0\n")
+            dest = tmp / "installer.sh"
+            cases = (
+                (
+                    {"GOWAVE_NODE_INSTALLER_COMMIT": "main", "GOWAVE_NODE_INSTALLER_SHA256": "0" * 64},
+                    "GOWAVE_NODE_INSTALLER_COMMIT must be a 40-character hex commit SHA",
+                ),
+                (
+                    {"GOWAVE_NODE_INSTALLER_COMMIT": self.COMMIT, "GOWAVE_NODE_INSTALLER_SHA256": ""},
+                    "GOWAVE_NODE_INSTALLER_SHA256 must be a 64-character hex SHA-256 digest",
+                ),
+            )
+            for extra, message in cases:
+                with self.subTest(message=message):
+                    result = self._fetch(NODE_SH, dest, dict(extra, PATH=f"{bin_dir}:{os.environ['PATH']}"))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(message, result.stderr)
+            self.assertFalse(args_log.exists(), "no download may start before the pin is validated")
+            self.assertFalse(dest.exists())
 
 
 class TestLocalNodeIdempotency(unittest.TestCase):
