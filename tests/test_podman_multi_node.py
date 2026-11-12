@@ -8,9 +8,12 @@ which addresses they own, what command provisions the Worker, and how the
 Worker's own report is read. A mistake in any of them turns a real product
 defect into a harness failure — or worse, a wrong node into a passing case.
 """
+import base64
 import contextlib
 import io
+import subprocess
 import sys
+import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -159,6 +162,140 @@ class TestMultiNodeRoles(unittest.TestCase):
         host = self._create()
         self.assertNotIn(host.engine_client_name, host.started)
         host.require_roles()
+
+
+def _ssh_ed25519(seed, comment):
+    """A well-formed ed25519 public key line, so the fingerprint helper is exercised for real."""
+    blob = b"\x00\x00\x00\x0b" + b"ssh-ed25519" + b"\x00\x00\x00\x20" + seed
+    return f"ssh-ed25519 {base64.b64encode(blob).decode('ascii')} {comment}"
+
+
+MASTER_PUBLIC_KEY = _ssh_ed25519(b"m" * 32, "root@master")
+WORKER_HOST_KEY = _ssh_ed25519(b"w" * 32, "root@worker")
+
+
+def _append_targets(script):
+    """The files a shell snippet appends to, read out of its own ``>>`` redirects."""
+    targets = []
+    for fragment in script.split(">>")[1:]:
+        words = fragment.split()
+        if words:
+            targets.append(words[0].rstrip(";"))
+    return targets
+
+
+class _TrustPodman(_StubPodman):
+    """A Podman stand-in whose only fidelity is whether stdin reaches the command.
+
+    ``drop_stdin`` names the files whose append must be silently lost. That is
+    precisely what ``podman exec`` without ``-i`` did: the command exited 0 and
+    the file stayed empty, so the product's own preflight was the first thing to
+    notice the missing key.
+    """
+
+    def __init__(self, root, drop_stdin=()):
+        super().__init__(root)
+        self.drop_stdin = tuple(drop_stdin)
+        self.files = {}
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
+        if "ssh-keygen" in script:
+            self.files[(name, "/root/.ssh/id_ed25519.pub")] = MASTER_PUBLIC_KEY + "\n"
+            return subprocess.CompletedProcess(["bash"], 0, "", "")
+        return self.exec(name, ["bash", "-c", script], check=check, input_text=input_text, timeout=timeout)
+
+    def exec(self, name, argv, check=True, input_text=None, timeout=300):
+        if argv[0] == "cat":
+            content = self.files.get((name, argv[1]))
+            if content is None:
+                return subprocess.CompletedProcess(argv, 1, "", f"cat: {argv[1]}: No such file")
+            return subprocess.CompletedProcess(argv, 0, content, "")
+        if argv[0] == "bash":
+            for target in _append_targets(argv[2]):
+                if input_text is None or any(fragment in target for fragment in self.drop_stdin):
+                    continue
+                key = (name, target)
+                self.files[key] = self.files.get(key, "") + input_text
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        raise AssertionError(f"unexpected exec: {argv}")
+
+
+class TestWorkerTrustPin(unittest.TestCase):
+    """5.2: the trust the product preflight checks is proven, never assumed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def host(self, **kwargs):
+        podman = _TrustPodman(Path(self.tmp.name), **kwargs)
+        host = topology.MultiNodeTopology(podman, egress_resolvers=["192.0.2.53"])
+        podman.files[(host.worker_name, "/etc/ssh/ssh_host_ed25519_key.pub")] = WORKER_HOST_KEY + "\n"
+        return host
+
+    def test_the_pin_is_reported_and_present_on_both_sides(self):
+        host = self.host()
+        evidence = host.pin_worker_trust()
+        files = host.podman.files
+        self.assertIn(topology.MultiNodeTopology._key_blob(MASTER_PUBLIC_KEY),
+                      files[(host.worker_name, "/root/.ssh/authorized_keys")])
+        self.assertIn(topology.MultiNodeTopology._key_blob(WORKER_HOST_KEY),
+                      files[(host.target_name, "/root/.ssh/known_hosts")])
+        self.assertEqual(evidence["known_hosts_entry"], host.plan.worker_ip)
+        self.assertTrue(evidence["master_key_fingerprint"].startswith("SHA256:"))
+
+    def test_a_lost_authorized_key_write_is_refused_by_name(self):
+        host = self.host(drop_stdin=("authorized_keys",))
+        with self.assertRaises(topology.TopologyError) as caught:
+            host.pin_worker_trust()
+        self.assertIn("authorized_keys", str(caught.exception))
+        self.assertIn(host.worker_name, str(caught.exception))
+
+    def test_a_lost_known_hosts_write_is_refused_before_the_product_preflight(self):
+        host = self.host(drop_stdin=("known_hosts",))
+        with self.assertRaises(topology.TopologyError) as caught:
+            host.pin_worker_trust()
+        self.assertIn("known_hosts", str(caught.exception))
+        self.assertIn(host.target_name, str(caught.exception))
+
+
+class TestPodmanExecAttachesStdin(unittest.TestCase):
+    """Delivery over stdin only happens when ``podman exec`` is handed ``-i``."""
+
+    def podman(self):
+        from tools.podman_e2e.podman import Podman
+        from tools.podman_e2e.runner import RunContext
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with unittest.mock.patch("tools.podman_e2e.podman.podman_binary", return_value="/usr/bin/podman"):
+            instance = Podman(RunContext(
+                "multi-node", Path(tmp.name), budget_seconds=60,
+                run_id="podman-multi-node-stdin-00000000",
+            ))
+        calls = []
+
+        def record(args, check=True, input_text=None, timeout=300):
+            calls.append((list(args), input_text))
+            return subprocess.CompletedProcess(list(args), 0, "", "")
+
+        instance._run = record
+        return instance, calls
+
+    def test_an_append_travels_over_attached_stdin(self):
+        podman, calls = self.podman()
+        podman.exec("worker", ["bash", "-c", "cat >> /root/.ssh/authorized_keys"],
+                    input_text=MASTER_PUBLIC_KEY + "\n")
+        argv, delivered = calls[0]
+        self.assertEqual(argv[:5], ["exec", "-i", "worker", "bash", "-c"])
+        self.assertEqual(delivered, MASTER_PUBLIC_KEY + "\n")
+
+    def test_a_command_without_input_does_not_attach_stdin(self):
+        podman, calls = self.podman()
+        podman.exec("worker", ["cat", "/etc/ssh/ssh_host_ed25519_key.pub"])
+        argv, delivered = calls[0]
+        self.assertNotIn("-i", argv)
+        self.assertIsNone(delivered)
 
 
 class TestMultiNodeZone(unittest.TestCase):

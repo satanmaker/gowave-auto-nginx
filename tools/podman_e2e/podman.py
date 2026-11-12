@@ -274,7 +274,12 @@ class Podman:
         input_text: Optional[str] = None,
         timeout: int = DEFAULT_COMMAND_TIMEOUT,
     ) -> subprocess.CompletedProcess:
-        return self._run(["exec", name, *argv], check=check, input_text=input_text, timeout=timeout)
+        # ``podman exec`` attaches stdin only with ``-i``; without it the container
+        # reads EOF, so a command like ``cat >> file`` succeeds and writes nothing.
+        # Delivery over stdin is how secrets and keys avoid argv, so the flag is
+        # mandatory whenever there is something to deliver.
+        attached = ["-i"] if input_text is not None else []
+        return self._run(["exec", *attached, name, *argv], check=check, input_text=input_text, timeout=timeout)
 
     def exec_bash(
         self,
