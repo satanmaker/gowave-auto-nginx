@@ -346,6 +346,26 @@ def data_plane_cases() -> List[Dict[str, Any]]:
         "topology": ["aio"],
         "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
     })
+    nodes = (data.get("topologies") or {}).get(matrix_data.MULTI_NODE, {}).get("nodes") or []
+    for node in nodes:
+        for inbound, client in matrix_data.tuples(data, vision=True):
+            entries.append({
+                "id": matrix_data.case_id(
+                    data, matrix_data.MULTI_NODE, str(inbound["id"]), client, node=str(node),
+                ),
+                "requirement": "Real client data-plane verification",
+                "assertion": (
+                    f"The {client} client consumes the Panel-issued {inbound['id']} outbound of the "
+                    f"{node} node — {inbound['protocol']} over {inbound['transport']} with the "
+                    f"{inbound['security']} security layer — sends a unique payload through it, and the "
+                    "controlled endpoint echoes the request id and body digest while recording that "
+                    "node's own egress address, not the client's, under the SNI that node publishes for "
+                    "the inbound. Both nodes serve the same transport/security pairs, so the case names "
+                    "the node: a transfer that dialled the other node's name would prove the other node."
+                ),
+                "topology": ["multi-node"],
+                "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
+            })
     return entries
 
 

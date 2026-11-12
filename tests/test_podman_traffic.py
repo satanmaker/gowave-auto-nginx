@@ -6,7 +6,9 @@ echoes, the digest of the body it received, and the source address it observed.
 These tests hold the probe, the case that reads its facts, and the topology that
 gives it somewhere to send the payload to.
 """
+import contextlib
 import hashlib
+import io
 import json
 import socket
 import subprocess
@@ -66,10 +68,12 @@ XRAY_CONFIG = {
         {"tag": "http-in", "protocol": "http", "port": 10809},
     ],
     "outbounds": [
-        {"tag": "proxy", "protocol": "vless", "streamSettings": {
-            "network": "tcp", "security": "reality",
-            "realitySettings": {"serverName": topology.REALITY_DOMAIN},
-        }},
+        {"tag": "proxy", "protocol": "vless",
+         "settings": {"vnext": [{"address": topology.PANEL_DOMAIN, "port": 443}]},
+         "streamSettings": {
+             "network": "tcp", "security": "reality",
+             "realitySettings": {"serverName": topology.REALITY_DOMAIN},
+         }},
         {"tag": "direct", "protocol": "freedom"},
         {"tag": "block", "protocol": "blackhole"},
     ],
@@ -80,12 +84,14 @@ SERVED_MIHOMO = "\n".join([
     "proxies:",
     "  - name: vless-reality",
     "    type: vless",
+    "    server: reality.testbed.internal",
     "    network: tcp",
     "    servername: reality.testbed.internal",
     "    reality-opts:",
     "      public-key: public-key-value",
     "  - name: vless-ws",
     "    type: vless",
+    "    server: panel.testbed.internal",
     "    network: ws",
     "    servername: panel.testbed.internal",
     "    tls: true",
@@ -156,6 +162,21 @@ class TestTrafficProbeHelpers(unittest.TestCase):
         self.assertEqual(label["security"], "reality")
         self.assertEqual(label["sni"], topology.REALITY_DOMAIN)
         self.assertEqual(label["protocol"], "vless")
+        self.assertEqual(label["server"], topology.PANEL_DOMAIN)
+
+    def test_the_xray_label_reads_the_server_from_every_shape_the_templates_use(self):
+        vless = traffic_probe.xray_label(XRAY_CONFIG)
+        self.assertEqual(vless["server"], topology.PANEL_DOMAIN)
+        trojan = traffic_probe.xray_label({"outbounds": [
+            {"tag": "proxy", "protocol": "trojan",
+             "settings": {"servers": [{"address": topology.WORKER_DOMAIN, "port": 443}]}},
+        ]})
+        self.assertEqual(trojan["server"], topology.WORKER_DOMAIN)
+        self.assertEqual(
+            traffic_probe.xray_label({"outbounds": [{"tag": "proxy", "protocol": "trojan"}]})["server"],
+            "",
+            "an outbound that dials nothing must not be reported as naming a host",
+        )
 
     def test_the_xray_label_falls_back_to_the_tls_and_tcp_defaults(self):
         config = {"outbounds": [{"tag": "proxy", "protocol": "trojan", "streamSettings": {
@@ -173,10 +194,12 @@ class TestTrafficProbeHelpers(unittest.TestCase):
         self.assertEqual(reality["tag"], "vless-reality")
         self.assertEqual(reality["security"], "reality")
         self.assertEqual(reality["sni"], topology.REALITY_DOMAIN)
+        self.assertEqual(reality["server"], topology.REALITY_DOMAIN)
         plain = traffic_probe.mihomo_label(proxies[1])
         self.assertEqual(plain["network"], "ws")
         self.assertEqual(plain["security"], "tls")
         self.assertEqual(plain["sni"], topology.PANEL_DOMAIN)
+        self.assertEqual(plain["server"], topology.PANEL_DOMAIN)
 
     def test_the_fixture_anchor_is_appended_as_pem_without_editing_the_served_yaml(self):
         with tempfile.TemporaryDirectory(prefix="gowave-traffic-ca-") as directory:
@@ -436,9 +459,11 @@ class TestTrafficProbeTransferOne(unittest.TestCase):
     def labels(self):
         return [
             {"engine": "xray", "tag": "proxy", "network": "tcp", "security": "reality",
+             "server": topology.PANEL_DOMAIN,
              "sni": topology.REALITY_DOMAIN, "status": 200, "delivered": True,
              "request_id_match": True, "body_match": True, "source_ip": PLAN.data_target_ip},
             {"engine": "xray", "tag": "proxy", "network": "ws", "security": "tls",
+             "server": topology.PANEL_DOMAIN,
              "sni": topology.PANEL_DOMAIN, "status": 200, "delivered": True,
              "request_id_match": True, "body_match": True, "source_ip": PLAN.data_target_ip},
         ]
@@ -451,13 +476,13 @@ class TestTrafficProbeTransferOne(unittest.TestCase):
             return selected
         return transfers
 
-    def run_one(self, labels, network="tcp", security="reality", calls=None):
+    def run_one(self, labels, network="tcp", security="reality", calls=None, host=""):
         with tempfile.TemporaryDirectory() as workdir:
             with mock.patch.object(traffic_probe, "xray_transfers",
                                    self.fake(labels, calls)):
                 return traffic_probe.transfer_one(
                     "/secrets", "/fixtures/ca/root.pem", "203.0.114.30:18080", Path(workdir),
-                    "xray", network, security,
+                    "xray", network, security, host=host,
                 )
 
     def test_the_scope_sends_through_the_one_outbound_the_tuple_names(self):
@@ -484,6 +509,40 @@ class TestTrafficProbeTransferOne(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             self.run_one(labels)
         self.assertIn("declares 2 tcp/reality outbound(s)", str(caught.exception))
+
+    def test_the_scope_narrows_the_tuple_to_the_node_that_was_named(self):
+        labels = self.labels()
+        labels.append(dict(labels[0], tag="worker", server=topology.WORKER_DOMAIN,
+                           sni=topology.WORKER_REALITY_DOMAIN))
+        facts = self.run_one(labels, host=topology.WORKER_DOMAIN)
+        self.assertEqual(facts["tag"], "worker")
+        self.assertEqual(facts["server"], topology.WORKER_DOMAIN)
+        self.assertEqual(facts["sni"], topology.WORKER_REALITY_DOMAIN)
+
+    def test_a_node_that_serves_no_such_tuple_is_a_missing_case(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_one(self.labels(), host=topology.WORKER_DOMAIN)
+        self.assertIn(
+            f"declares 0 tcp/reality outbound(s) on {topology.WORKER_DOMAIN}",
+            str(caught.exception),
+        )
+
+    def test_the_host_argument_reaches_the_scope_from_the_command_line(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            with mock.patch.object(traffic_probe, "transfer_one",
+                                   return_value={"outbounds": 1}) as probe, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                traffic_probe.main([
+                    "--scope", "transfer",
+                    "--ca", "/fixtures/ca/root.pem",
+                    "--destination", "203.0.114.30:18080",
+                    "--engine", "xray",
+                    "--network", "tcp",
+                    "--security", "reality",
+                    "--host", topology.WORKER_DOMAIN,
+                    "--workdir", workdir,
+                ])
+        self.assertEqual(probe.call_args.kwargs["host"], topology.WORKER_DOMAIN)
 
     def test_the_scope_refuses_an_engine_the_matrix_does_not_pin(self):
         with tempfile.TemporaryDirectory() as workdir:
@@ -711,6 +770,7 @@ class StubEngineHost:
         self.scopes = []
         self.payload_dirs = []
         self.transfers = []
+        self.transfer_hosts = []
         self.facts = facts
         self.returncode = returncode
         self.stdout = stdout
@@ -730,8 +790,20 @@ class StubEngineHost:
         body = self.stdout if self.stdout is not None else json.dumps(self.facts or {})
         return self._probe(body, self.returncode)
 
-    def transfer_facts(self, engine, network, security, timeout=300):
+    def node_names(self, node=""):
+        if node not in ("", "local"):
+            raise topology.TopologyError(f"the test host has one node, not {node!r}")
+        return {"dial": self.panel_domain, "reality": self.reality_domain,
+                "vision": self.vision_domain or ""}
+
+    def node_data_ip(self, node=""):
+        if node not in ("", "local"):
+            raise topology.TopologyError(f"the test host has one node, not {node!r}")
+        return str(self.plan.data_target_ip)
+
+    def transfer_facts(self, engine, network, security, timeout=300, host=""):
         self.transfers.append((engine, network, security))
+        self.transfer_hosts.append(host)
         body = self.stdout if self.stdout is not None else json.dumps(self.facts or {})
         return self._probe(body, self.returncode)
 
@@ -742,6 +814,7 @@ def data_plane_facts(**overrides):
         "outbounds": 1,
         "engine": "xray",
         "tag": "proxy",
+        "server": topology.PANEL_DOMAIN,
         "network": "tcp",
         "security": "reality",
         "sni": topology.REALITY_DOMAIN,
@@ -813,8 +886,12 @@ class TestDataPlaneCase(unittest.TestCase):
         self.assertEqual(evidence["sni"], topology.REALITY_DOMAIN)
         self.assertEqual(evidence["status"], 200)
         self.assertEqual(evidence["source_ip"], PLAN.data_target_ip)
+        self.assertEqual(evidence["server"], topology.PANEL_DOMAIN)
         self.assertEqual(evidence["outbounds"], 1)
+        self.assertNotIn("node", evidence, "a single-node run has no node to name")
         self.assertEqual(product.host.transfers, [("xray", "tcp", "reality")])
+        self.assertEqual(product.host.transfer_hosts, [topology.PANEL_DOMAIN],
+                         "the probe is narrowed to the one node's own dial name")
         self.assertIn("--scope subscriptions", podman.scripts[0])
         for value in evidence.values():
             self.assertIsInstance(
@@ -831,12 +908,15 @@ class TestDataPlaneCase(unittest.TestCase):
     def test_the_vision_tuple_is_served_under_the_vision_domain(self):
         facts = data_plane_facts(
             engine="mihomo", network="tcp", security="tls", sni=topology.VISION_DOMAIN,
+            server=topology.VISION_DOMAIN,
         )
         evidence, product, _ = self.run_case(
             inbound_id="VISION", client="mihomo", facts=facts, vision=True,
         )
         self.assertEqual(product.inbound_count, 5)
         self.assertEqual(product.host.transfers, [("mihomo", "tcp", "tls")])
+        self.assertEqual(product.host.transfer_hosts, [topology.VISION_DOMAIN],
+                         "the Vision inbound is dialled by its own name")
         self.assertEqual(evidence["sni"], topology.VISION_DOMAIN)
 
     def test_the_case_fails_when_the_tuple_matches_more_than_one_outbound(self):
@@ -863,6 +943,18 @@ class TestDataPlaneCase(unittest.TestCase):
             f"carries SNI {topology.PANEL_DOMAIN!r} instead of the {topology.REALITY_DOMAIN!r}",
             sni=topology.PANEL_DOMAIN,
         )
+
+    def test_the_case_fails_when_the_outbound_dials_another_nodes_name(self):
+        self.reject(
+            f"dials {topology.WORKER_DOMAIN!r} instead of {topology.PANEL_DOMAIN!r}",
+            server=topology.WORKER_DOMAIN,
+        )
+
+    def test_the_case_fails_when_it_names_a_node_the_topology_does_not_have(self):
+        product, _ = installed_product(self.context, facts=data_plane_facts())
+        with self.assertRaises(topology.TopologyError) as caught:
+            aio.case_data_plane(product, self.inbound("REALITY"), "xray", node="worker")
+        self.assertIn("has one node, not 'worker'", str(caught.exception))
 
     def test_the_case_fails_when_the_probe_exits_non_zero(self):
         product, _ = installed_product(self.context, returncode=1)
@@ -1378,6 +1470,14 @@ class TestTrafficTopology(unittest.TestCase):
         self.assertEqual(argv[argv.index("--ca") + 1], f"{topology.CA_MOUNT}/{topology.ISSUED_ROOT_NAME}")
         self.assertEqual(argv[argv.index("--destination") + 1],
                          f"{self.instance.plan.data_echo_ip}:{topology.ECHO_HTTP_PORT}")
+
+    def test_the_transfer_scope_names_the_node_only_when_one_is_given(self):
+        self.instance.transfer_facts("xray", "tcp", "reality")
+        self.assertNotIn("--host", self.podman.execs[-1][1],
+                         "a single-node run has no second node to disambiguate")
+        self.instance.transfer_facts("xray", "tcp", "reality", host=topology.WORKER_DOMAIN)
+        argv = self.podman.execs[-1][1]
+        self.assertEqual(argv[argv.index("--host") + 1], topology.WORKER_DOMAIN)
 
     def test_the_engine_client_reaches_both_the_control_plane_and_the_endpoint(self):
         self.instance.engine_client()

@@ -265,6 +265,14 @@ def proxy_outbound(config: Dict[str, Any]) -> Dict[str, Any]:
     raise SystemExit("the Panel-issued Xray profile carries no proxy outbound")
 
 
+def outbound_address(outbound: Dict[str, Any]) -> str:
+    """The host an Xray outbound dials, whichever shape the protocol declares it in."""
+    settings = outbound.get("settings") or {}
+    servers = settings.get("vnext") or settings.get("servers") or [{}]
+    server = servers[0] if isinstance(servers[0], dict) else {}
+    return str(server.get("address") or "")
+
+
 def xray_label(config: Dict[str, Any]) -> Dict[str, str]:
     outbound = proxy_outbound(config)
     stream = outbound.get("streamSettings") or {}
@@ -272,6 +280,7 @@ def xray_label(config: Dict[str, Any]) -> Dict[str, str]:
     return {
         "tag": str(outbound.get("tag") or ""),
         "protocol": str(outbound.get("protocol") or ""),
+        "server": outbound_address(outbound),
         "network": str(stream.get("network") or "tcp"),
         "security": str(stream.get("security") or "none"),
         "sni": str(settings.get("serverName") or ""),
@@ -287,6 +296,7 @@ def mihomo_label(proxy: Dict[str, str]) -> Dict[str, str]:
     return {
         "tag": str(proxy.get("name") or ""),
         "protocol": str(proxy.get("type") or ""),
+        "server": str(proxy.get("server") or ""),
         "network": str(proxy.get("network") or "tcp"),
         "security": (
             "reality" if "reality-opts" in proxy else ("tls" if proxy.get("tls") == "true" else "none")
@@ -832,6 +842,7 @@ def transfer_one(
     engine: str,
     network: str,
     security: str,
+    host: str = "",
 ) -> Dict[str, Any]:
     """Send one payload through exactly the matrix tuple the arguments name.
 
@@ -841,9 +852,10 @@ def transfer_one(
     papered over by running whatever happened to be first: an unexplained extra
     case and a missing one are both count drift.
 
-    The verdict stays with the caller — this returns what the endpoint recorded.
-    A connection failure still raises, because that names the engine's own log,
-    which is the only place the reason a tunnel did not accept a payload exists.
+    ``host`` narrows the tuple to one node. A cluster serves the same transport
+    and security layer on both nodes, so without it a Worker tuple would match
+    the Master's outbound and prove the wrong node. The verdict stays with the
+    caller — this returns what the endpoint recorded.
     """
     if not destination:
         raise SystemExit("a destination address is required: the payload needs somewhere to go")
@@ -851,22 +863,26 @@ def transfer_one(
         raise SystemExit(f"unknown matrix client {engine!r}: the probe runs the pinned engines only")
 
     def selected(label: Dict[str, str]) -> bool:
-        return matches_tuple(label, network, security)
+        if not matches_tuple(label, network, security):
+            return False
+        return not host or str(label.get("server")) == host
 
     if engine == "xray":
         found = xray_transfers(payload_dir, ca_file, destination, workdir, match=selected)
     else:
         found = mihomo_transfers(payload_dir, ca_file, destination, workdir, match=selected)
     if len(found) != 1:
+        where = f" on {host}" if host else ""
         raise SystemExit(
-            f"the served {engine} representation declares {len(found)} {network}/{security} outbound(s) "
-            "for the matrix tuple, expected exactly one"
+            f"the served {engine} representation declares {len(found)} {network}/{security} "
+            f"outbound(s){where} for the matrix tuple, expected exactly one"
         )
     item = found[0]
     return {
         "outbounds": len(found),
         "engine": item.get("engine"),
         "tag": item.get("tag"),
+        "server": item.get("server"),
         "network": item.get("network"),
         "security": item.get("security"),
         "sni": item.get("sni"),
@@ -897,6 +913,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("--network", default="", help="The matrix transport of the transfer scope")
     parser.add_argument("--security", default="", help="The matrix security layer of the transfer scope")
+    parser.add_argument(
+        "--host", default="",
+        help="The node's dial name, when the topology has more than one",
+    )
     parser.add_argument("--workdir", default="")
     args = parser.parse_args(argv)
 
@@ -909,7 +929,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elif args.scope == "transfer":
         facts = transfer_one(
             args.payload_dir, args.ca, args.destination, workdir,
-            args.engine, args.network, args.security,
+            args.engine, args.network, args.security, host=args.host,
         )
     else:
         scopes = {
