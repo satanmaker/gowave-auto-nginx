@@ -1,0 +1,35 @@
+# A clean, supported, systemd-enabled target host for the product E2E.
+#
+# Nothing the product installs is pre-installed here on purpose: the operator
+# under test must resolve and install NGINX, Certbot, UFW, Fail2ban, Python and
+# the rest itself, exactly as it would on a fresh VPS. Adding any of those would
+# let a missing prerequisite step pass unnoticed.
+ARG BASE_IMAGE=docker.io/library/ubuntu:24.04
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV container=podman
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        systemd \
+        systemd-sysv \
+        dbus \
+    && rm -rf /var/lib/apt/lists/*
+
+# A container has no udev, logind seat, or tty; masking these keeps PID 1 from
+# repeatedly failing units that can never work in this environment.
+RUN rm -f /lib/systemd/system/sysinit.target.wants/systemd-udevd.service \
+    /lib/systemd/system/multi-user.target.wants/systemd-logind.service \
+    /lib/systemd/system/getty.target.wants/getty@tty1.service \
+    /lib/systemd/system/sockets.target.wants/*udev* \
+    /lib/systemd/system/sockets.target.wants/*initctl* \
+    && systemctl mask --force systemd-udevd.service systemd-udevd-control.socket \
+        systemd-udevd-kernel.socket systemd-logind.service getty@tty1.service >/dev/null
+
+# The product manages its own swap and BBR settings; the container only has to
+# reach multi-user.target with a working service manager.
+RUN systemctl set-default multi-user.target >/dev/null
+
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

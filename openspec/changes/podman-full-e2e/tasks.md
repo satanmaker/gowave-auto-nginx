@@ -36,7 +36,7 @@
 
 ## 4. All-in-One product E2E
 
-- [ ] 4.1 Create a clean supported systemd-enabled target image.
+- [x] 4.1 Create a clean supported systemd-enabled target image.
 - [ ] 4.2 Execute the real operator full-install path without test-side product provisioning.
 - [ ] 4.3 Verify installed packages, systemd units, active services, listening sockets, Panel/API, NGINX, and TLS independently.
 - [ ] 4.4 Exercise Panel authentication and required API lifecycle operations.

@@ -125,6 +125,25 @@ class Podman:
         self._run(args)
         return name
 
+    def network_subnets(self) -> List[str]:
+        """Subnets already claimed by Podman networks, so a new /24 never collides."""
+        listing = self._run(["network", "ls", "--format", "{{.Name}}"], check=False)
+        subnets: List[str] = []
+        for name in (listing.stdout or "").split():
+            inspected = self._run(["network", "inspect", name], check=False)
+            if inspected.returncode != 0:
+                continue
+            try:
+                data = json.loads(inspected.stdout or "[]")
+            except json.JSONDecodeError:
+                continue
+            for network in data if isinstance(data, list) else []:
+                for entry in (network.get("subnets") or []):
+                    subnet = entry.get("subnet") if isinstance(entry, dict) else None
+                    if subnet:
+                        subnets.append(str(subnet))
+        return subnets
+
     def volume_create(self, name: str) -> str:
         self._run(["volume", "create", *self._ownership_labels(), name])
         return name
@@ -177,6 +196,7 @@ class Podman:
         command: Optional[Sequence[str]] = None,
         read_only_repo: bool = True,
         systemd: str = "always",
+        extra_args: Sequence[str] = (),
     ) -> str:
         args = [
             "run", "-d", "--name", name,
@@ -195,17 +215,32 @@ class Podman:
             args += ["-v", f"{Path(__file__).resolve().parent.parent.parent}:/repo:ro"]
         for key, value in (environment or {}).items():
             args += ["-e", f"{key}={value}"]
+        args.extend(extra_args)
         args.append(self.ensure_image(image_alias))
         if command:
             args.extend(command)
         self._run(args)
         return name
 
-    def exec(self, name: str, argv: Sequence[str], check: bool = True, input_text: Optional[str] = None) -> subprocess.CompletedProcess:
-        return self._run(["exec", name, *argv], check=check, input_text=input_text)
+    def exec(
+        self,
+        name: str,
+        argv: Sequence[str],
+        check: bool = True,
+        input_text: Optional[str] = None,
+        timeout: int = DEFAULT_COMMAND_TIMEOUT,
+    ) -> subprocess.CompletedProcess:
+        return self._run(["exec", name, *argv], check=check, input_text=input_text, timeout=timeout)
 
-    def exec_bash(self, name: str, script: str, check: bool = True, input_text: Optional[str] = None) -> subprocess.CompletedProcess:
-        return self.exec(name, ["bash", "-lc", script], check=check, input_text=input_text)
+    def exec_bash(
+        self,
+        name: str,
+        script: str,
+        check: bool = True,
+        input_text: Optional[str] = None,
+        timeout: int = DEFAULT_COMMAND_TIMEOUT,
+    ) -> subprocess.CompletedProcess:
+        return self.exec(name, ["bash", "-lc", script], check=check, input_text=input_text, timeout=timeout)
 
     def wait_systemd(self, name: str, timeout_seconds: int = 90) -> str:
         observed = {"state": "unknown"}
