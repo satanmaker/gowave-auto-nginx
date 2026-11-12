@@ -241,6 +241,18 @@ class TestArtifactOwnership(unittest.TestCase):
         with mock.patch.dict(os.environ, {"SUDO_UID": "1234", "SUDO_GID": "5678"}):
             self.assertEqual(operator_identity(Path("/nonexistent")), (1234, 5678))
 
+    def test_sudo_from_a_root_shell_falls_back_to_the_artifact_owner(self):
+        from unittest import mock
+
+        from tools.podman_e2e.runner import operator_identity
+
+        # ``sudo`` run inside a root shell reports the invoker as root, which
+        # would hand the evidence back to root and change nothing.
+        artifact_root = mock.Mock()
+        artifact_root.stat.return_value = mock.Mock(st_uid=1000, st_gid=1000)
+        with mock.patch.dict(os.environ, {"SUDO_UID": "0", "SUDO_GID": "0"}):
+            self.assertEqual(operator_identity(artifact_root), (1000, 1000))
+
     def test_an_artifact_root_owned_by_root_is_left_alone(self):
         from unittest import mock
 

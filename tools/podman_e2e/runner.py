@@ -40,10 +40,14 @@ def operator_identity(artifact_root: Path) -> Optional[tuple[int, int]]:
     Multi-Node run came out root-owned. The owner of the artifact root is the
     same operator in that case, and when that owner is root itself the run
     leaves ownership alone.
+
+    ``sudo`` invoked from a root shell reports ``SUDO_UID=0``: there the
+    credentials name root, handing the tree back to root would change nothing,
+    so they are ignored exactly like absent ones.
     """
     uid = os.environ.get("SUDO_UID")
     gid = os.environ.get("SUDO_GID")
-    if uid and gid:
+    if uid and gid and int(uid) != 0:
         return int(uid), int(gid)
     try:
         owned = artifact_root.stat()
