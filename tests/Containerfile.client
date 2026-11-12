@@ -1,0 +1,37 @@
+# The Control Machine role for the Podman acceptance suite: the client engines
+# that consume what the Panel serves, and nothing from the product.
+#
+# The base image is pinned by registry digest through images.lock.yaml, and both
+# engines are pinned by version *and* SHA-256 from tests/cases/matrix.yaml. The
+# build fails if a downloaded artifact does not match either, so a case can never
+# report "the client rejected this subscription" when the client was the wrong
+# build.
+#
+# No package manager is used: the base image already carries python3, which is
+# enough to verify and unpack the pinned artifacts.
+ARG BASE_IMAGE=docker.io/library/python:3.12-slim
+FROM ${BASE_IMAGE}
+
+ARG XRAY_URL
+ARG XRAY_SHA256
+ARG XRAY_EXPECT
+ARG MIHOMO_URL
+ARG MIHOMO_SHA256
+ARG MIHOMO_EXPECT
+
+COPY install_client_artifact.py /usr/local/lib/install_client_artifact.py
+
+RUN python3 /usr/local/lib/install_client_artifact.py \
+        --url "${XRAY_URL}" --sha256 "${XRAY_SHA256}" --archive zip \
+        --member xray --dest /usr/local/bin/xray \
+        --version-arg version --expect "${XRAY_EXPECT}"
+
+RUN python3 /usr/local/lib/install_client_artifact.py \
+        --url "${MIHOMO_URL}" --sha256 "${MIHOMO_SHA256}" --archive gz \
+        --dest /usr/local/bin/mihomo \
+        --version-arg="-v" --expect "${MIHOMO_EXPECT}"
+
+ENV PYTHONDONTWRITEBYTECODE=1
+WORKDIR /work
+
+CMD ["sleep", "infinity"]

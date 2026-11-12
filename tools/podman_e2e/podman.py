@@ -179,13 +179,23 @@ class Podman:
         self.context.environment.setdefault("images_resolved", {})[alias] = f"{repository}@{digest}"
         return pinned
 
-    def build(self, tag: str, base_alias: str, containerfile: Path, context_dir: Path) -> str:
+    def build(
+        self,
+        tag: str,
+        base_alias: str,
+        containerfile: Path,
+        context_dir: Path,
+        build_args: Optional[Dict[str, str]] = None,
+    ) -> str:
         """Build a testbed image from a digest-pinned base and label it for cleanup."""
         base = self.ensure_image(base_alias)
+        arguments = ["--build-arg", f"BASE_IMAGE={base}"]
+        for key, value in (build_args or {}).items():
+            arguments += ["--build-arg", f"{key}={value}"]
         self._run([
             "build", "-t", tag, "-f", str(containerfile),
             *self._ownership_labels(),
-            "--build-arg", f"BASE_IMAGE={base}",
+            *arguments,
             str(context_dir),
         ])
         self.context.add_cleanup(lambda: self._run(["rmi", "-f", tag], check=False))

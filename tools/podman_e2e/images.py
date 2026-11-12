@@ -45,6 +45,7 @@ REQUIRED_ALIASES: Sequence[str] = (
     "debian-13",
     "acme-pebble",
     "fixture-echo",
+    "client-base",
 )
 
 MANIFEST_ACCEPT = ", ".join((

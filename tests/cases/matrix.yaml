@@ -72,11 +72,27 @@ clients:
     version_key: xray_client_version
     consumes: [base64, xray-json]
     trust: tlsSettings.certificates usage=verify
+    artifact:
+      url: https://github.com/XTLS/Xray-core/releases/download/v26.11.9/Xray-linux-64.zip
+      sha256: "b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82"
+      archive: zip
+      member: xray
+    version_check:
+      argument: version
+      contains: "Xray 26.11.9"
   - id: mihomo
     binary: mihomo
     version_key: mihomo_client_version
     consumes: [mihomo, clash]
     trust: scoped CA bundle
+    artifact:
+      url: https://github.com/MetaCubeX/mihomo/releases/download/v1.19.34/mihomo-linux-amd64-v1.19.34.gz
+      sha256: "223fab877e5795ce780ba39902e5f0b1113c1256ae244a7160f1165e017e9ccc"
+      archive: gz
+      member: ""
+    version_check:
+      argument: -v
+      contains: "v1.19.34"
 
 representations:
   base64: "/api/sub/{shortUuid}"

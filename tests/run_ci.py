@@ -26,6 +26,8 @@ SUITES = {
         "test_podman_fixture_isolation.TestPodmanFixtureIsolation",
         "test_podman_client_trust.TestPodmanClientTrust",
         "test_podman_target_image.TestPodmanTargetImage",
+        "test_podman_client_image.TestClientImageContract",
+        "test_podman_client_image.TestClientArtifactInstaller",
         "test_podman_topology.TestPodmanTopology",
         "test_podman_aio.TestAioSuite",
         "test_podman_aio.TestAioVerificationCases",
