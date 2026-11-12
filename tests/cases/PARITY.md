@@ -60,7 +60,9 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **AIO-PACKAGES** — promotion target: All-in-One Master VPS Installation Verification
 - **AIO-AUTH** — promotion target: All-in-One Master VPS Installation Verification
 - **AIO-CLIENT** — promotion target: Real Subscription Delivery and User-Agent Policy
+- **SUB-SERVED** — promotion target: Real Subscription Delivery and User-Agent Policy
 - **SUB-B64** — promotion target: Real Subscription Delivery and User-Agent Policy
+- **SUB-UA-ABSENT** — promotion target: Real Subscription Delivery and User-Agent Policy
 - **SUB-UA-BLANK** — promotion target: Real Subscription Delivery and User-Agent Policy
 - **SUB-JSON-SHAPES** — promotion target: Real Subscription Delivery and User-Agent Policy
 - **NGX-COVER-DERIVE** — promotion target: NGINX SNI Routing and REALITY Decoy Verification

@@ -61,11 +61,35 @@ PUBLIC_PANEL = f"https://{topology.PANEL_DOMAIN}"
 PANEL_DOMAIN = topology.PANEL_DOMAIN
 REALITY_DOMAIN = topology.REALITY_DOMAIN
 PANEL_SURFACE_SCRIPT = "/repo/tools/podman_e2e/panel_surface.py"
+SUBSCRIPTION_PROBE_SCRIPT = topology.SUBSCRIPTION_PROBE_SCRIPT
 
 # The MVP profile carries four inbounds without a Vision domain; the fifth
 # appears only when the optional Vision domain is configured, which this
 # topology does not configure.
 CORE_INBOUNDS = 4
+
+# What each YAML representation is expected to carry, per the shipped generators.
+# GenerateMihomo skips only kcp, so Mihomo receives one proxy per inbound.
+# GenerateClash skips vless, xhttp, kcp and hysteria outright, and the core set
+# has exactly one trojan entry, so Clash receives that single proxy — a strict
+# subset of the Mihomo inventory, not a second copy of it.
+MIHOMO_PROXIES = CORE_INBOUNDS
+CLASH_PROXIES = 1
+MIHOMO_PROXY_TYPES: Sequence[str] = ("trojan", "vless")
+CLASH_PROXY_TYPES: Sequence[str] = ("trojan",)
+
+# Every served representation the Panel exposes, and the client family that
+# consumes it. The order matches the documented representation inventory.
+REPRESENTATIONS: Sequence[str] = ("base64", "xray-json", "mihomo", "clash", "singbox")
+# Non-base64 representations are validated structurally; these two are loaded by
+# the real engine that consumes them.
+ENGINE_LOADED: Sequence[str] = ("base64", "xray-json", "mihomo", "clash")
+
+# The product emits this uTLS fingerprint on REALITY and TLS transports, and the
+# matrix pins the same value; a subscription that lost it is not importable.
+EXPECTED_FINGERPRINT = "firefox"
+
+UA_REFUSAL_STATUS = 403
 
 
 class AioProduct:
@@ -77,6 +101,8 @@ class AioProduct:
         self.distribution = distribution
         self.host: Optional[topology.AioTopology] = None
         self.outcome: Optional[topology.InstallOutcome] = None
+        self._subscriptions: Optional[Dict[str, Any]] = None
+        self._subscription_error = ""
 
     # ------------------------------------------------------------------ install
     def install(self) -> Dict[str, Any]:
@@ -116,6 +142,55 @@ class AioProduct:
     def host_script(self, script: str, timeout: int = 120) -> Any:
         host = self.require_installed()
         return self.podman.exec_bash(host.target_name, script, check=False, timeout=timeout)
+
+    # ----------------------------------------------------------- subscriptions
+    def collect_subscriptions(self, case_id: str) -> Dict[str, Any]:
+        """Fetch every representation once; the payloads stay on the host, 0600.
+
+        The subscription routes are loopback-only, so the host is the only place
+        that can read them. What comes back is a status, a media type, and a byte
+        count per representation — never the payload itself.
+        """
+        if self._subscriptions is not None:
+            return self._subscriptions
+        if self._subscription_error:
+            raise CaseBlocked(f"SUB-SERVED: {self._subscription_error}")
+        result = self.host_script(
+            f"python3 {PANEL_SURFACE_SCRIPT} --scope subscriptions "
+            f"--payload-dir {topology.PAYLOAD_MOUNT}"
+        )
+        detail = (result.stderr or result.stdout or "").strip()[-2000:]
+        if result.returncode != 0:
+            self._subscription_error = f"the subscription probe exited {result.returncode}: {detail}"
+            require(case_id, False, self._subscription_error)
+        try:
+            facts = json.loads(result.stdout or "")
+        except json.JSONDecodeError:
+            self._subscription_error = f"the subscription probe did not print JSON: {(result.stdout or '')[:400]}"
+            require(case_id, False, self._subscription_error)
+            return {}
+        self._subscriptions = facts.get("subscriptions") or {}
+        return self._subscriptions
+
+    def subscription_payloads(self, case_id: str) -> Dict[str, Any]:
+        """The payloads another case fetched, or a block that names the owning case."""
+        return self.collect_subscriptions(case_id)
+
+    def engine_facts(self, case_id: str, scope: str) -> Dict[str, Any]:
+        """Run the engine-side probe and return the facts it reports."""
+        host = self.require_installed()
+        result = host.subscription_facts(scope)
+        detail = (result.stderr or result.stdout or "").strip()[-2000:]
+        require(
+            case_id,
+            result.returncode == 0,
+            f"the client probe exited {result.returncode}: {detail}",
+        )
+        try:
+            return json.loads(result.stdout or "")
+        except json.JSONDecodeError:
+            require(case_id, False, f"the client probe did not print JSON: {(result.stdout or '')[:400]}")
+            return {}
 
 
 def _login_preamble() -> str:
@@ -482,6 +557,241 @@ def case_client_lifecycle(product: AioProduct) -> Dict[str, Any]:
     return facts
 
 
+def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
+    """SUB-SERVED: every served representation is fetched and loaded by its real client.
+
+    The Panel serves five representations and none of them substitutes for
+    another: the base64 list is what an Xray-family mobile client imports, the
+    Xray JSON is a config object or a list of complete per-profile configs, and
+    the Mihomo YAML is loaded by Mihomo itself. The Clash YAML is loaded by the
+    same engine but carries only the trojan subset the shipped Clash generator
+    keeps. Only the representations a pinned engine consumes are executed,
+    because the sing-box client is not part of the pinned matrix.
+    """
+    facts = product.collect_subscriptions("SUB-SERVED")
+    require("SUB-SERVED", int(facts.get("short_uuid_length") or 0) > 0,
+            "the default client has no shortUuid, so no subscription could be fetched")
+
+    served = facts.get("representations") or {}
+    for name in REPRESENTATIONS:
+        record = served.get(name) or {}
+        require("SUB-SERVED", record.get("status") == 200,
+                f"GET /api/sub/<shortUuid>/{name} returned {record.get('status')!r} instead of 200")
+        require("SUB-SERVED", int(record.get("bytes") or 0) > 0,
+                f"the {name} representation is empty")
+        require("SUB-SERVED", bool(record.get("content_type")),
+                f"the {name} representation came back without a media type")
+
+    loaded = product.engine_facts("SUB-SERVED", "representations")
+
+    base64 = loaded.get("base64") or {}
+    require("SUB-SERVED", base64.get("decoded"), "the base64 subscription did not decode")
+    require("SUB-SERVED", base64.get("link_count") == CORE_INBOUNDS,
+            f"the base64 list carries {base64.get('link_count')!r} links, expected one per inbound "
+            f"({CORE_INBOUNDS})")
+
+    xray_json = loaded.get("xray_json") or {}
+    shape = xray_json.get("shape")
+    require("SUB-SERVED", shape in ("list", "object"),
+            f"the Xray JSON is neither a config object nor a profile list (shape {shape!r})")
+    expected_entries = CORE_INBOUNDS if shape == "list" else 1
+    require("SUB-SERVED", xray_json.get("entries") == expected_entries,
+            f"the Xray JSON {shape} carries {xray_json.get('entries')!r} profile(s), "
+            f"expected {expected_entries}")
+    require("SUB-SERVED", sorted(xray_json.get("protocols") or []) == ["trojan", "vless"],
+            f"the Xray profiles carry outbound protocols {xray_json.get('protocols')!r} instead of "
+            "the core vless and trojan set")
+    # Every served profile is a complete config and is validated as one; the
+    # runtime wrapper exists for a bare outbound object, which is not what the
+    # Panel serves.
+    require("SUB-SERVED", xray_json.get("wrapped") == 0,
+            f"a served Xray {shape} profile needed {xray_json.get('wrapped')!r} runtime wrapper(s) "
+            "before Xray accepted it, so it is not a runnable config")
+
+    for name, proxies, expected_types, reason in (
+        ("mihomo", MIHOMO_PROXIES, MIHOMO_PROXY_TYPES, "one per inbound"),
+        ("clash", CLASH_PROXIES, CLASH_PROXY_TYPES, "the trojan subset GenerateClash keeps"),
+    ):
+        record = loaded.get(name) or {}
+        require("SUB-SERVED", record.get("exit") == 0,
+                f"{name} did not load the Panel YAML (exit {record.get('exit')!r})")
+        require("SUB-SERVED", record.get("proxies") == proxies,
+                f"the {name} YAML declares {record.get('proxies')!r} proxies, expected {proxies} "
+                f"({reason})")
+        require("SUB-SERVED", sorted(record.get("proxy_types") or []) == list(expected_types),
+                f"the {name} YAML declares proxy types {record.get('proxy_types')!r}, expected "
+                f"{list(expected_types)!r}")
+        require("SUB-SERVED", record.get("match_rule"),
+                f"the {name} YAML has no MATCH rule, so a client would route nothing through it")
+
+    singbox = loaded.get("singbox") or {}
+    require("SUB-SERVED", singbox.get("parsed"), "the sing-box JSON did not parse")
+    require("SUB-SERVED", int(singbox.get("outbounds") or 0) > 0,
+            "the sing-box JSON carries no outbounds")
+
+    evidence: Dict[str, Any] = {"short_uuid_length": facts.get("short_uuid_length")}
+    for name in REPRESENTATIONS:
+        record = served.get(name) or {}
+        evidence[f"{name}_status"] = record.get("status")
+        evidence[f"{name}_content_type"] = record.get("content_type")
+        evidence[f"{name}_bytes"] = record.get("bytes")
+    evidence["base64_link_count"] = base64.get("link_count")
+    evidence["base64_schemes"] = ",".join(base64.get("schemes") or [])
+    evidence["xray_json_shape"] = shape
+    evidence["xray_json_entries"] = xray_json.get("entries")
+    evidence["xray_json_wrapped"] = xray_json.get("wrapped")
+    evidence["xray_json_protocols"] = ",".join(xray_json.get("protocols") or [])
+    for name in ("mihomo", "clash"):
+        record = loaded.get(name) or {}
+        evidence[f"{name}_proxies"] = record.get("proxies")
+        evidence[f"{name}_proxy_types"] = ",".join(record.get("proxy_types") or [])
+        evidence[f"{name}_groups"] = record.get("groups")
+        evidence[f"{name}_match_rule"] = record.get("match_rule")
+    evidence["singbox_outbounds"] = singbox.get("outbounds")
+    return evidence
+
+
+def _user_agent_case(product: AioProduct, case_id: str, scope: str, policy: str) -> Dict[str, Any]:
+    """Assert the pinned policy: no header and a blank header are both refused."""
+    facts = _panel_facts(product, case_id, scope).get("policy") or {}
+    require(case_id, facts.get("policy") == policy,
+            f"the probe reported policy {facts.get('policy')!r} instead of {policy!r}")
+    statuses = facts.get("representations") or {}
+    require(case_id, set(statuses) == set(REPRESENTATIONS),
+            f"the probe asked {sorted(statuses)} instead of every served representation")
+    served = sorted(name for name, status in statuses.items() if status != UA_REFUSAL_STATUS)
+    require(case_id, not served,
+            f"the Panel served {', '.join(served)} with a {policy} User-Agent instead of "
+            f"refusing it with {UA_REFUSAL_STATUS}")
+    return {
+        "policy": policy,
+        "representation_count": len(statuses),
+        "statuses": ",".join(f"{name}={statuses[name]}" for name in REPRESENTATIONS),
+    }
+
+
+def case_user_agent_absent(product: AioProduct) -> Dict[str, Any]:
+    """SUB-UA-ABSENT: a subscription request without a User-Agent header is refused."""
+    return _user_agent_case(product, "SUB-UA-ABSENT", "ua-absent", "absent")
+
+
+def case_user_agent_blank(product: AioProduct) -> Dict[str, Any]:
+    """SUB-UA-BLANK: a subscription request with an explicitly blank header is refused."""
+    return _user_agent_case(product, "SUB-UA-BLANK", "ua-blank", "blank")
+
+
+def case_share_links(product: AioProduct) -> Dict[str, Any]:
+    """SUB-B64: the base64 list describes exactly the served proxy inventory.
+
+    The link list is decoded and every entry is compared with the outbound the
+    Panel publishes in its Xray JSON, so the two representations cannot drift
+    apart unnoticed. Xray imports the decoded list; the raw JSON body, offered to
+    the same importer, yields nothing.
+    """
+    product.subscription_payloads("SUB-B64")
+    host = product.require_installed()
+    facts = product.engine_facts("SUB-B64", "share-links")
+
+    require("SUB-B64", facts.get("link_count") == CORE_INBOUNDS,
+            f"the base64 list carries {facts.get('link_count')!r} links, expected one per inbound "
+            f"({CORE_INBOUNDS})")
+    require("SUB-B64", facts.get("protocols") == {"vless": 3, "trojan": 1},
+            f"the link list carries protocols {facts.get('protocols')!r} instead of the core "
+            "three vless and one trojan entries")
+    require("SUB-B64", facts.get("ports") == ["443"],
+            f"the links point at ports {facts.get('ports')!r} instead of the public 443 listener")
+    require("SUB-B64", facts.get("sni_missing") == 0,
+            f"{facts.get('sni_missing')!r} links carry no SNI")
+    require("SUB-B64", facts.get("fingerprint_missing") == 0,
+            f"{facts.get('fingerprint_missing')!r} links carry no uTLS fingerprint")
+    require("SUB-B64", facts.get("fingerprints") == [EXPECTED_FINGERPRINT],
+            f"the links carry fingerprints {facts.get('fingerprints')!r} instead of "
+            f"{EXPECTED_FINGERPRINT!r}")
+    require("SUB-B64", facts.get("credential_present"),
+            "at least one link carries no client credential, so it could not be imported")
+    allowed_hosts = {host.panel_domain, host.reality_domain}
+    if host.vision_domain:
+        allowed_hosts.add(host.vision_domain)
+    unknown_hosts = sorted(set(facts.get("hosts") or []) - allowed_hosts)
+    require("SUB-B64", not unknown_hosts,
+            f"the links point at hosts this run never configured: {', '.join(unknown_hosts)}")
+    unknown_snis = sorted(set(facts.get("snis") or []) - allowed_hosts)
+    require("SUB-B64", not unknown_snis,
+            f"the links name SNIs this run never configured: {', '.join(unknown_snis)}")
+
+    require("SUB-B64", facts.get("xray_outbounds") == CORE_INBOUNDS,
+            f"Xray imported {facts.get('xray_outbounds')!r} outbounds from the link list")
+    require("SUB-B64", facts.get("cross_representation_issued") == CORE_INBOUNDS,
+            f"the Xray JSON publishes {facts.get('cross_representation_issued')!r} proxy outbounds")
+    require(
+        "SUB-B64",
+        facts.get("cross_representation_matches") == facts.get("cross_representation_issued"),
+        f"only {facts.get('cross_representation_matches')!r} of "
+        f"{facts.get('cross_representation_issued')!r} link entries match the Panel's own JSON "
+        "outbounds",
+    )
+    require("SUB-B64", facts.get("json_body_links") == 0,
+            f"the raw Xray JSON body yielded {facts.get('json_body_links')!r} share links, so the "
+            "two representations cannot be told apart by an importer")
+
+    return {
+        "link_count": facts.get("link_count"),
+        "protocols": ",".join(f"{name}={count}" for name, count in sorted((facts.get("protocols") or {}).items())),
+        "hosts": ",".join(facts.get("hosts") or []),
+        "snis": ",".join(facts.get("snis") or []),
+        "fingerprints": ",".join(facts.get("fingerprints") or []),
+        "ports": ",".join(facts.get("ports") or []),
+        "networks": ",".join(facts.get("networks") or []),
+        "xray_outbounds": facts.get("xray_outbounds"),
+        "cross_representation_matches": facts.get("cross_representation_matches"),
+        "json_body_links": facts.get("json_body_links"),
+    }
+
+
+def case_json_shapes(product: AioProduct) -> Dict[str, Any]:
+    """SUB-JSON-SHAPES: the served and the alternate `/v2ray-json` shape both load.
+
+    Only one shape is served per request, so the other is formed from the Panel's
+    own outbound — the outbound, not all of them: a config object is one host and
+    the Panel tags every host outbound ``proxy``, so merging profiles into a
+    single object would collide on the tag instead of testing a shape. The
+    wrapper count is the assertion that matters: whatever the Panel serves is a
+    complete config and is never wrapped, while the bare outbound object that is
+    not a core config needs exactly one listener added.
+    """
+    product.subscription_payloads("SUB-JSON-SHAPES")
+    facts = product.engine_facts("SUB-JSON-SHAPES", "json-shapes")
+
+    served = facts.get("served_shape")
+    require("SUB-JSON-SHAPES", served in ("list", "object"),
+            f"the Panel served a {served!r} shape, which is neither documented shape")
+    require("SUB-JSON-SHAPES", int(facts.get("served_entries") or 0) > 0,
+            "the served Xray JSON carries no profile")
+    require("SUB-JSON-SHAPES", facts.get("served_wrapped") == 0,
+            f"a served {served} profile was wrapped {facts.get('served_wrapped')!r} time(s) before "
+            "Xray accepted it; a served profile is a complete config and needs no wrapper")
+
+    alternate = facts.get("alternate_shape")
+    require("SUB-JSON-SHAPES", alternate == ("object" if served == "list" else "list"),
+            f"the alternate shape is {alternate!r} instead of the one the served {served} shape omits")
+    expected_alternate_wrapped = 1 if alternate == "object" else 0
+    require("SUB-JSON-SHAPES", facts.get("alternate_wrapped") == expected_alternate_wrapped,
+            f"the alternate {alternate} shape needed {facts.get('alternate_wrapped')!r} wrapper(s), "
+            f"expected {expected_alternate_wrapped}")
+    require("SUB-JSON-SHAPES", facts.get("alternate_outbounds") == 1,
+            f"the alternate shape carries {facts.get('alternate_outbounds')!r} Panel outbounds; a "
+            "config object is one host, and the Panel tags every host outbound 'proxy', so it "
+            "carries exactly one")
+    return {
+        "served_shape": served,
+        "served_entries": facts.get("served_entries"),
+        "served_wrapped": facts.get("served_wrapped"),
+        "alternate_shape": alternate,
+        "alternate_outbounds": facts.get("alternate_outbounds"),
+        "alternate_wrapped": facts.get("alternate_wrapped"),
+    }
+
+
 def cases(podman: Any, distribution: str = "ubuntu-24.04") -> List[Case]:
     """The AIO suite: the install case plus every case that reuses its host."""
     product = AioProduct(podman, distribution)
@@ -495,4 +805,9 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04") -> List[Case]:
         Case("AIO-05", "aio", lambda context: case_tls_and_identity(product), timeout_seconds=300),
         Case("AIO-AUTH", "aio", lambda context: case_panel_auth(product), timeout_seconds=300),
         Case("AIO-CLIENT", "aio", lambda context: case_client_lifecycle(product), timeout_seconds=300),
+        Case("SUB-SERVED", "aio", lambda context: case_subscriptions(product), timeout_seconds=600),
+        Case("SUB-UA-ABSENT", "aio", lambda context: case_user_agent_absent(product), timeout_seconds=300),
+        Case("SUB-UA-BLANK", "aio", lambda context: case_user_agent_blank(product), timeout_seconds=300),
+        Case("SUB-B64", "aio", lambda context: case_share_links(product), timeout_seconds=300),
+        Case("SUB-JSON-SHAPES", "aio", lambda context: case_json_shapes(product), timeout_seconds=300),
     ]

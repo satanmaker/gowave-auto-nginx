@@ -133,9 +133,23 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Real Subscription Delivery and User-Agent Policy",
     },
     {
+        "id": "SUB-SERVED",
+        "requirement": "Panel subscription representations",
+        "assertion": "Every representation the Panel serves — the base64 share-link list, the Xray JSON profile list, the Mihomo and Clash YAML, and the sing-box JSON — is fetched with the User-Agent of the client that consumes it, and the pinned Xray and Mihomo binaries load what was served without the Panel-issued outbound being replaced.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Real Subscription Delivery and User-Agent Policy",
+    },
+    {
         "id": "SUB-B64",
         "requirement": "Panel subscription representations",
         "assertion": "The base64 share-link list at /api/sub/<shortUuid> contains one link per proxy entry with the expected protocol, host, SNI and firefox fingerprint, and an Xray-family client imports it while the raw JSON body imports nothing.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Real Subscription Delivery and User-Agent Policy",
+    },
+    {
+        "id": "SUB-UA-ABSENT",
+        "requirement": "Real Panel subscription lifecycle",
+        "assertion": "A subscription request that carries no User-Agent header at all is rejected with 403 for every representation, as a result separate from the blank-header case.",
         "topology": ["aio", "multi-node"],
         "promotion_target": "Real Subscription Delivery and User-Agent Policy",
     },

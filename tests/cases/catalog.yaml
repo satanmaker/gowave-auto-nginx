@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 17
-  total: 142
+  podman_first: 19
+  total: 144
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3208,6 +3208,25 @@ cases:
   driver: null
   driver_status: planned
   promotion_target: Real Subscription Delivery and User-Agent Policy
+- id: SUB-SERVED
+  requirement: Panel subscription representations
+  live_scenario: null
+  assertion: Every representation the Panel serves — the base64 share-link list, the Xray JSON profile
+    list, the Mihomo and Clash YAML, and the sing-box JSON — is fetched with the User-Agent of the client
+    that consumes it, and the pinned Xray and Mihomo binaries load what was served without the Panel-issued
+    outbound being replaced.
+  assertion_sha256: c0597fee80b9003e630908cad51b6e2b0c70121bc07d0d95162d22de426defb5
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Real Subscription Delivery and User-Agent Policy
 - id: SUB-B64
   requirement: Panel subscription representations
   live_scenario: null
@@ -3215,6 +3234,23 @@ cases:
     the expected protocol, host, SNI and firefox fingerprint, and an Xray-family client imports it while
     the raw JSON body imports nothing.
   assertion_sha256: 0f7bfb4c7b5b7f4f7965821e45c3d494cddefff2c1f406e776ff5a0ac5bed9ab
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Real Subscription Delivery and User-Agent Policy
+- id: SUB-UA-ABSENT
+  requirement: Real Panel subscription lifecycle
+  live_scenario: null
+  assertion: A subscription request that carries no User-Agent header at all is rejected with 403 for
+    every representation, as a result separate from the blank-header case.
+  assertion_sha256: f9f57f14e4a43a85c57399139181809f791239c5826c6d2f50905a0a40aa9e74
   runs_in:
   - podman
   state: incubating
