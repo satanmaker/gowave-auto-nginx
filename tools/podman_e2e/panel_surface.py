@@ -182,6 +182,15 @@ def surface(panel: Panel) -> Dict[str, Any]:
         "inbound_digest": digest([inbound.get("uuid") for inbound in node_inbounds]),
         "inbound_types": sorted({str(inbound.get("type", "")) for inbound in node_inbounds}),
         "inbound_ports": sorted({str(inbound.get("port", "")) for inbound in node_inbounds}),
+        # Which node is which, and whether it is connected: a run with two nodes
+        # cannot prove "the Worker is online" from a total count alone.
+        "names": sorted(str(node.get("name", "")) for node in nodes),
+        "endpoints": sorted(
+            f"{node.get('address', '')}:{node.get('port', '')}" for node in nodes
+        ),
+        "connected": {
+            str(node.get("name", "")): node.get("isConnected") is True for node in nodes
+        },
     }
 
     status, body = panel.call("GET", "/api/config-profiles")

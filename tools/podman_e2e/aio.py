@@ -252,10 +252,14 @@ class AioProduct:
 
     def __init__(
         self, podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False,
+        install_case_id: str = INSTALL_CASE_ID,
     ) -> None:
         self.podman = podman
         self.context = podman.context
         self.distribution = distribution
+        # A topology that installs more than one host names its own install case;
+        # the block messages must then point at that case, not at the AIO one.
+        self.install_case_id = install_case_id
         # The optional Vision domain is a product configuration, not a harness
         # option: it decides whether the operator provisions a fifth inbound and
         # therefore whether the matrix owes 8 or 10 positive cases.
@@ -282,22 +286,28 @@ class AioProduct:
         self.data_plane_results[case_id] = status
 
     # ------------------------------------------------------------------ install
-    def install(self) -> Dict[str, Any]:
-        """Create the disposable host and run the operator install exactly once."""
+    def install(self, host: Optional[topology.AioTopology] = None) -> Dict[str, Any]:
+        """Create the disposable host and run the operator install exactly once.
+
+        ``host`` lets a topology that owns more than one node — the Multi-Node
+        Master and its Worker — hand in the host it already prepared, so the
+        install command and every probe after it run against the same instance.
+        """
         if self.host is not None:
             raise AssertionError(
-                f"{INSTALL_CASE_ID}: the AIO host is installed once per run and reused by later cases"
+                f"{self.install_case_id}: the host is installed once per run and reused by later cases"
             )
-        host = topology.AioTopology(
-            self.podman,
-            distribution=self.distribution,
-            vision_domain=topology.VISION_DOMAIN if self.vision else None,
-        )
-        host.create()
+        if host is None:
+            host = topology.AioTopology(
+                self.podman,
+                distribution=self.distribution,
+                vision_domain=topology.VISION_DOMAIN if self.vision else None,
+            )
+            host.create()
         self.host = host
         self.outcome = host.install()
         require(
-            INSTALL_CASE_ID,
+            self.install_case_id,
             self.outcome.ok,
             f"the operator full install failed with exit {self.outcome.returncode}:\n"
             f"{self.outcome.tail(6000)}",
@@ -328,13 +338,13 @@ class AioProduct:
         """The successfully installed host, for cases that must not provision anything themselves."""
         if self.host is None or self.outcome is None:
             raise CaseBlocked(
-                f"{INSTALL_CASE_ID}: this case needs the AIO install, and no install has run in this suite"
+                f"{self.install_case_id}: this case needs the install, and no install has run in this suite"
             )
         if not self.outcome.ok:
             # A half-installed host answers some probes and not others; running
             # them anyway would report the install failure six times over.
             raise CaseBlocked(
-                f"{INSTALL_CASE_ID}: the install failed with exit {self.outcome.returncode}, "
+                f"{self.install_case_id}: the install failed with exit {self.outcome.returncode}, "
                 "so this case had nothing to verify"
             )
         return self.host

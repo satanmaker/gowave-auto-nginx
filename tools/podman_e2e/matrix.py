@@ -23,6 +23,7 @@ MATRIX_PATH = REPO_ROOT / "tests" / "cases" / "matrix.yaml"
 VISION_INBOUND = "VISION"
 
 AIO = "aio"
+MULTI_NODE = "multi-node"
 
 
 def load(path: Path = MATRIX_PATH) -> Dict[str, Any]:
@@ -75,17 +76,34 @@ def case_id(data: Dict[str, Any], topology: str, inbound_id: str, client: str, n
         raise KeyError(f"the {topology} case id pattern needs {exc} which the tuple does not carry")
 
 
-def combination(topology: str, vision: bool) -> str:
-    """The matrix key that names the selected Vision configuration."""
+def combination(topology: str, vision: bool = False, worker_vision: bool = False) -> str:
+    """The matrix key that names the selected per-node Vision configuration.
+
+    The All-in-One topology has one node, so it has two configurations. The
+    Multi-Node topology configures Vision per node, so the same two flags give
+    four: neither, master-only, worker-only and both.
+    """
     if topology == AIO:
+        if worker_vision:
+            raise KeyError("the AIO topology has no Worker to configure Vision on")
         return "enabled" if vision else "disabled"
+    if topology == MULTI_NODE:
+        if vision and worker_vision:
+            return "both"
+        if vision:
+            return "master-only"
+        if worker_vision:
+            return "worker-only"
+        return "neither"
     raise KeyError(f"no Vision combination is defined for {topology!r} yet")
 
 
-def positive_count(data: Dict[str, Any], topology: str, vision: bool) -> int:
+def positive_count(
+    data: Dict[str, Any], topology: str, vision: bool = False, worker_vision: bool = False,
+) -> int:
     """How many positive cases the matrix owes for the selected configuration."""
     counts = (data.get("topologies") or {}).get(topology, {}).get("positive_case_counts") or {}
-    key = combination(topology, vision)
+    key = combination(topology, vision, worker_vision)
     if key not in counts:
         raise KeyError(f"the matrix declares no positive case count for {topology}/{key}")
     return int(counts[key])

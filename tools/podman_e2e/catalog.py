@@ -114,6 +114,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "All-in-One Master VPS Installation Verification",
     },
     {
+        "id": "MN-INSTALL",
+        "requirement": "Distributed Worker VPS Deployment Verification",
+        "assertion": "The real operator runs its documented All-in-One install on a clean Master host while a second clean supported systemd host sits beside it untouched, and the Worker stays unprovisioned until the operator registers it.",
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
+    {
         "id": "AIO-PACKAGES",
         "requirement": "All-in-One Master VPS Installation Verification",
         "assertion": "Every prerequisite the operator documents as its own responsibility is installed by that operator on a clean host, checked against a harness-owned package list rather than the product's own claim.",

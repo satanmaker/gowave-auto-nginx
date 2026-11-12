@@ -19,6 +19,8 @@ operator is the same narrow, test-only path the installer already validates.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import ipaddress
 import json
 import socket
@@ -66,6 +68,11 @@ CLIENT_OFFSET = 40
 # The engine client runs the real xray/mihomo binaries; it is a second, distinct
 # role from the standard-library Control Machine above.
 ENGINE_CLIENT_OFFSET = 41
+# Multi-Node roles. The Worker is a second installed node, so it needs its own
+# control and data-plane addresses: sharing the Master's would make the run
+# unable to tell which node a payload actually left from.
+WORKER_OFFSET = 11
+UNTRUSTED_OFFSET = 44
 
 DNS_PORT = 53
 DNS_ZONE_TTL = 30
@@ -96,6 +103,15 @@ VISION_DOMAIN = "vision.testbed.internal"
 COVER_APEX = "testbed.internal"
 ECHO_HOST = "echo.testbed.internal"
 CLIENT_HOST = "client.testbed.internal"
+# The Worker owns its names as well: the operator is asked for a Worker domain
+# and a REALITY domain per node, and the matrix identifies a Multi-Node tuple by
+# the node whose SNI it dials.
+WORKER_DOMAIN = "worker.testbed.internal"
+WORKER_REALITY_DOMAIN = "worker-reality.testbed.internal"
+WORKER_VISION_DOMAIN = "worker-vision.testbed.internal"
+# The node name the operator registers the Worker under; the Panel reports it
+# back, so the cases match the registered node instead of counting nodes.
+WORKER_NODE_NAME = "worker-1"
 
 # The probe the client role runs: standard library only, so its verdict cannot
 # depend on anything the product installed.
@@ -163,6 +179,18 @@ class NetworkPlan:
     @property
     def data_target_ip(self) -> str:
         return self._address(TARGET_OFFSET, self.data_subnet)
+
+    @property
+    def worker_ip(self) -> str:
+        return self._address(WORKER_OFFSET)
+
+    @property
+    def data_worker_ip(self) -> str:
+        return self._address(WORKER_OFFSET, self.data_subnet)
+
+    @property
+    def untrusted_ip(self) -> str:
+        return self._address(UNTRUSTED_OFFSET)
 
     @property
     def data_echo_ip(self) -> str:
@@ -316,6 +344,10 @@ class AioTopology:
             self.egress_resolvers = egress_resolvers()
 
     # ------------------------------------------------------------------ setup
+    def zone(self) -> Dict[str, Any]:
+        """The fixture zone for every name this topology installs."""
+        return zone(self.plan)
+
     def create(self) -> "AioTopology":
         if not self.egress_resolvers:
             raise TopologyError(
@@ -337,7 +369,7 @@ class AioTopology:
         directory = self.context.secret_dir / "dns"
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         zone_path = directory / "zone.json"
-        zone_path.write_text(json.dumps(zone(self.plan), sort_keys=True), encoding="utf-8")
+        zone_path.write_text(json.dumps(self.zone(), sort_keys=True), encoding="utf-8")
         self.podman.run(
             name=self.dns_name,
             image_alias=FIXTURE_IMAGE,
@@ -780,4 +812,214 @@ class AioTopology:
                 "install_duration_seconds": round(outcome.duration, 1),
                 "install_command": outcome.command,
             })
+        return record
+
+
+NODE_ADD_TIMEOUT_SECONDS = 5400
+WORKER_SSH_SETUP_SCRIPT = r"""
+set -eu
+umask 077
+mkdir -p /root/.ssh
+chmod 0700 /root/.ssh
+# A shared test image is built once, so its host keys are identical in every
+# container it starts. Real VPS hosts are not, and the trust cases depend on
+# telling one node's key from another's.
+rm -f /etc/ssh/ssh_host_*
+ssh-keygen -A >/dev/null
+systemctl restart ssh.service
+"""
+
+
+@dataclass
+class MultiNodeTopology(AioTopology):
+    """One Master, one Worker, the Control Machine, and an untrusted client.
+
+    The Master is the All-in-One host: the operator installs Panel, the local
+    GoWave Node, NGINX and Xray there through the same command the All-in-One
+    suite uses. The Worker is a *separate* clean systemd host, provisioned only
+    through the operator's real ``gowave-auto.sh node add`` path, so nothing in
+    the harness reproduces a product installation step.
+    """
+
+    worker_domain: str = WORKER_DOMAIN
+    worker_reality_domain: str = WORKER_REALITY_DOMAIN
+    worker_vision_domain: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.worker_name = self.context.resource_name("worker")
+        self.untrusted_name = self.context.resource_name("untrusted")
+
+    def zone(self) -> Dict[str, Any]:
+        """The base zone plus the Worker's own names, which only this topology has."""
+        data = zone(self.plan)
+        records = data["records"]
+        records[self.worker_domain] = {"A": [self.plan.worker_ip]}
+        records[self.worker_reality_domain] = {"A": [self.plan.worker_ip]}
+        if self.worker_vision_domain:
+            records[self.worker_vision_domain] = {"A": [self.plan.worker_ip]}
+        return data
+
+    def create(self) -> "MultiNodeTopology":
+        super().create()
+        self._start_worker()
+        self._start_untrusted_client()
+        return self
+
+    def _start_worker(self) -> None:
+        image_tag = target_image.build(self.podman, self.distribution)
+        self.podman.run(
+            name=self.worker_name,
+            image_alias=image_tag,
+            network=self.network,
+            aliases=(self.worker_domain,),
+            privileged=True,
+            # The Worker installs its own packages and manages its own units, so
+            # it needs the same egress resolver path the Master has.
+            environment={"DEBIAN_FRONTEND": "noninteractive"},
+            extra_args=(
+                "--ip", self.plan.worker_ip,
+                "--dns", self.plan.dns_ip,
+                *[option for resolver in self.egress_resolvers for option in ("--dns", resolver)],
+            ),
+        )
+        self.started.append(self.worker_name)
+        self.podman.wait_systemd(self.worker_name, timeout_seconds=180)
+        self.podman.exec_bash(self.worker_name, WORKER_SSH_SETUP_SCRIPT, timeout=120)
+        # The Worker's public address, for the egress-attribution cases: the
+        # endpoint must see Worker traffic leave from Worker, not from Master.
+        self.podman.network_connect(self.worker_name, self.data_network, ip=self.plan.data_worker_ip)
+        self.worker_clean_facts = target_image.assert_clean(self.podman, self.worker_name)
+
+    def _start_untrusted_client(self) -> None:
+        """A client role with the run CA and nothing else.
+
+        It shares the control network with the fixtures, so it can reach every
+        management endpoint by address; every case that must be *denied* runs
+        from here rather than from the Control Machine, which owns the topology.
+        """
+        self.podman.run(
+            name=self.untrusted_name,
+            image_alias=FIXTURE_IMAGE,
+            network=self.network,
+            privileged=False,
+            volumes=(f"{self._ca_dir}:{CA_MOUNT}:ro,Z",),
+            command=("sleep", "infinity"),
+            systemd="false",
+            extra_args=(
+                "--ip", self.plan.untrusted_ip,
+                "--dns", self.plan.dns_ip,
+            ),
+        )
+        self.started.append(self.untrusted_name)
+
+    # ------------------------------------------------------------------- trust
+    def pin_worker_trust(self) -> Dict[str, Any]:
+        """Give the Master key access to the Worker and pin the Worker's host key.
+
+        The operator refuses an unpinned host key on purpose, so the run pins one:
+        the key is read from the Worker's own filesystem, which is the trusted
+        local control plane here, exactly as an operator would verify it out of
+        band before adding the node. Nothing is learned from an unauthenticated
+        ``ssh-keyscan``.
+        """
+        self.podman.exec_bash(
+            self.target_name,
+            "umask 077; mkdir -p /root/.ssh; chmod 0700 /root/.ssh; "
+            "test -f /root/.ssh/id_ed25519 || "
+            "ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519 >/dev/null",
+            timeout=120,
+        )
+        public_key = self.podman.exec(
+            self.target_name, ["cat", "/root/.ssh/id_ed25519.pub"],
+        ).stdout.strip()
+        if not public_key:
+            raise TopologyError("the Master did not produce an SSH identity for the Worker")
+        # The key travels over stdin: an argv copy would be visible in the
+        # container's process list for as long as the exec lasts.
+        self.podman.exec(
+            self.worker_name,
+            ["bash", "-c",
+             "umask 077; mkdir -p /root/.ssh; chmod 0700 /root/.ssh; "
+             "cat >> /root/.ssh/authorized_keys; chmod 0600 /root/.ssh/authorized_keys"],
+            input_text=public_key + "\n",
+            timeout=120,
+        )
+        worker_host_key = self.podman.exec(
+            self.worker_name, ["cat", "/etc/ssh/ssh_host_ed25519_key.pub"],
+        ).stdout.strip()
+        if not worker_host_key.startswith("ssh-ed25519 "):
+            raise TopologyError("the Worker has no ed25519 host key to pin")
+        known_hosts = f"{self.plan.worker_ip} {worker_host_key}\n"
+        self.podman.exec(
+            self.target_name,
+            ["bash", "-c", "umask 077; mkdir -p /root/.ssh; cat >> /root/.ssh/known_hosts"],
+            input_text=known_hosts,
+            timeout=120,
+        )
+        self._worker_host_key = worker_host_key
+        self._worker_public_key = public_key
+        return {
+            "worker_host_key": worker_host_key.split()[0] + " " + worker_host_key.split()[1][:16] + "…",
+            "known_hosts_entry": f"{self.plan.worker_ip}",
+            "master_key_fingerprint": self._key_fingerprint(public_key),
+        }
+
+    @staticmethod
+    def _key_fingerprint(public_key: str) -> str:
+        """The SHA256 fingerprint of an OpenSSH public key, computed without a key file."""
+        fields = public_key.split()
+        if len(fields) < 2:
+            return ""
+        blob = base64.b64decode(fields[1])
+        digest = hashlib.sha256(blob).digest()
+        return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+    # --------------------------------------------------------------- node add
+    def node_add_script(self, name: str = WORKER_NODE_NAME) -> str:
+        arguments = [
+            f"'{name}'",
+            f"'{self.plan.worker_ip}'",
+            f"'{self.worker_domain}'",
+            f"'{self.worker_reality_domain}'",
+        ]
+        vision = f"--vision-domain '{self.worker_vision_domain}' " if self.worker_vision_domain else ""
+        return f"bash {REPO_IN_CONTAINER}/gowave-auto.sh node add {vision}{' '.join(arguments)}"
+
+    def node_add(self, name: str = WORKER_NODE_NAME) -> InstallOutcome:
+        """Provision the Worker through the operator's real ``node add`` path.
+
+        The command runs on the Master, over the same SSH transport and Panel API
+        registration an operator uses; the harness only supplies the trusted
+        host-key pin and the SSH identity the operator would establish first.
+        """
+        script = self.node_add_script(name)
+        started = time.monotonic()
+        proc = self.podman.exec_bash(
+            self.target_name, script, check=False, timeout=NODE_ADD_TIMEOUT_SECONDS,
+        )
+        outcome = InstallOutcome(
+            returncode=proc.returncode,
+            stdout=proc.stdout or "",
+            stderr=proc.stderr or "",
+            duration=time.monotonic() - started,
+            command=script,
+        )
+        self.context.evidence_text("mn-node-add.stdout.log", outcome.stdout)
+        self.context.evidence_text("mn-node-add.stderr.log", outcome.stderr)
+        return outcome
+
+    def evidence(self, outcome: Optional[InstallOutcome] = None) -> Dict[str, Any]:
+        record = super().evidence(outcome)
+        record.update({
+            "worker_ip": self.plan.worker_ip,
+            "worker_container": self.worker_name,
+            "worker_domain": self.worker_domain,
+            "worker_reality_domain": self.worker_reality_domain,
+            "worker_vision_domain": self.worker_vision_domain or "",
+            "data_worker_ip": self.plan.data_worker_ip,
+            "untrusted_ip": self.plan.untrusted_ip,
+            "untrusted_container": self.untrusted_name,
+            "pre_install_worker": getattr(self, "worker_clean_facts", {}),
+        })
         return record

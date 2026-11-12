@@ -20,20 +20,30 @@ from typing import List, Optional, Sequence
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.podman_e2e import aio, target_image  # noqa: E402
+from tools.podman_e2e import aio, multi_node, target_image  # noqa: E402
 from tools.podman_e2e.podman import Podman  # noqa: E402
 from tools.podman_e2e.runner import Case, RunContext, Runner  # noqa: E402
 
-TOPOLOGIES = ("aio",)
+TOPOLOGIES = ("aio", "multi-node")
 
 # The install downloads releases and issues certificates; the budget is spent
 # across the whole suite, so it must cover a slow network without being open.
+# The Multi-Node suite provisions two hosts and moves real traffic through both,
+# so its default budget is larger than the single-host one.
 DEFAULT_BUDGET_SECONDS = 7200
+MULTI_NODE_BUDGET_SECONDS = 10800
 
 
-def build_suite(podman: Podman, topology: str, distribution: str, vision: bool = False) -> List[Case]:
+def build_suite(
+    podman: Podman, topology: str, distribution: str,
+    vision: bool = False, worker_vision: bool = False,
+) -> List[Case]:
     if topology == "aio":
         return aio.cases(podman, distribution, vision=vision)
+    if topology == "multi-node":
+        return multi_node.cases(
+            podman, distribution, vision=vision, worker_vision=worker_vision,
+        )
     raise ValueError(f"unsupported topology: {topology!r}")
 
 
@@ -49,29 +59,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--vision",
         action="store_true",
-        help="Install the optional VLESS Vision inbound, which makes the matrix 10 cases instead of 8",
+        help=(
+            "Install the optional VLESS Vision inbound; the matrix is then 10 cases instead of 8, "
+            "or for multi-node 18/20 instead of 16"
+        ),
+    )
+    parser.add_argument(
+        "--worker-vision",
+        action="store_true",
+        help="Configure the optional VLESS Vision inbound on the Multi-Node Worker as well",
     )
     parser.add_argument(
         "--artifact-root",
         type=Path,
         default=REPO_ROOT / "artifacts" / "podman-e2e",
     )
-    parser.add_argument("--budget-seconds", type=int, default=DEFAULT_BUDGET_SECONDS)
+    parser.add_argument("--budget-seconds", type=int, default=None)
     args = parser.parse_args(argv)
+
+    if args.worker_vision and args.topology != "multi-node":
+        parser.error("--worker-vision configures a Worker, and the AIO topology has none")
+
+    budget = args.budget_seconds
+    if budget is None:
+        budget = MULTI_NODE_BUDGET_SECONDS if args.topology == "multi-node" else DEFAULT_BUDGET_SECONDS
 
     context = RunContext(
         topology=args.topology,
         artifact_root=args.artifact_root,
-        budget_seconds=args.budget_seconds,
+        budget_seconds=budget,
     )
     # The selected Vision configuration is part of the run's identity: the
-    # matrix owes 8 or 10 positive cases depending on it.
+    # matrix owes 8 or 10 positive cases (AIO) or 16/18/20 (Multi-Node).
     context.environment["vision"] = "enabled" if args.vision else "disabled"
+    if args.topology == "multi-node":
+        context.environment["worker_vision"] = "enabled" if args.worker_vision else "disabled"
     podman = Podman(context)
     # Containers, the network, and run images belong to the run, not the shell.
     podman.register_cleanup()
     runner = Runner(context)
-    for case in build_suite(podman, args.topology, args.distribution, vision=args.vision):
+    for case in build_suite(
+        podman, args.topology, args.distribution,
+        vision=args.vision, worker_vision=args.worker_vision,
+    ):
         runner.add(case)
     status = runner.execute()
     print(f"artifacts: {context.artifact_dir}")
