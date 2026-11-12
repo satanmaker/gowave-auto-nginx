@@ -187,5 +187,48 @@ class TestPodmanRunOwnership(unittest.TestCase):
                 context.write_secret("../escape", "value")
 
 
+class TestArtifactOwnership(unittest.TestCase):
+    """A root run must leave artifacts the invoking operator can actually read."""
+
+    def test_a_sudo_run_hands_the_evidence_back_to_the_invoking_user(self):
+        from unittest import mock
+
+        chowned = []
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"SUDO_UID": "1000", "SUDO_GID": "1000"}), \
+                mock.patch("os.geteuid", return_value=0), \
+                mock.patch("os.chown",
+                           side_effect=lambda path, uid, gid: chowned.append((Path(path), uid, gid))):
+            context = RunContext("aio", Path(tmp), budget_seconds=60, run_id="podman-aio-owned-abcd1234")
+            context.evidence_text("probe.txt", "evidence")
+        targets = {path.name: (uid, gid) for path, uid, gid in chowned}
+        self.assertEqual(targets[context.run_id], (1000, 1000))
+        self.assertEqual(targets["probe.txt"], (1000, 1000))
+
+    def test_a_non_root_run_never_touches_ownership(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"SUDO_UID": "1000", "SUDO_GID": "1000"}), \
+                mock.patch("os.geteuid", return_value=1000), \
+                mock.patch("os.chown") as chown:
+            context = RunContext("aio", Path(tmp), budget_seconds=60, run_id="podman-aio-ownless-abcd1234")
+            context.evidence_text("probe.txt", "evidence")
+        chown.assert_not_called()
+
+    def test_a_root_run_outside_sudo_leaves_ownership_alone(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("os.geteuid", return_value=0), \
+                mock.patch("os.chown") as chown, \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SUDO_UID", None)
+            os.environ.pop("SUDO_GID", None)
+            context = RunContext("aio", Path(tmp), budget_seconds=60, run_id="podman-aio-nosudo-abcd1234")
+            context.evidence_text("probe.txt", "evidence")
+        chown.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
