@@ -255,6 +255,29 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertNotIn("Compensating rollback completed on worker host.", worker_script)
         self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_failed=1', worker_script)
 
+    def test_worker_keeps_port_80_acme_vhost_for_renewal(self):
+        """Worker port-80 ACME vhost must survive issuance; deleting it makes renewal 404."""
+        script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        funcs_start = script.index("cat <<'RUNNER_FUNCS'")
+        payload = script[funcs_start:script.index("\nRUNNER_FUNCS\n", funcs_start)]
+
+        start = payload.index("configure_edge_nginx() {")
+        end = payload.index("\n}\n", start) + len("\n}\n")
+        body = payload[start:end]
+
+        vhost = "/etc/nginx/conf.d/00-worker-acme-challenge.conf"
+        self.assertIn(f"cat > {vhost}", body)
+        self.assertIn("location /.well-known/acme-challenge/ {", body)
+        self.assertIn("root /var/www/gowave-acme;", body)
+        self.assertNotIn(f"rm -f {vhost}", body)
+
+        rollback_start = payload.index("compensate_remote_worker() {")
+        self.assertIn(vhost, payload[rollback_start:])
+
+        uninstall_start = script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
+        uninstall = script[uninstall_start:script.index("\nROLLBACK_REMOTE_SCRIPT", uninstall_start)]
+        self.assertIn(vhost, uninstall)
+
     def test_standalone_remote_rollback_reports_non_acme_cleanup_failures(self):
         """Standalone rollback must fail if service, NGINX, hook, or scratch cleanup is incomplete."""
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
