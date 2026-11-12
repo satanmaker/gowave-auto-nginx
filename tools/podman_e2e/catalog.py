@@ -401,6 +401,20 @@ def data_plane_cases() -> List[Dict[str, Any]]:
                 "topology": ["multi-node"],
                 "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
             })
+    entries.append({
+        "id": "MN-MATRIX",
+        "requirement": "Real client data-plane verification",
+        "assertion": (
+            "The executed positive data-plane cases are exactly the matrix tuples of both nodes — "
+            "each node contributing one case per inbound it was configured with times every client, "
+            "so 16 without the optional inbound, 18 with Vision on one node and 20 with it on both — "
+            "and a count that disagrees with the matrix, a node that never ran one of the clients, a "
+            "declared case the matrix does not enumerate, or a tuple that produced no result fails "
+            "the run instead of being counted as green."
+        ),
+        "topology": ["multi-node"],
+        "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
+    })
     return entries
 
 

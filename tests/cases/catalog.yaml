@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 64
-  total: 189
+  podman_first: 65
+  total: 190
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -4285,6 +4285,25 @@ cases:
     under the SNI that node publishes for the inbound. Both nodes serve the same transport/security pairs,
     so the case names the node: a transfer that dialled the other node''s name would prove the other node.'
   assertion_sha256: fbf117a9c165e88a069fe58538250ac509bcf4375ec4d83235e30761e18bc83b
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-MATRIX
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: The executed positive data-plane cases are exactly the matrix tuples of both nodes — each
+    node contributing one case per inbound it was configured with times every client, so 16 without the
+    optional inbound, 18 with Vision on one node and 20 with it on both — and a count that disagrees with
+    the matrix, a node that never ran one of the clients, a declared case the matrix does not enumerate,
+    or a tuple that produced no result fails the run instead of being counted as green.
+  assertion_sha256: 257bcd082973db20a36ab866aec5ba61d2fa43bbcad869446ec439203e2b11b6
   runs_in:
   - podman
   state: incubating

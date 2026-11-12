@@ -725,6 +725,155 @@ class TestMultiNodeCounts(unittest.TestCase):
             matrix.combination("aio", vision=False, worker_vision=True)
 
 
+class _MatrixProduct(multi_node.MultiNodeProduct):
+    """The real product with the two readiness guards satisfied by a scripted run.
+
+    Nothing else is replaced: the tuple enumeration, the declared/executed
+    registries and every assertion stay the product's own, so a test drives the
+    same count path the live suite does.
+    """
+
+    def __init__(self, vision=False, worker_vision=False):
+        self._root = tempfile.TemporaryDirectory()
+        super().__init__(_StubPodman(Path(self._root.name)),
+                         vision=vision, worker_vision=worker_vision)
+        self.topology = type("Host", (), {"plan": topology.allocate_plan([])})()
+
+    def cleanup(self):
+        self._root.cleanup()
+
+    def require_installed(self):
+        return self.topology
+
+    def require_worker(self):
+        return self.topology
+
+
+class TestMatrixCase(unittest.TestCase):
+    """MN-MATRIX: the positive cases are exactly the matrix tuples of both nodes."""
+
+    def expected_ids(self, product):
+        expected = []
+        for node, node_vision in (("master", product.vision), ("worker", product.worker_vision)):
+            for inbound, client in matrix.tuples(product.matrix, node_vision):
+                expected.append(matrix.case_id(
+                    product.matrix, multi_node.matrix_data.MULTI_NODE, str(inbound["id"]),
+                    client, node=node,
+                ))
+        return expected
+
+    def product(self, vision=False, worker_vision=False, declared=None, results=None):
+        product = _MatrixProduct(vision=vision, worker_vision=worker_vision)
+        self.addCleanup(product.cleanup)
+        expected = self.expected_ids(product)
+        product.declare_data_plane(expected if declared is None else declared)
+        product.master.data_plane_results = dict(
+            results if results is not None else {case_id: "PASS" for case_id in expected}
+        )
+        return product, expected
+
+    def reject(self, expected_text, vision=False, worker_vision=False, declared=None,
+               results=None):
+        product, _expected = self.product(
+            vision=vision, worker_vision=worker_vision, declared=declared, results=results,
+        )
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_matrix(product)
+        self.assertIn(expected_text, str(caught.exception))
+
+    def test_the_vision_less_run_owes_the_sixteen_tuples_on_both_clients(self):
+        product, expected = self.product()
+        evidence = multi_node.case_matrix(product)
+        self.assertEqual(len(expected), 16)
+        self.assertEqual(evidence["vision"], "neither")
+        self.assertEqual(evidence["inbounds"], 8)
+        self.assertEqual(evidence["clients"], 2)
+        self.assertEqual(evidence["expected_positive_cases"], 16)
+        self.assertEqual(evidence["declared_cases"], 16)
+        self.assertEqual(evidence["executed_cases"], 16)
+        self.assertEqual(evidence["passed_cases"], 16)
+        self.assertEqual(evidence["per_node"]["master"],
+                         {"inbounds": 4, "clients": ["mihomo", "xray"], "cases": 8})
+        self.assertEqual(evidence["per_node"]["worker"],
+                         {"inbounds": 4, "clients": ["mihomo", "xray"], "cases": 8})
+
+    def test_each_vision_combination_owes_its_own_positive_count(self):
+        expected = {
+            (False, False): ("neither", 16, 4, 4),
+            (True, False): ("master-only", 18, 5, 4),
+            (False, True): ("worker-only", 18, 4, 5),
+            (True, True): ("both", 20, 5, 5),
+        }
+        for flags, (name, count, master_inbounds, worker_inbounds) in expected.items():
+            product, expected_ids = self.product(*flags)
+            evidence = multi_node.case_matrix(product)
+            self.assertEqual(len(expected_ids), count, flags)
+            self.assertEqual(evidence["vision"], name)
+            self.assertEqual(evidence["expected_positive_cases"], count)
+            self.assertEqual(evidence["per_node"]["master"]["cases"], master_inbounds * 2)
+            self.assertEqual(evidence["per_node"]["worker"]["cases"], worker_inbounds * 2)
+            self.assertEqual(evidence["passed_cases"], count)
+
+    def test_a_node_that_never_ran_one_client_fails_the_run(self):
+        product, _expected = self.product()
+        enumerated = multi_node.matrix_data.tuples
+
+        def xray_only(data, vision):
+            return [(inbound, client) for inbound, client in enumerated(data, vision)
+                    if client == "xray"]
+
+        with unittest.mock.patch.object(multi_node.matrix_data, "tuples", xray_only):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.case_matrix(product)
+        self.assertIn("the master node ran ['xray'] instead of every matrix client "
+                      "['mihomo', 'xray']", str(caught.exception))
+
+    def test_a_declared_case_the_matrix_never_enumerates_fails_the_run(self):
+        _, expected = self.product()
+        self.reject("unexplained ['MN-DP-master-REALITY-singbox']",
+                    declared=expected + ["MN-DP-master-REALITY-singbox"])
+
+    def test_a_matrix_tuple_the_suite_never_declared_fails_the_run(self):
+        _, expected = self.product()
+        self.reject("missing ['MN-DP-worker-TROJAN-GRPC-mihomo']",
+                    declared=[case_id for case_id in expected
+                              if case_id != "MN-DP-worker-TROJAN-GRPC-mihomo"])
+
+    def test_a_declared_case_that_produced_no_result_fails_the_run(self):
+        _product, expected = self.product()
+        results = {case_id: "PASS" for case_id in expected}
+        del results["MN-DP-master-XHTTP-mihomo"]
+        self.reject("produced no result: MN-DP-master-XHTTP-mihomo", results=results)
+
+    def test_a_failed_tuple_fails_the_run_even_when_the_count_matches(self):
+        _product, expected = self.product(worker_vision=True)
+        results = {case_id: "PASS" for case_id in expected}
+        results["MN-DP-worker-VISION-xray"] = "FAIL"
+        self.reject("did not pass: MN-DP-worker-VISION-xray",
+                    worker_vision=True, results=results)
+
+    def test_a_case_outside_the_matrix_is_not_counted_as_a_green_one(self):
+        _, expected = self.product()
+        results = {case_id: "PASS" for case_id in expected}
+        results["MN-DP-master-EXTRA-mihomo"] = "PASS"
+        self.reject("but the matrix declares 16", results=results)
+
+    def test_a_matrix_count_its_own_inbounds_do_not_produce_fails_the_run(self):
+        product, _expected = self.product()
+        product.matrix["topologies"]["multi-node"]["positive_case_counts"]["neither"] = 17
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_matrix(product)
+        self.assertIn("declares 17 positive case(s)", str(caught.exception))
+
+    def test_the_case_is_blocked_when_no_install_has_run(self):
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        product = multi_node.MultiNodeProduct(_StubPodman(Path(root.name)))
+        with self.assertRaises(CaseBlocked) as caught:
+            multi_node.case_matrix(product)
+        self.assertIn(multi_node.INSTALL_CASE_ID, str(caught.exception))
+
+
 class _SshCompleted:
     def __init__(self, returncode, stdout="", stderr=""):
         self.returncode = returncode
@@ -1015,12 +1164,15 @@ class TestMultiNodeSuite(unittest.TestCase):
         self.assertEqual(product.data_plane_results,
                          {"MN-DP-master-REALITY-xray": "PASS"})
 
-    def test_the_subscription_representations_close_the_data_plane(self):
-        # 5.6: what the Panel serves a client has to be both loadable and this
-        # cluster's, so the two shared subscription cases run after every node
-        # they depend on exists.
+    def test_the_count_case_closes_the_matrix_before_the_subscriptions(self):
+        # 5.11: the count case reads the verdicts the tuples recorded, so it runs
+        # after every one of them and before the cases that only read the Panel.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[36:38], ["SUB-SERVED", "SUB-B64"])
+        self.assertEqual(ids[35], "MN-DP-worker-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[36:39], [multi_node.MATRIX_CASE_ID, "SUB-SERVED", "SUB-B64"])
+        suite = {case.id: case for case in multi_node.cases(self.podman)}
+        self.assertEqual(suite[multi_node.MATRIX_CASE_ID].timeout_seconds,
+                         multi_node.MATRIX_TIMEOUT_SECONDS)
 
     def test_the_lifecycle_cases_run_last_because_they_fault_the_worker(self):
         # 5.9: revocation and the Worker's own stop/start/restart change the
