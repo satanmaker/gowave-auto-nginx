@@ -373,6 +373,16 @@ def transfer(
             f"endpoint report: {sanitize(raw.decode('utf-8', errors='replace'), 300)}"
             f"{engine_detail(log_path)}"
         )
+    if status != 200 or recorded.get("error"):
+        # The endpoint answered but refused the payload — an unaccepted source,
+        # or a destination it will not serve. That is a refusal, not a delivery:
+        # a caller that treated the answer as proof would count a body the
+        # endpoint never logged as a transfer.
+        return refusal(
+            engine, label, request_id, status=status,
+            reason=f"HTTP {status} {recorded.get('error') or ''}".strip(),
+            source_ip=str(recorded.get("source_ip") or ""),
+        )
     if expect_refusal:
         # A delivered payload is a fact for the case to judge, not a crash: the
         # Panel has to push the revocation and the node has to apply it, so a
@@ -405,6 +415,7 @@ def refusal(
     request_id: str,
     status: Optional[int],
     reason: str,
+    source_ip: str = "",
 ) -> Dict[str, Any]:
     """A transfer the tunnel refused: no endpoint report came back for it."""
     return {
@@ -414,6 +425,7 @@ def refusal(
         "delivered": False,
         "status": status,
         "reason": reason,
+        "source_ip": source_ip,
     }
 
 
@@ -806,8 +818,8 @@ def prohibited(
     if not attempts:
         raise SystemExit("the served Xray payload declares no outbound to test the policy with")
     attempt = attempts[0]
-    recorded = _recorded_request_ids(report)
-    leaked = attempt["request_id"] in recorded
+    received = _received_request_ids(report)
+    leaked = attempt["request_id"] in received
     if leaked:
         raise SystemExit(
             "the endpoint recorded a payload sent to a destination the product's policy excludes"
@@ -819,8 +831,67 @@ def prohibited(
         "delivered": bool(attempt.get("delivered")),
         "status": attempt.get("status"),
         "reason": attempt.get("reason", ""),
-        "endpoint_records": len(recorded),
+        "endpoint_records": len(received),
         "recorded_request_ids": 0,
+    }
+
+
+def direct(
+    destination: str,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Try to deliver a payload straight at the endpoint, without traversing a node.
+
+    The endpoint accepts a payload only from a node's egress identity, so this
+    attempt has to be refused: a delivery here would mean a client could
+    manufacture the very evidence the data-plane cases rest on. The endpoint is
+    then asked what it recorded, because a refusal that still logged the body
+    would be a denial only in the response.
+    """
+    if not destination:
+        raise SystemExit("a destination address is required: the endpoint is the target")
+    attempt = transfer(
+        None, destination, {"tag": "direct", "network": "direct"}, "direct",
+        expect_refusal=True, timeout=timeout,
+    )
+    diagnostics = echo_diagnostics(destination)
+    recorded = {
+        str(event.get("request_id") or ""): event
+        for event in diagnostics.get("requests") or []
+        if isinstance(event, dict)
+    }
+    denied = {
+        str(event.get("request_id") or ""): event
+        for event in diagnostics.get("denied") or []
+        if isinstance(event, dict)
+    }
+    request_id = str(attempt.get("request_id") or "")
+    accepted = (
+        bool(attempt.get("delivered"))
+        and attempt.get("status") == 200
+        and bool(attempt.get("request_id_match"))
+        and bool(attempt.get("body_match"))
+    )
+    return {
+        "endpoint": destination,
+        "accepted": accepted,
+        "status": attempt.get("status"),
+        "reason": attempt.get("reason", ""),
+        "source_ip": str(attempt.get("source_ip") or ""),
+        "recorded": request_id in recorded,
+        "denied_recorded": request_id in denied,
+        "denied_source_ip": str((denied.get(request_id) or {}).get("source_ip") or ""),
+        "denied_sources": sorted({
+            str(event.get("source_ip") or "")
+            for event in denied.values()
+            if event.get("source_ip")
+        }),
+        "payload_sources": sorted({
+            str(event.get("source_ip") or "")
+            for event in recorded.values()
+            if event.get("source_ip")
+        }),
+        "allowed_sources": [str(address) for address in diagnostics.get("allowed_sources") or []],
     }
 
 
@@ -832,6 +903,24 @@ def _recorded_request_ids(destination: str) -> set:
         for event in diagnostics.get("requests") or []
         if isinstance(event, dict)
     }
+
+
+def _received_request_ids(destination: str) -> set:
+    """Every request id the endpoint saw, whether it accepted or refused the source.
+
+    A payload the product was supposed to block that arrives at the endpoint is a
+    leak even when the fixture refuses its source by policy: the fixture's own
+    allowlist must never stand in for the product's routing rule.
+    """
+    diagnostics = echo_diagnostics(destination)
+    received = set()
+    for key in ("requests", "denied"):
+        received.update(
+            str(event.get("request_id") or "")
+            for event in diagnostics.get(key) or []
+            if isinstance(event, dict)
+        )
+    return received
 
 
 def transfer_one(
@@ -905,7 +994,7 @@ def transfer_one(
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Send payloads through the Panel-issued outbounds")
     parser.add_argument("--scope", required=True,
-                        choices=("traffic", "revoked", "warmup", "prohibited", "transfer"))
+                        choices=("traffic", "revoked", "warmup", "prohibited", "transfer", "direct"))
     parser.add_argument("--payload-dir", default="/secrets")
     parser.add_argument("--ca", required=True)
     parser.add_argument("--destination", default="")
@@ -944,6 +1033,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.engine, args.network, args.security, host=args.host,
             expect_refusal=args.expect_refusal,
         )
+    elif args.scope == "direct":
+        facts = direct(args.destination)
     else:
         scopes = {
             "traffic": traffic,

@@ -480,6 +480,11 @@ class AioTopology:
                 "--log", f"{ECHO_MOUNT}/requests.jsonl",
                 "--cert", f"{CA_MOUNT}/{ECHO_CERT_NAME}",
                 "--key", f"{CA_MOUNT}/{ECHO_KEY_NAME}",
+                *[
+                    option
+                    for source in self.echo_allow_sources()
+                    for option in ("--allow-source", source)
+                ],
             ),
             systemd="false",
             extra_args=(
@@ -576,6 +581,17 @@ class AioTopology:
         if node not in ("", "local"):
             raise TopologyError(f"the All-in-One topology has one node, not {node!r}")
         return str(self.plan.data_target_ip)
+
+    def echo_allow_sources(self) -> List[str]:
+        """The only node identities the endpoint accepts a payload from.
+
+        The endpoint sits outside the product, so the source address it records
+        is the one piece of evidence a client cannot supply: the harness reads it
+        back to attribute a transfer to a node. Accepting a payload from anyone
+        else would make a direct client connection indistinguishable from product
+        traffic, so the fixture refuses every other source by name.
+        """
+        return [str(self.plan.data_target_ip)]
 
     def _start_engine_client(self) -> None:
         """Start the pinned client engines, with no product code in the container.
@@ -693,6 +709,33 @@ class AioTopology:
                 "--security", security,
                 *(["--host", host] if host else []),
                 *(["--expect-refusal"] if expect_refusal else []),
+            ],
+            check=False,
+            timeout=timeout,
+        )
+
+    def direct_egress_facts(self, vantage: str, timeout: int = 300) -> Any:
+        """Send one payload straight at the endpoint from a client role.
+
+        ``vantage`` names the container the attempt leaves from — the Control
+        Machine or the pinned-engine client. Neither owns a node identity, so the
+        endpoint has to refuse the payload by source; the probe reports the
+        refusal, the recorded denials and the sources of the payloads the
+        endpoint did accept.
+        """
+        if vantage == "control":
+            container = self.client_name
+        elif vantage == "engine":
+            container = self.engine_client()
+        else:
+            raise TopologyError(f"the topology has no client vantage {vantage!r}")
+        return self.podman.exec(
+            container,
+            [
+                "python3", TRAFFIC_PROBE_SCRIPT,
+                "--scope", "direct",
+                "--ca", f"{CA_MOUNT}/{ISSUED_ROOT_NAME}",
+                "--destination", f"{self.plan.echo_ip}:{ECHO_HTTP_PORT}",
             ],
             check=False,
             timeout=timeout,
@@ -971,6 +1014,10 @@ class MultiNodeTopology(AioTopology):
         if node == "worker":
             return str(self.plan.data_worker_ip)
         raise TopologyError(f"the Multi-Node topology has a Master and a Worker, not {node!r}")
+
+    def echo_allow_sources(self) -> List[str]:
+        """Both node identities, and only those: the endpoint has two egress peers."""
+        return [str(self.plan.data_target_ip), str(self.plan.data_worker_ip)]
 
     def create(self) -> "MultiNodeTopology":
         super().create()

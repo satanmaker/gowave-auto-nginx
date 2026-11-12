@@ -247,6 +247,17 @@ fi
 """
 
 
+def probe_json(case_id: str, label: str, result: Any) -> Dict[str, Any]:
+    """A probe that exited non-zero or printed no JSON fails the case."""
+    detail = (result.stderr or result.stdout or "").strip()[-2000:]
+    require(case_id, result.returncode == 0, f"{label} exited {result.returncode}: {detail}")
+    try:
+        return json.loads(result.stdout or "")
+    except json.JSONDecodeError:
+        require(case_id, False, f"{label} did not print JSON: {(result.stdout or '')[:400]}")
+        return {}
+
+
 class AioProduct:
     """One disposable AIO host, installed once by the real operator."""
 
@@ -454,13 +465,7 @@ class AioProduct:
 
     def _probe_json(self, case_id: str, label: str, result: Any) -> Dict[str, Any]:
         """A probe that exited non-zero or printed no JSON fails the case."""
-        detail = (result.stderr or result.stdout or "").strip()[-2000:]
-        require(case_id, result.returncode == 0, f"{label} exited {result.returncode}: {detail}")
-        try:
-            return json.loads(result.stdout or "")
-        except json.JSONDecodeError:
-            require(case_id, False, f"{label} did not print JSON: {(result.stdout or '')[:400]}")
-            return {}
+        return probe_json(case_id, label, result)
 
     def wait_tunnel_ready(self, case_id: str, payload_dir: Optional[str] = None) -> Dict[str, Any]:
         """Wait until one served outbound really carries a payload to the endpoint.

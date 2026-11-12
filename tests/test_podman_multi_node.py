@@ -11,6 +11,7 @@ defect into a harness failure — or worse, a wrong node into a passing case.
 import base64
 import contextlib
 import io
+import json
 import subprocess
 import sys
 import tempfile
@@ -347,6 +348,14 @@ class TestMultiNodeZone(unittest.TestCase):
         records = host.zone()["records"]
         self.assertEqual(records[topology.PANEL_DOMAIN]["A"], [host.plan.target_ip])
         self.assertEqual(records[topology.REALITY_DOMAIN]["A"], [host.plan.target_ip])
+
+    def test_the_endpoint_accepts_payloads_only_from_both_node_identities(self):
+        host = topology.MultiNodeTopology(self.podman, egress_resolvers=["192.0.2.53"])
+        self.assertEqual(host.echo_allow_sources(),
+                         [host.plan.data_target_ip, host.plan.data_worker_ip])
+        for client_ip in (host.plan.client_ip, host.plan.engine_client_ip):
+            self.assertNotIn(client_ip, host.echo_allow_sources(),
+                             "a client vantage cannot own a node's egress identity")
 
 
 class TestWorkerProvisioningCommand(unittest.TestCase):
@@ -874,6 +883,220 @@ class TestMatrixCase(unittest.TestCase):
         self.assertIn(multi_node.INSTALL_CASE_ID, str(caught.exception))
 
 
+class _Completed:
+    """The shape a Podman exec returns, without a container behind it."""
+
+    def __init__(self, payload=None, returncode=0, stdout=None, stderr=""):
+        self.returncode = returncode
+        self.stdout = json.dumps(payload) if stdout is None else stdout
+        self.stderr = stderr
+
+
+def _denial_facts(plan, vantage, **overrides):
+    """What the endpoint should report for one refused direct attempt."""
+    identity = plan.client_ip if vantage == "control" else plan.engine_client_ip
+    node_ids = sorted({plan.data_target_ip, plan.data_worker_ip})
+    facts = {
+        "endpoint": f"{plan.echo_ip}:18080",
+        "accepted": False,
+        "status": 403,
+        "reason": "HTTP 403 source-not-allowed",
+        "source_ip": identity,
+        "recorded": False,
+        "denied_recorded": True,
+        "denied_source_ip": identity,
+        "denied_sources": [identity],
+        "payload_sources": node_ids,
+        "allowed_sources": node_ids,
+    }
+    facts.update(overrides)
+    return facts
+
+
+class _EgressHost:
+    """Two node identities and the endpoint's answers to the direct probes."""
+
+    def __init__(self, plan, facts_for=None):
+        self.plan = plan
+        self.facts_for = facts_for
+        self.probes = []
+
+    def node_data_ip(self, node=""):
+        return str({
+            "master": self.plan.data_target_ip,
+            "worker": self.plan.data_worker_ip,
+        }[node])
+
+    def direct_egress_facts(self, vantage, timeout=300):
+        self.probes.append(vantage)
+        result = self.facts_for(self.plan, vantage) if self.facts_for else _denial_facts(
+            self.plan, vantage)
+        return result if isinstance(result, _Completed) else _Completed(result)
+
+
+class _EgressProduct(_MatrixProduct):
+    def __init__(self, facts_for=None, vision=False, worker_vision=False):
+        super().__init__(vision=vision, worker_vision=worker_vision)
+        self.topology = _EgressHost(self.topology.plan, facts_for)
+
+
+class TestEgressCase(unittest.TestCase):
+    """MN-EGRESS: the endpoint's observed source is the attribution evidence."""
+
+    def product(self, vision=False, worker_vision=False, sources=None, facts_for=None):
+        product = _EgressProduct(facts_for, vision=vision, worker_vision=worker_vision)
+        self.addCleanup(product.cleanup)
+        expected = {
+            case_id: product.topology.node_data_ip(node)
+            for case_id, _inbound, _client, node in multi_node.data_plane_cases(product)
+        }
+        product.declare_data_plane(list(expected))
+        for case_id, source in (expected if sources is None else sources).items():
+            product.record_data_plane_source(case_id, source)
+        return product, expected
+
+    def reject(self, expected_text, **kwargs):
+        product, _expected = self.product(**kwargs)
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_egress(product)
+        self.assertIn(expected_text, str(caught.exception))
+
+    def test_the_run_attributes_every_case_to_its_node_and_refuses_both_vantages(self):
+        product, expected = self.product()
+        plan = product.topology.plan
+        evidence = multi_node.case_egress(product)
+        self.assertEqual(len(expected), 16)
+        self.assertEqual(evidence["master_identity"], plan.data_target_ip)
+        self.assertEqual(evidence["worker_identity"], plan.data_worker_ip)
+        self.assertEqual(evidence["attributed_cases"], 16)
+        self.assertEqual(evidence["per_node"]["master"],
+                         {"identity": plan.data_target_ip, "cases": 8})
+        self.assertEqual(evidence["per_node"]["worker"],
+                         {"identity": plan.data_worker_ip, "cases": 8})
+        self.assertEqual(evidence["payload_sources"],
+                         sorted({plan.data_target_ip, plan.data_worker_ip}))
+        self.assertEqual(evidence["denied_sources"],
+                         sorted({plan.client_ip, plan.engine_client_ip}))
+        self.assertEqual(product.topology.probes, ["control", "engine"])
+        self.assertEqual(evidence["denials"]["control"]["source_ip"], plan.client_ip)
+        self.assertIn("source-not-allowed", evidence["denials"]["control"]["reason"])
+
+    def test_the_vision_combination_does_not_change_the_attribution(self):
+        product, expected = self.product(vision=True, worker_vision=True)
+        plan = product.topology.plan
+        evidence = multi_node.case_egress(product)
+        self.assertEqual(len(expected), 20)
+        self.assertEqual(evidence["attributed_cases"], 20)
+        self.assertEqual(evidence["per_node"]["master"]["cases"], 10)
+        self.assertEqual(evidence["per_node"]["worker"]["cases"], 10)
+
+    def test_a_worker_tuple_that_left_from_the_master_fails_by_name(self):
+        product, expected = self.product()
+        plan = product.topology.plan
+        sources = dict(expected)
+        sources["MN-DP-worker-REALITY-xray"] = plan.data_target_ip
+        self.reject(
+            "MN-DP-worker-REALITY-xray left from "
+            f"{plan.data_target_ip} instead of the worker node {plan.data_worker_ip}",
+            sources=sources,
+        )
+
+    def test_a_matrix_case_without_egress_evidence_fails_the_run(self):
+        product, expected = self.product()
+        sources = dict(expected)
+        del sources["MN-DP-master-REALITY-xray"]
+        self.reject("left no egress evidence: MN-DP-master-REALITY-xray", sources=sources)
+
+    def test_a_cluster_whose_nodes_share_an_identity_fails_the_run(self):
+        with unittest.mock.patch.object(
+            topology.NetworkPlan, "data_worker_ip",
+            new=property(lambda self: self.data_target_ip),
+        ):
+            self.reject("the Master and the Worker share the egress identity")
+
+    def test_a_direct_attempt_the_endpoint_accepted_fails_the_run(self):
+        def accepted(plan, vantage):
+            return _denial_facts(plan, vantage, accepted=True, status=200, recorded=True)
+
+        self.reject("the control delivered a payload straight at the endpoint",
+                    facts_for=accepted)
+
+    def test_a_denial_attributed_to_a_node_fails_the_run(self):
+        def misattributed(plan, vantage):
+            return _denial_facts(plan, vantage, denied_source_ip=plan.data_worker_ip)
+
+        self.reject("instead of the control vantage", facts_for=misattributed)
+
+    def test_a_refusal_without_a_recorded_denial_fails_the_run(self):
+        def silent(plan, vantage):
+            return _denial_facts(plan, vantage, denied_recorded=False)
+
+        self.reject("without recording the denial", facts_for=silent)
+
+    def test_an_allowlist_wider_than_the_two_nodes_fails_the_run(self):
+        def wide(plan, vantage):
+            allowed = sorted({plan.data_target_ip, plan.data_worker_ip, plan.client_ip})
+            return _denial_facts(plan, vantage, allowed_sources=allowed)
+
+        self.reject("the endpoint accepts payloads from", facts_for=wide)
+
+    def test_a_payload_the_fixture_recorded_from_a_client_fails_the_run(self):
+        def leaked(plan, vantage):
+            sources = sorted({plan.data_target_ip, plan.data_worker_ip, plan.client_ip})
+            return _denial_facts(plan, vantage, payload_sources=sources)
+
+        self.reject("the endpoint's own record shows payloads from", facts_for=leaked)
+
+    def test_a_direct_probe_that_printed_no_json_blocks_the_case(self):
+        def broken(_plan, _vantage):
+            return _Completed(None, stdout="", returncode=0)
+
+        self.reject("did not print JSON", facts_for=broken)
+
+    def test_the_case_is_blocked_when_no_install_has_run(self):
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        product = multi_node.MultiNodeProduct(_StubPodman(Path(root.name)))
+        with self.assertRaises(CaseBlocked) as caught:
+            multi_node.case_egress(product)
+        self.assertIn(multi_node.INSTALL_CASE_ID, str(caught.exception))
+
+
+class TestDataPlaneSourceEvidence(unittest.TestCase):
+    """The tuple's own body is what supplies the egress attribution case's facts."""
+
+    def product(self):
+        product = _MatrixProduct()
+        self.addCleanup(product.cleanup)
+        return product
+
+    def test_a_transfer_records_the_address_the_endpoint_observed(self):
+        product = self.product()
+        inbound, client = matrix.tuples(product.matrix, vision=False)[0]
+        case_id = matrix.case_id(
+            product.matrix, multi_node.matrix_data.MULTI_NODE, str(inbound["id"]), client,
+            node="worker",
+        )
+        with unittest.mock.patch.object(
+            multi_node.aio, "_data_plane_case",
+            return_value={"source_ip": product.topology.plan.data_worker_ip},
+        ):
+            evidence = multi_node.data_plane_case(product, inbound, client, "worker")
+        self.assertEqual(evidence["source_ip"], product.topology.plan.data_worker_ip)
+        self.assertEqual(product.data_plane_sources[case_id],
+                         product.topology.plan.data_worker_ip)
+
+    def test_a_failed_tuple_records_no_attribution(self):
+        product = self.product()
+        inbound, client = matrix.tuples(product.matrix, vision=False)[0]
+        with unittest.mock.patch.object(
+            multi_node.aio, "_data_plane_case", side_effect=AssertionError("no delivery"),
+        ):
+            with self.assertRaises(AssertionError):
+                multi_node.data_plane_case(product, inbound, client, "master")
+        self.assertEqual(product.data_plane_sources, {})
+
+
 class _SshCompleted:
     def __init__(self, returncode, stdout="", stderr=""):
         self.returncode = returncode
@@ -1167,12 +1390,17 @@ class TestMultiNodeSuite(unittest.TestCase):
     def test_the_count_case_closes_the_matrix_before_the_subscriptions(self):
         # 5.11: the count case reads the verdicts the tuples recorded, so it runs
         # after every one of them and before the cases that only read the Panel.
+        # 5.12: attribution reads the same run and the endpoint, so it follows the
+        # count and still precedes revocation, which would revoke a client.
         ids = [case.id for case in multi_node.cases(self.podman)]
         self.assertEqual(ids[35], "MN-DP-worker-TROJAN-GRPC-mihomo")
-        self.assertEqual(ids[36:39], [multi_node.MATRIX_CASE_ID, "SUB-SERVED", "SUB-B64"])
+        self.assertEqual(ids[36:40], [multi_node.MATRIX_CASE_ID, multi_node.EGRESS_CASE_ID,
+                                      "SUB-SERVED", "SUB-B64"])
         suite = {case.id: case for case in multi_node.cases(self.podman)}
         self.assertEqual(suite[multi_node.MATRIX_CASE_ID].timeout_seconds,
                          multi_node.MATRIX_TIMEOUT_SECONDS)
+        self.assertEqual(suite[multi_node.EGRESS_CASE_ID].timeout_seconds,
+                         multi_node.EGRESS_TIMEOUT_SECONDS)
 
     def test_the_lifecycle_cases_run_last_because_they_fault_the_worker(self):
         # 5.9: revocation and the Worker's own stop/start/restart change the
