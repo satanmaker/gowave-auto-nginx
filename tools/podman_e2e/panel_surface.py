@@ -11,15 +11,24 @@ used in memory; the bearer token stays in this process; client and inbound
 identifiers are reduced to SHA-256 digests. What is printed is a status, a count,
 a boolean, a non-secret protocol/port name, or a digest.
 
+Subscription payloads are secrets — they carry client identifiers, Trojan
+passwords, and REALITY public keys — so they are written to the run's 0600
+payload directory and never printed: the facts only report a status, a media
+type, and a byte count.
+
     python3 /repo/tools/podman_e2e/panel_surface.py --scope surface
+    python3 /repo/tools/podman_e2e/panel_surface.py --scope subscriptions --payload-dir /payloads
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
+import os
 import secrets
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -30,6 +39,25 @@ REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_USER = "default-user"
 MVP_SQUAD = "Default MVP Squad"
 CLIENT_PREFIX = "podman-e2e-"
+
+# The User-Agent strings name the client family that really imports each
+# representation. The Panel's pinned policy only requires a non-empty header, but
+# a case that sent an anonymous or invented header would not describe a client.
+MOBILE_USER_AGENT = "v2rayNG/1.8.5"
+XRAY_USER_AGENT = "Xray/26.11.9"
+MIHOMO_USER_AGENT = "mihomo/1.19.34"
+CLASH_USER_AGENT = "clash.meta/1.19.34"
+SINGBOX_USER_AGENT = "sing-box/1.10.0"
+
+# name, path template, the client that consumes it. The order is the order the
+# representation inventory is documented in.
+REPRESENTATIONS: Sequence[tuple[str, str, str]] = (
+    ("base64", "/api/sub/{short_uuid}", MOBILE_USER_AGENT),
+    ("xray-json", "/api/sub/{short_uuid}/v2ray-json", XRAY_USER_AGENT),
+    ("mihomo", "/api/sub/{short_uuid}/mihomo", MIHOMO_USER_AGENT),
+    ("clash", "/api/sub/{short_uuid}/clash", CLASH_USER_AGENT),
+    ("singbox", "/api/sub/{short_uuid}/singbox", SINGBOX_USER_AGENT),
+)
 
 
 def read_credentials(path: Path) -> tuple[str, str]:
@@ -206,6 +234,98 @@ def surface(panel: Panel) -> Dict[str, Any]:
     return facts
 
 
+def default_user_short_uuid(panel: Panel) -> str:
+    """The default client's shortUuid, read from the API rather than a file."""
+    status, body = panel.call("GET", f"/api/users/by-username/{DEFAULT_USER}")
+    user = payload(body)
+    user = user if isinstance(user, dict) else {}
+    short_uuid = str(user.get("shortUuid") or "")
+    if status != 200 or not short_uuid:
+        raise SystemExit(
+            f"GET /api/users/by-username/{DEFAULT_USER} returned {status} without a shortUuid"
+        )
+    return short_uuid
+
+
+def fetch(
+    base_url: str,
+    path: str,
+    user_agent: Optional[str],
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Fetch one path with an explicit User-Agent, or with no header at all.
+
+    ``urllib`` always adds a default User-Agent, so the absent-header request has
+    to be written by hand: it is the only way to observe what the Panel does when
+    a client sends no header. A ``user_agent`` of ``""`` sends an explicitly
+    blank header, which is a different request from an absent one.
+    """
+    parsed = urllib.parse.urlsplit(base_url)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+    try:
+        connection.putrequest("GET", path, skip_accept_encoding=True)
+        connection.putheader("Accept", "*/*")
+        connection.putheader("Connection", "close")
+        if user_agent is not None:
+            connection.putheader("User-Agent", user_agent)
+        connection.endheaders()
+        response = connection.getresponse()
+        body = response.read()
+        return {
+            "status": response.status,
+            "content_type": (response.getheader("Content-Type") or ""),
+            "body": body,
+        }
+    finally:
+        connection.close()
+
+
+def media_type(value: str) -> str:
+    """The bare media type, so parameter noise cannot hide a changed representation."""
+    return (value or "").split(";", 1)[0].strip().lower()
+
+
+def write_payload(path: Path, body: bytes) -> None:
+    """Write a subscription payload as a 0600 file; it carries client secrets."""
+    if not path.parent.is_dir():
+        raise SystemExit(f"payload directory {path.parent} does not exist")
+    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(handle, "wb") as sink:
+        sink.write(body)
+    os.chmod(path, 0o600)
+
+
+def subscriptions(panel: Panel, payload_dir: Optional[Path]) -> Dict[str, Any]:
+    """Fetch every served representation once and store its payload for the clients."""
+    short_uuid = default_user_short_uuid(panel)
+    facts: Dict[str, Any] = {"short_uuid_length": len(short_uuid), "representations": {}}
+    for name, template, user_agent in REPRESENTATIONS:
+        response = fetch(panel.base_url, template.format(short_uuid=short_uuid), user_agent)
+        body = response["body"]
+        facts["representations"][name] = {
+            "status": response["status"],
+            "content_type": media_type(response["content_type"]),
+            "bytes": len(body),
+        }
+        if payload_dir is not None and response["status"] == 200 and body:
+            write_payload(payload_dir / f"{name}.payload", body)
+    return facts
+
+
+def user_agent_policy(
+    panel: Panel,
+    user_agent: Optional[str],
+    policy: str,
+) -> Dict[str, Any]:
+    """Ask every representation for an answer while withholding or blanking the header."""
+    short_uuid = default_user_short_uuid(panel)
+    facts: Dict[str, Any] = {"policy": policy, "representations": {}}
+    for name, template, _user_agent in REPRESENTATIONS:
+        response = fetch(panel.base_url, template.format(short_uuid=short_uuid), user_agent)
+        facts["representations"][name] = response["status"]
+    return facts
+
+
 def lifecycle(panel: Panel) -> Dict[str, Any]:
     """Create, read back, and delete a client through the real API contracts."""
     facts: Dict[str, Any] = {}
@@ -266,9 +386,18 @@ def lifecycle(panel: Panel) -> Dict[str, Any]:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Collect Panel API facts without leaking secrets")
-    parser.add_argument("--scope", choices=("surface", "lifecycle", "all"), default="all")
+    parser.add_argument(
+        "--scope",
+        choices=("surface", "lifecycle", "subscriptions", "ua-absent", "ua-blank", "all"),
+        default="all",
+    )
     parser.add_argument("--panel-url", default=PANEL_URL)
     parser.add_argument("--credentials", default=CREDENTIALS_FILE)
+    parser.add_argument(
+        "--payload-dir",
+        default="",
+        help="Directory the subscription payloads are written to (0600); never printed",
+    )
     args = parser.parse_args(argv)
 
     username, password = read_credentials(Path(args.credentials))
@@ -278,6 +407,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         facts["surface"] = surface(panel)
     if args.scope in ("lifecycle", "all"):
         facts["lifecycle"] = lifecycle(panel)
+    if args.scope in ("subscriptions", "all"):
+        payload_dir = Path(args.payload_dir) if args.payload_dir else None
+        facts["subscriptions"] = subscriptions(panel, payload_dir)
+    if args.scope == "ua-absent":
+        facts["policy"] = user_agent_policy(panel, None, "absent")
+    if args.scope == "ua-blank":
+        facts["policy"] = user_agent_policy(panel, "", "blank")
     print(json.dumps(facts, sort_keys=True))
     return 0
 

@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from tools.podman_e2e import acme_fixture, target_image
+from tools.podman_e2e import acme_fixture, client_image, target_image
 
 # 10.90.0.0/24 .. 10.254.0.0/24: the private range container networks live in.
 # Every candidate is checked against the host before it is claimed.
@@ -35,6 +35,9 @@ TARGET_OFFSET = 10
 PEBBLE_OFFSET = 20
 ECHO_OFFSET = 30
 CLIENT_OFFSET = 40
+# The engine client runs the real xray/mihomo binaries; it is a second, distinct
+# role from the standard-library Control Machine above.
+ENGINE_CLIENT_OFFSET = 41
 
 DNS_PORT = 53
 DNS_ZONE_TTL = 30
@@ -58,6 +61,14 @@ CLIENT_HOST = "client.testbed.internal"
 # The probe the client role runs: standard library only, so its verdict cannot
 # depend on anything the product installed.
 HTTP_PROBE_SCRIPT = f"{REPO_IN_CONTAINER}/tools/podman_e2e/http_probe.py"
+# The probe the engine role runs: it consumes the Panel payloads with the pinned
+# client binaries and reports facts only.
+SUBSCRIPTION_PROBE_SCRIPT = f"{REPO_IN_CONTAINER}/tools/podman_e2e/subscription_probe.py"
+# Payloads are fetched on the host (the subscription routes are loopback-only)
+# and mounted into the engine container; they are never printed or copied into
+# the artifact directory.
+PAYLOAD_MOUNT = "/payloads"
+SECRETS_MOUNT = "/secrets"
 
 INSTALL_TIMEOUT_SECONDS = 5400
 
@@ -95,6 +106,10 @@ class NetworkPlan:
     @property
     def client_ip(self) -> str:
         return self._address(CLIENT_OFFSET)
+
+    @property
+    def engine_client_ip(self) -> str:
+        return self._address(ENGINE_CLIENT_OFFSET)
 
 
 def _overlaps(candidate: ipaddress.IPv4Network, used: Sequence[str]) -> bool:
@@ -221,6 +236,9 @@ class AioTopology:
         self.dns_name = self.context.resource_name("dns")
         self.target_name = self.context.resource_name("aio")
         self.client_name = self.context.resource_name("client")
+        self.engine_client_name = self.context.resource_name("engines")
+        self.payload_dir = self.context.secret_dir / "subscriptions"
+        self._engine_image = ""
         if self.plan is None:
             self.plan = allocate_plan(self.podman.network_subnets())
         if self.egress_resolvers is None:
@@ -232,6 +250,7 @@ class AioTopology:
             raise TopologyError(
                 f"no egress resolver found in {HOST_RESOLV_CONF}; the disposable host could not install packages"
             )
+        self.payload_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.podman.network_create(self.network, self.plan.subnet, disable_dns=True)
         self._start_dns()
         self._start_acme()
@@ -289,7 +308,12 @@ class AioTopology:
             network=self.network,
             aliases=(self.panel_domain,),
             privileged=True,
-            volumes=(f"{self._ca_dir}:{CA_MOUNT}:ro,Z",),
+            volumes=(
+                f"{self._ca_dir}:{CA_MOUNT}:ro,Z",
+                # The subscription routes are loopback-only, so the payloads are
+                # fetched on the host and handed to the engine client from here.
+                f"{self.payload_dir}:{PAYLOAD_MOUNT}:Z",
+            ),
             environment=self.install_environment(),
             systemd="always",
             extra_args=(
@@ -326,6 +350,53 @@ class AioTopology:
         self.started.append(self.client_name)
 
     # ------------------------------------------------------------------ client
+    def engine_client(self) -> str:
+        """The engine role, started once per run and reused by every client case."""
+        if not self._engine_image:
+            self._start_engine_client()
+        return self.engine_client_name
+
+    def _start_engine_client(self) -> None:
+        """Start the pinned client engines, with no product code in the container.
+
+        The payload directory is mounted read-only: the Panel's subscription
+        routes are loopback-only, so the host fetches them and the engines
+        consume exactly the bytes the Panel served.
+        """
+        self._engine_image = client_image.build(self.podman)
+        self.podman.run(
+            name=self.engine_client_name,
+            image_alias=self._engine_image,
+            network=self.network,
+            privileged=False,
+            volumes=(
+                f"{self.payload_dir}:{SECRETS_MOUNT}:ro,Z",
+                f"{self._ca_dir}:{CA_MOUNT}:ro,Z",
+            ),
+            command=("sleep", "infinity"),
+            systemd="false",
+            extra_args=(
+                "--ip", self.plan.engine_client_ip,
+                "--dns", self.plan.dns_ip,
+            ),
+        )
+        self.started.append(self.engine_client_name)
+
+    def subscription_facts(self, scope: str, timeout: int = 300) -> Any:
+        """Run the engine-side subscription probe and return the completed process."""
+        self.engine_client()
+        return self.podman.exec(
+            self.engine_client_name,
+            [
+                "python3", SUBSCRIPTION_PROBE_SCRIPT,
+                "--scope", scope,
+                "--payload-dir", SECRETS_MOUNT,
+                "--ca", f"{CA_MOUNT}/{ISSUED_ROOT_NAME}",
+            ],
+            check=False,
+            timeout=timeout,
+        )
+
     def client_http(
         self,
         url: str,
