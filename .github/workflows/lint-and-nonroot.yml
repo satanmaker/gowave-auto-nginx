@@ -33,6 +33,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends shellcheck sqlite3 tar gzip openssl curl
           npm install -g @fission-ai/openspec
 
+      # The completeness check imports every test module, and the protocol matrix
+      # and the served-payload probes parse YAML, so the toolchain Python needs it.
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check PyYAML
+
       - name: ShellCheck validation
         run: |
           shellcheck --severity=error gowave-auto.sh gowave-node-auto.sh assets/backup/gowave-backup.sh modules/*.sh tests/*.sh

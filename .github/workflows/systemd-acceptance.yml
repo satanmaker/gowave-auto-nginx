@@ -27,6 +27,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check PyYAML
+
       - name: Run Suite Services (Unprivileged EUID != 0)
         run: |
           python3 tests/run_ci.py --suite services
