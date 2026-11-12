@@ -324,6 +324,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Negative Scenario and Fault Injection Tests",
     },
     {
+        "id": "MN-SSHKEY",
+        "requirement": "Preflight SSH Trust and DNS Verification",
+        "assertion": "Through the controller's own remote-finalize SSH operation, a known_hosts entry holding a key that is not the Worker's is refused by OpenSSH host-key verification before the remote command runs, and after the Worker rotates its host key the stale pin is refused the same way while re-pinning the new key lets the same command run and take its observable effect.",
+        "topology": ["multi-node"],
+        "promotion_target": "Preflight SSH Trust and DNS Verification",
+    },
+    {
         "id": "MN-VISION",
         "requirement": "Independent Optional Vision Domains",
         "assertion": "In each of the four per-node Vision combinations, every node is checked against its own Vision domain alone: a configured node declares exactly one Vision inbound and one disabled-free Panel host bound to it under its own name, holds a certificate covering that name that renews from this run's ACME directory, routes the name to its Vision inbound and runs that inbound in its applied config; an unconfigured node has none of those under its own name, so swapping the two nodes' Vision configuration fails.",

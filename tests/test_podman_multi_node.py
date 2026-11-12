@@ -725,6 +725,180 @@ class TestMultiNodeCounts(unittest.TestCase):
             matrix.combination("aio", vision=False, worker_vision=True)
 
 
+class _SshCompleted:
+    def __init__(self, returncode, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class _SshTrustPodman:
+    """A two-host stand-in for OpenSSH, the Worker's filesystem, and the remote script.
+
+    It encodes the three rules the case depends on: a connection succeeds only
+    when the pinned key equals the host's current key, the remote script deletes
+    the planted snapshot, and each flag below can break exactly one of them so
+    the case has to refuse it.
+    """
+
+    DECOY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDecoyDecoyDecoyDecoyDecoyDecoy"
+    KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOriginalOriginalOriginalOriginal"
+    ROTATED = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIRotatedRotatedRotatedRotatedRotated"
+
+    def __init__(
+        self, *, rotate=True, wrong_pin_opens=False, stale_pin_opens=False,
+        leaks_command=False, refusal="Host key verification failed.",
+        delete_on_success=True,
+    ):
+        self.worker_ip = ""
+        self.worker_key = self.KEY
+        self.original_key = self.KEY
+        self.rotated = False
+        self.pins = {}
+        self.sentinel = False
+        self.rotate = rotate
+        self.wrong_pin_opens = wrong_pin_opens
+        self.stale_pin_opens = stale_pin_opens
+        self.leaks_command = leaks_command
+        self.refusal = refusal
+        self.delete_on_success = delete_on_success
+
+    # ------------------------------------------------------------ podman API
+    def exec(self, name, argv, check=True, input_text=None, timeout=None):
+        if name == "master" and argv[:2] == ["bash", "-c"] and "cat > " in argv[2]:
+            self.pins[argv[2].split("cat > ", 1)[1]] = input_text or ""
+            return _SshCompleted(0)
+        if name == "worker" and argv[:2] == ["test", "-f"]:
+            return _SshCompleted(0 if self.sentinel else 1)
+        if name == "worker" and argv[:1] == ["cat"]:
+            return _SshCompleted(0, self.worker_key + "\n")
+        raise AssertionError(f"unexpected exec on {name}: {argv}")
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=None):
+        if name == "worker" and "install -d" in script:
+            self.sentinel = True
+            return _SshCompleted(0)
+        if name == "master" and "mn-sshkey-decoy.pub" in script:
+            return _SshCompleted(0, self.DECOY + "\n")
+        if name == "worker" and "ssh-keygen -A" in script:
+            if self.rotate:
+                self.worker_key = self.ROTATED
+                self.rotated = True
+            return _SshCompleted(0)
+        if name == "master" and "remote_finalize" in script:
+            return self._remote_finalize(script)
+        raise AssertionError(f"unexpected bash script on {name}: {script[:200]!r}")
+
+    # ------------------------------------------------------------- the rules
+    def _remote_finalize(self, script):
+        path = script.split("SSH_KNOWN_HOSTS=", 1)[1].split()[0].strip("'\"")
+        if path in self.pins:
+            pinned = self.pins[path]
+        elif path == "/root/.ssh/known_hosts":
+            # The harness pinned the Worker's original key before node add.
+            pinned = f"{self.worker_ip} {self.original_key}\n"
+        else:
+            pinned = ""
+        fields = pinned.split()
+        # A known_hosts line is "<host> <type> <blob>", so the blob is third.
+        key = fields[2] if len(fields) > 2 else ""
+        accepted = key and key == self.worker_key.split()[1]
+        if not accepted and path.endswith("wrong-key") and self.wrong_pin_opens:
+            accepted = True
+        if not accepted and self.rotated and self.stale_pin_opens and key == self.original_key.split()[1]:
+            accepted = True
+        if not accepted:
+            if self.leaks_command:
+                self.sentinel = False
+                return _SshCompleted(
+                    255, "Worker ACME recovery snapshot finalized.\n", self.refusal + "\n",
+                )
+            return _SshCompleted(255, "", self.refusal + "\n")
+        if self.delete_on_success:
+            self.sentinel = False
+        return _SshCompleted(0, "Worker ACME recovery snapshot finalized.\n")
+
+
+class _SshKeyProduct:
+    """The case's product surface, with the real remote-finalize command builder."""
+
+    def __init__(self, podman):
+        self.podman = podman
+        self.host = type("Host", (), {
+            "plan": topology.allocate_plan([]),
+            "target_name": "master",
+            "worker_name": "worker",
+        })()
+        podman.worker_ip = self.host.plan.worker_ip
+
+    def require_installed(self):
+        return self.host
+
+    def remote_finalize(self, known_hosts, transaction, timeout=0):
+        return multi_node.MultiNodeProduct.remote_finalize(
+            self, known_hosts, transaction, timeout,
+        )
+
+
+class TestSshHostKeyCase(unittest.TestCase):
+    """MN-SSHKEY: the pin gates the command, and a rotation needs a new pin."""
+
+    def _run(self, **flags):
+        product = _SshKeyProduct(_SshTrustPodman(**flags))
+        return multi_node.case_ssh_host_key(product), product
+
+    def test_the_pinned_key_gates_every_operation_and_a_rotation_is_adopted(self):
+        evidence, product = self._run()
+        self.assertIs(evidence["wrong_key_refused"], True)
+        self.assertIs(evidence["wrong_key_executed_remotely"], False)
+        self.assertIs(evidence["old_key_rejected"], True)
+        self.assertIs(evidence["old_key_executed_remotely"], False)
+        self.assertIs(evidence["new_key_accepted"], True)
+        self.assertIs(evidence["new_key_executed_remotely"], True)
+        self.assertNotEqual(evidence["worker_host_key_before"],
+                            evidence["worker_host_key_after"])
+        self.assertIs(product.podman.sentinel, False)
+        for path in ("/root/.ssh/known_hosts", "/root/.ssh/known_hosts-wrong-key"):
+            self.assertTrue(product.podman.pins[path].startswith(evidence["worker_ip"]))
+
+    def test_a_wrong_pin_that_still_connects_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(wrong_pin_opens=True)
+        self.assertIn("a different key was pinned", str(caught.exception))
+
+    def test_a_refusal_that_still_runs_the_script_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(leaks_command=True)
+        self.assertIn("ran although the pinned host key was not the Worker's",
+                      str(caught.exception))
+
+    def test_a_refusal_without_the_ssh_verification_message_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(refusal="Permission denied (publickey).")
+        self.assertIn("without OpenSSH naming the verification failure",
+                      str(caught.exception))
+
+    def test_a_rotation_that_changes_nothing_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(rotate=False)
+        self.assertIn("did not change", str(caught.exception))
+
+    def test_a_stale_pin_accepted_after_rotation_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(stale_pin_opens=True)
+        self.assertIn("stale pin was accepted", str(caught.exception))
+
+    def test_a_re_pinned_key_that_never_reaches_the_worker_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(delete_on_success=False)
+        self.assertIn("still on the Worker", str(caught.exception))
+
+    def test_the_suite_runs_the_trust_case_before_the_provisioning_path(self):
+        ids = [case.id for case in multi_node.cases(_StubPodman(Path(tempfile.mkdtemp())))]
+        self.assertLess(ids.index(multi_node.SSH_KEY_CASE_ID),
+                        ids.index(multi_node.NODE_ADD_CASE_ID))
+
+
 class TestMultiNodeSuite(unittest.TestCase):
     """The declared suite is what the runner executes, and its ids are stable."""
 
@@ -739,9 +913,9 @@ class TestMultiNodeSuite(unittest.TestCase):
         suite = multi_node.cases(self.podman)
         self.assertIsInstance(suite[0], Case)
         self.assertEqual(
-            [case.id for case in suite][:3],
-            [multi_node.INSTALL_CASE_ID, multi_node.NODE_ADD_CASE_ID,
-             multi_node.MASTER_ADDRESS_CASE_ID],
+            [case.id for case in suite][:4],
+            [multi_node.INSTALL_CASE_ID, multi_node.SSH_KEY_CASE_ID,
+             multi_node.NODE_ADD_CASE_ID, multi_node.MASTER_ADDRESS_CASE_ID],
         )
         self.assertEqual({case.topology for case in suite}, {"multi-node"})
 
@@ -758,37 +932,37 @@ class TestMultiNodeSuite(unittest.TestCase):
 
     def test_the_mtls_cases_follow_the_verifier_then_the_negative_controls(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[3:11], [f"MTLS-0{number}" for number in range(1, 9)])
+        self.assertEqual(ids[4:12], [f"MTLS-0{number}" for number in range(1, 9)])
 
     def test_the_management_denial_pair_follows_the_control_plane_proof(self):
         # 5.8: an untrusted vantage and the allowed one are measured after the
         # Master's mTLS path is proven, so a refusal can be told from an outage.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[11:13], ["FW-01", "FW-02"])
+        self.assertEqual(ids[12:14], ["FW-01", "FW-02"])
 
     def test_the_cluster_audit_follows_the_control_plane_proof(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[13:16], ["CLUS-01", "CLUS-02", "CLUS-03"])
+        self.assertEqual(ids[14:17], ["CLUS-01", "CLUS-02", "CLUS-03"])
 
     def test_the_worker_state_audit_follows_the_cluster_audit(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[16:18], ["WRK-05", "WRK-06"])
+        self.assertEqual(ids[17:19], ["WRK-05", "WRK-06"])
 
     def test_the_vision_independence_case_follows_the_worker_config(self):
         # 5.10: the per-node Vision proof reads the config WRK-06 has just
         # compared, so it runs once that assignment is established and before any
         # data plane traffic.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[16:19], ["WRK-05", "WRK-06", multi_node.VISION_CASE_ID])
+        self.assertEqual(ids[17:20], ["WRK-05", "WRK-06", multi_node.VISION_CASE_ID])
 
     def test_the_data_plane_cases_follow_the_worker_audit(self):
         # 5.7: a payload has to traverse the Worker too, so the matrix tuples of
         # both nodes run once the Worker's own config is applied.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[19], "MN-DP-master-REALITY-xray")
-        self.assertEqual(ids[26], "MN-DP-master-TROJAN-GRPC-mihomo")
-        self.assertEqual(ids[27], "MN-DP-worker-REALITY-xray")
-        self.assertEqual(ids[34], "MN-DP-worker-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[20], "MN-DP-master-REALITY-xray")
+        self.assertEqual(ids[27], "MN-DP-master-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[28], "MN-DP-worker-REALITY-xray")
+        self.assertEqual(ids[35], "MN-DP-worker-TROJAN-GRPC-mihomo")
 
     def test_every_node_contributes_its_own_matrix_tuples(self):
         data = matrix.load()
@@ -846,7 +1020,7 @@ class TestMultiNodeSuite(unittest.TestCase):
         # cluster's, so the two shared subscription cases run after every node
         # they depend on exists.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[35:37], ["SUB-SERVED", "SUB-B64"])
+        self.assertEqual(ids[36:38], ["SUB-SERVED", "SUB-B64"])
 
     def test_the_lifecycle_cases_run_last_because_they_fault_the_worker(self):
         # 5.9: revocation and the Worker's own stop/start/restart change the
