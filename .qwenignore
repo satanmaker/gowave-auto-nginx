@@ -1,0 +1,5 @@
+# Reference clones of upstream projects (Xray-core, mihomo, gowave, gowave-node,
+# community-baseline). They stay on disk for local reference and for the
+# developer-checkout installer fallback in modules/node.sh, but they are never
+# tracked by git and must not be indexed or read wholesale by the agent.
+/sources/
