@@ -86,11 +86,23 @@ class TestDenialParsers(unittest.TestCase):
 
     def test_the_ssh_observation_returns_the_worker_lines(self):
         lines = denial.parse_sshd_observation(
-            '{"count": 1, "matches": ["sshd[12]: Failed password for root from '
+            '{"count": 1, "matches": ["Failed publickey for root from '
             f'{UNTRUSTED} port 40000 ssh2"]}}'
         )
         self.assertEqual(len(lines), 1)
         self.assertIn(UNTRUSTED, lines[0])
+
+    def test_the_ssh_report_carries_the_daemon_tail_for_a_diagnosable_miss(self):
+        # journalctl -o cat prints the message alone, so the query selects the
+        # daemon and the report has to show what it logged when nothing matches.
+        report = denial.parse_sshd_report(
+            '{"count": 0, "matches": [], '
+            '"tail": ["Server listening on 0.0.0.0 port 22.", '
+            f'"Connection closed by {UNTRUSTED} port 40000"]}}'
+        )
+        self.assertEqual(report["matches"], [])
+        self.assertEqual(len(report["tail"]), 2)
+        self.assertIn(UNTRUSTED, report["tail"][-1])
 
     def test_the_probe_is_a_real_connection_and_a_real_login(self):
         script = denial.untrusted_probe_script("10.89.0.22")
@@ -182,7 +194,11 @@ class _DenialProduct:
             },
             "observed_source": UNTRUSTED,
             "observed_lines": [
-                f"sshd[21]: Failed publickey for root from {UNTRUSTED} port 40000 ssh2"
+                f"Failed publickey for root from {UNTRUSTED} port 40000 ssh2"
+            ],
+            "journal_tail": [
+                "Server listening on 0.0.0.0 port 22.",
+                f"Connection closed by authenticating user root {UNTRUSTED} port 40000",
             ],
             "firewall": {
                 "active": True,
@@ -339,8 +355,10 @@ class TestDenialFactsVantage(unittest.TestCase):
 
         with mock.patch.object(denial, "run_trusted_ssh", side_effect=trusted), \
                 mock.patch.object(denial, "run_untrusted_probe", side_effect=probe), \
-                mock.patch.object(denial, "sshd_observation",
-                                  return_value=[f"sshd[9]: Failed publickey from {UNTRUSTED}"]), \
+                mock.patch.object(denial, "sshd_observation", return_value={
+                    "matches": [f"Failed publickey from {UNTRUSTED}"],
+                    "tail": [f"Connection closed by {UNTRUSTED} port 40000"],
+                }), \
                 mock.patch.object(denial, "worker_firewall", return_value={
                     "iptables_returncode": 0, "node_allow_sources": [MASTER],
                 }):
@@ -350,6 +368,7 @@ class TestDenialFactsVantage(unittest.TestCase):
         self.assertEqual(calls["untrusted"], ("untrusted", WORKER))
         self.assertEqual(facts["master_address"], MASTER)
         self.assertEqual(facts["worker_address"], WORKER)
+        self.assertEqual(facts["journal_tail"], [f"Connection closed by {UNTRUSTED} port 40000"])
 
 
 if __name__ == "__main__":

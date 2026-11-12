@@ -167,31 +167,45 @@ import json, os, subprocess
 
 NEEDLE = __NEEDLE__
 
-lines = []
+identified = []   # sshd's own messages, identifier chosen by the query
+prefixed = []     # formats that carry "sshd[pid]:" in the line itself
 
 
-def collect(*argv):
+def collect(target, *argv):
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=45)
     except (OSError, subprocess.SubprocessError):
         return
-    lines.extend((proc.stdout or "").splitlines())
+    target.extend((proc.stdout or "").splitlines())
 
 
-collect("journalctl", "-q", "--no-pager", "-n", "800", "-o", "cat")
-collect("dmesg")
+# ``journalctl -o cat`` prints the message alone, without the "sshd[pid]:" the
+# short format adds, so the daemon is selected by the query instead of by a
+# substring: requiring "sshd" in the text discarded exactly the line that names
+# the refused address on a host that keeps no auth.log, which is every clean
+# image this suite runs.
+collect(identified, "journalctl", "-q", "--no-pager", "-n", "200",
+        "-t", "sshd", "-t", "sshd-session", "-o", "cat")
+# A journal that tags the daemon differently, or a host with a syslog file.
+collect(prefixed, "journalctl", "-q", "--no-pager", "-n", "1500", "-o", "short")
 for path in ("/var/log/auth.log", "/var/log/secure"):
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            lines.extend(handle.read().splitlines()[-800:])
+            prefixed.extend(handle.read().splitlines()[-800:])
     except OSError:
         continue
 
-matches = [
-    line.strip() for line in lines
-    if NEEDLE in line and "sshd" in line.lower()
-]
-print(json.dumps({"count": len(matches), "matches": matches[-5:]}))
+matches = [line.strip() for line in identified if NEEDLE in line]
+if not matches:
+    matches = [
+        line.strip() for line in prefixed
+        if NEEDLE in line and ("sshd" in line.lower() or "preauth" in line.lower())
+    ]
+print(json.dumps({
+    "count": len(matches),
+    "matches": matches[-5:],
+    "tail": [line.strip() for line in identified if line.strip()][-3:],
+}))
 '''
 
 
@@ -289,11 +303,20 @@ def parse_trusted_ssh(output: str) -> Dict[str, Any]:
     }
 
 
-def parse_sshd_observation(output: str) -> List[str]:
-    """The lines the Worker logged that name the probed source address."""
+def parse_sshd_report(output: str) -> Dict[str, Any]:
+    """The matching lines plus the daemon's own tail, so a miss is diagnosable."""
     report = _json_object(output)
     matches = report.get("matches") or []
-    return [str(line) for line in matches if isinstance(line, str)]
+    tail = report.get("tail") or []
+    return {
+        "matches": [str(line) for line in matches if isinstance(line, str)],
+        "tail": [str(line) for line in tail if isinstance(line, str)],
+    }
+
+
+def parse_sshd_observation(output: str) -> List[str]:
+    """The lines the Worker logged that name the probed source address."""
+    return parse_sshd_report(output)["matches"]
 
 
 def parse_node_rules(rules: Sequence[str], node_port: int = NODE_PORT) -> Dict[str, Any]:
@@ -500,10 +523,13 @@ def worker_firewall(
 def sshd_observation(
     podman: Any, container: str, needle: str,
     timeout: int = WORKER_REPORT_TIMEOUT_SECONDS,
-) -> List[str]:
-    """The Worker's log lines naming one source address, read in one pass."""
+) -> Dict[str, Any]:
+    """The Worker's log lines naming one address, and what it logged otherwise."""
     result = podman.exec(
         container, ["python3", "-c", sshd_observation_script(needle)],
         check=False, timeout=timeout,
     )
-    return parse_sshd_observation(result.stdout or "")
+    report = parse_sshd_report(result.stdout or "")
+    report["returncode"] = result.returncode
+    report["detail"] = (result.stderr or "").strip()[-400:]
+    return report
