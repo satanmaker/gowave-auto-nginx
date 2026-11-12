@@ -1083,10 +1083,17 @@ class MultiNodeTopology(AioTopology):
         It shares the control network with the fixtures, so it can reach every
         management endpoint by address; every case that must be *denied* runs
         from here rather than from the Control Machine, which owns the topology.
+
+        The clean target image carries an SSH client, which the denial cases need
+        to attempt a real login against the Worker's open SSH port; the fixture
+        image has none. It still holds no product package, credential, or node
+        identity, so the vantage stays untrusted. ``target_image.build`` has
+        already tagged it for this run, so ``Podman.ensure_image`` resolves it
+        without another build.
         """
         self.podman.run(
             name=self.untrusted_name,
-            image_alias=FIXTURE_IMAGE,
+            image_alias=target_image.tag(self.distribution),
             network=self.network,
             privileged=False,
             volumes=(f"{self._ca_dir}:{CA_MOUNT}:ro,Z",),

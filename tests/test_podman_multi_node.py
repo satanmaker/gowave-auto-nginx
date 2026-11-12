@@ -151,6 +151,23 @@ class TestMultiNodeRoles(unittest.TestCase):
         self.assertFalse(runs[self.host.untrusted_name]["privileged"])
         self.assertEqual(runs[self.host.untrusted_name]["systemd"], "false")
 
+    def test_the_denial_role_runs_the_clean_image_so_a_real_login_can_be_attempted(self):
+        # The fixture image has no SSH client, so the refusal would be skipped
+        # rather than measured. The clean target image carries one and still
+        # holds no product package, credential, or node identity.
+        from tools.podman_e2e import target_image
+
+        self._create()
+        runs = self._runs()
+        self.assertEqual(
+            runs[self.host.untrusted_name]["image_alias"],
+            target_image.tag(self.host.distribution),
+        )
+        self.assertNotEqual(
+            runs[self.host.untrusted_name]["image_alias"],
+            topology.FIXTURE_IMAGE,
+        )
+
     def test_a_role_that_never_started_is_refused_by_name(self):
         host = self._create()
         host.started.remove(host.worker_name)
@@ -743,22 +760,28 @@ class TestMultiNodeSuite(unittest.TestCase):
         ids = [case.id for case in multi_node.cases(self.podman)]
         self.assertEqual(ids[3:11], [f"MTLS-0{number}" for number in range(1, 9)])
 
+    def test_the_management_denial_pair_follows_the_control_plane_proof(self):
+        # 5.8: an untrusted vantage and the allowed one are measured after the
+        # Master's mTLS path is proven, so a refusal can be told from an outage.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertEqual(ids[11:13], ["FW-01", "FW-02"])
+
     def test_the_cluster_audit_follows_the_control_plane_proof(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[11:14], ["CLUS-01", "CLUS-02", "CLUS-03"])
+        self.assertEqual(ids[13:16], ["CLUS-01", "CLUS-02", "CLUS-03"])
 
     def test_the_worker_state_audit_follows_the_cluster_audit(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[14:16], ["WRK-05", "WRK-06"])
+        self.assertEqual(ids[16:18], ["WRK-05", "WRK-06"])
 
     def test_the_data_plane_cases_follow_the_worker_audit(self):
         # 5.7: a payload has to traverse the Worker too, so the matrix tuples of
         # both nodes run once the Worker's own config is applied.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[16], "MN-DP-master-REALITY-xray")
-        self.assertEqual(ids[23], "MN-DP-master-TROJAN-GRPC-mihomo")
-        self.assertEqual(ids[24], "MN-DP-worker-REALITY-xray")
-        self.assertEqual(ids[31], "MN-DP-worker-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[18], "MN-DP-master-REALITY-xray")
+        self.assertEqual(ids[25], "MN-DP-master-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[26], "MN-DP-worker-REALITY-xray")
+        self.assertEqual(ids[33], "MN-DP-worker-TROJAN-GRPC-mihomo")
 
     def test_every_node_contributes_its_own_matrix_tuples(self):
         data = matrix.load()

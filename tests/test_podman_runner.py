@@ -22,6 +22,7 @@ from tools.podman_e2e.runner import (  # noqa: E402
     BudgetExhausted,
     Case,
     CaseBlocked,
+    CaseIncomplete,
     CaseResult,
     RunAborted,
     RunContext,
@@ -113,6 +114,22 @@ class TestPodmanRunnerContract(unittest.TestCase):
         runner.add(Case("AIO-BUDGET", "aio", exhausted))
         self.assertEqual(runner.execute(), 1)
         self.assertEqual(runner.results[0].status, INCOMPLETE)
+
+    def test_evidence_that_cannot_decide_the_question_is_incomplete_not_failed(self):
+        # A refusal with no working control beside it says nothing about the
+        # policy, so calling it a product failure would invent a defect.
+        context = self.context()
+
+        def ambiguous(ctx):
+            raise CaseIncomplete("FW-02: the refusal is not attributable to a policy")
+
+        runner = Runner(context)
+        runner.add(Case("FW-02", "aio", ambiguous))
+        self.assertEqual(runner.execute(), 1)
+        report = json.loads((context.artifact_dir / "result.json").read_text())
+        self.assertEqual(report["cases"][0]["status"], INCOMPLETE)
+        self.assertEqual(report["overall"], INCOMPLETE)
+        self.assertIn("not attributable", report["cases"][0]["message"])
 
     def test_skip_never_passes_the_run(self):
         self.assertEqual(overall_status([CaseResult("X", "aio", SKIP)]), FAIL)

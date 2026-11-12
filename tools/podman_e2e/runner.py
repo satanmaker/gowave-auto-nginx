@@ -117,6 +117,15 @@ class CaseBlocked(Exception):
     """
 
 
+class CaseIncomplete(Exception):
+    """The case observed something that cannot decide the question either way.
+
+    Reported as INCOMPLETE rather than FAIL: a refusal with no working control
+    beside it is not evidence that a policy denied anything, and calling it a
+    product failure would invent a defect the evidence does not name.
+    """
+
+
 class CaseTimeout(Exception):
     pass
 
@@ -269,6 +278,8 @@ class Runner:
                     result = CaseResult(case.id, case.topology, FAIL, message=str(exc))
                 except CaseBlocked as exc:
                     result = CaseResult(case.id, case.topology, BLOCKED, message=str(exc))
+                except CaseIncomplete as exc:
+                    result = CaseResult(case.id, case.topology, INCOMPLETE, message=str(exc))
                 except BudgetExhausted as exc:
                     result = CaseResult(case.id, case.topology, INCOMPLETE, message=str(exc))
                 except Exception as exc:  # unexpected harness error is never PASS
