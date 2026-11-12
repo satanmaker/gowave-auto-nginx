@@ -14,6 +14,7 @@ operator ships.
 """
 from __future__ import annotations
 
+import ipaddress
 from typing import Any, Dict, List, Optional, Sequence
 
 from tools.podman_e2e import aio, matrix as matrix_data, topology
@@ -50,6 +51,24 @@ def worker_control_script() -> str:
     return WORKER_CONTROL_SCRIPT.replace("NODE_PORT_PLACEHOLDER", f":{NODE_PORT}")
 
 
+def normalize_peer_host(host: str) -> str:
+    """The peer's address as plain IPv4 when the kernel reported a mapped socket.
+
+    ``ss`` prints a dual-stack connection as ``[::ffff:10.89.0.10]:port``: the node
+    binds ``::`` and accepts IPv4, so a Master-to-Worker control connection is an
+    IPv6 socket whose peer is the Master's IPv4 address in mapped form. Comparing
+    that text to the plan's ``10.89.0.10`` would fail on notation rather than on
+    routing, so the mapped address is unwrapped before anything compares it.
+    """
+    candidate = host.strip("[]")
+    try:
+        address = ipaddress.ip_address(candidate)
+    except ValueError:
+        return host
+    mapped = getattr(address, "ipv4_mapped", None)
+    return str(mapped) if mapped is not None else candidate
+
+
 def parse_worker_control(output: str) -> Dict[str, Any]:
     """Split the Worker's report into the sections the cases assert on."""
     sections: Dict[str, List[str]] = {}
@@ -73,7 +92,7 @@ def parse_worker_control(output: str) -> Dict[str, Any]:
         local, peer = fields[2], fields[3]
         if not local.endswith(f":{NODE_PORT}"):
             continue
-        host = peer.rsplit(":", 1)[0]
+        host = normalize_peer_host(peer.rsplit(":", 1)[0])
         if host not in peers:
             peers.append(host)
     return {
