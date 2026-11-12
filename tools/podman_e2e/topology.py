@@ -1024,6 +1024,16 @@ class MultiNodeTopology(AioTopology):
             input_text=public_key + "\n",
             timeout=120,
         )
+        # A write that never arrived exits 0 and leaves an empty file, so the
+        # pin is proven by reading it back: an unverified pin would surface much
+        # later as the product's own "host key is not pre-pinned" refusal.
+        authorized = self.podman.exec(
+            self.worker_name, ["cat", "/root/.ssh/authorized_keys"], check=False,
+        ).stdout
+        if self._key_blob(public_key) not in authorized:
+            raise TopologyError(
+                f"the Master key did not land in {self.worker_name}:/root/.ssh/authorized_keys"
+            )
         worker_host_key = self.podman.exec(
             self.worker_name, ["cat", "/etc/ssh/ssh_host_ed25519_key.pub"],
         ).stdout.strip()
@@ -1036,6 +1046,13 @@ class MultiNodeTopology(AioTopology):
             input_text=known_hosts,
             timeout=120,
         )
+        pinned = self.podman.exec(
+            self.target_name, ["cat", "/root/.ssh/known_hosts"], check=False,
+        ).stdout
+        if self._key_blob(worker_host_key) not in pinned:
+            raise TopologyError(
+                f"the Worker host key did not land in {self.target_name}:/root/.ssh/known_hosts"
+            )
         self._worker_host_key = worker_host_key
         self._worker_public_key = public_key
         return {
@@ -1053,6 +1070,12 @@ class MultiNodeTopology(AioTopology):
         blob = base64.b64decode(fields[1])
         digest = hashlib.sha256(blob).digest()
         return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+    @staticmethod
+    def _key_blob(public_key: str) -> str:
+        """The base64 key material of a public key line, for substring proof of a pin."""
+        fields = public_key.split()
+        return fields[1] if len(fields) > 1 else ""
 
     # --------------------------------------------------------------- node add
     def node_add_script(self, name: str = WORKER_NODE_NAME) -> str:
