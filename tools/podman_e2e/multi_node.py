@@ -15,6 +15,9 @@ operator ships.
 from __future__ import annotations
 
 import ipaddress
+import json
+import os
+import re
 from typing import Any, Dict, List, Optional, Sequence
 
 from tools.podman_e2e import aio, matrix as matrix_data, mtls, topology
@@ -23,9 +26,13 @@ from tools.podman_e2e.runner import Case, CaseBlocked, require
 
 INSTALL_CASE_ID = "MN-INSTALL"
 NODE_ADD_CASE_ID = "WRK-04"
+WORKER_STATE_CASE_ID = "WRK-05"
+WORKER_CONFIG_CASE_ID = "WRK-06"
 MASTER_ADDRESS_CASE_ID = "PODNET-MASTER-ADDR"
 MTLS_TIMEOUT_SECONDS = 300
 CLUSTER_TIMEOUT_SECONDS = 300
+WORKER_STATE_TIMEOUT_SECONDS = 300
+WORKER_REPORT_TIMEOUT_SECONDS = 120
 
 # The name the installer gives the node the Panel runs on. Without it, a cluster
 # audit could be satisfied by any two nodes rather than the ones the product
@@ -56,6 +63,190 @@ ufw status 2>/dev/null || true
 
 def worker_control_script() -> str:
     return WORKER_CONTROL_SCRIPT.replace("NODE_PORT_PLACEHOLDER", f":{NODE_PORT}")
+
+
+# What the Worker says about itself, read through the product's own surfaces: the
+# CLI's version and status commands, the config the node actually loaded, and the
+# settings file it was installed with. Nothing here is written by the harness, and
+# the Panel secret in `/opt/gowave-node/.env` is never read out.
+WORKER_STATE_SCRIPT = r"""
+python3 - <<'PY'
+import json
+import os
+import subprocess
+
+BINARY = "/opt/gowave-node/gowave-node"
+CORE = "/opt/gowave-node/rw-core"
+ENV_FILE = "/opt/gowave-node/.env"
+RUNTIME = "/run/gowave-node"
+CONFIG = os.path.join(RUNTIME, "xray.json")
+
+
+def text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def mode(path):
+    try:
+        return oct(os.stat(path).st_mode & 0o777)
+    except OSError:
+        return ""
+
+
+def run(*arguments):
+    try:
+        result = subprocess.run(arguments, capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"returncode": None, "stdout": "", "stderr": str(error)}
+    return {
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def options(path):
+    # The settings that describe the Worker's own serving identity. Everything
+    # else in this file, the Panel secret above all, stays unread.
+    wanted = {"NODE_PORT", "GOWAVE_NODE_RUNTIME_DIR"}
+    found = {}
+    for line in text(path).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key in wanted:
+            found[key] = value.strip().strip('"').strip("'")
+    return found
+
+
+def applied(path):
+    raw = text(path)
+    try:
+        config = json.loads(raw) if raw.strip() else None
+    except json.JSONDecodeError:
+        return {"parsed": False, "inbounds": [], "outbound_count": 0}
+    if not isinstance(config, dict):
+        return {"parsed": False, "inbounds": [], "outbound_count": 0}
+    inbounds = []
+    for entry in config.get("inbounds") or []:
+        if not isinstance(entry, dict):
+            continue
+        stream = entry.get("streamSettings")
+        stream = stream if isinstance(stream, dict) else {}
+        inbounds.append({
+            "tag": str(entry.get("tag") or ""),
+            "type": str(entry.get("protocol") or ""),
+            "port": entry.get("port"),
+            "network": str(stream.get("network") or "tcp"),
+            "security": str(stream.get("security") or "none"),
+        })
+    outbounds = config.get("outbounds")
+    return {
+        "parsed": True,
+        "inbounds": inbounds,
+        "outbound_count": len(outbounds) if isinstance(outbounds, list) else 0,
+    }
+
+
+print(json.dumps({
+    "binary": {"path": BINARY, "executable": os.access(BINARY, os.X_OK)},
+    "version": run(BINARY, "version"),
+    "status": run(BINARY, "status"),
+    "paths": {
+        "runtime_dir": {"mode": mode(RUNTIME)},
+        "config": {"path": CONFIG, "mode": mode(CONFIG)},
+        "env": {"path": ENV_FILE, "mode": mode(ENV_FILE)},
+        "core": {"path": CORE, "executable": os.access(CORE, os.X_OK)},
+    },
+    "options": options(ENV_FILE),
+    "applied": applied(CONFIG),
+}, sort_keys=True))
+PY
+"""
+
+ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
+VERSION_PATTERN = re.compile(r"\d+\.\d+(?:\.\d+)?")
+
+
+def strip_ansi(text: str) -> str:
+    """Drop the colours the product's status CLI writes even into a pipe."""
+    return ANSI_PATTERN.sub("", text or "")
+
+
+def version_number(text: str) -> str:
+    """The numeric part of a version string, so ``v1.0.5 (Go)`` meets ``1.0.5``."""
+    match = VERSION_PATTERN.search(str(text or ""))
+    return match.group(0) if match else ""
+
+
+def parse_node_version(output: str) -> str:
+    """``gowave-node version`` prints one line: ``gowave-node v1.0.5``."""
+    for line in strip_ansi(output).splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[0].startswith("gowave-node"):
+            return fields[1]
+    return ""
+
+
+def parse_node_status(output: str) -> Dict[str, Any]:
+    """The self-report ``gowave-node status`` prints, label by label.
+
+    The CLI is the product's own runtime check, so its verdict — not the unit's
+    active state and not a socket the harness opened — is what the case reads.
+    """
+    labels: Dict[str, str] = {}
+    for line in strip_ansi(output).splitlines():
+        stripped = line.strip().lstrip("\u25cf\u25cb").strip()
+        label, separator, value = stripped.partition(":")
+        if not separator or not value.strip():
+            continue
+        key = label.strip().lower()
+        if key.startswith("daemon"):
+            labels["daemon"] = value.strip()
+        elif key.startswith("systemd"):
+            labels["service"] = value.split("(")[0].strip()
+        elif key.startswith("xray core"):
+            labels["core"] = value.strip()
+        elif key.startswith("node version"):
+            labels["version"] = value.strip()
+    return {
+        "daemon_running": labels.get("daemon", "").upper().startswith("RUNNING"),
+        "daemon": labels.get("daemon", ""),
+        "service": labels.get("service", ""),
+        "core": labels.get("core", ""),
+        "version": labels.get("version", ""),
+    }
+
+
+def inbound_key(spec: Dict[str, Any]) -> tuple:
+    """One inbound declaration reduced to the fields both sides must agree on."""
+    port = spec.get("port")
+    return (
+        str(spec.get("tag") or ""),
+        str(spec.get("type") or "").lower(),
+        "" if port in (None, "") else str(port),
+        str(spec.get("network") or "").lower(),
+        str(spec.get("security") or "").lower(),
+    )
+
+
+def panel_node(cluster: Dict[str, Any], name: str, case_id: str) -> Dict[str, Any]:
+    """The registry record for one node, refused by name when it is absent."""
+    records = (cluster.get("nodes") or {}).get("records") or []
+    node = next((record for record in records if record.get("name") == name), None)
+    require(
+        case_id,
+        node is not None,
+        f"the Panel registry lists no node named {name!r}; observed "
+        f"{sorted(str(record.get('name') or '') for record in records)}",
+    )
+    return node
 
 
 def normalize_peer_host(host: str) -> str:
@@ -160,6 +351,9 @@ class MultiNodeProduct:
         self.node_add_outcome: Optional[topology.InstallOutcome] = None
         self.mtls_positive_facts: Optional[Dict[str, Any]] = None
         self.mtls_negative_facts: Optional[Dict[str, Any]] = None
+        self.worker_state_cache: Optional[Dict[str, Any]] = None
+        self.worker_report_timeout = WORKER_REPORT_TIMEOUT_SECONDS
+        self.worker_report_interval = NODE_HEALTH_INTERVAL_SECONDS
         self.trust: Dict[str, Any] = {}
         self.declared_data_plane: List[str] = []
         self.data_plane_results: Dict[str, str] = {}
@@ -285,6 +479,40 @@ class MultiNodeProduct:
             )
         return cluster
 
+    def worker_state(self, case_id: str) -> Dict[str, Any]:
+        """What the Worker says about itself, collected once per run.
+
+        The report is read from the product's own CLI and its own applied config,
+        so no case here can be satisfied by a value the harness wrote.
+        """
+        host = self.require_worker()
+        if self.worker_state_cache is None:
+            result = self.podman.exec_bash(
+                host.worker_name, WORKER_STATE_SCRIPT, check=False,
+                timeout=WORKER_STATE_TIMEOUT_SECONDS,
+            )
+            require(
+                case_id,
+                result.returncode == 0,
+                f"the Worker state probe exited {result.returncode}: "
+                f"{(result.stderr or result.stdout or '').strip()[-2000:]}",
+            )
+            parsed: Optional[Dict[str, Any]] = None
+            try:
+                candidate = json.loads(result.stdout or "")
+            except json.JSONDecodeError:
+                candidate = None
+            if isinstance(candidate, dict):
+                parsed = candidate
+            require(
+                case_id,
+                parsed is not None,
+                f"the Worker state probe did not print a JSON object: "
+                f"{(result.stdout or '')[:400]}",
+            )
+            self.worker_state_cache = parsed
+        return self.worker_state_cache
+
     def worker_control_facts(self, case_id: str, timeout: int = 120) -> Dict[str, Any]:
         host = self.require_installed()
         result = self.podman.exec_bash(host.worker_name, worker_control_script(), check=False,
@@ -331,6 +559,34 @@ class MultiNodeProduct:
             ready,
             f"the Panel never reported {expected} connected nodes within "
             f"{NODE_HEALTH_TIMEOUT_SECONDS}s: {observed}",
+        )
+        return observed
+
+    def wait_for_worker_report(self, case_id: str) -> Dict[str, Any]:
+        """Wait until the Panel holds a version report from the Worker.
+
+        A node's versions are stored by the heartbeat that first reaches the
+        Panel, so a read taken between registration and that heartbeat finds the
+        connection flag without the self-report behind it.
+        """
+        observed: Dict[str, Any] = {}
+
+        def reported() -> bool:
+            record = panel_node(self.cluster_facts(case_id), topology.WORKER_NODE_NAME, case_id)
+            observed.clear()
+            observed.update(record)
+            versions = record.get("versions") or {}
+            return bool(versions.get("node"))
+
+        ready = wait_until(
+            reported, self.worker_report_timeout, f"{case_id} Worker self-report",
+            interval_seconds=self.worker_report_interval,
+        )
+        require(
+            case_id,
+            ready,
+            f"the Panel never recorded a node version for {topology.WORKER_NODE_NAME!r} "
+            f"within {self.worker_report_timeout}s; last record {observed.get('versions')}",
         )
         return observed
 
@@ -1037,6 +1293,207 @@ def case_cluster_nodes(product: MultiNodeProduct) -> Dict[str, Any]:
     }
 
 
+def case_worker_state(product: MultiNodeProduct) -> Dict[str, Any]:
+    """WRK-05: the Worker's own health report is what the Panel records about it.
+
+    The Panel does not invent a node's version strings; they arrive over that
+    node's heartbeat. Reading the same binary and the same core on the Worker is
+    what turns the registry entry into a fact. And a connected node whose latest
+    config was rejected is not healthy, which is exactly what the registry's
+    status message says and a connection count cannot.
+    """
+    product.require_worker()
+    record = product.wait_for_worker_report(WORKER_STATE_CASE_ID)
+    state = record.get("state") or {}
+    versions = record.get("versions") or {}
+    require(
+        WORKER_STATE_CASE_ID,
+        record.get("connected") is True,
+        f"the Panel does not report {topology.WORKER_NODE_NAME!r} as connected",
+    )
+    require(
+        WORKER_STATE_CASE_ID,
+        state.get("disabled") is not True,
+        "the Panel holds the Worker disabled, so it is registered but not serving",
+    )
+    require(
+        WORKER_STATE_CASE_ID,
+        state.get("connecting") is not True,
+        f"the Panel still reports the Worker as connecting after {NODE_ADD_CASE_ID}",
+    )
+    require(
+        WORKER_STATE_CASE_ID,
+        not state.get("status_message"),
+        f"the Panel records a node status message {state.get('status_message')!r}, "
+        f"which is how it reports a config the node refused to load",
+    )
+    require(
+        WORKER_STATE_CASE_ID,
+        str(versions.get("node_type") or "").lower() == "go",
+        f"the Panel records the Worker as a {versions.get('node_type')!r} node",
+    )
+
+    facts = product.worker_state(WORKER_STATE_CASE_ID)
+    binary = facts.get("binary") or {}
+    require(
+        WORKER_STATE_CASE_ID,
+        binary.get("executable") is True,
+        f"the Worker has no executable node binary at {binary.get('path') or 'the node path'}",
+    )
+    version_command = facts.get("version") or {}
+    version = parse_node_version(version_command.get("stdout") or "")
+    require(
+        WORKER_STATE_CASE_ID,
+        version_command.get("returncode") == 0 and bool(version),
+        f"`gowave-node version` on the Worker exited {version_command.get('returncode')} "
+        f"and printed {(version_command.get('stdout') or '').strip()[:200]!r}",
+    )
+    require(
+        WORKER_STATE_CASE_ID,
+        version_number(version) == version_number(versions.get("node")),
+        f"the Worker binary reports {version!r} while the Panel records "
+        f"{versions.get('node')!r}",
+    )
+    requested = (os.environ.get("GOWAVE_NODE_VERSION") or "").strip()
+    if requested and requested.lower() != "latest":
+        require(
+            WORKER_STATE_CASE_ID,
+            version_number(version) == version_number(requested),
+            f"the Worker runs {version!r} although this deployment requested {requested!r}",
+        )
+
+    status_command = facts.get("status") or {}
+    status = parse_node_status(status_command.get("stdout") or "")
+    require(
+        WORKER_STATE_CASE_ID,
+        status_command.get("returncode") == 0 and status["daemon_running"],
+        f"`gowave-node status` on the Worker reports "
+        f"{status.get('daemon') or 'no daemon line'!r}; exit {status_command.get('returncode')}",
+    )
+    core = status.get("core") or ""
+    require(
+        WORKER_STATE_CASE_ID,
+        bool(core) and "NOT FOUND" not in core.upper(),
+        f"`gowave-node status` on the Worker reports no Xray core: {core!r}",
+    )
+    panel_xray = versions.get("xray") or ""
+    require(
+        WORKER_STATE_CASE_ID,
+        bool(panel_xray) and version_number(core) == version_number(panel_xray),
+        f"the Worker's core reports {core!r} while the Panel records {panel_xray!r}",
+    )
+    return {
+        "worker_version": version,
+        "requested_version": requested or "latest",
+        "panel_node_version": versions.get("node"),
+        "panel_xray_version": panel_xray,
+        "core": core,
+        "daemon": status.get("daemon"),
+        "service": status.get("service"),
+        "last_status_change": state.get("last_status_change"),
+    }
+
+
+def case_worker_config(product: MultiNodeProduct) -> Dict[str, Any]:
+    """WRK-06: the config the Worker loaded is the one the Panel assigned to it.
+
+    An active-inbound count cannot tell a node serving its own assignment from a
+    node serving another's, and it cannot tell whether the latest config was
+    applied. So the Worker's applied config — the product's own output — is
+    compared to the Panel's declaration field by field, and the permissions that
+    keep the REALITY keys and client credentials private are checked with it.
+    """
+    product.require_worker()
+    record = panel_node(
+        product.cluster_facts(WORKER_CONFIG_CASE_ID),
+        topology.WORKER_NODE_NAME, WORKER_CONFIG_CASE_ID,
+    )
+    declared = [spec for spec in record.get("inbound_specs") or [] if isinstance(spec, dict)]
+    require(
+        WORKER_CONFIG_CASE_ID,
+        bool(declared),
+        f"the Panel declares no inbounds for {topology.WORKER_NODE_NAME!r}",
+    )
+    require(
+        WORKER_CONFIG_CASE_ID,
+        len(declared) == product.worker_inbound_count,
+        f"the Panel declares {len(declared)} inbounds for the Worker, expected "
+        f"{product.worker_inbound_count}",
+    )
+
+    facts = product.worker_state(WORKER_CONFIG_CASE_ID)
+    paths = facts.get("paths") or {}
+    config_path = (paths.get("config") or {}).get("path") or "/run/gowave-node/xray.json"
+    applied = facts.get("applied") or {}
+    require(
+        WORKER_CONFIG_CASE_ID,
+        applied.get("parsed") is True,
+        f"the config the Worker applied at {config_path} is not a JSON object",
+    )
+    inbounds = [entry for entry in applied.get("inbounds") or [] if isinstance(entry, dict)]
+    require(
+        WORKER_CONFIG_CASE_ID,
+        len(inbounds) == len(declared),
+        f"the Worker loaded {len(inbounds)} inbounds while the Panel assigned it "
+        f"{len(declared)}",
+    )
+    require(
+        WORKER_CONFIG_CASE_ID,
+        applied.get("outbound_count", 0) > 0,
+        "the config the Worker loaded declares no outbounds",
+    )
+    expected = {inbound_key(spec) for spec in declared}
+    actual = {inbound_key(spec) for spec in inbounds}
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    require(
+        WORKER_CONFIG_CASE_ID,
+        not missing and not extra,
+        f"the inbounds the Worker loaded differ from the Panel's assignment: "
+        f"missing {missing}, unexpected {extra}",
+    )
+
+    runtime_mode = (paths.get("runtime_dir") or {}).get("mode")
+    config_mode = (paths.get("config") or {}).get("mode")
+    env_mode = (paths.get("env") or {}).get("mode")
+    require(
+        WORKER_CONFIG_CASE_ID,
+        runtime_mode == "0o700",
+        f"the Worker's runtime directory is {runtime_mode!r} instead of 0700, so the "
+        f"config inside it is reachable by other local users",
+    )
+    require(
+        WORKER_CONFIG_CASE_ID,
+        config_mode == "0o600",
+        f"the applied config is {config_mode!r} instead of 0600 although it carries the "
+        f"REALITY key material and client credentials",
+    )
+    require(
+        WORKER_CONFIG_CASE_ID,
+        env_mode == "0o600",
+        f"the Worker's settings file is {env_mode!r} instead of 0600",
+    )
+
+    options = facts.get("options") or {}
+    require(
+        WORKER_CONFIG_CASE_ID,
+        str(options.get("NODE_PORT")) == str(record.get("port")),
+        f"the Worker's settings serve port {options.get('NODE_PORT')!r} while the Panel "
+        f"reaches it on {record.get('port')!r}",
+    )
+    return {
+        "declared_inbound_count": len(declared),
+        "worker_inbound_count": len(inbounds),
+        "inbound_ports": sorted({str(entry.get("port")) for entry in inbounds}),
+        "inbound_tags": sorted(str(entry.get("tag") or "") for entry in inbounds),
+        "outbound_count": applied.get("outbound_count"),
+        "node_port": options.get("NODE_PORT"),
+        "runtime_mode": runtime_mode,
+        "config_mode": config_mode,
+        "env_mode": env_mode,
+    }
+
+
 def cases(
     podman: Any, distribution: str = "ubuntu-24.04",
     vision: bool = False, worker_vision: bool = False,
@@ -1074,4 +1531,8 @@ def cases(
              timeout_seconds=CLUSTER_TIMEOUT_SECONDS),
         Case("CLUS-03", "multi-node", lambda context: case_cluster_nodes(product),
              timeout_seconds=CLUSTER_TIMEOUT_SECONDS),
+        Case(WORKER_STATE_CASE_ID, "multi-node", lambda context: case_worker_state(product),
+             timeout_seconds=WORKER_STATE_TIMEOUT_SECONDS),
+        Case(WORKER_CONFIG_CASE_ID, "multi-node", lambda context: case_worker_config(product),
+             timeout_seconds=WORKER_STATE_TIMEOUT_SECONDS),
     ]

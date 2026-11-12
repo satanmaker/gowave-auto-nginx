@@ -124,6 +124,48 @@ def inbound_entries(entries: Any) -> List[Dict[str, Any]]:
     return result
 
 
+def inbound_spec(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """The declaration a node's own applied config has to reproduce.
+
+    Tag, protocol, port, transport, and security layer are read from the same
+    template the node loads, so they are the fields a Worker-side config can be
+    compared against field by field. ``rawInbound`` is deliberately absent: it
+    carries the REALITY key material and the client credentials.
+    """
+    return {
+        "tag": str(entry.get("tag") or ""),
+        "type": str(entry.get("type") or ""),
+        "port": entry.get("port"),
+        "network": str(entry.get("network") or ""),
+        "security": str(entry.get("security") or ""),
+    }
+
+
+def node_versions(value: Any) -> Dict[str, Any]:
+    """What the node reported about itself, as the Panel stored it.
+
+    The values arrive over the node's own heartbeat, so they are the Panel's
+    record of the Worker's self-report rather than a value the Panel computed.
+    """
+    versions = value if isinstance(value, dict) else {}
+    return {
+        "node": str(versions.get("node") or ""),
+        "xray": str(versions.get("xray") or ""),
+        "node_type": str(versions.get("nodeType") or ""),
+        "custom_core": versions.get("isCustom") is True,
+    }
+
+
+def node_state(node: Dict[str, Any]) -> Dict[str, Any]:
+    """The health flags that say whether the node is serving the latest config."""
+    return {
+        "disabled": node.get("isDisabled") is True,
+        "connecting": node.get("isConnecting") is True,
+        "status_message": str(node.get("lastStatusMessage") or ""),
+        "last_status_change": str(node.get("lastStatusChange") or ""),
+    }
+
+
 def _decode(raw: str) -> Any:
     if not raw.strip():
         return {}
@@ -317,9 +359,10 @@ def cluster(panel: Panel) -> Dict[str, Any]:
     node_records: List[Dict[str, Any]] = []
     for node in nodes:
         profile = node.get("configProfile") if isinstance(node.get("configProfile"), dict) else {}
+        declared = inbound_entries(profile.get("activeInbounds"))
         inbounds = [
             identifier(inbound.get("uuid"))
-            for inbound in inbound_entries(profile.get("activeInbounds"))
+            for inbound in declared
         ]
         node_records.append({
             "name": str(node.get("name") or ""),
@@ -329,6 +372,9 @@ def cluster(panel: Panel) -> Dict[str, Any]:
             "uuid": identifier(node.get("uuid")),
             "profile": identifier(profile.get("activeConfigProfileUuid")),
             "inbounds": [value for value in inbounds if value],
+            "inbound_specs": [inbound_spec(entry) for entry in declared],
+            "state": node_state(node),
+            "versions": node_versions(node.get("versions")),
         })
     facts["nodes"] = {"status": status, "records": node_records}
 

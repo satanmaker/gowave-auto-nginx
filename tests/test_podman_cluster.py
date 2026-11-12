@@ -24,6 +24,7 @@ from tools.podman_e2e import matrix, multi_node, panel_surface, topology  # noqa
 
 PASSWORD = "pw-do-not-print"
 TOKEN = "token-do-not-print"
+PRIVATE_KEY_SENTINEL = "reality-private-key-do-not-print"
 
 MASTER_NODE_UUID = "node-uuid-master"
 WORKER_NODE_UUID = "node-uuid-worker"
@@ -36,6 +37,41 @@ def inbound_uuids(node: str, vision: bool):
     """One inbound UUID per matrix entry the node's profile carries."""
     entries = matrix.inbounds(matrix.load(), vision=vision)
     return [f"inbound-uuid-{node}-{index}" for index, _entry in enumerate(entries)]
+
+
+def inbound_specs(node: str, vision: bool):
+    """One declared inbound per matrix entry, in the Panel's own field names.
+
+    The values come from the shipped templates because that is what the Panel
+    parses into an inbound row, so a fixture cannot drift from the product.
+    """
+    specs = []
+    for entry in matrix.inbounds(matrix.load(), vision=vision):
+        template = json.loads((REPO_ROOT / entry["template"]).read_text(encoding="utf-8"))
+        stream = template.get("streamSettings") or {}
+        specs.append({
+            "tag": f"{entry['tag']}-{node}",
+            "type": template.get("protocol"),
+            "port": template.get("port"),
+            "network": stream.get("network"),
+            "security": stream.get("security"),
+        })
+    return specs
+
+
+NODE_VERSIONS = {
+    "node": "v1.0.5 (Go)",
+    "xray": "v26.11.9",
+    "node_type": "go",
+    "custom_core": False,
+}
+
+NODE_STATE = {
+    "disabled": False,
+    "connecting": False,
+    "status_message": "",
+    "last_status_change": "2026-11-12T17:00:00Z",
+}
 
 
 def host_record(node_name, node_uuid, profile_uuid, inbound_uuid, address,
@@ -67,6 +103,9 @@ def healthy_cluster(vision=False, worker_vision=False):
             "uuid": panel_surface.identifier(MASTER_NODE_UUID),
             "profile": panel_surface.identifier(MASTER_PROFILE_UUID),
             "inbounds": [panel_surface.identifier(value) for value in master],
+            "inbound_specs": inbound_specs("master", vision),
+            "state": dict(NODE_STATE),
+            "versions": dict(NODE_VERSIONS),
         },
         {
             "name": topology.WORKER_NODE_NAME,
@@ -76,6 +115,9 @@ def healthy_cluster(vision=False, worker_vision=False):
             "uuid": panel_surface.identifier(WORKER_NODE_UUID),
             "profile": panel_surface.identifier(WORKER_PROFILE_UUID),
             "inbounds": [panel_surface.identifier(value) for value in worker],
+            "inbound_specs": inbound_specs("worker", worker_vision),
+            "state": dict(NODE_STATE),
+            "versions": dict(NODE_VERSIONS),
         },
     ]
     profiles = [
@@ -226,6 +268,10 @@ class TestClusterScope(unittest.TestCase):
             def raw(value):
                 return reverse.get(value, value)
 
+            # The Panel stores the inbound template verbatim with its keys, so a
+            # probe that echoed it would leak the REALITY secret.
+            raw_inbound = json.dumps({"privateKey": PRIVATE_KEY_SENTINEL})
+
             server_payload = {
                 "nodes": [
                     {
@@ -234,11 +280,23 @@ class TestClusterScope(unittest.TestCase):
                         "address": record["address"],
                         "port": record["port"],
                         "isConnected": record["connected"],
+                        "isDisabled": record["state"]["disabled"],
+                        "isConnecting": record["state"]["connecting"],
+                        "lastStatusMessage": record["state"]["status_message"] or None,
+                        "lastStatusChange": record["state"]["last_status_change"],
+                        "versions": {
+                            "node": record["versions"]["node"],
+                            "xray": record["versions"]["xray"],
+                            "nodeType": record["versions"]["node_type"],
+                            "isCustom": record["versions"]["custom_core"],
+                        },
                         "configProfile": {
                             "activeConfigProfileUuid": raw(record["profile"]),
                             "activeInbounds": [
-                                {"uuid": raw(value), "type": "vless", "port": 443}
-                                for value in record["inbounds"]
+                                dict(spec, uuid=raw(value), rawInbound=raw_inbound)
+                                for value, spec in zip(
+                                    record["inbounds"], record["inbound_specs"]
+                                )
                             ],
                         },
                     }
@@ -363,8 +421,30 @@ class TestClusterScope(unittest.TestCase):
     def test_the_report_carries_no_internal_identifier(self):
         _facts, output = self._probe()
         for value in (MASTER_NODE_UUID, WORKER_NODE_UUID, MASTER_PROFILE_UUID,
-                      WORKER_PROFILE_UUID, "inbound-uuid-master-0", "inbound-uuid-worker-3"):
+                      WORKER_PROFILE_UUID, "inbound-uuid-master-0", "inbound-uuid-worker-3",
+                      PRIVATE_KEY_SENTINEL):
             self.assertNotIn(value, output, f"the report leaked {value!r}")
+
+    def test_each_node_reports_the_inbounds_it_declares(self):
+        facts, _output = self._probe()
+        records = {record["name"]: record for record in facts["cluster"]["nodes"]["records"]}
+        for name, specs in (
+            (multi_node.LOCAL_NODE_NAME, inbound_specs("master", False)),
+            (topology.WORKER_NODE_NAME, inbound_specs("worker", False)),
+        ):
+            reported = records[name]["inbound_specs"]
+            self.assertEqual(len(reported), 4)
+            self.assertEqual(reported, specs)
+            self.assertEqual(sorted(reported[0]),
+                             ["network", "port", "security", "tag", "type"])
+
+    def test_each_node_reports_its_own_state_and_versions(self):
+        facts, _output = self._probe()
+        records = {record["name"]: record for record in facts["cluster"]["nodes"]["records"]}
+        for record in records.values():
+            self.assertEqual(record["state"], NODE_STATE)
+            self.assertEqual(record["versions"], NODE_VERSIONS)
+        self.assertIs(records[topology.WORKER_NODE_NAME]["state"]["disabled"], False)
 
 
 class TestClusterCases(unittest.TestCase):

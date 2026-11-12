@@ -261,6 +261,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Distributed Worker VPS Deployment Verification",
     },
     {
+        "id": "WRK-06",
+        "requirement": "Distributed Worker VPS Deployment Verification",
+        "assertion": "The config the Worker node actually loaded is the one the Panel assigned to it: every declared inbound matches on tag, protocol, port, transport, and security layer, the applied config declares outbounds, and the runtime directory, applied config, and settings file are private.",
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
+    {
         "id": "ACME-REJECT-ARB",
         "requirement": "Fail-closed local ACME test mode",
         "assertion": "Arbitrary ACME directory URLs are rejected by Master and Worker both outside and inside the test-only opt-in; only the pinned fixture endpoint and the Let's Encrypt allowlist are accepted.",
