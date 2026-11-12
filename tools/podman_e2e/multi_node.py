@@ -20,16 +20,19 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from tools.podman_e2e import aio, matrix as matrix_data, mtls, topology
+from tools.podman_e2e import aio, denial, matrix as matrix_data, mtls, topology
 from tools.podman_e2e.podman import wait_until
-from tools.podman_e2e.runner import Case, CaseBlocked, require
+from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
 
 INSTALL_CASE_ID = "MN-INSTALL"
 NODE_ADD_CASE_ID = "WRK-04"
 WORKER_STATE_CASE_ID = "WRK-05"
 WORKER_CONFIG_CASE_ID = "WRK-06"
 MASTER_ADDRESS_CASE_ID = "PODNET-MASTER-ADDR"
+MANAGEMENT_DENIAL_CASE_ID = "FW-01"
+DENIAL_CLASSIFICATION_CASE_ID = "FW-02"
 MTLS_TIMEOUT_SECONDS = 300
+DENIAL_TIMEOUT_SECONDS = 300
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 WORKER_REPORT_TIMEOUT_SECONDS = 120
@@ -401,6 +404,7 @@ class MultiNodeProduct:
         self.node_add_outcome: Optional[topology.InstallOutcome] = None
         self.mtls_positive_facts: Optional[Dict[str, Any]] = None
         self.mtls_negative_facts: Optional[Dict[str, Any]] = None
+        self.denial_facts_cache: Optional[Dict[str, Any]] = None
         self.worker_state_cache: Optional[Dict[str, Any]] = None
         self.worker_report_timeout = WORKER_REPORT_TIMEOUT_SECONDS
         self.worker_report_interval = NODE_HEALTH_INTERVAL_SECONDS
@@ -699,6 +703,97 @@ class MultiNodeProduct:
             f"the negative controls reported nothing for {key!r}; observed {sorted(report)}",
         )
         return outcome
+
+    # --------------------------------------------------------------- denial
+    def denial_facts(self, case_id: str = MANAGEMENT_DENIAL_CASE_ID) -> Dict[str, Any]:
+        """The untrusted and trusted management paths, measured once.
+
+        FW-01 and FW-02 read the same observations — the Master's working path,
+        the untrusted attempts, and what the Worker recorded about them — so a
+        second collection would let the two cases describe different instants.
+        A failed probe blocks instead of reporting a refusal, because "the probe
+        could not run" and "the Worker said no" are not the same finding.
+        """
+        host = self.require_worker()
+        if self.denial_facts_cache is not None:
+            return self.denial_facts_cache
+
+        master_address = host.plan.target_ip
+        untrusted_address = host.plan.untrusted_ip
+        # Both attempts dial the Worker, not the Master: the trust material the
+        # operator set up names the Worker's run address, and the control port
+        # the firewall scopes is the Worker's.
+        worker_address = host.plan.worker_ip
+        require(
+            case_id,
+            master_address != untrusted_address,
+            f"the untrusted role runs at {untrusted_address}, the same address the Master "
+            f"uses ({master_address}); a denial from that vantage would prove nothing",
+        )
+
+        positive = self.mtls_positive()
+        require(
+            case_id,
+            positive.get("returncode") == 0,
+            f"the Master's own mTLS verifier exited {positive.get('returncode')}, so a "
+            f"refusal seen from the untrusted role could not be told from a control plane "
+            f"that was down: {positive.get('tail') or 'no output'}",
+        )
+        trusted = denial.run_trusted_ssh(self.podman, host.target_name, worker_address)
+        probe = denial.run_untrusted_probe(self.podman, host.untrusted_name, worker_address)
+        if not probe.get("management"):
+            raise CaseBlocked(
+                f"{case_id}: the untrusted probe produced no report (exit "
+                f"{probe.get('returncode')}): {probe.get('detail') or 'no output'}"
+            )
+        observed: List[str] = []
+
+        def logged() -> bool:
+            # sshd writes the refusal when the connection ends, so the line can
+            # trail the probe by a moment; the deadline is what makes that a poll
+            # rather than an assumption.
+            observed.clear()
+            observed.extend(
+                line for line in denial.sshd_observation(
+                    self.podman, host.worker_name, untrusted_address,
+                )
+                if "[preauth]" in line or "Failed" in line or "Connection closed" in line
+            )
+            return bool(observed)
+
+        wait_until(
+            logged, denial.SSHD_OBSERVATION_TIMEOUT_SECONDS,
+            f"{case_id} Worker sshd observation", interval_seconds=2,
+        )
+        firewall = denial.worker_firewall(self.podman, host.worker_name)
+        require(
+            case_id,
+            firewall.get("iptables_returncode") == 0,
+            f"the Worker's firewall rules could not be read (exit "
+            f"{firewall.get('iptables_returncode')}): "
+            f"{firewall.get('iptables_error') or firewall.get('detail') or 'no output'}",
+        )
+        require(
+            case_id,
+            firewall["node_allow_sources"],
+            "the Worker allows no source to reach the control port, so there is no allowed "
+            "management path for the trusted half of this pair",
+        )
+
+        self.denial_facts_cache = {
+            "master_address": master_address,
+            "worker_address": worker_address,
+            "untrusted_address": untrusted_address,
+            "trusted_mtls": positive,
+            "trusted_ssh": trusted,
+            "untrusted": probe,
+            "observed_source": untrusted_address if observed else "",
+            "observed_lines": observed,
+            "firewall": firewall,
+            "worker_name": host.worker_name,
+            "untrusted_name": host.untrusted_name,
+        }
+        return self.denial_facts_cache
 
     def worker_address_facts(self, case_id: str) -> Dict[str, Any]:
         """What the Worker itself says about the Master address it was given."""
@@ -1013,6 +1108,193 @@ def case_mtls_wrong_sni(product: MultiNodeProduct) -> Dict[str, Any]:
         f"unanswered is not evidence of routing either way",
     )
     return {"wrong_sni": outcome}
+
+
+def case_management_denial(product: MultiNodeProduct) -> Dict[str, Any]:
+    """FW-01: an untrusted source cannot reach the Worker's management plane.
+
+    The Worker's control port is allowed from the Master's address and nowhere
+    else, and the node demands a client certificate on top of that. Both halves
+    are asserted here, because one without the other is not a policy: a refusal
+    that would also happen for the Master is a broken control plane, and an
+    allow rule naming the Master proves nothing if the port is open to everyone
+    with a certificate. The SSH attempt is the same question at the other
+    boundary — the port is open to every source, so the denial has to be
+    authentication, and the Worker's own log has to name the address it refused.
+    """
+    facts = product.denial_facts(MANAGEMENT_DENIAL_CASE_ID)
+    firewall = facts["firewall"]
+    master = facts["master_address"]
+    untrusted = facts["untrusted_address"]
+
+    require(
+        MANAGEMENT_DENIAL_CASE_ID,
+        firewall["active"],
+        "the Worker's UFW is not active, so the control port is not being filtered at all",
+    )
+    require(
+        MANAGEMENT_DENIAL_CASE_ID,
+        firewall["input_policy"] == "DROP",
+        f"the Worker's INPUT policy is {firewall['input_policy'] or 'unset'!r} instead of DROP",
+    )
+    require(
+        MANAGEMENT_DENIAL_CASE_ID,
+        not firewall["unscoped_allows"],
+        f"the Worker allows the control port from every source: "
+        f"{[entry['line'] for entry in firewall['unscoped_allows']]}",
+    )
+    require(
+        MANAGEMENT_DENIAL_CASE_ID,
+        firewall["node_allow_sources"] == [master],
+        f"the Worker allows {firewall['node_allow_sources'] or 'nobody'} to reach the "
+        f"control port instead of only the Master's run address {master}",
+    )
+    require(
+        MANAGEMENT_DENIAL_CASE_ID,
+        firewall["ssh_anywhere"],
+        "the Worker's SSH port is not open to every source, so a refused login would "
+        "prove a closed port rather than a rejected identity",
+    )
+
+    # The allowed management client, using the trust material the operator set up:
+    # a payload-backed TLS 1.3 handshake with a 200 over it, and a root login over
+    # the pinned host key.
+    trusted_mtls = facts["trusted_mtls"]
+    require(
+        MANAGEMENT_DENIAL_CASE_ID,
+        trusted_mtls.get("handshake_pass") is True,
+        f"the Master's mTLS handshake with the Worker failed, so the trusted management "
+        f"path is not working: {trusted_mtls.get('tail') or 'no output'}",
+    )
+    require(
+        MANAGEMENT_DENIAL_CASE_ID,
+        trusted_mtls.get("response") == "health",
+        f"the Master's authenticated call answered {trusted_mtls.get('status_line')!r} "
+        f"instead of the Node health response",
+    )
+    trusted_ssh = facts["trusted_ssh"]
+    require(
+        MANAGEMENT_DENIAL_CASE_ID,
+        trusted_ssh.get("returncode") == 0 and trusted_ssh.get("marker"),
+        f"the operator's pinned-key SSH command to the Worker exited "
+        f"{trusted_ssh.get('returncode')} without its marker; the allowed management "
+        f"client cannot reach the Worker: {trusted_ssh.get('stderr') or 'no output'}",
+    )
+
+    management = (facts["untrusted"].get("management") or {})
+    outcome = str(management.get("outcome") or "")
+    require(
+        MANAGEMENT_DENIAL_CASE_ID,
+        outcome != "CONNECTED",
+        f"the untrusted source at {untrusted} completed a TCP connection to the Worker's "
+        f"control port {denial.NODE_PORT}, so the source allowlist is not in force",
+    )
+    require(
+        MANAGEMENT_DENIAL_CASE_ID,
+        outcome in ("REFUSED", "TIMEOUT"),
+        f"the untrusted control-plane attempt ended {outcome or 'without a verdict'} "
+        f"({management.get('detail') or 'no detail'}), which is "
+        f"neither a refusal nor a dropped connection",
+    )
+
+    ssh = facts["untrusted"].get("ssh_login") or {}
+    require(
+        MANAGEMENT_DENIAL_CASE_ID,
+        ssh.get("outcome") == "REJECTED",
+        f"the untrusted identity's SSH login ended {ssh.get('outcome') or 'without a verdict'}"
+        f" ({ssh.get('detail') or ssh.get('stderr') or 'no detail'}) instead of being "
+        f"refused during authentication",
+    )
+    require(
+        MANAGEMENT_DENIAL_CASE_ID,
+        ssh.get("command_output") is False,
+        "the untrusted identity executed a remote command on the Worker",
+    )
+    require(
+        MANAGEMENT_DENIAL_CASE_ID,
+        "permission denied" in str(ssh.get("stderr") or "").lower(),
+        f"the refused login did not report a permission denial, so it was not "
+        f"authentication that stopped it: {ssh.get('stderr') or 'no output'}",
+    )
+
+    require(
+        MANAGEMENT_DENIAL_CASE_ID,
+        untrusted != master,
+        f"the untrusted role and the Master report the same address {master}, so this "
+        f"denial cannot be attributed to the vantage",
+    )
+    if not facts["observed_source"]:
+        # The refusal itself was measured and the rules are scoped, but the
+        # Worker never named the address it refused: the catalog calls that
+        # INCOMPLETE, because a missing observation is absent evidence rather
+        # than a product failure the run can point at.
+        raise CaseIncomplete(
+            f"{MANAGEMENT_DENIAL_CASE_ID}: the Worker never logged the untrusted source "
+            f"{untrusted} on its SSH port, so the address that was refused is unproven: "
+            f"{facts['observed_lines'] or 'no matching line'}"
+        )
+    return {
+        "input_policy": firewall["input_policy"],
+        "node_allow_sources": ",".join(firewall["node_allow_sources"]),
+        "ssh_port_open_to_any_source": firewall["ssh_anywhere"],
+        "node_allow_packets": sum(
+            int(entry.get("packets") or 0) for entry in firewall["counters"]
+        ),
+        "master_address": master,
+        "worker_address": facts["worker_address"],
+        "untrusted_address": untrusted,
+        "trusted_mtls_response": trusted_mtls.get("status_line"),
+        "trusted_ssh": "pinned host key, authorized identity",
+        "untrusted_management": outcome,
+        "untrusted_ssh": ssh.get("outcome"),
+        "untrusted_ssh_returncode": ssh.get("returncode"),
+        "worker_observed_source": facts["observed_source"],
+        "worker_observation": (facts["observed_lines"] or [""])[-1][:300],
+    }
+
+
+def case_denial_classification(product: MultiNodeProduct) -> Dict[str, Any]:
+    """FW-02: a refusal alone is not a firewall verdict.
+
+    Connection refused, a timeout, a route failure, or a missing Worker all look
+    identical from the vantage that was denied. The classification therefore
+    requires the working control beside the refusal and the Worker's own rule and
+    log evidence; anything less is INCOMPLETE rather than a pass, and an accepted
+    connection is a finding of its own.
+    """
+    facts = product.denial_facts(DENIAL_CLASSIFICATION_CASE_ID)
+    firewall = facts["firewall"]
+    verdict, reason = denial.classify_denial(
+        management_outcome=str(
+            (facts["untrusted"].get("management") or {}).get("outcome") or ""
+        ),
+        positive_control=(
+            facts["trusted_mtls"].get("handshake_pass") is True
+            and facts["trusted_mtls"].get("response") == "health"
+            and facts["trusted_ssh"].get("returncode") == 0
+            and bool(facts["trusted_ssh"].get("marker"))
+        ),
+        worker_rule_scoped=(
+            firewall["node_allow_sources"] == [facts["master_address"]]
+            and not firewall["unscoped_allows"]
+        ),
+        observed_source=facts["observed_source"],
+        allowed_source=facts["master_address"],
+    )
+    require(
+        DENIAL_CLASSIFICATION_CASE_ID,
+        verdict != denial.ACCEPTED,
+        f"{DENIAL_CLASSIFICATION_CASE_ID}: {reason}",
+    )
+    if verdict == denial.AMBIGUOUS:
+        raise CaseIncomplete(f"{DENIAL_CLASSIFICATION_CASE_ID}: {reason}")
+    return {
+        "verdict": verdict,
+        "reason": reason,
+        "allowed_source": facts["master_address"],
+        "denied_source": facts["observed_source"],
+        "classification_requires": "allowed control + Worker rule + observed source",
+    }
 
 
 def case_cluster_hosts(product: MultiNodeProduct) -> Dict[str, Any]:
@@ -1635,6 +1917,12 @@ def cases(
              timeout_seconds=MTLS_TIMEOUT_SECONDS),
         Case("MTLS-08", "multi-node", lambda context: case_mtls_wrong_sni(product),
              timeout_seconds=MTLS_TIMEOUT_SECONDS),
+        Case(MANAGEMENT_DENIAL_CASE_ID, "multi-node",
+             lambda context: case_management_denial(product),
+             timeout_seconds=DENIAL_TIMEOUT_SECONDS),
+        Case(DENIAL_CLASSIFICATION_CASE_ID, "multi-node",
+             lambda context: case_denial_classification(product),
+             timeout_seconds=DENIAL_TIMEOUT_SECONDS),
         Case("CLUS-01", "multi-node", lambda context: case_cluster_hosts(product),
              timeout_seconds=CLUSTER_TIMEOUT_SECONDS),
         Case("CLUS-02", "multi-node", lambda context: case_cluster_squad(product),
