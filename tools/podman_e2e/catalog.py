@@ -119,6 +119,20 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "All-in-One Master VPS Installation Verification",
     },
     {
+        "id": "AIO-AUTH",
+        "requirement": "All-in-One Master VPS Installation Verification",
+        "assertion": "The documented admin login returns a bearer token that the real Panel API accepts while the same call is refused anonymously, and the authenticated read surface reports one local node, one config profile, the default squad, and one host per inbound that all describe the same four-inbound set for a Vision-less All-in-One install.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "AIO-CLIENT",
+        "requirement": "All-in-One Master VPS Installation Verification",
+        "assertion": "A client is created through POST /api/users into the default squad, read back by username and by id with the same shortUuid, and deleted with DELETE /api/users/{id} returning 204 after which the username is no longer served.",
+        "topology": ["aio"],
+        "promotion_target": "Real Subscription Delivery and User-Agent Policy",
+    },
+    {
         "id": "SUB-B64",
         "requirement": "Panel subscription representations",
         "assertion": "The base64 share-link list at /api/sub/<shortUuid> contains one link per proxy entry with the expected protocol, host, SNI and firefox fingerprint, and an Xray-family client imports it while the raw JSON body imports nothing.",

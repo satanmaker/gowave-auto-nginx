@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 15
-  total: 140
+  podman_first: 17
+  total: 142
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3173,6 +3173,41 @@ cases:
   driver: null
   driver_status: planned
   promotion_target: All-in-One Master VPS Installation Verification
+- id: AIO-AUTH
+  requirement: All-in-One Master VPS Installation Verification
+  live_scenario: null
+  assertion: The documented admin login returns a bearer token that the real Panel API accepts while the
+    same call is refused anonymously, and the authenticated read surface reports one local node, one config
+    profile, the default squad, and one host per inbound that all describe the same four-inbound set for
+    a Vision-less All-in-One install.
+  assertion_sha256: 9b338f2f238bbbb6ae9bec21a251dae764d05ab6b102d33e16e764cd938f6623
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: AIO-CLIENT
+  requirement: All-in-One Master VPS Installation Verification
+  live_scenario: null
+  assertion: A client is created through POST /api/users into the default squad, read back by username
+    and by id with the same shortUuid, and deleted with DELETE /api/users/{id} returning 204 after which
+    the username is no longer served.
+  assertion_sha256: f9b2ac821b66c83e79cc7040a5bcc003ea3abcfb28a4b472c044f96015eaff8d
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Real Subscription Delivery and User-Agent Policy
 - id: SUB-B64
   requirement: Panel subscription representations
   live_scenario: null

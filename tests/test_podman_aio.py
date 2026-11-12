@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Suite nonroot: the All-in-One suite installs once with the real operator."""
+import io
+import json
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
+from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.podman_e2e import aio, catalog, target_image, topology  # noqa: E402
+from tools.podman_e2e import aio, catalog, panel_surface, target_image, topology  # noqa: E402
 from tools.podman_e2e.runner import Case, CaseBlocked, RunContext  # noqa: E402
 
 INSTALL_OUTPUT = (
@@ -344,6 +349,321 @@ class TestAioVerificationCases(unittest.TestCase):
         block = function.split("cat <<'EOF'", 1)[1].split("EOF", 1)[0]
         declared = [line.strip() for line in block.splitlines() if line.strip()]
         self.assertEqual(tuple(declared), tuple(aio.REQUIRED_PACKAGES))
+
+
+def surface_facts(overrides=None):
+    """Panel probe output for the happy path, with single facts replaceable."""
+    inbound = {"uuid": "inbound-uuid", "tag": "VLESS-REALITY-Vision@node", "type": "vless", "port": 443}
+    other = [
+        {"uuid": "xhttp-uuid", "tag": "VLESS-XHTTP-TLS@node", "type": "vless", "port": 443},
+        {"uuid": "ws-uuid", "tag": "VLESS-WS-TLS@node", "type": "vless", "port": 443},
+        {"uuid": "trojan-uuid", "tag": "Trojan-gRPC-TLS@node", "type": "trojan", "port": 443},
+    ]
+    inbounds = [inbound, *other]
+    identifiers = [entry["uuid"] for entry in inbounds]
+    digests = panel_surface.digest(identifiers)
+    facts = {
+        "login": {"status": 200, "token_present": True, "token_length": 64},
+        "surface": {
+            "unauthenticated_nodes_status": 401,
+            "nodes": {
+                "status": 200, "count": 1, "connected_count": 1,
+                "inbound_count": len(inbounds), "inbound_digest": digests,
+                "inbound_types": ["trojan", "vless"], "inbound_ports": ["443"],
+            },
+            "profiles": {
+                "status": 200, "count": 1, "inbound_count": len(inbounds),
+                "inbound_digest": digests, "inbound_tags": sorted(i["tag"] for i in inbounds),
+            },
+            "squads": {
+                "status": 200, "count": 1, "mvp_present": True,
+                "mvp_inbound_count": len(inbounds), "mvp_inbound_digest": digests,
+            },
+            "hosts": {
+                "status": 200, "count": len(inbounds), "inbound_digest": digests,
+                "security_layers": ["DEFAULT"], "fingerprints": ["firefox"],
+            },
+            "default_user": {"status": 200, "short_uuid_length": 16, "status_field": "ACTIVE"},
+        },
+        "lifecycle": {
+            "squad_requested": True, "create_status": 201, "created_id_present": True,
+            "created_short_uuid_length": 16, "created_status_field": "ACTIVE",
+            "readback_status": 200, "readback_username_matches": True,
+            "readback_short_uuid_matches": True, "readback_squad_count": 1,
+            "get_by_id_status": 200, "delete_status": 204, "after_delete_status": 404,
+        },
+    }
+    for path, value in (overrides or {}).items():
+        target = facts
+        *parents, leaf = path.split(".")
+        for name in parents:
+            target = target[name]
+        target[leaf] = value
+    return json.dumps(facts)
+
+
+def probe_product(context, facts, returncode=0):
+    product, podman = installed_product(context, [(facts, returncode)])
+    return product, podman
+
+
+class TestPanelApiCases(unittest.TestCase):
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def test_panel_surface_probe_is_valid_python(self):
+        source = (REPO_ROOT / "tools" / "podman_e2e" / "panel_surface.py").read_text(encoding="utf-8")
+        compile(source, "panel_surface.py", "exec")
+
+    def test_inbound_digest_ignores_order_but_not_membership(self):
+        self.assertEqual(panel_surface.digest(["b", "a"]), panel_surface.digest(["a", "b"]))
+        self.assertNotEqual(panel_surface.digest(["a"]), panel_surface.digest(["a", "b"]))
+        self.assertEqual(panel_surface.digest([]), "")
+
+    def test_auth_case_reads_the_inventory_from_one_api_set(self):
+        product, podman = probe_product(self.context, surface_facts())
+        evidence = aio.case_panel_auth(product)
+        self.assertEqual(evidence["login_status"], 200)
+        self.assertEqual(evidence["unauthenticated_nodes_status"], 401)
+        self.assertEqual(evidence["host_count"], aio.CORE_INBOUNDS)
+        self.assertEqual(podman.scripts[0], f"python3 {aio.PANEL_SURFACE_SCRIPT} --scope surface")
+
+    def test_auth_case_rejects_an_unauthenticated_read_surface(self):
+        product, _ = probe_product(
+            self.context, surface_facts({"surface.unauthenticated_nodes_status": 200})
+        )
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_panel_auth(product)
+        self.assertIn("anonymous /api/nodes", str(caught.exception))
+
+    def test_auth_case_rejects_a_profile_that_diverges_from_the_node(self):
+        product, _ = probe_product(
+            self.context, surface_facts({"surface.profiles.inbound_digest": "0" * 64})
+        )
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_panel_auth(product)
+        self.assertIn("disagree on which inbounds are active", str(caught.exception))
+
+    def test_auth_case_rejects_a_squad_that_grants_nothing(self):
+        product, _ = probe_product(self.context, surface_facts({"surface.squads.mvp_present": False}))
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_panel_auth(product)
+        self.assertIn("Default MVP Squad", str(caught.exception))
+
+    def test_auth_case_rejects_a_missing_host_for_an_inbound(self):
+        product, _ = probe_product(self.context, surface_facts({"surface.hosts.count": 3}))
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_panel_auth(product)
+        self.assertIn("one per inbound", str(caught.exception))
+
+    def test_client_lifecycle_case_walks_create_read_delete(self):
+        product, podman = probe_product(self.context, surface_facts())
+        evidence = aio.case_client_lifecycle(product)
+        self.assertEqual(evidence["create_status"], 201)
+        self.assertEqual(evidence["delete_status"], 204)
+        self.assertEqual(evidence["after_delete_status"], 404)
+        self.assertEqual(podman.scripts[0], f"python3 {aio.PANEL_SURFACE_SCRIPT} --scope lifecycle")
+
+    def test_client_lifecycle_case_fails_when_the_delete_does_not_take_effect(self):
+        product, _ = probe_product(self.context, surface_facts({"lifecycle.after_delete_status": 200}))
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_client_lifecycle(product)
+        self.assertIn("still served by username", str(caught.exception))
+
+    def test_client_lifecycle_case_fails_when_the_client_gets_no_squad(self):
+        product, _ = probe_product(self.context, surface_facts({"lifecycle.squad_requested": False}))
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_client_lifecycle(product)
+        self.assertIn("Default MVP Squad", str(caught.exception))
+
+    def test_probe_failure_is_reported_with_its_stderr(self):
+        product, _ = probe_product(self.context, "", returncode=2)
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_panel_auth(product)
+        self.assertIn("Panel probe exited 2", str(caught.exception))
+
+    def test_probe_output_that_is_not_json_fails_the_case(self):
+        product, _ = probe_product(self.context, "login failed\n")
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_panel_auth(product)
+        self.assertIn("did not print JSON", str(caught.exception))
+
+
+class TestPanelSurfaceProbe(unittest.TestCase):
+    """The probe is exercised against a stub Panel: it must collect facts, not secrets."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.password = "pw-do-not-print"
+        self.token = "token-do-not-print"
+        self.credentials = Path(self.tmp.name) / "credentials"
+        self.credentials.write_text(
+            f"ADMIN_USERNAME=admin\nADMIN_PASSWORD={self.password}\n", encoding="utf-8"
+        )
+        self.credentials.chmod(0o600)
+        inbounds = [
+            {"uuid": f"inbound-{index}", "tag": f"tag-{index}", "type": "vless", "port": 443}
+            for index in range(aio.CORE_INBOUNDS)
+        ]
+        self.inbounds = inbounds
+        self.server = self._start_stub(inbounds)
+        self.addCleanup(self.server.shutdown)
+
+    def _start_stub(self, inbounds):
+        deleted = {"done": False}
+        created = {"username": None, "short_uuid": "created-short-uuid"}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _authorised(self):
+                return self.headers.get("Authorization") == f"Bearer {self.server.token}"
+
+            def _send(self, status, body=None):
+                self.send_response(status)
+                if body is not None:
+                    raw = json.dumps(body).encode()
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                else:
+                    self.end_headers()
+
+            def do_GET(self):
+                path = self.path
+                if path == "/api/nodes" and not self._authorised():
+                    return self._send(401, {"error": "Unauthorized"})
+                if not self._authorised():
+                    return self._send(401, {"error": "Unauthorized"})
+                if path == "/api/nodes":
+                    node = {"uuid": "node-uuid", "isConnected": True,
+                            "configProfile": {"activeInbounds": inbounds}}
+                    return self._send(200, {"response": [node]})
+                if path == "/api/config-profiles":
+                    profile = {"uuid": "profile-uuid", "inbounds": inbounds}
+                    return self._send(200, {"response": {"total": 1, "configProfiles": [profile]}})
+                if path == "/api/internal-squads":
+                    squad = {"uuid": "squad-uuid", "name": "Default MVP Squad",
+                             "info": {"inboundsCount": len(inbounds)},
+                             "inbounds": [{"uuid": item["uuid"]} for item in inbounds]}
+                    return self._send(200, {"response": {"total": 1, "internalSquads": [squad]}})
+                if path == "/api/hosts":
+                    hosts = [{"uuid": f"host-{item['uuid']}", "securityLayer": "DEFAULT",
+                              "fingerprint": "firefox",
+                              "inbound": {"configProfileUuid": "profile-uuid",
+                                          "configProfileInboundUuid": item["uuid"]}}
+                             for item in inbounds]
+                    return self._send(200, {"response": hosts})
+                if path == "/api/users/by-username/default-user":
+                    return self._send(200, {"response": {"username": "default-user",
+                                                         "shortUuid": "default-short-uuid"}})
+                if path == f"/api/users/by-username/{created['username']}":
+                    if deleted["done"]:
+                        return self._send(404, {"message": "User not found"})
+                    return self._send(200, {"response": {
+                        "username": created["username"], "shortUuid": created["short_uuid"],
+                        "activeInternalSquads": [{"uuid": "squad-uuid"}],
+                    }})
+                if path == "/api/users/7":
+                    return self._send(200, {"response": {"id": 7}})
+                return self._send(404, {"message": "not found"})
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if self.path == "/api/auth/login":
+                    if body.get("password") != self.server.password:
+                        return self._send(401, {"error": "Unauthorized"})
+                    return self._send(200, {"response": {"accessToken": self.server.token,
+                                                         "tokenType": "Bearer"}})
+                if self.path == "/api/users" and self._authorised():
+                    created["username"] = body.get("username")
+                    return self._send(201, {"response": {
+                        "id": 7, "username": body.get("username"), "status": "ACTIVE",
+                        "shortUuid": created["short_uuid"],
+                    }})
+                return self._send(404, {"message": "not found"})
+
+            def do_DELETE(self):
+                if not self._authorised():
+                    return self._send(401, {"error": "Unauthorized"})
+                if self.path == "/api/users/7":
+                    deleted["done"] = True
+                    return self._send(204)
+                return self._send(404, {"message": "not found"})
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.token = self.token
+        server.password = self.password
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.port = server.server_address[1]
+        return server
+
+    def _run(self, scope):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = panel_surface.main([
+                "--scope", scope,
+                "--panel-url", f"http://127.0.0.1:{self.port}",
+                "--credentials", str(self.credentials),
+            ])
+        self.assertEqual(code, 0)
+        output = stdout.getvalue()
+        self.assertNotIn(self.password, output)
+        self.assertNotIn(self.token, output)
+        return json.loads(output)
+
+    def test_probe_reports_statuses_counts_and_digests_without_secrets(self):
+        facts = self._run("all")
+        self.assertEqual(facts["login"]["status"], 200)
+        self.assertTrue(facts["login"]["token_present"])
+        self.assertEqual(facts["login"]["token_length"], len(self.token))
+
+        surface = facts["surface"]
+        self.assertEqual(surface["unauthenticated_nodes_status"], 401)
+        self.assertEqual(surface["nodes"]["count"], 1)
+        self.assertEqual(surface["nodes"]["inbound_count"], aio.CORE_INBOUNDS)
+        self.assertEqual(surface["profiles"]["inbound_digest"], surface["nodes"]["inbound_digest"])
+        self.assertEqual(surface["squads"]["mvp_inbound_digest"],
+                         surface["profiles"]["inbound_digest"])
+        self.assertEqual(surface["hosts"]["count"], aio.CORE_INBOUNDS)
+        self.assertEqual(surface["default_user"]["short_uuid_length"], len("default-short-uuid"))
+        for uuid in (item["uuid"] for item in self.inbounds):
+            self.assertNotIn(uuid, json.dumps(surface))
+
+        lifecycle = facts["lifecycle"]
+        self.assertTrue(lifecycle["squad_requested"])
+        self.assertEqual(
+            [lifecycle[key] for key in (
+                "create_status", "readback_status", "get_by_id_status",
+                "delete_status", "after_delete_status",
+            )],
+            [201, 200, 200, 204, 404],
+        )
+        self.assertTrue(lifecycle["readback_username_matches"])
+        self.assertTrue(lifecycle["readback_short_uuid_matches"])
+        self.assertEqual(lifecycle["readback_squad_count"], 1)
+
+    def test_probe_scope_surface_does_not_create_anything(self):
+        facts = self._run("surface")
+        self.assertNotIn("lifecycle", facts)
+        self.assertIn("surface", facts)
+
+    def test_probe_fails_on_a_wrong_password_instead_of_printing_a_token(self):
+        self.credentials.write_text(
+            "ADMIN_USERNAME=admin\nADMIN_PASSWORD=wrong\n", encoding="utf-8"
+        )
+        facts = self._run("surface")
+        self.assertEqual(facts["login"]["status"], 401)
+        self.assertFalse(facts["login"]["token_present"])
+        self.assertEqual(facts["surface"]["nodes"]["status"], 401)
 
 
 if __name__ == "__main__":

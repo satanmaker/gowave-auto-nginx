@@ -13,6 +13,7 @@ product code on it.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import topology
@@ -59,6 +60,12 @@ LOOPBACK_PANEL = "http://127.0.0.1:3000"
 PUBLIC_PANEL = f"https://{topology.PANEL_DOMAIN}"
 PANEL_DOMAIN = topology.PANEL_DOMAIN
 REALITY_DOMAIN = topology.REALITY_DOMAIN
+PANEL_SURFACE_SCRIPT = "/repo/tools/podman_e2e/panel_surface.py"
+
+# The MVP profile carries four inbounds without a Vision domain; the fifth
+# appears only when the optional Vision domain is configured, which this
+# topology does not configure.
+CORE_INBOUNDS = 4
 
 
 class AioProduct:
@@ -341,6 +348,140 @@ def case_tls_and_identity(product: AioProduct) -> Dict[str, Any]:
     }
 
 
+def _panel_facts(product: AioProduct, case_id: str, scope: str) -> Dict[str, Any]:
+    """Run the host-side probe and return its facts; comparisons stay here."""
+    result = product.host_script(f"python3 {PANEL_SURFACE_SCRIPT} --scope {scope}")
+    require(
+        case_id,
+        result.returncode == 0,
+        f"the Panel probe exited {result.returncode}: "
+        f"{(result.stderr or result.stdout or '').strip()[-2000:]}",
+    )
+    try:
+        return json.loads(result.stdout or "")
+    except json.JSONDecodeError:
+        require(case_id, False, f"the Panel probe did not print JSON: {(result.stdout or '')[:400]}")
+        return {}
+
+
+def case_panel_auth(product: AioProduct) -> Dict[str, Any]:
+    """AIO-AUTH: the documented admin login opens the real, consistent read surface.
+
+    The inventory is read entirely through the API, so a case cannot be satisfied
+    by a file the operator wrote next to it: the node's active inbounds, the
+    profile that declares them, the squad that grants them, and the hosts that
+    publish them must all describe the same set.
+    """
+    facts = _panel_facts(product, "AIO-AUTH", "surface")
+    login = facts.get("login") or {}
+    require("AIO-AUTH", login.get("status") == 200, f"admin login returned {login.get('status')!r}")
+    require("AIO-AUTH", login.get("token_present"), "admin login returned no access token")
+
+    surface = facts.get("surface") or {}
+    # The read surface is only "authenticated" if the same call is refused
+    # without the token.
+    anonymous = surface.get("unauthenticated_nodes_status")
+    require("AIO-AUTH", anonymous in (401, 403),
+            f"an anonymous /api/nodes call returned {anonymous!r} instead of being refused")
+
+    nodes = surface.get("nodes") or {}
+    require("AIO-AUTH", nodes.get("status") == 200, f"/api/nodes returned {nodes.get('status')!r}")
+    require("AIO-AUTH", nodes.get("count") == 1,
+            f"the Panel reports {nodes.get('count')!r} nodes instead of the one local node")
+    require("AIO-AUTH", nodes.get("inbound_count") == CORE_INBOUNDS,
+            f"the local node exposes {nodes.get('inbound_count')!r} active inbounds, "
+            f"expected {CORE_INBOUNDS}")
+    require("AIO-AUTH", bool(nodes.get("inbound_digest")),
+            "the local node reported no active inbound identifiers")
+
+    profiles = surface.get("profiles") or {}
+    require("AIO-AUTH", profiles.get("status") == 200,
+            f"/api/config-profiles returned {profiles.get('status')!r}")
+    require("AIO-AUTH", profiles.get("count") == 1,
+            f"the Panel reports {profiles.get('count')!r} config profiles instead of one")
+    require("AIO-AUTH", profiles.get("inbound_count") == CORE_INBOUNDS,
+            f"the config profile declares {profiles.get('inbound_count')!r} inbounds, "
+            f"expected {CORE_INBOUNDS}")
+    require("AIO-AUTH", profiles.get("inbound_digest") == nodes.get("inbound_digest"),
+            "the config profile and the node disagree on which inbounds are active")
+
+    squads = surface.get("squads") or {}
+    require("AIO-AUTH", squads.get("status") == 200,
+            f"/api/internal-squads returned {squads.get('status')!r}")
+    require("AIO-AUTH", squads.get("mvp_present"),
+            "the Panel has no 'Default MVP Squad' to grant the profile's inbounds")
+    require("AIO-AUTH", squads.get("mvp_inbound_digest") == profiles.get("inbound_digest"),
+            "the default squad does not carry exactly the profile's inbounds")
+
+    hosts = surface.get("hosts") or {}
+    require("AIO-AUTH", hosts.get("status") == 200, f"/api/hosts returned {hosts.get('status')!r}")
+    require("AIO-AUTH", hosts.get("count") == CORE_INBOUNDS,
+            f"the Panel publishes {hosts.get('count')!r} hosts, expected one per inbound "
+            f"({CORE_INBOUNDS})")
+    require("AIO-AUTH", hosts.get("inbound_digest") == profiles.get("inbound_digest"),
+            "the published hosts do not cover exactly the profile's inbounds")
+
+    default_user = surface.get("default_user") or {}
+    require("AIO-AUTH", default_user.get("status") == 200,
+            f"/api/users/by-username/default-user returned {default_user.get('status')!r}")
+    require("AIO-AUTH", int(default_user.get("short_uuid_length") or 0) > 0,
+            "the default user has no shortUuid in the API")
+
+    return {
+        "login_status": login.get("status"),
+        "token_length": login.get("token_length"),
+        "unauthenticated_nodes_status": anonymous,
+        "node_count": nodes.get("count"),
+        "node_connected_count": nodes.get("connected_count"),
+        "node_inbound_count": nodes.get("inbound_count"),
+        "inbound_digest": nodes.get("inbound_digest"),
+        "inbound_types": ",".join(nodes.get("inbound_types") or []),
+        "inbound_ports": ",".join(nodes.get("inbound_ports") or []),
+        "profile_count": profiles.get("count"),
+        "profile_inbound_tags": ",".join(profiles.get("inbound_tags") or []),
+        "squad_count": squads.get("count"),
+        "squad_inbound_count": squads.get("mvp_inbound_count"),
+        "host_count": hosts.get("count"),
+        "host_fingerprints": ",".join(hosts.get("fingerprints") or []),
+        "host_security_layers": ",".join(hosts.get("security_layers") or []),
+        "default_user_short_uuid_length": default_user.get("short_uuid_length"),
+    }
+
+
+def case_client_lifecycle(product: AioProduct) -> Dict[str, Any]:
+    """AIO-CLIENT: a client is created, read back, and deleted through the real API.
+
+    The username is unique per invocation, and the deletion is part of the case
+    rather than cleanup: leaving the client behind would make the next run's
+    inventory assertions depend on the previous run.
+    """
+    facts = _panel_facts(product, "AIO-CLIENT", "lifecycle").get("lifecycle") or {}
+    require("AIO-CLIENT", facts.get("squad_requested"),
+            "no 'Default MVP Squad' exists, so the client could not be provisioned as documented")
+    require("AIO-CLIENT", facts.get("create_status") == 201,
+            f"POST /api/users returned {facts.get('create_status')!r} instead of 201")
+    require("AIO-CLIENT", facts.get("created_id_present"), "the created client has no id")
+    require("AIO-CLIENT", int(facts.get("created_short_uuid_length") or 0) > 0,
+            "the created client has no shortUuid")
+    require("AIO-CLIENT", facts.get("readback_status") == 200,
+            f"reading the client back by username returned {facts.get('readback_status')!r}")
+    require("AIO-CLIENT", facts.get("readback_username_matches"),
+            "the client read back by username is not the one that was created")
+    require("AIO-CLIENT", facts.get("readback_short_uuid_matches"),
+            "the client read back by username has a different shortUuid")
+    require("AIO-CLIENT", facts.get("readback_squad_count") == 1,
+            f"the client was created with one squad but reports "
+            f"{facts.get('readback_squad_count')!r}")
+    require("AIO-CLIENT", facts.get("get_by_id_status") == 200,
+            f"reading the client by id returned {facts.get('get_by_id_status')!r}")
+    require("AIO-CLIENT", facts.get("delete_status") == 204,
+            f"DELETE /api/users/{{id}} returned {facts.get('delete_status')!r} instead of 204")
+    require("AIO-CLIENT", facts.get("after_delete_status") == 404,
+            f"the deleted client is still served by username "
+            f"(status {facts.get('after_delete_status')!r})")
+    return facts
+
+
 def cases(podman: Any, distribution: str = "ubuntu-24.04") -> List[Case]:
     """The AIO suite: the install case plus every case that reuses its host."""
     product = AioProduct(podman, distribution)
@@ -352,4 +493,6 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04") -> List[Case]:
         Case("AIO-01", "aio", lambda context: case_panel_ready(product), timeout_seconds=300),
         Case("AIO-03", "aio", lambda context: case_credentials(product), timeout_seconds=300),
         Case("AIO-05", "aio", lambda context: case_tls_and_identity(product), timeout_seconds=300),
+        Case("AIO-AUTH", "aio", lambda context: case_panel_auth(product), timeout_seconds=300),
+        Case("AIO-CLIENT", "aio", lambda context: case_client_lifecycle(product), timeout_seconds=300),
     ]
