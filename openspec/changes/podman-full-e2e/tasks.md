@@ -52,7 +52,7 @@
 
 - [x] 5.1 Create clean Control, Master/Panel, Worker, trusted client, and untrusted client roles.
 - [x] 5.2 Run the real operator's supported Master and Worker provisioning flow.
-- [ ] 5.2a Implement the narrowly scoped Podman-only Master private-address override and prove the real Worker observes that address on its Master-to-Worker connection; do not mock `node add` or use the host's public egress address.
+- [x] 5.2a Implement the narrowly scoped Podman-only Master private-address override and prove the real Worker observes that address on its Master-to-Worker connection; do not mock `node add` or use the host's public egress address.
 - [ ] 5.3 Verify pinned SSH trust and mTLS using actual deployed services.
 - [ ] 5.4 Register and manage Worker through the real GoWave Panel API.
 - [ ] 5.5 Verify Node health/state and configuration consistency across Panel and Worker.
