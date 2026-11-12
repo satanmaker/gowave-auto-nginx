@@ -1,0 +1,3363 @@
+version: 1
+schema: gowave-case-catalog/v1
+live_spec: openspec/specs/live-vps-e2e/spec.md
+live_spec_sha256: 7c0db7d11281cba30eda21abf8d626c2a55283bdf9096fcc167af53807b8fffa
+counts:
+  live_total: 125
+  container: 115
+  partial: 8
+  live_only: 2
+  podman_first: 13
+  total: 138
+expected_positive_case_counts:
+  aio:
+    vision_disabled: 8
+    vision_enabled: 10
+  multi-node:
+    vision_neither: 16
+    vision_one_node: 18
+    vision_both: 20
+cases:
+- id: ENV-01
+  requirement: Disposable Environment Gate
+  live_scenario: Clean VPS passes baseline gate
+  assertion: '**GIVEN** a VPS with fresh OS, no running GoWave services, and no listening processes on
+    required ports
+
+    **WHEN** the runner performs baseline inspection over SSH
+
+    **THEN** the VPS passes the disposable gate, baseline manifest is recorded, and installation proceeds'
+  assertion_sha256: dd74e9656bfd8e05eb3521e87d4889bb17277660bfafa93871952b539a51c9d3
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: ENV-02
+  requirement: Disposable Environment Gate
+  live_scenario: Contaminated VPS blocked before modification
+  assertion: '**GIVEN** a VPS with an existing GoWave installation or a listener on port 443
+
+    **WHEN** the runner performs baseline inspection
+
+    **THEN** the runner terminates before any remote command that modifies system state, records the rejection
+
+    reason in `result.json`, and sets overall status to `FAIL`
+
+
+    ---'
+  assertion_sha256: 7ad53dbc2d9968dae65621ea9470d5c20db1e5fe7c3352915bf343a21f998287
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: OWN-01
+  requirement: Complete Mutation-Target Baseline and Resource Ownership
+  live_scenario: Existing Worker system configuration is not overwritten
+  assertion: '**GIVEN** /etc/sysctl.d/99-gowave-node.conf exists with unrelated sentinel content, while
+    no GoWave
+
+    service is running and the required ports are free
+
+    **WHEN** disposable-baseline validation runs
+
+    **THEN** it rejects the target or captures a complete same-host restorable before-image before any
+    write;
+
+    Worker configuration MUST NOT truncate the file and later treat it as transaction-created'
+  assertion_sha256: 3f4cb797fe052b3713cca2f67a2a8f59c903235027164e5f74303e2653bbde1d
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: OWN-02
+  requirement: Complete Mutation-Target Baseline and Resource Ownership
+  live_scenario: Existing Worker service or binary paths are not removed
+  assertion: '**GIVEN** one or more of the Worker systemd unit/drop-in paths, /usr/local/bin/xray,
+
+    /usr/local/bin/gowave-node, or managed NGINX/webroot paths exist but GoWave services are inactive
+
+    **WHEN** the runner validates rollback targets
+
+    **THEN** it rejects those paths unless a complete ownership record and tested restore operation proves
+
+    they belong to this run; rollback MUST preserve the unrelated object'
+  assertion_sha256: 966986f3093a75e371a2b4935b2ea7bf6e887cc6331d30ae66185757af3e9e0d
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: OWN-03
+  requirement: Complete Mutation-Target Baseline and Resource Ownership
+  live_scenario: Existing firewall policy is preserved
+  assertion: '**GIVEN** UFW is active or contains non-default IPv4/IPv6 rules or default policies
+
+    **WHEN** preflight evaluates the supported disposable baseline
+
+    **THEN** the runner either rejects the baseline or records a complete restorable firewall before-image;
+
+    after an injected failure, all original rules, default policies and enabled state are restored, not
+    merely
+
+    a selected subset of rules deleted'
+  assertion_sha256: 545fe08270c7b1d326c8671abbe7843a9f080a5fe60a004c201cba9978d54933
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: OWN-04
+  requirement: Complete Mutation-Target Baseline and Resource Ownership
+  live_scenario: Failure restores every transaction-owned resource
+  assertion: '**GIVEN** the runner has modified one or more inventoried resources and a later deployment
+    step fails
+
+    **WHEN** compensation completes
+
+    **THEN** every transaction-created object is removed only while its identity/digest still match, every
+
+    supported pre-existing object is restored to its recorded content and metadata, and any externally
+
+    modified or unverifiable object is preserved with cleanup reported as incomplete'
+  assertion_sha256: 4b6f138ce77a7d700695fc91378318030050eb9f6dd190e7611b349284917132
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: PRE-01
+  requirement: Preflight SSH Trust and DNS Verification
+  live_scenario: SSH host key not pre-pinned
+  assertion: '**GIVEN** a VPS whose SSH host key is absent from the configured `known_hosts` file
+
+    **WHEN** the runner performs SSH preflight check
+
+    **THEN** the runner terminates before any remote modification with a message identifying the missing
+    key'
+  assertion_sha256: 4520d23191f6fa92fb83fb50fce6b3fe0bfe7941285e33540cf99e3fc7d51b64
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: PRE-02
+  requirement: Preflight SSH Trust and DNS Verification
+  live_scenario: DNS A-record points to wrong IP
+  assertion: '**GIVEN** `MASTER_PANEL_DOMAIN` resolves to an IP other than `MASTER_IP`
+
+    **WHEN** DNS preflight check is performed
+
+    **THEN** the runner terminates before connecting to any VPS and records the DNS mismatch in the report'
+  assertion_sha256: 4aaf594df96569b6c9b8655e15ad041889d6a510e33d32b1feb46798985037b4
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: PRE-03
+  requirement: Preflight SSH Trust and DNS Verification
+  live_scenario: Published AAAA is rejected when IPv6 testing is disabled
+  assertion: '**GIVEN** any configured FQDN returns one or more AAAA records while ENABLE_IPV6=false
+
+    **WHEN** DNS preflight validates the complete A/AAAA/CNAME answers
+
+    **THEN** preflight rejects the configuration before remote mutation; the runner MUST NOT silently
+    ignore IPv6 addresses because IPv6 traffic checks are disabled'
+  assertion_sha256: 601dfe2a1e2fa553c4c2e465fd1b9271b593123987e1fb95125f0fbab96aaffb
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: PRE-04
+  requirement: Preflight SSH Trust and DNS Verification
+  live_scenario: Private or reserved IP rejected
+  assertion: '**GIVEN** `MASTER_IP` or `WORKER_IP` is set to a loopback, RFC-1918 private, link-local,
+    multicast,
+
+    or documentation range address (e.g., `203.0.113.0/24`)
+
+    **WHEN** config validation runs
+
+    **THEN** the runner terminates immediately with an error identifying the disallowed address'
+  assertion_sha256: 742dc82a746a9f58e10fe6da00d0aba27e991c09dbbcc8afe3535b447fbec092
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: partial
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  partial_split: Container proves the private/reserved rule against Podman addresses with an explicitly
+    scoped, fail-closed exemption; the live run is authoritative for real public addresses.
+  promotion_target: null
+- id: PRE-05
+  requirement: Preflight SSH Trust and DNS Verification
+  live_scenario: IPv6 AAAA records verified when enabled
+  assertion: '**GIVEN** `ENABLE_IPV6=true` is configured and DNS preflight runs
+
+    **WHEN** DNS verification checks AAAA records for each required domain
+
+    **THEN** every domain has an AAAA record resolving to the expected VPS IPv6 address; any missing or
+    wrong
+
+    AAAA record causes preflight failure before any remote command'
+  assertion_sha256: 06d53b80be3fa56f8e40d0f506f549fc511e84c93f5ff4c43db0dd6292414884
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: PRE-06
+  requirement: Preflight SSH Trust and DNS Verification
+  live_scenario: Published AAAA records cannot bypass IPv6 verification
+  assertion: '**GIVEN** any configured Panel, REALITY, or independently configured Vision FQDN publishes
+    an AAAA record
+
+    **WHEN** preflight validates DNS and the listener/firewall policy
+
+    **THEN** with ENABLE_IPV6=false preflight fails before remote modification; with ENABLE_IPV6=true,
+
+    every AAAA answer from each independent resolver matches only the configured VPS IPv6 address and
+    the
+
+    corresponding listener/firewall checks are mandatory. Extra or conflicting address answers fail preflight.
+
+
+    ---'
+  assertion_sha256: 122d67194b938088ea2075b241b279b1a9cc9c31ca253026a8d9773e256c0f24
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: ADDR-01
+  requirement: Target Address, Domain, and SSH Identity Safety
+  live_scenario: Master and Worker target addresses must differ
+  assertion: '**GIVEN** `MASTER_IP` and `WORKER_IP` contain the same IPv4 address
+
+    **WHEN** configuration preflight validates target identity
+
+    **THEN** preflight fails before SSH mutation or lock acquisition; the runner does not treat two ports
+    on one public address as two independently verified VPS instances'
+  assertion_sha256: 71b43cbd08bd713a65b8096db4dcc8bdb5f8419d6227a95e58dc72f3306d44ad
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: ADDR-02
+  requirement: Target Address, Domain, and SSH Identity Safety
+  live_scenario: Mandatory domains are pairwise unique
+  assertion: '**GIVEN** the four mandatory Master/Worker Panel and REALITY domains are configured
+
+    **WHEN** configuration preflight validates the FQDNs
+
+    **THEN** all four names are distinct; duplicates fail preflight before SSH'
+  assertion_sha256: 3b863f135d876e88e3dd6e57135098627808ee599a5094c39e666c00f30c6428
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: ADDR-03
+  requirement: Target Address, Domain, and SSH Identity Safety
+  live_scenario: Non-root SSH account is rejected in v1
+  assertion: '**GIVEN** either `MASTER_SSH_USER` or `WORKER_SSH_USER` is not `root`
+
+    **WHEN** configuration or read-only SSH preflight validates execution identity
+
+    **THEN** preflight fails before remote lock acquisition or any mutation; no implicit `sudo` fallback
+    is attempted
+
+
+    ---'
+  assertion_sha256: b6e112048b081ca9aaf5d000b5b88de8a29bacf8cbe6d0c8c2dde048a765b3ce
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: VIS-01
+  requirement: Independent Optional Vision Domains
+  live_scenario: Master-only Vision configuration
+  assertion: '**GIVEN** `MASTER_VISION_DOMAIN` is configured and `WORKER_VISION_DOMAIN` is absent
+
+    **WHEN** the whitelist configuration parser validates the E2E config
+
+    **THEN** validation succeeds and the Master Vision endpoint is provisioned independently; the total
+    endpoint count is nine'
+  assertion_sha256: 017f2ecd7464b5156a607fb1ad1675621dc4e9779ead65267d4d39f068cdac2a
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: VIS-02
+  requirement: Independent Optional Vision Domains
+  live_scenario: Worker-only Vision configuration
+  assertion: '**GIVEN** `WORKER_VISION_DOMAIN` is configured and `MASTER_VISION_DOMAIN` is absent
+
+    **WHEN** the whitelist configuration parser validates the E2E config
+
+    **THEN** validation succeeds and the Worker Vision endpoint is provisioned independently; the total
+    endpoint count is nine'
+  assertion_sha256: 9b88734f21c9049c10222f5086b3341638813a3e8067853e6205a2abb48eb9af
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: VIS-03
+  requirement: Independent Optional Vision Domains
+  live_scenario: Both Vision domains are configured
+  assertion: '**GIVEN** both Vision domains are configured and valid DNS records resolve to their respective
+    VPS addresses
+
+    **WHEN** Master and Worker installation and Panel provisioning complete
+
+    **THEN** each VPS has a valid certificate for its Vision domain, each node has five inbounds, the
+    Panel has five matching hosts per node with correct node/inbound associations, and NGINX routes Vision
+    SNI to 8444; Xray''s `xver: 1` non-VLESS HTTP fallback reaches a loopback-only cleartext HTTP vhost
+    on `127.0.0.1:9444` that accepts PROXY protocol and serves decoy content, not Panel/API content; the
+    total endpoint count is ten'
+  assertion_sha256: ec7291f069b90ea2d923cd13fae77ceff070a7fc242ad0ea212d802c8a921cea
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: VIS-04
+  requirement: Independent Optional Vision Domains
+  live_scenario: Vision domains are unique
+  assertion: '**GIVEN** any subset of Vision domains is configured
+
+    **WHEN** the whitelist configuration parser validates the E2E config
+
+    **THEN** every configured Vision domain MUST differ from every other configured Vision domain and
+    all four mandatory Panel/REALITY domains; duplicates fail preflight before SSH or remote modification'
+  assertion_sha256: 2cc762669886e71c51486f4d26330ed1370ae93ba6e2be98ae40250eb20811cf
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: VIS-05
+  requirement: Independent Optional Vision Domains
+  live_scenario: Vision certificate failure aborts the relevant host installation
+  assertion: '**GIVEN** Vision is enabled but issuance, ACME-lineage validation, certificate hostname
+    validation, or
+
+    certificate/key verification fails on Master or Worker
+
+    **WHEN** that host''s installation stage executes
+
+    **THEN** the stage fails and rolls back; no profile, host, certificate lineage created by the failed
+    transaction, bootstrap name, stream-map entry,
+
+    9444 fallback vhost, or deploy-hook side effect may be left advertising or serving an unusable Vision
+    endpoint;
+
+    pre-existing certificate lineages and unrelated resources MUST NOT be deleted by rollback'
+  assertion_sha256: 77607ca38bc066d268b43ad411fe227cebb1f8c22a61ee53fdd624522cc0fee2
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: VIS-06
+  requirement: Independent Optional Vision Domains
+  live_scenario: Incomplete Vision compensation is reported, not hidden
+  assertion: '**GIVEN** Worker remote rollback or Panel API rollback fails after a Vision provisioning
+    failure
+
+    **WHEN** the orchestrator performs compensation
+
+    **THEN** it checks both rollback results, returns nonzero, retains the recovery journal and records
+    rollback/run status as incomplete; it MUST NOT suppress the remote rollback error or report cleanup
+    PASS'
+  assertion_sha256: ac3589ffde2aef3e43d40565bb5a1ad63959d885ccf300de838faadc204b405d
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: VIS-07
+  requirement: Independent Optional Vision Domains
+  live_scenario: Vision disabled preserves the four-inbound topology
+  assertion: '**GIVEN** both Vision domain fields are absent
+
+    **WHEN** Master and Worker are installed
+
+    **THEN** each node has exactly four inbounds and four hosts, no Vision certificate or route is created,
+    and
+
+    the mandatory Data Plane matrix contains sixteen runtime cases'
+  assertion_sha256: ff3429fa61aaa4184dc23ce278b0158b6d0304af23ea3ee7e6d9f213afed9f80
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: VIS-08
+  requirement: Independent Optional Vision Domains
+  live_scenario: Vision port gate applies only to the Vision-enabled host
+  assertion: '**GIVEN** exactly one of `MASTER_VISION_DOMAIN` or `WORKER_VISION_DOMAIN` is configured
+
+    **WHEN** the disposable baseline gate evaluates each VPS
+
+    **THEN** only the VPS whose own Vision domain is configured is required to keep the Vision ports `8444`
+    and `9444` free, while the other VPS is evaluated against the default port set alone'
+  assertion_sha256: 9fd8bfa75262f7eb676b09f90496c34d3e337c1daccd16483ef022dcab84c214
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: VER-01
+  requirement: Pinned Version Fidelity
+  live_scenario: Version mismatch detected post-installation
+  assertion: '**GIVEN** `GOWAVE_PANEL_VERSION` is set to `1.2.3` in configuration
+
+    **WHEN** the installed Panel binary is interrogated after installation
+
+    **THEN** the runner records the installed version; if it does not match the configured version, the
+
+    `master_install` result is set to `FAIL`'
+  assertion_sha256: 1af985b2aa39d27cb3a8418525e1cec6be0ebe4ef0e3c5cc09e5c644774ba4af
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: VER-02
+  requirement: Pinned Version Fidelity
+  live_scenario: Floating installer branch or installer digest mismatch rejected
+  assertion: '**GIVEN** `GOWAVE_NODE_INSTALLER_COMMIT` is not an explicit 40-hex commit, or the installer
+    artifact SHA256
+
+    does not match mandatory `GOWAVE_NODE_INSTALLER_SHA256`
+
+    **WHEN** preflight validates the bundled Master installer and immutable remote Worker installer source
+
+    **THEN** the runner terminates before installation; neither path may fall back to floating `main`
+    or execute
+
+    an installer whose bytes do not match the configured digest'
+  assertion_sha256: cec9cb8f251ea997cbfe2e9b6e6f39d33b2e60aba7b583dcfada71de59e0a974
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: VER-03
+  requirement: Pinned Version Fidelity
+  live_scenario: Server and client Xray versions are independently pinned
+  assertion: '**GIVEN** `XRAY_SERVER_VERSION` and `XRAY_CLIENT_VERSION` are configured
+
+    **WHEN** preflight and post-install checks inspect the Node-managed server core and Control Machine
+    client
+
+    **THEN** both exact versions are recorded and compared independently; Node version alone is not accepted
+    as
+
+    evidence of the installed Xray core version; inability to identify either version prevents overall
+    PASS
+
+
+    ---'
+  assertion_sha256: d13511621af8ae96fd969c61d8b508c06e808ea9526908046b4673a4132e5d78
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: AIO-01
+  requirement: All-in-One Master VPS Installation Verification
+  live_scenario: Panel service active and API ready
+  assertion: '**GIVEN** `gowave-auto.sh install` completed with exit code 0
+
+    **WHEN** the runner verifies Master installation
+
+    **THEN** `gowave.service` is active, Panel responds to an authenticated API call at `127.0.0.1:3000`,
+
+    and the same HTTPS endpoint is reachable from the Control Machine through NGINX on port 443'
+  assertion_sha256: 73b19f9d1f8249b9a1a724ac062aa6a5644fff65a08812f3ef5cecfcebccb189
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: AIO-02
+  requirement: All-in-One Master VPS Installation Verification
+  live_scenario: Installer TLS/SNI probe trusts only the per-run CA bundle
+  assertion: '**GIVEN** `ACME_MODE=staging` and the runner has validated the D9 mode-specific CA bundle
+
+    **WHEN** `gowave-auto.sh install` runs `verify_public_tls_sni` on Master
+
+    **THEN** the runner stages that bundle in a root-only `/run` file and supplies `GOWAVE_TLS_CA_FILE`;
+    the probe uses `-CAfile`, `-verify_return_error`, and `-verify_hostname`, so the staging certificate
+    succeeds without adding Staging roots to `/etc/ssl/certs`; an untrusted test CA fails; the temporary
+    bundle is removed on success or failure'
+  assertion_sha256: 2bdc65d1b5fc7d43e9f2f607b6ef7dfd7681cdeea14e97b1f240e3735f4a00cc
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: AIO-03
+  requirement: All-in-One Master VPS Installation Verification
+  live_scenario: Credentials file has correct permissions and content
+  assertion: '**GIVEN** install completed successfully
+
+    **WHEN** the runner checks `/root/gowave-credentials.txt` via SSH on Master
+
+    **THEN** owner is root, mode is `0600`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`, and `SCOPED_API_TOKEN`
+    are
+
+    present, and no credential values appear in runner logs or reports'
+  assertion_sha256: 85b3f90e14b3ffa44f540a261db66dccaceaf032f76b60b5b5b6c254361b52e6
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: AIO-04
+  requirement: All-in-One Master VPS Installation Verification
+  live_scenario: Master services active and listeners correct
+  assertion: '**GIVEN** `gowave-auto.sh install` completed with exit code 0
+
+    **WHEN** the runner checks systemd service status and port listeners on Master
+
+    **THEN** `gowave.service`, `gowave-node.service`, `nginx.service`, and `fail2ban.service` are all
+    active;
+
+    Panel listens on `127.0.0.1:3000`, Node on `3002`, and NGINX publicly on `443`'
+  assertion_sha256: 9c0427a97715cf6ebbb0d689d4485663d6c5e8a5c655dc8290772f575810becc
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: AIO-05
+  requirement: All-in-One Master VPS Installation Verification
+  live_scenario: TLS certificate valid and shortUuid retrievable
+  assertion: '**GIVEN** Master installation completed with exit code 0
+
+    **WHEN** the runner verifies certificates and retrieves the default user identity
+
+    **THEN** TLS certificates for `MASTER_PANEL_DOMAIN` and `MASTER_REALITY_DOMAIN` have correct SAN and
+    valid
+
+    chain; `shortUuid` is retrieved via `GET /api/users/by-username/default-user` or confirmed from `state.json`
+
+    — it is NOT read from `/root/gowave-credentials.txt`
+
+
+    ---'
+  assertion_sha256: 9b1c7beaa1c21720abe8c3bb8391384595f5dad3f3f70c58cb0e9dad458afc6f
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: WRK-01
+  requirement: Distributed Worker VPS Deployment Verification
+  live_scenario: SECRET_KEY is absent from a complete process argv trace
+  assertion: '**GIVEN** `gowave-auto.sh node add` is executing the SSH remote deployment on Master
+
+    **WHEN** the runner traces the local Master-side descendant process tree (including the local SSH
+    client)
+
+    with
+
+    `strace -f -v -s N -e trace=execve,execveat`, where `N=32 * os.sysconf("SC_PAGE_SIZE")`
+
+    **THEN** the observer exits successfully, every `argv` vector and string is complete, the scanner
+    parses
+
+    escaped argv bytes and finds no exact or known encoded `SECRET_KEY` value; only this complete observation
+
+    can PASS. The raw `envp` emitted by `-v` is discarded and MUST NOT enter reports or logs.'
+  assertion_sha256: 0adf7137f2d574154ca9448dae815b748acbcb6d6aec21589449e2113cd57b4c
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: WRK-02
+  requirement: Distributed Worker VPS Deployment Verification
+  live_scenario: Long argv string is not truncated
+  assertion: '**GIVEN** a test helper performs both `execve` and `execveat` with a sentinel embedded after
+    byte 32
+
+    of an argument
+
+    **WHEN** the argv observer acceptance test runs with the computed positive `-s` limit
+
+    **THEN** the complete sentinel is present in each corresponding parsed argument; a missing or truncated
+
+    sentinel makes observer acceptance FAIL and the live observation INCOMPLETE'
+  assertion_sha256: e12a8e6552abe01d3c27d9ab28f74fec1592ee018e0f582b1ea28d2274df0cbd
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: WRK-03
+  requirement: Distributed Worker VPS Deployment Verification
+  live_scenario: Later argv elements are not abbreviated
+  assertion: '**GIVEN** a test helper performs both `execve` and `execveat` with at least 128 argv elements
+    and places
+
+    a sentinel only in the final element
+
+    **WHEN** the argv observer runs with `-v` / `--no-abbrev`
+
+    **THEN** the parser receives all 128 or more argv elements in order, including the complete final
+    sentinel,
+
+    and no strace omission marker. Any omitted element or ambiguous parse makes acceptance FAIL and the
+    live
+
+    observation INCOMPLETE'
+  assertion_sha256: 102d8fed013252b4bca69647e7a3fcab4803e9bc351fd9e5011843001ab6d53c
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: WRK-04
+  requirement: Distributed Worker VPS Deployment Verification
+  live_scenario: Worker node registered and connected in Panel
+  assertion: '**GIVEN** Worker deployment completed with exit code 0
+
+    **WHEN** the runner polls `GET /api/nodes` with bounded timeout up to `NODE_READY_TIMEOUT`
+
+    **THEN** a node named `worker-1` with address `WORKER_IP` and port `3002` appears with `isConnected:
+    true`'
+  assertion_sha256: e033cffdf4578920ac27205af1759f100694940b1405eb603539d29b74122e29
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: WRK-05
+  requirement: Distributed Worker VPS Deployment Verification
+  live_scenario: Worker deployment details verified
+  assertion: '**GIVEN** Worker deployment completed with exit code 0
+
+    **WHEN** the runner audits the Worker node state
+
+    **THEN** installer commit matches configuration; Node binary version matches `GOWAVE_NODE_VERSION`;
+
+    deploy hook exists and is executable; cover-reality assets are present with SHA256 matching transmitted
+
+    payload; `nginx -t` passes on Worker
+
+
+    ---'
+  assertion_sha256: 807f5f8d738b5017d0added80b8a375311a8b968319d0394add0803c1f20fc83
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: MTLS-01
+  requirement: Public mTLS Control Plane Verification (Master → Worker)
+  live_scenario: Existing verifier succeeds with valid credentials
+  assertion: '**GIVEN** Worker is deployed and `gowave-node.service` is active
+
+    **WHEN** Master obtains the already-Base64-encoded value from `modules/node.sh:extract_secret_key`
+    and runs
+
+    `modules/verify_node_mtls.py --host WORKER_IP --port 3002 --mode full` with that value unchanged on
+    stdin
+
+    **THEN** the verifier performs exactly one Base64 decode and emits `Payload cryptographic verification
+    PASSED` before the socket attempt, then (on a successful handshake) `Handshake SUCCESS: TLSv1.3 negotiated`
+    and `Node response: <status line>`; the runner MUST NOT Base64-encode the extractor output again and
+    records these exact observations without logging the payload or derived SNI'
+  assertion_sha256: a24b01f599587b5be122611a25ebb553cffb14229d91d5e0813436306579ade9
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: MTLS-02
+  requirement: Public mTLS Control Plane Verification (Master → Worker)
+  live_scenario: HTTP 200 is distinguished from HTTP 401
+  assertion: '**GIVEN** TLS 1.3 and the HKDF-derived SNI handshake succeeded
+
+    **WHEN** the Node health endpoint responds
+
+    **THEN** HTTP 200 sets `WORKER_HTTP_HEALTH_PASS`; HTTP 401 records `MTLS_HANDSHAKE_PASS` but does
+    NOT set HTTP health or authenticated control-plane success'
+  assertion_sha256: e5ad02da445ca3220d2c54737bfd6a7d110ac34d9a04e7ee0a603786b974db92
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: MTLS-03
+  requirement: Public mTLS Control Plane Verification (Master → Worker)
+  live_scenario: Panel-to-Worker authenticated connectivity is independently verified
+  assertion: '**GIVEN** the local mTLS verifier completed
+
+    **WHEN** the runner checks the real Panel''s node state and authenticated connectivity through the
+    documented Panel API
+
+    **THEN** `PANEL_WORKER_AUTH_PASS` is set only when the Panel reports the Worker connected; a local
+    401 response MUST NOT be treated as proof of Panel authentication'
+  assertion_sha256: e61535a8938b47bc922c0853519d71e40a1b5a4f3dc74593a857fe7f733e342e
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: MTLS-04
+  requirement: Public mTLS Control Plane Verification (Master → Worker)
+  live_scenario: Untrusted client certificate rejected by Worker
+  assertion: '**GIVEN** Worker Node is active and Master can reach Worker:3002
+
+    **WHEN** Master attempts TLS 1.3 with a self-signed client certificate not issued by the GoWave CA
+
+    **THEN** Worker rejects the client certificate during handshake and no HTTP handler is reached'
+  assertion_sha256: 6916f464e52e25e6982f3df65b22002865a7c82281a0721ce843ccbdfc8ac12a
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: MTLS-05
+  requirement: Public mTLS Control Plane Verification (Master → Worker)
+  live_scenario: Absent client certificate rejected by Worker
+  assertion: '**GIVEN** Worker Node requires mTLS
+
+    **WHEN** Master attempts TLS 1.3 without presenting a client certificate
+
+    **THEN** Worker rejects the handshake before the HTTP handler'
+  assertion_sha256: 4258d541d563f2116d15a6d97f973e95706d4605cfbed6908642282640af832f
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: MTLS-06
+  requirement: Public mTLS Control Plane Verification (Master → Worker)
+  live_scenario: Mismatched client certificate and private key is classified as local failure
+  assertion: '**GIVEN** the runner pairs a valid client certificate with a different private key
+
+    **WHEN** the existing `validate_payload_crypto()` validation path compares the certificate public
+    key with the private key''s derived public key through OpenSSL
+
+    **THEN** local cryptographic validation fails before any socket is opened; the runner records a client-side
+    validation failure, not a remote Worker handshake rejection'
+  assertion_sha256: 1aa7b28523a25c4723771eb5bb0d9fb48e44652c1a389ddf49f5a6a91be732fe
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: MTLS-07
+  requirement: Public mTLS Control Plane Verification (Master → Worker)
+  live_scenario: Untrusted Worker CA is classified as client-side server verification failure
+  assertion: '**GIVEN** the runner has already derived the valid HKDF SNI and has a valid client certificate/key
+
+    **WHEN** Master connects with that same SNI and client identity but replaces only its server-trust
+    store with one that does not contain the GoWave CA
+
+    **THEN** Master rejects the Worker certificate during server-certificate validation; the test isolates
+    trust failure without changing SNI or client identity and is not reported as Worker rejecting the
+    client'
+  assertion_sha256: 6458c9b2ab42426ea7a73a114f97738db13d3e84d1159f87ca7daa78efdd253e
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: MTLS-08
+  requirement: Public mTLS Control Plane Verification (Master → Worker)
+  live_scenario: Wrong SNI routing is measured without assuming a TLS alert
+  assertion: '**GIVEN** the valid derived SNI and normal connection pass
+
+    **WHEN** Master connects using a deliberately incorrect SNI
+
+    **THEN** the runner records the actual NGINX/default-route and TLS outcome; it MUST NOT assume that
+    every wrong SNI necessarily produces a TLS handshake failure'
+  assertion_sha256: 3582b4ad0e8b0c3af00e2253faf70454cbe70cb15961ac0af8c16e4dd57816a6
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: APIC-01
+  requirement: TLS-aware Bounded Panel API Client
+  live_scenario: Panel API client uses scoped trust and configured timeout
+  assertion: '**GIVEN** `ACME_MODE=staging` and a validated combined CA bundle
+
+    **WHEN** `panel_api.py` logs in and requests the real Panel API over HTTPS
+
+    **THEN** the request uses an SSL context loaded from that bundle, retains hostname verification, uses
+
+    `API_TIMEOUT` per request attempt, and does not use `allowInsecure` or a trust bypass; normal production
+
+    callers that omit the optional parameters retain their current behavior
+
+
+    ---'
+  assertion_sha256: 13aac73d5a303cab540e4381fd219f3446c76425658b53527e79275609b97049
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: CLUS-01
+  requirement: Panel API Cluster Structure Audit
+  live_scenario: Hosts present with correct node and inbound associations
+  assertion: '**GIVEN** Master installed and Worker deployed on a clean test environment
+
+    **WHEN** runner queries `GET /api/hosts`
+
+    **THEN** exactly eight, nine, or ten according to the number of configured Vision domains Host records
+    exist; four (or five) reference `local-node` UUID and four (or five) reference `worker-1`
+
+    UUID; each Host''s `inbound UUID` matches one of the inbounds in the corresponding node''s config
+    profile; REALITY hosts carry the configured REALITY fingerprint (`firefox` by
+
+    default, overridable via `REALITY_FINGERPRINT`) and every TLS host carries `fingerprint: firefox`'
+  assertion_sha256: 6861b5951e1eec9424e5e99d719e48aaf5b2e976554a10308611d5d2442799f7
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: CLUS-02
+  requirement: Panel API Cluster Structure Audit
+  live_scenario: Internal Squad contains all provisioned inbound UUIDs
+  assertion: '**GIVEN** both nodes are registered with four (or five) inbounds each
+
+    **WHEN** runner queries `GET /api/internal-squads` for `Default MVP Squad`
+
+    **THEN** the squad''s inbound list contains exactly the eight (or ten) UUIDs (four or five from Master
+    profile, four or five from
+
+    Worker profile) with no duplicates — verified by set equality'
+  assertion_sha256: 9beec7b1fa67d5e133ee93d7161117a30257bc8ce0e035b17b79a71f97d7c36f
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: CLUS-03
+  requirement: Panel API Cluster Structure Audit
+  live_scenario: Two nodes and two config profiles with correct structure
+  assertion: '**GIVEN** Master installed and Worker deployed on a clean test environment
+
+    **WHEN** runner queries `GET /api/nodes` and `GET /api/config-profiles`
+
+    **THEN** exactly two nodes exist (`local-node` at `127.0.0.1:3002` and `worker-1` at `WORKER_IP:3002`),
+
+    each with four (or five with vision) active inbounds and unique UUIDs; two config profiles each have
+    four (or five) inbounds and valid
+
+    computed JSON config; Node API address for Worker is `WORKER_IP` and VPN client address is `WORKER_DOMAIN`
+
+
+    ---'
+  assertion_sha256: 190c52fedbf8087ae00a26c5eba166f28552adaf542c6e09a688d90a118d4ae0
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: SUB-01
+  requirement: Real Subscription Delivery and User-Agent Policy
+  live_scenario: Subscription rejected with absent User-Agent
+  assertion: '**GIVEN** a valid shortUuid for the default user
+
+    **WHEN** `GET /api/sub/{shortUuid}/v2ray-json` is requested without a User-Agent header
+
+    **THEN** the real Panel returns the HTTP status code mandated by the upstream User-Agent policy at
+    the
+
+    installed GoWave version; if that is 403, the runner records a pass; if the Panel behavior differs,
+    the
+
+    runner records the actual response and fails the assertion'
+  assertion_sha256: 94cc2c447baa81491a0695dae1ab49f75f31b93d6014506d4d3015f1f961a024
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: SUB-02
+  requirement: Real Subscription Delivery and User-Agent Policy
+  live_scenario: Proxy-capable outbounds in Xray JSON
+  assertion: '**GIVEN** subscription fetched with valid Xray User-Agent
+
+    **WHEN** runner parses the JSON and counts proxy-capable outbounds
+
+    **THEN** exactly eight, nine, or ten according to the number of configured Vision domains outbounds
+    are identified by protocol/transport tag (VLESS REALITY, VLESS XHTTP
+
+    TLS, VLESS WS TLS, Trojan gRPC TLS, and optional VLESS XTLS Vision TLS) for Master and Worker; REALITY
+
+    outbounds carry the configured REALITY fingerprint (`firefox` by default) and TLS outbounds carry
+
+    `fingerprint: "firefox"`; `direct`, `block`, and routing-only entries
+
+    are excluded from the count'
+  assertion_sha256: 2d44500036ac31d8b2c282ad0f4c7ca5e9cc7cb447144da9d76927d86f9690f1
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: SUB-03
+  requirement: Real Subscription Delivery and User-Agent Policy
+  live_scenario: Xray JSON subscription headers and content verified
+  assertion: '**GIVEN** subscription fetched with valid Xray User-Agent
+
+    **WHEN** runner validates HTTP response and parses JSON
+
+    **THEN** HTTP 200 is returned with correct Content-Type, `Cache-Control: no-store` and all mandatory
+
+    response headers; addresses and SNI match the corresponding Host API records; no server-side private
+    secrets
+
+    appear in the subscription content; real `xray run -test` validates the config'
+  assertion_sha256: 549c664684bc9f9319ec55eb6297bd37f6db4aab6d98f862179008ac087d2352
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: SUB-04
+  requirement: Real Subscription Delivery and User-Agent Policy
+  live_scenario: Mihomo YAML subscription verified
+  assertion: '**GIVEN** subscription fetched with valid Mihomo User-Agent
+
+    **WHEN** runner validates HTTP response and parses YAML
+
+    **THEN** HTTP 200 is returned with correct Content-Type; eight, nine, or ten according to the number
+    of configured Vision domains proxy entries with correct protocol and
+
+    transport parameters are present; REALITY entries carry `client-fingerprint` equal to the configured
+    REALITY
+
+    fingerprint (`firefox` by default) and the TLS transports carry `client-fingerprint: "firefox"`;
+
+    `GEOIP,private,DIRECT,no-resolve` rule is present; no duplicates; real
+
+    `mihomo -t` validates the config
+
+
+    ---'
+  assertion_sha256: 525ef1e295d77c660884c3456f0dfebb7d546b9b7ee97d29ddb94a29b4575eed
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: FW-01
+  requirement: UFW Firewall Isolation Verification
+  live_scenario: Worker allows Master and blocks Control Machine
+  assertion: '**GIVEN** Worker Node is active and a positive mTLS probe from Master succeeds
+
+    **WHEN** the runner records the source address seen by Worker for that successful connection and then
+    probes Worker:3002 from Control Machine
+
+    **THEN** the observed Master source address matches the effective UFW allow rule; the Control Machine
+    probe is blocked; and Worker-side UFW rule/counter or packet trace confirms the DROP path. The Worker
+    MUST also observe the actual source address of the Control Machine probe and prove it differs from
+    the allowed Master source. If the two source addresses are equal, this negative probe is `INCOMPLETE`,
+    not a firewall PASS; a distinct external probe vantage is required'
+  assertion_sha256: 35105c162ec8772be03e57d3a0ebdecded8fe66e52b17de171fc92af9dc49e61
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: FW-02
+  requirement: UFW Firewall Isolation Verification
+  live_scenario: Negative probe is not misclassified
+  assertion: '**GIVEN** a Control Machine connection to Worker:3002 fails
+
+    **WHEN** the runner evaluates the result
+
+    **THEN** `Connection refused`, route failure, DNS failure, or timeout without a successful Master
+    control probe and Worker-side firewall evidence MUST NOT count as firewall PASS; ambiguous evidence
+    is `INCOMPLETE`'
+  assertion_sha256: b897c06d32f7a3a2cc97f3386fefd617ea069c039b8855b97c958e5803519a61
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: FW-03
+  requirement: UFW Firewall Isolation Verification
+  live_scenario: Master local and external access are distinguished
+  assertion: '**GIVEN** Master Node is listening on loopback port 3002 and external isolation is configured
+
+    **WHEN** the runner probes loopback from Master and the public endpoint from Control Machine
+
+    **THEN** loopback succeeds; the external probe is blocked; and the DROP rule/counter or packet trace
+    is
+
+    collected on Master itself. Worker-side evidence MUST NOT be used to prove Master firewall behavior.'
+  assertion_sha256: 3ac3ebc178bd9b7beb4dfbbbe3be390b3121f4817c340553fe660da077c00935
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: partial
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  partial_split: Container proves isolation between distinct source addresses; provider-level external
+    reachability is live-only.
+  promotion_target: null
+- id: FW-04
+  requirement: UFW Firewall Isolation Verification
+  live_scenario: IPv6 firewall isolation checked when enabled
+  assertion: '**GIVEN** `ENABLE_IPV6=true` and valid AAAA routing are configured
+
+    **WHEN** runner repeats the positive and negative probes over IPv6
+
+    **THEN** the observed IPv6 source address matches the allowlist and the allowed Master probe succeeds;
+
+    the Control Machine probe is blocked with DROP evidence collected on the VPS being tested (Master
+    or Worker).'
+  assertion_sha256: 07559951e28eb46345a91c248c220282d64ca07ad74852ed8898d5cae39d453f
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: NGX-01
+  requirement: NGINX SNI Routing and REALITY Decoy Verification
+  live_scenario: Panel HTTPS accessible with correct SNI
+  assertion: '**GIVEN** Master NGINX is active and TLS certificate for `MASTER_PANEL_DOMAIN` is installed
+
+    **WHEN** HTTPS connection is made to `MASTER_IP:443` with SNI `MASTER_PANEL_DOMAIN`
+
+    **THEN** TLS terminates correctly, certificate is for the expected domain, Panel API health endpoint
+    responds'
+  assertion_sha256: 346b647a09a8da5eca2483b846610a15dd51bc166fc11df54067058bd24c872d
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: NGX-02
+  requirement: NGINX SNI Routing and REALITY Decoy Verification
+  live_scenario: REALITY decoy does not leak GoWave API content
+  assertion: '**GIVEN** REALITY decoy site is installed
+
+    **WHEN** an HTTPS request is made to the decoy endpoint with the REALITY domain SNI
+
+    **THEN** the response contains the cover-reality site content, not GoWave Panel API responses or admin
+    routes'
+  assertion_sha256: f0d46c8c5d390645039266314adfaecdbac52fc270cc16cc787381e983c9e75d
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: NGX-03
+  requirement: NGINX SNI Routing and REALITY Decoy Verification
+  live_scenario: REALITY fallback and cover-reality assets present
+  assertion: '**GIVEN** NGINX is active on Master or Worker with REALITY SNI configured
+
+    **WHEN** runner connects with the REALITY SNI but invalid REALITY client parameters and checks asset
+    presence
+
+    **THEN** REALITY fallback returns a decoy site response; a unique cover-reality site marker file is
+    accessible;
+
+    unknown SNI routes per NGINX + Xray REALITY fallback logic without returning GoWave API content'
+  assertion_sha256: e71770c2fd6a869c70ae0f63a45286a35b50506bd5fc0a0dbd9e037f7907cc3e
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: NGX-04
+  requirement: NGINX SNI Routing and REALITY Decoy Verification
+  live_scenario: Optional Vision SNI routing and decoy fallback
+  assertion: '**GIVEN** both Vision domains are configured and NGINX Stream is active
+
+    **WHEN** runner connects with vision domain SNI using a non-VLESS HTTP probe
+
+    **THEN** traffic routes to loopback port 8444 and falls back to loopback port 9444 returning decoy
+    site content via PROXY protocol
+
+
+    ---'
+  assertion_sha256: 3506828e155491d40546ff40621f2a1499422a02d25ae35801b2d422c53f198a
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: DP-01
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: All active logical endpoints are exercised by both clients
+  assertion: '**GIVEN** the real Xray JSON and Mihomo YAML subscriptions each contain four or five Master
+    and four or five Worker proxy entries
+
+    **WHEN** the runner executes the Data Plane phase
+
+    **THEN** it runs Xray and Mihomo independently against each of the active logical endpoints (16, 18,
+    or 20 cases total), both clients using the configured REALITY fingerprint (`firefox` by default);
+    all cases must pass for overall `PASS`'
+  assertion_sha256: 731e0c0ef19bbf41fb3f9c295bb7748b700ad8d0d93cd2c465ee04a802d20f36
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: DP-02
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: Tunnel setup tolerates one cold resolver stall
+  assertion: '**GIVEN** `TRAFFIC_TIMEOUT` bounds every Xray and Mihomo egress request
+
+    **WHEN** a client must resolve the target hostname without a cached answer
+
+    **THEN** the curl connect budget is at least half of `TRAFFIC_TIMEOUT` and never below 10 seconds,
+    so a single 5-second resolver stall cannot fail an otherwise healthy endpoint'
+  assertion_sha256: 8cf0771678111598578d2d933b6c3a7c9d4375fa0644bc9daceb4a579b117a0d
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: DP-03
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: Clients are the cores deployed by Panel and Node
+  assertion: '**GIVEN** the pinned `XRAY_CLIENT_VERSION` and `MIHOMO_CLIENT_VERSION` binaries on the Control
+    Machine
+
+    **WHEN** the runner executes the Data Plane phase
+
+    **THEN** exactly those two pinned cores are exercised against the subscription (no alternative or
+
+    replacement client binaries), matching the server cores that GoWave Panel and GoWave Node deploy'
+  assertion_sha256: e8709ee54c452e0088cf1150c3a8e03e0f7c823a0a5e54f92807479329f04a32
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: DP-04
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: Xray runtime request traverses the selected Master endpoint
+  assertion: '**GIVEN** a Master endpoint outbound has been extracted from the real Xray subscription
+
+    **WHEN** a real Xray process exposes a local SOCKS5 listener and the runner sends an HTTPS request
+    through that selected outbound
+
+    **THEN** the request succeeds, egress matches the configured Master expectation (or documented direct-egress
+    baseline), and isolated packet evidence increases on Master during the request window'
+  assertion_sha256: 62cf714d00e8f50ecb990c4407550afb3646cc08bda9b4a8dd07d3f48aed2c3c
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: DP-05
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: Mihomo runtime configuration is isolated on Control Machine
+  assertion: '**GIVEN** a real Mihomo subscription YAML fetched from the Panel
+
+    **WHEN** the runner prepares the per-run Mihomo config
+
+    **THEN** it preserves all proxy definitions and routing rules but assigns collision-free loopback-only
+
+    mixed/SOCKS/redir/controller listeners, verifies `allow-lan: false` and controller binding to `127.0.0.1`,
+
+    and refuses to launch if any control endpoint would bind to a non-loopback interface'
+  assertion_sha256: 7690d6d23b1bcb4c97f76110b99cf907632da8e044ff1c24df043e22fa19e2c6
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: DP-06
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: Mihomo runtime request traverses the selected Master endpoint
+  assertion: '**GIVEN** a Master proxy has been selected from the real Mihomo subscription
+
+    **WHEN** a real Mihomo process is running and the runner selects that proxy through its supported
+    controller/API or a dedicated generated config
+
+    **THEN** the HTTPS request succeeds through the selected proxy, egress is verified, and Master ingress
+    evidence increases during the isolated window'
+  assertion_sha256: aa0444c9974f19c970a6cced5febdf4a0fec13056c436a45a7c9a264aa9c4ee6
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: DP-07
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: Xray runtime request traverses the selected Worker endpoint
+  assertion: '**GIVEN** a Worker endpoint outbound has been extracted from the real Xray subscription
+
+    **WHEN** a real Xray process sends an HTTPS request through the selected Worker outbound
+
+    **THEN** the request succeeds, egress matches the configured Worker expectation (or documented direct-egress
+    baseline), Worker ingress evidence increases, and Master ingress evidence does not increase for that
+    controlled request'
+  assertion_sha256: 9cb48281708292b73e8c325cc7387dc36743aa9916dc6a9863f1e987f609a505
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: DP-08
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: Mihomo runtime request traverses the selected Worker endpoint
+  assertion: '**GIVEN** a Worker proxy has been selected from the real Mihomo subscription
+
+    **WHEN** a real Mihomo process sends an HTTPS request through the selected Worker proxy
+
+    **THEN** the request succeeds, egress is verified, Worker ingress evidence increases, and Master ingress
+    evidence does not increase for that controlled request'
+  assertion_sha256: 95d5104c8bdbc0608dc1200da740e87b33ae1c61e0e57537008b64ac5af9bf00
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: DP-09
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: Staging and public CA chains are both trusted without bypass
+  assertion: '**GIVEN** `ACME_MODE=staging` and the runner has built its scoped combined CA bundle
+
+    **WHEN** Python, curl, Xray and Mihomo perform their respective TLS requests
+
+    **THEN** each client validates both a Let''s Encrypt Staging endpoint and an ordinary public-CA endpoint
+
+    (including the public HTTPS egress probe); an untrusted test CA is rejected; `allowInsecure` and
+
+    `skip-cert-verify` are prohibited'
+  assertion_sha256: 47a8d15a38e7c6ea432380cbd0d9fac3a767c9863a42ddcf5edf9fcea26f6949
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: partial
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  partial_split: Container proves explicit verify anchors and no global trust change; public Let's Encrypt
+    issuance is live-only.
+  promotion_target: null
+- id: DP-10
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: Xray TLS outbounds carry explicit Staging trust anchors
+  assertion: '**GIVEN** `ACME_MODE=staging` and the runner has built its scoped combined CA bundle
+
+    **WHEN** the runner prepares an Xray outbound whose `streamSettings.security` is `tls`
+
+    **THEN** it appends one `{"usage": "verify", "certificateFile": <staged bundle path>}` entry per pinned
+
+    Staging root to `streamSettings.tlsSettings.certificates`, because Xray ignores `SSL_CERT_FILE` and
+    reads
+
+    only hardcoded system CA paths; REALITY outbounds are left unmodified since they trust the pinned
+    key
+
+    instead of a CA chain; `allowInsecure` stays absent, and in `ACME_MODE=production` no anchors are
+    injected'
+  assertion_sha256: ea9d2e12782755378acd36fdbe0f503ad03c4b99f6c306b157344b911e48cc68
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: partial
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  partial_split: Container proves the injected verify anchor is required; real Staging material is live-only.
+  promotion_target: null
+- id: DP-11
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: Staging CA material is pinned and reproducible
+  assertion: '**GIVEN** `ACME_MODE=staging`
+
+    **WHEN** TLS preflight loads `tools/certs/letsencrypt-staging/`
+
+    **THEN** exactly the four official self-signed Staging roots identified in design D9 are present and
+
+    individually match the DER SHA-256 values in `pins.json`; no intermediate is treated as a trust anchor,
+
+    no certificate is downloaded at runtime, and a missing or mismatched pin fails preflight before any
+
+    remote modification'
+  assertion_sha256: fff9db5cb1523c3eed722118182e243e1e1d2722dbcaca5dfa8fe594df873959
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: partial
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  partial_split: Container proves fixture CA pinning by digest; real Staging CA distribution is live-only.
+  promotion_target: null
+- id: DP-12
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: Production mode does not add Staging roots to trust
+  assertion: '**GIVEN** `ACME_MODE=production`
+
+    **WHEN** the runner constructs the mode-specific TLS bundle
+
+    **THEN** the bundle contains the complete public CA roots and no Let''s Encrypt Staging roots; a Staging-only
+
+    chain remains untrusted, and ordinary public-CA endpoints continue to validate'
+  assertion_sha256: 2182f56660fc026ea3b2278eec40f9ec62bd0e08be14caf482301c1d6db2811e
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: DP-13
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: Ingress evidence is ambiguous
+  assertion: '**GIVEN** unrelated background traffic changes the same listener counters during the test
+    window
+
+    **WHEN** the runner cannot attribute ingress evidence to the controlled request
+
+    **THEN** that case is `INCOMPLETE`, not `PASS`'
+  assertion_sha256: 40e37d7fd08a0cff2554a70d01c3e70a64db2dbf8f04e563aa302a37c34e9982
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: DP-14
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: Data Plane is explicitly disabled
+  assertion: '**GIVEN** `TEST_TRAFFIC_VERIFICATION=false` or Mihomo runtime testing is disabled
+
+    **WHEN** the full run completes the remaining phases
+
+    **THEN** the skipped cases are recorded as `SKIP` and overall status is `INCOMPLETE`, never `PASS`'
+  assertion_sha256: 8a09d6bcbfc98b0bf7aa0ad72ea99d11a7de0b04cf2f609fdb8b2b84a0f1f364
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: DP-15
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: One or more mandatory runtime cases fail
+  assertion: '**GIVEN** the sixteen-, eighteen-, or twenty-case runtime matrix is required
+
+    **WHEN** any Xray or Mihomo case fails
+
+    **THEN** the corresponding case is `FAIL` and overall status is `FAIL`'
+  assertion_sha256: 1cfe5da1f6a4c361001496b739254a1be8718859550e9b5e0d9fb221353ecc91
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: NEG-01
+  requirement: Negative Scenario and Fault Injection Tests
+  live_scenario: Matrix of fifteen fault scenarios verified (NEG-01..NEG-15)
+  assertion: '**GIVEN** a valid E2E config with isolated local preflight fixtures and a confirmed disposable
+    VPS testbed for the live fault-injection cases
+
+    **WHEN** the runner executes the negative test suite
+
+    **THEN** all 15 scenarios terminate at their designated boundaries per the following matrix:
+
+
+    | Scenario ID | Component / Area | Fault Injection Method | Expected Failure Boundary & Outcome |
+
+    |-------------|------------------|------------------------|--------------------------------------|
+
+    | **NEG-01**  | Preflight SSH    | Host key absent or mutated in `known_hosts` | Terminate before
+    any remote modification |
+
+    | **NEG-02**  | Preflight SSH    | Target SSH port closed / unreachable | Terminate with connectivity
+    timeout before execution |
+
+    | **NEG-03**  | Preflight DNS    | Domain resolves to wrong IP address | Terminate before remote modification
+    |
+
+    | **NEG-04**  | Preflight DNS    | Missing AAAA record when `ENABLE_IPV6=true` | Preflight failure
+    before execution |
+
+    | **NEG-05**  | ACME Install     | Certbot challenge failure (NXDOMAIN / blocked 80) | Installation
+    aborts; services not marked healthy |
+
+    | **NEG-06**  | NGINX Config     | Syntax corruption in `/etc/nginx/conf.d/*.conf` | `nginx -t` fails;
+    runner blocks activation |
+
+    | **NEG-07**  | Worker Node      | `systemctl stop gowave-node` on Worker | Panel detects offline;
+    `isConnected` becomes `false` |
+
+    | **NEG-08**  | Worker Node      | `systemctl start gowave-node` on Worker | Panel recovers; `isConnected`
+    returns `true` |
+
+    | **NEG-09**  | Subscription     | Request without User-Agent header | Real Panel rejects with upstream
+    policy code (e.g. 403) |
+
+    | **NEG-10**  | mTLS Control     | Forged / self-signed client certificate | Worker TLS 1.3 rejects
+    handshake before HTTP handler |
+
+    | **NEG-11**  | Backup Restore   | Corrupted archive header / invalid tar format | Preflight check
+    rejects before mutating live files |
+
+    | **NEG-12**  | Backup Restore   | SQLite DB file in archive corrupted | SQLite integrity check fails
+    before replacing live DB |
+
+    | **NEG-13**  | Worker Deploy    | SSH pipeline interrupted mid-execution | Master recovery journal
+    does NOT enter `COMMITTED` |
+
+    | **NEG-14**  | Worker Deploy    | Duplicate `node add` when the worker name is already in `state.json`
+    | Explicit fail-fast rejection before API mutation; no duplicate DB entities or hosts |
+
+    | **NEG-15**  | Panel API Auth   | API request with expired or forged JWT | Panel returns 401 Unauthorized
+    |'
+  assertion_sha256: d31528a0886a73f7929325ad2140462f3c3f0a1214b84c6c9e53a15b1aa41a0c
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: NEG-02
+  requirement: Negative Scenario and Fault Injection Tests
+  live_scenario: Duplicate Worker registration is rejected without mutation (NEG-14)
+  assertion: '**GIVEN** `worker-1` is already present in Master `state.json` and all associated API objects
+    exist
+
+    **WHEN** `gowave-auto.sh node add worker-1` is invoked again with the same parameters
+
+    **THEN** the command exits nonzero with the existing-name rejection before constructing `GoWaveClient`
+    or issuing any Panel API request; `state.json` is unchanged and the existing single node, profile,
+    hosts, and inbounds remain unchanged'
+  assertion_sha256: 974420bf9b4d57ed0a90d80ff250b57c972b4c3efaf7c63d44adc6e43aae2655
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: NEG-03
+  requirement: Negative Scenario and Fault Injection Tests
+  live_scenario: Partial SSH deployment leaves no false COMMITTED journal state (NEG-13)
+  assertion: '**GIVEN** SSH connection to Worker is interrupted mid-installation
+
+    **WHEN** the runner inspects the recovery journal on Master
+
+    **THEN** journal state is NOT `COMMITTED`; it is in a failure or recovery-required state requiring
+    operator
+
+    action before the Worker is considered registered
+
+    **AND** the recorded rollback removes the partial Panel entities and the Worker entry from `state.json`,
+    leaving
+
+    its content equal to the pre-dispatch snapshot apart from the update timestamp, and releases the host
+    mutation lock'
+  assertion_sha256: 357253d7008cd9106c84a546e8ff12b5126b59a4558d64fdc28a0aa2a5fb7622
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: NEG-04
+  requirement: Negative Scenario and Fault Injection Tests
+  live_scenario: Preflight, lifecycle, and protocol scenarios verified (NEG-01..NEG-10)
+  assertion: '**GIVEN** isolated fixtures for NEG-01..NEG-04, an isolated ACME failure setup for NEG-05,
+    and a confirmed disposable VPS for the live scenarios
+
+    **WHEN** runner executes NEG-01 through NEG-10 per the normative matrix
+
+    **THEN** each scenario terminates or fails at the expected boundary; NEG-07 and NEG-08 bound Panel
+
+    detection of Worker unavailability and reconnection within configured timeouts; NEG-10 rejects forged
+
+    client certificate at TLS handshake before HTTP handler executes'
+  assertion_sha256: d09e01d9db3ff17bb0f6f9c7a1c70e03233f6ffa7edd39c5c8a2f26186b1e25b
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: NEG-05
+  requirement: Negative Scenario and Fault Injection Tests
+  live_scenario: Backup and restore negative scenarios verified (NEG-11, NEG-12)
+  assertion: '**GIVEN** disposable VPS confirmed and negative test suite enabled
+
+    **WHEN** runner executes NEG-11 (corrupted archive) and NEG-12 (corrupted SQLite DB in archive)
+
+    **THEN** NEG-11: restore rejects before modifying live data; NEG-12: restore fails before stopping
+    or
+
+    replacing the live DB'
+  assertion_sha256: 516f60119e1cdc068d7ea2e0de16fc504dfcab4a563db22686d49fc7a4aa9227
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: NEG-06
+  requirement: Negative Scenario and Fault Injection Tests
+  live_scenario: Forged or expired Panel JWT is rejected (NEG-15)
+  assertion: '**GIVEN** the runner has an otherwise valid authenticated Panel API session
+
+    **WHEN** it sends a protected Panel API request with a forged or expired JWT
+
+    **THEN** the Panel returns HTTP 401 and the request is recorded as an authentication-negative PASS
+
+
+    ---'
+  assertion_sha256: 214ac5e78a812fe805f4e18a6a94f161502dbad6deb95ae66c0f023bda30c7be
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: NEG-07
+  requirement: Negative Scenario and Fault Injection Tests
+  live_scenario: Negative suite PASS requires all fifteen scenarios to pass
+  assertion: '**GIVEN** `TEST_NEGATIVE_SUITE=true`
+
+    **WHEN** the negative phase completes with any scenario `FAIL`, `SKIP`, `NOT_RUN`, `PARTIAL`, or `INCOMPLETE`
+
+    **THEN** `negative_tests` is not `PASS` and overall status cannot be `PASS`; it is `FAIL` for a failed
+
+    assertion and `INCOMPLETE` when required evidence or execution is missing'
+  assertion_sha256: 3f23997bd15f0dfaa9a284c3fec9d05e53432a2b4c536cd08399d7a80246505a
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: NEG-08
+  requirement: Negative Scenario and Fault Injection Tests
+  live_scenario: Negative suite cannot be silently skipped for a passing run
+  assertion: '**GIVEN** `TEST_NEGATIVE_SUITE=false`
+
+    **WHEN** the full run reaches the negative-test phase
+
+    **THEN** all 15 negative scenarios are explicitly recorded as `SKIP` and overall status is `INCOMPLETE`;
+
+    the run MUST NOT be reported as `PASS`
+
+
+    ---'
+  assertion_sha256: 64e001ae77b5de87d3061fd799e173854a200e0ccdf02506b7839672f578cb2d
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: HOOK-01
+  requirement: Global Certbot Deploy Hook Ownership
+  live_scenario: Pre-existing global deploy hook blocks installation safely
+  assertion: '**GIVEN** Master or Worker already has a deploy hook at the managed path, including a symlink
+    or non-regular object
+
+    **WHEN** the runner performs disposable-baseline and hook-ownership preflight
+
+    **THEN** it fails before remote mutation and preserves the original path, target, bytes, owner, group,
+    and mode'
+  assertion_sha256: ec935a8f5d3301c2668269f403e794bfab7816af0e9f27d59abed8030f54b8ff
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: HOOK-02
+  requirement: Global Certbot Deploy Hook Ownership
+  live_scenario: Transaction-created hook is cleaned up only while still owned
+  assertion: '**GIVEN** the hook path was absent at preflight and the current transaction creates the
+    managed hook
+
+    **WHEN** a later installation failure triggers compensation
+
+    **THEN** rollback removes the hook only if the journal proves transaction ownership and the current
+    identity/digest still match; a modified/replaced path is preserved and cleanup is marked incomplete'
+  assertion_sha256: e4ce29c0eebeb54307695d1f87a934c155831ac5f241e50bd25b5e35027e6274
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: HOOK-03
+  requirement: Global Certbot Deploy Hook Ownership
+  live_scenario: Uncatchable Worker termination is recovered before the next mutation
+  assertion: '**GIVEN** a previous Worker deployment was terminated by SIGKILL, kernel panic or power
+    loss after writing an uncommitted transaction journal
+
+    **WHEN** the next authenticated Worker management or recovery entrypoint is invoked
+
+    **THEN** it discovers and reconciles the uncommitted journal before accepting any new mutation; if
+    recovery cannot be fully verified, it rejects the new operation, retains the journal and reports INCOMPLETE'
+  assertion_sha256: ff3bb0fa63bd8e9c3fca8b8e3592510a4ec166a8e3a898dcfbc92b707a2d5050
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: HOOK-04
+  requirement: Global Certbot Deploy Hook Ownership
+  live_scenario: PRESERVE reports package-manager residuals without claiming OS baseline restoration
+  assertion: '**GIVEN** the installation transaction has installed or upgraded OS packages and package
+    post-install scripts have created service defaults
+
+    **WHEN** compensation or teardown completes under TEST_TEARDOWN_POLICY=PRESERVE
+
+    **THEN** the report records the package changes as retained residual state and distinguishes transaction
+    compensation from restoration of the original OS baseline; the VPS is not eligible for another clean-baseline
+    run until re-imaged or restored through the verified snapshot procedure'
+  assertion_sha256: 7078b409700bc1f32c8217762b8c1cfdc08ae4705ac4eb13c8ae78e77d24282d
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: TXN-01
+  requirement: Signal-Safe and Verifiable Transaction Compensation
+  live_scenario: Worker deployment is interrupted by a signal
+  assertion: '**GIVEN** remote Worker deployment has mutated at least one resource and has not committed
+
+    **WHEN** the remote shell receives HUP, INT or TERM
+
+    **THEN** it stops starting new mutations, persists interruption state, executes compensation exactly
+    once,
+
+    verifies the result, and exits nonzero; secret/temp-file cleanup alone is not sufficient'
+  assertion_sha256: de37202abefdea35aef612c65703eda9700e6f9042c5e4ea67dcd222221a3b4d
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: TXN-02
+  requirement: Signal-Safe and Verifiable Transaction Compensation
+  live_scenario: Remote rollback cannot claim success after a failed cleanup step
+  assertion: '**GIVEN** the Worker rollback encounters a Certbot, filesystem, NGINX, systemd, UFW or sysctl
+    cleanup error
+
+    **WHEN** the compensator reports its result to Master
+
+    **THEN** it returns a versioned per-resource result with status INCOMPLETE, nonzero exit and retained
+
+    recovery journal; exit zero and ROLLED_BACK are permitted only after all required final states are
+    verified'
+  assertion_sha256: 074f7bda2e4487e47b943d87d66a5ee2bad0f31dc4f8c47cd9c5eb2ab7f77ed1
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: TXN-03
+  requirement: Signal-Safe and Verifiable Transaction Compensation
+  live_scenario: Worker and Panel API rollback results are both required
+  assertion: '**GIVEN** Worker compensation succeeds but Panel API rollback fails, or vice versa
+
+    **WHEN** Master finalizes the failed node add transaction
+
+    **THEN** it retains both recovery records, reports the overall operation as INCOMPLETE, and MUST NOT
+
+    mark the transaction rolled back or committed until both sides are verified'
+  assertion_sha256: c9846a52ae14a685cd19c6624746b7da1d4dc88a04eda5022c288b1ebfcafc75
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: TD-01
+  requirement: Teardown Policy Enforcement
+  live_scenario: Destroy policy rejected before the run starts
+  assertion: '**GIVEN** `TEST_TEARDOWN_POLICY=DESTROY`
+
+    **WHEN** configuration preflight validates the teardown policy
+
+    **THEN** preflight fails before any remote modification and records that destruction is unsupported
+    in v1'
+  assertion_sha256: dd635fa2022fc08ccd5287c594bcf29b9622dc9e2dd39dfb68f5cf656d9b57a5
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: TD-02
+  requirement: Teardown Policy Enforcement
+  live_scenario: Preserve policy after success or failure
+  assertion: '**GIVEN** `TEST_TEARDOWN_POLICY=PRESERVE`
+
+    **WHEN** the test run completes with any test outcome
+
+    **THEN** diagnostics are collected, the actual test outcome is retained, and teardown is recorded
+    separately as
+
+    `PASS`; `PRESERVE` itself does not uninstall, restore, reimage, or destroy either VPS, so all mutations
+    made by
+
+    the test run remain in place and the next run requires operator re-image or verified snapshot restoration'
+  assertion_sha256: 869be7d5b352fb2a646c9ac570365652a3b2de206d16389652792b6fcfe3fb18
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: TD-03
+  requirement: Teardown Policy Enforcement
+  live_scenario: Snapshot restore hook configuration and protocol are validated
+  assertion: '**GIVEN** `TEST_TEARDOWN_POLICY=RESTORE_SNAPSHOT`
+
+    **WHEN** configuration preflight validates the teardown policy
+
+    **THEN** both `MASTER_SNAPSHOT_ID` and `WORKER_SNAPSHOT_ID`, an absolute `SNAPSHOT_RESTORE_HOOK` path,
+
+    and `SNAPSHOT_RESTORE_HOOK_SHA256` MUST be supplied; the hook MUST be an absolute path to a non-symlink
+    regular executable owned by the
+
+    runner user or root, not group/world-writable, and its digest MUST match before the run and immediately
+    before execution. Missing or invalid values fail
+
+    preflight before remote modification.'
+  assertion_sha256: eb65756ecd99e497ba664d6cab8728107b5bd2e777b36cef46563d727be6a6bb
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: TD-04
+  requirement: Teardown Policy Enforcement
+  live_scenario: Restore hook receives a versioned request and returns both restored resources
+  assertion: '**GIVEN** preflight accepted both snapshot IDs and the SHA256-pinned external restore hook
+
+    **WHEN** teardown invokes the hook directly without a shell, passing JSON on stdin
+
+    **THEN** the request contains `schema_version: 1`, `action: "restore"`, `test_run_id`, and
+
+    `master`/`worker` objects containing `address` and `snapshot_id`; the hook exits zero and returns
+    valid
+
+    JSON with `schema_version: 1`, `status: "RESTORED"`, and matching `snapshot_id` plus `restored: true`
+
+    for both hosts. Hook execution is bounded by `RESTORE_TIMEOUT`.'
+  assertion_sha256: 6d014bd7f37200ed60ac80a4752cf4d6ad7ec83ba19cc6fa61773d737a3ed382
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: TD-05
+  requirement: Teardown Policy Enforcement
+  live_scenario: Snapshot restore reacquires the remote lock pair before baseline verification
+  assertion: '**GIVEN** snapshot restoration has rebooted one or both VPS; the original lock-holder session
+    on a non-rebooted host may still be alive
+
+    **WHEN** both restored VPS become reachable again
+
+    **THEN** the runner explicitly closes/releases both original holder sessions (including any surviving
+    session), confirms termination, then reacquires a fresh pair in deterministic address order before
+    validating saved run identity and the clean baseline. It never acquires a replacement lock while its
+    own previous holder may still own that host lock. If another controller acquires either lock during
+    the release/reacquisition window, any lock already reacquired is released and teardown becomes `TEARDOWN_FAILED`;
+    failure to reacquire, identity mismatch, or baseline mismatch also yields `TEARDOWN_FAILED`, never
+    `PASS`'
+  assertion_sha256: d97c425695c00dbc613c73585bbc412a029350b45e9a54e72a4a8c9887a73d5c
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: partial
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  partial_split: Container proves lock ordering and hook protocol; provider snapshots are live-only.
+  promotion_target: null
+- id: TD-06
+  requirement: Teardown Policy Enforcement
+  live_scenario: Single-host snapshot reboot does not self-deadlock lock reacquisition
+  assertion: '**GIVEN** only Master (or only Worker) is rebooted by the restore hook and the other VPS
+    remains online with its original SSH lock-holder session
+
+    **WHEN** both hosts become reachable and the runner prepares the post-restore baseline check
+
+    **THEN** it closes/releases the surviving old holder before acquiring the pair again; the test proves
+    no self-deadlock, both locks are held during baseline verification, and a competing controller winning
+    either lock causes safe `TEARDOWN_FAILED`'
+  assertion_sha256: d403bdc005463f5873ec92e13cbcefa960d74ccb0e5094cb24d04934fc3ca446
+  runs_in:
+  - live
+  state: live-only
+  environment: live-only
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: not-applicable
+  live_only_reason: Requires a provider snapshot and a real reboot; a container cannot reproduce the host
+    lifecycle.
+  promotion_target: null
+- id: TD-07
+  requirement: Teardown Policy Enforcement
+  live_scenario: Snapshot restore hook success requires baseline verification
+  assertion: '**GIVEN** the restore hook returns valid `RESTORED` JSON with matching IDs and the runner
+    has reacquired both remote locks
+
+    **WHEN** the runner recollects the Phase 0 baseline manifest while holding both locks
+
+    **THEN** the required clean-baseline invariants match the pre-install manifest; only then may teardown
+    be `PASS`'
+  assertion_sha256: 725e6d3e988f56c7c62a59eb7cca4160df886cbdc0fc37b20aad85840d2a4c63
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: TD-08
+  requirement: Teardown Policy Enforcement
+  live_scenario: Snapshot restore hook does not restore both hosts
+  assertion: '**GIVEN** preflight accepted the SHA256-pinned restore hook and both snapshot IDs
+
+    **WHEN** the hook times out, exits nonzero, returns invalid/mismatched JSON, or restored VPS fail
+    the baseline check
+
+    **THEN** teardown is `TEARDOWN_FAILED`; neither test nor teardown status may be represented as overall
+    `PASS`
+
+
+    ---'
+  assertion_sha256: 09c7bd74b24698bb79f12cc1af2a16b609433b2c262fbf56db1d8c7aa6f3016b
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: LOCK-01
+  requirement: Pair-Wide Run Locking
+  live_scenario: A second Control Machine cannot acquire an occupied VPS
+  assertion: '**GIVEN** one runner holds the authoritative remote lock on either target VPS
+
+    **WHEN** another runner attempts a run against the same Master or Worker from another Control Machine
+
+    **THEN** it fails before remote modification; a lock-file''s mere existence is not treated as ownership'
+  assertion_sha256: a69db4eb92039c8bf4b6ae196ccd7794b1728fe81b9e663f786883589efacf5c
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: LOCK-02
+  requirement: Pair-Wide Run Locking
+  live_scenario: Loss of a remote lock-holder session fails closed
+  assertion: '**GIVEN** a mutating run holds both remote locks
+
+    **WHEN** either SSH lock-holder session is lost
+
+    **THEN** the runner stops starting mutating phases, records `INCOMPLETE`, and MUST NOT resume until
+    it has
+
+    reacquired both locks and revalidated the saved run state
+
+
+    ---'
+  assertion_sha256: cf6740762ab335273258e04633d27cc355d0a50c4def9837d90dae3268760d0b
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: MLOCK-01
+  requirement: Shared Mutation Lock Across All Management Entry Points
+  live_scenario: Existing management command is blocked while the E2E run owns the host
+  assertion: '**GIVEN** the E2E runner holds the pair-wide lock on Master and Worker
+
+    **WHEN** another session invokes gowave-auto.sh install, node add/rollback, domain-change,
+
+    channel switch, uninstall, backup restore, or Worker remote_payload/remote_rollback without the
+
+    active run''s re-entrant lease
+
+    **THEN** the command fails before its first mutation; it cannot bypass the E2E lock by using a separate
+
+    lock file or by not acquiring a lock'
+  assertion_sha256: 7a9b3bc99e3e666c4cf37cd037c7fa9455ff2b3e4ff6e7d909a12736f14c22ce
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: MLOCK-02
+  requirement: Shared Mutation Lock Across All Management Entry Points
+  live_scenario: Runner-owned nested command does not release exclusivity
+  assertion: '**GIVEN** the E2E runner holds both remote locks and supplies a valid run-bound lease through
+    stdin to a
+
+    child deployment/rollback command
+
+    **WHEN** that child performs its authorized mutations
+
+    **THEN** it is accepted only while the original kernel lock holder and lease remain valid; another
+
+    controller still fails to acquire either host lock, and a stale/replayed lease is rejected after holder
+    loss'
+  assertion_sha256: 32896c4215c522652e338fab76e7de038f537307c2ad5ba4f2fd54ed2d6a49a9
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: MLOCK-03
+  requirement: Shared Mutation Lock Across All Management Entry Points
+  live_scenario: Unsafe remote lock path is rejected
+  assertion: '**GIVEN** the remote lock file or any parent directory is a symlink, non-regular object,
+    wrong-owner
+
+    file, or has unsafe permissions
+
+    **WHEN** the runner acquires the pair-wide lock
+
+    **THEN** it fails closed before any remote modification and does not follow, replace or unlink the
+    object'
+  assertion_sha256: a8cce92a2bd5d391334734ecdeb88a0833ee7be036901d3611a854a0464c7234
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: STATE-01
+  requirement: Durable Run State for Partial CLI Modes
+  live_scenario: Run ID cannot escape the artifact root
+  assertion: '**GIVEN** an operator supplies a `--run-id` containing `..`, a path separator, NUL, or a
+    symlinked path component
+
+    **WHEN** the CLI validates the run ID and constructs its artifact directory
+
+    **THEN** the CLI rejects it before creating files or contacting either VPS; accepted IDs match `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`
+    and resolve strictly below `artifacts/live-vps/`'
+  assertion_sha256: 98b92a97aa1718be07b56bd62fd1b2f16b8ed60c2aa3a4e300873502a0bf27c4
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: STATE-02
+  requirement: Durable Run State for Partial CLI Modes
+  live_scenario: Partial mode cannot resume a different run or repeat completed installation
+  assertion: '**GIVEN** preflight has created a stored run state for a specific repository commit, Master/Worker
+    addresses
+
+    and non-secret config identity
+
+    **WHEN** `install`, `verify`, `traffic`, `negative`, or `teardown` is invoked with the printed run
+    ID
+
+    **THEN** the runner verifies the matching state and prerequisite phase statuses before remote modification;
+
+    completed phases are not repeated implicitly; missing state, mismatched identity or unmet prerequisites
+    fail
+
+    closed. `install` requires preflight PASS, reacquires both remote locks, and re-collects the disposable
+
+    baseline while holding those locks; any drift from the stored preflight snapshot fails before modification.
+
+    `verify` requires install PASS, `traffic` requires verification PASS, `negative` requires an installed
+
+    disposable environment, and `teardown` requires the original baseline and diagnostic state.
+
+
+    ---'
+  assertion_sha256: 1ad17dc5973becdbb41930bbf2e47975f812ccd067e5c7b1c3bbb3a68b53e024
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: RED-01
+  requirement: Redacted Diagnostic Artifact Collection
+  live_scenario: Redacted copy of credentials file
+  assertion: '**GIVEN** diagnostics collection runs on Master
+
+    **WHEN** runner reads `/root/gowave-credentials.txt` for diagnostic summary
+
+    **THEN** only field names (e.g., `ADMIN_USERNAME`, `ADMIN_PASSWORD`, `SCOPED_API_TOKEN`) are recorded
+    as
+
+    present/absent; actual values are replaced with `[REDACTED]`; no plaintext secret appears in any artifact'
+  assertion_sha256: 05c313b8e54af7299f0712805d79368c9f737f12ac9d1cb6250a15148659512d
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: RED-02
+  requirement: Redacted Diagnostic Artifact Collection
+  live_scenario: Diagnostic files contain required safe fields
+  assertion: '**GIVEN** a completed test run (any outcome)
+
+    **WHEN** runner writes diagnostic files to the artifacts directory
+
+    **THEN** diagnostic files contain: OS/kernel/version, package versions, systemd unit statuses, journal
+
+    snippets, listener inventory, `nginx -t` output, firewall status and relevant rules, certificate metadata
+
+    (without private keys), API object summaries, traffic test results, and timing metrics
+
+
+    ---'
+  assertion_sha256: 9bd3b269e07eb090e67caa1624c12556d6040dafd79da289a7f8505534200143
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: RES-01
+  requirement: Result Status Semantics
+  live_scenario: PASS requires all active Data Plane runtime cases
+  assertion: '**GIVEN** Vision is disabled and all installation, API, subscription, firewall, and NGINX
+    phases are `PASS`
+
+    **WHEN** only fourteen of sixteen runtime cases pass (two fail)
+
+    **THEN** overall status is `FAIL`, not `PASS`; the failing protocol/client cases are identified individually
+    in `result.json`'
+  assertion_sha256: 35af4395ea6d2ebd7aafc1c34120f6ef298563e75360f228a5965e7032bc28e5
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: RES-02
+  requirement: Result Status Semantics
+  live_scenario: Vision-enabled PASS requires all active runtime cases
+  assertion: '**GIVEN** one or both Vision domains are configured and all installation, API, subscription,
+    firewall, and NGINX phases are `PASS`
+
+    **WHEN** any active runtime case fails
+
+    **THEN** overall status is `FAIL`, not `PASS`; each failed Vision or core protocol/client case is
+    identified individually in `result.json` and JUnit XML'
+  assertion_sha256: 005682c619d66c2e174ca7ac5439df61ca02f0c43740ee3709c72dc1a7de0fcc
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: RES-03
+  requirement: Result Status Semantics
+  live_scenario: result.json schema fields present
+  assertion: '**GIVEN** a completed test run (any outcome)
+
+    **WHEN** `result.json` is written
+
+    **THEN** it contains: `test_run_id`, `repository_commit`, `started_at`, `finished_at`, `control_machine`,
+    `master`,
+
+    `worker`, `trust`, `results`, `traffic`, and `overall`. `control_machine` records OS/kernel, Python,
+    OpenSSL,
+
+    Xray client and Mihomo versions plus installed-binary SHA256 values. `master` records OS/kernel, Panel
+    and Node
+
+    versions, Node installer commit and SHA256, Node-managed Xray/rw-core version, NGINX/OpenSSL versions,
+
+    egress IP and installed-binary SHA256 values. `worker` records OS/kernel, Node version, the same Node
+    installer
+
+    commit and SHA256, Node-managed Xray/rw-core version, NGINX/OpenSSL versions, egress IP and installed-binary
+
+    SHA256 values. `trust` records ACME mode and, for staging, the public CA bundle SHA256, Staging pin-manifest
+
+    SHA256 and validated root subjects. `results` contains all mandatory phase keys; `traffic` contains
+
+    Master/Worker sub-objects for each of the provisioned protocols (four core protocols, plus optional
+    VLESS Vision)
+
+    and separate Xray/Mihomo case results per protocol;
+
+    `overall` is the status string. All version and digest values are required to satisfy Pinned Version
+    Fidelity;
+
+    no secret, raw shortUuid, subscription content or private key is included.'
+  assertion_sha256: 76250449094bb29cf5b1c9d19a271902e1481d2f11231264db3b3ab47e875661
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: BOOT-01
+  requirement: Local Operator Credential Bootstrap and Cleanup
+  live_scenario: Host identity is verified before password authentication
+  assertion: '**GIVEN** the controller has opened an unauthenticated SSH connection
+
+    **WHEN** the operator does not confirm the provider-console SHA-256 fingerprint exactly
+
+    **THEN** the controller aborts before requesting or sending the password'
+  assertion_sha256: b240981611012e2f107fb0cfc4333e7fed3527740001039d2b11a5413f9c0e15
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: partial
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  partial_split: Container proves host identity precedes the password; the live controller's public-target
+    path is live-only.
+  promotion_target: null
+- id: BOOT-02
+  requirement: Local Operator Credential Bootstrap and Cleanup
+  live_scenario: Temporary access is bounded and revoked
+  assertion: '**GIVEN** the operator has authenticated and the controller is bootstrapping a VPS
+
+    **WHEN** the temporary public key is installed
+
+    **THEN** a persistent two-hour remote expiry timer is already enabled
+
+    **AND** the controller attempts immediate revocation and independently verifies marker removal and
+    timer inactivity
+
+    **AND** unverified cleanup downgrades an otherwise successful run to INCOMPLETE'
+  assertion_sha256: aa38ffb9cd73d6c21b03fa243472e43f850e44b7659f0375ab7a372b4a9330c7
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: partial
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  partial_split: Container proves bounded key lifetime and revocation; live account behaviour is live-only.
+  promotion_target: null
+- id: PKT-01
+  requirement: Per-Case Data-Plane Packet Evidence
+  live_scenario: Selected VPS receives the proxy request
+  assertion: '**GIVEN** a single Xray or Mihomo proxy request is in progress
+
+    **WHEN** both VPS packet captures are active, filtered only by the exact proxy destination port, and
+    their observed source addresses are compared with the control-machine IPv4 each target reports on
+    the runner''s SSH session
+
+    **THEN** the intended VPS records at least one matching packet and the other VPS records zero
+
+    **AND** the observed egress IPv4 matches the expected egress of the intended VPS'
+  assertion_sha256: 08e620f465d7c84ed4bd83818a837174885e4f2bd351d0e6cb042cc854143f0e
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: PKT-02
+  requirement: Per-Case Data-Plane Packet Evidence
+  live_scenario: Packet evidence is unavailable or ambiguous
+  assertion: '**GIVEN** tcpdump, target-reported source-IP identity, endpoint port, or a valid capture
+    summary is unavailable, or every captured packet came from an address other than the reported control
+    IPv4
+
+    **WHEN** the traffic case is evaluated
+
+    **THEN** the case is INCOMPLETE, the non-matching source addresses are recorded, and aggregate interface
+    counters MUST NOT be used to mark it PASS
+
+    **AND** no PCAP or packet payload is persisted'
+  assertion_sha256: ad58404fdffd4c63099f2e81af918642cef39b0307fbedd4ca272b8405bd3e88
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: PKT-03
+  requirement: Per-Case Data-Plane Packet Evidence
+  live_scenario: Traffic reaches the wrong VPS
+  assertion: '**WHEN** the other VPS captures matching inbound packets during a proxy case
+
+    **THEN** the individual case MUST be FAIL even if the egress IPv4 matches the expected value'
+  assertion_sha256: 16ea3aed3a94f18614562345155d3e9684e853a281c6905c983b042537f9b890
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: OP-01
+  requirement: Local interactive operator entrypoint
+  live_scenario: Five-domain input is validated before network access
+  assertion: '**WHEN** the operator enters the two target addresses and five domain names
+
+    **THEN** the controller validates all values with the strict configuration parser before opening either
+    SSH connection
+
+    **AND** invalid IPs, duplicate domains, invalid FQDNs, or unsupported SSH accounts abort without contacting
+    either VPS'
+  assertion_sha256: d60e9ef55306dc2d312472a7a98b21b220f818118e1d6d37bfafe946c16f8fa6
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: OP-02
+  requirement: Local interactive operator entrypoint
+  live_scenario: Password is hidden and not persisted
+  assertion: '**WHEN** the operator enters an SSH password
+
+    **THEN** the password is read through a hidden prompt and passed only to the in-memory SSH authentication
+    call
+
+    **AND** the password MUST NOT appear in argv, environment variables, config files, logs, reports,
+    or CI secrets'
+  assertion_sha256: aeccc2493070f33c7e948bcfa2f68a7dcb965c67fc6578e96fe00fe159db9b49
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: SSHID-01
+  requirement: Out-of-band SSH host identity verification
+  live_scenario: Host key is confirmed
+  assertion: '**WHEN** the observed SSH host-key fingerprint exactly matches the operator-confirmed fingerprint
+
+    **THEN** password authentication may proceed
+
+    **AND** the exact host key is written to a private temporary known_hosts file for subsequent OpenSSH
+    connections'
+  assertion_sha256: 44177a2cedbe4aa3b48805709965ba67376ad82875d8f70ef15fccd84409b706
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: SSHID-02
+  requirement: Out-of-band SSH host identity verification
+  live_scenario: Host key is not confirmed
+  assertion: '**WHEN** the fingerprint does not match or the operator declines confirmation
+
+    **THEN** the controller aborts before sending the password and before modifying the VPS'
+  assertion_sha256: b4d17eb4f34d20fa0ba8a4eb2c17febbb99b08387ad928c2760eecb171818043
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: TSSH-01
+  requirement: Temporary SSH access with remote expiry
+  live_scenario: Temporary key is installed
+  assertion: '**WHEN** password authentication and root identity verification succeed
+
+    **THEN** a per-host temporary public key is added without replacing existing authorized_keys entries
+
+    **AND** a persistent two-hour expiry timer is active before the key becomes usable'
+  assertion_sha256: 77cb0fe51a68effbf6b971ec22fe674bc7a43aba572ec3491b6b95906e6026a1
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: TSSH-02
+  requirement: Temporary SSH access with remote expiry
+  live_scenario: Bootstrap fails after expiry is armed
+  assertion: '**WHEN** any bootstrap operation fails after timer installation
+
+    **THEN** the controller attempts immediate cleanup
+
+    **AND** the remote timer remains the bounded fallback if immediate cleanup cannot be verified'
+  assertion_sha256: ba4896621832f26d665376c7d70c86ad2be620bbf7ea5a0a869b950db86850b0
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: REV-01
+  requirement: Immediate credential revocation gates overall status
+  live_scenario: Immediate revocation succeeds
+  assertion: '**WHEN** the run-specific authorized_keys marker is absent and the expiry timer is inactive
+
+    **THEN** the cleanup phase is PASS'
+  assertion_sha256: 251875fa65cc7377a6a7341e9086a04201031042de1d64edb213640650481fc0
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: REV-02
+  requirement: Immediate credential revocation gates overall status
+  live_scenario: Immediate revocation cannot be verified
+  assertion: '**WHEN** SSH cleanup fails or the marker/timer state cannot be independently verified
+
+    **THEN** the cleanup phase is INCOMPLETE
+
+    **AND** an otherwise PASS overall result MUST become INCOMPLETE
+
+    **AND** the persistent remote expiry timer MUST remain armed'
+  assertion_sha256: a655310f93339ef352d4f9aba8d22239e0425a51bf10be330943f8d997238819
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: LOCAL-01
+  requirement: Local-only live VPS credential handling
+  live_scenario: GitHub CI runs without target credentials
+  assertion: '**WHEN** repository CI executes
+
+    **THEN** it runs the runner unit tests without requiring VPS target credentials or GitHub Environment
+    secrets'
+  assertion_sha256: a32780e586f79efd5f34c5ce87c98fa672ce1fc5617cafd6cd1246707e1b88c5
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: null
+- id: LOCAL-02
+  requirement: Local-only live VPS credential handling
+  live_scenario: Local operator starts a live run
+  assertion: '**WHEN** the operator launches the local controller
+
+    **THEN** target credentials remain on the local control machine and the existing E2E runner executes
+    with temporary SSH keys and strict host-key verification'
+  assertion_sha256: dcf2d049820a42bd3b79f7feb8d53ed0adb13e1d68b03dc9e4817edfbbd8481b
+  runs_in:
+  - live
+  state: live-only
+  environment: live-only
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: not-applicable
+  live_only_reason: Starts the interactive operator against real disposable VPS instances; live infrastructure
+    only.
+  promotion_target: null
+- id: SUB-B64
+  requirement: Panel subscription representations
+  live_scenario: null
+  assertion: The base64 share-link list at /api/sub/<shortUuid> contains one link per proxy entry with
+    the expected protocol, host, SNI and firefox fingerprint, and an Xray-family client imports it while
+    the raw JSON body imports nothing.
+  assertion_sha256: 0f7bfb4c7b5b7f4f7965821e45c3d494cddefff2c1f406e776ff5a0ac5bed9ab
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Real Subscription Delivery and User-Agent Policy
+- id: SUB-UA-BLANK
+  requirement: Real Panel subscription lifecycle
+  live_scenario: null
+  assertion: An explicitly blank User-Agent header is rejected with 403 as a result separate from the
+    absent-header case.
+  assertion_sha256: d3dfe5b69b4d8533279bfb02a978e24aa2119596f9f10964b4bcbad0a7d2d8ff
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Real Subscription Delivery and User-Agent Policy
+- id: SUB-JSON-SHAPES
+  requirement: Panel subscription representations
+  live_scenario: null
+  assertion: '/v2ray-json is validated in both served shapes: a list entry as a complete config, and only
+    a bare outbound object wrapped with the minimal runtime wrapper.'
+  assertion_sha256: a989b08477878907085e354f8864e410d218498816e94fa7836278c4f582da30
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Real Subscription Delivery and User-Agent Policy
+- id: NGX-COVER-DERIVE
+  requirement: Camouflage decoy and certificate lineage
+  live_scenario: null
+  assertion: The cover apex is the last two labels of panel_domain and a domain with fewer than three
+    labels produces no cover lineage and is handled explicitly.
+  assertion_sha256: d743362e7871c15495dfb5416fab2506507b5e62cb80de64d51396639b031863
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: NGINX SNI Routing and REALITY Decoy Verification
+- id: NGX-COVER-UNRESOLVED
+  requirement: Camouflage decoy and certificate lineage
+  live_scenario: null
+  assertion: When the apex or www.<apex> does not resolve to the host IPv4, the operator refuses before
+    issuing the lineage and leaves no partial decoy or stale sites-enabled entry.
+  assertion_sha256: 1a2e40b03b1d32bbb9f0b627816d6f21d2513abca38d1f10acf6f92addc22e2c
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: NGINX SNI Routing and REALITY Decoy Verification
+- id: NGX-WORKER-ACME80
+  requirement: Camouflage decoy and certificate lineage
+  live_scenario: null
+  assertion: A Worker install or reconfiguration keeps its port 80 ACME vhost reachable so renewal retains
+    a working HTTP-01 path.
+  assertion_sha256: 74e54dc9d92b481c2f4bb70257a52d5bfc2e5759794a70b2955599bf7fa28bf3
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Distributed Worker VPS Deployment Verification
+- id: TLS-VERIFY-ANCHORS
+  requirement: Private test CA trust for both client engines
+  live_scenario: null
+  assertion: Every Xray TLS outbound carries the fixture CA through tlsSettings.certificates with usage
+    verify, and removing the anchor turns the case into a chain-verification failure.
+  assertion_sha256: da69d10a4f643ff7509d8603d68f5e1726882a3bfd133073bb73df725f271548
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: PODNET-MASTER-ADDR
+  requirement: Podman-only Master address selection for Worker provisioning
+  live_scenario: null
+  assertion: The real node add path uses the validated private Master address on the run-scoped network,
+    Worker observes that source, and the override is rejected without the explicit opt-in or when the
+    address is not assigned to Master.
+  assertion_sha256: 7a31bcbc2bd64353df48a4af4eb82741fd2b65891fa9303b1f9e7ce717287372
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Distributed Worker VPS Deployment Verification
+- id: ACME-REJECT-ARB
+  requirement: Fail-closed local ACME test mode
+  live_scenario: null
+  assertion: Arbitrary ACME directory URLs are rejected by Master and Worker both outside and inside the
+    test-only opt-in; only the pinned fixture endpoint and the Let's Encrypt allowlist are accepted.
+  assertion_sha256: d287422833bc7fd5b17f1c65e11a1d1dab1d6e5e0173e3bd8e5694adfa9d425d
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Global Certbot Deploy Hook Ownership
+- id: GATE-BUDGET
+  requirement: Pre-push and pull-request acceptance gate
+  live_scenario: null
+  assertion: A run that exhausts the declared runtime budget before every case executed reports INCOMPLETE
+    naming the unexecuted cases and cannot be converted into PASS.
+  assertion_sha256: e9651489b128b24228e286b6f92f1f7a2940c8023dc3469cf1c6152a177db50a
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Result Status Semantics
+- id: GATE-COVERAGE
+  requirement: Coverage completeness and error paths
+  live_scenario: null
+  assertion: An unmapped behavior, a behavior covered only on its happy path, or a case mapped to no behavior
+    fails the coverage audit with the item named.
+  assertion_sha256: 27d1468d6a83cf5643c65f1623bfa022cc90e9d656402fa25fd1eefa99a9225e
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Result Status Semantics
+- id: GATE-PREPUSH
+  requirement: Pre-push and pull-request acceptance gate
+  live_scenario: null
+  assertion: The documented pre-push entrypoint runs both topologies with pinned fixtures and no live
+    credentials and blocks a regressed change with its case IDs.
+  assertion_sha256: 35dacf321c4d4b4d4f576f38166dcbc031c10c72aa3a6cae6de89b28f108b7d4
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Result Status Semantics
+- id: GATE-DIVERGENCE
+  requirement: Live scenario parity
+  live_scenario: null
+  assertion: A live scenario without a catalog entry, a live-parity case executed by only one suite, or
+    a topology count departing from 8/10 and 16/18/20 fails the divergence guard.
+  assertion_sha256: e0d185638c097b9f0331292da705db4927db0eb27499c6c4ce9feb663394fc13
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Result Status Semantics

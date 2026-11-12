@@ -1,0 +1,36 @@
+# Pinned Podman E2E images. Regenerate with:
+#   python3 -m tools.podman_e2e.images refresh
+# Digests are registry manifest digests; never replace one by hand with a tag.
+version: 1
+schema: gowave-podman-images/v1
+images:
+  ubuntu-24.04:
+    reference: docker.io/library/ubuntu:24.04
+    digest: sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5
+    role: base
+    distro: ubuntu-24.04
+  ubuntu-26.04:
+    reference: docker.io/library/ubuntu:26.04
+    digest: sha256:065aa8626841f16057b78b027b464cd59c4fac36c204c72dcbf48d66f5fa8a96
+    role: base
+    distro: ubuntu-26.04
+  debian-12:
+    reference: docker.io/library/debian:12
+    digest: sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8
+    role: base
+    distro: debian-12
+  debian-13:
+    reference: docker.io/library/debian:13
+    digest: sha256:9c6e381421d0f48d1b8133e573f33c185ee16cbf505eda9c4a8a4791b25ea8a6
+    role: base
+    distro: debian-13
+  acme-pebble:
+    reference: ghcr.io/letsencrypt/pebble:2.10.3
+    digest: sha256:0c81f05db371f436c97fb894bd6d2ab8fc9c8e2ce40f8bef8a8e15941bcd75ef
+    role: acme-fixture
+    distro: null
+  fixture-echo:
+    reference: docker.io/library/python:3.12-slim
+    digest: sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b
+    role: egress-fixture
+    distro: null

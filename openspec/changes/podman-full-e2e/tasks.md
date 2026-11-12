@@ -16,13 +16,13 @@
 
 ## 2. Framework architecture
 
-- [ ] 2.1 Define a run-scoped Podman resource model with unique labels, network, volumes, credentials, and cleanup ownership.
-- [ ] 2.2 Define a shared test runner contract, stable case IDs, timeouts, result states, and JSON/JUnit report schema.
-- [ ] 2.3 Define rootful Podman prerequisites and a separately scoped rootless-compatible subset.
-- [ ] 2.4 Pin base image references by immutable digest and record runtime/kernel/cgroup/network metadata.
-- [ ] 2.5 Implement failure-safe cleanup for success, assertion failure, timeout, SIGINT, SIGTERM, and stale-run recovery.
-- [ ] 2.6 Define bounded readiness polling; prohibit unbounded waits and fixed sleeps as readiness assertions.
-- [ ] 2.7 Define the Podman-only Master-address override contract for the real `node add` path: explicit opt-in, address/interface/network membership validation, rejection outside Podman mode, and no change to Live VPS safety checks.
+- [x] 2.1 Define a run-scoped Podman resource model with unique labels, network, volumes, credentials, and cleanup ownership.
+- [x] 2.2 Define a shared test runner contract, stable case IDs, timeouts, result states, and JSON/JUnit report schema.
+- [x] 2.3 Define rootful Podman prerequisites and a separately scoped rootless-compatible subset.
+- [x] 2.4 Pin base image references by immutable digest and record runtime/kernel/cgroup/network metadata.
+- [x] 2.5 Implement failure-safe cleanup for success, assertion failure, timeout, SIGINT, SIGTERM, and stale-run recovery.
+- [x] 2.6 Define bounded readiness polling; prohibit unbounded waits and fixed sleeps as readiness assertions.
+- [x] 2.7 Define the Podman-only Master-address override contract for the real `node add` path: explicit opt-in, address/interface/network membership validation, rejection outside Podman mode, and no change to Live VPS safety checks.
 
 ## 3. Deterministic external fixtures
 

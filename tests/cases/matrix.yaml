@@ -1,0 +1,152 @@
+# Versioned protocol/client acceptance matrix for the Podman product E2E.
+# The matrix is consumed by the Podman runner and validated by catalog.py.
+# It is not a second source of truth: every field is derived from the shipped
+# inbound templates, the Panel subscription contracts, and the pinned client
+# versions recorded in tools/live_vps_config.env.example.
+version: 1
+schema: gowave-podman-matrix/v1
+
+product:
+  xray_version: "26.11.9"
+  xray_client_version: "26.11.9"
+  mihomo_client_version: "1.19.34"
+  reality_fingerprint: "firefox"
+  node_api_port: 3002
+  panel_api_port: 3000
+
+inbounds:
+  - id: REALITY
+    tag: vless-reality
+    protocol: vless
+    transport: tcp
+    security: reality
+    template: assets/xray/vless-reality.json
+    fingerprint: firefox
+    optional: false
+    listener: 443/tcp
+    subscription_protocol: vless
+  - id: XHTTP
+    tag: vless-xhttp
+    protocol: vless
+    transport: xhttp
+    security: tls
+    template: assets/xray/vless-xhttp.json
+    fingerprint: firefox
+    optional: false
+    listener: 443/tcp
+    subscription_protocol: vless
+  - id: WS
+    tag: vless-ws
+    protocol: vless
+    transport: ws
+    security: tls
+    template: assets/xray/vless-ws.json
+    fingerprint: firefox
+    optional: false
+    listener: 443/tcp
+    subscription_protocol: vless
+  - id: TROJAN-GRPC
+    tag: trojan-grpc
+    protocol: trojan
+    transport: grpc
+    security: tls
+    template: assets/xray/trojan-grpc.json
+    fingerprint: firefox
+    optional: false
+    listener: 443/tcp
+    subscription_protocol: trojan
+  - id: VISION
+    tag: vless-vision
+    protocol: vless
+    transport: tcp
+    security: tls
+    template: assets/xray/vless-vision.json
+    fingerprint: firefox
+    optional: true
+    listener: 8443/tcp
+    subscription_protocol: vless
+
+clients:
+  - id: xray
+    binary: xray
+    version_key: xray_client_version
+    consumes: [base64, xray-json]
+    trust: tlsSettings.certificates usage=verify
+  - id: mihomo
+    binary: mihomo
+    version_key: mihomo_client_version
+    consumes: [mihomo, clash]
+    trust: scoped CA bundle
+
+representations:
+  base64: "/api/sub/{shortUuid}"
+  xray-json: "/api/sub/{shortUuid}/v2ray-json"
+  mihomo: "/api/sub/{shortUuid}/mihomo"
+  clash: "/api/sub/{shortUuid}/clash"
+  singbox: "/api/sub/{shortUuid}/singbox"
+
+user_agent:
+  accepted: "non-empty header"
+  absent: 403
+  blank: 403
+
+topologies:
+  aio:
+    nodes: [local]
+    vision_combinations: [disabled, enabled]
+    positive_case_counts:
+      disabled: 8
+      enabled: 10
+    case_id_pattern: "AIO-DP-{inbound}-{client}"
+    runtime_budget_seconds: 2700
+    gate: [pre-push, pr]
+  multi-node:
+    nodes: [master, worker]
+    vision_combinations: [neither, master-only, worker-only, both]
+    positive_case_counts:
+      neither: 16
+      master-only: 18
+      worker-only: 18
+      both: 20
+    case_id_pattern: "MN-DP-{node}-{inbound}-{client}"
+    runtime_budget_seconds: 4500
+    gate: [pre-push, pr]
+
+runtime_budget:
+  pre_push_total_seconds: 7200
+  pr_total_seconds: 9000
+  nightly_total_seconds: 14400
+  on_exhaustion: INCOMPLETE
+
+ci_tiers:
+  L0: lint, static analysis, contract tests
+  L1: existing transport acceptance
+  L2: full All-in-One product E2E
+  L3: full Multi-Node product E2E
+  L4: lifecycle, backup/restore, channel update/rollback
+  L5: QEMU cold boot
+  L6: separately authorized live VPS acceptance
+
+# Privilege scopes are not interchangeable. Rootless Podman cannot bind 80/443
+# or prove host INPUT firewall isolation, so it may only run static self-checks
+# and never claims product acceptance.
+privilege_scopes:
+  rootful:
+    claim: product acceptance
+    prerequisites:
+      - EUID 0 (sudo)
+      - podman info Host.Security.Rootless=false
+      - cgroup v2 with the systemd cgroup manager
+      - netavark network backend
+    required_for:
+      - privileged systemd container boot
+      - host firewall (UFW/nftables) INPUT isolation
+      - listener binding on 80/443
+      - Worker mTLS control plane and port 3002 isolation
+      - Panel and NGINX service supervision
+  rootless:
+    claim: static self-checks only
+    checks: [catalog-parity, image-lock, matrix-schema, harness-contracts]
+    excluded:
+      - every product topology case
+      - every firewall, listener, and service assertion
