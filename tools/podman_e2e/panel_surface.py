@@ -17,6 +17,7 @@ payload directory and never printed: the facts only report a status, a media
 type, and a byte count.
 
     python3 /repo/tools/podman_e2e/panel_surface.py --scope surface
+    python3 /repo/tools/podman_e2e/panel_surface.py --scope cluster
     python3 /repo/tools/podman_e2e/panel_surface.py --scope subscriptions --payload-dir /payloads
 """
 from __future__ import annotations
@@ -77,6 +78,24 @@ def digest(identifiers: Sequence[Any]) -> str:
     """A stable fingerprint of an identifier set, so the set can be compared safely."""
     joined = "\n".join(sorted(str(value) for value in identifiers if value))
     return hashlib.sha256(joined.encode("utf-8")).hexdigest() if joined else ""
+
+
+IDENTIFIER_LENGTH = 16
+
+
+def identifier(value: Any) -> str:
+    """A short, one-way fingerprint of a single Panel identifier.
+
+    Nodes, profiles, and inbounds are referenced by UUID across different
+    payloads, and a case has to know when two references name the same object.
+    Printing a digest keeps that comparison possible without writing internal
+    identifiers into a report; 16 hex characters tell apart far more objects than
+    one cluster holds.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:IDENTIFIER_LENGTH]
 
 
 def payload(body: Any) -> Any:
@@ -247,6 +266,125 @@ def surface(panel: Panel) -> Dict[str, Any]:
         "status": status,
         "count": len(tokens),
         "name_digest": digest([token.get("name") for token in tokens]),
+    }
+    return facts
+
+
+def computed_config(panel: Panel, profile_uuid: str) -> Dict[str, Any]:
+    """The profile's computed Xray config, reduced to the shape a case can assert.
+
+    The Panel expands the profile on read, so ``config`` is the object the node
+    would run. Only its parseability and its inbound/outbound counts are
+    reported: the config carries the client credentials a subscription would.
+    """
+    status, body = panel.call(
+        "GET", f"/api/config-profiles/{profile_uuid}/computed-config"
+    )
+    profile = payload(body)
+    raw = profile.get("config") if isinstance(profile, dict) else None
+    config: Optional[Dict[str, Any]] = None
+    if isinstance(raw, dict):
+        config = raw
+    elif isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            decoded = None
+        config = decoded if isinstance(decoded, dict) else None
+    facts: Dict[str, Any] = {"status": status, "parsed": config is not None}
+    if config is not None:
+        inbounds = config.get("inbounds")
+        outbounds = config.get("outbounds")
+        facts["inbound_count"] = len(inbounds) if isinstance(inbounds, list) else -1
+        facts["outbound_count"] = len(outbounds) if isinstance(outbounds, list) else -1
+    return facts
+
+
+def cluster(panel: Panel) -> Dict[str, Any]:
+    """The cluster structure: which node owns which profile, inbounds, and hosts.
+
+    The single-node ``surface`` scope counts the inventory; this scope keeps the
+    per-object relations a two-node cluster has to prove — a host names exactly
+    one node and one of that node's inbounds, a node runs one profile, and the
+    profile expands into a config the node could load. Identifiers are reduced to
+    digests, so the same object can be recognised across payloads without the
+    report carrying it.
+    """
+    facts: Dict[str, Any] = {}
+
+    status, body = panel.call("GET", "/api/nodes")
+    nodes = [node for node in items(body, "nodes") if isinstance(node, dict)]
+    node_records: List[Dict[str, Any]] = []
+    for node in nodes:
+        profile = node.get("configProfile") if isinstance(node.get("configProfile"), dict) else {}
+        inbounds = [
+            identifier(inbound.get("uuid"))
+            for inbound in inbound_entries(profile.get("activeInbounds"))
+        ]
+        node_records.append({
+            "name": str(node.get("name") or ""),
+            "address": str(node.get("address") or ""),
+            "port": node.get("port"),
+            "connected": node.get("isConnected") is True,
+            "uuid": identifier(node.get("uuid")),
+            "profile": identifier(profile.get("activeConfigProfileUuid")),
+            "inbounds": [value for value in inbounds if value],
+        })
+    facts["nodes"] = {"status": status, "records": node_records}
+
+    status, body = panel.call("GET", "/api/config-profiles")
+    profiles = [profile for profile in items(body, "configProfiles") if isinstance(profile, dict)]
+    profile_records: List[Dict[str, Any]] = []
+    for profile in profiles:
+        uuid = str(profile.get("uuid") or "")
+        inbounds = [
+            identifier(inbound.get("uuid"))
+            for inbound in inbound_entries(profile.get("inbounds"))
+        ]
+        profile_records.append({
+            "name": str(profile.get("name") or ""),
+            "uuid": identifier(uuid),
+            "inbounds": [value for value in inbounds if value],
+            "computed": computed_config(panel, uuid) if uuid else {"status": 0, "parsed": False},
+        })
+    facts["profiles"] = {"status": status, "records": profile_records}
+
+    status, body = panel.call("GET", "/api/hosts")
+    hosts = [host for host in items(body, "hosts") if isinstance(host, dict)]
+    host_records: List[Dict[str, Any]] = []
+    for host in hosts:
+        inbound = host.get("inbound") if isinstance(host.get("inbound"), dict) else {}
+        references = host.get("nodes") if isinstance(host.get("nodes"), list) else []
+        nodes_of_host = []
+        for reference in references:
+            value = reference.get("uuid") if isinstance(reference, dict) else reference
+            nodes_of_host.append(identifier(value))
+        host_records.append({
+            "remark": str(host.get("remark") or ""),
+            "address": str(host.get("address") or ""),
+            "port": host.get("port"),
+            "sni": str(host.get("sni") or ""),
+            "fingerprint": str(host.get("fingerprint") or ""),
+            "security_layer": str(host.get("securityLayer") or ""),
+            "disabled": host.get("isDisabled") is True,
+            "profile": identifier(inbound.get("configProfileUuid")),
+            "inbound": identifier(inbound.get("configProfileInboundUuid")),
+            "nodes": sorted(value for value in nodes_of_host if value),
+        })
+    facts["hosts"] = {"status": status, "records": host_records}
+
+    status, body = panel.call("GET", "/api/internal-squads")
+    squads = [squad for squad in items(body, "internalSquads") if isinstance(squad, dict)]
+    mvp = next((squad for squad in squads if squad.get("name") == MVP_SQUAD), None)
+    granted = [
+        identifier(inbound.get("uuid"))
+        for inbound in inbound_entries(mvp.get("inbounds") if mvp else None)
+    ]
+    facts["squad"] = {
+        "status": status,
+        "name": MVP_SQUAD,
+        "mvp_present": mvp is not None,
+        "inbounds": [value for value in granted if value],
     }
     return facts
 
@@ -588,7 +726,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Collect Panel API facts without leaking secrets")
     parser.add_argument(
         "--scope",
-        choices=("surface", "lifecycle", "subscriptions", "ua-absent", "ua-blank", "revoke", "all"),
+        choices=(
+            "surface", "cluster", "lifecycle", "subscriptions",
+            "ua-absent", "ua-blank", "revoke", "all",
+        ),
         default="all",
     )
     parser.add_argument("--panel-url", default=PANEL_URL)
@@ -610,6 +751,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     facts: Dict[str, Any] = {"login": login(panel, username, password)}
     if args.scope in ("surface", "all"):
         facts["surface"] = surface(panel)
+    if args.scope == "cluster":
+        facts["cluster"] = cluster(panel)
     if args.scope in ("lifecycle", "all"):
         facts["lifecycle"] = lifecycle(panel)
     if args.scope in ("subscriptions", "all"):

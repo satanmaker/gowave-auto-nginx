@@ -25,6 +25,12 @@ INSTALL_CASE_ID = "MN-INSTALL"
 NODE_ADD_CASE_ID = "WRK-04"
 MASTER_ADDRESS_CASE_ID = "PODNET-MASTER-ADDR"
 MTLS_TIMEOUT_SECONDS = 300
+CLUSTER_TIMEOUT_SECONDS = 300
+
+# The name the installer gives the node the Panel runs on. Without it, a cluster
+# audit could be satisfied by any two nodes rather than the ones the product
+# provisions.
+LOCAL_NODE_NAME = "local-node"
 
 NODE_ADD_TIMEOUT_SECONDS = topology.NODE_ADD_TIMEOUT_SECONDS
 NODE_HEALTH_TIMEOUT_SECONDS = 600
@@ -180,9 +186,15 @@ class MultiNodeProduct:
         configured per node, so one node can carry five inbounds while the other
         carries four.
         """
-        core = len(matrix_data.inbounds(self.matrix, vision=False))
-        extra = len(matrix_data.inbounds(self.matrix, vision=True)) - core
-        return 2 * core + (extra if self.vision else 0) + (extra if self.worker_vision else 0)
+        return self.master_inbound_count + self.worker_inbound_count
+
+    @property
+    def master_inbound_count(self) -> int:
+        return len(matrix_data.inbounds(self.matrix, vision=self.vision))
+
+    @property
+    def worker_inbound_count(self) -> int:
+        return len(matrix_data.inbounds(self.matrix, vision=self.worker_vision))
 
     def declare_data_plane(self, case_ids: Sequence[str]) -> None:
         self.declared_data_plane = list(case_ids)
@@ -258,6 +270,20 @@ class MultiNodeProduct:
     # ---------------------------------------------------------------- probes
     def panel_surface(self, case_id: str) -> Dict[str, Any]:
         return aio.panel_probe(self.master, case_id, "surface")
+
+    def panel_cluster(self, case_id: str) -> Dict[str, Any]:
+        return aio.panel_probe(self.master, case_id, "cluster")
+
+    def cluster_facts(self, case_id: str) -> Dict[str, Any]:
+        """The Panel's cluster structure, refused by name when the probe returned none."""
+        facts = self.panel_cluster(case_id)
+        cluster = facts.get("cluster")
+        if not isinstance(cluster, dict):
+            raise CaseBlocked(
+                f"{case_id}: the Panel probe returned no cluster structure; "
+                f"observed {sorted(facts)}"
+            )
+        return cluster
 
     def worker_control_facts(self, case_id: str, timeout: int = 120) -> Dict[str, Any]:
         host = self.require_installed()
@@ -672,6 +698,345 @@ def case_mtls_wrong_sni(product: MultiNodeProduct) -> Dict[str, Any]:
     return {"wrong_sni": outcome}
 
 
+def case_cluster_hosts(product: MultiNodeProduct) -> Dict[str, Any]:
+    """CLUS-01: every Host names one node, one of its inbounds, and the pinned fingerprint.
+
+    The Host records are what a client is told to dial, so a host total proves
+    nothing: a host can exist, carry a fingerprint, and still name another
+    node's inbound. Each record must therefore name exactly one node, publish an
+    inbound that node's profile actually carries, and keep the uTLS fingerprint
+    the product pins for both the REALITY and TLS transports.
+    """
+    product.require_worker()
+    cluster = product.cluster_facts("CLUS-01")
+    hosts = cluster.get("hosts") or {}
+    require(
+        "CLUS-01",
+        hosts.get("status") == 200,
+        f"GET /api/hosts returned {hosts.get('status')!r}",
+    )
+    records = hosts.get("records") or []
+    nodes = {
+        record.get("uuid"): record
+        for record in (cluster.get("nodes") or {}).get("records") or []
+    }
+    expected = product.expected_inbound_total
+    require(
+        "CLUS-01",
+        len(records) == expected,
+        f"the Panel publishes {len(records)} hosts, expected {expected} for the "
+        f"{product.combination} Vision configuration",
+    )
+    per_node: Dict[str, int] = {}
+    for record in records:
+        remark = record.get("remark")
+        references = record.get("nodes") or []
+        require(
+            "CLUS-01",
+            len(references) == 1,
+            f"host {remark!r} references {len(references)} nodes instead of exactly one",
+        )
+        node = nodes.get(references[0])
+        require(
+            "CLUS-01",
+            node is not None,
+            f"host {remark!r} references a node that GET /api/nodes does not list",
+        )
+        require(
+            "CLUS-01",
+            record.get("inbound") in (node.get("inbounds") or []),
+            f"host {remark!r} publishes an inbound that is not among the inbounds "
+            f"{node.get('name')!r} runs, so its clients would be dialled at a "
+            f"transport that node does not serve",
+        )
+        require(
+            "CLUS-01",
+            record.get("profile") == node.get("profile"),
+            f"host {remark!r} belongs to a profile its node {node.get('name')!r} "
+            f"does not run",
+        )
+        name = str(node.get("name") or "")
+        per_node[name] = per_node.get(name, 0) + 1
+
+    require(
+        "CLUS-01",
+        set(per_node) == {LOCAL_NODE_NAME, topology.WORKER_NODE_NAME},
+        f"the published hosts cover {sorted(per_node)} instead of both nodes",
+    )
+    for name, expected_count in (
+        (LOCAL_NODE_NAME, product.master_inbound_count),
+        (topology.WORKER_NODE_NAME, product.worker_inbound_count),
+    ):
+        require(
+            "CLUS-01",
+            per_node.get(name) == expected_count,
+            f"{per_node.get(name)!r} hosts reference {name!r}, expected one per "
+            f"active inbound ({expected_count})",
+        )
+
+    fingerprints = sorted({str(record.get("fingerprint") or "") for record in records})
+    require(
+        "CLUS-01",
+        fingerprints == [aio.EXPECTED_FINGERPRINT],
+        f"the published hosts carry fingerprints {fingerprints} instead of the "
+        f"pinned {aio.EXPECTED_FINGERPRINT!r}",
+    )
+    layers = sorted({str(record.get("security_layer") or "") for record in records})
+    require(
+        "CLUS-01",
+        {"DEFAULT", "TLS"}.issubset(set(layers)),
+        f"the published hosts carry security layers {layers}; the REALITY and TLS "
+        f"hosts must both exist for the pinned fingerprint to cover both classes",
+    )
+    return {
+        "host_count": len(records),
+        "hosts_per_node": per_node,
+        "fingerprints": fingerprints,
+        "security_layers": layers,
+    }
+
+
+def case_cluster_squad(product: MultiNodeProduct) -> Dict[str, Any]:
+    """CLUS-02: the MVP squad grants exactly the inbounds the two nodes carry.
+
+    A squad that omits an inbound hands a client a subscription that cannot
+    reach that transport; a squad that repeats one hands out a duplicate entry.
+    Only set equality against the node records catches both, and the comparison
+    is against the Panel's own node inventory rather than the matrix, so a
+    provisioning defect cannot be signed off by the plan that caused it.
+    """
+    product.require_worker()
+    cluster = product.cluster_facts("CLUS-02")
+    squad = cluster.get("squad") or {}
+    require(
+        "CLUS-02",
+        squad.get("status") == 200,
+        f"GET /api/internal-squads returned {squad.get('status')!r}",
+    )
+    require(
+        "CLUS-02",
+        squad.get("mvp_present"),
+        f"the Panel lists no {squad.get('name')!r} squad, so no client could be granted "
+        f"the provisioned inbounds through it",
+    )
+    nodes = (cluster.get("nodes") or {}).get("records") or []
+    require(
+        "CLUS-02",
+        len(nodes) == 2,
+        f"the squad comparison needs both nodes and the Panel reports {len(nodes)}",
+    )
+    expected = sorted({value for node in nodes for value in node.get("inbounds") or []})
+    granted = squad.get("inbounds") or []
+    duplicates = sorted({
+        value for value in granted if granted.count(value) > 1
+    })
+    require(
+        "CLUS-02",
+        not duplicates,
+        f"the squad grants {len(duplicates)} inbound(s) more than once "
+        f"({duplicates}), so a client would receive duplicate proxy entries",
+    )
+    require(
+        "CLUS-02",
+        sorted(granted) == expected,
+        f"the squad's inbound set differs from the inbounds the two nodes run: "
+        f"missing {sorted(set(expected) - set(granted))}, "
+        f"extra {sorted(set(granted) - set(expected))}",
+    )
+    require(
+        "CLUS-02",
+        len(granted) == product.expected_inbound_total,
+        f"the squad grants {len(granted)} inbounds, expected "
+        f"{product.expected_inbound_total} for the {product.combination} Vision "
+        f"configuration",
+    )
+    return {
+        "squad": squad.get("name"),
+        "granted_inbound_count": len(granted),
+        "unique_granted_inbound_count": len(set(granted)),
+        "node_inbound_count": len(expected),
+    }
+
+
+def case_cluster_nodes(product: MultiNodeProduct) -> Dict[str, Any]:
+    """CLUS-03: two nodes, each on its own profile and its own dial address.
+
+    The Worker exists for clients to be pointed at it, so the case separates the
+    two addresses the product maintains: the Panel reaches the Worker on its Node
+    API address (the run-network IP), while a client dials it on the Worker's own
+    VPN domain. Two profiles have to expand into loadable configs, because a node
+    attached to an unexpandable profile is registered but unusable.
+    """
+    host = product.require_worker()
+    cluster = product.cluster_facts("CLUS-03")
+
+    nodes_section = cluster.get("nodes") or {}
+    require(
+        "CLUS-03",
+        nodes_section.get("status") == 200,
+        f"GET /api/nodes returned {nodes_section.get('status')!r}",
+    )
+    records = nodes_section.get("records") or []
+    require(
+        "CLUS-03",
+        len(records) == 2,
+        f"the Panel reports {len(records)} nodes instead of the Master and the Worker",
+    )
+    by_name = {str(record.get("name") or ""): record for record in records}
+    require(
+        "CLUS-03",
+        set(by_name) == {LOCAL_NODE_NAME, topology.WORKER_NODE_NAME},
+        f"the Panel reports nodes {sorted(by_name)} instead of "
+        f"{sorted({LOCAL_NODE_NAME, topology.WORKER_NODE_NAME})}",
+    )
+    local = by_name[LOCAL_NODE_NAME]
+    worker = by_name[topology.WORKER_NODE_NAME]
+    require(
+        "CLUS-03",
+        (local.get("address"), local.get("port")) == ("127.0.0.1", NODE_PORT),
+        f"the Master node is registered at {local.get('address')!r}:{local.get('port')!r} "
+        f"instead of 127.0.0.1:{NODE_PORT}",
+    )
+    require(
+        "CLUS-03",
+        (worker.get("address"), worker.get("port")) == (host.plan.worker_ip, NODE_PORT),
+        f"the Worker's Node API address is {worker.get('address')!r}:{worker.get('port')!r} "
+        f"instead of {host.plan.worker_ip}:{NODE_PORT}",
+    )
+    for record, expected_count in (
+        (local, product.master_inbound_count),
+        (worker, product.worker_inbound_count),
+    ):
+        inbounds = record.get("inbounds") or []
+        require(
+            "CLUS-03",
+            len(inbounds) == expected_count,
+            f"{record.get('name')!r} runs {len(inbounds)} active inbounds, expected "
+            f"{expected_count}",
+        )
+        require(
+            "CLUS-03",
+            len(set(inbounds)) == len(inbounds),
+            f"{record.get('name')!r} lists the same inbound UUID more than once",
+        )
+    require(
+        "CLUS-03",
+        not set(local.get("inbounds") or []) & set(worker.get("inbounds") or []),
+        "the two nodes share an inbound UUID, so a host cannot be attributed to one of them",
+    )
+
+    profiles_section = cluster.get("profiles") or {}
+    require(
+        "CLUS-03",
+        profiles_section.get("status") == 200,
+        f"GET /api/config-profiles returned {profiles_section.get('status')!r}",
+    )
+    profiles = profiles_section.get("records") or []
+    require(
+        "CLUS-03",
+        len(profiles) == 2,
+        f"the Panel reports {len(profiles)} config profiles instead of one per node",
+    )
+    require(
+        "CLUS-03",
+        len({profile.get("uuid") for profile in profiles}) == 2,
+        "the two nodes are not attached to two distinct config profiles",
+    )
+    for record in (local, worker):
+        profile = next(
+            (candidate for candidate in profiles
+             if candidate.get("uuid") == record.get("profile")),
+            None,
+        )
+        require(
+            "CLUS-03",
+            profile is not None,
+            f"node {record.get('name')!r} runs a profile GET /api/config-profiles does not list",
+        )
+        require(
+            "CLUS-03",
+            sorted(profile.get("inbounds") or []) == sorted(record.get("inbounds") or []),
+            f"the profile of {record.get('name')!r} declares different inbounds than the "
+            f"node runs, so the node would serve a different set than the Panel publishes",
+        )
+        computed = profile.get("computed") or {}
+        require(
+            "CLUS-03",
+            computed.get("status") == 200,
+            f"the computed config of {record.get('name')!r}'s profile returned "
+            f"{computed.get('status')!r}",
+        )
+        require(
+            "CLUS-03",
+            computed.get("parsed") is True,
+            f"the computed config of {record.get('name')!r}'s profile is not valid JSON",
+        )
+        require(
+            "CLUS-03",
+            computed.get("inbound_count") == len(profile.get("inbounds") or []),
+            f"the computed config of {record.get('name')!r}'s profile expands "
+            f"{computed.get('inbound_count')!r} inbounds for "
+            f"{len(profile.get('inbounds') or [])} declared ones",
+        )
+        require(
+            "CLUS-03",
+            int(computed.get("outbound_count") or 0) > 0,
+            f"the computed config of {record.get('name')!r}'s profile carries no outbounds",
+        )
+
+    hosts = (cluster.get("hosts") or {}).get("records") or []
+    worker_hosts = [
+        record for record in hosts if worker.get("uuid") in (record.get("nodes") or [])
+    ]
+    require(
+        "CLUS-03",
+        worker_hosts,
+        "no published host references the Worker, so no client could be pointed at it",
+    )
+    vpn_addresses = {host.worker_domain}
+    if product.worker_vision:
+        vpn_addresses.add(host.worker_vision_domain)
+    stray = sorted({
+        str(record.get("address") or "")
+        for record in worker_hosts
+        if record.get("address") not in vpn_addresses
+    })
+    require(
+        "CLUS-03",
+        not stray,
+        f"the Worker's hosts dial {stray} instead of the Worker's own VPN address "
+        f"{sorted(vpn_addresses)}",
+    )
+    reality = [
+        record for record in worker_hosts
+        if record.get("security_layer") == "DEFAULT"
+    ]
+    require(
+        "CLUS-03",
+        reality,
+        "the Worker publishes no REALITY host, so its VPN client address cannot be checked",
+    )
+    require(
+        "CLUS-03",
+        all(record.get("address") == host.worker_domain for record in reality),
+        f"the Worker's REALITY host does not dial {host.worker_domain!r}; observed "
+        f"{sorted({str(record.get('address') or '') for record in reality})}",
+    )
+    return {
+        "nodes": sorted(by_name),
+        "node_addresses": {
+            name: f"{record.get('address')}:{record.get('port')}"
+            for name, record in by_name.items()
+        },
+        "inbounds_per_node": {
+            name: len(record.get("inbounds") or []) for name, record in by_name.items()
+        },
+        "profile_count": len(profiles),
+        "worker_vpn_addresses": sorted(vpn_addresses),
+        "worker_host_count": len(worker_hosts),
+    }
+
+
 def cases(
     podman: Any, distribution: str = "ubuntu-24.04",
     vision: bool = False, worker_vision: bool = False,
@@ -703,4 +1068,10 @@ def cases(
              timeout_seconds=MTLS_TIMEOUT_SECONDS),
         Case("MTLS-08", "multi-node", lambda context: case_mtls_wrong_sni(product),
              timeout_seconds=MTLS_TIMEOUT_SECONDS),
+        Case("CLUS-01", "multi-node", lambda context: case_cluster_hosts(product),
+             timeout_seconds=CLUSTER_TIMEOUT_SECONDS),
+        Case("CLUS-02", "multi-node", lambda context: case_cluster_squad(product),
+             timeout_seconds=CLUSTER_TIMEOUT_SECONDS),
+        Case("CLUS-03", "multi-node", lambda context: case_cluster_nodes(product),
+             timeout_seconds=CLUSTER_TIMEOUT_SECONDS),
     ]
