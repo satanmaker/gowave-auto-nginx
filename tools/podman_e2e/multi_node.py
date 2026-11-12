@@ -747,18 +747,17 @@ class MultiNodeProduct:
                 f"{probe.get('returncode')}): {probe.get('detail') or 'no output'}"
             )
         observed: List[str] = []
+        journal_tail: List[str] = []
 
         def logged() -> bool:
             # sshd writes the refusal when the connection ends, so the line can
             # trail the probe by a moment; the deadline is what makes that a poll
             # rather than an assumption.
-            observed.clear()
-            observed.extend(
-                line for line in denial.sshd_observation(
-                    self.podman, host.worker_name, untrusted_address,
-                )
-                if "[preauth]" in line or "Failed" in line or "Connection closed" in line
+            report = denial.sshd_observation(
+                self.podman, host.worker_name, untrusted_address,
             )
+            observed[:] = report["matches"]
+            journal_tail[:] = report["tail"]
             return bool(observed)
 
         wait_until(
@@ -789,6 +788,7 @@ class MultiNodeProduct:
             "untrusted": probe,
             "observed_source": untrusted_address if observed else "",
             "observed_lines": observed,
+            "journal_tail": journal_tail,
             "firewall": firewall,
             "worker_name": host.worker_name,
             "untrusted_name": host.untrusted_name,
@@ -1231,7 +1231,8 @@ def case_management_denial(product: MultiNodeProduct) -> Dict[str, Any]:
         raise CaseIncomplete(
             f"{MANAGEMENT_DENIAL_CASE_ID}: the Worker never logged the untrusted source "
             f"{untrusted} on its SSH port, so the address that was refused is unproven: "
-            f"{facts['observed_lines'] or 'no matching line'}"
+            f"{facts['observed_lines'] or 'no matching line'}; sshd's last lines were "
+            f"{facts.get('journal_tail') or 'none'}"
         )
     return {
         "input_policy": firewall["input_policy"],
