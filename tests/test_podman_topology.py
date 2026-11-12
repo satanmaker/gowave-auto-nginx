@@ -55,7 +55,9 @@ class FakePodman:
     def exec(self, name, argv, check=True, input_text=None, timeout=300):
         self.execs.append((name, list(argv)))
         if len(argv) == 3 and argv[2] == target_image.cleanliness_probe():
-            return subprocess.CompletedProcess(argv, 0, "init=systemd\nsystemd=systemd 255\n", "")
+            return subprocess.CompletedProcess(
+                argv, 0, "init=systemd\nsystemd=systemd 255\nsshd=active\n", ""
+            )
         raise AssertionError(f"unexpected exec: {argv}")
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=300):

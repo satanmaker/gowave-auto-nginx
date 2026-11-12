@@ -4,8 +4,8 @@
     "managementListenAddress": "0.0.0.0:15000",
     "certificate": "/fixtures/acme/pebble.crt",
     "privateKey": "/fixtures/acme/pebble.key",
-    "httpPort": 5002,
-    "tlsPort": 5001,
+    "httpPort": 80,
+    "tlsPort": 443,
     "ocspResponderURL": "",
     "externalAccountBindingRequired": false
   }

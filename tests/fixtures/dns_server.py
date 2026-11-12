@@ -42,14 +42,30 @@ DEFAULT_ZONE: Dict[str, object] = {
 }
 
 
-def log_event(log_path: Optional[Path], event: Dict[str, object]) -> None:
-    if log_path is None:
-        return
-    line = json.dumps(event, sort_keys=True)
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+class Diagnostics:
+    """Append-only query log that can never take the resolver down.
+
+    A diagnostics failure (read-only mount, full disk) must degrade the trail,
+    not the answers: a case that suddenly sees NXDOMAIN because logging broke
+    would report the wrong product behaviour.
+    """
+
+    def __init__(self, log_path: Optional[Path]) -> None:
+        self.path = log_path
+        self.writable = log_path is not None
+
+    def write(self, event: Dict[str, object]) -> None:
+        if not self.writable:
+            return
+        line = json.dumps(event, sort_keys=True)
+        try:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            print(f"dns-fixture: diagnostics disabled ({exc})", file=sys.stderr, flush=True)
+            self.writable = False
 
 
 class Zone:
@@ -168,7 +184,7 @@ def build_response(
     query: bytes,
     zone: Zone,
     client: str,
-    log_path: Optional[Path],
+    diagnostics: Diagnostics,
     suffixes: Sequence[str] = (DEFAULT_SUFFIX,),
     out_of_zone: str = "nxdomain",
 ) -> bytes:
@@ -194,7 +210,7 @@ def build_response(
 
     response_flags = 0x8000 | 0x0400 | (flags & 0x0100) | rcode
     header = struct.pack("!HHHHHH", transaction_id, response_flags, 1, answer_count, 0, 0)
-    log_event(log_path, {
+    diagnostics.write({
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "client": client,
         "qname": name,
@@ -212,7 +228,7 @@ def build_response(
 def serve_udp(
     sock: socket.socket,
     zone: Zone,
-    log_path: Optional[Path],
+    diagnostics: Diagnostics,
     stop: threading.Event,
     suffixes: Sequence[str],
     out_of_zone: str,
@@ -226,10 +242,10 @@ def serve_udp(
             return
         try:
             response = build_response(
-                data, zone, f"{address[0]}:{address[1]}", log_path, suffixes, out_of_zone,
+                data, zone, f"{address[0]}:{address[1]}", diagnostics, suffixes, out_of_zone,
             )
         except (ValueError, struct.error) as exc:
-            log_event(log_path, {
+            diagnostics.write({
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "client": f"{address[0]}:{address[1]}",
                 "error": str(exc),
@@ -244,7 +260,7 @@ def serve_udp(
 def handle_tcp(
     conn: socket.socket,
     zone: Zone,
-    log_path: Optional[Path],
+    diagnostics: Diagnostics,
     suffixes: Sequence[str],
     out_of_zone: str,
 ) -> None:
@@ -262,7 +278,7 @@ def handle_tcp(
                     return
                 data += chunk
             response = build_response(
-                data, zone, str(conn.getpeername()[0]), log_path, suffixes, out_of_zone,
+                data, zone, str(conn.getpeername()[0]), diagnostics, suffixes, out_of_zone,
             )
             conn.sendall(struct.pack("!H", len(response)) + response)
         except (OSError, ValueError, struct.error):
@@ -272,7 +288,7 @@ def handle_tcp(
 def serve_tcp(
     sock: socket.socket,
     zone: Zone,
-    log_path: Optional[Path],
+    diagnostics: Diagnostics,
     stop: threading.Event,
     suffixes: Sequence[str],
     out_of_zone: str,
@@ -285,7 +301,11 @@ def serve_tcp(
             continue
         except OSError:
             return
-        threading.Thread(target=handle_tcp, args=(conn, zone, log_path), daemon=True).start()
+        threading.Thread(
+            target=handle_tcp,
+            args=(conn, zone, diagnostics, suffixes, out_of_zone),
+            daemon=True,
+        ).start()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -309,9 +329,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    args.log.parent.mkdir(parents=True, exist_ok=True)
     suffixes = tuple(args.suffix or (DEFAULT_SUFFIX,))
     zone = Zone(args.zone)
+    diagnostics = Diagnostics(args.log)
+    try:
+        args.log.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"dns-fixture: diagnostics disabled ({exc})", file=sys.stderr, flush=True)
+        diagnostics.writable = False
     stop = threading.Event()
 
     def shutdown(signum, frame):
@@ -326,7 +351,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     udp.settimeout(0.5)
 
     threads = [threading.Thread(
-        target=serve_udp, args=(udp, zone, args.log, stop, suffixes, args.out_of_zone), daemon=True,
+        target=serve_udp,
+        args=(udp, zone, diagnostics, stop, suffixes, args.out_of_zone),
+        daemon=True,
     )]
     if not args.no_tcp:
         tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -334,7 +361,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tcp.bind((args.listen, args.port))
         tcp.listen(8)
         threads.append(threading.Thread(
-            target=serve_tcp, args=(tcp, zone, args.log, stop, suffixes, args.out_of_zone), daemon=True,
+            target=serve_tcp,
+            args=(tcp, zone, diagnostics, stop, suffixes, args.out_of_zone),
+            daemon=True,
         ))
 
     for thread in threads:

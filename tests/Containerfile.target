@@ -10,11 +10,24 @@ FROM ${BASE_IMAGE}
 ENV DEBIAN_FRONTEND=noninteractive
 ENV container=podman
 
+# The official base image ships a policy-rc.d that refuses every service start
+# during package installation. A VPS has no such policy: installing NGINX or
+# Certbot starts and enables those units immediately, and the product's ACME
+# path relies on the challenge vhost being live by then. Removing the policy is
+# what makes package installation here behave like package installation there.
+RUN rm -f /usr/sbin/policy-rc.d
+
+# A VPS is administered over SSH, so the daemon and its host keys are part of
+# the host, not of what the product installs. openssh-server pulls in the SSH
+# client transitively, so the cleanliness probe tracks neither of them.
+# Everything the product installs (NGINX, Certbot, UFW, Fail2ban, Python
+# bindings, ...) stays absent.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         systemd \
         systemd-sysv \
         dbus \
+        openssh-server \
     && rm -rf /var/lib/apt/lists/*
 
 # A container has no udev, logind seat, or tty; masking these keeps PID 1 from
@@ -26,6 +39,12 @@ RUN rm -f /lib/systemd/system/sysinit.target.wants/systemd-udevd.service \
     /lib/systemd/system/sockets.target.wants/*initctl* \
     && systemctl mask --force systemd-udevd.service systemd-udevd-control.socket \
         systemd-udevd-kernel.socket systemd-logind.service getty@tty1.service >/dev/null
+
+# The product inspects the live SSH daemon and validates its configuration with
+# ``sshd -t``. A real VPS has sshd running, and that also gives the validation
+# the privilege separation directory systemd creates at service start; without
+# it the same check exits 255 ("Missing privilege separation directory").
+RUN systemctl enable ssh.service >/dev/null
 
 # The product manages its own swap and BBR settings; the container only has to
 # reach multi-user.target with a working service manager.

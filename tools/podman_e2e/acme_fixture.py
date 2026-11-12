@@ -38,8 +38,12 @@ PEBBLE_CONFIG_TEMPLATE = ACME_TEMPLATE_DIR / "pebble-config.json"
 FIXTURE_HOST = "pebble.testbed.internal"
 ACME_PORT = 14000
 MANAGEMENT_PORT = 15000
-CHALLENGE_HTTP_PORT = 5002
-CHALLENGE_TLS_PORT = 5001
+# Pebble connects to these ports on the target during validation, so they must
+# match a public CA's: the product's HTTP-01 path is port 80 and TLS-ALPN-01 is
+# 443. The fixture binds neither port itself; only its management API is
+# published, on loopback.
+CHALLENGE_HTTP_PORT = 80
+CHALLENGE_TLS_PORT = 443
 
 CONTAINER_FIXTURE_DIR = "/fixtures/acme"
 

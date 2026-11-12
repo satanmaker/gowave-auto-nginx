@@ -129,10 +129,14 @@ class TestPodmanFixtureIsolation(unittest.TestCase):
             self.assertNotIn("letsencrypt.org", url)
         self.assertEqual(acme_fixture.MANAGEMENT_PORT, 15000)
 
-    def test_pebble_challenge_ports_never_claim_80_or_443(self):
+    def test_pebble_validates_on_the_public_ca_ports_and_binds_none_of_them(self):
         pebble = acme_fixture.pebble_config()["pebble"]
-        for port in (pebble["httpPort"], pebble["tlsPort"]):
-            self.assertNotIn(port, (80, 443, acme_fixture.ACME_PORT))
+        self.assertEqual(pebble["httpPort"], 80)
+        self.assertEqual(pebble["tlsPort"], 443)
+        fixture = acme_fixture.AcmeFixture(StubPodman(), "net", management_host_port=15099)
+        published = list(fixture._podman_args())
+        self.assertIn("127.0.0.1:15099:15000", published)
+        self.assertEqual(published, ["-p", "127.0.0.1:15099:15000"])
 
     def test_no_fixture_or_harness_module_installs_a_global_trust_anchor(self):
         for path in python_sources(HARNESS_DIR) + python_sources(FIXTURE_DIR):
