@@ -41,8 +41,10 @@ RESTART_CASE_ID = "MN-RESTART"
 VISION_CASE_ID = "MN-VISION"
 SSH_KEY_CASE_ID = "MN-SSHKEY"
 MATRIX_CASE_ID = "MN-MATRIX"
+EGRESS_CASE_ID = "MN-EGRESS"
 MTLS_TIMEOUT_SECONDS = 300
 MATRIX_TIMEOUT_SECONDS = 120
+EGRESS_TIMEOUT_SECONDS = 300
 DENIAL_TIMEOUT_SECONDS = 300
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
@@ -645,6 +647,7 @@ class MultiNodeProduct:
         self.mtls_negative_facts: Optional[Dict[str, Any]] = None
         self.denial_facts_cache: Optional[Dict[str, Any]] = None
         self.worker_state_cache: Optional[Dict[str, Any]] = None
+        self._data_plane_sources: Dict[str, str] = {}
         self.worker_report_timeout = WORKER_REPORT_TIMEOUT_SECONDS
         self.worker_report_interval = NODE_HEALTH_INTERVAL_SECONDS
         self.trust: Dict[str, Any] = {}
@@ -703,6 +706,14 @@ class MultiNodeProduct:
     def record_data_plane(self, case_id: str, status: str) -> None:
         self.master.record_data_plane(case_id, status)
 
+    def record_data_plane_source(self, case_id: str, source_ip: str) -> None:
+        """Record the address a matrix case's payload actually left from.
+
+        The count case says the tuples ran; this registry says where each one
+        left from, so a cluster cannot attribute a Worker tuple to the Master.
+        """
+        self.data_plane_sources[case_id] = source_ip
+
     @property
     def declared_data_plane(self) -> List[str]:
         return self.master.declared_data_plane
@@ -710,6 +721,10 @@ class MultiNodeProduct:
     @property
     def data_plane_results(self) -> Dict[str, str]:
         return self.master.data_plane_results
+
+    @property
+    def data_plane_sources(self) -> Dict[str, str]:
+        return self._data_plane_sources
 
     # ------------------------------------------------------------------ setup
     def install(self) -> Dict[str, Any]:
@@ -895,6 +910,23 @@ class MultiNodeProduct:
             f"{(result.stderr or result.stdout or '').strip()[-2000:]}",
         )
         return parse_worker_control(result.stdout or "")
+
+    def direct_egress_facts(
+        self, vantage: str, timeout: int = EGRESS_TIMEOUT_SECONDS,
+    ) -> Dict[str, Any]:
+        """Try to deliver a payload straight at the endpoint from one client role.
+
+        Neither the Control Machine nor the pinned-engine client owns a node
+        identity, so the endpoint has to refuse the payload by source. Running the
+        same attempt from both roles is what separates "the product's egress is
+        attributable" from "one container happens to sit outside the allowlist".
+        """
+        host = self.require_worker()
+        return aio.probe_json(
+            EGRESS_CASE_ID,
+            f"the {vantage} direct-egress probe",
+            host.direct_egress_facts(vantage, timeout=timeout),
+        )
 
     def wait_for_nodes(self, case_id: str, expected: int) -> Dict[str, Any]:
         """Wait until the Panel reports every node it owns as connected.
@@ -2836,6 +2868,155 @@ def case_matrix(product: MultiNodeProduct) -> Dict[str, Any]:
     }
 
 
+def case_egress(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-EGRESS: every payload is attributable to the node that carried it.
+
+    The source address the endpoint records is the one fact a client cannot
+    supply, so a cluster has to prove three things about it: the two nodes have
+    distinct egress identities, every matrix payload left from the identity of
+    the node its case names, and a direct attempt from either client role is
+    refused and recorded as a denial under that role's own address. The last
+    check is what gives the first two meaning — a fixture that accepted any
+    source would let a client manufacture the evidence the matrix rests on.
+    """
+    host = product.require_worker()
+    master_ip = str(host.plan.data_target_ip)
+    worker_ip = str(host.plan.data_worker_ip)
+    node_ids = sorted({master_ip, worker_ip})
+    require(
+        EGRESS_CASE_ID,
+        len(node_ids) == 2,
+        f"the Master and the Worker share the egress identity {master_ip!r}, so the address "
+        "the endpoint records cannot attribute a payload to the node that carried it",
+    )
+
+    cases = data_plane_cases(product)
+    sources = product.data_plane_sources
+    unattributed = [case_id for case_id, _inbound, _client, _node in cases
+                    if not sources.get(case_id)]
+    require(
+        EGRESS_CASE_ID,
+        not unattributed,
+        f"{len(unattributed)} matrix case(s) left no egress evidence: "
+        f"{', '.join(unattributed)}",
+    )
+    per_node: Dict[str, Dict[str, Any]] = {}
+    wrong: List[str] = []
+    for case_id, _inbound, _client, node in cases:
+        expected = str(host.node_data_ip(node))
+        observed = sources.get(case_id, "")
+        if observed != expected:
+            wrong.append(
+                f"{case_id} left from {observed or 'nowhere'} instead of the {node} node "
+                f"{expected}"
+            )
+            continue
+        tally = per_node.setdefault(node, {"identity": expected, "cases": 0})
+        tally["cases"] += 1
+    require(
+        EGRESS_CASE_ID,
+        not wrong,
+        "the matrix payloads were attributed to the wrong node: " + "; ".join(wrong),
+    )
+    observed_ids = sorted({sources[case_id] for case_id, _inbound, _client, _node in cases})
+    require(
+        EGRESS_CASE_ID,
+        observed_ids == node_ids,
+        f"the matrix payloads left from {observed_ids} instead of exactly the two node "
+        f"identities {node_ids}",
+    )
+
+    vantages = {
+        "control": str(host.plan.client_ip),
+        "engine": str(host.plan.engine_client_ip),
+    }
+    denials: Dict[str, Dict[str, Any]] = {}
+    payload_sources: set = set()
+    denied_sources: set = set()
+    for vantage, identity in vantages.items():
+        facts = product.direct_egress_facts(vantage)
+        require(
+            EGRESS_CASE_ID,
+            not facts.get("accepted"),
+            f"the {vantage} delivered a payload straight at the endpoint, so a client can "
+            "manufacture the source evidence the matrix cases rest on",
+        )
+        require(
+            EGRESS_CASE_ID,
+            facts.get("status") == 403,
+            f"the endpoint answered the {vantage} payload with {facts.get('status')!r} instead "
+            f"of refusing it: {facts.get('reason', '')}",
+        )
+        require(
+            EGRESS_CASE_ID,
+            not facts.get("recorded"),
+            f"the endpoint recorded the {vantage} payload although it refused it",
+        )
+        require(
+            EGRESS_CASE_ID,
+            facts.get("denied_recorded"),
+            f"the endpoint refused the {vantage} payload without recording the denial, so the "
+            "refusal exists only in the response",
+        )
+        denied_source = str(facts.get("denied_source_ip") or "")
+        require(
+            EGRESS_CASE_ID,
+            denied_source == identity,
+            f"the endpoint attributed the refused {vantage} payload to "
+            f"{denied_source or 'no source'} instead of the {vantage} vantage {identity}",
+        )
+        require(
+            EGRESS_CASE_ID,
+            denied_source not in node_ids,
+            f"the endpoint attributed the refused {vantage} payload to the node identity "
+            f"{denied_source!r}, so a client attempt is indistinguishable from product traffic",
+        )
+        allowed = sorted(str(address) for address in facts.get("allowed_sources") or [])
+        require(
+            EGRESS_CASE_ID,
+            allowed == node_ids,
+            f"the endpoint accepts payloads from {allowed} instead of exactly the two node "
+            f"identities {node_ids}",
+        )
+        payload_sources.update(str(item) for item in facts.get("payload_sources") or [])
+        denied_sources.update(str(item) for item in facts.get("denied_sources") or [])
+        denials[vantage] = {
+            "identity": identity,
+            "status": facts.get("status"),
+            "source_ip": denied_source,
+            "reason": facts.get("reason", ""),
+        }
+
+    require(
+        EGRESS_CASE_ID,
+        sorted(payload_sources) == node_ids,
+        f"the endpoint's own record shows payloads from {sorted(payload_sources)} instead of "
+        f"exactly the two node identities {node_ids}",
+    )
+    require(
+        EGRESS_CASE_ID,
+        set(vantages.values()) <= denied_sources,
+        f"the endpoint recorded denials from {sorted(denied_sources)} instead of the two "
+        f"client vantages {sorted(vantages.values())}",
+    )
+    require(
+        EGRESS_CASE_ID,
+        not (denied_sources & set(node_ids)),
+        f"a node identity {sorted(denied_sources & set(node_ids))} appears among the "
+        "endpoint's refusals, so the source allowlist is not the product's own",
+    )
+
+    return {
+        "master_identity": master_ip,
+        "worker_identity": worker_ip,
+        "attributed_cases": len(cases),
+        "per_node": per_node,
+        "payload_sources": sorted(payload_sources),
+        "denied_sources": sorted(denied_sources),
+        "denials": denials,
+    }
+
+
 def case_worker_outage(product: MultiNodeProduct) -> Dict[str, Any]:
     """MN-OUTAGE: stopping the Worker degrades the cluster, and removing the fault restores it.
 
@@ -3130,6 +3311,24 @@ def case_worker_restart(product: MultiNodeProduct) -> Dict[str, Any]:
     }
 
 
+def data_plane_case(
+    product: MultiNodeProduct, inbound: Dict[str, Any], client: str, node: str,
+) -> Dict[str, Any]:
+    """Run one matrix tuple and keep the address its payload actually left from.
+
+    The shared body already records the tuple's verdict for the count case; the
+    source address is the separate fact the egress case needs, so a Worker tuple
+    that left from the Master's address is caught by name instead of passing on
+    the strength of a 200.
+    """
+    evidence = aio._data_plane_case(product.master, inbound, client, node=node)
+    case_id = matrix_data.case_id(
+        product.matrix, matrix_data.MULTI_NODE, str(inbound["id"]), client, node=node,
+    )
+    product.record_data_plane_source(case_id, str(evidence.get("source_ip") or ""))
+    return evidence
+
+
 def data_plane_cases(product: MultiNodeProduct) -> List[Tuple[str, Dict[str, Any], str, str]]:
     """Every matrix tuple this cluster owes: each node's inbounds, both clients.
 
@@ -3207,8 +3406,8 @@ def cases(
     for case_id, inbound, client, node in data_plane:
         suite.append(Case(
             case_id, "multi-node",
-            lambda context, inbound=inbound, client=client, node=node: aio._data_plane_case(
-                product.master, inbound, client, node=node),
+            lambda context, inbound=inbound, client=client, node=node: data_plane_case(
+                product, inbound, client, node),
             timeout_seconds=aio.DATA_PLANE_TIMEOUT_SECONDS,
         ))
     # The count case closes the matrix: it reads the verdicts the tuples above
@@ -3216,6 +3415,12 @@ def cases(
     suite.append(Case(
         MATRIX_CASE_ID, "multi-node", lambda context: case_matrix(product),
         timeout_seconds=MATRIX_TIMEOUT_SECONDS,
+    ))
+    # Attribution reads what the tuples left behind, so it belongs immediately
+    # after the count and before any lifecycle case revokes a client.
+    suite.append(Case(
+        EGRESS_CASE_ID, "multi-node", lambda context: case_egress(product),
+        timeout_seconds=EGRESS_TIMEOUT_SECONDS,
     ))
     suite.extend([
         Case("SUB-SERVED", "multi-node", lambda context: aio.case_subscriptions(product.master),

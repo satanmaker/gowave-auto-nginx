@@ -23,7 +23,7 @@ def free_port() -> int:
 
 
 class EchoFixture:
-    def __init__(self) -> None:
+    def __init__(self, allow_sources=()) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.control_path = root / "echo-control.json"
@@ -36,6 +36,8 @@ class EchoFixture:
                 "--http-port", str(self.port),
                 "--control", str(self.control_path),
                 "--log", str(self.log_path),
+                *[option for source in allow_sources
+                  for option in ("--allow-source", source)],
             ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -97,8 +99,8 @@ class EchoFixture:
 
 
 class TestEchoFixture(unittest.TestCase):
-    def fixture(self) -> EchoFixture:
-        fixture = EchoFixture()
+    def fixture(self, **kwargs) -> EchoFixture:
+        fixture = EchoFixture(**kwargs)
         self.addCleanup(fixture.close)
         return fixture
 
@@ -171,6 +173,50 @@ class TestEchoFixture(unittest.TestCase):
         self.assertEqual(event["method"], "POST")
         self.assertEqual(event["body_sha256"], hashlib.sha256(b"abc").hexdigest())
         self.assertEqual(event["source_ip"], "127.0.0.1")
+
+
+class TestEchoFixtureSourceAllowlist(unittest.TestCase):
+    """Only a node identity may deliver a payload; every other source is refused."""
+
+    def fixture(self, **kwargs) -> EchoFixture:
+        fixture = EchoFixture(**kwargs)
+        self.addCleanup(fixture.close)
+        return fixture
+
+    def test_a_payload_from_a_source_outside_the_allowlist_is_refused(self):
+        fixture = self.fixture(allow_sources=("203.0.114.10",))
+        status, _, payload = fixture.request(
+            "/probe", method="POST", body="direct", headers={"X-Request-Id": "direct-1"},
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "source-not-allowed")
+        self.assertEqual(payload["source_ip"], "127.0.0.1")
+        self.assertEqual(payload["allowed_sources"], ["203.0.114.10"])
+        self.assertEqual([entry["path"] for entry in fixture.events()], ["/probe"])
+        self.assertTrue(fixture.events()[0]["denied"])
+
+    def test_the_allowed_source_delivers_and_is_the_only_recorded_one(self):
+        fixture = self.fixture(allow_sources=("127.0.0.1",))
+        status, _, payload = fixture.request("/probe", method="POST", body="allowed")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["source_ip"], "127.0.0.1")
+        self.assertNotIn("denied", fixture.events()[0])
+
+    def test_diagnostics_stays_readable_and_reports_the_denial(self):
+        fixture = self.fixture(allow_sources=("203.0.114.10",))
+        fixture.request("/probe", method="POST", body="direct", headers={"X-Request-Id": "direct-2"})
+        status, _, payload = fixture.get("/diagnostics")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["allowed_sources"], ["203.0.114.10"])
+        self.assertEqual(payload["requests"], [])
+        self.assertEqual([entry["request_id"] for entry in payload["denied"]], ["direct-2"])
+        self.assertEqual(payload["denied"][0]["source_ip"], "127.0.0.1")
+
+    def test_no_allowlist_means_every_source_is_accepted(self):
+        fixture = self.fixture()
+        status, _, payload = fixture.get("/probe")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["source_ip"], "127.0.0.1")
 
 
 if __name__ == "__main__":

@@ -415,6 +415,19 @@ def data_plane_cases() -> List[Dict[str, Any]]:
         "topology": ["multi-node"],
         "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
     })
+    entries.append({
+        "id": "MN-EGRESS",
+        "requirement": "Non-bypassable node egress attribution",
+        "assertion": (
+            "The Master and the Worker own distinct egress identities, every matrix payload is "
+            "recorded by the external endpoint under the identity of the node its case names, and "
+            "a payload sent straight at the endpoint from the Control Machine or the pinned-engine "
+            "client is refused with the denial recorded under that client's own source, so a "
+            "client cannot manufacture the source evidence the data-plane cases rest on."
+        ),
+        "topology": ["multi-node"],
+        "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
+    })
     return entries
 
 

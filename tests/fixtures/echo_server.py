@@ -40,7 +40,17 @@ RECENT: Deque[Dict[str, Any]] = deque(maxlen=1000)
 RECENT_LOCK = threading.Lock()
 CONTROL_PATH: Optional[Path] = None
 LOG_PATH: Optional[Path] = None
+# The product's own egress identities. A payload is accepted only from one of
+# these, so a delivery is never evidence of a client that reached the fixture
+# without traversing a node. Reads of the record stay open to any source: the
+# harness has to be able to ask the endpoint what it did *not* receive, and that
+# vantage is deliberately outside the node-egress network.
+ALLOWED_SOURCES: frozenset[str] = frozenset()
 SNI = threading.local()
+
+
+def source_allowed(source_ip: str) -> bool:
+    return not ALLOWED_SOURCES or source_ip in ALLOWED_SOURCES
 
 
 def load_control(path: Optional[Path]) -> Dict[str, Any]:
@@ -92,7 +102,34 @@ class EchoHandler(BaseHTTPRequestHandler):
         if parsed.path == "/diagnostics":
             with RECENT_LOCK:
                 recent = list(RECENT)
-            self._send_json(200, {"ok": True, "requests": recent, "control": load_control(CONTROL_PATH)})
+            self._send_json(200, {
+                "ok": True,
+                "requests": [event for event in recent if not event.get("denied")],
+                "denied": [event for event in recent if event.get("denied")],
+                "allowed_sources": sorted(ALLOWED_SOURCES),
+                "control": load_control(CONTROL_PATH),
+            })
+            return
+
+        source_ip = self.client_address[0]
+        if not source_allowed(source_ip):
+            request_id = self.headers.get("X-Request-Id") or uuid.uuid4().hex
+            log_event({
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "request_id": request_id,
+                "method": method,
+                "path": parsed.path,
+                "source_ip": source_ip,
+                "source_port": self.client_address[1],
+                "denied": True,
+                "reason": "source-not-allowed",
+            })
+            self._send_json(403, {
+                "error": "source-not-allowed",
+                "request_id": request_id,
+                "source_ip": source_ip,
+                "allowed_sources": sorted(ALLOWED_SOURCES),
+            })
             return
 
         control = load_control(CONTROL_PATH)
@@ -203,7 +240,7 @@ class DualStackServer:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    global CONTROL_PATH, LOG_PATH
+    global CONTROL_PATH, LOG_PATH, ALLOWED_SOURCES
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--listen", default="0.0.0.0")
     parser.add_argument("--http-port", type=int, default=8080)
@@ -212,17 +249,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--log", type=Path, default=Path("/fixtures/echo-requests.jsonl"))
     parser.add_argument("--cert", type=Path)
     parser.add_argument("--key", type=Path)
+    parser.add_argument(
+        "--allow-source", action="append", default=[], metavar="ADDRESS",
+        help="accept payloads only from this source address; repeat for each node identity",
+    )
     args = parser.parse_args(argv)
 
     CONTROL_PATH = args.control
     LOG_PATH = args.log
+    ALLOWED_SOURCES = frozenset(args.allow_source)
     args.log.parent.mkdir(parents=True, exist_ok=True)
 
     server = DualStackServer(args.listen, args.http_port, args.https_port, args.cert, args.key)
     server.start()
     print(
         f"echo-fixture http={args.listen}:{args.http_port} "
-        f"https={args.listen}:{args.https_port} control={args.control}",
+        f"https={args.listen}:{args.https_port} control={args.control} "
+        f"allowed={','.join(sorted(ALLOWED_SOURCES)) or '*'}",
         flush=True,
     )
 

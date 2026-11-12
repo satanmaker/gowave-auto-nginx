@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 65
-  total: 190
+  podman_first: 66
+  total: 191
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -4304,6 +4304,25 @@ cases:
     the matrix, a node that never ran one of the clients, a declared case the matrix does not enumerate,
     or a tuple that produced no result fails the run instead of being counted as green.
   assertion_sha256: 257bcd082973db20a36ab866aec5ba61d2fa43bbcad869446ec439203e2b11b6
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-EGRESS
+  requirement: Non-bypassable node egress attribution
+  live_scenario: null
+  assertion: The Master and the Worker own distinct egress identities, every matrix payload is recorded
+    by the external endpoint under the identity of the node its case names, and a payload sent straight
+    at the endpoint from the Control Machine or the pinned-engine client is refused with the denial recorded
+    under that client's own source, so a client cannot manufacture the source evidence the data-plane
+    cases rest on.
+  assertion_sha256: 69ab11e10f67d98248f4ee89b8bb5520bd1b1fe32666374742cc577711a36987
   runs_in:
   - podman
   state: incubating

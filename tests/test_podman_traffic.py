@@ -346,22 +346,60 @@ class EchoStub(BaseHTTPRequestHandler):
 
     response = {"match": True}
     body = None
+    status = None
+    allow_sources = ()
+    record_denials = True
     received = []
+    denied = []
+
+    def _send_json(self, status, payload):
+        body = json.dumps(payload)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body.encode("utf-8"))))
+        self.end_headers()
+        self.wfile.write(body.encode("utf-8"))
+
+    def do_GET(self):  # noqa: N802 - the standard library names it this way
+        if self.path != "/diagnostics":
+            self._send_json(404, {"error": "not-found"})
+            return
+        self._send_json(200, {
+            "ok": True,
+            "requests": [
+                {"request_id": request_id, "path": path, "source_ip": "203.0.114.10"}
+                for path, request_id in type(self).received
+            ],
+            "denied": list(type(self).denied),
+            "allowed_sources": sorted(type(self).allow_sources),
+            "control": {},
+        })
 
     def do_POST(self):  # noqa: N802 - the standard library names it this way
         length = int(self.headers.get("Content-Length") or 0)
         payload = self.rfile.read(length)
         digest = hashlib.sha256(payload).hexdigest()
-        type(self).received.append((self.path, self.headers.get("X-Request-Id")))
+        source_ip = self.client_address[0]
+        request_id = self.headers.get("X-Request-Id")
+        if type(self).allow_sources and source_ip not in type(self).allow_sources:
+            if type(self).record_denials:
+                type(self).denied.append({"request_id": request_id, "source_ip": source_ip,
+                                          "reason": "source-not-allowed"})
+            self._send_json(403, {"error": "source-not-allowed", "request_id": request_id,
+                                  "source_ip": source_ip,
+                                  "allowed_sources": sorted(type(self).allow_sources)})
+            return
+        type(self).received.append((self.path, request_id))
         recorded = {
-            "request_id": self.headers.get("X-Request-Id"),
+            "request_id": request_id,
             "body_sha256": digest,
             "match": self.headers.get("X-Expect-SHA256") == digest,
             "source_ip": "203.0.114.10",
         }
         recorded.update(type(self).response)
         body = type(self).body if type(self).body is not None else json.dumps(recorded)
-        self.send_response(200 if type(self).response.get("match", True) else 500)
+        status = type(self).status or (200 if type(self).response.get("match", True) else 500)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body.encode("utf-8"))))
         self.end_headers()
@@ -371,19 +409,28 @@ class EchoStub(BaseHTTPRequestHandler):
         return
 
 
+def echo_stub_server(case, allow_sources=(), record_denials=True, status=None):
+    """Start the stub endpoint for one test and reset its recorded state."""
+    EchoStub.response = {"match": True}
+    EchoStub.body = None
+    EchoStub.status = status
+    EchoStub.allow_sources = tuple(allow_sources)
+    EchoStub.record_denials = record_denials
+    EchoStub.received = []
+    EchoStub.denied = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), EchoStub)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    case.addCleanup(server.server_close)
+    case.addCleanup(server.shutdown)
+    return f"127.0.0.1:{server.server_address[1]}"
+
+
 class TestTrafficProbeTransfer(unittest.TestCase):
     """One transfer proves itself with the endpoint's echo, not with a status."""
 
     def setUp(self):
-        EchoStub.response = {"match": True}
-        EchoStub.body = None
-        EchoStub.received = []
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), EchoStub)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
-        self.thread.start()
-        self.addCleanup(self.server.server_close)
-        self.addCleanup(self.server.shutdown)
-        self.destination = f"127.0.0.1:{self.server.server_address[1]}"
+        self.destination = echo_stub_server(self)
         self.label = {"tag": "vless-ws", "network": "ws"}
 
     def test_a_recorded_request_id_and_digest_is_what_proves_the_transfer(self):
@@ -451,6 +498,50 @@ class TestTrafficProbeTransfer(unittest.TestCase):
         self.assertEqual(report["delivered"], False)
         self.assertEqual(report["request_id"], "req-1")
         self.assertEqual(report["reason"], "ECONNREFUSED")
+
+    def test_a_payload_the_endpoint_refused_is_a_refusal_not_a_delivery(self):
+        # The endpoint answered, but it refused the source: counting that as a
+        # delivered payload would let a direct client attempt look like product
+        # traffic on the strength of an HTTP status.
+        EchoStub.allow_sources = ("203.0.114.10",)
+        report = traffic_probe.transfer(None, self.destination, self.label, "xray")
+        self.assertFalse(report["delivered"])
+        self.assertEqual(report["status"], 403)
+        self.assertIn("source-not-allowed", report["reason"])
+        self.assertEqual(report["source_ip"], "127.0.0.1")
+
+
+class TestTrafficProbeDirect(unittest.TestCase):
+    """The direct scope: a client role cannot deliver a payload to the endpoint."""
+
+    def setUp(self):
+        self.destination = echo_stub_server(self, allow_sources=("203.0.114.10",))
+
+    def test_a_direct_attempt_is_refused_and_recorded_as_a_denial(self):
+        facts = traffic_probe.direct(self.destination)
+        self.assertFalse(facts["accepted"])
+        self.assertEqual(facts["status"], 403)
+        self.assertIn("source-not-allowed", facts["reason"])
+        self.assertFalse(facts["recorded"])
+        self.assertTrue(facts["denied_recorded"])
+        self.assertEqual(facts["denied_source_ip"], "127.0.0.1")
+        self.assertEqual(facts["denied_sources"], ["127.0.0.1"])
+        self.assertEqual(facts["payload_sources"], [])
+        self.assertEqual(facts["allowed_sources"], ["203.0.114.10"])
+
+    def test_a_direct_endpoint_that_accepts_the_source_is_not_attribution(self):
+        EchoStub.allow_sources = ("127.0.0.1",)
+        facts = traffic_probe.direct(self.destination)
+        self.assertTrue(facts["accepted"])
+        self.assertEqual(facts["status"], 200)
+        self.assertEqual(facts["payload_sources"], ["203.0.114.10"])
+
+    def test_a_refusal_the_endpoint_did_not_log_is_not_a_denial(self):
+        EchoStub.record_denials = False
+        facts = traffic_probe.direct(self.destination)
+        self.assertEqual(facts["status"], 403)
+        self.assertFalse(facts["denied_recorded"])
+        self.assertEqual(facts["denied_sources"], [])
 
 
 class TestTrafficProbeTransferOne(unittest.TestCase):
@@ -682,14 +773,17 @@ class TestTrafficProbeProhibited(unittest.TestCase):
             "xray-prohibited", None, "HTTP 503 without an endpoint report",
         )
 
-    def run_scope(self, control, attempt, recorded=("xray-control",), destination=None):
+    def run_scope(self, control, attempt, recorded=("xray-control",), denied=(), destination=None):
         sequence = [control, attempt]
         with tempfile.TemporaryDirectory() as workdir:
             with mock.patch.object(traffic_probe, "xray_transfers",
                                    lambda *a, **k: list(sequence.pop(0))), \
                     mock.patch.object(
                         traffic_probe, "echo_diagnostics",
-                        lambda *a, **k: {"requests": [{"request_id": rid} for rid in recorded]},
+                        lambda *a, **k: {
+                            "requests": [{"request_id": rid} for rid in recorded],
+                            "denied": [{"request_id": rid} for rid in denied],
+                        },
                     ):
                 return traffic_probe.prohibited(
                     "/secrets", "/fixtures/ca/root.pem",
@@ -713,6 +807,15 @@ class TestTrafficProbeProhibited(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             self.run_scope([self.delivered()], [self.refused()],
                            recorded=("xray-control", "xray-prohibited"))
+        self.assertIn("recorded a payload sent to a destination", str(caught.exception))
+
+    def test_a_prohibited_payload_the_fixture_refused_on_source_is_still_a_leak(self):
+        # The endpoint sits behind a source allowlist, so a leak shows up as a
+        # recorded denial rather than an accepted request. The product's routing
+        # rule is not proven by the fixture's own policy refusing the payload.
+        with self.assertRaises(SystemExit) as caught:
+            self.run_scope([self.delivered()], [self.refused()],
+                           denied=("xray-prohibited",))
         self.assertIn("recorded a payload sent to a destination", str(caught.exception))
 
     def test_the_scope_refuses_to_run_without_a_destination(self):
@@ -1477,6 +1580,28 @@ class TestTrafficTopology(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"),
                              self.leaf[leaf_name].read_text(encoding="utf-8"))
             self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+
+    def test_the_endpoint_accepts_payloads_only_from_the_node_egress_identity(self):
+        echo = run_for(self.podman.runs, self.instance.echo_name)
+        command = list(echo["command"])
+        sources = [command[index + 1] for index, item in enumerate(command)
+                   if item == "--allow-source"]
+        self.assertEqual(sources, [self.instance.plan.data_target_ip],
+                         "the fixture has to refuse a payload that did not leave from the node")
+
+    def test_the_direct_egress_probe_runs_from_the_client_role_it_names(self):
+        self.instance.direct_egress_facts("control")
+        name, argv = self.podman.execs[-1]
+        self.assertEqual(name, self.instance.client_name)
+        self.assertEqual(argv[:2], ["python3", topology.TRAFFIC_PROBE_SCRIPT])
+        self.assertEqual(argv[argv.index("--scope") + 1], "direct")
+        self.assertEqual(argv[argv.index("--destination") + 1],
+                         f"{self.instance.plan.echo_ip}:{topology.ECHO_HTTP_PORT}")
+        self.instance.direct_egress_facts("engine")
+        self.assertEqual(self.podman.execs[-1][0], self.instance.engine_client_name)
+        with self.assertRaises(topology.TopologyError) as caught:
+            self.instance.direct_egress_facts("node")
+        self.assertIn("no client vantage", str(caught.exception))
 
     def test_the_endpoint_record_directory_is_run_scoped_and_private(self):
         self.assertEqual(self.instance.echo_dir.parent, self.instance.context.secret_dir)
