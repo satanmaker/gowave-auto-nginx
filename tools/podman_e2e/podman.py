@@ -176,13 +176,14 @@ class Podman:
         environment: Optional[Dict[str, str]] = None,
         command: Optional[Sequence[str]] = None,
         read_only_repo: bool = True,
+        systemd: str = "always",
     ) -> str:
         args = [
             "run", "-d", "--name", name,
             *self._ownership_labels(),
             "--network", network,
             "--hostname", aliases[0] if aliases else name,
-            "--systemd=always",
+            f"--systemd={systemd}",
         ]
         if privileged:
             args.append("--privileged")
