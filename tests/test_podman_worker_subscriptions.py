@@ -210,6 +210,36 @@ class TestWorkerSubscriptionCases(unittest.TestCase):
                          f"{topology.PANEL_DOMAIN},{topology.WORKER_DOMAIN}")
         self.assertEqual(evidence["short_uuid_length"], len(SHORT_UUID))
 
+    def test_the_clash_subset_grows_with_the_cluster(self):
+        # GenerateClash keeps only the trojan subset, and each node issues one, so
+        # a two-node Panel serves two Clash proxies. A single-node expectation
+        # here failed the live run podman-multi-node-20261112T205435-fb78f4c3 with
+        # "the clash YAML declares 2 proxies, expected 1" while the Panel was right.
+        data = matrix.load()
+        cluster = (matrix.inbounds(data, vision=False) * 2)
+        engine = engine_representations({
+            "base64.link_count": 8,
+            "xray_json.entries": 8,
+            "mihomo.proxies": 8,
+            "mihomo.proxy_details": [
+                {"name": "REALITY", "type": "vless", "server": topology.PANEL_DOMAIN},
+                {"name": "XHTTP", "type": "vless", "server": topology.PANEL_DOMAIN},
+                {"name": "WS", "type": "vless", "server": topology.PANEL_DOMAIN},
+                {"name": "TROJAN", "type": "trojan", "server": topology.PANEL_DOMAIN},
+                {"name": "REALITY-worker", "type": "vless", "server": topology.WORKER_DOMAIN},
+                {"name": "XHTTP-worker", "type": "vless", "server": topology.WORKER_DOMAIN},
+                {"name": "WS-worker", "type": "vless", "server": topology.WORKER_DOMAIN},
+                {"name": "TROJAN-worker", "type": "trojan", "server": topology.WORKER_DOMAIN},
+            ],
+            "clash.proxies": 2,
+            "singbox.outbounds": 8,
+        })
+        product = self._product(engine)
+        product.subscription_inbounds_override = cluster
+        evidence = aio.case_subscriptions(product)
+        self.assertEqual(evidence["clash_proxies"], 2)
+        self.assertEqual(evidence["mihomo_proxies"], 8)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -67,10 +67,10 @@ SUBSCRIPTION_PROBE_SCRIPT = topology.SUBSCRIPTION_PROBE_SCRIPT
 
 # What each YAML representation is expected to carry, per the shipped generators.
 # GenerateMihomo skips only kcp, so Mihomo receives one proxy per inbound.
-# GenerateClash skips vless, xhttp, kcp and hysteria outright, and the inbound set
-# has exactly one trojan entry, so Clash receives that single proxy — a strict
-# subset of the Mihomo inventory, not a second copy of it.
-CLASH_PROXIES = 1
+# GenerateClash skips vless, xhttp, kcp and hysteria outright, so Clash receives
+# one proxy per trojan inbound — a strict subset of the Mihomo inventory, not a
+# second copy of it. The count therefore follows the node inventory: one for an
+# All-in-One install, one per node for a cluster.
 MIHOMO_PROXY_TYPES: Sequence[str] = ("trojan", "vless")
 CLASH_PROXY_TYPES: Sequence[str] = ("trojan",)
 
@@ -1406,9 +1406,14 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
             f"a served Xray {shape} profile needed {xray_json.get('wrapped')!r} runtime wrapper(s) "
             "before Xray accepted it, so it is not a runnable config")
 
+    # Clash keeps only the trojan subset, and each node issues one, so a cluster
+    # serves one Clash proxy per node rather than the single one an All-in-One
+    # install serves.
+    trojan_inbounds = subscription_protocol_counts(product).get("trojan", 0)
     for name, proxies, expected_types, reason in (
         ("mihomo", product.subscription_inbound_count, MIHOMO_PROXY_TYPES, "one per inbound"),
-        ("clash", CLASH_PROXIES, CLASH_PROXY_TYPES, "the trojan subset GenerateClash keeps"),
+        ("clash", trojan_inbounds, CLASH_PROXY_TYPES,
+         "one per trojan inbound, so the trojan subset GenerateClash keeps"),
     ):
         record = loaded.get(name) or {}
         require("SUB-SERVED", record.get("exit") == 0,
