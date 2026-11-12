@@ -86,6 +86,10 @@ class TestPodmanTopology(unittest.TestCase):
         return instance, podman
 
     def create(self, **overrides):
+        # The disposable host must reach a resolver the fixtures do not answer for,
+        # so the tests pin one instead of inheriting whatever /etc/resolv.conf holds
+        # on the machine running them (CI runners only list loopback stubs).
+        overrides.setdefault("egress_resolvers", ["192.0.2.53"])
         instance, podman = self.topology(**overrides)
         with mock.patch.object(acme_fixture.AcmeFixture, "issued_root", return_value=PEM), \
                 mock.patch.object(acme_fixture.AcmeFixture, "wait_ready", return_value=None):

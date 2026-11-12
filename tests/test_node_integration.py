@@ -1021,7 +1021,10 @@ class TestNodeIntegration(unittest.TestCase):
         node_bin.write_text(
             "#!/bin/sh\n"
             f'printf "%s\\n" "$*" >> "{install_log}"\n'
-            f"[[ {install_rc} -eq 0 ]] || exit {install_rc}\n"
+            # /bin/sh is dash on Debian and Ubuntu, so the stub uses the POSIX test
+            # builtin: an unhandled [[ ... ]] there fails the command, `|| exit 0`
+            # fires and the rewritten version is never written.
+            f"[ {install_rc} -eq 0 ] || exit {install_rc}\n"
             + (f'printf "1.2.3\\n" > "{version_file}"\n' if rewrite_version else "")
             + "exit 0\n",
             encoding="utf-8",
