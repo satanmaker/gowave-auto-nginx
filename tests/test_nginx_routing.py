@@ -107,6 +107,93 @@ class TestNginxRouting(unittest.TestCase):
             self.assertTrue((cover_dir / "robots.txt").exists())
             self.assertTrue((cover_dir / "404.html").exists())
 
+    def test_derive_cover_domain(self):
+        cases = (
+            ("panel.example.com", "example.com"),
+            ("reality.example.com", "example.com"),
+            ("panel.sub.example.org", "example.org"),
+            ("example.com", ""),
+            ("", ""),
+        )
+        for domain, expected in cases:
+            with self.subTest(domain=domain):
+                res = subprocess.run(
+                    ["bash", "-c", f'source "{NGINX_SH}" && derive_cover_domain "{domain}"'],
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(res.stdout.strip(), expected)
+
+    def test_cover_domains_resolve_here_requires_both_records(self):
+        cases = (
+            ("", "203.0.113.10"),           # no cover domain at all
+            ("example.com", ""),            # public IPv4 unknown
+        )
+        for domain, server_ip in cases:
+            with self.subTest(domain=domain, server_ip=server_ip):
+                res = subprocess.run(
+                    ["bash", "-c",
+                     f'source "{NGINX_SH}" && cover_domains_resolve_here "{domain}" "{server_ip}"'],
+                    capture_output=True, text=True,
+                )
+                self.assertNotEqual(res.returncode, 0, "cover site must stay disabled")
+
+    def test_render_cover_site_substitutes_every_placeholder(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cover_dir = Path(tmpdir) / "cover-reality"
+            cmd = f'source "{NGINX_SH}" && render_cover_site "{cover_dir}" "reality.example.com"'
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+
+            index = (cover_dir / "index.html").read_text()
+            self.assertNotIn("{{", index)
+            self.assertIn("Example", index)  # brand derives from the site label
+            self.assertIn("/static/art/hero-1.svg", index)
+            self.assertNotIn('src="/static/hero.svg"', index)
+            self.assertNotIn('href="/favicon.ico"', index)
+
+            css = (cover_dir / "static" / "site.css").read_text()
+            self.assertIn("--accent:#0f6b5c", css)
+            self.assertIn("--accent2:#14876f", css)
+
+            for page in cover_dir.rglob("*"):
+                if page.suffix in {".html", ".css"}:
+                    self.assertNotIn("{{", page.read_text(), f"unrendered placeholder in {page}")
+
+    def test_cover_domain_reaches_the_decoy_and_redirects_http(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            inet6 = tmp / "if_inet6"
+            stream = tmp / "stream.conf"
+            http = tmp / "http.conf"
+            decoy = tmp / "decoy.conf"
+            cover_dir = tmp / "cover-reality"
+
+            cmd = (
+                f'source "{NGINX_SH}" && '
+                f'generate_stream_config "panel.example.com" "reality.example.com" "{stream}" "{inet6}" "" "example.com" && '
+                f'generate_production_http_vhost "panel.example.com" "reality.example.com" "{http}" "{inet6}" "" "example.com" && '
+                f'generate_decoy_vhost "reality.example.com" "{decoy}" nginx "{cover_dir}" "example.com"'
+            )
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+
+            # The apex terminates on the decoy listener, not on the Xray fallback.
+            stream_conf = stream.read_text()
+            self.assertIn("example.com 127.0.0.1:9443;", stream_conf)
+            self.assertIn("www.example.com 127.0.0.1:9443;", stream_conf)
+
+            http_conf = http.read_text()
+            self.assertIn("server_name panel.example.com reality.example.com example.com www.example.com;", http_conf)
+            self.assertIn("www\\.example\\.com", http_conf)
+            self.assertIn("return 301 https://$host$request_uri;", http_conf)
+
+            decoy_conf = decoy.read_text()
+            self.assertIn("server_name reality.example.com example.com www.example.com;", decoy_conf)
+            self.assertIn("error_page 404 /404.html;", decoy_conf)
+            self.assertTrue((cover_dir / "index.html").exists())
+            self.assertNotIn("{{", (cover_dir / "index.html").read_text())
+
     def test_generate_bootstrap_acme_vhost(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

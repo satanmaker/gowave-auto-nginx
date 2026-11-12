@@ -10,6 +10,107 @@ fi
 ACME_WEBROOT="${ACME_WEBROOT:-/var/www/gowave-acme}"
 COVER_REALITY_ROOT="${COVER_REALITY_ROOT:-/var/www/gowave-auto-nginx/cover-reality}"
 DECOY_ACCESS_LOG="${DECOY_ACCESS_LOG:-/var/log/nginx/gowave-decoy-access.log}"
+COVER_ACCENT="${GOWAVE_COVER_ACCENT:-#0f6b5c}"
+COVER_ACCENT2="${GOWAVE_COVER_ACCENT2:-#14876f}"
+COVER_SOFT="${GOWAVE_COVER_SOFT:-#e7f3ee}"
+COVER_HEADLINE="${GOWAVE_COVER_HEADLINE:-Plan the work, keep the context, move on.}"
+COVER_LEDE="${GOWAVE_COVER_LEDE:-Projects, notes and next steps in one calm place, with just enough structure to keep everyone oriented.}"
+
+# The cover site is served on the registrable apex of the deployment domain, so
+# a browser that reaches for the bare domain lands on a plausible static site
+# instead of a certificate error. Only domains with a subdomain part qualify:
+# for a two-label deployment domain the apex *is* the public entry point.
+derive_cover_domain() {
+    local panel_domain="${1:-}"
+    local labels
+    [[ -n "$panel_domain" ]] || return 0
+    IFS='.' read -r -a labels <<< "${panel_domain%.}"
+    local count="${#labels[@]}"
+    if [[ "$count" -lt 3 ]]; then
+        return 0
+    fi
+    printf '%s.%s\n' "${labels[count - 2]}" "${labels[count - 1]}"
+}
+
+# Cover-site brand is the site label of the deployment domain, so the decoy
+# names itself after its own domain instead of shipping a placeholder.
+cover_brand_from_domain() {
+    local domain="${1:-}"
+    local labels label word out=""
+    [[ -n "$domain" ]] || return 0
+    IFS='.' read -r -a labels <<< "${domain%.}"
+    local count="${#labels[@]}"
+    if [[ "$count" -ge 3 ]]; then
+        label="${labels[count - 2]}"
+    else
+        label="${labels[0]}"
+    fi
+    label="${label//-/ }"
+    for word in $label; do
+        out+="${word^} "
+    done
+    printf '%s\n' "${out% }"
+}
+
+# ACME validates the cover domains over port 80 on this host, so they are only
+# usable when both records already resolve to its public IPv4 address.
+cover_domains_resolve_here() {
+    local cover_domain="${1:-}"
+    local server_ip="${2:-}"
+    [[ -n "$cover_domain" && -n "$server_ip" ]] || return 1
+    local name resolved
+    for name in "$cover_domain" "www.$cover_domain"; do
+        resolved=$(getent ahostsv4 "$name" 2>/dev/null | awk 'NR==1 {print $1}')
+        [[ "$resolved" == "$server_ip" ]] || return 1
+    done
+}
+
+# Copy the camouflage template into the webroot and substitute its placeholders.
+# Files are rewritten through temporary siblings so a reader never sees a
+# half-rendered page.
+render_cover_site() {
+    local cover_root="$1"
+    local domain="${2:-}"
+    local source_dir="$SCRIPT_DIR/assets/cover-sites/cover-reality"
+
+    [[ -d "$cover_root" ]] || mkdir -p "$cover_root" || return 1
+    # The Worker receives the template in its payload instead of a checkout, so
+    # a missing source directory means "render what is already in the webroot".
+    if [[ -d "$source_dir" ]]; then
+        cp -r "$source_dir/." "$cover_root/" || return 1
+    fi
+    chmod -R 0755 "$cover_root" 2>/dev/null || true
+
+    local brand="${GOWAVE_COVER_BRAND:-}"
+    if [[ -z "$brand" ]]; then
+        brand=$(cover_brand_from_domain "$domain")
+    fi
+    brand="${brand//&/}"
+    brand="${brand//|/}"
+
+    local file tmp
+    while IFS= read -r file; do
+        tmp="$file.tmp.$$"
+        if ! sed -e "s|{{BRAND}}|$brand|g" \
+                 -e "s|{{ACCENT2}}|$COVER_ACCENT2|g" \
+                 -e "s|{{ACCENT}}|$COVER_ACCENT|g" \
+                 -e "s|{{SOFT}}|$COVER_SOFT|g" \
+                 -e "s|{{HOME_HEADLINE}}|$COVER_HEADLINE|g" \
+                 -e "s|{{HOME_LEDE}}|$COVER_LEDE|g" \
+                 "$file" > "$tmp"; then
+            rm -f "$tmp"
+            echo "Error: failed to render $file" >&2
+            return 1
+        fi
+        chmod 0644 "$tmp" && mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+    done < <(find "$cover_root" -type f \( -name '*.html' -o -name '*.css' \) -print)
+
+    if grep -rq '{{' "$cover_root" --include='*.html' --include='*.css'; then
+        echo "Error: camouflage site still contains unrendered placeholders under $cover_root" >&2
+        return 1
+    fi
+    echo "Rendered camouflage site for ${domain:-unknown domain} into $cover_root."
+}
 
 ensure_nginx_stream_block() {
     local nginx_conf="${1:-/etc/nginx/nginx.conf}"
@@ -56,6 +157,7 @@ generate_stream_config() {
     local out_file="${3:-/etc/nginx/stream-enabled/gowave-stream.conf}"
     local if_inet6="${4:-/proc/net/if_inet6}"
     local vision_domain="${5:-${VISION_DOMAIN:-}}"
+    local cover_domain="${6:-}"
 
     mkdir -p "$(dirname "$out_file")"
 
@@ -69,12 +171,22 @@ generate_stream_config() {
         vision_entry="    $vision_domain 127.0.0.1:8444;"
     fi
 
+    # The camouflage apex terminates on the decoy listener directly: no reason
+    # to expose an Xray fingerprint on a name that is meant to look like a
+    # plain static website.
+    local cover_entry=""
+    if [[ -n "$cover_domain" ]]; then
+        cover_entry="    $cover_domain 127.0.0.1:9443;
+    www.$cover_domain 127.0.0.1:9443;"
+    fi
+
     cat > "$out_file" <<EOF
 # Managed by GoWave Auto NGINX: Port 443 Stream SNI Router
 map \$ssl_preread_server_name \$sni_backend {
     $panel_domain 127.0.0.1:7443;
     $reality_domain 127.0.0.1:8443;
 $vision_entry
+$cover_entry
     default 127.0.0.1:8443;
 }
 
@@ -97,6 +209,7 @@ generate_bootstrap_acme_vhost() {
     local out_file="${3:-/etc/nginx/conf.d/00-bootstrap-acme.conf}"
     local if_inet6="${4:-/proc/net/if_inet6}"
     local vision_domain="${5:-}"
+    local cover_domain="${6:-}"
 
     mkdir -p "$(dirname "$out_file")"
     if [[ "$(id -u)" -eq 0 ]] || [[ -w "/var/www" ]]; then
@@ -112,6 +225,9 @@ generate_bootstrap_acme_vhost() {
     local server_names="$panel_domain $reality_domain"
     if [[ -n "$vision_domain" ]]; then
         server_names="$server_names $vision_domain"
+    fi
+    if [[ -n "$cover_domain" ]]; then
+        server_names="$server_names $cover_domain www.$cover_domain"
     fi
 
     cat > "$out_file" <<EOF
@@ -138,6 +254,7 @@ generate_production_http_vhost() {
     local out_file="${3:-/etc/nginx/conf.d/gowave-http.conf}"
     local if_inet6="${4:-/proc/net/if_inet6}"
     local vision_domain="${5:-}"
+    local cover_domain="${6:-}"
 
     mkdir -p "$(dirname "$out_file")"
     if [[ "$(id -u)" -eq 0 ]] || [[ -w "/var/www" ]]; then
@@ -155,6 +272,11 @@ generate_production_http_vhost() {
     if [[ -n "$vision_domain" ]]; then
         server_names="$server_names $vision_domain"
         redirect_regex="${redirect_regex}|${vision_domain}"
+    fi
+    if [[ -n "$cover_domain" ]]; then
+        local cover_regex="${cover_domain//./\\.}"
+        server_names="$server_names $cover_domain www.$cover_domain"
+        redirect_regex="${redirect_regex}|${cover_regex}|www\\.${cover_regex}"
     fi
 
     cat > "$out_file" <<EOF
@@ -343,14 +465,17 @@ generate_decoy_vhost() {
     local out_file="${2:-/etc/nginx/conf.d/gowave-decoy.conf}"
     local nginx_bin="${3:-nginx}"
     local cover_root="${4:-$COVER_REALITY_ROOT}"
+    local cover_domain="${5:-}"
 
     mkdir -p "$(dirname "$out_file")"
     if [[ "$(id -u)" -eq 0 ]] || [[ -w "/var/www" ]] || [[ -w "$(dirname "$cover_root")" ]] || [[ -d "$cover_root" && -w "$cover_root" ]]; then
-        mkdir -p "$cover_root" 2>/dev/null || true
-        if [[ -d "$cover_root" && -w "$cover_root" && -d "$SCRIPT_DIR/assets/cover-sites/cover-reality" ]]; then
-            cp -r "$SCRIPT_DIR/assets/cover-sites/cover-reality/." "$cover_root/"
-            chmod -R 0755 "$cover_root" 2>/dev/null || true
-        fi
+        # The decoy is the visible face of the deployment, so it is always
+        # rendered: an unsubstituted template is an obvious tell.
+        render_cover_site "$cover_root" "${cover_domain:-$reality_domain}" || return 1
+    fi
+    local cover_names=""
+    if [[ -n "$cover_domain" ]]; then
+        cover_names=" $cover_domain www.$cover_domain"
     fi
     local listen_directive
     listen_directive=$(render_nginx_listen_ssl_http2 "127.0.0.1:9443" "proxy_protocol" "$nginx_bin")
@@ -359,7 +484,7 @@ generate_decoy_vhost() {
 # Managed by GoWave Auto NGINX: REALITY Fallback Camouflage Decoy
 server {
     $listen_directive
-    server_name $reality_domain;
+    server_name $reality_domain$cover_names;
 
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
@@ -370,6 +495,7 @@ server {
 
     root $cover_root;
     index index.html;
+    error_page 404 /404.html;
 
     # Dedicated probe security audit log recording PROXY-restored remote_addr
     access_log $DECOY_ACCESS_LOG combined;
@@ -389,11 +515,7 @@ generate_vision_fallback_vhost() {
 
     mkdir -p "$(dirname "$out_file")"
     if [[ "$(id -u)" -eq 0 ]] || [[ -w "/var/www" ]] || [[ -w "$(dirname "$cover_root")" ]] || [[ -d "$cover_root" && -w "$cover_root" ]]; then
-        mkdir -p "$cover_root" 2>/dev/null || true
-        if [[ -d "$cover_root" && -w "$cover_root" && -d "$SCRIPT_DIR/assets/cover-sites/cover-reality" ]]; then
-            cp -r "$SCRIPT_DIR/assets/cover-sites/cover-reality/." "$cover_root/"
-            chmod -R 0755 "$cover_root" 2>/dev/null || true
-        fi
+        render_cover_site "$cover_root" "$vision_domain" || return 1
     fi
 
     cat > "$out_file" <<EOF

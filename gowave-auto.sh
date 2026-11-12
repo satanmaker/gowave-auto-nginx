@@ -176,6 +176,22 @@ PY
         check_acme_lineage "$vision_domain" "$effective_acme_server" || return 1
     fi
 
+    # The camouflage site lives on the registrable apex of the panel domain so
+    # that a browser reaching for the bare domain lands on a plausible static
+    # site. ACME validates it over port 80 on this host, so it is only enabled
+    # when both the apex and www already resolve here.
+    local cover_domain=""
+    cover_domain=$(derive_cover_domain "$panel_domain")
+    if [[ -n "$cover_domain" ]]; then
+        local server_ip=""
+        server_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me 2>/dev/null || \
+                    curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)
+        if ! cover_domains_resolve_here "$cover_domain" "$server_ip"; then
+            echo "Warning: camouflage apex site disabled — $cover_domain / www.$cover_domain do not resolve to this host (${server_ip:-unknown}); HTTP-01 would fail." >&2
+            cover_domain=""
+        fi
+    fi
+
     echo "==> Starting GoWave Auto NGINX All-in-One Deployment..."
     echo "Panel Domain:   $panel_domain"
     echo "Reality Domain: $reality_domain"
@@ -183,6 +199,11 @@ PY
         echo "Vision Domain:  $vision_domain (Optional VLESS + XTLS Vision enabled)"
     else
         echo "Vision Domain:  Disabled (default 4-inbound configuration)"
+    fi
+    if [[ -n "$cover_domain" ]]; then
+        echo "Cover Site:     $cover_domain (+ www) — camouflage website on the apex"
+    else
+        echo "Cover Site:     Disabled (apex does not resolve here or panel domain has no subdomain)"
     fi
 
     # Step 1: Preflight Environment Inspection
@@ -230,7 +251,7 @@ PY
         return 0
     }
 
-    if ! generate_bootstrap_acme_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/00-bootstrap-acme.conf" "/proc/net/if_inet6" "$vision_domain"; then
+    if ! generate_bootstrap_acme_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/00-bootstrap-acme.conf" "/proc/net/if_inet6" "$vision_domain" "$cover_domain"; then
         echo "Error: Failed to generate bootstrap ACME NGINX configuration; rolling back certificate lineages." >&2
         rollback_acme_lineages
         return 1
@@ -262,8 +283,16 @@ PY
     fi
 
     echo "Acquiring Let's Encrypt TLS certificate for REALITY decoy ($reality_domain)..."
+    # The camouflage certificate also covers the apex website, so one lineage
+    # serves both the probe fallback and the plain-domain landing page.
+    local reality_cert_args=(-d "$reality_domain")
+    local reality_cert_flags=()
+    if [[ -n "$cover_domain" ]]; then
+        reality_cert_args+=(-d "$cover_domain" -d "www.$cover_domain")
+        reality_cert_flags+=(--expand)
+    fi
     if ! certbot certonly --webroot -w "$ACME_WEBROOT" \
-        -d "$reality_domain" --cert-name "$reality_domain" \
+        "${reality_cert_args[@]}" "${reality_cert_flags[@]}" --cert-name "$reality_domain" \
         --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring \
         "${certbot_extra_args[@]}"; then
         rollback_acme_lineages
@@ -286,6 +315,7 @@ PY
     # Verify certificates cryptographically (refuse to proceed with invalid or missing certificates)
     if ! verify_acme_certificate "$panel_domain" || \
        ! verify_acme_certificate "$reality_domain" || \
+       { [[ -n "$cover_domain" ]] && ! verify_acme_certificate "$cover_domain" "/etc/letsencrypt/live/$reality_domain"; } || \
        { [[ -n "$vision_domain" ]] && ! verify_acme_certificate "$vision_domain"; }; then
         rollback_acme_lineages
         return 1
@@ -293,10 +323,10 @@ PY
 
     # Step 5: NGINX Configuration
     ensure_nginx_stream_block
-    generate_stream_config "$panel_domain" "$reality_domain" "/etc/nginx/stream-enabled/gowave-stream.conf" "/proc/net/if_inet6" "$vision_domain"
-    generate_production_http_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/gowave-http.conf" "/proc/net/if_inet6" "$vision_domain"
+    generate_stream_config "$panel_domain" "$reality_domain" "/etc/nginx/stream-enabled/gowave-stream.conf" "/proc/net/if_inet6" "$vision_domain" "$cover_domain"
+    generate_production_http_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/gowave-http.conf" "/proc/net/if_inet6" "$vision_domain" "$cover_domain"
     generate_panel_https_vhost "$panel_domain"
-    generate_decoy_vhost "$reality_domain"
+    generate_decoy_vhost "$reality_domain" "/etc/nginx/conf.d/gowave-decoy.conf" nginx "$COVER_REALITY_ROOT" "$cover_domain"
     if [[ -n "$vision_domain" ]]; then
         generate_vision_fallback_vhost "$vision_domain"
     fi
@@ -893,6 +923,13 @@ PY
     check_acme_lineage "$new_panel_domain" "$effective_acme_server" || return 1
     check_acme_lineage "$new_reality_domain" "$effective_acme_server" || return 1
 
+    local cover_domain=""
+    cover_domain=$(derive_cover_domain "$new_panel_domain")
+    if [[ -n "$cover_domain" ]] && ! cover_domains_resolve_here "$cover_domain" "$srv_ip"; then
+        echo "Warning: camouflage apex site disabled — $cover_domain / www.$cover_domain do not resolve to this host (${srv_ip:-unknown})." >&2
+        cover_domain=""
+    fi
+
     local snap_dir
     snap_dir=$(prepare_update_snapshot "domain-change")
     rollback_domain_change() {
@@ -926,7 +963,7 @@ from modules.recovery import write_journal_atomically
 write_journal_atomically(str(p), data)
 PY
 
-    generate_bootstrap_acme_vhost "$new_panel_domain" "$new_reality_domain"
+    generate_bootstrap_acme_vhost "$new_panel_domain" "$new_reality_domain" "/etc/nginx/conf.d/00-bootstrap-acme.conf" "/proc/net/if_inet6" "" "$cover_domain"
     reload_nginx_strict || { rollback_domain_change "bootstrap NGINX activation failed"; return 1; }
 
     local certbot_extra_args=()
@@ -937,17 +974,26 @@ PY
     if ! certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_panel_domain" --cert-name "$new_panel_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring "${certbot_extra_args[@]}"; then
         rollback_domain_change "ACME issuance failed for panel domain"; return 1
     fi
-    if ! certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_reality_domain" --cert-name "$new_reality_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring "${certbot_extra_args[@]}"; then
+    local new_reality_cert_args=(-d "$new_reality_domain")
+    local new_reality_cert_flags=()
+    if [[ -n "$cover_domain" ]]; then
+        new_reality_cert_args+=(-d "$cover_domain" -d "www.$cover_domain")
+        new_reality_cert_flags+=(--expand)
+    fi
+    if ! certbot certonly --webroot -w "$ACME_WEBROOT" "${new_reality_cert_args[@]}" "${new_reality_cert_flags[@]}" --cert-name "$new_reality_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring "${certbot_extra_args[@]}"; then
         rollback_domain_change "ACME issuance failed for REALITY domain"; return 1
     fi
     verify_acme_certificate "$new_panel_domain" || { rollback_domain_change "invalid panel certificate"; return 1; }
     verify_acme_certificate "$new_reality_domain" || { rollback_domain_change "invalid REALITY certificate"; return 1; }
+    if [[ -n "$cover_domain" ]] && ! verify_acme_certificate "$cover_domain" "/etc/letsencrypt/live/$new_reality_domain"; then
+        rollback_domain_change "REALITY certificate does not cover the camouflage apex"; return 1
+    fi
 
     rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
-    generate_stream_config "$new_panel_domain" "$new_reality_domain"
-    generate_production_http_vhost "$new_panel_domain" "$new_reality_domain"
+    generate_stream_config "$new_panel_domain" "$new_reality_domain" "/etc/nginx/stream-enabled/gowave-stream.conf" "/proc/net/if_inet6" "" "$cover_domain"
+    generate_production_http_vhost "$new_panel_domain" "$new_reality_domain" "/etc/nginx/conf.d/gowave-http.conf" "/proc/net/if_inet6" "" "$cover_domain"
     generate_panel_https_vhost "$new_panel_domain"
-    generate_decoy_vhost "$new_reality_domain"
+    generate_decoy_vhost "$new_reality_domain" "/etc/nginx/conf.d/gowave-decoy.conf" nginx "$COVER_REALITY_ROOT" "$cover_domain"
     sed -i "s/^PANEL_DOMAIN=.*/PANEL_DOMAIN=$new_panel_domain/" "$GOWAVE_DIR/.env"
     sed -i "s|^SUB_PUBLIC_DOMAIN=.*|SUB_PUBLIC_DOMAIN=$new_panel_domain/api/sub|" "$GOWAVE_DIR/.env"
 
