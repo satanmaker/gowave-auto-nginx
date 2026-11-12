@@ -216,18 +216,42 @@ class TestArtifactOwnership(unittest.TestCase):
             context.evidence_text("probe.txt", "evidence")
         chown.assert_not_called()
 
-    def test_a_root_run_outside_sudo_leaves_ownership_alone(self):
+    def test_a_root_run_outside_sudo_still_hands_the_tree_to_its_owner(self):
         from unittest import mock
 
+        chowned = []
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch("os.geteuid", return_value=0), \
-                mock.patch("os.chown") as chown, \
+                mock.patch("os.chown",
+                           side_effect=lambda path, uid, gid: chowned.append((Path(path), uid, gid))), \
                 mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SUDO_UID", None)
             os.environ.pop("SUDO_GID", None)
+            owner = os.stat(tmp)
             context = RunContext("aio", Path(tmp), budget_seconds=60, run_id="podman-aio-nosudo-abcd1234")
             context.evidence_text("probe.txt", "evidence")
-        chown.assert_not_called()
+        self.assertTrue(chowned, "a root shell has no SUDO_UID, so the artifact owner is the only signal")
+        self.assertEqual({(uid, gid) for _, uid, gid in chowned}, {(owner.st_uid, owner.st_gid)})
+
+    def test_sudo_credentials_name_the_operator_before_any_stat(self):
+        from unittest import mock
+
+        from tools.podman_e2e.runner import operator_identity
+
+        with mock.patch.dict(os.environ, {"SUDO_UID": "1234", "SUDO_GID": "5678"}):
+            self.assertEqual(operator_identity(Path("/nonexistent")), (1234, 5678))
+
+    def test_an_artifact_root_owned_by_root_is_left_alone(self):
+        from unittest import mock
+
+        from tools.podman_e2e.runner import operator_identity
+
+        root_owned = mock.Mock()
+        root_owned.stat.return_value = mock.Mock(st_uid=0, st_gid=0)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SUDO_UID", None)
+            os.environ.pop("SUDO_GID", None)
+            self.assertIsNone(operator_identity(root_owned))
 
 
 if __name__ == "__main__":
