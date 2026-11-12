@@ -31,6 +31,9 @@ QTYPE_NAMES = {TYPE_A: "A", TYPE_AAAA: "AAAA"}
 RCODE_NOERROR = 0
 RCODE_SERVFAIL = 2
 RCODE_NXDOMAIN = 3
+RCODE_REFUSED = 5
+
+DEFAULT_SUFFIX = "testbed.internal"
 
 DEFAULT_ZONE: Dict[str, object] = {
     "ttl": 300,
@@ -157,14 +160,35 @@ def encode_answer(name_pointer: bytes, qtype: int, ttl: int, values: Sequence[st
     return answers
 
 
-def build_response(query: bytes, zone: Zone, client: str, log_path: Optional[Path]) -> bytes:
+def in_zone(name: str, suffixes: Sequence[str]) -> bool:
+    return any(name == suffix or name.endswith("." + suffix) for suffix in suffixes)
+
+
+def build_response(
+    query: bytes,
+    zone: Zone,
+    client: str,
+    log_path: Optional[Path],
+    suffixes: Sequence[str] = (DEFAULT_SUFFIX,),
+    out_of_zone: str = "nxdomain",
+) -> bytes:
     transaction_id, name, qtype, qclass, flags, question = parse_question(query)
     behaviour = zone.behavior
     delay_ms = int(behaviour.get("delay_ms", 0) or 0)
     if delay_ms > 0:
         time.sleep(min(delay_ms, 5000) / 1000.0)
 
-    rcode, values, ttl = zone.lookup(name, qtype)
+    if not in_zone(name, suffixes):
+        # Out-of-zone names are never answered from here. REFUSED lets a resolver
+        # list fall through to the real resolver the target needs for packages,
+        # while a name inside the fixture zone can never be answered elsewhere.
+        rcode = RCODE_REFUSED if out_of_zone == "refused" else RCODE_NXDOMAIN
+        values: List[str] = []
+        ttl = zone.ttl
+        path = "out-of-zone-refused" if out_of_zone == "refused" else "out-of-zone-nxdomain"
+    else:
+        rcode, values, ttl = zone.lookup(name, qtype)
+        path = "authoritative"
     answer_bytes = encode_answer(b"\xc0\x0c", qtype, ttl, values) if rcode == RCODE_NOERROR else b""
     answer_count = len(values) if rcode == RCODE_NOERROR else 0
 
@@ -177,6 +201,7 @@ def build_response(query: bytes, zone: Zone, client: str, log_path: Optional[Pat
         "qtype": QTYPE_NAMES.get(qtype, str(qtype)),
         "qclass": qclass,
         "mode": str(behaviour.get("mode", "answer")),
+        "path": path,
         "rcode": rcode,
         "answers": values,
         "ttl": ttl,
@@ -184,7 +209,14 @@ def build_response(query: bytes, zone: Zone, client: str, log_path: Optional[Pat
     return header + question + answer_bytes
 
 
-def serve_udp(sock: socket.socket, zone: Zone, log_path: Optional[Path], stop: threading.Event) -> None:
+def serve_udp(
+    sock: socket.socket,
+    zone: Zone,
+    log_path: Optional[Path],
+    stop: threading.Event,
+    suffixes: Sequence[str],
+    out_of_zone: str,
+) -> None:
     while not stop.is_set():
         try:
             data, address = sock.recvfrom(4096)
@@ -193,7 +225,9 @@ def serve_udp(sock: socket.socket, zone: Zone, log_path: Optional[Path], stop: t
         except OSError:
             return
         try:
-            response = build_response(data, zone, f"{address[0]}:{address[1]}", log_path)
+            response = build_response(
+                data, zone, f"{address[0]}:{address[1]}", log_path, suffixes, out_of_zone,
+            )
         except (ValueError, struct.error) as exc:
             log_event(log_path, {
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -207,7 +241,13 @@ def serve_udp(sock: socket.socket, zone: Zone, log_path: Optional[Path], stop: t
             continue
 
 
-def handle_tcp(conn: socket.socket, zone: Zone, log_path: Optional[Path]) -> None:
+def handle_tcp(
+    conn: socket.socket,
+    zone: Zone,
+    log_path: Optional[Path],
+    suffixes: Sequence[str],
+    out_of_zone: str,
+) -> None:
     with conn:
         conn.settimeout(5)
         try:
@@ -221,13 +261,22 @@ def handle_tcp(conn: socket.socket, zone: Zone, log_path: Optional[Path]) -> Non
                 if not chunk:
                     return
                 data += chunk
-            response = build_response(data, zone, str(conn.getpeername()[0]), log_path)
+            response = build_response(
+                data, zone, str(conn.getpeername()[0]), log_path, suffixes, out_of_zone,
+            )
             conn.sendall(struct.pack("!H", len(response)) + response)
         except (OSError, ValueError, struct.error):
             return
 
 
-def serve_tcp(sock: socket.socket, zone: Zone, log_path: Optional[Path], stop: threading.Event) -> None:
+def serve_tcp(
+    sock: socket.socket,
+    zone: Zone,
+    log_path: Optional[Path],
+    stop: threading.Event,
+    suffixes: Sequence[str],
+    out_of_zone: str,
+) -> None:
     sock.settimeout(0.5)
     while not stop.is_set():
         try:
@@ -246,9 +295,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--zone", type=Path, default=Path("/fixtures/dns-zone.json"))
     parser.add_argument("--log", type=Path, default=Path("/fixtures/dns-queries.jsonl"))
     parser.add_argument("--no-tcp", action="store_true", help="Serve UDP only")
+    parser.add_argument(
+        "--suffix",
+        action="append",
+        default=None,
+        help=f"Authoritative zone suffix (repeatable, default {DEFAULT_SUFFIX})",
+    )
+    parser.add_argument(
+        "--out-of-zone",
+        choices=("nxdomain", "refused"),
+        default="nxdomain",
+        help="Answer for names outside the authoritative suffixes",
+    )
     args = parser.parse_args(argv)
 
     args.log.parent.mkdir(parents=True, exist_ok=True)
+    suffixes = tuple(args.suffix or (DEFAULT_SUFFIX,))
     zone = Zone(args.zone)
     stop = threading.Event()
 
@@ -263,13 +325,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     udp.bind((args.listen, args.port))
     udp.settimeout(0.5)
 
-    threads = [threading.Thread(target=serve_udp, args=(udp, zone, args.log, stop), daemon=True)]
+    threads = [threading.Thread(
+        target=serve_udp, args=(udp, zone, args.log, stop, suffixes, args.out_of_zone), daemon=True,
+    )]
     if not args.no_tcp:
         tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         tcp.bind((args.listen, args.port))
         tcp.listen(8)
-        threads.append(threading.Thread(target=serve_tcp, args=(tcp, zone, args.log, stop), daemon=True))
+        threads.append(threading.Thread(
+            target=serve_tcp, args=(tcp, zone, args.log, stop, suffixes, args.out_of_zone), daemon=True,
+        ))
 
     for thread in threads:
         thread.start()

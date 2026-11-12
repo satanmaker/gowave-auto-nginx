@@ -55,7 +55,7 @@ def free_port() -> int:
 
 
 class DnsFixture:
-    def __init__(self, zone: dict) -> None:
+    def __init__(self, zone: dict, extra_args=None) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.zone_path = root / "dns-zone.json"
@@ -69,6 +69,7 @@ class DnsFixture:
                 "--port", str(self.port),
                 "--zone", str(self.zone_path),
                 "--log", str(self.log_path),
+                *(extra_args or ()),
             ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -182,6 +183,32 @@ class TestDnsFixture(unittest.TestCase):
         self.assertEqual(rcode, 3)
         self.assertEqual(answers, [])
 
+    def test_out_of_zone_refused_lets_the_real_resolver_answer(self):
+        fixture = DnsFixture(BASE_ZONE, extra_args=("--out-of-zone", "refused"))
+        self.addCleanup(fixture.close)
+        _, rcode, answers = fixture.query("archive.ubuntu.com")
+        self.assertEqual(rcode, 5)
+        self.assertEqual(answers, [])
+        event = [item for item in fixture.queries() if item.get("qname") == "archive.ubuntu.com"][-1]
+        self.assertEqual(event["path"], "out-of-zone-refused")
+
+    def test_in_zone_names_never_fall_through_even_when_refusing(self):
+        fixture = DnsFixture(BASE_ZONE, extra_args=("--out-of-zone", "refused"))
+        self.addCleanup(fixture.close)
+        _, rcode, answers = fixture.query("missing.testbed.internal")
+        self.assertEqual(rcode, 3)
+        self.assertEqual(answers, [])
+
+    def test_suffix_is_configurable(self):
+        zone = {"ttl": 30, "records": {"panel.internal.example": {"A": ["10.89.0.10"]}}, "behavior": {"mode": "answer"}}
+        fixture = DnsFixture(zone, extra_args=("--suffix", "internal.example"))
+        self.addCleanup(fixture.close)
+        _, rcode, answers = fixture.query("panel.internal.example")
+        self.assertEqual(rcode, 0)
+        self.assertEqual(answers[0]["value"], "10.89.0.10")
+        _, rcode, _ = fixture.query("panel.testbed.internal")
+        self.assertEqual(rcode, 3)
+
     def test_diagnostics_record_every_query(self):
         fixture = self.fixture()
         fixture.query("worker.testbed.internal", TYPE_A)
@@ -190,6 +217,7 @@ class TestDnsFixture(unittest.TestCase):
         self.assertEqual(events[-1]["rcode"], 0)
         self.assertEqual(events[-1]["answers"], ["10.89.0.11"])
         self.assertEqual(events[-1]["mode"], "answer")
+        self.assertEqual(events[-1]["path"], "authoritative")
 
     def test_latency_injection_is_applied(self):
         fixture = self.fixture()

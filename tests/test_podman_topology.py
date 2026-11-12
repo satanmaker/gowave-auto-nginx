@@ -33,8 +33,8 @@ class FakePodman:
     def network_subnets(self):
         return list(self.used_subnets)
 
-    def network_create(self, name, subnet=None):
-        self.networks.append((name, subnet))
+    def network_create(self, name, subnet=None, disable_dns=False):
+        self.networks.append((name, subnet, disable_dns))
         return name
 
     def run(self, **kwargs):
@@ -79,7 +79,8 @@ class TestPodmanTopology(unittest.TestCase):
 
     def create(self, **overrides):
         instance, podman = self.topology(**overrides)
-        with mock.patch.object(acme_fixture.AcmeFixture, "issued_root", return_value=PEM):
+        with mock.patch.object(acme_fixture.AcmeFixture, "issued_root", return_value=PEM), \
+                mock.patch.object(acme_fixture.AcmeFixture, "wait_ready", return_value=None):
             instance.create()
         return instance, podman
 
@@ -105,18 +106,39 @@ class TestPodmanTopology(unittest.TestCase):
         self.assertEqual(records[topology.ECHO_HOST]["A"], [plan.echo_ip])
         self.assertEqual(zone["behavior"]["mode"], "answer")
 
+    def test_egress_resolvers_skip_stub_addresses(self):
+        directory = Path(tempfile.mkdtemp(prefix="gowave-resolv-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, True))
+        resolv = directory / "resolv.conf"
+        resolv.write_text(
+            "nameserver 169.254.1.1\nnameserver 127.0.0.53\nnameserver 192.168.1.1\n"
+            "nameserver 192.168.1.1\nnameserver 9.9.9.9\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(topology.egress_resolvers(resolv), ["192.168.1.1", "9.9.9.9"])
+        self.assertEqual(topology.egress_resolvers(directory / "absent"), [])
+
+    def test_a_run_without_an_egress_resolver_never_starts(self):
+        instance, podman = self.topology(egress_resolvers=[])
+        with self.assertRaises(topology.TopologyError):
+            instance.create()
+        self.assertEqual(podman.runs, [])
+        self.assertEqual(podman.networks, [])
+
     def test_dns_fixture_command_serves_the_zone(self):
         command = topology.dns_command("/fixtures/dns/zone.json", "/fixtures/dns/queries.jsonl")
         self.assertEqual(command[0], "python3")
         self.assertIn(topology.DNS_FIXTURE_SCRIPT, command)
         self.assertEqual(command[command.index("--port") + 1], "53")
         self.assertEqual(command[command.index("--zone") + 1], "/fixtures/dns/zone.json")
+        self.assertEqual(command[command.index("--out-of-zone") + 1], "refused")
 
     def test_create_builds_one_private_network_and_three_containers(self):
         instance, podman = self.create()
         self.assertEqual(instance.plan.subnet, "10.91.0.0/24")
         self.assertEqual(len(podman.networks), 1)
         self.assertEqual(podman.networks[0][1], "10.91.0.0/24")
+        self.assertTrue(podman.networks[0][2], "the run network must not install its own resolver")
         dns = run_for(podman.runs, instance.dns_name)
         self.assertEqual(dns["image_alias"], topology.FIXTURE_IMAGE)
         self.assertFalse(dns["privileged"])
@@ -131,6 +153,10 @@ class TestPodmanTopology(unittest.TestCase):
         extra = target["extra_args"]
         self.assertEqual(extra[extra.index("--ip") + 1], instance.plan.target_ip)
         self.assertEqual(extra[extra.index("--dns") + 1], instance.plan.dns_ip)
+        self.assertEqual(
+            [extra[i + 1] for i, value in enumerate(extra) if value == "--dns"],
+            [instance.plan.dns_ip, *instance.egress_resolvers],
+        )
         self.assertTrue(target["volumes"][0].startswith(str(podman.context.secret_dir / "client-ca")))
         self.assertIn(("systemd", instance.target_name, "", 0), podman.waits)
 

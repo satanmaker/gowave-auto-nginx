@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -16,6 +17,7 @@ from tools.podman_e2e import acme_fixture, images  # noqa: E402
 from tools.podman_e2e.runner import RunContext  # noqa: E402
 
 ENDPOINT_PATTERN = re.compile(r'^GOWAVE_ACME_TEST_ENDPOINT="(?P<url>[^"]+)"$', re.MULTILINE)
+PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
 
 
 def openssl(*argv, timeout=60):
@@ -213,6 +215,27 @@ class TestPodmanAcmeFixture(unittest.TestCase):
         self.assertIn(fixture.stop, context.cleanup_actions)
         fixture.stop()
         self.assertEqual(podman.commands[-1], ["rm", "-f", fixture.name])
+
+    def test_readiness_is_polled_outside_the_shell_less_pebble_image(self):
+        context = self.context()
+        podman = FakePodman(context)
+        fixture = acme_fixture.AcmeFixture(
+            podman, "net", directory=self.workdir(), management_host_port=15099,
+        )
+        fixture.start()
+        calls = []
+
+        def fake_fetch(host, ca_file=None, timeout=30, port=acme_fixture.MANAGEMENT_PORT):
+            calls.append((host, ca_file, timeout, port))
+            return PEM
+
+        with mock.patch.object(acme_fixture, "fetch_issued_root", side_effect=fake_fetch):
+            fixture.wait_ready(timeout_seconds=5)
+        self.assertEqual(podman.waits, [])
+        self.assertEqual(calls[0][0], "127.0.0.1")
+        self.assertEqual(calls[0][3], 15099)
+        self.assertEqual(fixture.issued_root(), PEM)
+        self.assertEqual(len(calls), 1)
 
     def test_fixture_container_name_is_run_scoped(self):
         first = acme_fixture.AcmeFixture(FakePodman(self.context()), "net")
