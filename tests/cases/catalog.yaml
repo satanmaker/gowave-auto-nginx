@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 66
-  total: 191
+  podman_first: 67
+  total: 192
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3437,6 +3437,26 @@ cases:
   driver: null
   driver_status: planned
   promotion_target: All-in-One Master VPS Installation Verification
+- id: NGX-05
+  requirement: NGINX SNI Routing and REALITY Decoy Verification
+  live_scenario: null
+  assertion: On every role the product installs, the generated NGINX tree passes `nginx -t`, its dump
+    carries that role's own server name and its ssl_preread SNI routing, the product's managed ACME deploy
+    hook does not reload NGINX when an invalid snippet makes `nginx -t` fail — leaving the master, its
+    workers and the 443 listener untouched — and the same hook does reload it, without replacing the master,
+    once the snippet is removed.
+  assertion_sha256: 56b66444d0fbc95522cfe904fed412572e9c8642ffba37dc8f5c8df207bf0709
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: NGINX SNI Routing and REALITY Decoy Verification
 - id: NGX-COVER-DERIVE
   requirement: Camouflage decoy and certificate lineage
   live_scenario: null

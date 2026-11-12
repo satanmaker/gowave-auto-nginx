@@ -42,6 +42,9 @@ VISION_CASE_ID = "MN-VISION"
 SSH_KEY_CASE_ID = "MN-SSHKEY"
 MATRIX_CASE_ID = "MN-MATRIX"
 EGRESS_CASE_ID = "MN-EGRESS"
+# One requirement, one case id: the AIO suite runs the same contract on its own
+# host, and a cluster runs it on both roles.
+NGINX_CONFIG_CASE_ID = aio.NGX_CONFIG_CASE_ID
 MTLS_TIMEOUT_SECONDS = 300
 MATRIX_TIMEOUT_SECONDS = 120
 EGRESS_TIMEOUT_SECONDS = 300
@@ -81,6 +84,9 @@ RESTART_CASE_TIMEOUT_SECONDS = (
 # representations from the Panel, and run Xray and Mihomo over each of them.
 SUB_SERVED_TIMEOUT_SECONDS = 900
 SUB_SHARE_LINK_TIMEOUT_SECONDS = 600
+# The configuration contract runs three probes per role and, on restore, waits
+# for that role's master to replace its workers.
+NGX_CONFIG_CASE_TIMEOUT_SECONDS = 2 * aio.NGX_CONFIG_TIMEOUT_SECONDS
 
 # The name the installer gives the node the Panel runs on. Without it, a cluster
 # audit could be satisfied by any two nodes rather than the ones the product
@@ -3017,6 +3023,29 @@ def case_egress(product: MultiNodeProduct) -> Dict[str, Any]:
     }
 
 
+def case_nginx_config(product: MultiNodeProduct) -> Dict[str, Any]:
+    """NGX-05: both roles validate their own generated NGINX tree and reload safely.
+
+    A cluster generates two independent configurations — the Master's and the
+    Worker's, written by two different scripts — so proving one says nothing about
+    the other. Each role runs the full contract against its own server name: the
+    tree it generated passes `nginx -t`, a broken snippet in the tree it reads
+    makes the product's own deploy hook refuse to reload, and removing the
+    snippet makes the same hook reload without replacing the master.
+    """
+    host = product.require_worker()
+    roles = (
+        ("master", "the Master", host.target_name, topology.PANEL_DOMAIN),
+        ("worker", "the Worker", host.worker_name, host.worker_domain),
+    )
+    evidence: Dict[str, Any] = {}
+    for key, label, container, domain in roles:
+        evidence[key] = aio.nginx_config_reload_contract(
+            product.podman, container, NGINX_CONFIG_CASE_ID, label, domain,
+        )
+    return evidence
+
+
 def case_worker_outage(product: MultiNodeProduct) -> Dict[str, Any]:
     """MN-OUTAGE: stopping the Worker degrades the cluster, and removing the fault restores it.
 
@@ -3427,6 +3456,11 @@ def cases(
              timeout_seconds=SUB_SERVED_TIMEOUT_SECONDS),
         Case("SUB-B64", "multi-node", lambda context: aio.case_share_links(product.master),
              timeout_seconds=SUB_SHARE_LINK_TIMEOUT_SECONDS),
+        # Both roles' trees are validated and reloaded before the lifecycle cases:
+        # revocation and the Worker's own outage must not be read through a
+        # configuration change this case made.
+        Case(NGINX_CONFIG_CASE_ID, "multi-node", lambda context: case_nginx_config(product),
+             timeout_seconds=NGX_CONFIG_CASE_TIMEOUT_SECONDS),
         # The lifecycle cases run last: they revoke a client and fault the
         # Worker's own unit, so nothing that observes a healthy cluster may run
         # after them and no earlier case may be blamed for their state.
