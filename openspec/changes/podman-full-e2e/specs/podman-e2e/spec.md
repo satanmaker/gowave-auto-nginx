@@ -40,14 +40,15 @@ The test framework MUST provide distinct Control, Master/Panel, and Worker roles
 
 ### Requirement: Real Panel subscription lifecycle
 
-The framework MUST use the actual GoWave Panel endpoint and the version-pinned API/client contract to create, retrieve, update where supported, and revoke test client access. It MUST exercise the real subscription User-Agent policy for both subscription formats. If the pinned Panel API exposes no client-update operation, the update case is NOT_APPLICABLE only with a cited contract and a separate verification of the closest supported mutation; the harness MUST NOT invent an endpoint.
+The framework MUST use the actual GoWave Panel endpoint and the version-pinned contract to create, retrieve, update where supported, and revoke test client access. It MUST exercise the real User-Agent policy: a non-empty header is accepted, while absent and blank headers are rejected. If the pinned API exposes no client-update operation, that case is NOT_APPLICABLE only with a cited contract and a separate check of the closest supported mutation; the harness MUST NOT invent endpoints.
 
 #### Scenario: Subscription User-Agent policy is enforced
 
-- **WHEN** the suite requests `/api/sub/<shortUuid>/v2ray-json` and `/api/sub/<shortUuid>/mihomo` from the real Panel
-- **THEN** each valid request carries the client-family User-Agent required by the pinned Panel version (`v2rayN`-compatible for Xray JSON and `ClashMeta`-compatible for Mihomo YAML)
-- **AND** each response is HTTP 200 with the expected content type and parseable subscription content
-- **AND** a request without User-Agent is checked against the pinned Panel policy and its actual status is asserted; the test MUST NOT assume a status code without verifying that version's contract
+- **WHEN** the suite requests every served subscription representation from the real Panel
+- **THEN** a request carrying a non-empty client-identifying User-Agent returns HTTP 200 with parseable content
+- **AND** a request with no User-Agent header is rejected with HTTP 403
+- **AND** a request with an explicitly blank User-Agent header is rejected with HTTP 403
+- **AND** the absent and blank rejection cases are recorded as separate results
 
 #### Scenario: Subscription is issued, updated where supported, and revoked
 
@@ -56,16 +57,35 @@ The framework MUST use the actual GoWave Panel endpoint and the version-pinned A
 - **AND** after revocation a fresh connection using the revoked access cannot transfer a payload
 - **AND** existing-session termination is asserted only if the pinned product contract promises immediate termination
 
+### Requirement: Panel subscription representations
+
+The framework MUST consume every representation the Panel serves and MUST NOT treat one as a substitute for another. Base64 share links at `/api/sub/<shortUuid>` are what Xray-family clients import; `/v2ray-json` is served as one config object or as a list of complete per-profile configs; `/mihomo` and `/clash` serve the Mihomo YAML.
+
+#### Scenario: Base64 share-link list matches the profile inventory
+
+- **GIVEN** a test client with subscriptions issued by the real Panel
+- **WHEN** the suite fetches `/api/sub/<shortUuid>` with a client-identifying User-Agent and decodes the base64 payload
+- **THEN** it contains one share link per proxy entry with the expected protocol, host, SNI, and fingerprint
+- **AND** an Xray-family mobile client imports that list, and the JSON body is never substituted for it as the client's subscription
+
+#### Scenario: Xray JSON is validated in both served shapes
+
+- **GIVEN** the Panel returns either a single config object or a list of complete per-profile configs
+- **WHEN** the suite validates the payload with the pinned Xray binary
+- **THEN** each list entry is validated as the complete config it is
+- **AND** only a bare outbound object is wrapped with a minimal runtime wrapper
+- **AND** no Panel-issued outbound field is replaced with a hand-built equivalent
+
 ### Requirement: Versioned protocol and client coverage matrix
 
-The framework MUST maintain a versioned, machine-readable protocol/client matrix derived from the authoritative product inventory and pinned generated configuration. Every applicable inbound on every installed node MUST be tested with both Xray and Mihomo using the corresponding Panel-issued subscription format.
+The framework MUST maintain a versioned, machine-readable protocol/client matrix derived from the authoritative product inventory and pinned generated configuration. Every applicable inbound on every installed node MUST be tested with both Xray and Mihomo using the corresponding Panel-issued representation.
 
 #### Scenario: Complete client and inbound matrix is executed
 
 - **WHEN** the suite executes against a pinned product version and selected Vision configuration
 - **THEN** the matrix includes VLESS REALITY, VLESS XHTTP/TLS, VLESS WebSocket/TLS, and Trojan gRPC/TLS on each node, plus VLESS Vision/TLS when enabled on that node
 - **AND** it validates actual Panel-issued Xray JSON and Mihomo YAML subscriptions against generated inbound/host configuration
-- **AND** Xray JSON is handled as subscription data: the harness extracts the Panel-issued proxy outbound and builds only the minimal runtime wrapper required by the pinned Xray binary (for example, local SOCKS inbound and routing); it MUST NOT pass the subscription JSON directly to `xray run` as though it were a complete core configuration or replace the generated outbound with a hand-built equivalent
+- **AND** Xray JSON is consumed as served: a list entry is validated as the complete per-profile config it is, a bare outbound object is wrapped with only the minimal runtime wrapper the pinned Xray binary needs (for example, local SOCKS inbound and routing), and the Panel-issued outbound is never replaced with a hand-built equivalent
 - **AND** runs every applicable inbound with both Xray and Mihomo
 - **AND** reports exactly 8 or 10 positive cases for All-in-One and 16, 18, or 20 for Multi-Node according to independently enabled Vision inbounds
 - **AND** fails on any unexplained count mismatch, missing client, missing node/inbound tuple, or silently skipped case
@@ -118,6 +138,43 @@ The framework MUST provide controlled DNS and ACME fixtures. Certificate issuanc
 - **THEN** the operator follows its documented failure/rollback contract
 - **AND** the previous working service state is independently verified where rollback is promised
 - **AND** the result is not classified as PASS unless the expected state is independently verified
+
+### Requirement: Camouflage decoy and certificate lineage
+
+Every installed host MUST serve the product's camouflage decoy. The cover apex is the last two labels of `panel_domain`; the apex and `www.<apex>` MUST resolve to the host, terminate on the loopback decoy listener, serve the rendered cover site, and be covered by the REALITY certificate lineage. The port 80 ACME vhost MUST stay reachable on Master and Worker so renewal keeps a working HTTP-01 path.
+
+#### Scenario: Decoy renders for the derived apex
+
+- **GIVEN** a `panel_domain` with at least three labels, and apex plus `www.<apex>` resolving to the host's IPv4 address
+- **WHEN** the operator completes installation or a domain change
+- **THEN** the cover site contains the expected `*.html`, `*.css`, and `*.svg` assets with the derived brand and no surviving `{{` placeholder
+- **AND** apex and `www` SNI terminate on the loopback listener while every VPN SNI keeps its own route
+- **AND** the decoy listener is unreachable from client networks and exposes no Panel, API, or management path
+
+#### Scenario: Unresolvable cover names block rendering
+
+- **GIVEN** either the apex or `www.<apex>` does not resolve to the host's IPv4 address
+- **WHEN** the operator attempts to install or re-render the decoy
+- **THEN** it refuses before issuing the lineage and reports the resolution failure
+- **AND** no partial decoy configuration or stale `sites-enabled` entry remains
+
+#### Scenario: Worker keeps its decoy and ACME route
+
+- **GIVEN** a provisioned Worker host
+- **WHEN** the Worker is installed, restarted, or reconfigured
+- **THEN** its port 80 ACME vhost remains reachable for renewal
+- **AND** its decoy listener and SNI routes are unchanged unless the domain actually changed
+
+### Requirement: Private test CA trust for both client engines
+
+Certificates issued by the local ACME fixture MUST be trusted by both client engines without changing global system trust. The Xray client MUST receive the fixture CA through explicit `tlsSettings.certificates` entries with `usage: verify`, because Xray ignores `SSL_CERT_FILE`; Mihomo, curl, and the Python clients MUST use the scoped bundle. A missing anchor MUST fail the case with a chain error rather than pass silently.
+
+#### Scenario: Fixture chain is trusted by Xray and Mihomo
+
+- **WHEN** both clients run against every TLS transport provisioned with a fixture-issued certificate
+- **THEN** each TLS session completes and the payload is transferred
+- **AND** the fixture CA is absent from system trust stores
+- **AND** removing the verify anchors turns the same case into a chain-verification failure
 
 ### Requirement: Non-bypassable node egress attribution
 
@@ -238,6 +295,85 @@ The framework MUST publish separate required CI jobs and reports for All-in-One 
 - **WHEN** CI evaluates a change requiring product-level Podman acceptance
 - **THEN** both All-in-One and Multi-Node jobs execute as separate required checks
 - **AND** a missing, skipped, blocked, or incomplete job prevents an overall acceptance PASS
+
+### Requirement: Pre-push and pull-request acceptance gate
+
+The full All-in-One and Multi-Node suites MUST run automatically before every push and as separate required pull-request checks, without live credentials and within the runtime budget declared in the protocol/client matrix. A run that exceeds the budget or omits cases MUST report INCOMPLETE and MUST NOT pass.
+
+#### Scenario: Pre-push run blocks a regressed change
+
+- **GIVEN** a contributor has installed the documented pre-push entrypoint
+- **WHEN** a change breaks a covered behavior
+- **THEN** the affected topology reports FAIL with its case IDs
+- **AND** the push is blocked until the suite passes or the run is explicitly bypassed outside the gate
+
+#### Scenario: Budget overrun is not a truncated pass
+
+- **WHEN** the declared runtime budget is exhausted before every case ran
+- **THEN** the suite reports INCOMPLETE naming the unexecuted cases
+- **AND** no aggregate job may convert that run into PASS
+
+### Requirement: Coverage completeness and error paths
+
+The framework MUST keep a checked-in inventory mapping every in-scope behavior to at least one case, and each behavior's error paths MUST be exercised. The inventory MUST cover installation, provisioning, subscription representations, data plane, decoy, TLS/DNS/ACME, network policy, lifecycle, and failure injection. The audit MUST fail when a behavior has no case or a case maps to no behavior, and shared contracts with the live acceptance capability MUST be asserted identically.
+
+#### Scenario: Unmapped behavior or orphan case fails the audit
+
+- **WHEN** the coverage audit runs against the inventory
+- **THEN** a behavior with no case, a behavior covered only on its happy path, and a case mapped to no behavior each produce a failure naming the item
+
+#### Scenario: Shared contract diverges from live acceptance
+
+- **WHEN** this capability and the live acceptance capability assert the same product contract
+- **THEN** their observable outcomes and expected counts agree
+- **AND** a divergence is reported as a defect in this capability, not accepted as a container-only variant
+
+### Requirement: Case incubation and promotion path
+
+Both acceptance suites MUST share one case catalog. A new case MUST be implemented in the Podman suite first and promoted to the live suite only after its Podman runs are stable and reviewed; after promotion it MUST assert the same observable outcome in both environments. A case that cannot run in containers MUST be tagged live-only with a written reason. The suites MUST NOT keep independent definitions of the same behavior.
+
+#### Scenario: New case starts in Podman
+
+- **GIVEN** a product behavior needs new acceptance coverage
+- **WHEN** the case is added to the catalog
+- **THEN** it enters with an incubating state and a Podman driver
+- **AND** no live driver is created before the promotion criteria are met
+
+#### Scenario: Promotion keeps one definition
+
+- **WHEN** an incubating case is promoted
+- **THEN** the same case ID and assertion text run against the live environment
+- **AND** the Podman suite keeps running that case as a regression
+- **AND** divergent assertion text for the same ID fails the catalog audit
+
+#### Scenario: Live-only case states its reason
+
+- **WHEN** a live scenario cannot be reproduced in containers
+- **THEN** it carries the live-only state with the specific environment limitation
+- **AND** its absence from the Podman run is reported as a justified exclusion, not as an unexpected skip
+
+### Requirement: Live scenario parity
+
+The Podman suite MUST provide a case for every live acceptance scenario whose behavior is reproducible in containers. Of the current 125 live scenarios, 115 are container-reproducible, 8 are partially reproducible, and 2 are live-only. Partial cases MUST state which part the container proves and which part only the live run proves. The parity inventory MUST be checked in and MUST fail when a live scenario has neither a Podman case nor a justified classification.
+
+#### Scenario: Parity inventory matches both suites
+
+- **WHEN** the audit compares live scenario IDs against catalog entries
+- **THEN** every scenario is classified as container, partial, or live-only
+- **AND** an unclassified scenario fails the audit
+
+#### Scenario: Partial case splits the proof
+
+- **GIVEN** a partial case such as real Let's Encrypt issuance
+- **WHEN** the Podman suite runs it
+- **THEN** the container asserts the operator and lineage mechanics against the fixture CA
+- **AND** the live run remains the only source of truth for public issuance
+
+#### Scenario: Podman-first case has a promotion target
+
+- **WHEN** a Podman case asserts a contract the live suite does not cover yet
+- **THEN** the catalog records its promotion target and owning live requirement
+- **AND** the case is still executed in the pre-push gate
 
 ### Requirement: Trustworthy result and diagnostics
 
