@@ -20,6 +20,7 @@ SUITES = {
         "test_nginx_routing.TestNginxRouting",
         "test_nonroot_lint.TestNonrootLint",
         "test_backup_format_v1.TestBackupFormatV1",
+        "test_user_links.TestUserLinks",
     ),
     "integration": (
         "test_api_client.TestAPIClient",
