@@ -18,10 +18,13 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from tools.podman_e2e import aio, denial, matrix as matrix_data, mtls, topology
+from tools.podman_e2e import (
+    acme_fixture, aio, denial, matrix as matrix_data, mtls, topology,
+)
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
 
@@ -35,10 +38,12 @@ DENIAL_CLASSIFICATION_CASE_ID = "FW-02"
 REVOCATION_CASE_ID = "MN-REVOKE"
 OUTAGE_CASE_ID = "MN-OUTAGE"
 RESTART_CASE_ID = "MN-RESTART"
+VISION_CASE_ID = "MN-VISION"
 MTLS_TIMEOUT_SECONDS = 300
 DENIAL_TIMEOUT_SECONDS = 300
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
+VISION_PROBE_TIMEOUT_SECONDS = 120
 WORKER_REPORT_TIMEOUT_SECONDS = 120
 # A stopped node is only reported offline once the Panel's own heartbeat window
 # has expired, and a node that starts again has to re-register and re-apply its
@@ -219,6 +224,155 @@ print(json.dumps({
 PY
 """
 
+# What one node provisioned for one Vision domain, read from that node itself:
+# the certificate lineage the product asked the ACME fixture for, the NGINX
+# stream route and vhost that carry the domain's name, and the config the node
+# loaded. The probe is handed the domain it must report on, including when the
+# run did not configure it, so an unconfigured node is proven to have no
+# endpoint under that name rather than merely having no endpoint at all.
+NODE_VISION_SCRIPT = r"""python3 - VISION_DOMAIN_PLACEHOLDER VISION_PORT_PLACEHOLDER <<'PY'
+import glob
+import json
+import os
+import subprocess
+import sys
+
+domain = sys.argv[1]
+port = int(sys.argv[2])
+LIVE = "/etc/letsencrypt/live"
+RENEWAL = "/etc/letsencrypt/renewal"
+CONFIG = "/run/gowave-node/xray.json"
+NGINX_STREAM = "/etc/nginx/stream-enabled"
+NGINX_CONF = "/etc/nginx/conf.d"
+
+
+def openssl(*arguments):
+    try:
+        result = subprocess.run(
+            ("openssl",) + arguments, capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False, ""
+    return result.returncode == 0, result.stdout
+
+
+def certificate():
+    lineage = os.path.join(LIVE, domain)
+    cert = os.path.join(lineage, "cert.pem")
+    key = os.path.join(lineage, "privkey.pem")
+    present = os.path.isfile(cert) and os.path.isfile(key)
+    facts = {
+        "lineage": lineage,
+        "present": present,
+        "host_ok": False,
+        "valid": False,
+        "issuer": "",
+        "renewal_server": "",
+    }
+    if present:
+        host_ok, _ = openssl("x509", "-in", cert, "-noout", "-checkhost", domain)
+        valid, _ = openssl("x509", "-in", cert, "-noout", "-checkend", "86400")
+        issued, issuer = openssl("x509", "-in", cert, "-noout", "-issuer")
+        facts["host_ok"] = host_ok
+        facts["valid"] = valid
+        facts["issuer"] = " ".join(issuer.split()) if issued else ""
+    renewal = os.path.join(RENEWAL, domain + ".conf")
+    if os.path.isfile(renewal):
+        with open(renewal, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                name, separator, value = line.partition("=")
+                if separator and name.strip() == "server":
+                    facts["renewal_server"] = value.strip()
+                    break
+    return facts
+
+
+def read(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.readlines()
+    except OSError:
+        return []
+
+
+def nginx():
+    routes = []
+    targets = []
+    for path in sorted(glob.glob(os.path.join(NGINX_STREAM, "*.conf"))):
+        for line in read(path):
+            fields = line.split()
+            if len(fields) < 2:
+                continue
+            if fields[0] == domain:
+                routes.append({"file": os.path.basename(path), "target": fields[1]})
+            if fields[1] == "127.0.0.1:%d;" % port:
+                targets.append(os.path.basename(path))
+    vhosts = []
+    for path in sorted(glob.glob(os.path.join(NGINX_CONF, "*.conf"))):
+        for line in read(path):
+            stripped = line.strip()
+            if not stripped.startswith("server_name "):
+                continue
+            names = [name.rstrip(";") for name in stripped.split()[1:]]
+            if domain in names:
+                vhosts.append(os.path.basename(path))
+                break
+    return {
+        "stream_routes": routes,
+        "stream_vision_targets": sorted(set(targets)),
+        "vhost_files": vhosts,
+        "vision_named_files": [
+            os.path.basename(path)
+            for path in sorted(glob.glob(os.path.join(NGINX_CONF, "*vision*")))
+        ],
+    }
+
+
+def applied():
+    try:
+        with open(CONFIG, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {"parsed": False, "inbounds": []}
+    if not isinstance(config, dict):
+        return {"parsed": False, "inbounds": []}
+    inbounds = []
+    for entry in config.get("inbounds") or []:
+        if not isinstance(entry, dict):
+            continue
+        stream = entry.get("streamSettings")
+        stream = stream if isinstance(stream, dict) else {}
+        inbounds.append({
+            "tag": str(entry.get("tag") or ""),
+            "type": str(entry.get("protocol") or ""),
+            "port": entry.get("port"),
+            "listen": str(entry.get("listen") or ""),
+            "network": str(stream.get("network") or "tcp"),
+            "security": str(stream.get("security") or "none"),
+        })
+    return {"parsed": True, "inbounds": inbounds}
+
+
+print(json.dumps({
+    "domain": domain,
+    "port": port,
+    "certificate": certificate(),
+    "nginx": nginx(),
+    "applied": applied(),
+}, sort_keys=True))
+PY
+"""
+
+
+def node_vision_script(domain: str, port: int) -> str:
+    """The probe for one node and one Vision name, with both values quoted."""
+    return (
+        NODE_VISION_SCRIPT
+        .replace("VISION_DOMAIN_PLACEHOLDER", shlex.quote(domain))
+        .replace("VISION_PORT_PLACEHOLDER", str(int(port)))
+    )
+
+
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
 VERSION_PATTERN = re.compile(r"\d+\.\d+(?:\.\d+)?")
 
@@ -283,6 +437,57 @@ def inbound_key(spec: Dict[str, Any]) -> tuple:
         str(spec.get("network") or "").lower(),
         str(spec.get("security") or "").lower(),
     )
+
+
+def vision_identity(data: Dict[str, Any]) -> Dict[str, Any]:
+    """The Vision inbound's identity, taken from the matrix and its shipped template.
+
+    The inbound is identified by the fields the node loads — protocol, internal
+    port, transport and security layer — not by its tag. The Panel names the tag
+    after the node it provisions, so a case that matched the tag would accept a
+    node carrying another node's inbound.
+    """
+    entry = matrix_data.inbound(data, matrix_data.VISION_INBOUND)
+    template = json.loads(
+        (matrix_data.REPO_ROOT / str(entry["template"])).read_text(encoding="utf-8")
+    )
+    stream = template.get("streamSettings")
+    stream = stream if isinstance(stream, dict) else {}
+    return {
+        "id": str(entry.get("id") or ""),
+        "type": str(template.get("protocol") or "").lower(),
+        "port": int(template.get("port")),
+        "network": str(stream.get("network") or "tcp").lower(),
+        "security": str(stream.get("security") or "none").lower(),
+    }
+
+
+def vision_matches(spec: Dict[str, Any], identity: Dict[str, Any]) -> bool:
+    """Whether one inbound declaration is the Vision inbound of this matrix."""
+    port = spec.get("port")
+    return (
+        str(spec.get("type") or "").lower(),
+        "" if port in (None, "") else str(port),
+        str(spec.get("network") or "").lower(),
+        str(spec.get("security") or "").lower(),
+    ) == (
+        identity["type"], str(identity["port"]), identity["network"], identity["security"],
+    )
+
+
+def describe_inbounds(specs: Sequence[Dict[str, Any]]) -> str:
+    """A compact, credential-free inbound listing for a failure message."""
+    described = [
+        "{tag}({type}/{network}/{security}@{port})".format(
+            tag=spec.get("tag") or "untagged",
+            type=spec.get("type") or "?",
+            network=spec.get("network") or "?",
+            security=spec.get("security") or "?",
+            port=spec.get("port") or "?",
+        )
+        for spec in specs
+    ]
+    return ", ".join(described) or "none"
 
 
 def node_api_inbounds(inbounds: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -615,6 +820,39 @@ class MultiNodeProduct:
             )
             self.worker_state_cache = parsed
         return self.worker_state_cache
+
+    def node_vision_facts(
+        self, case_id: str, node: str, domain: str, port: int,
+    ) -> Dict[str, Any]:
+        """Read one node's certificate, NGINX routing and applied config for a Vision name.
+
+        The probe runs inside the node's own container and reads only files the
+        product wrote, so what it reports is the deployment rather than what the
+        installer intended to deploy.
+        """
+        host = self.require_worker() if node == "worker" else self.require_installed()
+        container = host.worker_name if node == "worker" else host.target_name
+        result = self.podman.exec_bash(
+            container, node_vision_script(domain, port), check=False,
+            timeout=VISION_PROBE_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            result.returncode == 0,
+            f"the {node} Vision probe exited {result.returncode}: "
+            f"{(result.stderr or result.stdout or '').strip()[-2000:]}",
+        )
+        try:
+            facts = json.loads(result.stdout or "")
+        except json.JSONDecodeError:
+            facts = None
+        require(
+            case_id,
+            isinstance(facts, dict),
+            f"the {node} Vision probe did not print a JSON object: "
+            f"{(result.stdout or '')[:400]}",
+        )
+        return facts
 
     def worker_control_facts(self, case_id: str, timeout: int = 120) -> Dict[str, Any]:
         host = self.require_installed()
@@ -2076,6 +2314,218 @@ def case_worker_config(product: MultiNodeProduct) -> Dict[str, Any]:
     }
 
 
+def case_vision_independence(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-VISION: each node provisions — and lacks — the Vision endpoint on its own.
+
+    The four combinations are launched and counted elsewhere, but a count cannot
+    tell one node's configuration from the other's: swapping the two nodes'
+    Vision domains leaves every total unchanged. So each node is checked against
+    its *own* Vision name — the Panel declaration and host bound to it, the
+    certificate lineage, the NGINX stream route and vhost, and the config the
+    node applied. The absent configuration is asserted as exactly as the present
+    one, so a node that received its neighbour's endpoint fails.
+    """
+    product.require_worker()
+    identity = vision_identity(product.matrix)
+    port = identity["port"]
+    target = "127.0.0.1:{};".format(port)
+    cluster = product.cluster_facts(VISION_CASE_ID)
+
+    nodes: Dict[str, Dict[str, Any]] = {}
+    for record in (cluster.get("nodes") or {}).get("records") or []:
+        if isinstance(record, dict):
+            nodes[str(record.get("name") or "")] = record
+    hosts = [
+        record for record in (cluster.get("hosts") or {}).get("records") or []
+        if isinstance(record, dict)
+    ]
+
+    planned = (
+        ("master", LOCAL_NODE_NAME, topology.VISION_DOMAIN, bool(product.vision)),
+        (
+            "worker", topology.WORKER_NODE_NAME, topology.WORKER_VISION_DOMAIN,
+            bool(product.worker_vision),
+        ),
+    )
+    evidence: Dict[str, Any] = {
+        "combination": product.combination,
+        "vision_type": identity["type"],
+        "vision_internal_port": port,
+    }
+    for node, name, domain, enabled in planned:
+        record = nodes.get(name)
+        require(
+            VISION_CASE_ID,
+            isinstance(record, dict),
+            f"the Panel reports no node {name!r}; observed {sorted(nodes)}",
+        )
+        specs = [spec for spec in record.get("inbound_specs") or [] if isinstance(spec, dict)]
+        declared = [spec for spec in specs if vision_matches(spec, identity)]
+        digests = [
+            digest
+            for digest, spec in zip(record.get("inbounds") or [], specs)
+            if vision_matches(spec, identity) and digest
+        ]
+        # Hosts reference their node by the digest the node record carries, not
+        # by name, so the relation is proven the way the Panel stores it.
+        uuid = str(record.get("uuid") or "")
+        vision_hosts = [
+            host for host in hosts
+            if uuid and uuid in (host.get("nodes") or [])
+            and domain in (host.get("address"), host.get("sni"))
+        ]
+
+        facts = product.node_vision_facts(VISION_CASE_ID, node, domain, port)
+        certificate = facts.get("certificate") or {}
+        routing = facts.get("nginx") or {}
+        applied = facts.get("applied") or {}
+        require(
+            VISION_CASE_ID,
+            applied.get("parsed") is True,
+            f"the {node} node has no parseable applied config at "
+            f"/run/gowave-node/xray.json, so the inbounds it serves cannot be observed",
+        )
+        loaded = [entry for entry in applied.get("inbounds") or [] if isinstance(entry, dict)]
+        loaded_vision = [entry for entry in loaded if vision_matches(entry, identity)]
+        routes = [route for route in routing.get("stream_routes") or [] if isinstance(route, dict)]
+        targets = list(routing.get("stream_vision_targets") or [])
+        vhosts = list(routing.get("vhost_files") or [])
+        named = list(routing.get("vision_named_files") or [])
+
+        evidence[f"{node}_domain"] = domain
+        evidence[f"{node}_vision_enabled"] = enabled
+        evidence[f"{node}_declared_vision_inbounds"] = len(declared)
+        evidence[f"{node}_vision_hosts"] = len(vision_hosts)
+        evidence[f"{node}_certificate"] = bool(certificate.get("present"))
+        evidence[f"{node}_renewal_server"] = str(certificate.get("renewal_server") or "")
+        evidence[f"{node}_stream_routes"] = ",".join(
+            str(route.get("file") or "") for route in routes
+        )
+        evidence[f"{node}_vhosts"] = ",".join(vhosts)
+        evidence[f"{node}_applied_inbounds"] = len(loaded)
+        evidence[f"{node}_applied_vision_inbounds"] = len(loaded_vision)
+
+        if enabled:
+            require(
+                VISION_CASE_ID,
+                len(declared) == 1,
+                f"the Panel declares {len(declared)} Vision inbounds for {name!r}, "
+                f"expected exactly one: {describe_inbounds(specs)}",
+            )
+            require(
+                VISION_CASE_ID,
+                len(vision_hosts) == 1,
+                f"{name!r} owns {len(vision_hosts)} Panel hosts under the Vision domain "
+                f"{domain!r}, expected exactly one",
+            )
+            host = vision_hosts[0]
+            require(
+                VISION_CASE_ID,
+                len(digests) == 1 and host.get("inbound") == digests[0],
+                f"the Panel host under {domain!r} is bound to inbound "
+                f"{host.get('inbound')!r} instead of the node's own Vision inbound "
+                f"{digests[0] if digests else 'none'!r}",
+            )
+            observed = (
+                host.get("address"), host.get("sni"), str(host.get("port")),
+                host.get("security_layer"),
+            )
+            require(
+                VISION_CASE_ID,
+                observed == (domain, domain, "443", "TLS"),
+                f"the Panel host under {domain!r} publishes {observed} instead of "
+                f"{(domain, domain, '443', 'TLS')}",
+            )
+            require(
+                VISION_CASE_ID,
+                host.get("disabled") is False,
+                f"the Vision host of {name!r} is disabled, so {domain!r} is published "
+                f"but unusable",
+            )
+            require(
+                VISION_CASE_ID,
+                certificate.get("present") is True,
+                f"{node} provisioned no certificate for {domain!r}: {certificate}",
+            )
+            require(
+                VISION_CASE_ID,
+                certificate.get("host_ok") is True,
+                f"the {node} certificate for {domain!r} does not cover the name: "
+                f"{certificate}",
+            )
+            require(
+                VISION_CASE_ID,
+                certificate.get("valid") is True,
+                f"the {node} certificate for {domain!r} expires within a day: {certificate}",
+            )
+            require(
+                VISION_CASE_ID,
+                certificate.get("renewal_server") == acme_fixture.ACME_DIRECTORY_URL,
+                f"the {node} renewal config asks {certificate.get('renewal_server')!r} "
+                f"instead of this run's ACME directory "
+                f"{acme_fixture.ACME_DIRECTORY_URL!r}",
+            )
+            require(
+                VISION_CASE_ID,
+                len(routes) == 1 and routes[0].get("target") == target,
+                f"{node} routes {domain!r} to "
+                f"{[route.get('target') for route in routes]} instead of exactly one "
+                f"{target} route",
+            )
+            require(
+                VISION_CASE_ID,
+                bool(vhosts),
+                f"{node} has no vhost naming {domain!r}, so nothing terminates TLS for "
+                f"the domain on that node",
+            )
+            require(
+                VISION_CASE_ID,
+                len(loaded_vision) == 1,
+                f"the {node} applied config carries {len(loaded_vision)} Vision inbounds "
+                f"instead of one: {describe_inbounds(loaded)}",
+            )
+            continue
+
+        require(
+            VISION_CASE_ID,
+            not declared,
+            f"the Panel declares a Vision inbound for {name!r} although the run did not "
+            f"configure one there: {describe_inbounds(declared)}",
+        )
+        require(
+            VISION_CASE_ID,
+            not vision_hosts,
+            f"the Panel publishes {len(vision_hosts)} hosts under {domain!r} for {name!r} "
+            f"although the run did not configure Vision there",
+        )
+        require(
+            VISION_CASE_ID,
+            certificate.get("present") is False,
+            f"{node} holds a certificate for {domain!r} although the run did not "
+            f"configure Vision there: {certificate}",
+        )
+        require(
+            VISION_CASE_ID,
+            not routes and not targets,
+            f"{node} routes Vision traffic although the run did not configure it: "
+            f"domain routes {routes}, {target} routes {targets}",
+        )
+        require(
+            VISION_CASE_ID,
+            not vhosts and not named,
+            f"{node} keeps Vision vhosts although the run did not configure Vision: "
+            f"naming {domain!r} {vhosts}, vision-named files {named}",
+        )
+        require(
+            VISION_CASE_ID,
+            not loaded_vision,
+            f"the {node} applied config carries a Vision inbound although the run did "
+            f"not configure one: {describe_inbounds(loaded_vision)}",
+        )
+
+    return evidence
+
+
 def case_worker_outage(product: MultiNodeProduct) -> Dict[str, Any]:
     """MN-OUTAGE: stopping the Worker degrades the cluster, and removing the fault restores it.
 
@@ -2437,6 +2887,8 @@ def cases(
              timeout_seconds=WORKER_STATE_TIMEOUT_SECONDS),
         Case(WORKER_CONFIG_CASE_ID, "multi-node", lambda context: case_worker_config(product),
              timeout_seconds=WORKER_STATE_TIMEOUT_SECONDS),
+        Case(VISION_CASE_ID, "multi-node", lambda context: case_vision_independence(product),
+             timeout_seconds=CLUSTER_TIMEOUT_SECONDS),
     ]
     for case_id, inbound, client, node in data_plane:
         suite.append(Case(

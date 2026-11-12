@@ -84,6 +84,7 @@ SUITES = {
         "test_podman_denial.TestDenialFactsVantage",
         "test_podman_cluster.TestClusterScope",
         "test_podman_cluster.TestClusterCases",
+        "test_podman_cluster.TestVisionCase",
         "test_podman_worker_state.TestWorkerProbeParsing",
         "test_podman_worker_state.TestWorkerProbeContract",
         "test_podman_worker_state.TestWorkerStateCase",

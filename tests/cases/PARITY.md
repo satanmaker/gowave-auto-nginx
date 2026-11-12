@@ -87,6 +87,7 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **MN-REVOKE** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **MN-OUTAGE** — promotion target: Negative Scenario and Fault Injection Tests
 - **MN-RESTART** — promotion target: Negative Scenario and Fault Injection Tests
+- **MN-VISION** — promotion target: Independent Optional Vision Domains
 - **AIO-DP-REALITY-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-REALITY-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-XHTTP-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
