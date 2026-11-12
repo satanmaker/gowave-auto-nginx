@@ -729,7 +729,8 @@ class TestNodeIntegration(unittest.TestCase):
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
         remote_start = worker_script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
         function_start = worker_script.index("restore_acme_lineage() {", remote_start)
-        function_end = worker_script.index("\n}\n\nacquire_mutation_lock", function_start) + 2
+        lock_at = worker_script.index("\nacquire_mutation_lock\n", function_start)
+        function_end = worker_script.rindex("\n}", function_start, lock_at) + 2
         self.assertGreater(function_start, remote_start)
         self.assertGreater(function_end, function_start)
         restore_function = worker_script[function_start:function_end]
@@ -787,7 +788,8 @@ class TestNodeIntegration(unittest.TestCase):
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
         remote_start = worker_script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
         function_start = worker_script.index("restore_acme_lineage() {", remote_start)
-        function_end = worker_script.index("\n}\n\nacquire_mutation_lock", function_start) + 2
+        lock_at = worker_script.index("\nacquire_mutation_lock\n", function_start)
+        function_end = worker_script.rindex("\n}", function_start, lock_at) + 2
         restore_function = worker_script[function_start:function_end]
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1268,6 +1270,118 @@ class TestLocalNodeIdempotency(unittest.TestCase):
                         install.index('bash "$upstream_installer" </dev/null'))
         self.assertIn("if (( node_restart_required == 1 )) && "
                       '[[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then', install)
+
+
+class TestWorkerPayloadBootstrap(unittest.TestCase):
+    """The Worker payload must provision python3 before the transaction that uses it.
+
+    A minimal supported host has no interpreter, and the mutation lease plus the
+    ACME lineage snapshots are python3 and openssl. When the payload reached them
+    first, ``node add`` died at its first Python call and the compensation failed
+    for the same reason, leaving the Worker half-provisioned.
+    """
+
+    def capture(self, tmp, *command):
+        tmp = Path(tmp)
+        known_hosts = tmp / "known_hosts"
+        known_hosts.write_text(
+            "127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGMockKeyMockKeyMockKeyMockKeyMockKeyMockKey\n"
+        )
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        capture = tmp / "payload.sh"
+        mock_ssh = bin_dir / "ssh"
+        mock_ssh.write_text(f'#!/bin/sh\ncat > "{capture}"\nexit 0\n')
+        mock_ssh.chmod(0o755)
+
+        env = os.environ.copy()
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+        env["SSH_KNOWN_HOSTS"] = str(known_hosts)
+        env["SECRET_KEY"] = "bW9jay1zZWNyZXQ="
+        result = subprocess.run(
+            [str(REPO_ROOT / "gowave-node-auto.sh"), *command],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}, stderr: {result.stderr}")
+        return capture.read_text()
+
+    def payload(self, tmp):
+        return self.capture(tmp, "remote_payload", "127.0.0.1", "22",
+                            "worker.example.com", "reality.example.com", "root")
+
+    def test_the_interpreter_arrives_before_the_lease_and_the_snapshots(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload = self.payload(tmpdir)
+        main_body = payload.split("main() {", 1)[1]
+        bootstrap_at = main_body.index("bootstrap_early_tools </dev/null")
+        self.assertLess(bootstrap_at, main_body.index("acquire_mutation_lock"),
+                        "the lease is python3, so it cannot come first")
+        self.assertLess(bootstrap_at, main_body.index("snapshot_acme_lineage"))
+        self.assertLess(bootstrap_at, main_body.index("setup_system_prereqs"))
+
+    def test_the_rollback_can_run_without_a_preinstalled_interpreter(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rollback = self.capture(tmpdir, "remote_rollback", "127.0.0.1", "22",
+                                    "worker.example.com", "reality.example.com", "root")
+        self.assertIn("command -v python3", rollback)
+        self.assertLess(rollback.rindex("command -v python3"),
+                        rollback.rindex("acquire_mutation_lock"))
+
+    def test_the_bootstrap_installs_only_what_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            payload = self.payload(tmp)
+            script = tmp / "payload.sh"
+            script.write_text(
+                "\n".join(
+                    line for line in payload.splitlines()
+                    if not line.startswith('main "$@"')
+                ) + "\n",
+                encoding="utf-8",
+            )
+            stubs = tmp / "stubs"
+            stubs.mkdir()
+            calls = tmp / "apt-calls.log"
+            installed = tmp / "installed"
+            (stubs / "dpkg-query").write_text(
+                "#!/bin/sh\n"
+                "for pkg in \"$@\"; do :; done\n"
+                f"if grep -qxF \"$pkg\" \"{installed}\" 2>/dev/null; then\n"
+                '  echo "install ok installed"\n'
+                "else\n"
+                '  echo "deinstall ok config-files"\n'
+                "fi\n"
+            )
+            (stubs / "apt-get").write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{calls}"\nexit 0\n')
+            for stub in (stubs / "dpkg-query", stubs / "apt-get"):
+                stub.chmod(0o755)
+
+            def bootstrap(pretend_installed):
+                installed.write_text("\n".join(pretend_installed) + "\n", encoding="utf-8")
+                calls.write_text("", encoding="utf-8")
+                result = subprocess.run(
+                    ["bash", "-c", 'source "$1"; set +euo pipefail; bootstrap_early_tools',
+                     "test", str(script)],
+                    env={**os.environ, "PATH": f"{stubs}:{os.environ['PATH']}"},
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return calls.read_text()
+
+            missing_all = bootstrap([])
+            self.assertIn("update -qq", missing_all)
+            install_line = [line for line in missing_all.splitlines() if line.startswith("install")]
+            self.assertEqual(len(install_line), 1, missing_all)
+            for package in ("python3", "openssl", "ca-certificates"):
+                self.assertIn(package, install_line[0])
+
+            self.assertEqual(bootstrap(["python3", "iproute2", "curl", "ca-certificates", "openssl"]), "",
+                             "a prepared host must not be touched again")
+
+            only_openssl = bootstrap(["python3", "iproute2", "curl", "ca-certificates"])
+            self.assertIn("install", only_openssl)
+            self.assertIn("openssl", only_openssl)
+            self.assertNotIn("python3", only_openssl)
 
 
 if __name__ == "__main__":
