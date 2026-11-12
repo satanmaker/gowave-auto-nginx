@@ -16,8 +16,17 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.podman_e2e import aio, catalog, panel_surface, target_image, topology  # noqa: E402
+from tools.podman_e2e import (  # noqa: E402
+    aio,
+    catalog,
+    matrix,
+    panel_surface,
+    target_image,
+    topology,
+)
 from tools.podman_e2e.runner import Case, CaseBlocked, RunContext  # noqa: E402
+
+MATRIX_INBOUNDS = len(matrix.inbounds(matrix.load(), vision=False))
 
 INSTALL_OUTPUT = (
     "Configured /opt/gowave/.env with mode 0640.\n"
@@ -557,7 +566,7 @@ class TestPanelApiCases(unittest.TestCase):
         evidence = aio.case_panel_auth(product)
         self.assertEqual(evidence["login_status"], 200)
         self.assertEqual(evidence["unauthenticated_nodes_status"], 401)
-        self.assertEqual(evidence["host_count"], aio.CORE_INBOUNDS)
+        self.assertEqual(evidence["host_count"], MATRIX_INBOUNDS)
         self.assertEqual(podman.scripts[0], f"python3 {aio.PANEL_SURFACE_SCRIPT} --scope surface")
 
     def test_auth_case_rejects_an_unauthenticated_read_surface(self):
@@ -636,7 +645,7 @@ class TestPanelSurfaceProbe(unittest.TestCase):
         self.credentials.chmod(0o600)
         inbounds = [
             {"uuid": f"inbound-{index}", "tag": f"tag-{index}", "type": "vless", "port": 443}
-            for index in range(aio.CORE_INBOUNDS)
+            for index in range(MATRIX_INBOUNDS)
         ]
         self.inbounds = inbounds
         self.server = self._start_stub(inbounds)
@@ -759,11 +768,11 @@ class TestPanelSurfaceProbe(unittest.TestCase):
         surface = facts["surface"]
         self.assertEqual(surface["unauthenticated_nodes_status"], 401)
         self.assertEqual(surface["nodes"]["count"], 1)
-        self.assertEqual(surface["nodes"]["inbound_count"], aio.CORE_INBOUNDS)
+        self.assertEqual(surface["nodes"]["inbound_count"], MATRIX_INBOUNDS)
         self.assertEqual(surface["profiles"]["inbound_digest"], surface["nodes"]["inbound_digest"])
         self.assertEqual(surface["squads"]["mvp_inbound_digest"],
                          surface["profiles"]["inbound_digest"])
-        self.assertEqual(surface["hosts"]["count"], aio.CORE_INBOUNDS)
+        self.assertEqual(surface["hosts"]["count"], MATRIX_INBOUNDS)
         self.assertEqual(surface["default_user"]["short_uuid_length"], len("default-short-uuid"))
         for uuid in (item["uuid"] for item in self.inbounds):
             self.assertNotIn(uuid, json.dumps(surface))

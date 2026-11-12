@@ -1103,7 +1103,8 @@ class TestSubscriptionCases(unittest.TestCase):
         self.reject_links({"link_count": 3}, "one per inbound")
 
     def test_share_link_case_rejects_a_changed_protocol_set(self):
-        self.reject_links({"protocols": {"vless": 4}}, "three vless and one trojan")
+        self.reject_links({"protocols": {"vless": 4}},
+                          "instead of the inbound set's own {'vless': 3, 'trojan': 1}")
 
     def test_share_link_case_rejects_a_link_that_left_the_public_listener(self):
         self.reject_links({"ports": ["8443"]}, "public 443 listener")

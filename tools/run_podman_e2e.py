@@ -31,9 +31,9 @@ TOPOLOGIES = ("aio",)
 DEFAULT_BUDGET_SECONDS = 7200
 
 
-def build_suite(podman: Podman, topology: str, distribution: str) -> List[Case]:
+def build_suite(podman: Podman, topology: str, distribution: str, vision: bool = False) -> List[Case]:
     if topology == "aio":
-        return aio.cases(podman, distribution)
+        return aio.cases(podman, distribution, vision=vision)
     raise ValueError(f"unsupported topology: {topology!r}")
 
 
@@ -45,6 +45,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         choices=sorted(target_image.DISTRIBUTIONS),
         default="ubuntu-24.04",
         help="Target distribution alias from tests/cases/images.lock.yaml",
+    )
+    parser.add_argument(
+        "--vision",
+        action="store_true",
+        help="Install the optional VLESS Vision inbound, which makes the matrix 10 cases instead of 8",
     )
     parser.add_argument(
         "--artifact-root",
@@ -59,11 +64,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         artifact_root=args.artifact_root,
         budget_seconds=args.budget_seconds,
     )
+    # The selected Vision configuration is part of the run's identity: the
+    # matrix owes 8 or 10 positive cases depending on it.
+    context.environment["vision"] = "enabled" if args.vision else "disabled"
     podman = Podman(context)
     # Containers, the network, and run images belong to the run, not the shell.
     podman.register_cleanup()
     runner = Runner(context)
-    for case in build_suite(podman, args.topology, args.distribution):
+    for case in build_suite(podman, args.topology, args.distribution, vision=args.vision):
         runner.add(case)
     status = runner.execute()
     print(f"artifacts: {context.artifact_dir}")

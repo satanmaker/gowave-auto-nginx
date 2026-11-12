@@ -17,7 +17,7 @@ import json
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
-from . import panel_surface, topology
+from . import matrix, panel_surface, topology
 from .podman import wait_until
 from .runner import Case, CaseBlocked, require
 
@@ -65,17 +65,11 @@ REALITY_DOMAIN = topology.REALITY_DOMAIN
 PANEL_SURFACE_SCRIPT = "/repo/tools/podman_e2e/panel_surface.py"
 SUBSCRIPTION_PROBE_SCRIPT = topology.SUBSCRIPTION_PROBE_SCRIPT
 
-# The MVP profile carries four inbounds without a Vision domain; the fifth
-# appears only when the optional Vision domain is configured, which this
-# topology does not configure.
-CORE_INBOUNDS = 4
-
 # What each YAML representation is expected to carry, per the shipped generators.
 # GenerateMihomo skips only kcp, so Mihomo receives one proxy per inbound.
-# GenerateClash skips vless, xhttp, kcp and hysteria outright, and the core set
+# GenerateClash skips vless, xhttp, kcp and hysteria outright, and the inbound set
 # has exactly one trojan entry, so Clash receives that single proxy — a strict
 # subset of the Mihomo inventory, not a second copy of it.
-MIHOMO_PROXIES = CORE_INBOUNDS
 CLASH_PROXIES = 1
 MIHOMO_PROXY_TYPES: Sequence[str] = ("trojan", "vless")
 CLASH_PROXY_TYPES: Sequence[str] = ("trojan",)
@@ -93,13 +87,17 @@ EXPECTED_FINGERPRINT = "firefox"
 
 UA_REFUSAL_STATUS = 403
 
-# The transports the core inbound set carries, and the two pinned clients that
-# have to traverse each of them. A Vision install adds a fifth transport, which is
-# what makes the matrix 8 or 10 tuples rather than a fixed list.
-TRAFFIC_NETWORKS: Sequence[str] = ("grpc", "tcp", "ws", "xhttp")
+# The pinned clients that have to traverse every inbound. The inbound set itself
+# comes from the protocol/client matrix: four inbounds without the optional
+# Vision domain, five with it, which is what makes the matrix 8 or 10 tuples
+# rather than a fixed list.
 TRAFFIC_ENGINES: Sequence[str] = ("mihomo", "xray")
-# Two engines over four transports, run sequentially on one client container.
+# Two engines over the whole inbound set, run sequentially on one client
+# container; lifecycle cases that exercise the matrix reuse the budget.
 TRAFFIC_TIMEOUT_SECONDS = 900
+# One matrix case starts one engine and sends one payload; it must not inherit
+# the deadline of the whole matrix.
+DATA_PLANE_TIMEOUT_SECONDS = 300
 
 # A restart of the product's own units is bounded by the same kind of deadline as
 # any other readiness wait; the interval is coarse because every poll is an exec.
@@ -252,14 +250,36 @@ fi
 class AioProduct:
     """One disposable AIO host, installed once by the real operator."""
 
-    def __init__(self, podman: Any, distribution: str = "ubuntu-24.04") -> None:
+    def __init__(
+        self, podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False,
+    ) -> None:
         self.podman = podman
         self.context = podman.context
         self.distribution = distribution
+        # The optional Vision domain is a product configuration, not a harness
+        # option: it decides whether the operator provisions a fifth inbound and
+        # therefore whether the matrix owes 8 or 10 positive cases.
+        self.vision = vision
+        self.matrix = matrix.load()
+        self.declared_data_plane: List[str] = []
+        self.data_plane_results: Dict[str, str] = {}
         self.host: Optional[topology.AioTopology] = None
         self.outcome: Optional[topology.InstallOutcome] = None
         self._subscriptions: Optional[Dict[str, Any]] = None
         self._subscription_error = ""
+
+    @property
+    def inbound_count(self) -> int:
+        """How many inbounds this install carries, per the selected configuration."""
+        return len(matrix.inbounds(self.matrix, self.vision))
+
+    def declare_data_plane(self, case_ids: Sequence[str]) -> None:
+        """Record the data-plane cases the suite declared, for the matrix count case."""
+        self.declared_data_plane = list(case_ids)
+
+    def record_data_plane(self, case_id: str, status: str) -> None:
+        """Record one matrix case's own verdict; a case that never reports is missing."""
+        self.data_plane_results[case_id] = status
 
     # ------------------------------------------------------------------ install
     def install(self) -> Dict[str, Any]:
@@ -268,7 +288,11 @@ class AioProduct:
             raise AssertionError(
                 f"{INSTALL_CASE_ID}: the AIO host is installed once per run and reused by later cases"
             )
-        host = topology.AioTopology(self.podman, distribution=self.distribution)
+        host = topology.AioTopology(
+            self.podman,
+            distribution=self.distribution,
+            vision_domain=topology.VISION_DOMAIN if self.vision else None,
+        )
         host.create()
         self.host = host
         self.outcome = host.install()
@@ -356,49 +380,41 @@ class AioProduct:
     def engine_facts(self, case_id: str, scope: str) -> Dict[str, Any]:
         """Run the engine-side probe and return the facts it reports."""
         host = self.require_installed()
-        result = host.subscription_facts(scope)
-        detail = (result.stderr or result.stdout or "").strip()[-2000:]
-        require(
-            case_id,
-            result.returncode == 0,
-            f"the client probe exited {result.returncode}: {detail}",
-        )
-        try:
-            return json.loads(result.stdout or "")
-        except json.JSONDecodeError:
-            require(case_id, False, f"the client probe did not print JSON: {(result.stdout or '')[:400]}")
-            return {}
+        return self._probe_json(case_id, "the client probe", host.subscription_facts(scope))
 
     def traffic_facts(self, case_id: str, scope: str, payload_dir: Optional[str] = None) -> Dict[str, Any]:
         """Run the engine-side traffic probe and return what the endpoint recorded."""
         host = self.require_installed()
-        result = host.traffic_facts(scope, payload_dir=payload_dir)
-        detail = (result.stderr or result.stdout or "").strip()[-2000:]
-        require(
-            case_id,
-            result.returncode == 0,
-            f"the traffic probe exited {result.returncode}: {detail}",
-        )
-        try:
-            return json.loads(result.stdout or "")
-        except json.JSONDecodeError:
-            require(case_id, False, f"the traffic probe did not print JSON: {(result.stdout or '')[:400]}")
-            return {}
+        return self._probe_json(case_id, "the traffic probe", host.traffic_facts(
+            scope, payload_dir=payload_dir,
+        ))
+
+    def transfer_facts(self, case_id: str, inbound_id: str, client: str) -> Dict[str, Any]:
+        """Run exactly one matrix tuple: one client through one inbound.
+
+        The matrix, not the case body, decides the transport and security layer,
+        so a matrix edit that renames or re-transports an inbound changes what the
+        case exercises instead of leaving the case asserting the old shape.
+        """
+        host = self.require_installed()
+        inbound = matrix.inbound(self.matrix, inbound_id)
+        return self._probe_json(case_id, "the transfer probe", host.transfer_facts(
+            client, str(inbound["transport"]), str(inbound["security"]),
+        ))
 
     def prohibited_facts(self, case_id: str) -> Dict[str, Any]:
         """Run the policy probe: one permitted control, one destination the product denies."""
         host = self.require_installed()
-        result = host.prohibited_facts()
+        return self._probe_json(case_id, "the policy probe", host.prohibited_facts())
+
+    def _probe_json(self, case_id: str, label: str, result: Any) -> Dict[str, Any]:
+        """A probe that exited non-zero or printed no JSON fails the case."""
         detail = (result.stderr or result.stdout or "").strip()[-2000:]
-        require(
-            case_id,
-            result.returncode == 0,
-            f"the policy probe exited {result.returncode}: {detail}",
-        )
+        require(case_id, result.returncode == 0, f"{label} exited {result.returncode}: {detail}")
         try:
             return json.loads(result.stdout or "")
         except json.JSONDecodeError:
-            require(case_id, False, f"the policy probe did not print JSON: {(result.stdout or '')[:400]}")
+            require(case_id, False, f"{label} did not print JSON: {(result.stdout or '')[:400]}")
             return {}
 
     def wait_tunnel_ready(self, case_id: str, payload_dir: Optional[str] = None) -> Dict[str, Any]:
@@ -544,6 +560,25 @@ def identity_probe_script() -> str:
 
 
 # ---------------------------------------------------------------------- cases
+def subscription_protocol_counts(product: AioProduct) -> Dict[str, int]:
+    """How many share links each protocol owes, counted from the matrix inbounds."""
+    counts: Dict[str, int] = {}
+    for inbound in matrix.inbounds(product.matrix, product.vision):
+        protocol = str(inbound.get("subscription_protocol"))
+        counts[protocol] = counts.get(protocol, 0) + 1
+    return counts
+
+
+def matrix_sni(product: AioProduct, inbound: Dict[str, Any]) -> str:
+    """The SNI the matrix tuple is served under: the domain the inbound was issued for."""
+    host = product.require_installed()
+    if str(inbound.get("id")) == matrix.VISION_INBOUND:
+        return str(host.vision_domain or "")
+    if str(inbound.get("security")) == "reality":
+        return str(host.reality_domain)
+    return str(host.panel_domain)
+
+
 def case_packages(product: AioProduct) -> Dict[str, Any]:
     """AIO-PACKAGES: the operator resolved its documented prerequisites itself."""
     packages = " ".join(REQUIRED_PACKAGES)
@@ -740,9 +775,9 @@ def case_panel_auth(product: AioProduct) -> Dict[str, Any]:
     require("AIO-AUTH", nodes.get("status") == 200, f"/api/nodes returned {nodes.get('status')!r}")
     require("AIO-AUTH", nodes.get("count") == 1,
             f"the Panel reports {nodes.get('count')!r} nodes instead of the one local node")
-    require("AIO-AUTH", nodes.get("inbound_count") == CORE_INBOUNDS,
+    require("AIO-AUTH", nodes.get("inbound_count") == product.inbound_count,
             f"the local node exposes {nodes.get('inbound_count')!r} active inbounds, "
-            f"expected {CORE_INBOUNDS}")
+            f"expected {product.inbound_count}")
     require("AIO-AUTH", bool(nodes.get("inbound_digest")),
             "the local node reported no active inbound identifiers")
 
@@ -751,9 +786,9 @@ def case_panel_auth(product: AioProduct) -> Dict[str, Any]:
             f"/api/config-profiles returned {profiles.get('status')!r}")
     require("AIO-AUTH", profiles.get("count") == 1,
             f"the Panel reports {profiles.get('count')!r} config profiles instead of one")
-    require("AIO-AUTH", profiles.get("inbound_count") == CORE_INBOUNDS,
+    require("AIO-AUTH", profiles.get("inbound_count") == product.inbound_count,
             f"the config profile declares {profiles.get('inbound_count')!r} inbounds, "
-            f"expected {CORE_INBOUNDS}")
+            f"expected {product.inbound_count}")
     require("AIO-AUTH", profiles.get("inbound_digest") == nodes.get("inbound_digest"),
             "the config profile and the node disagree on which inbounds are active")
 
@@ -767,9 +802,9 @@ def case_panel_auth(product: AioProduct) -> Dict[str, Any]:
 
     hosts = surface.get("hosts") or {}
     require("AIO-AUTH", hosts.get("status") == 200, f"/api/hosts returned {hosts.get('status')!r}")
-    require("AIO-AUTH", hosts.get("count") == CORE_INBOUNDS,
+    require("AIO-AUTH", hosts.get("count") == product.inbound_count,
             f"the Panel publishes {hosts.get('count')!r} hosts, expected one per inbound "
-            f"({CORE_INBOUNDS})")
+            f"({product.inbound_count})")
     require("AIO-AUTH", hosts.get("inbound_digest") == profiles.get("inbound_digest"),
             "the published hosts do not cover exactly the profile's inbounds")
 
@@ -876,7 +911,7 @@ def case_revocation(product: AioProduct) -> Dict[str, Any]:
     try:
         tunnel = product.wait_tunnel_ready("AIO-REVOKE", payload_dir=payload_dir)
         positive = product.traffic_facts("AIO-REVOKE", "traffic", payload_dir=payload_dir)
-        expected = CORE_INBOUNDS * len(TRAFFIC_ENGINES)
+        expected = product.inbound_count * len(TRAFFIC_ENGINES)
         require("AIO-REVOKE", int(positive.get("transfer_count") or 0) == expected,
                 f"the issued client transferred through {positive.get('transfer_count')!r} "
                 f"transports, expected {expected}")
@@ -1028,7 +1063,7 @@ def case_restart(product: AioProduct) -> Dict[str, Any]:
     tunnel = product.wait_tunnel_ready("AIO-RESTART")
 
     facts = product.traffic_facts("AIO-RESTART", "traffic")
-    expected = CORE_INBOUNDS * len(TRAFFIC_ENGINES)
+    expected = product.inbound_count * len(TRAFFIC_ENGINES)
     require("AIO-RESTART", int(facts.get("transfer_count") or 0) == expected,
             f"after the restart {facts.get('transfer_count')!r} transports carried a payload, "
             f"expected {expected}")
@@ -1118,7 +1153,7 @@ def case_idempotent(product: AioProduct) -> Dict[str, Any]:
             "every client that already imported it would stop working")
 
     facts = product.traffic_facts("AIO-IDEMPOTENT", "traffic")
-    expected = CORE_INBOUNDS * len(TRAFFIC_ENGINES)
+    expected = product.inbound_count * len(TRAFFIC_ENGINES)
     require("AIO-IDEMPOTENT", int(facts.get("transfer_count") or 0) == expected,
             f"after the repeated install {facts.get('transfer_count')!r} transports carried a "
             f"payload, expected {expected}")
@@ -1316,15 +1351,15 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
 
     base64 = loaded.get("base64") or {}
     require("SUB-SERVED", base64.get("decoded"), "the base64 subscription did not decode")
-    require("SUB-SERVED", base64.get("link_count") == CORE_INBOUNDS,
+    require("SUB-SERVED", base64.get("link_count") == product.inbound_count,
             f"the base64 list carries {base64.get('link_count')!r} links, expected one per inbound "
-            f"({CORE_INBOUNDS})")
+            f"({product.inbound_count})")
 
     xray_json = loaded.get("xray_json") or {}
     shape = xray_json.get("shape")
     require("SUB-SERVED", shape in ("list", "object"),
             f"the Xray JSON is neither a config object nor a profile list (shape {shape!r})")
-    expected_entries = CORE_INBOUNDS if shape == "list" else 1
+    expected_entries = product.inbound_count if shape == "list" else 1
     require("SUB-SERVED", xray_json.get("entries") == expected_entries,
             f"the Xray JSON {shape} carries {xray_json.get('entries')!r} profile(s), "
             f"expected {expected_entries}")
@@ -1339,7 +1374,7 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
             "before Xray accepted it, so it is not a runnable config")
 
     for name, proxies, expected_types, reason in (
-        ("mihomo", MIHOMO_PROXIES, MIHOMO_PROXY_TYPES, "one per inbound"),
+        ("mihomo", product.inbound_count, MIHOMO_PROXY_TYPES, "one per inbound"),
         ("clash", CLASH_PROXIES, CLASH_PROXY_TYPES, "the trojan subset GenerateClash keeps"),
     ):
         record = loaded.get(name) or {}
@@ -1422,12 +1457,13 @@ def case_share_links(product: AioProduct) -> Dict[str, Any]:
     host = product.require_installed()
     facts = product.engine_facts("SUB-B64", "share-links")
 
-    require("SUB-B64", facts.get("link_count") == CORE_INBOUNDS,
+    expected_protocols = subscription_protocol_counts(product)
+    require("SUB-B64", facts.get("link_count") == product.inbound_count,
             f"the base64 list carries {facts.get('link_count')!r} links, expected one per inbound "
-            f"({CORE_INBOUNDS})")
-    require("SUB-B64", facts.get("protocols") == {"vless": 3, "trojan": 1},
-            f"the link list carries protocols {facts.get('protocols')!r} instead of the core "
-            "three vless and one trojan entries")
+            f"({product.inbound_count})")
+    require("SUB-B64", facts.get("protocols") == expected_protocols,
+            f"the link list carries protocols {facts.get('protocols')!r} instead of the inbound "
+            f"set's own {expected_protocols!r}")
     require("SUB-B64", facts.get("ports") == ["443"],
             f"the links point at ports {facts.get('ports')!r} instead of the public 443 listener")
     require("SUB-B64", facts.get("sni_missing") == 0,
@@ -1449,9 +1485,9 @@ def case_share_links(product: AioProduct) -> Dict[str, Any]:
     require("SUB-B64", not unknown_snis,
             f"the links name SNIs this run never configured: {', '.join(unknown_snis)}")
 
-    require("SUB-B64", facts.get("xray_outbounds") == CORE_INBOUNDS,
+    require("SUB-B64", facts.get("xray_outbounds") == product.inbound_count,
             f"Xray imported {facts.get('xray_outbounds')!r} outbounds from the link list")
-    require("SUB-B64", facts.get("cross_representation_issued") == CORE_INBOUNDS,
+    require("SUB-B64", facts.get("cross_representation_issued") == product.inbound_count,
             f"the Xray JSON publishes {facts.get('cross_representation_issued')!r} proxy outbounds")
     require(
         "SUB-B64",
@@ -1478,70 +1514,118 @@ def case_share_links(product: AioProduct) -> Dict[str, Any]:
     }
 
 
-def case_traffic(product: AioProduct) -> Dict[str, Any]:
-    """AIO-TRAFFIC: every served outbound carries a unique payload to the endpoint.
+def case_data_plane(product: AioProduct, inbound: Dict[str, Any], client: str) -> Dict[str, Any]:
+    """AIO-DP-<inbound>-<client>: one matrix tuple carries a payload through the product.
 
     The engines run from the Control Machine, so a transfer that shows up at the
-    endpoint with the installed host as its source address traversed the product;
-    the same request sent straight from the client is recorded as its own source,
-    which is what makes that attribution meaningful. A 200 alone is not proof: the
-    endpoint has to echo the request id and the digest of the body it received.
+    endpoint with the installed host as its source address traversed the product.
+    A 200 alone is not proof: the endpoint has to echo the request id and the
+    digest of the body it received, and the SNI has to be the domain the inbound
+    was issued for, because a served outbound that addresses another host would
+    still answer while proving the wrong tuple.
+
+    Exactly one served outbound may match the tuple: the matrix names one inbound
+    per transport and security layer, so a second match is a representation the
+    matrix does not explain and must not be counted as this case.
     """
-    product.subscription_payloads("AIO-TRAFFIC")
+    case_id = matrix.case_id(product.matrix, "aio", str(inbound["id"]), client)
+    product.subscription_payloads(case_id)
     host = product.require_installed()
-    facts = product.traffic_facts("AIO-TRAFFIC", "traffic")
+    facts = product.transfer_facts(case_id, str(inbound["id"]), client)
 
-    transfers = facts.get("transfers") or []
-    require("AIO-TRAFFIC", transfers, "no served outbound was exercised, so the data plane was not proven")
-    require("AIO-TRAFFIC", facts.get("missing_request_ids") == 0,
-            f"{facts.get('missing_request_ids')!r} payload(s) never reached the controlled endpoint")
-    for item in transfers:
-        tuple_id = f"{item.get('engine')}/{item.get('network')}"
-        require("AIO-TRAFFIC", item.get("status") == 200,
-                f"the {tuple_id} transfer returned {item.get('status')!r} instead of 200")
-        require("AIO-TRAFFIC", item.get("request_id_match"),
-                f"the endpoint did not echo the {tuple_id} request id")
-        require("AIO-TRAFFIC", item.get("body_match"),
-                f"the endpoint did not receive the exact {tuple_id} payload")
-        require("AIO-TRAFFIC", item.get("source_ip") == host.plan.data_target_ip,
-                f"the {tuple_id} transfer left from {item.get('source_ip')!r} instead of the installed "
-                f"host {host.plan.data_target_ip!r}, so it did not traverse the product")
-
-    for engine in TRAFFIC_ENGINES:
-        observed = sorted({str(item.get("network")) for item in transfers if item.get("engine") == engine})
-        require("AIO-TRAFFIC", observed == list(TRAFFIC_NETWORKS),
-                f"the {engine} client covered {observed} instead of every core transport "
-                f"{list(TRAFFIC_NETWORKS)}")
-        realities = [
-            item for item in transfers
-            if item.get("engine") == engine and item.get("security") == "reality"
-        ]
-        require("AIO-TRAFFIC", len(realities) == 1,
-                f"the {engine} client exercised {len(realities)} REALITY outbounds, expected exactly one")
-        for item in transfers:
-            if item.get("engine") != engine or item.get("security") == "none":
-                continue
-            require("AIO-TRAFFIC", item.get("sni"),
-                    f"the {engine}/{item.get('network')} outbound carries no SNI, so the served profile "
-                    "cannot address the inbound it was issued for")
-
-    require("AIO-TRAFFIC", facts.get("direct_source_ip") == host.plan.data_engine_client_ip,
-            f"the control request left from {facts.get('direct_source_ip')!r} instead of the client "
-            f"{host.plan.data_engine_client_ip!r}, so source attribution was not calibrated")
-    require("AIO-TRAFFIC", facts.get("echo_records") >= len(transfers),
-            f"the endpoint recorded {facts.get('echo_records')!r} request(s) for {len(transfers)} "
-            "transfer(s)")
+    transport = f"{inbound['transport']}/{inbound['security']}"
+    require(case_id, int(facts.get("outbounds") or 0) == 1,
+            f"the served {client} representation declares {facts.get('outbounds')!r} {transport} "
+            f"outbound(s) for {inbound['id']}, expected exactly one")
+    require(case_id, facts.get("delivered"),
+            f"the {inbound['id']} payload never reached the controlled endpoint: "
+            f"{facts.get('reason', '')}")
+    require(case_id, facts.get("status") == 200,
+            f"the {inbound['id']} transfer returned {facts.get('status')!r} instead of 200")
+    require(case_id, facts.get("request_id_match"),
+            f"the endpoint did not echo the {inbound['id']} request id")
+    require(case_id, facts.get("body_match"),
+            f"the endpoint did not receive the exact {inbound['id']} payload")
+    require(case_id, facts.get("source_ip") == host.plan.data_target_ip,
+            f"the {inbound['id']} payload left from {facts.get('source_ip')!r} instead of the "
+            f"installed host {host.plan.data_target_ip!r}, so it did not traverse the product")
+    sni = matrix_sni(product, inbound)
+    require(case_id, facts.get("sni") == sni,
+            f"the served {client} outbound carries SNI {facts.get('sni')!r} instead of the {sni!r} "
+            f"the {inbound['id']} inbound was issued for")
 
     return {
-        "transfer_count": facts.get("transfer_count"),
-        "engines": ",".join(facts.get("engines") or []),
-        "networks": ",".join(facts.get("networks") or []),
-        "tuples": ",".join(
-            f"{item.get('engine')}:{item.get('network')}:{item.get('security')}" for item in transfers
-        ),
-        "source_ips": ",".join(facts.get("source_ips") or []),
-        "direct_source_ip": facts.get("direct_source_ip"),
-        "echo_records": facts.get("echo_records"),
+        "inbound": inbound["id"],
+        "client": client,
+        "transport": transport,
+        "tag": facts.get("tag"),
+        "sni": facts.get("sni"),
+        "status": facts.get("status"),
+        "source_ip": facts.get("source_ip"),
+        "outbounds": facts.get("outbounds"),
+    }
+
+
+def _data_plane_case(product: AioProduct, inbound: Dict[str, Any], client: str) -> Dict[str, Any]:
+    """Run one matrix tuple and record its own verdict for the count case."""
+    case_id = matrix.case_id(product.matrix, "aio", str(inbound["id"]), client)
+    try:
+        evidence = case_data_plane(product, inbound, client)
+    except AssertionError:
+        product.record_data_plane(case_id, "FAIL")
+        raise
+    product.record_data_plane(case_id, "PASS")
+    return evidence
+
+
+def case_matrix(product: AioProduct) -> Dict[str, Any]:
+    """AIO-MATRIX: the positive data-plane cases are exactly the matrix tuples.
+
+    The count is an acceptance invariant, not an estimate: the selected Vision
+    configuration owes 8 tuples without the optional inbound and 10 with it, and
+    every one of them is one inbound through one client. The three ways a count
+    can drift are each a failure here — the matrix declaring a number its own
+    inbound/client list does not produce, the suite declaring cases the matrix
+    does not enumerate, and a declared case that produced no result or did not
+    pass.
+    """
+    product.require_installed()
+    data = product.matrix
+    expected_ids = [
+        matrix.case_id(data, "aio", str(inbound["id"]), client)
+        for inbound, client in matrix.tuples(data, product.vision)
+    ]
+    declared = product.declared_data_plane
+    executed = product.data_plane_results
+    declared_count = matrix.positive_count(data, "aio", product.vision)
+
+    require("AIO-MATRIX", declared_count == len(expected_ids),
+            f"the matrix declares {declared_count} positive case(s) for the "
+            f"{matrix.combination('aio', product.vision)} Vision configuration but enumerates "
+            f"{len(expected_ids)} inbound/client tuple(s), so one of the two is unexplained")
+    missing = [case_id for case_id in expected_ids if case_id not in declared]
+    extra = [case_id for case_id in declared if case_id not in expected_ids]
+    require("AIO-MATRIX", not missing and not extra,
+            f"the suite declares {len(declared)} data-plane case(s) that are not the matrix's "
+            f"{len(expected_ids)}: missing {missing}, unexplained {extra}")
+    not_run = [case_id for case_id in expected_ids if case_id not in executed]
+    require("AIO-MATRIX", not not_run,
+            f"{len(not_run)} matrix case(s) produced no result: {', '.join(not_run)}")
+    failed = sorted(case_id for case_id, status in executed.items() if status != "PASS")
+    require("AIO-MATRIX", not failed,
+            f"{len(failed)} matrix case(s) did not pass: {', '.join(failed)}")
+    require("AIO-MATRIX", len(executed) == declared_count,
+            f"{len(executed)} data-plane case(s) ran, but the matrix declares {declared_count} for "
+            f"the {matrix.combination('aio', product.vision)} Vision configuration")
+
+    return {
+        "vision": matrix.combination("aio", product.vision),
+        "inbounds": product.inbound_count,
+        "clients": len(matrix.clients(data)),
+        "expected_positive_cases": declared_count,
+        "declared_cases": len(declared),
+        "executed_cases": len(executed),
+        "passed_cases": sum(1 for status in executed.values() if status == "PASS"),
     }
 
 
@@ -1589,10 +1673,20 @@ def case_json_shapes(product: AioProduct) -> Dict[str, Any]:
     }
 
 
-def cases(podman: Any, distribution: str = "ubuntu-24.04") -> List[Case]:
-    """The AIO suite: the install case plus every case that reuses its host."""
-    product = AioProduct(podman, distribution)
-    return [
+def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False) -> List[Case]:
+    """The AIO suite: the install case plus every case that reuses its host.
+
+    The data-plane cases are generated from the protocol/client matrix, so the
+    selected Vision configuration decides their number (8 without the optional
+    inbound, 10 with it) and no case id is written by hand.
+    """
+    product = AioProduct(podman, distribution, vision=vision)
+    data_plane = [
+        (matrix.case_id(product.matrix, "aio", str(inbound["id"]), client), inbound, client)
+        for inbound, client in matrix.tuples(product.matrix, vision)
+    ]
+    product.declare_data_plane([case_id for case_id, _inbound, _client in data_plane])
+    suite = [
         Case(INSTALL_CASE_ID, "aio", lambda context: product.install(),
              timeout_seconds=INSTALL_TIMEOUT_SECONDS),
         Case("AIO-PACKAGES", "aio", lambda context: case_packages(product), timeout_seconds=300),
@@ -1607,8 +1701,17 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04") -> List[Case]:
         Case("SUB-UA-BLANK", "aio", lambda context: case_user_agent_blank(product), timeout_seconds=300),
         Case("SUB-B64", "aio", lambda context: case_share_links(product), timeout_seconds=300),
         Case("SUB-JSON-SHAPES", "aio", lambda context: case_json_shapes(product), timeout_seconds=300),
-        Case("AIO-TRAFFIC", "aio", lambda context: case_traffic(product),
-             timeout_seconds=TRAFFIC_TIMEOUT_SECONDS),
+    ]
+    for case_id, inbound, client in data_plane:
+        suite.append(Case(
+            case_id, "aio",
+            lambda context, inbound=inbound, client=client: _data_plane_case(product, inbound, client),
+            timeout_seconds=DATA_PLANE_TIMEOUT_SECONDS,
+        ))
+    suite.append(Case(
+        "AIO-MATRIX", "aio", lambda context: case_matrix(product), timeout_seconds=120,
+    ))
+    suite.extend([
         Case("AIO-REVOKE", "aio", lambda context: case_revocation(product),
              timeout_seconds=TUNNEL_READY_TIMEOUT_SECONDS + 2 * TRAFFIC_TIMEOUT_SECONDS),
         Case("AIO-RESTART", "aio", lambda context: case_restart(product),
@@ -1622,4 +1725,5 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04") -> List[Case]:
         Case("AIO-NEG-ACME", "aio", lambda context: case_acme_fail_closed(product), timeout_seconds=300),
         Case("AIO-NEG-DEP", "aio", lambda context: case_public_dependency(product),
              timeout_seconds=RECOVERY_TIMEOUT_SECONDS + 300),
-    ]
+    ])
+    return suite
