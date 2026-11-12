@@ -45,12 +45,15 @@ ensure_pinned_xray_core() {
     local node_bin="${1:-$GOWAVE_NODE_INSTALL_DIR/gowave-node}"
     local core_bin="${2:-$GOWAVE_NODE_INSTALL_DIR/rw-core}"
 
-    if [[ -z "${XRAY_SERVER_VERSION:-}" || ! -x "$node_bin" ]]; then
+    # "latest" is the shipped default: it means the core the node installation
+    # already brought is the one to keep, not a version to reinstall.
+    local requested="${XRAY_SERVER_VERSION:-}"
+    if [[ -z "$requested" || "${requested,,}" == "latest" || "${requested,,}" == "vlatest" || ! -x "$node_bin" ]]; then
         return 0
     fi
 
     local expected_core cur_core
-    expected_core="${XRAY_SERVER_VERSION#v}"
+    expected_core="${requested#v}"
     cur_core=$("$core_bin" version 2>/dev/null || true)
     if core_version_matches "$cur_core" "$expected_core"; then
         return 0
@@ -107,6 +110,34 @@ EOF
     echo "Deployed $dropin_dir/10-port.conf."
 }
 
+node_binary_version() {
+    local node_bin="${1:-$GOWAVE_NODE_INSTALL_DIR/gowave-node}"
+    "$node_bin" version 2>/dev/null | awk 'NR == 1 {print $2}'
+}
+
+local_node_is_serving() {
+    local node_port="${1:-$DEFAULT_NODE_PORT}"
+    local expected="${2:-latest}"
+    local node_bin="$GOWAVE_NODE_INSTALL_DIR/gowave-node"
+
+    [[ "$(id -u)" -eq 0 ]] || return 1
+    command -v systemctl >/dev/null 2>&1 || return 1
+    command -v timeout >/dev/null 2>&1 || return 1
+    [[ -x "$node_bin" ]] || return 1
+    systemctl is-active --quiet gowave-node.service || return 1
+    # A different port means the running service is not the one this install
+    # would configure, so it has to go through the installer.
+    grep -qx "NODE_PORT=$node_port" "$GOWAVE_NODE_INSTALL_DIR/.env" 2>/dev/null || return 1
+    if [[ "$expected" != "latest" ]]; then
+        local installed
+        installed=$(node_binary_version "$node_bin")
+        [[ "v${installed#v}" == "v${expected#v}" ]] || return 1
+    fi
+    # Only a node whose Xray core is serving counts as already installed: a
+    # restarted node has to wait for the Panel to push a configuration again.
+    timeout 20 "$node_bin" status --wait-ready >/dev/null 2>&1
+}
+
 install_local_node() {
     local secret_key="$1"
     local node_port="${2:-$DEFAULT_NODE_PORT}"
@@ -144,38 +175,51 @@ install_local_node() {
         normalized_node_ver="v$normalized_node_ver"
     fi
 
-    # Pass SECRET_KEY and NODE_PORT strictly via environment to installer execution
-    if [[ -n "$upstream_installer" && -f "$upstream_installer" ]]; then
-        if [[ -n "${GOWAVE_NODE_INSTALLER_SHA256:-}" ]]; then
-            local actual_sha256
-            actual_sha256=$(sha256sum "$upstream_installer" | awk '{print $1}')
-            if [[ "$actual_sha256" != "$GOWAVE_NODE_INSTALLER_SHA256" ]]; then
-                echo "Error: Bundled installer SHA256 mismatch: expected $GOWAVE_NODE_INSTALLER_SHA256, got $actual_sha256." >&2
-                return 1
+    # A repeated install finds the node its predecessor left running. Running the
+    # upstream installer again restarts that node, which drops the Xray
+    # configuration the Panel pushed, and the Panel only pushes it again when the
+    # node answers as offline. Keeping a serving node untouched is what makes a
+    # repeated install a no-op for the traffic plane.
+    local node_restart_required=1
+    if local_node_is_serving "$node_port" "$normalized_node_ver"; then
+        node_restart_required=0
+        echo "Local GoWave Node already serves $normalized_node_ver on port $node_port; keeping the running service."
+    fi
+
+    if (( node_restart_required == 1 )); then
+        # Pass SECRET_KEY and NODE_PORT strictly via environment to installer execution
+        if [[ -n "$upstream_installer" && -f "$upstream_installer" ]]; then
+            if [[ -n "${GOWAVE_NODE_INSTALLER_SHA256:-}" ]]; then
+                local actual_sha256
+                actual_sha256=$(sha256sum "$upstream_installer" | awk '{print $1}')
+                if [[ "$actual_sha256" != "$GOWAVE_NODE_INSTALLER_SHA256" ]]; then
+                    echo "Error: Bundled installer SHA256 mismatch: expected $GOWAVE_NODE_INSTALLER_SHA256, got $actual_sha256." >&2
+                    return 1
+                fi
             fi
+            (
+                export SECRET_KEY="$secret_key"
+                export NODE_PORT="$node_port"
+                export GOWAVE_NODE_VERSION="$normalized_node_ver"
+                bash "$upstream_installer" </dev/null
+            )
+        elif [[ "${GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER:-0}" == "1" ]]; then
+            echo "Error: GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1 prohibits remote download or floating fallback." >&2
+            return 1
+        else
+            echo "Fetching upstream gowave-node installer..."
+            (
+                export SECRET_KEY="$secret_key"
+                export NODE_PORT="$node_port"
+                export GOWAVE_NODE_VERSION="$normalized_node_ver"
+                local tmp_inst
+                tmp_inst=$(mktemp "/tmp/gowave-node-install-XXXXXX.sh")
+                curl -fsSL https://raw.githubusercontent.com/aaaSaZaN/gowave-node/main/install.sh -o "$tmp_inst"
+                chmod 0700 "$tmp_inst"
+                bash "$tmp_inst" </dev/null
+                rm -f "$tmp_inst"
+            )
         fi
-        (
-            export SECRET_KEY="$secret_key"
-            export NODE_PORT="$node_port"
-            export GOWAVE_NODE_VERSION="$normalized_node_ver"
-            bash "$upstream_installer" </dev/null
-        )
-    elif [[ "${GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER:-0}" == "1" ]]; then
-        echo "Error: GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1 prohibits remote download or floating fallback." >&2
-        return 1
-    else
-        echo "Fetching upstream gowave-node installer..."
-        (
-            export SECRET_KEY="$secret_key"
-            export NODE_PORT="$node_port"
-            export GOWAVE_NODE_VERSION="$normalized_node_ver"
-            local tmp_inst
-            tmp_inst=$(mktemp "/tmp/gowave-node-install-XXXXXX.sh")
-            curl -fsSL https://raw.githubusercontent.com/aaaSaZaN/gowave-node/main/install.sh -o "$tmp_inst"
-            chmod 0700 "$tmp_inst"
-            bash "$tmp_inst" </dev/null
-            rm -f "$tmp_inst"
-        )
     fi
 
     # Ensure hardening and port configuration in .env and drop-in
@@ -191,7 +235,7 @@ install_local_node() {
         ufw deny "${node_port}/tcp" comment "Isolate local GoWave Node from external access" || true
     fi
 
-    if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
+    if (( node_restart_required == 1 )) && [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
         systemctl restart --no-ask-password gowave-node.service || true
     fi
     echo "Local GoWave Node installed and hardened on port $node_port."

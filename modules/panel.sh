@@ -185,9 +185,15 @@ except Exception:
         fi
     )
 
-    # Install files
-    cp "$tmp_dir/gowave-server" "$target_dir/gowave-server"
-    chmod 0755 "$target_dir/gowave-server"
+    # Install files. A repeated install replaces the binary the Panel is already
+    # running from this path, and writing through that inode fails with ETXTBSY.
+    # Staging beside the target and renaming only swaps the directory entry.
+    local staged_server="$target_dir/.gowave-server.new"
+    cp "$tmp_dir/gowave-server" "$staged_server"
+    chmod 0755 "$staged_server"
+    sync "$staged_server" 2>/dev/null || true
+    mv -f "$staged_server" "$target_dir/gowave-server"
+    sync "$target_dir" 2>/dev/null || true
 
     mkdir -p "$target_dir/frontend"
     tar -xzf "$tmp_dir/gowave-frontend.tar.gz" -C "$target_dir/frontend"
@@ -197,10 +203,24 @@ except Exception:
     ensure_gowave_user
     if [[ "$(id -u)" -eq 0 ]]; then
         chown -R root:gowave "$target_dir"
+        retain_panel_data_ownership "$target_dir"
     fi
     chmod 1770 "$target_dir" 2>/dev/null || chmod 0770 "$target_dir" || true
     echo "GoWave Panel binaries installed successfully in $target_dir."
     rm -rf "$tmp_dir"
+}
+
+retain_panel_data_ownership() {
+    # The Panel writes its own database, and a binary refresh hands every file in
+    # the install directory to root. Leaving the database root-owned turns the
+    # running Panel's next write into "attempt to write a readonly database".
+    local target_dir="${1:-$GOWAVE_INSTALL_DIR}"
+    local data_file
+    for data_file in "$target_dir/gowave.db" "$target_dir/gowave.db-wal" "$target_dir/gowave.db-shm"; do
+        [[ -e "$data_file" ]] || continue
+        chown gowave:gowave "$data_file"
+        chmod 0600 "$data_file"
+    done
 }
 
 generate_panel_env() {
@@ -212,8 +232,16 @@ generate_panel_env() {
     local channel="${6:-stable}"
 
     local env_file="$target_dir/.env"
-    local app_secret
-    app_secret=$(openssl rand -hex 32)
+    # A repeated install keeps the running Panel's APP_SECRET: it is the key the
+    # Panel encrypts stored credentials with, so a new one would make every row
+    # it already wrote unreadable.
+    local app_secret=""
+    if [[ -r "$env_file" ]]; then
+        app_secret=$(grep -s '^APP_SECRET=' "$env_file" | cut -d= -f2- || true)
+    fi
+    if [[ -z "$app_secret" ]]; then
+        app_secret=$(openssl rand -hex 32)
+    fi
 
     mkdir -p "$target_dir"
     ensure_gowave_user

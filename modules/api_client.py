@@ -88,6 +88,48 @@ def _extract_list(res, key):
     return []
 
 
+def _same_config(stored, candidate):
+    """Whether a profile already holds the configuration this install compiles.
+
+    The Panel restarts every node that uses a profile whenever the profile is
+    written, so an install that re-sends an identical configuration interrupts a
+    live traffic plane for nothing.
+    """
+    def _load(value):
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return None
+        return value
+
+    left = _load(stored)
+    right = _load(candidate)
+    if left is None or right is None:
+        return False
+    return left == right
+
+
+def _same_node_configuration(node, payload):
+    """Whether a node already carries the name, address, port and profile asked for."""
+    if not isinstance(node, dict):
+        return False
+    if (node.get("name"), node.get("address"), node.get("port")) != (
+        payload["name"], payload["address"], payload["port"],
+    ):
+        return False
+    stored_profile = node.get("configProfile") or {}
+    wanted_profile = payload["configProfile"]
+    if stored_profile.get("activeConfigProfileUuid") != wanted_profile["activeConfigProfileUuid"]:
+        return False
+    stored_inbounds = sorted(
+        str(item.get("uuid")) for item in stored_profile.get("activeInbounds") or []
+        if isinstance(item, dict)
+    )
+    wanted_inbounds = sorted(str(uuid) for uuid in wanted_profile["activeInbounds"])
+    return stored_inbounds == wanted_inbounds
+
+
 class GoWaveClient:
     def __init__(self, base_url="http://127.0.0.1:3000", token=None, ssl_context=None, timeout=15):
         self.base_url = base_url.rstrip("/")
@@ -231,8 +273,9 @@ class GoWaveClient:
             res = self.request("POST", "/api/auth/register", {"username": username, "password": password}, authenticate=False)
             return res
         except GoWaveAPIError as e:
-            if e.status_code in (400, 409):
-                # Likely already registered; try login
+            if e.status_code in (400, 403, 409):
+                # 403 is what the Panel answers once an admin already exists, so a
+                # repeated install has to fall back to the credentials it holds.
                 return self.login(username, password)
             raise
 
@@ -270,6 +313,41 @@ class GoWaveClient:
         if not private_key or not public_key:
             raise GoWaveAPIError("Invalid x25519 response: required key material is missing")
         return {"privateKey": private_key, "publicKey": public_key}
+
+    def existing_reality_material(self, profile_name, reality_domain):
+        """The REALITY key material the installed profile already publishes.
+
+        Installation is documented as repeatable, and every subscription the Panel
+        has served carries this public key plus one of these short ids. Generating
+        a new pair on a repeated install would silently invalidate every client
+        that already imported the subscription, so the installed material is
+        reused until the profile itself is gone.
+        """
+        res = self.request("GET", "/api/config-profiles")
+        for profile in _extract_list(res, "configProfiles"):
+            if not isinstance(profile, dict) or profile.get("name") != profile_name:
+                continue
+            config = profile.get("config")
+            try:
+                parsed = json.loads(config) if isinstance(config, str) else config
+            except json.JSONDecodeError:
+                return None
+            for inbound in (parsed or {}).get("inbounds") or []:
+                if not isinstance(inbound, dict):
+                    continue
+                reality = ((inbound.get("streamSettings") or {}).get("realitySettings") or {})
+                server_names = reality.get("serverNames") or []
+                private_key = reality.get("privateKey")
+                short_ids = reality.get("shortIds") or []
+                if not private_key or not short_ids or reality_domain not in server_names:
+                    continue
+                public_key = (reality.get("settings") or {}).get("publicKey") or ""
+                return {
+                    "privateKey": private_key,
+                    "publicKey": public_key,
+                    "shortIds": [str(value) for value in short_ids],
+                }
+        return None
 
     def compile_config_profile(self, node_name, reality_domain, private_key, short_ids=None, public_key=None, vision_domain=None, panel_domain=None):
         if short_ids is None:
@@ -380,10 +458,13 @@ class GoWaveClient:
             existing = next((p for p in profiles_list if p.get("uuid") == target_uuid), None)
             if not isinstance(existing, dict) or not all(k in existing for k in ("name", "config")):
                 raise GoWaveAPIError(f"Cannot safely update profile {target_uuid}: profile list has no complete rollback configuration snapshot")
-            before = {"name": existing["name"], "config": existing["config"]}
-            self._record_transaction_entity("profile", target_uuid, "updated", before)
-            self.request("PATCH", f"/api/config-profiles/{target_uuid}", {"name": profile_name, "config": raw_config_json})
-            profile_uuid = target_uuid
+            if _same_config(existing["config"], raw_config_json) and existing["name"] == profile_name:
+                profile_uuid = target_uuid
+            else:
+                before = {"name": existing["name"], "config": existing["config"]}
+                self._record_transaction_entity("profile", target_uuid, "updated", before)
+                self.request("PATCH", f"/api/config-profiles/{target_uuid}", {"name": profile_name, "config": raw_config_json})
+                profile_uuid = target_uuid
         else:
             pending = self._record_pending_create("profile")
             res = self.request("POST", "/api/config-profiles", {"name": profile_name, "config": raw_config_json})
@@ -455,6 +536,11 @@ class GoWaveClient:
                         break
 
             if found_uuid:
+                # The Panel starts Xray on a node whenever its configuration is
+                # written, so an unchanged node is left alone rather than
+                # restarted on every repeated install.
+                if _same_node_configuration(existing_node, payload):
+                    return found_uuid
                 required_before = ("name", "address", "port", "configProfile")
                 if not all(k in existing_node for k in required_before):
                     raise GoWaveAPIError(f"Cannot safely update node {found_uuid}: rollback snapshot is incomplete")
@@ -689,6 +775,27 @@ class GoWaveClient:
             if e.status_code == 404:
                 return None
             raise
+
+    def ensure_api_token(self, token_name="gowave-auto-sub-token", existing_token=""):
+        """Return the token this operator already issued under that name.
+
+        The Panel reveals a token value exactly once, so the only copy is the one
+        the credentials file saved. Reusing it keeps a repeated install from
+        leaving a second token with the same name behind; the stored value is
+        dropped only when the Panel no longer lists a token under that name.
+        """
+        if existing_token:
+            res = self.request("GET", "/api/tokens")
+            names = {
+                str(item.get("name") or "")
+                for item in _extract_list(res, "tokens")
+                if isinstance(item, dict)
+            }
+            if token_name in names:
+                return {"token": existing_token, "id": "", "reused": True}
+        info = self.issue_api_token(token_name)
+        info["reused"] = False
+        return info
 
     def delete_user(self, user_uuid):
         try:

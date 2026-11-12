@@ -4,22 +4,80 @@ set -euo pipefail
 
 PREFLIGHT_REQUIRED_PORTS=(80 443 3000 3001 3002 7443 8443 8444 9443 9444 10001 10002 10003)
 
+# A repeated install legitimately rediscovers the product already bound to the ports
+# it is about to re-check. Only listeners owned by anything else are a conflict.
+PREFLIGHT_MANAGED_UNITS=(gowave.service gowave-node.service nginx.service)
+PREFLIGHT_PROC_ROOT="${PREFLIGHT_PROC_ROOT:-/proc}"
+
+preflight_pid_is_managed() {
+    local pid="$1"
+    local cgroup=""
+    if [[ -z "$pid" ]]; then
+        return 1
+    fi
+    cgroup=$(cat "${PREFLIGHT_PROC_ROOT}/${pid}/cgroup" 2>/dev/null || true)
+    if [[ -z "$cgroup" ]]; then
+        return 1
+    fi
+    local unit
+    for unit in "${PREFLIGHT_MANAGED_UNITS[@]}"; do
+        # Matches both cgroup v2 ("0::/system.slice/<unit>") and the cgroup v1
+        # hierarchy ("1:name=systemd:/system.slice/<unit>").
+        if [[ "$cgroup" == *"/${unit}"* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+preflight_describe_socket() {
+    local line="$1"
+    local info
+    info=$(printf '%s\n' "$line" | grep -o 'users:(.*)' || true)
+    if [[ -n "$info" ]]; then
+        printf '%s\n' "$info"
+        return 0
+    fi
+    printf '%s\n' "$line"
+}
+
 check_port_availability() {
     local ports=("${@:-${PREFLIGHT_REQUIRED_PORTS[@]}}")
     local conflicts=()
 
+    if ! command -v ss >/dev/null 2>&1; then
+        return 0
+    fi
+
     for port in "${ports[@]}"; do
-        local line
-        # Check ss -Hltnp for listening sockets on the specified port
-        if command -v ss >/dev/null 2>&1; then
-            line=$(ss -Hltnp "sport = :$port" 2>/dev/null || true)
-            if [[ -n "$line" ]]; then
-                # Extract pid/process name if available
-                local proc_info
-                proc_info=$(echo "$line" | grep -o 'users:(.*)' || echo "$line")
-                conflicts+=("Port $port is in use: $proc_info")
-            fi
+        local line=""
+        line=$(ss -Hltnp "sport = :$port" 2>/dev/null || true)
+        if [[ -z "$line" ]]; then
+            continue
         fi
+
+        local owners=""
+        owners=$(printf '%s\n' "$line" | grep -o 'pid=[0-9][0-9]*' | cut -d= -f2 | sort -u || true)
+        if [[ -z "$owners" ]]; then
+            # An owner we cannot attribute is never silently forgiven.
+            conflicts+=("Port $port is in use: $(preflight_describe_socket "$line")")
+            continue
+        fi
+
+        local foreign=0
+        local owner
+        while IFS= read -r owner; do
+            if [[ -z "$owner" ]]; then
+                continue
+            fi
+            if ! preflight_pid_is_managed "$owner"; then
+                foreign=1
+            fi
+        done <<< "$owners"
+        if [[ "$foreign" -eq 0 ]]; then
+            continue
+        fi
+        conflicts+=("Port $port is in use: $(preflight_describe_socket "$line")")
     done
 
     if [[ ${#conflicts[@]} -gt 0 ]]; then

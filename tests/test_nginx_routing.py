@@ -676,6 +676,34 @@ class TestNginxRouting(unittest.TestCase):
             self.assertNotEqual(res.returncode, 0)
             self.assertIn("Pre-existing unowned Certbot deploy hook found", res.stderr)
 
+    def test_deploy_hook_ownership_repeated_install_accepts_its_own_hook(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            hook_file = tmp / "renewal-hooks" / "deploy" / "gowave-nginx.sh"
+            rec_dir = tmp / "recovery"
+
+            first = f'source "{NGINX_SH}" && install_managed_deploy_hook "install_1" "{hook_file}" "{rec_dir}"'
+            res_first = subprocess.run(["bash", "-c", first], capture_output=True, text=True)
+            self.assertEqual(res_first.returncode, 0, res_first.stderr)
+            # Commit keeps the manifest: it is the only host-local proof that the
+            # hook at this path was written by this product.
+            self.assertTrue((rec_dir / "install_1" / "deploy-hook-manifest.json").is_file())
+
+            # Every repeat install runs under a new transaction id, so its own
+            # manifest does not exist yet; the hook a prior transaction recorded is
+            # reused instead of being refused.
+            for tx_id in ("install_2", "install_3"):
+                repeat = f'source "{NGINX_SH}" && install_managed_deploy_hook "{tx_id}" "{hook_file}" "{rec_dir}"'
+                res_repeat = subprocess.run(["bash", "-c", repeat], capture_output=True, text=True)
+                self.assertEqual(res_repeat.returncode, 0, res_repeat.stderr)
+
+            # A hook someone else rewrote is not the file any transaction recorded.
+            hook_file.write_text("#!/bin/sh\necho hijacked\n")
+            fourth = f'source "{NGINX_SH}" && verify_deploy_hook_preflight "{hook_file}" "install_4" "{rec_dir}"'
+            res_fourth = subprocess.run(["bash", "-c", fourth], capture_output=True, text=True)
+            self.assertNotEqual(res_fourth.returncode, 0)
+            self.assertIn("Pre-existing unowned Certbot deploy hook found", res_fourth.stderr)
+
     def test_deploy_hook_ownership_create_and_rollback(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -718,22 +746,6 @@ class TestNginxRouting(unittest.TestCase):
             self.assertNotEqual(res_rollback.returncode, 0)
             self.assertIn("digest mismatch", res_rollback.stderr)
             self.assertTrue(hook_file.is_file())
-
-    def test_deploy_hook_ownership_cleanup_manifest_preserves_hook(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp = Path(tmpdir)
-            hook_file = tmp / "renewal-hooks" / "deploy" / "gowave-nginx.sh"
-            rec_dir = tmp / "recovery"
-            tx_id = "tx_hook_3"
-
-            cmd_install = f'source "{NGINX_SH}" && install_managed_deploy_hook "{tx_id}" "{hook_file}" "{rec_dir}"'
-            self.assertEqual(subprocess.run(["bash", "-c", cmd_install], capture_output=True).returncode, 0)
-
-            cmd_cleanup = f'source "{NGINX_SH}" && cleanup_deploy_hook_manifest "{tx_id}" "{rec_dir}"'
-            self.assertEqual(subprocess.run(["bash", "-c", cmd_cleanup], capture_output=True).returncode, 0)
-
-            self.assertTrue(hook_file.is_file(), "Deploy hook must be retained upon commit cleanup")
-            self.assertFalse((rec_dir / tx_id / "deploy-hook-manifest.json").exists())
 
 
 if __name__ == "__main__":

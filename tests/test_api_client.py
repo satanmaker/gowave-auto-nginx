@@ -18,6 +18,7 @@ from unittest.mock import patch
 REPO_ROOT = Path(__file__).resolve().parent.parent
 import sys
 sys.path.insert(0, str(REPO_ROOT))
+import modules.api_client as api_client
 from modules.api_client import (
     GoWaveAPIError,
     GoWaveClient,
@@ -514,6 +515,114 @@ class TestAPIClient(unittest.TestCase):
         # Re-provisioning with same remark (triggers PATCH /api/hosts with uuid in body)
         hosts2 = self.client.provision_hosts(prof_uuid, inbounds, "node-patch-test", "squad-patch-test", "vpn.example.com", "cdn.example.com", "patch-test-node")
         self.assertEqual(hosts1, hosts2)
+
+    def test_unchanged_profile_is_not_written_again(self):
+        # The Panel restarts every node that uses a profile whenever the profile
+        # is written, so a repeated install must not re-send an identical one.
+        config = json.dumps({"inbounds": [{"tag": "a", "protocol": "vless", "port": 443}]})
+        stored = json.dumps(json.loads(config), sort_keys=True, separators=(",", ":"))
+        client = GoWaveClient("http://panel.example.test")
+        calls = []
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            calls.append((method, endpoint))
+            if endpoint == "/api/config-profiles":
+                return {"response": {"configProfiles": [{"uuid": "profile-1", "name": "P", "config": stored}]}}
+            if endpoint == "/api/config-profiles/profile-1/computed-config":
+                return {"response": {"config": config}}
+            if endpoint == "/api/config-profiles/profile-1/inbounds":
+                return {"response": {"inbounds": [{"uuid": "inbound-1"}]}}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client.request = fake_request
+        result = client.provision_config_profile("P", config)
+        self.assertEqual(result["profile_uuid"], "profile-1")
+        self.assertEqual([c for c in calls if c[0] in ("PATCH", "POST")], [])
+        self.assertEqual(client.transaction_entities, [])
+
+    def test_changed_profile_is_written_and_rolled_back(self):
+        stored = json.dumps({"inbounds": [{"tag": "a", "protocol": "vless", "port": 443}]})
+        changed = json.dumps({"inbounds": [{"tag": "a", "protocol": "vless", "port": 8443}]})
+        client = GoWaveClient("http://panel.example.test")
+        calls = []
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            calls.append((method, endpoint))
+            if endpoint == "/api/config-profiles":
+                return {"response": {"configProfiles": [{"uuid": "profile-1", "name": "P", "config": stored}]}}
+            if endpoint == "/api/config-profiles/profile-1/computed-config":
+                return {"response": {"config": changed}}
+            if endpoint == "/api/config-profiles/profile-1/inbounds":
+                return {"response": {"inbounds": [{"uuid": "inbound-1"}]}}
+            if method == "PATCH":
+                return {"response": {}}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client.request = fake_request
+        client.provision_config_profile("P", changed)
+        self.assertIn(("PATCH", "/api/config-profiles/profile-1"), calls)
+        self.assertEqual(client.transaction_entities[0]["type"], "profile")
+        self.assertEqual(client.transaction_entities[0]["before"]["config"], stored)
+
+    def test_unchanged_node_is_not_written_again(self):
+        # Writing a node's configuration starts Xray on it, so an install that
+        # finds the node unchanged must leave the running data plane alone.
+        node = {
+            "uuid": "node-1",
+            "name": "local-node",
+            "address": "127.0.0.1",
+            "port": 3002,
+            "configProfile": {
+                "activeConfigProfileUuid": "profile-1",
+                "activeInbounds": [{"uuid": "inbound-1"}],
+            },
+        }
+        client = GoWaveClient("http://panel.example.test")
+        calls = []
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            calls.append((method, endpoint))
+            if endpoint == "/api/nodes":
+                return {"response": {"nodes": [node]}}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client.request = fake_request
+        node_uuid = client.associate_node(
+            "local-node", "127.0.0.1", 3002, "profile-1", ["inbound-1"],
+        )
+        self.assertEqual(node_uuid, "node-1")
+        self.assertEqual([c for c in calls if c[0] != "GET"], [])
+        self.assertEqual(client.transaction_entities, [])
+
+    def test_node_change_is_written(self):
+        node = {
+            "uuid": "node-1",
+            "name": "local-node",
+            "address": "127.0.0.1",
+            "port": 3002,
+            "configProfile": {
+                "activeConfigProfileUuid": "profile-1",
+                "activeInbounds": [{"uuid": "inbound-1"}],
+            },
+        }
+        client = GoWaveClient("http://panel.example.test")
+        calls = []
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            calls.append((method, endpoint))
+            if endpoint == "/api/nodes":
+                return {"response": {"nodes": [node]}}
+            if method == "PATCH":
+                return {"response": {}}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client.request = fake_request
+        node_uuid = client.associate_node(
+            "local-node", "127.0.0.1", 3002, "profile-2", ["inbound-1"],
+        )
+        self.assertEqual(node_uuid, "node-1")
+        self.assertIn(("PATCH", "/api/nodes/node-1"), calls)
+        self.assertEqual(client.transaction_entities[0]["before"]["configProfile"], node["configProfile"])
 
     def test_parse_core_version(self):
         self.assertEqual(parse_core_version("v26.11.9"), (26, 11, 9))
@@ -1234,6 +1343,137 @@ class TestAPIClient(unittest.TestCase):
             self.assertIn("rollback_error", updated)
             self.assertIn("unrelated-prof", MockGoWaveServer.profiles)
             self.assertIn("unrelated-node", MockGoWaveServer.nodes)
+
+
+class TestRepeatedInstallContract(unittest.TestCase):
+    """A second operator run must reuse what the installed Panel already publishes."""
+
+    def make_client(self):
+        return GoWaveClient("http://127.0.0.1:1")
+
+    def test_an_existing_admin_is_a_login_not_a_registration_failure(self):
+        client = self.make_client()
+        calls = []
+
+        def request(method, path, payload=None, authenticate=True):
+            calls.append((method, path))
+            if path == "/api/auth/register":
+                raise api_client.GoWaveAPIError("an admin already exists", status_code=403)
+            return {"response": {"accessToken": "reused-token"}}
+
+        with mock.patch.object(client, "request", request):
+            client.register_initial_admin("admin", "stored-password")
+
+        self.assertEqual(calls, [("POST", "/api/auth/register"), ("POST", "/api/auth/login")])
+        self.assertEqual(client.token, "reused-token")
+
+    def test_a_registration_failure_the_stored_password_cannot_fix_is_raised(self):
+        client = self.make_client()
+
+        def request(method, path, payload=None, authenticate=True):
+            raise api_client.GoWaveAPIError("server error", status_code=500)
+
+        with mock.patch.object(client, "request", request):
+            with self.assertRaises(api_client.GoWaveAPIError):
+                client.register_initial_admin("admin", "stored-password")
+
+    def test_a_listed_token_is_reused_instead_of_issued_twice(self):
+        client = self.make_client()
+        calls = []
+
+        def request(method, path, payload=None, authenticate=True):
+            calls.append((method, path))
+            return {"response": {"tokens": [{"name": "gowave-auto-sub-token", "uuid": "token-1"}]}}
+
+        with mock.patch.object(client, "request", request):
+            info = client.ensure_api_token(existing_token="stored-token")
+
+        self.assertEqual(info, {"token": "stored-token", "id": "", "reused": True})
+        self.assertEqual(calls, [("GET", "/api/tokens")])
+
+    def test_a_token_the_panel_no_longer_lists_is_issued_again(self):
+        client = self.make_client()
+        calls = []
+
+        def request(method, path, payload=None, authenticate=True):
+            calls.append((method, path))
+            if method == "GET":
+                return {"response": {"tokens": []}}
+            return {"response": {"token": "fresh-token", "id": "token-2"}}
+
+        with mock.patch.object(client, "request", request):
+            info = client.ensure_api_token(existing_token="stale-token")
+
+        self.assertEqual(info, {"token": "fresh-token", "id": "token-2", "reused": False})
+        self.assertEqual(calls, [("GET", "/api/tokens"), ("POST", "/api/tokens")])
+
+    def test_without_a_stored_token_nothing_is_looked_up(self):
+        client = self.make_client()
+        calls = []
+
+        def request(method, path, payload=None, authenticate=True):
+            calls.append((method, path))
+            return {"response": {"token": "fresh-token", "id": "token-3"}}
+
+        with mock.patch.object(client, "request", request):
+            info = client.ensure_api_token()
+
+        self.assertFalse(info["reused"])
+        self.assertEqual(calls, [("POST", "/api/tokens")])
+
+    def installed_profile(self):
+        config = json.loads(
+            self.make_client().compile_config_profile(
+                "local-node", "reality.example.com", "installed-private-key",
+                short_ids=["0123456789abcdef"], public_key="installed-public-key",
+            )
+        )
+        return {"uuid": "profile-1", "name": "GoWave MVP Unified Profile - local-node",
+                "config": json.dumps(config)}
+
+    def test_the_installed_reality_material_is_reused(self):
+        client = self.make_client()
+        profile = self.installed_profile()
+
+        with mock.patch.object(
+            client, "request", lambda *args, **kwargs: {"response": {"configProfiles": [profile]}},
+        ):
+            material = client.existing_reality_material(profile["name"], "reality.example.com")
+
+        self.assertEqual(material["privateKey"], "installed-private-key")
+        self.assertEqual(material["publicKey"], "installed-public-key")
+        self.assertEqual(material["shortIds"], ["0123456789abcdef"])
+
+    def test_a_profile_for_another_server_name_yields_no_material(self):
+        client = self.make_client()
+        profile = self.installed_profile()
+
+        with mock.patch.object(
+            client, "request", lambda *args, **kwargs: {"response": {"configProfiles": [profile]}},
+        ):
+            self.assertIsNone(client.existing_reality_material(profile["name"], "other.example.com"))
+
+    def test_a_profile_with_unparsable_config_yields_no_material(self):
+        client = self.make_client()
+        profile = {"uuid": "profile-1", "name": "GoWave MVP Unified Profile - local-node",
+                   "config": "not json"}
+
+        with mock.patch.object(
+            client, "request", lambda *args, **kwargs: {"response": {"configProfiles": [profile]}},
+        ):
+            self.assertIsNone(
+                client.existing_reality_material(profile["name"], "reality.example.com")
+            )
+
+    def test_no_profile_yields_no_material(self):
+        client = self.make_client()
+        with mock.patch.object(
+            client, "request", lambda *args, **kwargs: {"response": {"configProfiles": []}},
+        ):
+            self.assertIsNone(
+                client.existing_reality_material("GoWave MVP Unified Profile - local-node",
+                                                 "reality.example.com")
+            )
 
 
 if __name__ == "__main__":
