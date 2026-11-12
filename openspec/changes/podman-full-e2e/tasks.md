@@ -60,9 +60,9 @@
 - [x] 5.7 Prove payload traversal through Worker for every applicable supported protocol/configuration.
 - [x] 5.8 Verify untrusted management access is denied and trusted access remains functional.
 - [x] 5.9 Verify subscription revocation, Worker outage, restart, and recovery behavior.
-- [ ] 5.10 Verify all four independent Vision combinations: neither, Master-only, Worker-only, and both.
+- [x] 5.10 Verify all four independent Vision combinations: neither, Master-only, Worker-only, and both.
 - [x] 5.10a Verify SSH wrong-host-key rejection before command execution and authorized host-key rotation (new key accepted, old key rejected).
-- [ ] 5.11 Execute and assert the complete Multi-Node matrix with both Xray and Mihomo: exactly 16 positive transfer cases with Vision disabled, 18 with Vision enabled on one node, and 20 with Vision enabled on both nodes.
+- [x] 5.11 Execute and assert the complete Multi-Node matrix with both Xray and Mihomo: exactly 16 positive transfer cases with Vision disabled, 18 with Vision enabled on one node, and 20 with Vision enabled on both nodes.
 - [x] 5.12 Prove Worker and Master egress attribution using distinct node-only egress identities; deny direct client/Control access to the external fixture and reject wrong-node source attribution.
 
 ## 6. TLS, DNS, ACME, and network policy
