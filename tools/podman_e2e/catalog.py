@@ -1,0 +1,596 @@
+"""Shared acceptance case catalog for the Podman and Live VPS suites.
+
+The catalog is the single definition of every acceptance case: ID, owning
+requirement, source scenario, assertion text, environment classification, gate
+tier, and (once implemented) the suite driver. The Podman runner and the live
+runner read the same file; a case is never defined twice.
+
+Run this module as a script to regenerate the catalog from the live spec:
+
+    python3 -m tools.podman_e2e.catalog generate
+    python3 -m tools.podman_e2e.catalog check
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+LIVE_SPEC = REPO_ROOT / "openspec" / "specs" / "live-vps-e2e" / "spec.md"
+CATALOG_PATH = REPO_ROOT / "tests" / "cases" / "catalog.yaml"
+PARITY_PATH = REPO_ROOT / "tests" / "cases" / "PARITY.md"
+BEHAVIORS_PATH = REPO_ROOT / "tests" / "cases" / "behaviors.yaml"
+MATRIX_PATH = REPO_ROOT / "tests" / "cases" / "matrix.yaml"
+
+PODMAN_CASES: Sequence[str] = ("aio", "multi-node")
+ALL_CASES: Sequence[str] = ("podman", "live")
+
+REQUIREMENT_PREFIX = {
+    "Disposable Environment Gate": "ENV",
+    "Complete Mutation-Target Baseline and Resource Ownership": "OWN",
+    "Preflight SSH Trust and DNS Verification": "PRE",
+    "Target Address, Domain, and SSH Identity Safety": "ADDR",
+    "Independent Optional Vision Domains": "VIS",
+    "Pinned Version Fidelity": "VER",
+    "All-in-One Master VPS Installation Verification": "AIO",
+    "Distributed Worker VPS Deployment Verification": "WRK",
+    "Public mTLS Control Plane Verification (Master → Worker)": "MTLS",
+    "TLS-aware Bounded Panel API Client": "APIC",
+    "Panel API Cluster Structure Audit": "CLUS",
+    "Real Subscription Delivery and User-Agent Policy": "SUB",
+    "UFW Firewall Isolation Verification": "FW",
+    "NGINX SNI Routing and REALITY Decoy Verification": "NGX",
+    "Data Plane E2E Traffic Through All VPN Endpoints": "DP",
+    "Negative Scenario and Fault Injection Tests": "NEG",
+    "Global Certbot Deploy Hook Ownership": "HOOK",
+    "Signal-Safe and Verifiable Transaction Compensation": "TXN",
+    "Teardown Policy Enforcement": "TD",
+    "Pair-Wide Run Locking": "LOCK",
+    "Shared Mutation Lock Across All Management Entry Points": "MLOCK",
+    "Durable Run State for Partial CLI Modes": "STATE",
+    "Redacted Diagnostic Artifact Collection": "RED",
+    "Result Status Semantics": "RES",
+    "Local Operator Credential Bootstrap and Cleanup": "BOOT",
+    "Per-Case Data-Plane Packet Evidence": "PKT",
+    "Local interactive operator entrypoint": "OP",
+    "Out-of-band SSH host identity verification": "SSHID",
+    "Temporary SSH access with remote expiry": "TSSH",
+    "Immediate credential revocation gates overall status": "REV",
+    "Local-only live VPS credential handling": "LOCAL",
+}
+
+MULTI_NODE_ONLY = {
+    "Distributed Worker VPS Deployment Verification",
+    "Public mTLS Control Plane Verification (Master → Worker)",
+    "Panel API Cluster Structure Audit",
+    "UFW Firewall Isolation Verification",
+    "Pair-Wide Run Locking",
+    "Shared Mutation Lock Across All Management Entry Points",
+    "Local-only live VPS credential handling",
+}
+
+PARTIAL_SCENARIOS = {
+    ("Preflight SSH Trust and DNS Verification", "Private or reserved IP rejected"):
+        "Container proves the private/reserved rule against Podman addresses with an explicitly scoped, fail-closed exemption; the live run is authoritative for real public addresses.",
+    ("UFW Firewall Isolation Verification", "Master local and external access are distinguished"):
+        "Container proves isolation between distinct source addresses; provider-level external reachability is live-only.",
+    ("Data Plane E2E Traffic Through All VPN Endpoints", "Staging and public CA chains are both trusted without bypass"):
+        "Container proves explicit verify anchors and no global trust change; public Let's Encrypt issuance is live-only.",
+    ("Data Plane E2E Traffic Through All VPN Endpoints", "Xray TLS outbounds carry explicit Staging trust anchors"):
+        "Container proves the injected verify anchor is required; real Staging material is live-only.",
+    ("Data Plane E2E Traffic Through All VPN Endpoints", "Staging CA material is pinned and reproducible"):
+        "Container proves fixture CA pinning by digest; real Staging CA distribution is live-only.",
+    ("Teardown Policy Enforcement", "Snapshot restore reacquires the remote lock pair before baseline verification"):
+        "Container proves lock ordering and hook protocol; provider snapshots are live-only.",
+    ("Local Operator Credential Bootstrap and Cleanup", "Host identity is verified before password authentication"):
+        "Container proves host identity precedes the password; the live controller's public-target path is live-only.",
+    ("Local Operator Credential Bootstrap and Cleanup", "Temporary access is bounded and revoked"):
+        "Container proves bounded key lifetime and revocation; live account behaviour is live-only.",
+}
+
+LIVE_ONLY_SCENARIOS = {
+    ("Teardown Policy Enforcement", "Single-host snapshot reboot does not self-deadlock lock reacquisition"):
+        "Requires a provider snapshot and a real reboot; a container cannot reproduce the host lifecycle.",
+    ("Local-only live VPS credential handling", "Local operator starts a live run"):
+        "Starts the interactive operator against real disposable VPS instances; live infrastructure only.",
+}
+
+PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
+    {
+        "id": "SUB-B64",
+        "requirement": "Panel subscription representations",
+        "assertion": "The base64 share-link list at /api/sub/<shortUuid> contains one link per proxy entry with the expected protocol, host, SNI and firefox fingerprint, and an Xray-family client imports it while the raw JSON body imports nothing.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Real Subscription Delivery and User-Agent Policy",
+    },
+    {
+        "id": "SUB-UA-BLANK",
+        "requirement": "Real Panel subscription lifecycle",
+        "assertion": "An explicitly blank User-Agent header is rejected with 403 as a result separate from the absent-header case.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Real Subscription Delivery and User-Agent Policy",
+    },
+    {
+        "id": "SUB-JSON-SHAPES",
+        "requirement": "Panel subscription representations",
+        "assertion": "/v2ray-json is validated in both served shapes: a list entry as a complete config, and only a bare outbound object wrapped with the minimal runtime wrapper.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Real Subscription Delivery and User-Agent Policy",
+    },
+    {
+        "id": "NGX-COVER-DERIVE",
+        "requirement": "Camouflage decoy and certificate lineage",
+        "assertion": "The cover apex is the last two labels of panel_domain and a domain with fewer than three labels produces no cover lineage and is handled explicitly.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "NGINX SNI Routing and REALITY Decoy Verification",
+    },
+    {
+        "id": "NGX-COVER-UNRESOLVED",
+        "requirement": "Camouflage decoy and certificate lineage",
+        "assertion": "When the apex or www.<apex> does not resolve to the host IPv4, the operator refuses before issuing the lineage and leaves no partial decoy or stale sites-enabled entry.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "NGINX SNI Routing and REALITY Decoy Verification",
+    },
+    {
+        "id": "NGX-WORKER-ACME80",
+        "requirement": "Camouflage decoy and certificate lineage",
+        "assertion": "A Worker install or reconfiguration keeps its port 80 ACME vhost reachable so renewal retains a working HTTP-01 path.",
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
+    {
+        "id": "TLS-VERIFY-ANCHORS",
+        "requirement": "Private test CA trust for both client engines",
+        "assertion": "Every Xray TLS outbound carries the fixture CA through tlsSettings.certificates with usage verify, and removing the anchor turns the case into a chain-verification failure.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
+    },
+    {
+        "id": "PODNET-MASTER-ADDR",
+        "requirement": "Podman-only Master address selection for Worker provisioning",
+        "assertion": "The real node add path uses the validated private Master address on the run-scoped network, Worker observes that source, and the override is rejected without the explicit opt-in or when the address is not assigned to Master.",
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
+    {
+        "id": "ACME-REJECT-ARB",
+        "requirement": "Fail-closed local ACME test mode",
+        "assertion": "Arbitrary ACME directory URLs are rejected by Master and Worker both outside and inside the test-only opt-in; only the pinned fixture endpoint and the Let's Encrypt allowlist are accepted.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Global Certbot Deploy Hook Ownership",
+    },
+    {
+        "id": "GATE-BUDGET",
+        "requirement": "Pre-push and pull-request acceptance gate",
+        "assertion": "A run that exhausts the declared runtime budget before every case executed reports INCOMPLETE naming the unexecuted cases and cannot be converted into PASS.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Result Status Semantics",
+    },
+    {
+        "id": "GATE-COVERAGE",
+        "requirement": "Coverage completeness and error paths",
+        "assertion": "An unmapped behavior, a behavior covered only on its happy path, or a case mapped to no behavior fails the coverage audit with the item named.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Result Status Semantics",
+    },
+    {
+        "id": "GATE-PREPUSH",
+        "requirement": "Pre-push and pull-request acceptance gate",
+        "assertion": "The documented pre-push entrypoint runs both topologies with pinned fixtures and no live credentials and blocks a regressed change with its case IDs.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Result Status Semantics",
+    },
+    {
+        "id": "GATE-DIVERGENCE",
+        "requirement": "Live scenario parity",
+        "assertion": "A live scenario without a catalog entry, a live-parity case executed by only one suite, or a topology count departing from 8/10 and 16/18/20 fails the divergence guard.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Result Status Semantics",
+    },
+]
+
+SCENARIO_RE = re.compile(r"^#### Scenario:\s*(.+?)\s*$")
+REQUIREMENT_RE = re.compile(r"^### Requirement:\s*(.+?)\s*$")
+
+
+@dataclass
+class LiveScenario:
+    requirement: str
+    title: str
+    body: str
+
+    @property
+    def assertion(self) -> str:
+        return normalize_assertion(self.body)
+
+    @property
+    def assertion_sha256(self) -> str:
+        return hashlib.sha256(self.assertion.encode("utf-8")).hexdigest()
+
+
+def normalize_assertion(text: str) -> str:
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+        line = re.sub(r"^[-*]\s+", "", line)
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def parse_live_spec(path: Path = LIVE_SPEC) -> List[LiveScenario]:
+    scenarios: List[LiveScenario] = []
+    requirement: Optional[str] = None
+    title: Optional[str] = None
+    body: List[str] = []
+
+    def flush() -> None:
+        nonlocal title, body
+        if requirement and title:
+            scenarios.append(LiveScenario(requirement, title, "\n".join(body).strip()))
+        title = None
+        body = []
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        req_match = REQUIREMENT_RE.match(line)
+        if req_match:
+            flush()
+            requirement = req_match.group(1)
+            continue
+        scen_match = SCENARIO_RE.match(line)
+        if scen_match:
+            flush()
+            title = scen_match.group(1)
+            continue
+        if line.startswith("#"):
+            flush()
+            continue
+        if title is not None:
+            body.append(line)
+    flush()
+    return scenarios
+
+
+def classify(requirement: str, title: str) -> Tuple[str, Optional[str]]:
+    key = (requirement, title)
+    if key in LIVE_ONLY_SCENARIOS:
+        return "live-only", LIVE_ONLY_SCENARIOS[key]
+    if key in PARTIAL_SCENARIOS:
+        return "partial", PARTIAL_SCENARIOS[key]
+    return "container", None
+
+
+def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
+    scenarios = parse_live_spec(spec_path)
+    counters: Dict[str, int] = {}
+    cases: List[Dict[str, Any]] = []
+    for scenario in scenarios:
+        prefix = REQUIREMENT_PREFIX.get(scenario.requirement)
+        if not prefix:
+            raise ValueError(f"No stable ID prefix for requirement: {scenario.requirement!r}")
+        counters[prefix] = counters.get(prefix, 0) + 1
+        case_id = f"{prefix}-{counters[prefix]:02d}"
+        environment, note = classify(scenario.requirement, scenario.title)
+        if environment == "live-only":
+            runs_in = ["live"]
+            state = "live-only"
+        elif environment == "partial":
+            runs_in = ["podman", "live"]
+            state = "live-parity"
+        else:
+            runs_in = ["podman", "live"]
+            state = "live-parity"
+        topologies = ["multi-node"] if scenario.requirement in MULTI_NODE_ONLY else ["aio", "multi-node"]
+        case: Dict[str, Any] = {
+            "id": case_id,
+            "requirement": scenario.requirement,
+            "live_scenario": scenario.title,
+            "assertion": scenario.assertion,
+            "assertion_sha256": scenario.assertion_sha256,
+            "runs_in": runs_in,
+            "state": state,
+            "environment": environment,
+            "topology": topologies,
+            "gate": "pre-push",
+            "driver": None,
+            "driver_status": "planned" if "podman" in runs_in else "not-applicable",
+        }
+        if note:
+            key = "partial_split" if environment == "partial" else "live_only_reason"
+            case[key] = note
+        case["promotion_target"] = None
+        cases.append(case)
+
+    for extra in PODMAN_FIRST_CASES:
+        cases.append({
+            "id": extra["id"],
+            "requirement": extra["requirement"],
+            "live_scenario": None,
+            "assertion": extra["assertion"],
+            "assertion_sha256": hashlib.sha256(extra["assertion"].encode("utf-8")).hexdigest(),
+            "runs_in": ["podman"],
+            "state": "incubating",
+            "environment": "container",
+            "topology": extra["topology"],
+            "gate": "pre-push",
+            "driver": None,
+            "driver_status": "planned",
+            "promotion_target": extra["promotion_target"],
+        })
+
+    counts = {
+        "live_total": len(scenarios),
+        "container": sum(1 for c in cases if c["live_scenario"] and c["environment"] == "container"),
+        "partial": sum(1 for c in cases if c["environment"] == "partial"),
+        "live_only": sum(1 for c in cases if c["environment"] == "live-only"),
+        "podman_first": len(PODMAN_FIRST_CASES),
+        "total": len(cases),
+    }
+    spec_sha = hashlib.sha256(spec_path.read_bytes()).hexdigest()
+    return {
+        "version": 1,
+        "schema": "gowave-case-catalog/v1",
+        "live_spec": str(spec_path.relative_to(REPO_ROOT)),
+        "live_spec_sha256": spec_sha,
+        "counts": counts,
+        "expected_positive_case_counts": {
+            "aio": {"vision_disabled": 8, "vision_enabled": 10},
+            "multi-node": {
+                "vision_neither": 16,
+                "vision_one_node": 18,
+                "vision_both": 20,
+            },
+        },
+        "cases": cases,
+    }
+
+
+def load_catalog(path: Path = CATALOG_PATH) -> Dict[str, Any]:
+    with path.open(encoding="utf-8") as handle:
+        return yaml.safe_load(handle)
+
+
+def write_catalog(catalog: Dict[str, Any], path: Path = CATALOG_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(catalog, sort_keys=False, allow_unicode=True, width=100),
+        encoding="utf-8",
+    )
+
+
+def validate_catalog(catalog: Dict[str, Any], spec_path: Path = LIVE_SPEC) -> List[str]:
+    errors: List[str] = []
+    scenarios = parse_live_spec(spec_path)
+    by_live: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    ids: Dict[str, Dict[str, Any]] = {}
+    for case in catalog.get("cases", []):
+        case_id = case.get("id")
+        if not case_id:
+            errors.append("Catalog case without an id")
+            continue
+        if case_id in ids:
+            errors.append(f"Duplicate case id: {case_id}")
+        ids[case_id] = case
+        if case.get("live_scenario"):
+            key = (case.get("requirement", ""), case["live_scenario"])
+            if key in by_live:
+                errors.append(f"Duplicate live scenario mapping: {key[0]} / {key[1]}")
+            by_live[key] = case
+
+    for scenario in scenarios:
+        key = (scenario.requirement, scenario.title)
+        case = by_live.get(key)
+        if case is None:
+            errors.append(f"Live scenario has no catalog entry: {scenario.requirement} / {scenario.title}")
+            continue
+        if case.get("assertion_sha256") != scenario.assertion_sha256:
+            errors.append(f"Assertion drift for {case.get('id')}: catalog text differs from the live spec")
+        if case.get("environment") == "live-only" and case.get("runs_in") != ["live"]:
+            errors.append(f"{case.get('id')}: live-only case must only run in the live suite")
+        if case.get("environment") == "partial" and not case.get("partial_split"):
+            errors.append(f"{case.get('id')}: partial case must state its split")
+        if case.get("environment") == "live-only" and not case.get("live_only_reason"):
+            errors.append(f"{case.get('id')}: live-only case must state its reason")
+
+    for key, case in by_live.items():
+        if key not in {(s.requirement, s.title) for s in scenarios}:
+            errors.append(f"Catalog entry has no live scenario: {case.get('id')} / {key[1]}")
+
+    counts = catalog.get("counts", {})
+    expected = {
+        "live_total": 125,
+        "container": 115,
+        "partial": 8,
+        "live_only": 2,
+    }
+    for field_name, expected_value in expected.items():
+        if counts.get(field_name) != expected_value:
+            errors.append(
+                f"Parity count drift: {field_name}={counts.get(field_name)} expected {expected_value}"
+            )
+
+    for case in catalog.get("cases", []):
+        if not case.get("live_scenario") and case.get("runs_in") != ["podman"]:
+            errors.append(f"{case.get('id')}: Podman-first case must run only in Podman")
+        if not case.get("live_scenario") and not case.get("promotion_target"):
+            errors.append(f"{case.get('id')}: Podman-first case requires a promotion target")
+    return errors
+
+
+def executable_gaps(catalog: Dict[str, Any], suite: str = "podman") -> List[str]:
+    """Return cases that claim to run in a suite but have no implemented driver."""
+    gaps = []
+    for case in catalog.get("cases", []):
+        if suite in case.get("runs_in", []) and not case.get("driver"):
+            gaps.append(f"{case['id']} ({case.get('environment')})")
+    return gaps
+
+
+def coverage_audit(catalog: Dict[str, Any], behaviors_path: Path = BEHAVIORS_PATH) -> List[str]:
+    errors: List[str] = []
+    if not behaviors_path.exists():
+        return [f"Behavior inventory is missing: {behaviors_path.relative_to(REPO_ROOT)}"]
+    inventory = yaml.safe_load(behaviors_path.read_text(encoding="utf-8")) or {}
+    behaviors = inventory.get("behaviors", [])
+    case_ids = {case["id"] for case in catalog.get("cases", [])}
+    mapped_cases = set()
+    for behavior in behaviors:
+        name = behavior.get("name", "<unnamed>")
+        cases = behavior.get("cases") or []
+        error_paths = behavior.get("error_paths") or []
+        if not cases:
+            errors.append(f"Behavior has no case: {name}")
+        if not error_paths:
+            errors.append(f"Behavior has no error-path case: {name}")
+        for case_id in cases + error_paths:
+            mapped_cases.add(case_id)
+            if case_id not in case_ids:
+                errors.append(f"Behavior {name} references unknown case {case_id}")
+    for case_id in sorted(case_ids - mapped_cases):
+        errors.append(f"Case is mapped to no behavior: {case_id}")
+    return errors
+
+
+def executed_ids_from_results(paths: Iterable[Path]) -> set:
+    executed = set()
+    for path in paths:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        for case in data.get("cases", []):
+            if case.get("status") not in ("SKIP", None):
+                executed.add(case.get("id"))
+    return executed
+
+
+def divergence_guard(
+    catalog_path: Path = CATALOG_PATH,
+    spec_path: Path = LIVE_SPEC,
+    podman_results: Sequence[Path] = (),
+    live_results: Sequence[Path] = (),
+) -> List[str]:
+    catalog = load_catalog(catalog_path)
+    errors = validate_catalog(catalog, spec_path)
+    if errors:
+        return errors
+
+    matrix = yaml.safe_load(MATRIX_PATH.read_text(encoding="utf-8"))
+    expected = catalog.get("expected_positive_case_counts", {})
+    matrix_expected = matrix.get("topologies", {})
+    for topology, values in expected.items():
+        matrix_counts = matrix_expected.get(topology, {}).get("positive_case_counts", {})
+        if set(values.values()) != set(matrix_counts.values()):
+            errors.append(
+                f"Positive case counts diverge between catalog and matrix for {topology}: "
+                f"{sorted(values.values())} vs {sorted(matrix_counts.values())}"
+            )
+
+    by_id = {case["id"]: case for case in catalog.get("cases", [])}
+    podman_executed = executed_ids_from_results(podman_results)
+    live_executed = executed_ids_from_results(live_results)
+    for case_id in podman_executed:
+        case = by_id.get(case_id)
+        if case is None:
+            errors.append(f"Podman run executed an unknown case: {case_id}")
+        elif "podman" not in case.get("runs_in", []):
+            errors.append(f"Podman ran a live-only case: {case_id}")
+    for case_id in live_executed:
+        case = by_id.get(case_id)
+        if case is None:
+            errors.append(f"Live run executed an unknown case: {case_id}")
+        elif case.get("state") == "live-parity" and case_id not in podman_executed:
+            errors.append(f"live-parity case was not executed by the Podman suite: {case_id}")
+    return errors
+
+
+def render_parity(catalog: Dict[str, Any]) -> str:
+    groups: Dict[str, Dict[str, int]] = {}
+    for case in catalog["cases"]:
+        if not case.get("live_scenario"):
+            continue
+        group = groups.setdefault(case["requirement"], {"container": 0, "partial": 0, "live-only": 0})
+        group[case["environment"]] += 1
+    lines = [
+        "# Podman / Live parity inventory",
+        "",
+        "Generated from `tests/cases/catalog.yaml`; do not edit by hand.",
+        "",
+        f"Live scenarios: {catalog['counts']['live_total']} — "
+        f"container {catalog['counts']['container']}, "
+        f"partial {catalog['counts']['partial']}, "
+        f"live-only {catalog['counts']['live_only']}.",
+        "",
+        "| Live requirement group | Scenarios | Container | Partial | Live-only |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for requirement in REQUIREMENT_PREFIX:
+        if requirement not in groups:
+            continue
+        counts = groups[requirement]
+        total = sum(counts.values())
+        lines.append(
+            f"| {requirement} | {total} | {counts['container']} | {counts['partial']} | {counts['live-only']} |"
+        )
+    lines.extend(["", "## Partial splits", ""])
+    for case in catalog["cases"]:
+        if case.get("environment") == "partial":
+            lines.append(f"- **{case['id']}** — {case.get('partial_split')}")
+    lines.extend(["", "## Live-only exclusions", ""])
+    for case in catalog["cases"]:
+        if case.get("environment") == "live-only":
+            lines.append(f"- **{case['id']}** — {case.get('live_only_reason')}")
+    lines.extend(["", "## Podman-first cases awaiting live promotion", ""])
+    for case in catalog["cases"]:
+        if case.get("state") == "incubating":
+            lines.append(f"- **{case['id']}** — promotion target: {case.get('promotion_target')}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("generate", help="Regenerate catalog.yaml and PARITY.md from the live spec")
+    sub.add_parser("check", help="Validate catalog parity, counts, and coverage")
+    sub.add_parser("gaps", help="List cases without an implemented driver")
+    args = parser.parse_args(argv)
+
+    if args.command == "generate":
+        catalog = build_catalog()
+        write_catalog(catalog)
+        PARITY_PATH.write_text(render_parity(catalog), encoding="utf-8")
+        print(f"Wrote {CATALOG_PATH.relative_to(REPO_ROOT)} and {PARITY_PATH.relative_to(REPO_ROOT)}")
+        return 0
+
+    if args.command == "check":
+        catalog = load_catalog()
+        errors = validate_catalog(catalog)
+        errors.extend(coverage_audit(catalog))
+        if errors:
+            for error in errors:
+                print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+        print("CATALOG: PASS")
+        return 0
+
+    if args.command == "gaps":
+        catalog = load_catalog()
+        gaps = executable_gaps(catalog)
+        for gap in gaps:
+            print(gap)
+        return 0 if not gaps else 1
+
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

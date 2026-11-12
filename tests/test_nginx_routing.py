@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import hashlib
+import os
 import subprocess
 import tempfile
 import unittest
@@ -274,6 +276,164 @@ class TestNginxRouting(unittest.TestCase):
         res_bad = subprocess.run(["bash", "-c", cmd_bad], capture_output=True, text=True)
         self.assertNotEqual(res_bad.returncode, 0)
         self.assertIn("Invalid GOWAVE_ACME_SERVER", res_bad.stderr)
+
+    def test_validate_acme_test_mode_is_fail_closed(self):
+        fixture = "https://pebble.testbed.internal:14000/dir"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ca_file = Path(tmpdir) / "pebble-ca.pem"
+            ca_file.write_text("test-ca-material\n")
+            digest = hashlib.sha256(ca_file.read_bytes()).hexdigest()
+
+            # The fixture endpoint is rejected unless the explicit opt-in is set.
+            res_no_mode = subprocess.run(
+                ["bash", "-c", f'source "{NGINX_SH}" && validate_acme_server "{fixture}"'],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(res_no_mode.returncode, 0)
+            self.assertIn("GOWAVE_ACME_TEST_MODE=1", res_no_mode.stderr)
+
+            # Test mode without a pinned CA fails closed.
+            env = {"GOWAVE_ACME_TEST_MODE": "1"}
+            res_no_ca = subprocess.run(
+                ["bash", "-c", f'source "{NGINX_SH}" && validate_acme_server "{fixture}"'],
+                capture_output=True, text=True, env={**os.environ, **env},
+            )
+            self.assertNotEqual(res_no_ca.returncode, 0)
+            self.assertIn("GOWAVE_ACME_TEST_CA_FILE", res_no_ca.stderr)
+
+            # A wrong CA digest is rejected.
+            env = {
+                "GOWAVE_ACME_TEST_MODE": "1",
+                "GOWAVE_ACME_TEST_CA_FILE": str(ca_file),
+                "GOWAVE_ACME_TEST_CA_SHA256": "0" * 64,
+            }
+            res_bad_digest = subprocess.run(
+                ["bash", "-c", f'source "{NGINX_SH}" && validate_acme_server "{fixture}"'],
+                capture_output=True, text=True, env={**os.environ, **env},
+            )
+            self.assertNotEqual(res_bad_digest.returncode, 0)
+            self.assertIn("digest mismatch", res_bad_digest.stderr)
+
+            # The exact fixture endpoint with the pinned CA is accepted.
+            env["GOWAVE_ACME_TEST_CA_SHA256"] = digest
+            res_ok = subprocess.run(
+                ["bash", "-c", f'source "{NGINX_SH}" && validate_acme_server "{fixture}"'],
+                capture_output=True, text=True, env={**os.environ, **env},
+            )
+            self.assertEqual(res_ok.returncode, 0, res_ok.stderr)
+
+            # Arbitrary URLs remain rejected even with test mode enabled.
+            res_arbitrary = subprocess.run(
+                ["bash", "-c", f'source "{NGINX_SH}" && validate_acme_server "https://attacker.example.com/dir"'],
+                capture_output=True, text=True, env={**os.environ, **env},
+            )
+            self.assertNotEqual(res_arbitrary.returncode, 0)
+            self.assertIn("pinned fixture endpoint", res_arbitrary.stderr)
+
+    def test_check_acme_lineage_fixture_requires_pinned_ca(self):
+        fixture = "https://pebble.testbed.internal:14000/dir"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            ca_key = tmp / "ca.key"
+            ca_cert = tmp / "ca.pem"
+            subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                 "-keyout", str(ca_key), "-out", str(ca_cert),
+                 "-days", "2", "-subj", "/CN=GoWave Podman Pebble CA"],
+                check=True, stderr=subprocess.DEVNULL,
+            )
+            digest = hashlib.sha256(ca_cert.read_bytes()).hexdigest()
+            live_dir = tmp / "live"
+            live_dir.mkdir()
+            renewal_conf = tmp / "panel.example.com.conf"
+            renewal_conf.write_text(f"[renewalparams]\nserver = {fixture}\n")
+
+            # A fixture lineage is rejected outside test mode.
+            cmd_lineage = (
+                f'source "{NGINX_SH}" && check_acme_lineage "panel.example.com" '
+                f'"{fixture}" "{renewal_conf}" "{live_dir}"'
+            )
+            res_no_mode = subprocess.run(["bash", "-c", cmd_lineage], capture_output=True, text=True)
+            self.assertNotEqual(res_no_mode.returncode, 0)
+            self.assertIn("GOWAVE_ACME_TEST_MODE=1", res_no_mode.stderr)
+
+            env = {
+                "GOWAVE_ACME_TEST_MODE": "1",
+                "GOWAVE_ACME_TEST_CA_FILE": str(ca_cert),
+                "GOWAVE_ACME_TEST_CA_SHA256": digest,
+            }
+
+            # A certificate that does not chain to the pinned CA is rejected.
+            subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                 "-keyout", str(live_dir / "privkey.pem"),
+                 "-out", str(live_dir / "fullchain.pem"),
+                 "-days", "2", "-subj", "/CN=panel.example.com"],
+                check=True, stderr=subprocess.DEVNULL,
+            )
+            res_untrusted = subprocess.run(
+                ["bash", "-c", cmd_lineage], capture_output=True, text=True,
+                env={**os.environ, **env},
+            )
+            self.assertNotEqual(res_untrusted.returncode, 0)
+            self.assertIn("does not chain to the pinned local ACME test CA", res_untrusted.stderr)
+
+            # A certificate issued by the pinned fixture CA is reusable.
+            leaf_key = tmp / "leaf.key"
+            leaf_csr = tmp / "leaf.csr"
+            leaf_cert = tmp / "leaf.pem"
+            subprocess.run(
+                ["openssl", "req", "-newkey", "rsa:2048", "-nodes",
+                 "-keyout", str(leaf_key), "-out", str(leaf_csr),
+                 "-subj", "/CN=panel.example.com"],
+                check=True, stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["openssl", "x509", "-req", "-in", str(leaf_csr), "-CA", str(ca_cert),
+                 "-CAkey", str(ca_key), "-CAcreateserial", "-out", str(leaf_cert),
+                 "-days", "2", "-sha256"],
+                check=True, stderr=subprocess.DEVNULL,
+            )
+            (live_dir / "fullchain.pem").write_bytes(leaf_cert.read_bytes())
+            (live_dir / "privkey.pem").write_bytes(leaf_key.read_bytes())
+            res_trusted = subprocess.run(
+                ["bash", "-c", cmd_lineage], capture_output=True, text=True,
+                env={**os.environ, **env},
+            )
+            self.assertEqual(res_trusted.returncode, 0, res_trusted.stderr)
+
+    def test_run_certbot_scopes_test_ca_trust(self):
+        fixture = "https://pebble.testbed.internal:14000/dir"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            ca_file = tmp / "pebble-ca.pem"
+            ca_file.write_text("test-ca-material\n")
+            digest = hashlib.sha256(ca_file.read_bytes()).hexdigest()
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            fake_certbot = bin_dir / "certbot"
+            fake_certbot.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf 'REQUESTS_CA_BUNDLE=%s\\nSSL_CERT_FILE=%s\\n' "
+                "\"${REQUESTS_CA_BUNDLE:-}\" \"${SSL_CERT_FILE:-}\"\n"
+            )
+            fake_certbot.chmod(0o755)
+
+            env = os.environ.copy()
+            env.update({
+                "PATH": f"{bin_dir}:{env['PATH']}",
+                "GOWAVE_ACME_TEST_MODE": "1",
+                "GOWAVE_ACME_SERVER": fixture,
+                "GOWAVE_ACME_TEST_CA_FILE": str(ca_file),
+                "GOWAVE_ACME_TEST_CA_SHA256": digest,
+            })
+            res = subprocess.run(
+                ["bash", "-c", f'source "{NGINX_SH}" && run_certbot certonly'],
+                capture_output=True, text=True, env=env,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn(f"REQUESTS_CA_BUNDLE={ca_file}", res.stdout)
+            self.assertIn(f"SSL_CERT_FILE={ca_file}", res.stdout)
 
     def test_check_acme_lineage(self):
         with tempfile.TemporaryDirectory() as tmpdir:

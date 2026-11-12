@@ -17,14 +17,68 @@ if [[ -f "$SCRIPT_DIR/modules/security.sh" ]]; then
     source "$SCRIPT_DIR/modules/security.sh"
 fi
 
+# The local ACME fixture is a test-only trust anchor. Its endpoint is pinned so
+# enabling test mode never turns GOWAVE_ACME_SERVER into an arbitrary-URL option.
+GOWAVE_ACME_TEST_ENDPOINT="https://pebble.testbed.internal:14000/dir"
+
+acme_test_mode_enabled() {
+    [[ "${GOWAVE_ACME_TEST_MODE:-0}" == "1" ]]
+}
+
+validate_acme_test_ca() {
+    local ca_file="${GOWAVE_ACME_TEST_CA_FILE:-}"
+    local expected_sha256="${GOWAVE_ACME_TEST_CA_SHA256:-}"
+    if [[ -z "$ca_file" || -z "$expected_sha256" ]]; then
+        echo "Error: test-only ACME mode requires GOWAVE_ACME_TEST_CA_FILE and GOWAVE_ACME_TEST_CA_SHA256." >&2
+        return 1
+    fi
+    if [[ -L "$ca_file" || ! -f "$ca_file" ]]; then
+        echo "Error: GOWAVE_ACME_TEST_CA_FILE must be a regular file, not a symlink." >&2
+        return 1
+    fi
+    if [[ ! "$expected_sha256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo "Error: GOWAVE_ACME_TEST_CA_SHA256 must be a 64-character hex digest." >&2
+        return 1
+    fi
+    local actual_sha256
+    actual_sha256=$(sha256sum -- "$ca_file" 2>/dev/null | awk '{print $1}')
+    if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+        echo "Error: ACME test CA digest mismatch; refusing an unpinned trust anchor." >&2
+        return 1
+    fi
+    return 0
+}
+
+run_certbot() {
+    if acme_test_mode_enabled && [[ "${GOWAVE_ACME_SERVER:-}" == "$GOWAVE_ACME_TEST_ENDPOINT" ]]; then
+        REQUESTS_CA_BUNDLE="$GOWAVE_ACME_TEST_CA_FILE" \
+            SSL_CERT_FILE="$GOWAVE_ACME_TEST_CA_FILE" \
+            certbot "$@"
+        return
+    fi
+    certbot "$@"
+}
+
 validate_acme_server() {
     local server="${1:-}"
     if [[ -z "$server" ]]; then
         return 0
     fi
+    if [[ "$server" == "$GOWAVE_ACME_TEST_ENDPOINT" ]]; then
+        if ! acme_test_mode_enabled; then
+            echo "Error: Invalid GOWAVE_ACME_SERVER: the local ACME fixture endpoint is accepted only with GOWAVE_ACME_TEST_MODE=1." >&2
+            return 1
+        fi
+        validate_acme_test_ca || return 1
+        return 0
+    fi
     if [[ "$server" != "https://acme-staging-v02.api.letsencrypt.org/directory" && \
           "$server" != "https://acme-v02.api.letsencrypt.org/directory" ]]; then
-        echo "Error: Invalid GOWAVE_ACME_SERVER: '$server'. Only 'https://acme-staging-v02.api.letsencrypt.org/directory' or 'https://acme-v02.api.letsencrypt.org/directory' are supported." >&2
+        if acme_test_mode_enabled; then
+            echo "Error: test-only ACME mode accepts only the pinned fixture endpoint '$GOWAVE_ACME_TEST_ENDPOINT' or a Let's Encrypt Staging/Production directory; refusing '$server'." >&2
+        else
+            echo "Error: Invalid GOWAVE_ACME_SERVER: '$server'. Only 'https://acme-staging-v02.api.letsencrypt.org/directory' or 'https://acme-v02.api.letsencrypt.org/directory' are supported." >&2
+        fi
         return 1
     fi
     return 0
@@ -35,6 +89,16 @@ check_acme_lineage() {
     local target_server="${2:-https://acme-v02.api.letsencrypt.org/directory}"
     local renewal_conf="${3:-/etc/letsencrypt/renewal/${domain}.conf}"
     local live_dir="${4:-/etc/letsencrypt/live/${domain}}"
+    local fixture_target=0
+
+    if [[ "$target_server" == "$GOWAVE_ACME_TEST_ENDPOINT" ]]; then
+        if ! acme_test_mode_enabled; then
+            echo "Error: ACME lineage for $domain targets the local fixture endpoint without GOWAVE_ACME_TEST_MODE=1." >&2
+            return 1
+        fi
+        validate_acme_test_ca || return 1
+        fixture_target=1
+    fi
 
     if [[ -f "$renewal_conf" ]]; then
         local existing_server=""
@@ -51,8 +115,15 @@ check_acme_lineage() {
             return 1
         fi
 
-        if [[ "$existing_server" != "https://acme-staging-v02.api.letsencrypt.org/directory" && \
-              "$existing_server" != "https://acme-v02.api.letsencrypt.org/directory" ]]; then
+        local recognized=0
+        if [[ "$existing_server" == "https://acme-staging-v02.api.letsencrypt.org/directory" || \
+              "$existing_server" == "https://acme-v02.api.letsencrypt.org/directory" ]]; then
+            recognized=1
+        elif [[ "$existing_server" == "$GOWAVE_ACME_TEST_ENDPOINT" ]] && acme_test_mode_enabled; then
+            validate_acme_test_ca || return 1
+            recognized=1
+        fi
+        if [[ "$recognized" -ne 1 ]]; then
             echo "Error: Existing renewal lineage for $domain uses unrecognized ACME directory: '$existing_server'." >&2
             return 1
         fi
@@ -65,18 +136,25 @@ check_acme_lineage() {
 
     local fullchain="$live_dir/fullchain.pem"
     if [[ -s "$fullchain" ]]; then
-        local issuer
-        issuer=$(openssl x509 -in "$fullchain" -noout -issuer 2>/dev/null || true)
-        local is_staging_cert=0
-        if [[ "$issuer" =~ \(STAGING\) ]]; then
-            is_staging_cert=1
-        fi
-        if [[ "$target_server" == "https://acme-staging-v02.api.letsencrypt.org/directory" && "$is_staging_cert" -eq 0 ]]; then
-            echo "Error: Existing certificate for $domain was issued by production ($issuer), but requested ACME server is staging ($target_server)." >&2
-            return 1
-        elif [[ "$target_server" == "https://acme-v02.api.letsencrypt.org/directory" && "$is_staging_cert" -eq 1 ]]; then
-            echo "Error: Existing certificate for $domain was issued by staging ($issuer), but requested ACME server is production ($target_server)." >&2
-            return 1
+        if [[ "$fixture_target" -eq 1 ]]; then
+            if ! openssl verify -CAfile "$GOWAVE_ACME_TEST_CA_FILE" -untrusted "$fullchain" "$fullchain" >/dev/null 2>&1; then
+                echo "Error: Existing certificate for $domain does not chain to the pinned local ACME test CA; refusing to reuse a cross-lineage certificate." >&2
+                return 1
+            fi
+        else
+            local issuer
+            issuer=$(openssl x509 -in "$fullchain" -noout -issuer 2>/dev/null || true)
+            local is_staging_cert=0
+            if [[ "$issuer" =~ \(STAGING\) ]]; then
+                is_staging_cert=1
+            fi
+            if [[ "$target_server" == "https://acme-staging-v02.api.letsencrypt.org/directory" && "$is_staging_cert" -eq 0 ]]; then
+                echo "Error: Existing certificate for $domain was issued by production ($issuer), but requested ACME server is staging ($target_server)." >&2
+                return 1
+            elif [[ "$target_server" == "https://acme-v02.api.letsencrypt.org/directory" && "$is_staging_cert" -eq 1 ]]; then
+                echo "Error: Existing certificate for $domain was issued by staging ($issuer), but requested ACME server is production ($target_server)." >&2
+                return 1
+            fi
         fi
     fi
 
@@ -876,6 +954,12 @@ remote_payload() {
         printf 'export VISION_DOMAIN=%q\n' "${VISION_DOMAIN:-}"
         printf 'export ADMIN_EMAIL=%q\n' "$admin_email"
         printf 'export GOWAVE_ACME_SERVER=%q\n' "${GOWAVE_ACME_SERVER:-}"
+        printf 'export GOWAVE_ACME_TEST_MODE=%q\n' "${GOWAVE_ACME_TEST_MODE:-0}"
+        printf 'export GOWAVE_ACME_TEST_CA_SHA256=%q\n' "${GOWAVE_ACME_TEST_CA_SHA256:-}"
+        # Test-only CA content travels over the validated SSH stdin stream; it is
+        # materialized with mode 0600 and never placed in argv or logs.
+        printf 'export GOWAVE_ACME_TEST_CA_B64=%q\n' "${GOWAVE_ACME_TEST_CA_B64:-}"
+        printf 'export GOWAVE_PODMAN_TEST_MODE=%q\n' "${GOWAVE_PODMAN_TEST_MODE:-0}"
         printf 'export ACME_TX_ID=%q\n' "${ACME_TX_ID:-}"
         printf 'COVER_REALITY_B64=%q\n' "$cover_b64"
         printf 'COVER_REALITY_SHA256=%q\n' "$cover_sha256"
@@ -888,14 +972,68 @@ log_info() { printf '[INFO] %s\n' "$*"; }
 log_warn() { printf '[WARN] %s\n' "$*" >&2; }
 log_err()  { printf '[ERROR] %s\n' "$*" >&2; }
 
+# The local ACME fixture is a test-only trust anchor. Its endpoint is pinned so
+# enabling test mode never turns GOWAVE_ACME_SERVER into an arbitrary-URL option.
+GOWAVE_ACME_TEST_ENDPOINT="https://pebble.testbed.internal:14000/dir"
+
+acme_test_mode_enabled() {
+    [[ "${GOWAVE_ACME_TEST_MODE:-0}" == "1" ]]
+}
+
+validate_acme_test_ca() {
+    local ca_file="${GOWAVE_ACME_TEST_CA_FILE:-}"
+    local expected_sha256="${GOWAVE_ACME_TEST_CA_SHA256:-}"
+    if [[ -z "$ca_file" || -z "$expected_sha256" ]]; then
+        echo "Error: test-only ACME mode requires GOWAVE_ACME_TEST_CA_FILE and GOWAVE_ACME_TEST_CA_SHA256." >&2
+        return 1
+    fi
+    if [[ -L "$ca_file" || ! -f "$ca_file" ]]; then
+        echo "Error: GOWAVE_ACME_TEST_CA_FILE must be a regular file, not a symlink." >&2
+        return 1
+    fi
+    if [[ ! "$expected_sha256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo "Error: GOWAVE_ACME_TEST_CA_SHA256 must be a 64-character hex digest." >&2
+        return 1
+    fi
+    local actual_sha256
+    actual_sha256=$(sha256sum -- "$ca_file" 2>/dev/null | awk '{print $1}')
+    if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+        echo "Error: ACME test CA digest mismatch; refusing an unpinned trust anchor." >&2
+        return 1
+    fi
+    return 0
+}
+
+run_certbot() {
+    if acme_test_mode_enabled && [[ "${GOWAVE_ACME_SERVER:-}" == "$GOWAVE_ACME_TEST_ENDPOINT" ]]; then
+        REQUESTS_CA_BUNDLE="$GOWAVE_ACME_TEST_CA_FILE" \
+            SSL_CERT_FILE="$GOWAVE_ACME_TEST_CA_FILE" \
+            certbot "$@"
+        return
+    fi
+    certbot "$@"
+}
+
 validate_acme_server() {
     local server="${1:-}"
     if [[ -z "$server" ]]; then
         return 0
     fi
+    if [[ "$server" == "$GOWAVE_ACME_TEST_ENDPOINT" ]]; then
+        if ! acme_test_mode_enabled; then
+            echo "Error: Invalid GOWAVE_ACME_SERVER: the local ACME fixture endpoint is accepted only with GOWAVE_ACME_TEST_MODE=1." >&2
+            return 1
+        fi
+        validate_acme_test_ca || return 1
+        return 0
+    fi
     if [[ "$server" != "https://acme-staging-v02.api.letsencrypt.org/directory" && \
           "$server" != "https://acme-v02.api.letsencrypt.org/directory" ]]; then
-        echo "Error: Invalid GOWAVE_ACME_SERVER: '$server'. Only 'https://acme-staging-v02.api.letsencrypt.org/directory' or 'https://acme-v02.api.letsencrypt.org/directory' are supported." >&2
+        if acme_test_mode_enabled; then
+            echo "Error: test-only ACME mode accepts only the pinned fixture endpoint '$GOWAVE_ACME_TEST_ENDPOINT' or a Let's Encrypt Staging/Production directory; refusing '$server'." >&2
+        else
+            echo "Error: Invalid GOWAVE_ACME_SERVER: '$server'. Only 'https://acme-staging-v02.api.letsencrypt.org/directory' or 'https://acme-v02.api.letsencrypt.org/directory' are supported." >&2
+        fi
         return 1
     fi
     return 0
@@ -906,6 +1044,16 @@ check_acme_lineage() {
     local target_server="${2:-https://acme-v02.api.letsencrypt.org/directory}"
     local renewal_conf="${3:-/etc/letsencrypt/renewal/${domain}.conf}"
     local live_dir="${4:-/etc/letsencrypt/live/${domain}}"
+    local fixture_target=0
+
+    if [[ "$target_server" == "$GOWAVE_ACME_TEST_ENDPOINT" ]]; then
+        if ! acme_test_mode_enabled; then
+            echo "Error: ACME lineage for $domain targets the local fixture endpoint without GOWAVE_ACME_TEST_MODE=1." >&2
+            return 1
+        fi
+        validate_acme_test_ca || return 1
+        fixture_target=1
+    fi
 
     if [[ -f "$renewal_conf" ]]; then
         local existing_server=""
@@ -922,8 +1070,15 @@ check_acme_lineage() {
             return 1
         fi
 
-        if [[ "$existing_server" != "https://acme-staging-v02.api.letsencrypt.org/directory" && \
-              "$existing_server" != "https://acme-v02.api.letsencrypt.org/directory" ]]; then
+        local recognized=0
+        if [[ "$existing_server" == "https://acme-staging-v02.api.letsencrypt.org/directory" || \
+              "$existing_server" == "https://acme-v02.api.letsencrypt.org/directory" ]]; then
+            recognized=1
+        elif [[ "$existing_server" == "$GOWAVE_ACME_TEST_ENDPOINT" ]] && acme_test_mode_enabled; then
+            validate_acme_test_ca || return 1
+            recognized=1
+        fi
+        if [[ "$recognized" -ne 1 ]]; then
             echo "Error: Existing renewal lineage for $domain uses unrecognized ACME directory: '$existing_server'." >&2
             return 1
         fi
@@ -936,18 +1091,25 @@ check_acme_lineage() {
 
     local fullchain="$live_dir/fullchain.pem"
     if [[ -s "$fullchain" ]]; then
-        local issuer
-        issuer=$(openssl x509 -in "$fullchain" -noout -issuer 2>/dev/null || true)
-        local is_staging_cert=0
-        if [[ "$issuer" =~ \(STAGING\) ]]; then
-            is_staging_cert=1
-        fi
-        if [[ "$target_server" == "https://acme-staging-v02.api.letsencrypt.org/directory" && "$is_staging_cert" -eq 0 ]]; then
-            echo "Error: Existing certificate for $domain was issued by production ($issuer), but requested ACME server is staging ($target_server)." >&2
-            return 1
-        elif [[ "$target_server" == "https://acme-v02.api.letsencrypt.org/directory" && "$is_staging_cert" -eq 1 ]]; then
-            echo "Error: Existing certificate for $domain was issued by staging ($issuer), but requested ACME server is production ($target_server)." >&2
-            return 1
+        if [[ "$fixture_target" -eq 1 ]]; then
+            if ! openssl verify -CAfile "$GOWAVE_ACME_TEST_CA_FILE" -untrusted "$fullchain" "$fullchain" >/dev/null 2>&1; then
+                echo "Error: Existing certificate for $domain does not chain to the pinned local ACME test CA; refusing to reuse a cross-lineage certificate." >&2
+                return 1
+            fi
+        else
+            local issuer
+            issuer=$(openssl x509 -in "$fullchain" -noout -issuer 2>/dev/null || true)
+            local is_staging_cert=0
+            if [[ "$issuer" =~ \(STAGING\) ]]; then
+                is_staging_cert=1
+            fi
+            if [[ "$target_server" == "https://acme-staging-v02.api.letsencrypt.org/directory" && "$is_staging_cert" -eq 0 ]]; then
+                echo "Error: Existing certificate for $domain was issued by production ($issuer), but requested ACME server is staging ($target_server)." >&2
+                return 1
+            elif [[ "$target_server" == "https://acme-v02.api.letsencrypt.org/directory" && "$is_staging_cert" -eq 1 ]]; then
+                echo "Error: Existing certificate for $domain was issued by staging ($issuer), but requested ACME server is production ($target_server)." >&2
+                return 1
+            fi
         fi
     fi
 
@@ -1927,8 +2089,12 @@ configure_edge_nginx() {
     cover_domain=$(derive_cover_domain "$WORKER_DOMAIN")
     if [[ -n "$cover_domain" ]]; then
         local server_ip=""
-        server_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me 2>/dev/null || \
-                    curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)
+        if [[ "${GOWAVE_PODMAN_TEST_MODE:-0}" == "1" ]]; then
+            server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        else
+            server_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me 2>/dev/null || \
+                        curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)
+        fi
         if ! cover_domains_resolve_here "$cover_domain" "$server_ip"; then
             echo "Warning: worker camouflage apex site disabled — $cover_domain / www.$cover_domain do not resolve to this host (${server_ip:-unknown}); HTTP-01 would fail." >&2
             cover_domain=""
@@ -1976,7 +2142,7 @@ EOF
     fi
 
     echo "Acquiring Let's Encrypt TLS certificate for Worker ($WORKER_DOMAIN)..."
-    certbot certonly --webroot -w /var/www/gowave-acme \
+    run_certbot certonly --webroot -w /var/www/gowave-acme \
         -d "$WORKER_DOMAIN" --cert-name "$WORKER_DOMAIN" \
         --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring \
         "${certbot_extra_args[@]}"
@@ -1991,7 +2157,7 @@ EOF
         reality_cert_args+=(-d "$cover_domain" -d "www.$cover_domain")
         reality_cert_flags+=(--expand)
     fi
-    certbot certonly --webroot -w /var/www/gowave-acme \
+    run_certbot certonly --webroot -w /var/www/gowave-acme \
         "${reality_cert_args[@]}" "${reality_cert_flags[@]}" --cert-name "$REALITY_DOMAIN" \
         --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring \
         "${certbot_extra_args[@]}"
@@ -1999,7 +2165,7 @@ EOF
 
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
         echo "Acquiring Let's Encrypt TLS certificate for Vision ($VISION_DOMAIN)..."
-        certbot certonly --webroot -w /var/www/gowave-acme \
+        run_certbot certonly --webroot -w /var/www/gowave-acme \
             -d "$VISION_DOMAIN" --cert-name "$VISION_DOMAIN" \
             --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring \
             "${certbot_extra_args[@]}"
@@ -2425,8 +2591,8 @@ compensate_remote_worker() {
     fi
 
     # 8. Clean temporary files and unset secrets
-    unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64 SECURITY_HELPER_B64
-    rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.py /tmp/gowave-node-install-*.sh || rollback_failed=1
+    unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64 SECURITY_HELPER_B64 GOWAVE_ACME_TEST_CA_B64
+    rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.py /tmp/gowave-node-install-*.sh /run/gowave-acme-test-ca.pem || rollback_failed=1
 
     if [[ "$rollback_failed" -ne 0 ]]; then
         echo "[ROLLBACK] ERROR: compensating rollback incomplete; one or more cleanup operations failed." >&2
@@ -2455,10 +2621,17 @@ main() {
     _STREAM_INCLUDE_ADDED=0
     _NODE_SERVICE_CONFIGURED=0
 
+    if [[ "${GOWAVE_ACME_TEST_MODE:-0}" == "1" && -n "${GOWAVE_ACME_TEST_CA_B64:-}" ]]; then
+        printf '%s' "$GOWAVE_ACME_TEST_CA_B64" | base64 -d > /run/gowave-acme-test-ca.pem
+        chmod 0600 /run/gowave-acme-test-ca.pem
+        export GOWAVE_ACME_TEST_CA_FILE=/run/gowave-acme-test-ca.pem
+        unset GOWAVE_ACME_TEST_CA_B64
+    fi
+
     _COMPENSATED=0
     cleanup_temp_and_secrets() {
-        unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64 SECURITY_HELPER_B64 2>/dev/null || true
-        rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.py /tmp/gowave-node-install-*.sh 2>/dev/null || true
+        unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64 SECURITY_HELPER_B64 GOWAVE_ACME_TEST_CA_B64 2>/dev/null || true
+        rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.py /tmp/gowave-node-install-*.sh /run/gowave-acme-test-ca.pem 2>/dev/null || true
     }
     handle_signal() {
         local sig="$1"

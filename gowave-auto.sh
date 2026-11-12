@@ -10,6 +10,7 @@ CREDENTIALS_FILE="/root/gowave-credentials.txt"
 
 # Source submodules
 source "$SCRIPT_DIR/modules/lock.sh"
+source "$SCRIPT_DIR/modules/address.sh"
 source "$SCRIPT_DIR/modules/os.sh"
 source "$SCRIPT_DIR/modules/preflight.sh"
 source "$SCRIPT_DIR/modules/security.sh"
@@ -184,8 +185,7 @@ PY
     cover_domain=$(derive_cover_domain "$panel_domain")
     if [[ -n "$cover_domain" ]]; then
         local server_ip=""
-        server_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me 2>/dev/null || \
-                    curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)
+        server_ip=$(resolve_panel_ipv4) || return 1
         if ! cover_domains_resolve_here "$cover_domain" "$server_ip"; then
             echo "Warning: camouflage apex site disabled — $cover_domain / www.$cover_domain do not resolve to this host (${server_ip:-unknown}); HTTP-01 would fail." >&2
             cover_domain=""
@@ -274,7 +274,7 @@ PY
     fi
 
     echo "Acquiring Let's Encrypt TLS certificate for Panel ($panel_domain)..."
-    if ! certbot certonly --webroot -w "$ACME_WEBROOT" \
+    if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" \
         -d "$panel_domain" --cert-name "$panel_domain" \
         --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring \
         "${certbot_extra_args[@]}"; then
@@ -291,7 +291,7 @@ PY
         reality_cert_args+=(-d "$cover_domain" -d "www.$cover_domain")
         reality_cert_flags+=(--expand)
     fi
-    if ! certbot certonly --webroot -w "$ACME_WEBROOT" \
+    if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" \
         "${reality_cert_args[@]}" "${reality_cert_flags[@]}" --cert-name "$reality_domain" \
         --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring \
         "${certbot_extra_args[@]}"; then
@@ -301,7 +301,7 @@ PY
 
     if [[ -n "$vision_domain" ]]; then
         echo "Acquiring Let's Encrypt TLS certificate for VLESS Vision ($vision_domain)..."
-        if ! certbot certonly --webroot -w "$ACME_WEBROOT" \
+        if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" \
             -d "$vision_domain" --cert-name "$vision_domain" \
             --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring \
             "${certbot_extra_args[@]}"; then
@@ -544,8 +544,8 @@ cmd_node() {
             validate_acme_server "${GOWAVE_ACME_SERVER:-}" || return 1
 
             local panel_ip panel_ipv6
-            panel_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org || true)
-            panel_ipv6=$(curl -s6 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s6 --connect-timeout 5 --max-time 10 https://api64.ipify.org || true)
+            panel_ip=$(resolve_panel_ipv4) || return 1
+            panel_ipv6=$(resolve_panel_ipv6) || return 1
             if [[ -z "$panel_ip" && -z "$panel_ipv6" ]]; then
                 echo "Error: unable to determine a public Panel IP address; refusing an untrusted firewall fallback." >&2
                 return 1
@@ -746,9 +746,19 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
 
 
             # 4. Dispatch remote deployment strictly via SSH stdin
+            local acme_test_ca_b64=""
+            if [[ "${GOWAVE_ACME_TEST_MODE:-0}" == "1" && "${GOWAVE_ACME_SERVER:-}" == "$GOWAVE_ACME_TEST_ENDPOINT" ]]; then
+                validate_acme_test_ca || return 1
+                acme_test_ca_b64=$(base64 -w 0 "$GOWAVE_ACME_TEST_CA_FILE")
+            fi
             if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
                 XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
                 GOWAVE_ACME_SERVER="${GOWAVE_ACME_SERVER:-}" \
+                GOWAVE_ACME_TEST_MODE="${GOWAVE_ACME_TEST_MODE:-0}" \
+                GOWAVE_ACME_TEST_CA_FILE="${GOWAVE_ACME_TEST_CA_FILE:-}" \
+                GOWAVE_ACME_TEST_CA_SHA256="${GOWAVE_ACME_TEST_CA_SHA256:-}" \
+                GOWAVE_ACME_TEST_CA_B64="$acme_test_ca_b64" \
+                GOWAVE_PODMAN_TEST_MODE="${GOWAVE_PODMAN_TEST_MODE:-0}" \
                 GOWAVE_NODE_INSTALLER_COMMIT="${GOWAVE_NODE_INSTALLER_COMMIT:-}" \
                 GOWAVE_NODE_INSTALLER_SHA256="${GOWAVE_NODE_INSTALLER_SHA256:-}" \
                 VISION_DOMAIN="$vision_domain" \
@@ -865,8 +875,8 @@ for n in data.get('nodes', []):
             fi
             local known_hosts="${SSH_KNOWN_HOSTS:-/root/.ssh/known_hosts}"
             local panel_ip panel_ipv6
-            panel_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org || true)
-            panel_ipv6=$(curl -s6 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s6 --connect-timeout 5 --max-time 10 https://api64.ipify.org || true)
+            panel_ip=$(resolve_panel_ipv4) || return 1
+            panel_ipv6=$(resolve_panel_ipv6) || return 1
             local node_port=3002
             PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
                 VISION_DOMAIN="$vision_domain" \
@@ -908,7 +918,7 @@ PY
     echo "Changing domains to: $new_panel_domain / $new_reality_domain..."
 
     local srv_ip
-    srv_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org || echo "")
+    srv_ip=$(resolve_panel_ipv4) || return 1
     if [[ -n "$srv_ip" ]] && command -v getent >/dev/null 2>&1; then
         local resolved_ip
         resolved_ip=$(getent ahostsv4 "$new_panel_domain" 2>/dev/null | awk 'NR==1 {print $1}' || true)
@@ -971,7 +981,7 @@ PY
         certbot_extra_args+=(--server "$GOWAVE_ACME_SERVER")
     fi
 
-    if ! certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_panel_domain" --cert-name "$new_panel_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring "${certbot_extra_args[@]}"; then
+    if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_panel_domain" --cert-name "$new_panel_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring "${certbot_extra_args[@]}"; then
         rollback_domain_change "ACME issuance failed for panel domain"; return 1
     fi
     local new_reality_cert_args=(-d "$new_reality_domain")
@@ -980,7 +990,7 @@ PY
         new_reality_cert_args+=(-d "$cover_domain" -d "www.$cover_domain")
         new_reality_cert_flags+=(--expand)
     fi
-    if ! certbot certonly --webroot -w "$ACME_WEBROOT" "${new_reality_cert_args[@]}" "${new_reality_cert_flags[@]}" --cert-name "$new_reality_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring "${certbot_extra_args[@]}"; then
+    if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" "${new_reality_cert_args[@]}" "${new_reality_cert_flags[@]}" --cert-name "$new_reality_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring "${certbot_extra_args[@]}"; then
         rollback_domain_change "ACME issuance failed for REALITY domain"; return 1
     fi
     verify_acme_certificate "$new_panel_domain" || { rollback_domain_change "invalid panel certificate"; return 1; }
