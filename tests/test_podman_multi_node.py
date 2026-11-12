@@ -741,7 +741,11 @@ class TestMultiNodeSuite(unittest.TestCase):
 
     def test_the_mtls_cases_follow_the_verifier_then_the_negative_controls(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[3:], [f"MTLS-0{number}" for number in range(1, 9)])
+        self.assertEqual(ids[3:11], [f"MTLS-0{number}" for number in range(1, 9)])
+
+    def test_the_cluster_audit_follows_the_control_plane_proof(self):
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertEqual(ids[11:], ["CLUS-01", "CLUS-02", "CLUS-03"])
 
 
 class TestMtlsVerifierReport(unittest.TestCase):

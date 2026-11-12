@@ -72,6 +72,8 @@ SUITES = {
         "test_podman_multi_node.TestRunnerEntrypoint",
         "test_podman_multi_node.TestMultiNodeCounts",
         "test_podman_multi_node.TestMultiNodeSuite",
+        "test_podman_cluster.TestClusterScope",
+        "test_podman_cluster.TestClusterCases",
         "test_podman_cleanup.TestPodmanStaleRunRecovery",
         "test_fixture_dns.TestDnsFixture",
         "test_fixture_echo.TestEchoFixture",
