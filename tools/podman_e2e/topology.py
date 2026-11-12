@@ -34,6 +34,7 @@ DNS_OFFSET = 53
 TARGET_OFFSET = 10
 PEBBLE_OFFSET = 20
 ECHO_OFFSET = 30
+CLIENT_OFFSET = 40
 
 DNS_PORT = 53
 DNS_ZONE_TTL = 30
@@ -52,6 +53,11 @@ REALITY_DOMAIN = "reality.testbed.internal"
 VISION_DOMAIN = "vision.testbed.internal"
 COVER_APEX = "testbed.internal"
 ECHO_HOST = "echo.testbed.internal"
+CLIENT_HOST = "client.testbed.internal"
+
+# The probe the client role runs: standard library only, so its verdict cannot
+# depend on anything the product installed.
+HTTP_PROBE_SCRIPT = f"{REPO_IN_CONTAINER}/tools/podman_e2e/http_probe.py"
 
 INSTALL_TIMEOUT_SECONDS = 5400
 
@@ -85,6 +91,10 @@ class NetworkPlan:
     @property
     def echo_ip(self) -> str:
         return self._address(ECHO_OFFSET)
+
+    @property
+    def client_ip(self) -> str:
+        return self._address(CLIENT_OFFSET)
 
 
 def _overlaps(candidate: ipaddress.IPv4Network, used: Sequence[str]) -> bool:
@@ -151,6 +161,7 @@ def zone(plan: NetworkPlan) -> Dict[str, Any]:
             f"www.{COVER_APEX}": {"A": [plan.target_ip]},
             acme_fixture.FIXTURE_HOST: {"A": [plan.pebble_ip]},
             ECHO_HOST: {"A": [plan.echo_ip]},
+            CLIENT_HOST: {"A": [plan.client_ip]},
         },
         "behavior": {"mode": "answer", "delay_ms": 0},
     }
@@ -209,6 +220,7 @@ class AioTopology:
         self.network = self.context.resource_name("e2e-net")
         self.dns_name = self.context.resource_name("dns")
         self.target_name = self.context.resource_name("aio")
+        self.client_name = self.context.resource_name("client")
         if self.plan is None:
             self.plan = allocate_plan(self.podman.network_subnets())
         if self.egress_resolvers is None:
@@ -224,6 +236,7 @@ class AioTopology:
         self._start_dns()
         self._start_acme()
         self._start_target()
+        self._start_client()
         return self
 
     def _start_dns(self) -> None:
@@ -289,6 +302,84 @@ class AioTopology:
         self.podman.wait_systemd(self.target_name, timeout_seconds=180)
         self._clean_facts = target_image.assert_clean(self.podman, self.target_name)
 
+    def _start_client(self) -> None:
+        """The Control Machine role: independent of the host it probes.
+
+        It shares the run network so it can reach the host by name, but it has no
+        product code, no product packages, and no product configuration: whatever
+        it reports about the host comes from its own standard-library client.
+        """
+        self.podman.run(
+            name=self.client_name,
+            image_alias=FIXTURE_IMAGE,
+            network=self.network,
+            aliases=(CLIENT_HOST,),
+            privileged=False,
+            volumes=(f"{self._ca_dir}:{CA_MOUNT}:ro,Z",),
+            command=("sleep", "infinity"),
+            systemd="false",
+            extra_args=(
+                "--ip", self.plan.client_ip,
+                "--dns", self.plan.dns_ip,
+            ),
+        )
+        self.started.append(self.client_name)
+
+    # ------------------------------------------------------------------ client
+    def client_http(
+        self,
+        url: str,
+        expect_status: Optional[int] = None,
+        expect_body: Optional[str] = None,
+        expect_absent: Optional[str] = None,
+        expect_san: Sequence[str] = (),
+        headers: Sequence[str] = (),
+        method: str = "GET",
+        body: Optional[str] = None,
+        insecure: bool = False,
+        timeout: int = 30,
+    ) -> Dict[str, Any]:
+        """Fetch a URL from the Control Machine role and return the probe report.
+
+        The probe trusts the run CA only, so a certificate the product obtained
+        from the fixture directory is the only one that can pass.
+        """
+        argv = [
+            "python3", HTTP_PROBE_SCRIPT,
+            "--url", url,
+            "--timeout", str(timeout),
+            "--method", method,
+        ]
+        if insecure:
+            argv.append("--insecure")
+        else:
+            argv += ["--ca", f"{CA_MOUNT}/{ISSUED_ROOT_NAME}"]
+        if expect_status is not None:
+            argv += ["--expect-status", str(expect_status)]
+        if expect_body is not None:
+            argv += ["--expect-body", expect_body]
+        if expect_absent is not None:
+            argv += ["--expect-absent", expect_absent]
+        for san in expect_san:
+            argv += ["--expect-san", san]
+        for header in headers:
+            argv += ["--header", header]
+        if body is not None:
+            argv += ["--body", body]
+        proc = self.podman.exec(self.client_name, argv, check=False, timeout=timeout + 30)
+        report: Dict[str, Any] = {
+            "url": url,
+            "returncode": proc.returncode,
+            "stdout": (proc.stdout or "").strip(),
+            "stderr": (proc.stderr or "").strip(),
+        }
+        try:
+            parsed = json.loads(report["stdout"]) if report["stdout"] else {}
+        except json.JSONDecodeError:
+            parsed = {}
+        report["probe"] = parsed
+        return report
+
     # ----------------------------------------------------------------- install
     def install_environment(self) -> Dict[str, str]:
         ca_file = f"{CA_MOUNT}/{CA_FILE_NAME}"
@@ -346,6 +437,8 @@ class AioTopology:
             "subnet": self.plan.subnet,
             "target_ip": self.plan.target_ip,
             "target_container": self.target_name,
+            "client_ip": self.plan.client_ip,
+            "client_container": self.client_name,
             "panel_domain": self.panel_domain,
             "reality_domain": self.reality_domain,
             "vision_domain": self.vision_domain or "",

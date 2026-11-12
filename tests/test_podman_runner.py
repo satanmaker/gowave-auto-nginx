@@ -21,6 +21,7 @@ from tools.podman_e2e.runner import (  # noqa: E402
     SKIP,
     BudgetExhausted,
     Case,
+    CaseBlocked,
     CaseResult,
     RunAborted,
     RunContext,
@@ -60,6 +61,19 @@ class TestPodmanRunnerContract(unittest.TestCase):
         report = json.loads((context.artifact_dir / "result.json").read_text())
         self.assertEqual(report["overall"], FAIL)
         self.assertIn("payload mismatch", report["cases"][0]["message"])
+
+    def test_a_case_without_its_prerequisite_is_blocked_not_failed(self):
+        context = self.context()
+
+        def blocked(ctx):
+            raise CaseBlocked("AIO-INSTALL: this case needs the AIO install")
+
+        runner = Runner(context)
+        runner.add(Case("AIO-04", "aio", blocked))
+        self.assertEqual(runner.execute(), 1)
+        report = json.loads((context.artifact_dir / "result.json").read_text())
+        self.assertEqual(report["cases"][0]["status"], BLOCKED)
+        self.assertEqual(report["overall"], BLOCKED)
 
     def test_declared_case_timeout_is_enforced(self):
         context = self.context()

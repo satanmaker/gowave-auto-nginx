@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 14
-  total: 139
+  podman_first: 15
+  total: 140
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3146,6 +3146,23 @@ cases:
   assertion: The real operator runs its documented All-in-One install on a clean supported systemd host
     that offers only what a VPS offers, exits successfully, and needs no test-side product provisioning.
   assertion_sha256: d271cd3e45cebc1f52e236039c22970fc87f48c1f0d869cf27a3b872c8f3e87b
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: AIO-PACKAGES
+  requirement: All-in-One Master VPS Installation Verification
+  live_scenario: null
+  assertion: Every prerequisite the operator documents as its own responsibility is installed by that
+    operator on a clean host, checked against a harness-owned package list rather than the product's own
+    claim.
+  assertion_sha256: d84d6a142a38d8859504d4106390d650febc76917f44a6c8da6425e0be46e31c
   runs_in:
   - podman
   state: incubating
