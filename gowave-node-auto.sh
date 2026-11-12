@@ -1833,9 +1833,111 @@ unpack_cover_reality() {
     _COVER_UNPACKED=1
 }
 
+derive_cover_domain() {
+    local panel_domain="${1:-}"
+    local labels
+    [[ -n "$panel_domain" ]] || return 0
+    IFS='.' read -r -a labels <<< "${panel_domain%.}"
+    local count="${#labels[@]}"
+    if [[ "$count" -lt 3 ]]; then
+        return 0
+    fi
+    printf '%s.%s\n' "${labels[count - 2]}" "${labels[count - 1]}"
+}
+
+cover_brand_from_domain() {
+    local domain="${1:-}"
+    local labels label word out=""
+    [[ -n "$domain" ]] || return 0
+    IFS='.' read -r -a labels <<< "${domain%.}"
+    local count="${#labels[@]}"
+    if [[ "$count" -ge 3 ]]; then
+        label="${labels[count - 2]}"
+    else
+        label="${labels[0]}"
+    fi
+    label="${label//-/ }"
+    for word in $label; do
+        out+="${word^} "
+    done
+    printf '%s\n' "${out% }"
+}
+
+cover_domains_resolve_here() {
+    local cover_domain="${1:-}"
+    local server_ip="${2:-}"
+    [[ -n "$cover_domain" && -n "$server_ip" ]] || return 1
+    local name resolved
+    for name in "$cover_domain" "www.$cover_domain"; do
+        resolved=$(getent ahostsv4 "$name" 2>/dev/null | awk 'NR==1 {print $1}')
+        [[ "$resolved" == "$server_ip" ]] || return 1
+    done
+}
+
+render_cover_site() {
+    local cover_root="$1"
+    local domain="${2:-}"
+    local source_dir="${SCRIPT_DIR:-}/assets/cover-sites/cover-reality"
+
+    [[ -d "$cover_root" ]] || return 0
+    if [[ -d "$source_dir" ]]; then
+        cp -r "$source_dir/." "$cover_root/" || return 1
+    fi
+    chmod -R 0755 "$cover_root" 2>/dev/null || true
+
+    local brand="${GOWAVE_COVER_BRAND:-}"
+    if [[ -z "$brand" ]]; then
+        brand=$(cover_brand_from_domain "$domain")
+    fi
+    brand="${brand//&/}"
+    brand="${brand//|/}"
+
+    local file tmp
+    while IFS= read -r file; do
+        tmp="$file.tmp.$$"
+        if ! sed -e "s|{{BRAND}}|$brand|g" \
+                 -e "s|{{ACCENT2}}|${GOWAVE_COVER_ACCENT2:-#14876f}|g" \
+                 -e "s|{{ACCENT}}|${GOWAVE_COVER_ACCENT:-#0f6b5c}|g" \
+                 -e "s|{{SOFT}}|${GOWAVE_COVER_SOFT:-#e7f3ee}|g" \
+                 -e "s|{{HOME_HEADLINE}}|${GOWAVE_COVER_HEADLINE:-Plan the work, keep the context, move on.}|g" \
+                 -e "s|{{HOME_LEDE}}|${GOWAVE_COVER_LEDE:-Projects, notes and next steps in one calm place, with just enough structure to keep everyone oriented.}|g" \
+                 "$file" > "$tmp"; then
+            rm -f "$tmp"
+            echo "Error: failed to render $file" >&2
+            return 1
+        fi
+        chmod 0644 "$tmp" && mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+    done < <(find "$cover_root" -type f \( -name '*.html' -o -name '*.css' \) -print)
+
+    if grep -rq '{{' "$cover_root" --include='*.html' --include='*.css'; then
+        echo "Error: camouflage site still contains unrendered placeholders under $cover_root" >&2
+        return 1
+    fi
+    echo "Rendered worker camouflage site for ${domain:-unknown domain}."
+}
+
 configure_edge_nginx() {
     mkdir -p /etc/nginx/stream-enabled /etc/nginx/conf.d /var/www/gowave-acme
     chmod 0755 /var/www/gowave-acme
+
+    # Camouflage apex: the bare domain of this Worker serves the static decoy.
+    # ACME validates it over port 80 here, so it requires the apex and www
+    # records to point at this host.
+    local cover_domain=""
+    cover_domain=$(derive_cover_domain "$WORKER_DOMAIN")
+    if [[ -n "$cover_domain" ]]; then
+        local server_ip=""
+        server_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me 2>/dev/null || \
+                    curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)
+        if ! cover_domains_resolve_here "$cover_domain" "$server_ip"; then
+            echo "Warning: worker camouflage apex site disabled — $cover_domain / www.$cover_domain do not resolve to this host (${server_ip:-unknown}); HTTP-01 would fail." >&2
+            cover_domain=""
+        fi
+    fi
+    local cover_names=""
+    if [[ -n "$cover_domain" ]]; then
+        cover_names=" $cover_domain www.$cover_domain"
+    fi
 
     # Port 80 ACME webroot vhost. It stays in place after issuance: certbot's
     # HTTP-01 renewal revalidates through this same path, so removing it makes
@@ -1844,7 +1946,7 @@ configure_edge_nginx() {
 # Managed by GoWave Auto NGINX: Worker Port 80 ACME Challenge
 server {
     listen 80;
-    server_name $WORKER_DOMAIN $REALITY_DOMAIN ${VISION_DOMAIN:-};
+    server_name $WORKER_DOMAIN $REALITY_DOMAIN ${VISION_DOMAIN:-}$cover_names;
     location /.well-known/acme-challenge/ {
         root /var/www/gowave-acme;
     }
@@ -1871,8 +1973,16 @@ EOF
     _ACME_WORKER_ISSUED=1
 
     echo "Acquiring Let's Encrypt TLS certificate for REALITY decoy ($REALITY_DOMAIN)..."
+    # The camouflage certificate also covers the apex website served by this
+    # Worker, so one lineage backs both the probe fallback and the plain domain.
+    local reality_cert_args=(-d "$REALITY_DOMAIN")
+    local reality_cert_flags=()
+    if [[ -n "$cover_domain" ]]; then
+        reality_cert_args+=(-d "$cover_domain" -d "www.$cover_domain")
+        reality_cert_flags+=(--expand)
+    fi
     certbot certonly --webroot -w /var/www/gowave-acme \
-        -d "$REALITY_DOMAIN" --cert-name "$REALITY_DOMAIN" \
+        "${reality_cert_args[@]}" "${reality_cert_flags[@]}" --cert-name "$REALITY_DOMAIN" \
         --non-interactive --agree-tos -m "$ADMIN_EMAIL" --keep-until-expiring \
         "${certbot_extra_args[@]}"
     _ACME_REALITY_ISSUED=1
@@ -1887,7 +1997,8 @@ EOF
     fi
 
     verify_worker_certificate() {
-        local domain="$1" cert="/etc/letsencrypt/live/$1/fullchain.pem" key="/etc/letsencrypt/live/$1/privkey.pem"
+        local domain="$1" lineage="${2:-/etc/letsencrypt/live/$1}"
+        local cert="$lineage/fullchain.pem" key="$lineage/privkey.pem"
         [[ -s "$cert" && -s "$key" ]] || { echo "Fatal: certificate/key missing for $domain" >&2; return 1; }
         openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null
         openssl x509 -in "$cert" -noout -checkend 86400 >/dev/null
@@ -1901,6 +2012,9 @@ EOF
     }
     verify_worker_certificate "$WORKER_DOMAIN"
     verify_worker_certificate "$REALITY_DOMAIN"
+    if [[ -n "$cover_domain" ]]; then
+        verify_worker_certificate "$cover_domain" "/etc/letsencrypt/live/$REALITY_DOMAIN"
+    fi
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
         verify_worker_certificate "$VISION_DOMAIN"
     fi
@@ -1925,12 +2039,18 @@ EOF
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
         worker_vision="    $VISION_DOMAIN 127.0.0.1:8444;"
     fi
+    local worker_cover=""
+    if [[ -n "$cover_domain" ]]; then
+        worker_cover="    $cover_domain 127.0.0.1:9443;
+    www.$cover_domain 127.0.0.1:9443;"
+    fi
     cat > /etc/nginx/stream-enabled/gowave-worker-stream.conf <<EOF
 # Managed by GoWave Auto NGINX: Worker Edge Stream
 map \$ssl_preread_server_name \$worker_dest {
     $WORKER_DOMAIN 127.0.0.1:7443;
     $REALITY_DOMAIN 127.0.0.1:8443;
 $worker_vision
+$worker_cover
     default 127.0.0.1:8443;
 }
 
@@ -2013,7 +2133,7 @@ EOF
 # Managed by GoWave Auto NGINX: Worker Edge Decoy
 server {
     $listen_9443
-    server_name $REALITY_DOMAIN;
+    server_name $REALITY_DOMAIN$cover_names;
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
     ssl_protocols TLSv1.3;
@@ -2023,9 +2143,11 @@ server {
 
     root /var/www/gowave-auto-nginx/cover-reality;
     index index.html;
+    error_page 404 /404.html;
     access_log /var/log/nginx/gowave-decoy-access.log;
 }
 EOF
+    render_cover_site "/var/www/gowave-auto-nginx/cover-reality" "${cover_domain:-$REALITY_DOMAIN}" || return 1
 
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
         cat > /etc/nginx/conf.d/gowave-worker-vision-fallback.conf <<EOF
