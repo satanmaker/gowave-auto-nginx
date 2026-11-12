@@ -32,3 +32,6 @@ __pycache__/
 # Live VPS E2E environment configuration and artifacts
 tools/live_vps_config.env
 artifacts/live-vps/
+
+# Podman E2E run artifacts (per-run evidence, result.json, junit.xml)
+artifacts/podman-e2e/

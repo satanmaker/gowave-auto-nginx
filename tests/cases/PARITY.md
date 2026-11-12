@@ -56,6 +56,7 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 
 ## Podman-first cases awaiting live promotion
 
+- **AIO-INSTALL** — promotion target: All-in-One Master VPS Installation Verification
 - **SUB-B64** — promotion target: Real Subscription Delivery and User-Agent Policy
 - **SUB-UA-BLANK** — promotion target: Real Subscription Delivery and User-Agent Policy
 - **SUB-JSON-SHAPES** — promotion target: Real Subscription Delivery and User-Agent Policy
