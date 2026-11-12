@@ -73,6 +73,7 @@ SUITES = {
         "test_podman_multi_node.TestWorkerRegistrationCase",
         "test_podman_multi_node.TestRunnerEntrypoint",
         "test_podman_multi_node.TestMultiNodeCounts",
+        "test_podman_multi_node.TestMatrixCase",
         "test_podman_multi_node.TestMultiNodeSuite",
         "test_podman_multi_node.TestWorkerOutageCase",
         "test_podman_multi_node.TestWorkerPeerWait",

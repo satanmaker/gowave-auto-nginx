@@ -40,7 +40,9 @@ OUTAGE_CASE_ID = "MN-OUTAGE"
 RESTART_CASE_ID = "MN-RESTART"
 VISION_CASE_ID = "MN-VISION"
 SSH_KEY_CASE_ID = "MN-SSHKEY"
+MATRIX_CASE_ID = "MN-MATRIX"
 MTLS_TIMEOUT_SECONDS = 300
+MATRIX_TIMEOUT_SECONDS = 120
 DENIAL_TIMEOUT_SECONDS = 300
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
@@ -2747,6 +2749,93 @@ def case_vision_independence(product: MultiNodeProduct) -> Dict[str, Any]:
     return evidence
 
 
+def case_matrix(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-MATRIX: the positive cases are exactly the matrix tuples of both nodes.
+
+    The count is an acceptance invariant, not an estimate: each node owes one
+    case per inbound it was configured with times every client, so this run owes
+    16 tuples with Vision on neither node, 18 with it on one, and 20 on both.
+    Four ways the count can drift are each a failure here — the matrix declaring
+    a number its own per-node inbounds and clients do not produce, a node that
+    ran fewer clients than the matrix names (so one client never traversed it),
+    a declared tuple that produced no result or did not pass, and a result
+    outside the declared matrix being counted as green.
+    """
+    product.require_worker()
+    data = product.matrix
+    clients = matrix_data.clients(data)
+    expected_ids: List[str] = []
+    per_node: Dict[str, Dict[str, Any]] = {}
+    for node, node_vision in (("master", product.vision), ("worker", product.worker_vision)):
+        tuples = matrix_data.tuples(data, node_vision)
+        node_ids = [
+            matrix_data.case_id(
+                data, matrix_data.MULTI_NODE, str(inbound["id"]), client, node=node,
+            )
+            for inbound, client in tuples
+        ]
+        node_clients = sorted({client for _inbound, client in tuples})
+        require(
+            MATRIX_CASE_ID,
+            node_clients == sorted(clients),
+            f"the {node} node ran {node_clients} instead of every matrix client "
+            f"{sorted(clients)}, so a client never had to traverse that node",
+        )
+        per_node[node] = {
+            "inbounds": len({str(inbound["id"]) for inbound, _client in tuples}),
+            "clients": node_clients,
+            "cases": len(node_ids),
+        }
+        expected_ids.extend(node_ids)
+
+    declared = product.declared_data_plane
+    executed = product.data_plane_results
+    declared_count = product.positive_case_count
+    require(
+        MATRIX_CASE_ID,
+        declared_count == len(expected_ids),
+        f"the matrix declares {declared_count} positive case(s) for the "
+        f"{product.combination} Vision configuration but its own per-node inbounds and "
+        f"clients enumerate {len(expected_ids)} tuple(s), so one of the two is unexplained",
+    )
+    missing = [case_id for case_id in expected_ids if case_id not in declared]
+    extra = [case_id for case_id in declared if case_id not in expected_ids]
+    require(
+        MATRIX_CASE_ID,
+        not missing and not extra,
+        f"the suite declares {len(declared)} data-plane case(s) that are not the matrix's "
+        f"{len(expected_ids)}: missing {missing}, unexplained {extra}",
+    )
+    not_run = [case_id for case_id in expected_ids if case_id not in executed]
+    require(
+        MATRIX_CASE_ID,
+        not not_run,
+        f"{len(not_run)} matrix case(s) produced no result: {', '.join(not_run)}",
+    )
+    failed = sorted(case_id for case_id, status in executed.items() if status != "PASS")
+    require(
+        MATRIX_CASE_ID,
+        not failed,
+        f"{len(failed)} matrix case(s) did not pass: {', '.join(failed)}",
+    )
+    require(
+        MATRIX_CASE_ID,
+        len(executed) == declared_count,
+        f"{len(executed)} data-plane case(s) ran, but the matrix declares {declared_count} for "
+        f"the {product.combination} Vision configuration",
+    )
+    return {
+        "vision": product.combination,
+        "inbounds": product.expected_inbound_total,
+        "clients": len(clients),
+        "per_node": per_node,
+        "expected_positive_cases": declared_count,
+        "declared_cases": len(declared),
+        "executed_cases": len(executed),
+        "passed_cases": sum(1 for status in executed.values() if status == "PASS"),
+    }
+
+
 def case_worker_outage(product: MultiNodeProduct) -> Dict[str, Any]:
     """MN-OUTAGE: stopping the Worker degrades the cluster, and removing the fault restores it.
 
@@ -3122,6 +3211,12 @@ def cases(
                 product.master, inbound, client, node=node),
             timeout_seconds=aio.DATA_PLANE_TIMEOUT_SECONDS,
         ))
+    # The count case closes the matrix: it reads the verdicts the tuples above
+    # recorded, so it runs once every one of them had its chance to report.
+    suite.append(Case(
+        MATRIX_CASE_ID, "multi-node", lambda context: case_matrix(product),
+        timeout_seconds=MATRIX_TIMEOUT_SECONDS,
+    ))
     suite.extend([
         Case("SUB-SERVED", "multi-node", lambda context: aio.case_subscriptions(product.master),
              timeout_seconds=SUB_SERVED_TIMEOUT_SECONDS),
