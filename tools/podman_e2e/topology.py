@@ -237,7 +237,9 @@ class AioTopology:
             network=self.network,
             aliases=("dns.testbed.internal",),
             privileged=False,
-            volumes=(f"{directory}:/fixtures/dns:ro,Z",),
+            # Writable: cases rewrite the zone to steer answers and the fixture
+            # appends its query log there.
+            volumes=(f"{directory}:/fixtures/dns:Z",),
             command=dns_command("/fixtures/dns/zone.json", "/fixtures/dns/queries.jsonl"),
             systemd="false",
             extra_args=("--ip", self.plan.dns_ip),

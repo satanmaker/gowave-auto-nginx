@@ -13,7 +13,7 @@ from tools.podman_e2e import target_image  # noqa: E402
 
 
 class FakePodman:
-    def __init__(self, probe_output: str = "init=systemd\nsystemd=systemd 255 (255.4-1)\n") -> None:
+    def __init__(self, probe_output: str = "init=systemd\nsystemd=systemd 255 (255.4-1)\nsshd=active\n") -> None:
         self.builds = []
         self.execs = []
         self.probe_output = probe_output
@@ -101,17 +101,25 @@ class TestPodmanTargetImage(unittest.TestCase):
             self.assertIn(package, probe)
         self.assertIn("ps -p 1", probe)
         self.assertIn("dpkg-query", probe)
+        self.assertIn("systemctl is-active ssh.service", probe)
 
     def test_clean_target_passes_the_pre_install_check(self):
         podman = FakePodman()
         facts = target_image.assert_clean(podman, "aio-target")
         self.assertEqual(facts["init"], "systemd")
+        self.assertEqual(facts["sshd"], "active")
         self.assertEqual(facts["installed"], [])
         self.assertEqual(podman.execs[0][0], "aio-target")
         self.assertEqual(podman.execs[0][1][:2], ["bash", "-lc"])
 
+    def test_target_without_a_running_sshd_fails_the_check(self):
+        podman = FakePodman("init=systemd\nsystemd=systemd 255\nsshd=inactive\n")
+        with self.assertRaises(target_image.TargetImageError) as caught:
+            target_image.assert_clean(podman, "no-sshd")
+        self.assertIn("sshd", str(caught.exception))
+
     def test_preinstalled_product_package_fails_the_check(self):
-        podman = FakePodman("init=systemd\nsystemd=systemd 255\ninstalled=certbot\n")
+        podman = FakePodman("init=systemd\nsystemd=systemd 255\nsshd=active\ninstalled=certbot\n")
         with self.assertRaises(target_image.TargetImageError) as caught:
             target_image.assert_clean(podman, "dirty")
         self.assertIn("certbot", str(caught.exception))
@@ -125,7 +133,9 @@ class TestPodmanTargetImage(unittest.TestCase):
 
     def test_parse_probe_ignores_noise(self):
         facts = target_image.parse_probe("garbage\ninit=systemd\ninstalled=ufw\ninstalled=\n")
-        self.assertEqual(facts, {"init": "systemd", "systemd": "", "installed": ["ufw"]})
+        self.assertEqual(
+            facts, {"init": "systemd", "systemd": "", "sshd": "", "installed": ["ufw"]}
+        )
 
     def test_evidence_records_distribution_and_image(self):
         record = target_image.evidence("ubuntu-26.04", "aio", {"init": "systemd", "systemd": "systemd 257", "installed": []})

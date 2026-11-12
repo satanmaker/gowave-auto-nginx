@@ -55,11 +55,11 @@ def free_port() -> int:
 
 
 class DnsFixture:
-    def __init__(self, zone: dict, extra_args=None) -> None:
+    def __init__(self, zone: dict, extra_args=None, log_path=None) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.zone_path = root / "dns-zone.json"
-        self.log_path = root / "dns-queries.jsonl"
+        self.log_path = Path(log_path) if log_path else root / "dns-queries.jsonl"
         self.zone_path.write_text(json.dumps(zone), encoding="utf-8")
         self.port = free_port()
         self.process = subprocess.Popen(
@@ -218,6 +218,13 @@ class TestDnsFixture(unittest.TestCase):
         self.assertEqual(events[-1]["answers"], ["10.89.0.11"])
         self.assertEqual(events[-1]["mode"], "answer")
         self.assertEqual(events[-1]["path"], "authoritative")
+
+    def test_unwritable_diagnostics_never_stop_the_answers(self):
+        fixture = DnsFixture(BASE_ZONE, log_path="/proc/self/denied/dns-queries.jsonl")
+        self.addCleanup(fixture.close)
+        _, rcode, answers = fixture.query("panel.testbed.internal")
+        self.assertEqual(rcode, 0)
+        self.assertEqual(answers, [{"type": TYPE_A, "ttl": 300, "value": "10.89.0.10"}])
 
     def test_latency_injection_is_applied(self):
         fixture = self.fixture()

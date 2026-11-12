@@ -29,7 +29,11 @@ DISTRIBUTIONS = {
 # Exactly the packages the operator is responsible for installing. None of them
 # may be baked into the image, which is what makes the install path observable.
 # gzip is omitted on purpose: it ships in every supported base image, so its
-# presence says nothing about what the operator did.
+# presence says nothing about what the operator did. The whole SSH pair is out
+# for the same class of reason: a VPS is administered over SSH, so the image
+# ships openssh-server as host baseline, and that package depends on
+# openssh-client. Neither presence nor absence would then say anything about
+# what the operator installed.
 PRODUCT_PACKAGES = (
     "nginx-full",
     "libnginx-mod-stream",
@@ -42,8 +46,6 @@ PRODUCT_PACKAGES = (
     "systemd-resolved",
     "iproute2",
     "ca-certificates",
-    "openssh-client",
-    "openssh-server",
     "sudo",
 )
 
@@ -78,6 +80,8 @@ def containerfile() -> str:
         raise TargetImageError("the target image must boot systemd as PID 1")
     if "STOPSIGNAL SIGRTMIN+3" not in code:
         raise TargetImageError("the target image must stop systemd with SIGRTMIN+3")
+    if "systemctl enable ssh.service" not in code:
+        raise TargetImageError("the target image must run sshd like the VPS the product inspects")
     if "ENV container=podman" not in code:
         raise TargetImageError("the target image must declare the Podman container environment")
     baked = [package for package in PRODUCT_PACKAGES if re.search(rf"(?<![\w-]){re.escape(package)}(?![\w-])", code)]
@@ -107,6 +111,7 @@ def cleanliness_probe() -> str:
     return (
         'printf "init=%s\\n" "$(ps -p 1 -o comm= 2>/dev/null || true)"; '
         'printf "systemd=%s\\n" "$(systemctl --version 2>/dev/null | head -n1 || true)"; '
+        'printf "sshd=%s\\n" "$(systemctl is-active ssh.service 2>/dev/null || true)"; '
         'for pkg in ' + package_list + '; do '
         'if dpkg-query -W -f=\'${Status}\' "$pkg" 2>/dev/null | grep -q "install ok installed"; then '
         'printf "installed=%s\\n" "$pkg"; fi; done'
@@ -116,6 +121,7 @@ def cleanliness_probe() -> str:
 def parse_probe(output: str) -> Dict[str, Any]:
     init = ""
     systemd = ""
+    sshd = ""
     installed = []
     for line in output.splitlines():
         key, _, value = line.partition("=")
@@ -123,9 +129,16 @@ def parse_probe(output: str) -> Dict[str, Any]:
             init = value.strip()
         elif key == "systemd":
             systemd = value.strip()
+        elif key == "sshd":
+            sshd = value.strip()
         elif key == "installed":
             installed.append(value.strip())
-    return {"init": init, "systemd": systemd, "installed": sorted(item for item in installed if item)}
+    return {
+        "init": init,
+        "systemd": systemd,
+        "sshd": sshd,
+        "installed": sorted(item for item in installed if item),
+    }
 
 
 def assert_clean(podman, container: str) -> Dict[str, Any]:
@@ -136,6 +149,10 @@ def assert_clean(podman, container: str) -> Dict[str, Any]:
         raise TargetImageError(f"{container} is not running systemd as PID 1 (found {facts['init']!r})")
     if not facts["systemd"].startswith("systemd"):
         raise TargetImageError(f"{container} has no usable systemctl: {facts['systemd']!r}")
+    if facts["sshd"] != "active":
+        # The product validates the live SSH configuration with ``sshd -t``, which
+        # only works once the service has created its runtime directory.
+        raise TargetImageError(f"{container} is not running sshd (found {facts['sshd']!r})")
     if facts["installed"]:
         raise TargetImageError(
             f"{container} already contains product packages: {', '.join(facts['installed'])}"
