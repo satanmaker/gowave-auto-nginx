@@ -79,6 +79,11 @@ REPO_IN_CONTAINER = "/repo"
 CA_MOUNT = "/fixtures/ca"
 CA_FILE_NAME = "fixture-ca.crt"
 ISSUED_ROOT_NAME = "issued-root.pem"
+# The product uses one pinned CA file for both jobs: trusting the ACME endpoint
+# itself and verifying that an existing lineage is its own. Pebble serves its
+# HTTPS endpoint under the fixture root while it issues certificates under its
+# own root, so a single root would fail one of the two on the second install.
+ACME_CA_BUNDLE_NAME = "acme-trust.pem"
 ECHO_MOUNT = "/fixtures/echo"
 ECHO_HTTP_PORT = 18080
 ECHO_HTTPS_PORT = 18443
@@ -371,6 +376,12 @@ class AioTopology:
         issued = self._ca_dir / ISSUED_ROOT_NAME
         issued.write_text(self._issued_root, encoding="utf-8")
         issued.chmod(0o644)
+        bundle = self._ca_dir / ACME_CA_BUNDLE_NAME
+        bundle.write_text(
+            ca_file.read_text(encoding="utf-8").rstrip("\n") + "\n" + self._issued_root.strip() + "\n",
+            encoding="utf-8",
+        )
+        bundle.chmod(0o644)
 
         self.podman.run(
             name=self.target_name,
@@ -540,12 +551,18 @@ class AioTopology:
             timeout=timeout,
         )
 
-    def traffic_facts(self, scope: str, timeout: int = 900) -> Any:
+    def traffic_facts(
+        self, scope: str, timeout: int = 900, payload_dir: Optional[str] = None,
+    ) -> Any:
         """Run the engine-side traffic probe against the controlled endpoint.
 
         The destination is the endpoint's public address, not the private one the
         fixtures resolve: both of the product's guards pass a global destination
         and would drop or blackhole a private one.
+
+        ``payload_dir`` selects which captured subscription the engines consume;
+        the revoked-access case replays a payload the Panel issued before the
+        revocation, which is not the current one.
         """
         self.engine_client()
         return self.podman.exec(
@@ -553,7 +570,7 @@ class AioTopology:
             [
                 "python3", TRAFFIC_PROBE_SCRIPT,
                 "--scope", scope,
-                "--payload-dir", SECRETS_MOUNT,
+                "--payload-dir", payload_dir or SECRETS_MOUNT,
                 "--ca", f"{CA_MOUNT}/{ISSUED_ROOT_NAME}",
                 "--destination", f"{self.plan.data_echo_ip}:{ECHO_HTTP_PORT}",
             ],
@@ -617,12 +634,15 @@ class AioTopology:
 
     # ----------------------------------------------------------------- install
     def install_environment(self) -> Dict[str, str]:
-        ca_file = f"{CA_MOUNT}/{CA_FILE_NAME}"
+        ca_file = f"{CA_MOUNT}/{ACME_CA_BUNDLE_NAME}"
+        bundle = self._ca_dir / ACME_CA_BUNDLE_NAME if self._ca_dir else None
         return {
             "GOWAVE_ACME_SERVER": acme_fixture.ACME_DIRECTORY_URL,
             "GOWAVE_ACME_TEST_MODE": "1",
             "GOWAVE_ACME_TEST_CA_FILE": ca_file,
-            "GOWAVE_ACME_TEST_CA_SHA256": acme_fixture.ca_file_sha256(self.acme.ca_file()) if self.acme else "",
+            "GOWAVE_ACME_TEST_CA_SHA256": (
+                acme_fixture.ca_file_sha256(bundle) if bundle is not None and bundle.is_file() else ""
+            ),
             "GOWAVE_TLS_CA_FILE": f"{CA_MOUNT}/{ISSUED_ROOT_NAME}",
             "GOWAVE_PODMAN_TEST_MODE": "1",
             "GOWAVE_PODMAN_MASTER_ADDRESS": self.plan.target_ip,
@@ -639,6 +659,18 @@ class AioTopology:
 
     def install(self) -> InstallOutcome:
         """Run the real operator install, unmodified, inside the target."""
+        return self._install("aio-install")
+
+    def reinstall(self) -> InstallOutcome:
+        """Run the same operator command again against the already installed host.
+
+        The product documents installation as repeatable, so this is the operator's
+        own command rather than a second entry point. The two runs keep separate
+        evidence files so the second cannot overwrite what the first recorded.
+        """
+        return self._install("aio-reinstall")
+
+    def _install(self, evidence_prefix: str) -> InstallOutcome:
         script = self.install_script()
         started = time.monotonic()
         proc = self.podman.exec_bash(
@@ -651,8 +683,8 @@ class AioTopology:
             duration=time.monotonic() - started,
             command=script,
         )
-        self.context.evidence_text("aio-install.stdout.log", outcome.stdout)
-        self.context.evidence_text("aio-install.stderr.log", outcome.stderr)
+        self.context.evidence_text(f"{evidence_prefix}.stdout.log", outcome.stdout)
+        self.context.evidence_text(f"{evidence_prefix}.stderr.log", outcome.stderr)
         return outcome
 
     def install_must_succeed(self) -> InstallOutcome:

@@ -175,6 +175,27 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
     },
     {
+        "id": "AIO-REVOKE",
+        "requirement": "Real client data-plane verification",
+        "assertion": "A subscription is served, updated through PATCH and captured once one real transfer proves the Panel's asynchronous user push reached the node, the documented revoke action rotates the credentials and the subscription path with the old path returning 404, and freshly started engines replaying the pre-revocation payload deliver nothing while the controlled endpoint records none of their request ids.",
+        "topology": ["aio"],
+        "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
+    },
+    {
+        "id": "AIO-RESTART",
+        "requirement": "All-in-One Master VPS Installation Verification",
+        "assertion": "Restarting the product's own systemd units leaves every declared unit active, the Panel answering the documented authenticated call again inside one bounded deadline, one served outbound carrying a payload to the endpoint before the matrix runs, and both pinned clients transferring a unique payload through every core transport with the installed host as the source.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "AIO-IDEMPOTENT",
+        "requirement": "All-in-One Master VPS Installation Verification",
+        "assertion": "The real operator install is executed a second time against the installed target and leaves the Panel inventory — nodes, config profiles, squads, hosts and API tokens — and the host inventory — systemd unit files and digested NGINX configuration — unchanged, the credentials file root-owned 0600 and still authenticating, the already served subscription carrying the same credentials, and both pinned clients still transferring payloads.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
         "id": "NGX-COVER-DERIVE",
         "requirement": "Camouflage decoy and certificate lineage",
         "assertion": "The cover apex is the last two labels of panel_domain and a domain with fewer than three labels produces no cover lineage and is handled explicitly.",

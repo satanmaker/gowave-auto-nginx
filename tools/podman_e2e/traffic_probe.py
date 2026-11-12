@@ -297,12 +297,18 @@ def transfer(
     label: Dict[str, str],
     engine: str,
     log_path: Optional[Path] = None,
+    expect_refusal: bool = False,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> Dict[str, Any]:
     """POST one unique body through a local proxy, or directly when none is given.
 
     A direct transfer is the control for source attribution: it leaves from the
     client itself, so an endpoint that recorded the product's address for the
     tunnelled transfers has recorded something the client could not fake.
+
+    ``expect_refusal`` inverts the verdict: the access being revoked is only
+    proven revoked when this attempt cannot make the endpoint report it, so a
+    refusal is the result and a delivered payload fails the case.
     """
     token = "".join(character if character.isalnum() else "-" for character in label["tag"])[:40]
     request_id = f"{engine}-{token}-{uuid.uuid4().hex[:12]}"
@@ -313,10 +319,10 @@ def transfer(
     digest = hashlib.sha256(body).hexdigest()
     host, _, port = destination.partition(":")
     if proxy_port is None:
-        connection = http.client.HTTPConnection(host, int(port or ECHO_HTTP_PORT), timeout=REQUEST_TIMEOUT_SECONDS)
+        connection = http.client.HTTPConnection(host, int(port or ECHO_HTTP_PORT), timeout=timeout)
         target = TRANSFER_PATH
     else:
-        connection = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=REQUEST_TIMEOUT_SECONDS)
+        connection = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=timeout)
         target = f"http://{destination}{TRANSFER_PATH}"
     try:
         connection.request(
@@ -334,6 +340,8 @@ def transfer(
         status = response.status
         raw = response.read(65536)
     except (OSError, http.client.HTTPException) as exc:
+        if expect_refusal:
+            return refusal(engine, label, request_id, status=None, reason=f"{type(exc).__name__}: {sanitize(str(exc), 200)}")
         raise SystemExit(
             f"the {engine} transfer through {label['network']} did not reach the endpoint: "
             f"{type(exc).__name__}: {sanitize(str(exc), 300)}{engine_detail(log_path)}"
@@ -344,19 +352,54 @@ def transfer(
     try:
         recorded = json.loads(raw.decode("utf-8", errors="replace"))
     except json.JSONDecodeError:
+        if expect_refusal:
+            return refusal(engine, label, request_id, status=status, reason=f"HTTP {status} without an endpoint report")
         raise SystemExit(
             f"the {engine} transfer through {label['network']} returned HTTP {status} without an "
             f"endpoint report: {sanitize(raw.decode('utf-8', errors='replace'), 300)}"
             f"{engine_detail(log_path)}"
         )
+    if expect_refusal:
+        # A delivered payload is a fact for the case to judge, not a crash: the
+        # Panel has to push the revocation and the node has to apply it, so a
+        # round that still delivers is a propagation lag the scope retries.
+        return {
+            "engine": engine,
+            **label,
+            "request_id": request_id,
+            "delivered": True,
+            "status": status,
+            "request_id_match": recorded.get("request_id") == request_id,
+            "body_match": recorded.get("body_sha256") == digest and recorded.get("match") is True,
+            "source_ip": str(recorded.get("source_ip") or ""),
+        }
     return {
         "engine": engine,
         **label,
         "request_id": request_id,
+        "delivered": True,
         "status": status,
         "request_id_match": recorded.get("request_id") == request_id,
         "body_match": recorded.get("body_sha256") == digest and recorded.get("match") is True,
         "source_ip": str(recorded.get("source_ip") or ""),
+    }
+
+
+def refusal(
+    engine: str,
+    label: Dict[str, str],
+    request_id: str,
+    status: Optional[int],
+    reason: str,
+) -> Dict[str, Any]:
+    """A transfer the tunnel refused: no endpoint report came back for it."""
+    return {
+        "engine": engine,
+        **label,
+        "request_id": request_id,
+        "delivered": False,
+        "status": status,
+        "reason": reason,
     }
 
 
@@ -410,12 +453,21 @@ def xray_transfers(
     ca_file: str,
     destination: str,
     workdir: Path,
+    expect_refusal: bool = False,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+    limit: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """Run every served Xray profile and send a payload through each."""
+    """Run every served Xray profile and send a payload through each.
+
+    ``limit`` runs only the first profiles, which the readiness scope uses to
+    probe one tunnel instead of the whole matrix.
+    """
     raw = subscription_probe.read_payload(payload_dir, "xray-json")
     shape, profiles = subscription_probe.load_profiles(raw)
     transfers: List[Dict[str, Any]] = []
     for index, profile in enumerate(profiles):
+        if limit is not None and index >= limit:
+            break
         prepared, wrapped = subscription_probe.prepare_config(profile, ca_file)
         if wrapped:
             raise SystemExit(
@@ -436,6 +488,7 @@ def xray_transfers(
                 transfers.append(transfer(
                     http_proxy_port(prepared), destination, label, "xray",
                     workdir / f"traffic-xray-{index}.log",
+                    expect_refusal=expect_refusal, timeout=timeout,
                 ))
         finally:
             path.unlink(missing_ok=True)
@@ -496,6 +549,8 @@ def mihomo_transfers(
     ca_file: str,
     destination: str,
     workdir: Path,
+    expect_refusal: bool = False,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> List[Dict[str, Any]]:
     """Load the served Mihomo YAML and send a payload through every proxy it declares."""
     text = subscription_probe.read_payload(payload_dir, "mihomo")
@@ -525,6 +580,7 @@ def mihomo_transfers(
                 select_mihomo_proxy(label["tag"])
                 transfers.append(transfer(
                     MIHOMO_MIXED_PORT, destination, label, "mihomo", workdir / "traffic-mihomo.log",
+                    expect_refusal=expect_refusal, timeout=timeout,
                 ))
     finally:
         config.unlink(missing_ok=True)
@@ -532,6 +588,53 @@ def mihomo_transfers(
 
 
 # ----------------------------------------------------------------------- scopes
+WARMUP_PROFILES = 1
+REVOCATION_ROUNDS = 6
+REVOCATION_ROUND_PAUSE_SECONDS = 5
+REVOCATION_TIMEOUT_SECONDS = 10
+
+
+def wait_revocation_propagation(seconds: int = REVOCATION_ROUND_PAUSE_SECONDS) -> None:
+    """Pause between rounds: the Panel pushes a revocation and the node applies it asynchronously."""
+    time.sleep(seconds)
+
+
+def warmup(payload_dir: str, ca_file: str, destination: str, workdir: Path) -> Dict[str, Any]:
+    """Send one payload through the first served outbound and say whether it arrived.
+
+    This is a readiness scope, not an acceptance one: the Panel hands a new user
+    to the node and the node applies it asynchronously, so the first transfer of a
+    freshly issued payload can legitimately be refused. A refusal is therefore a
+    reported result the caller waits on rather than an error, and the verdict
+    comes from the endpoint's own log, because a proxy that answers without
+    carrying the payload must not look ready.
+    """
+    if not destination:
+        raise SystemExit("a destination address is required: the payload needs somewhere to go")
+
+    attempts = xray_transfers(
+        payload_dir, ca_file, destination, workdir,
+        expect_refusal=True, timeout=REVOCATION_TIMEOUT_SECONDS, limit=WARMUP_PROFILES,
+    )
+    if not attempts:
+        raise SystemExit("the served Xray payload declares no outbound to warm up")
+    attempt = attempts[0]
+    diagnostics = echo_diagnostics(destination)
+    recorded = {
+        str(event.get("request_id") or "")
+        for event in diagnostics.get("requests") or []
+        if isinstance(event, dict)
+    }
+    return {
+        "delivered": bool(attempt.get("delivered")) and attempt["request_id"] in recorded,
+        "engine": attempt.get("engine"),
+        "network": attempt.get("network"),
+        "status": attempt.get("status"),
+        "reason": attempt.get("reason", ""),
+        "recorded": attempt["request_id"] in recorded,
+    }
+
+
 def traffic(payload_dir: str, ca_file: str, destination: str, workdir: Path) -> Dict[str, Any]:
     """Send a unique payload through every served outbound, with both engines."""
     if not destination:
@@ -546,9 +649,83 @@ def traffic(payload_dir: str, ca_file: str, destination: str, workdir: Path) -> 
     return transfer_matrix(transfers, echo_diagnostics(destination), direct["source_ip"])
 
 
+def revoked(
+    payload_dir: str,
+    ca_file: str,
+    destination: str,
+    workdir: Path,
+    rounds: int = REVOCATION_ROUNDS,
+) -> Dict[str, Any]:
+    """Prove that access which was revoked cannot make the endpoint record a payload.
+
+    Every attempt is a fresh engine started from the subscription payload that was
+    captured while the access still worked, so this is what a client that kept the
+    old subscription would experience — not an existing session.
+
+    A revocation is not instantaneous: the Panel pushes the change and the node
+    applies it. Each round therefore retries, and only a round in which every
+    transport refused ends the wait. The verdict rests on two independent
+    observations, because a refusal message alone would also describe a broken
+    network: no attempt may receive an endpoint report, and the endpoint's own log
+    may not contain a single one of the attempted request ids.
+    """
+    if not destination:
+        raise SystemExit("a destination address is required: the payload needs somewhere to go")
+
+    attempts: List[Dict[str, Any]] = []
+    delivered: List[Dict[str, Any]] = []
+    completed = 0
+    for round_index in range(1, rounds + 1):
+        attempts = xray_transfers(
+            payload_dir, ca_file, destination, workdir,
+            expect_refusal=True, timeout=REVOCATION_TIMEOUT_SECONDS,
+        )
+        attempts += mihomo_transfers(
+            payload_dir, ca_file, destination, workdir,
+            expect_refusal=True, timeout=REVOCATION_TIMEOUT_SECONDS,
+        )
+        if not attempts:
+            raise SystemExit("no outbound was exercised, so nothing about the revocation was proven")
+        delivered = [item for item in attempts if item.get("delivered")]
+        completed = round_index
+        if not delivered:
+            break
+        if round_index < rounds:
+            wait_revocation_propagation()
+
+    if delivered:
+        raise SystemExit(
+            f"access revoked in the Panel still reached the endpoint after {completed} rounds: "
+            + ", ".join(f"{item['engine']}:{item['network']}" for item in delivered)
+        )
+
+    diagnostics = echo_diagnostics(destination)
+    recorded = {
+        str(event.get("request_id") or "")
+        for event in diagnostics.get("requests") or []
+        if isinstance(event, dict)
+    }
+    leaked = sorted(item["request_id"] for item in attempts if item["request_id"] in recorded)
+    if leaked:
+        raise SystemExit(
+            f"the endpoint recorded a request from revoked access: {', '.join(leaked)}"
+        )
+    return {
+        "attempts": attempts,
+        "attempt_count": len(attempts),
+        "engines": sorted({str(item["engine"]) for item in attempts}),
+        "networks": sorted({str(item["network"]) for item in attempts}),
+        "refused": sum(1 for item in attempts if not item.get("delivered")),
+        "delivered": len(delivered),
+        "rounds": completed,
+        "endpoint_records": len(recorded),
+        "recorded_request_ids": len(leaked),
+    }
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Send payloads through the Panel-issued outbounds")
-    parser.add_argument("--scope", required=True, choices=("traffic",))
+    parser.add_argument("--scope", required=True, choices=("traffic", "revoked", "warmup"))
     parser.add_argument("--payload-dir", default="/secrets")
     parser.add_argument("--ca", required=True)
     parser.add_argument("--destination", default="")
@@ -556,11 +733,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     workdir = Path(args.workdir) if args.workdir else Path("/tmp")
-    if args.scope == "traffic":
-        facts = traffic(args.payload_dir, args.ca, args.destination, workdir)
-        print(json.dumps(facts, sort_keys=True))
-        return 0
-    raise SystemExit(f"unsupported scope: {args.scope}")
+    scopes = {
+        "traffic": traffic,
+        "revoked": revoked,
+        "warmup": warmup,
+    }
+    facts = scopes[args.scope](args.payload_dir, args.ca, args.destination, workdir)
+    print(json.dumps(facts, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
