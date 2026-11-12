@@ -69,6 +69,10 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **AIO-REVOKE** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-RESTART** — promotion target: All-in-One Master VPS Installation Verification
 - **AIO-IDEMPOTENT** — promotion target: All-in-One Master VPS Installation Verification
+- **AIO-NEG-DEST** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **AIO-NEG-PORT** — promotion target: All-in-One Master VPS Installation Verification
+- **AIO-NEG-ACME** — promotion target: Independent All-in-One Acceptance Topology
+- **AIO-NEG-DEP** — promotion target: All-in-One Master VPS Installation Verification
 - **NGX-COVER-DERIVE** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **NGX-COVER-UNRESOLVED** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **NGX-WORKER-ACME80** — promotion target: Distributed Worker VPS Deployment Verification

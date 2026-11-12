@@ -65,6 +65,10 @@ MIHOMO_GLOBAL_GROUP = "GLOBAL"
 STARTUP_SECONDS = 60
 REQUEST_TIMEOUT_SECONDS = 30
 SHUTDOWN_SECONDS = 10
+# A prohibited destination is answered by the node's block outbound, which closes
+# the connection immediately; the budget only has to cover a policy that drops
+# the packets silently instead, and must not turn a denial into a hung probe.
+PROHIBITED_TIMEOUT_SECONDS = 15
 
 TRANSFER_PATH = "/traffic"
 
@@ -723,22 +727,105 @@ def revoked(
     }
 
 
+def prohibited(
+    payload_dir: str,
+    ca_file: str,
+    destination: str,
+    workdir: Path,
+    report_destination: str = "",
+) -> Dict[str, Any]:
+    """Prove the node's egress policy drops a destination the product excludes.
+
+    The permitted control comes first, through the same served outbound and the
+    same engine: without it, a refusal of the prohibited attempt would describe a
+    tunnel that is merely broken. The endpoint is then asked directly, not
+    through the tunnel, which request ids it recorded, so a payload that reached
+    it cannot hide behind a refused connection.
+
+    The two addresses are separate because the product blocks private and
+    loopback destinations by routing rule: the prohibited one is the fixture's
+    private face, and the permitted one is the same fixture on its public face.
+    """
+    if not destination:
+        raise SystemExit("a prohibited destination is required: the policy needs somewhere to deny")
+    report = report_destination or destination
+
+    control = xray_transfers(
+        payload_dir, ca_file, report, workdir, timeout=PROHIBITED_TIMEOUT_SECONDS, limit=1,
+    )
+    if not control:
+        raise SystemExit("the served Xray payload declares no outbound to test the policy with")
+    permitted = control[0]
+    recorded = _recorded_request_ids(report)
+    if not permitted.get("delivered") or permitted["request_id"] not in recorded:
+        raise SystemExit(
+            "the control transfer to the permitted destination did not reach the endpoint, so a "
+            f"refusal of the prohibited one would prove nothing: {permitted.get('reason', '')}"
+        )
+
+    attempts = xray_transfers(
+        payload_dir, ca_file, destination, workdir,
+        expect_refusal=True, timeout=PROHIBITED_TIMEOUT_SECONDS, limit=1,
+    )
+    if not attempts:
+        raise SystemExit("the served Xray payload declares no outbound to test the policy with")
+    attempt = attempts[0]
+    recorded = _recorded_request_ids(report)
+    leaked = attempt["request_id"] in recorded
+    if leaked:
+        raise SystemExit(
+            "the endpoint recorded a payload sent to a destination the product's policy excludes"
+        )
+    return {
+        "engine": attempt.get("engine"),
+        "network": attempt.get("network"),
+        "control_delivered": True,
+        "delivered": bool(attempt.get("delivered")),
+        "status": attempt.get("status"),
+        "reason": attempt.get("reason", ""),
+        "endpoint_records": len(recorded),
+        "recorded_request_ids": 0,
+    }
+
+
+def _recorded_request_ids(destination: str) -> set:
+    """The request ids the endpoint itself says it received."""
+    diagnostics = echo_diagnostics(destination)
+    return {
+        str(event.get("request_id") or "")
+        for event in diagnostics.get("requests") or []
+        if isinstance(event, dict)
+    }
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Send payloads through the Panel-issued outbounds")
-    parser.add_argument("--scope", required=True, choices=("traffic", "revoked", "warmup"))
+    parser.add_argument("--scope", required=True,
+                        choices=("traffic", "revoked", "warmup", "prohibited"))
     parser.add_argument("--payload-dir", default="/secrets")
     parser.add_argument("--ca", required=True)
     parser.add_argument("--destination", default="")
+    parser.add_argument(
+        "--report-destination", default="",
+        help="Where the prohibited scope reads the endpoint's own record, when it is not "
+             "reachable at the prohibited destination",
+    )
     parser.add_argument("--workdir", default="")
     args = parser.parse_args(argv)
 
     workdir = Path(args.workdir) if args.workdir else Path("/tmp")
-    scopes = {
-        "traffic": traffic,
-        "revoked": revoked,
-        "warmup": warmup,
-    }
-    facts = scopes[args.scope](args.payload_dir, args.ca, args.destination, workdir)
+    if args.scope == "prohibited":
+        facts = prohibited(
+            args.payload_dir, args.ca, args.destination, workdir,
+            report_destination=args.report_destination,
+        )
+    else:
+        scopes = {
+            "traffic": traffic,
+            "revoked": revoked,
+            "warmup": warmup,
+        }
+        facts = scopes[args.scope](args.payload_dir, args.ca, args.destination, workdir)
     print(json.dumps(facts, sort_keys=True))
     return 0
 
