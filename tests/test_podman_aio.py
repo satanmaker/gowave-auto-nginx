@@ -11,6 +11,7 @@ import unittest
 from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Optional, Sequence
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1105,6 +1106,233 @@ class TestIdempotentCase(unittest.TestCase):
                          + aio.TRAFFIC_TIMEOUT_SECONDS)
         self.assertEqual(cases["AIO-IDEMPOTENT"].timeout_seconds,
                          aio.INSTALL_TIMEOUT_SECONDS + aio.TRAFFIC_TIMEOUT_SECONDS)
+
+
+BROKEN_TAIL = (
+    'nginx: [emerg] unknown directive "gowave_e2e_broken_probe" '
+    f"in {aio.NGX_CONFIG_SNIPPET}:1\n"
+    "nginx: configuration file /etc/nginx/nginx.conf test failed"
+)
+
+
+def nginx_probe(
+    mode: str, *, test: int = 0, tail: str = "", hook: int = 0, active: str = "active",
+    main_pid: str = "4242", before_workers: Sequence[str] = ("4243", "4244"),
+    after_workers: Optional[Sequence[str]] = None, listeners: int = 1,
+    after_listeners: Optional[int] = None, dump: Optional[dict] = None,
+    present_before: bool = False, present: Optional[bool] = None,
+    domain: str = aio.PANEL_DOMAIN,
+) -> dict:
+    """One phase's report, shaped exactly as the host probe prints it."""
+    after = tuple(before_workers) if after_workers is None else tuple(after_workers)
+    return {
+        "mode": mode,
+        "primary_domain": domain,
+        "directive": aio.NGX_CONFIG_DIRECTIVE,
+        "snippet": {
+            "path": aio.NGX_CONFIG_SNIPPET,
+            "present_before": present_before,
+            "present": mode == "break" if present is None else present,
+        },
+        "config_files": ["/etc/nginx/conf.d/gowave-http.conf"],
+        "test": {"returncode": test, "tail": tail},
+        "dump": dump or {
+            "returncode": 0, "bytes": 4096, "sha256": "a" * 64, "server_name_lines": 3,
+            "ssl_preread": True, "primary_server_name": True, "tail": "",
+        },
+        "hook": {"present": True, "executable": True, "returncode": hook,
+                 "stdout": "", "stderr": ""},
+        "before_hook": {"active": active, "main_pid": main_pid,
+                        "worker_pids": list(before_workers), "listeners_443": listeners},
+        "after_hook": {"active": active, "main_pid": main_pid,
+                       "worker_pids": list(after),
+                       "listeners_443": listeners if after_listeners is None else after_listeners},
+        "reload_waited_seconds": 0.5,
+    }
+
+
+class TestNginxConfigCase(unittest.TestCase):
+    """NGX-05: a valid tree is reloaded, a broken one never reaches the master."""
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def contract(self, *probes):
+        product, podman = installed_product(
+            self.context, [(json.dumps(probe), 0) for probe in probes],
+        )
+        return aio.case_nginx_config(product), podman
+
+    def reject(self, expected: str, *probes):
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(*probes)
+        self.assertIn(expected, str(caught.exception))
+        return caught
+
+    def healthy_phases(self, **overrides):
+        """The three phases of a passing run, with any phase's fields overridden."""
+        return (
+            nginx_probe("before", **overrides.get("before", {})),
+            nginx_probe("break", test=1, tail=BROKEN_TAIL, present=True,
+                        **overrides.get("broken", {})),
+            nginx_probe("restore", after_workers=("5100", "5101"),
+                        **overrides.get("restored", {})),
+        )
+
+    def test_the_case_refuses_a_broken_tree_and_reloads_the_restored_one(self):
+        evidence, podman = self.contract(*self.healthy_phases())
+        self.assertEqual(len(podman.scripts), 3)
+        self.assertEqual(evidence["role"], "the All-in-One host")
+        self.assertEqual(evidence["generated_config_files"], 1)
+        self.assertEqual(evidence["invalid_configuration"]["nginx_test_returncode"], 1)
+        self.assertEqual(evidence["invalid_configuration"]["hook_returncode"], 0)
+        self.assertEqual(evidence["invalid_configuration"]["worker_pids"], ["4243", "4244"])
+        self.assertEqual(evidence["restored_configuration"]["worker_pids_before"], ["4243", "4244"])
+        self.assertEqual(evidence["restored_configuration"]["worker_pids_after"], ["5100", "5101"])
+
+    def test_every_phase_drives_the_products_own_hook_against_the_planted_snippet(self):
+        _evidence, podman = self.contract(*self.healthy_phases())
+        for phase, script in zip(("before", "break", "restore"), podman.scripts):
+            self.assertIn(phase, script)
+            self.assertIn(aio.NGX_CONFIG_SNIPPET, script)
+            self.assertIn(aio.NGX_CONFIG_HOOK, script)
+            self.assertIn(aio.PANEL_DOMAIN, script)
+
+    def test_a_generated_tree_that_fails_nginx_t_fails_the_case(self):
+        product, podman = installed_product(
+            self.context, [(json.dumps(nginx_probe("before", test=1, tail="boom")), 0)],
+        )
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_nginx_config(product)
+        self.assertIn("does not pass `nginx -t`", str(caught.exception))
+        self.assertEqual(len(podman.scripts), 1, "nothing was planted, so nothing is restored")
+
+    def test_a_dump_without_sni_routing_fails_the_case(self):
+        dump = nginx_probe("before")["dump"]
+        dump["ssl_preread"] = False
+        self.reject("no ssl_preread SNI routing",
+                    nginx_probe("before", dump=dump))
+
+    def test_a_dump_without_the_deployments_own_server_name_fails_the_case(self):
+        dump = nginx_probe("before")["dump"]
+        dump["primary_server_name"] = False
+        self.reject("no server_name for",
+                    nginx_probe("before", dump=dump))
+
+    def test_a_missing_deploy_hook_fails_the_case(self):
+        probe = nginx_probe("before")
+        probe["hook"] = {"present": False, "executable": False, "returncode": None,
+                         "stdout": "", "stderr": ""}
+        self.reject("deploy hook", probe)
+
+    def test_a_snippet_nginx_never_validates_fails_the_case(self):
+        self.reject(
+            "left `nginx -t` succeeding",
+            nginx_probe("before"),
+            nginx_probe("break", test=0, present=True),
+            nginx_probe("restore", after_workers=("5100",)),
+        )
+
+    def test_a_hook_that_reloads_a_broken_configuration_fails_the_case(self):
+        self.reject(
+            "reloaded NGINX with an invalid configuration",
+            nginx_probe("before"),
+            nginx_probe("break", test=1, tail=BROKEN_TAIL, present=True,
+                        after_workers=("4300", "4301")),
+            nginx_probe("restore", after_workers=("5100",)),
+        )
+
+    def test_a_hook_that_replaces_the_master_on_a_broken_configuration_fails_the_case(self):
+        probe = nginx_probe("break", test=1, tail=BROKEN_TAIL, present=True)
+        probe["after_hook"]["main_pid"] = "9001"
+        self.reject(
+            "replaced the NGINX master on an invalid configuration",
+            nginx_probe("before"), probe,
+        )
+
+    def test_a_hook_that_fails_on_a_broken_configuration_fails_the_case(self):
+        probe = nginx_probe("break", test=1, tail=BROKEN_TAIL, present=True, hook=1)
+        probe["hook"]["stderr"] = "systemctl: Unit nginx.service not found."
+        self.reject(
+            "on an invalid configuration instead of leaving NGINX alone",
+            nginx_probe("before"), probe,
+        )
+
+    def test_a_restore_that_never_reloads_fails_the_case(self):
+        self.reject(
+            "did not reload NGINX once the configuration was valid again",
+            nginx_probe("before"),
+            nginx_probe("break", test=1, tail=BROKEN_TAIL, present=True),
+            nginx_probe("restore"),
+        )
+
+    def test_a_restore_that_restarts_the_master_fails_the_case(self):
+        restored = nginx_probe("restore", after_workers=("5100",))
+        restored["after_hook"]["main_pid"] = "9001"
+        self.reject(
+            "replaced the NGINX master instead of reloading it",
+            nginx_probe("before"),
+            nginx_probe("break", test=1, tail=BROKEN_TAIL, present=True),
+            restored,
+        )
+
+    def test_a_restore_that_still_fails_nginx_t_fails_the_case(self):
+        self.reject(
+            "the restored configuration still fails `nginx -t`",
+            nginx_probe("before"),
+            nginx_probe("break", test=1, tail=BROKEN_TAIL, present=True),
+            nginx_probe("restore", test=1, tail=BROKEN_TAIL, after_workers=("5100",)),
+        )
+
+    def test_the_snippet_is_removed_even_when_the_failing_probe_returns_nothing(self):
+        product, podman = installed_product(self.context, [
+            (json.dumps(nginx_probe("before")), 0),
+            ("", 1),
+            (json.dumps(nginx_probe("restore", after_workers=("5100",))), 0),
+        ])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_nginx_config(product)
+        self.assertIn("break probe", str(caught.exception))
+        self.assertEqual(len(podman.scripts), 3, "the restore probe has to run from the finally block")
+        self.assertIn("restore", podman.scripts[2])
+
+    def test_a_restore_that_cannot_run_is_reported_instead_of_hiding_the_finding(self):
+        product, podman = installed_product(self.context, [
+            (json.dumps(nginx_probe("before")), 0),
+            (json.dumps(nginx_probe("break", test=1, tail=BROKEN_TAIL, present=True)), 0),
+            ("", 1),
+        ])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_nginx_config(product)
+        self.assertIn("the restore probe exited 1", str(caught.exception))
+        self.assertEqual(len(podman.scripts), 3)
+
+    def test_the_planted_directive_is_not_one_the_product_generates(self):
+        for path in [*(REPO_ROOT / "modules").rglob("*.sh"),
+                     REPO_ROOT / "gowave-auto.sh", REPO_ROOT / "gowave-node-auto.sh"]:
+            self.assertNotIn(aio.NGX_CONFIG_DIRECTIVE, path.read_text(encoding="utf-8"), str(path))
+
+    def test_the_case_is_registered_before_any_traffic_and_carries_a_bounded_budget(self):
+        cases = {case.id: case for case in aio.cases(ScriptedPodman(self.context, []))}
+        self.assertIn(aio.NGX_CONFIG_CASE_ID, cases)
+        self.assertEqual(cases[aio.NGX_CONFIG_CASE_ID].timeout_seconds,
+                         aio.NGX_CONFIG_TIMEOUT_SECONDS)
+        self.assertEqual(cases[aio.NGX_CONFIG_CASE_ID].topology, "aio")
+        ids = [case.id for case in aio.cases(ScriptedPodman(self.context, []))]
+        self.assertLess(ids.index(aio.NGX_CONFIG_CASE_ID), ids.index("AIO-RESTART"))
+        self.assertLess(ids.index(aio.NGX_CONFIG_CASE_ID), ids.index("AIO-REVOKE"))
+
+    def test_the_case_is_catalogued_as_an_incubating_podman_first_case(self):
+        entry = {case["id"]: case for case in catalog.load_catalog()["cases"]}
+        self.assertIn(aio.NGX_CONFIG_CASE_ID, entry)
+        record = entry[aio.NGX_CONFIG_CASE_ID]
+        self.assertEqual(record["state"], "incubating")
+        self.assertEqual(record["runs_in"], ["podman"])
+        self.assertEqual(record["topology"], ["aio", "multi-node"])
+        self.assertEqual(record["promotion_target"],
+                         "NGINX SNI Routing and REALITY Decoy Verification")
 
 
 if __name__ == "__main__":

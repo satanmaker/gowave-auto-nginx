@@ -14,6 +14,7 @@ product code on it.
 from __future__ import annotations
 
 import json
+import shlex
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set
 
@@ -245,6 +246,217 @@ else
     echo "letsencrypt_production=refused"
 fi
 """
+
+NGX_CONFIG_CASE_ID = "NGX-05"
+# A snippet the generated tree can never contain: NGINX reads /etc/nginx/conf.d
+# on both roles, so an unknown directive there makes `nginx -t` fail while the
+# configuration that is already loaded keeps serving.
+NGX_CONFIG_SNIPPET = "/etc/nginx/conf.d/zz-gowave-e2e-broken.conf"
+NGX_CONFIG_DIRECTIVE = "gowave_e2e_broken_probe"
+# The managed Certbot deploy hook is the only unattended path that reloads
+# NGINX, and its `nginx -t` gate is the same one the operator's strict reload
+# uses before it touches the running master.
+NGX_CONFIG_HOOK = "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh"
+# One phase pays for a full `nginx -T` dump and, on restore, for the master to
+# replace its workers; the ceiling is a hang guard, not an expectation.
+NGX_CONFIG_PROBE_TIMEOUT_SECONDS = 180
+NGX_CONFIG_RELOAD_WAIT_SECONDS = 30
+# The AIO suite runs the contract on one host; a cluster runs it on both roles.
+NGX_CONFIG_TIMEOUT_SECONDS = 300
+
+NGX_CONFIG_SCRIPT = r"""python3 - MODE_PLACEHOLDER PRIMARY_DOMAIN_PLACEHOLDER <<'PY'
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+
+MODE = sys.argv[1]
+PRIMARY_DOMAIN = sys.argv[2]
+SNIPPET = "SNIPPET_PLACEHOLDER"
+DIRECTIVE = "DIRECTIVE_PLACEHOLDER"
+HOOK = "HOOK_PLACEHOLDER"
+CONFIG_DIRS = ("/etc/nginx/conf.d", "/etc/nginx/stream-enabled", "/etc/nginx/sites-enabled")
+RELOAD_WAIT_SECONDS = RELOAD_WAIT_PLACEHOLDER
+
+
+def run(argv, timeout=90):
+    try:
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as error:
+        return {
+            "returncode": 127,
+            "stdout": "",
+            "stderr": "%s: %s" % (type(error).__name__, error),
+        }
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout or "",
+        "stderr": completed.stderr or "",
+    }
+
+
+def tail(result, limit=1500):
+    text = (result["stderr"] or result["stdout"] or "").strip()
+    return text[-limit:]
+
+
+def configuration_test():
+    result = run(("nginx", "-t"))
+    return {"returncode": result["returncode"], "tail": tail(result)}
+
+
+def configuration_dump():
+    result = run(("nginx", "-T"))
+    text = result["stdout"] or ""
+    return {
+        "returncode": result["returncode"],
+        "bytes": len(text.encode("utf-8")),
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "server_name_lines": len([
+            line for line in text.splitlines() if line.strip().startswith("server_name")
+        ]),
+        "ssl_preread": "ssl_preread on;" in text,
+        "primary_server_name": PRIMARY_DOMAIN in text,
+        "tail": tail(result, 600),
+    }
+
+
+def child_pids(pid):
+    # Direct children of the master, read from procfs so no tool can be missing.
+    try:
+        with open("/proc/%s/task/%s/children" % (pid, pid), encoding="utf-8") as handle:
+            return sorted(entry for entry in handle.read().split() if entry.isdigit())
+    except OSError:
+        return []
+
+
+def service():
+    active = run(("systemctl", "is-active", "nginx"))
+    show = run(("systemctl", "show", "-p", "MainPID", "--value", "nginx"))
+    main = (show["stdout"] or "").strip()
+    workers = []
+    if main.isdigit() and int(main) > 0:
+        workers = child_pids(main)
+        if not workers:
+            children = run(("pgrep", "-P", main))
+            workers = sorted(pid for pid in (children["stdout"] or "").split() if pid.isdigit())
+    return {
+        "active": (active["stdout"] or "").strip(),
+        "main_pid": main,
+        "worker_pids": workers,
+        "listeners_443": len([
+            line for line in (run(("ss", "-H", "-ltn", "sport = :443"))["stdout"] or "").splitlines()
+            if line.strip()
+        ]),
+    }
+
+
+def config_files():
+    paths = []
+    for directory in CONFIG_DIRS:
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        paths.extend(os.path.join(directory, name) for name in names if name.endswith(".conf"))
+    return paths
+
+
+def mutate():
+    if MODE == "break":
+        with open(SNIPPET, "w", encoding="utf-8") as handle:
+            handle.write("%s on;\n" % DIRECTIVE)
+            handle.flush()
+            os.fsync(handle.fileno())
+    elif MODE == "restore":
+        try:
+            os.unlink(SNIPPET)
+        except FileNotFoundError:
+            pass
+
+
+def drive_hook():
+    # Run the product's own reload guard and report what it did.
+    present = os.path.isfile(HOOK)
+    facts = {
+        "present": present,
+        "executable": os.access(HOOK, os.X_OK),
+        "returncode": None,
+        "stdout": "",
+        "stderr": "",
+    }
+    if not present:
+        return facts
+    result = run((HOOK,), timeout=120)
+    facts.update({
+        "returncode": result["returncode"],
+        "stdout": (result["stdout"] or "").strip()[-600:],
+        "stderr": (result["stderr"] or "").strip()[-600:],
+    })
+    return facts
+
+
+def wait_for_new_workers(before_pids):
+    # Poll until the master replaced a worker, or the deadline expires.
+    started = time.monotonic()
+    deadline = started + RELOAD_WAIT_SECONDS
+    state = service()
+    while set(state["worker_pids"]) <= set(before_pids) and time.monotonic() < deadline:
+        time.sleep(0.5)
+        state = service()
+    return state, round(time.monotonic() - started, 2)
+
+
+snippet_before = os.path.isfile(SNIPPET)
+mutate()
+before_hook = service()
+hook = drive_hook()
+if MODE == "break":
+    # A guard that refused to reload leaves the running master untouched; give a
+    # wrong implementation a moment to show its new workers before reading them.
+    time.sleep(2.0)
+    after_hook = service()
+    waited = 2.0
+elif MODE == "restore":
+    after_hook, waited = wait_for_new_workers(before_hook["worker_pids"])
+else:
+    after_hook = service()
+    waited = 0.0
+
+print(json.dumps({
+    "mode": MODE,
+    "primary_domain": PRIMARY_DOMAIN,
+    "directive": DIRECTIVE,
+    "snippet": {
+        "path": SNIPPET,
+        "present_before": snippet_before,
+        "present": os.path.isfile(SNIPPET),
+    },
+    "config_files": config_files(),
+    "test": configuration_test(),
+    "dump": configuration_dump(),
+    "hook": hook,
+    "before_hook": before_hook,
+    "after_hook": after_hook,
+    "reload_waited_seconds": waited,
+}, sort_keys=True))
+PY
+"""
+
+
+def ngx_config_script(mode: str, primary_domain: str) -> str:
+    """The NGINX configuration probe for one phase of the case on one role."""
+    return (
+        NGX_CONFIG_SCRIPT
+        .replace("MODE_PLACEHOLDER", shlex.quote(mode))
+        .replace("PRIMARY_DOMAIN_PLACEHOLDER", shlex.quote(primary_domain))
+        .replace("SNIPPET_PLACEHOLDER", NGX_CONFIG_SNIPPET)
+        .replace("DIRECTIVE_PLACEHOLDER", NGX_CONFIG_DIRECTIVE)
+        .replace("HOOK_PLACEHOLDER", NGX_CONFIG_HOOK)
+        .replace("RELOAD_WAIT_PLACEHOLDER", str(int(NGX_CONFIG_RELOAD_WAIT_SECONDS)))
+    )
 
 
 def probe_json(case_id: str, label: str, result: Any) -> Dict[str, Any]:
@@ -1402,6 +1614,220 @@ def case_public_dependency(product: AioProduct) -> Dict[str, Any]:
     }
 
 
+def nginx_config_facts(
+    podman: Any, container: str, case_id: str, mode: str, primary_domain: str,
+    timeout: int = NGX_CONFIG_PROBE_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """One phase of the configuration contract, measured on one role.
+
+    ``mode`` is the phase name the probe reports back: ``before`` plants nothing,
+    ``break`` writes an invalid snippet and drives the product's reload guard,
+    and ``restore`` removes it and drives the same guard again.
+    """
+    result = podman.exec_bash(
+        container, ngx_config_script(mode, primary_domain), check=False, timeout=timeout,
+    )
+    return probe_json(case_id, f"the NGINX {mode} probe on {container}", result)
+
+
+def require_generated_nginx_config(case_id: str, role: str, facts: Dict[str, Any]) -> None:
+    """The generated tree is valid, complete, and behind the guard the product ships.
+
+    ``nginx -t`` alone would pass on an empty configuration, so the dump is read
+    too: the tree has to carry the deployment's own server name and the stream
+    SNI routing both roles are built around.
+    """
+    service = facts.get("before_hook") or {}
+    require(case_id, facts.get("mode") == "before",
+            f"{role}: the baseline probe answered for {facts.get('mode')!r}, not for the untouched tree")
+    require(case_id, service.get("active") == "active",
+            f"{role}: NGINX reports {service.get('active')!r} before the case touched its configuration")
+    test = facts.get("test") or {}
+    require(case_id, test.get("returncode") == 0,
+            f"{role}: the generated NGINX configuration does not pass `nginx -t`:\n{test.get('tail', '')}")
+    dump = facts.get("dump") or {}
+    require(case_id, dump.get("returncode") == 0 and int(dump.get("bytes") or 0) > 0,
+            f"{role}: `nginx -T` produced no configuration dump: {dump.get('tail', '')}")
+    require(case_id, dump.get("ssl_preread"),
+            f"{role}: the generated configuration carries no ssl_preread SNI routing")
+    require(case_id, dump.get("primary_server_name"),
+            f"{role}: the generated configuration carries no server_name for "
+            f"{facts.get('primary_domain')!r}")
+    require(case_id, facts.get("config_files"),
+            f"{role}: the product generated no NGINX configuration file")
+    require(case_id, not (facts.get("snippet") or {}).get("present_before"),
+            f"{role}: {NGX_CONFIG_SNIPPET} existed before the case planted it")
+    hook = facts.get("hook") or {}
+    require(case_id, hook.get("present"),
+            f"{role}: the managed ACME deploy hook {NGX_CONFIG_HOOK} is missing, so a renewal "
+            "would never reload NGINX")
+    require(case_id, hook.get("executable"),
+            f"{role}: the managed ACME deploy hook {NGX_CONFIG_HOOK} is not executable")
+    require(case_id, str(service.get("main_pid") or "").isdigit(),
+            f"{role}: NGINX reported no master PID ({service.get('main_pid')!r})")
+    require(case_id, service.get("worker_pids"),
+            f"{role}: NGINX reported no worker process, so a reload could not be observed")
+    require(case_id, int(service.get("listeners_443") or 0) >= 1,
+            f"{role}: nothing listens on 443 while the generated configuration is loaded")
+
+
+def require_refused_reload(
+    case_id: str, role: str, before: Dict[str, Any], broken: Dict[str, Any],
+) -> None:
+    """An invalid configuration must fail `nginx -t` and must not reach the master.
+
+    The three facts are one conclusion: the guard saw the broken tree, refused,
+    and left the running master, its workers and its listener exactly as they
+    were. Requiring the whole trio is what tells "the reload was suppressed" from
+    "the hook crashed before it could matter".
+    """
+    require(case_id, broken.get("mode") == "break",
+            f"{role}: the failing probe answered for {broken.get('mode')!r}")
+    require(case_id, (broken.get("snippet") or {}).get("present"),
+            f"{role}: the invalid snippet {NGX_CONFIG_SNIPPET} was not written")
+    test = broken.get("test") or {}
+    require(case_id, test.get("returncode") != 0,
+            f"{role}: the invalid snippet in {NGX_CONFIG_SNIPPET} left `nginx -t` succeeding, so the "
+            "tree NGINX validates is not the tree the product generates")
+    tail = test.get("tail") or ""
+    require(case_id, NGX_CONFIG_DIRECTIVE in tail and "zz-gowave-e2e-broken.conf" in tail,
+            f"{role}: `nginx -t` failed without naming the planted snippet:\n{tail}")
+    hook = broken.get("hook") or {}
+    require(case_id, hook.get("returncode") == 0,
+            f"{role}: the managed deploy hook exited {hook.get('returncode')!r} on an invalid "
+            f"configuration instead of leaving NGINX alone: {hook.get('stderr') or hook.get('stdout')}")
+    baseline = before.get("before_hook") or {}
+    after = broken.get("after_hook") or {}
+    require(case_id, after.get("active") == "active",
+            f"{role}: NGINX stopped after the deploy hook ran against an invalid configuration")
+    require(case_id, after.get("main_pid") == baseline.get("main_pid"),
+            f"{role}: the deploy hook replaced the NGINX master on an invalid configuration "
+            f"({baseline.get('main_pid')} -> {after.get('main_pid')})")
+    appeared = sorted(set(after.get("worker_pids") or []) - set(baseline.get("worker_pids") or []))
+    require(case_id, not appeared,
+            f"{role}: the deploy hook reloaded NGINX with an invalid configuration "
+            f"(new worker(s) {appeared})")
+    require(case_id, int(after.get("listeners_443") or 0) >= 1,
+            f"{role}: the 443 listener disappeared while the loaded configuration was untouched")
+
+
+def require_reload_after_restore(
+    case_id: str, role: str, before: Dict[str, Any], restored: Dict[str, Any],
+) -> None:
+    """A valid tree must be reloaded — and reloaded, not restarted."""
+    require(case_id, restored.get("mode") == "restore",
+            f"{role}: the restoring probe produced no report ({restored.get('error') or restored})")
+    require(case_id, not (restored.get("snippet") or {}).get("present"),
+            f"{role}: the invalid snippet {NGX_CONFIG_SNIPPET} survived the restore")
+    test = restored.get("test") or {}
+    require(case_id, test.get("returncode") == 0,
+            f"{role}: the restored configuration still fails `nginx -t`:\n{test.get('tail', '')}")
+    hook = restored.get("hook") or {}
+    require(case_id, hook.get("returncode") == 0,
+            f"{role}: the managed deploy hook exited {hook.get('returncode')!r} on a valid "
+            f"configuration: {hook.get('stderr') or hook.get('stdout')}")
+    baseline = before.get("before_hook") or {}
+    after = restored.get("after_hook") or {}
+    appeared = sorted(set(after.get("worker_pids") or []) - set(baseline.get("worker_pids") or []))
+    require(case_id, appeared,
+            f"{role}: the deploy hook did not reload NGINX once the configuration was valid again "
+            f"(workers stayed {baseline.get('worker_pids')} after "
+            f"{restored.get('reload_waited_seconds')}s)")
+    require(case_id, after.get("main_pid") == baseline.get("main_pid"),
+            f"{role}: the configuration change replaced the NGINX master instead of reloading it "
+            f"({baseline.get('main_pid')} -> {after.get('main_pid')})")
+    require(case_id, after.get("active") == "active",
+            f"{role}: NGINX is {after.get('active')!r} after the reload")
+    require(case_id, int(after.get("listeners_443") or 0) >= 1,
+            f"{role}: nothing listens on 443 after the reload")
+
+
+def _restore_nginx_configuration(
+    podman: Any, container: str, primary_domain: str,
+) -> Dict[str, Any]:
+    """Remove the planted snippet and drive a real reload, never masking a finding.
+
+    This runs from a ``finally`` block, so it reports its own failure instead of
+    raising: the case's primary assertion is what the operator needs to read.
+    """
+    try:
+        result = podman.exec_bash(
+            container, ngx_config_script("restore", primary_domain), check=False,
+            timeout=NGX_CONFIG_PROBE_TIMEOUT_SECONDS,
+        )
+    except Exception as error:  # noqa: BLE001 - cleanup must not hide the primary finding
+        return {"error": f"{type(error).__name__}: {error}"}
+    detail = (result.stderr or result.stdout or "").strip()[-600:]
+    if result.returncode != 0:
+        return {"error": f"the restore probe exited {result.returncode}: {detail}"}
+    try:
+        return json.loads(result.stdout or "")
+    except json.JSONDecodeError:
+        return {"error": f"the restore probe did not print JSON: {(result.stdout or '')[:300]}"}
+
+
+def nginx_config_reload_contract(
+    podman: Any, container: str, case_id: str, role: str, primary_domain: str,
+) -> Dict[str, Any]:
+    """Prove the generated configuration is valid and a broken one is never loaded.
+
+    The snippet is planted and removed either way, so the host is left with the
+    configuration the product generated even when an assertion fails.
+    """
+    before = nginx_config_facts(podman, container, case_id, "before", primary_domain)
+    require_generated_nginx_config(case_id, role, before)
+    broken: Dict[str, Any] = {}
+    try:
+        broken = nginx_config_facts(podman, container, case_id, "break", primary_domain)
+        require_refused_reload(case_id, role, before, broken)
+    finally:
+        restored = _restore_nginx_configuration(podman, container, primary_domain)
+    require_reload_after_restore(case_id, role, before, restored)
+    return {
+        "role": role,
+        "primary_domain": primary_domain,
+        "generated_config_files": len(before.get("config_files") or []),
+        "generated_config_dump_bytes": (before.get("dump") or {}).get("bytes"),
+        "generated_config_sha256": (before.get("dump") or {}).get("sha256"),
+        "generated_config_server_names": (before.get("dump") or {}).get("server_name_lines"),
+        "invalid_configuration": {
+            "nginx_test_returncode": (broken.get("test") or {}).get("returncode"),
+            "hook_returncode": (broken.get("hook") or {}).get("returncode"),
+            "master_pid": (broken.get("after_hook") or {}).get("main_pid"),
+            "worker_pids": (broken.get("after_hook") or {}).get("worker_pids"),
+            "listener_443": (broken.get("after_hook") or {}).get("listeners_443"),
+        },
+        "restored_configuration": {
+            "nginx_test_returncode": (restored.get("test") or {}).get("returncode"),
+            "hook_returncode": (restored.get("hook") or {}).get("returncode"),
+            "master_pid": (restored.get("after_hook") or {}).get("main_pid"),
+            "worker_pids_before": (before.get("before_hook") or {}).get("worker_pids"),
+            "worker_pids_after": (restored.get("after_hook") or {}).get("worker_pids"),
+            "reload_waited_seconds": restored.get("reload_waited_seconds"),
+        },
+    }
+
+
+def case_nginx_config(product: AioProduct) -> Dict[str, Any]:
+    """NGX-05: the generated configuration validates and a broken one never reloads.
+
+    The product generates the NGINX tree and then relies on one guard everywhere
+    it touches the running master: `nginx -t` first, reload only if it passes.
+    The case drives that guard through the file the product itself installs —
+    the Certbot deploy hook that fires on every renewal — because an unattended
+    renewal is exactly when an invalid tree would otherwise reach NGINX.
+
+    Nothing is reimplemented: the snippet is a file the generated tree cannot
+    contain, and the guard is the product's own script. What the case asserts is
+    the pair of behaviours that file has to have — refuse a broken tree, reload a
+    valid one — and that the refusal left the running master serving.
+    """
+    host = product.require_installed()
+    return nginx_config_reload_contract(
+        product.podman, host.target_name, NGX_CONFIG_CASE_ID, "the All-in-One host", PANEL_DOMAIN,
+    )
+
+
 def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
     """SUB-SERVED: every served representation is fetched and loaded by its real client.
 
@@ -1822,6 +2248,10 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case("AIO-01", "aio", lambda context: case_panel_ready(product), timeout_seconds=300),
         Case("AIO-03", "aio", lambda context: case_credentials(product), timeout_seconds=300),
         Case("AIO-05", "aio", lambda context: case_tls_and_identity(product), timeout_seconds=300),
+        # The configuration case only observes and reloads: it runs before any
+        # traffic so a reload it caused can never be read as a data-plane fault.
+        Case(NGX_CONFIG_CASE_ID, "aio", lambda context: case_nginx_config(product),
+             timeout_seconds=NGX_CONFIG_TIMEOUT_SECONDS),
         Case("AIO-AUTH", "aio", lambda context: case_panel_auth(product), timeout_seconds=300),
         Case("AIO-CLIENT", "aio", lambda context: case_client_lifecycle(product), timeout_seconds=300),
         Case("SUB-SERVED", "aio", lambda context: case_subscriptions(product), timeout_seconds=600),

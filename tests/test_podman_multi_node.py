@@ -20,10 +20,13 @@ import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+TESTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
+sys.path.insert(0, str(TESTS_DIR))
 
 from tools.podman_e2e import matrix, mtls, multi_node, topology  # noqa: E402
 from tools.podman_e2e.runner import Case, CaseBlocked  # noqa: E402
+from test_podman_aio import BROKEN_TAIL, nginx_probe  # noqa: E402
 
 
 class _StubContext:
@@ -1413,6 +1416,18 @@ class TestMultiNodeSuite(unittest.TestCase):
              multi_node.RESTART_CASE_ID],
         )
 
+    def test_the_nginx_configuration_case_precedes_the_lifecycle_cases(self):
+        # 6.1: both roles' trees are validated and reloaded while the cluster is
+        # healthy, so a later revocation cannot be read as a reload effect.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertEqual(ids[40], multi_node.NGINX_CONFIG_CASE_ID)
+        self.assertLess(ids.index(multi_node.NGINX_CONFIG_CASE_ID),
+                        ids.index(multi_node.REVOCATION_CASE_ID))
+        self.assertLess(ids.index("SUB-B64"), ids.index(multi_node.NGINX_CONFIG_CASE_ID))
+        suite = {case.id: case for case in multi_node.cases(self.podman)}
+        self.assertEqual(suite[multi_node.NGINX_CONFIG_CASE_ID].timeout_seconds,
+                         multi_node.NGX_CONFIG_CASE_TIMEOUT_SECONDS)
+
 
 class TestMtlsVerifierReport(unittest.TestCase):
     """MTLS-01/02: the verifier's own lines are the only evidence accepted."""
@@ -2212,6 +2227,97 @@ class TestWorkerUnitControl(unittest.TestCase):
         facts = product.worker_service("start", multi_node.OUTAGE_CASE_ID)
         self.assertIsNone(facts["returncode"])
         self.assertEqual(facts["detail"], "")
+
+
+class _NginxConfigProduct(multi_node.MultiNodeProduct):
+    """The real product with both roles' host probes scripted, role by role."""
+
+    def __init__(self, results):
+        self._root = tempfile.TemporaryDirectory()
+        super().__init__(_StubPodman(Path(self._root.name)))
+        self.topology = type("Host", (), {
+            "target_name": "master-test",
+            "worker_name": "worker-test",
+            "worker_domain": topology.WORKER_DOMAIN,
+        })()
+        self.node_add_outcome = topology.InstallOutcome(0, "", "", 1.0, "node add")
+        self.master.host = type("Host", (), {"target_name": "master-test"})()
+        self.master.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
+        self.results = list(results)
+        self.calls = []
+        self.podman.exec_bash = self._exec_bash
+
+    def _exec_bash(self, name, script, check=True, input_text=None, timeout=300):
+        self.calls.append((name, script))
+        stdout, returncode = self.results.pop(0)
+        return subprocess.CompletedProcess(["bash", "-lc", script], returncode, stdout, "")
+
+    def cleanup(self):
+        self._root.cleanup()
+
+
+class TestNginxConfigCase(unittest.TestCase):
+    """NGX-05: both roles validate and reload their own generated NGINX tree."""
+
+    def product(self, results):
+        product = _NginxConfigProduct(results)
+        self.addCleanup(product.cleanup)
+        return product
+
+    def phases(self, container_domain):
+        return [
+            (json.dumps(nginx_probe("before", domain=container_domain)), 0),
+            (json.dumps(nginx_probe("break", test=1, tail=BROKEN_TAIL, present=True,
+                                    domain=container_domain)), 0),
+            (json.dumps(nginx_probe("restore", after_workers=("5100",),
+                                    domain=container_domain)), 0),
+        ]
+
+    def test_the_case_runs_the_contract_on_the_master_and_on_the_worker(self):
+        product = self.product(
+            self.phases(topology.PANEL_DOMAIN) + self.phases(topology.WORKER_DOMAIN),
+        )
+        evidence = multi_node.case_nginx_config(product)
+        self.assertEqual([call[0] for call in product.calls],
+                         ["master-test"] * 3 + ["worker-test"] * 3)
+        self.assertEqual(set(evidence), {"master", "worker"})
+        self.assertEqual(evidence["master"]["primary_domain"], topology.PANEL_DOMAIN)
+        self.assertEqual(evidence["worker"]["primary_domain"], topology.WORKER_DOMAIN)
+        self.assertTrue(all(record["role"] for record in evidence.values()))
+
+    def test_the_master_is_validated_before_the_worker_is_touched(self):
+        product = self.product(
+            self.phases(topology.PANEL_DOMAIN) + self.phases(topology.WORKER_DOMAIN),
+        )
+        multi_node.case_nginx_config(product)
+        self.assertIn(topology.PANEL_DOMAIN, product.calls[0][1])
+        self.assertIn(topology.WORKER_DOMAIN, product.calls[3][1])
+
+    def test_a_worker_finding_names_the_worker_and_the_reason(self):
+        broken_worker = nginx_probe("break", test=1, tail=BROKEN_TAIL, present=True,
+                                    domain=topology.WORKER_DOMAIN)
+        broken_worker["after_hook"]["worker_pids"] = ["4300"]
+        product = self.product(
+            self.phases(topology.PANEL_DOMAIN)
+            + [(json.dumps(nginx_probe("before", domain=topology.WORKER_DOMAIN)), 0),
+               (json.dumps(broken_worker), 0),
+               (json.dumps(nginx_probe("restore", after_workers=("5100",),
+                                       domain=topology.WORKER_DOMAIN)), 0)]
+        )
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_nginx_config(product)
+        message = str(caught.exception)
+        self.assertIn("the Worker", message)
+        self.assertIn("reloaded NGINX with an invalid configuration", message)
+        self.assertEqual(product.calls[-1][0], "worker-test",
+                         "the Worker's own tree has to be restored")
+
+    def test_a_case_without_a_provisioned_worker_is_blocked(self):
+        product = self.product([])
+        product.node_add_outcome = None
+        with self.assertRaises(CaseBlocked) as caught:
+            multi_node.case_nginx_config(product)
+        self.assertIn(multi_node.NODE_ADD_CASE_ID, str(caught.exception))
 
 
 if __name__ == "__main__":
