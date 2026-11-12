@@ -671,5 +671,307 @@ class TestPanelSurfaceProbe(unittest.TestCase):
         self.assertEqual(facts["surface"]["nodes"]["status"], 401)
 
 
+PLAN = topology.NetworkPlan(subnet="203.0.114.0/24")
+
+
+def transfer_facts():
+    """The endpoint report shape the traffic probe returns for a healthy matrix."""
+    transfers = [
+        {
+            "engine": engine,
+            "tag": f"{engine}-{network}",
+            "network": network,
+            "security": security,
+            "sni": sni,
+            "request_id": f"{engine}-{network}-0123456789ab",
+            "status": 200,
+            "request_id_match": True,
+            "body_match": True,
+            "source_ip": PLAN.target_ip,
+        }
+        for engine in aio.TRAFFIC_ENGINES
+        for network, security, sni in (
+            ("tcp", "reality", topology.REALITY_DOMAIN),
+            ("ws", "tls", topology.PANEL_DOMAIN),
+            ("grpc", "tls", topology.PANEL_DOMAIN),
+            ("xhttp", "tls", topology.PANEL_DOMAIN),
+        )
+    ]
+    return {
+        "transfers": transfers,
+        "transfer_count": len(transfers),
+        "source_ips": [PLAN.target_ip],
+        "missing_request_ids": 0,
+    }
+
+
+def readiness_facts(delivered=True):
+    """What the single-tunnel readiness scope reports about the data plane."""
+    return {
+        "delivered": delivered,
+        "engine": "xray",
+        "network": "tcp",
+        "status": 200 if delivered else None,
+        "reason": "" if delivered else "HTTP 503 without an endpoint report",
+        "recorded": delivered,
+    }
+
+
+class TrafficHost(StubHost):
+    """The installed host, extended with the engine-side traffic probe."""
+
+    def __init__(self, facts=None, podman=None, readiness=None):
+        super().__init__()
+        self.plan = PLAN
+        self.traffic = transfer_facts() if facts is None else facts
+        self.readiness = readiness_facts() if readiness is None else readiness
+        self.scopes = []
+        self.podman = podman
+
+    def traffic_facts(self, scope, timeout=900, payload_dir=None):
+        self.scopes.append(scope)
+        facts = self.readiness if scope == "warmup" else self.traffic
+        return subprocess.CompletedProcess(
+            ["python3", "traffic_probe.py"], 0, json.dumps(facts), "",
+        )
+
+    def reinstall(self):
+        proc = self.podman.exec_bash(self.target_name, "reinstall", check=False, timeout=60)
+        return topology.InstallOutcome(
+            proc.returncode, proc.stdout, proc.stderr, 1.0, "reinstall",
+        )
+
+
+def surface_payload(counts=None, digest="digest-1"):
+    counts = counts or {}
+    return {
+        "login": {"status": 200, "token_present": True},
+        "surface": {
+            "nodes": {"status": 200, "count": counts.get("nodes", 1), "inbound_digest": digest},
+            "profiles": {"status": 200, "count": counts.get("profiles", 1), "inbound_digest": digest},
+            "squads": {"status": 200, "count": counts.get("squads", 1), "mvp_inbound_digest": digest},
+            "hosts": {"status": 200, "count": counts.get("hosts", 4), "inbound_digest": digest},
+            "tokens": {"status": 200, "count": counts.get("tokens", 1), "name_digest": digest},
+        },
+    }
+
+
+def subscription_payload(digest="credentials-1"):
+    return {"subscriptions": {"credential_digest": digest, "representations": {}}}
+
+
+def inventory_output(nginx="a" * 8, credentials="root 600", units=None):
+    units = units or [
+        "fail2ban.service enabled",
+        "gowave-node.service enabled",
+        "gowave.service enabled",
+        "nginx.service enabled",
+    ]
+    return (
+        "==units\n" + "\n".join(units) + "\n"
+        "==unit-files\n/etc/systemd/system/gowave.service\n"
+        "==nginx\n" + f"{nginx}  conf.d/gowave-panel.conf\n"
+        "==credentials\n" + credentials + "\n"
+    )
+
+
+class TestRestartCase(unittest.TestCase):
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def restart_product(self, results, facts=None, readiness=None):
+        podman = ScriptedPodman(self.context, results)
+        product = aio.AioProduct(podman)
+        product.host = TrafficHost(facts, podman, readiness)
+        product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
+        # The payloads were captured by an earlier case; this one only needs the
+        # block to pass, not a second fetch that would consume a scripted result.
+        product._subscriptions = {}
+        return product, podman
+
+    def poll_once(self):
+        return lambda predicate, *args, **kwargs: predicate()
+
+    def poll_until_the_tunnel(self):
+        """Let the control-plane wait pass, then report the tunnel as never ready."""
+        polls = []
+
+        def wait(predicate, *args, **kwargs):
+            polls.append(predicate())
+            return len(polls) == 1
+
+        return wait
+
+    def test_the_case_restarts_the_units_and_exercises_the_data_plane(self):
+        product, podman = self.restart_product([
+            ("", 0),
+            ("login=200 api=200 token_length=64 upstreams=2\n", 0),
+            ("active\nactive\nactive\nactive\n", 0),
+        ])
+        with mock.patch.object(aio, "wait_until", self.poll_once()):
+            evidence = aio.case_restart(product)
+        self.assertIn("systemctl restart gowave.service gowave-node.service", podman.scripts[0])
+        self.assertIn("8443", podman.scripts[1])
+        self.assertEqual(evidence["loopback_login"], "200")
+        self.assertEqual(evidence["readiness_network"], "tcp")
+        self.assertEqual(evidence["transfer_count"], 8)
+        self.assertEqual(product.host.scopes, ["warmup", "traffic"])
+
+    def test_the_case_waits_for_a_tunnel_that_really_carries_a_payload(self):
+        product, _ = self.restart_product([
+            ("", 0),
+            ("login=200 api=200 token_length=64 upstreams=2\n", 0),
+            ("active\nactive\nactive\nactive\n", 0),
+        ], readiness=readiness_facts(delivered=False))
+        with mock.patch.object(aio, "wait_until", self.poll_until_the_tunnel()):
+            with self.assertRaises(AssertionError) as caught:
+                aio.case_restart(product)
+        message = str(caught.exception)
+        self.assertIn("no served outbound carried a payload", message)
+        self.assertIn("HTTP 503 without an endpoint report", message)
+
+    def test_a_failed_restart_fails_the_case(self):
+        product, _ = self.restart_product([("not permitted", 1)])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_restart(product)
+        self.assertIn("systemctl restart", str(caught.exception))
+
+    def test_a_panel_that_never_answers_fails_the_case_within_the_deadline(self):
+        product, _ = self.restart_product([("", 0)])
+        with mock.patch.object(aio, "wait_until", lambda *args, **kwargs: False):
+            with self.assertRaises(AssertionError) as caught:
+                aio.case_restart(product)
+        self.assertIn("did not recover", str(caught.exception))
+
+    def test_a_tunnel_upstream_that_never_binds_fails_the_case(self):
+        product, _ = self.restart_product([
+            ("", 0),
+            ("login=200 api=200 token_length=64 upstreams=1\n", 0),
+        ])
+        with mock.patch.object(aio, "wait_until", self.poll_once()):
+            with self.assertRaises(AssertionError) as caught:
+                aio.case_restart(product)
+        self.assertIn("'upstreams': '1'", str(caught.exception))
+
+    def test_a_unit_that_stays_down_after_the_restart_fails_the_case(self):
+        product, _ = self.restart_product([
+            ("", 0),
+            ("login=200 api=200 token_length=64 upstreams=2\n", 0),
+            ("active\nactive\nfailed\nactive\n", 0),
+        ])
+        with mock.patch.object(aio, "wait_until", self.poll_once()):
+            with self.assertRaises(AssertionError) as caught:
+                aio.case_restart(product)
+        self.assertIn("nginx.service=failed", str(caught.exception))
+
+    def test_the_data_plane_must_still_transfer_after_the_restart(self):
+        facts = transfer_facts()
+        facts["transfer_count"] = 4
+        product, _ = self.restart_product([
+            ("", 0),
+            ("login=200 api=200 token_length=64 upstreams=2\n", 0),
+            ("active\nactive\nactive\nactive\n", 0),
+        ], facts)
+        with mock.patch.object(aio, "wait_until", self.poll_once()):
+            with self.assertRaises(AssertionError) as caught:
+                aio.case_restart(product)
+        self.assertIn("after the restart 4 transports", str(caught.exception))
+
+
+class TestIdempotentCase(unittest.TestCase):
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def idempotent_product(self, results, facts=None):
+        podman = ScriptedPodman(self.context, results)
+        product = aio.AioProduct(podman)
+        product.host = TrafficHost(facts, podman)
+        product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
+        product._subscriptions = {}
+        return product
+
+    def scripted(self, before, after, nginx_before="a" * 8, nginx_after="a" * 8,
+                 credentials_after="root 600", subscription_after="credentials-1"):
+        return [
+            (json.dumps(before), 0),
+            (inventory_output(nginx=nginx_before), 0),
+            (json.dumps(subscription_payload()), 0),
+            ("reinstall finished\n", 0),
+            (json.dumps(after), 0),
+            (inventory_output(nginx=nginx_after, credentials=credentials_after), 0),
+            (json.dumps(subscription_payload(subscription_after)), 0),
+        ]
+
+    def run_case(self, before=None, after=None, facts=None, **kwargs):
+        product = self.idempotent_product(
+            self.scripted(before or surface_payload(), after or surface_payload(), **kwargs), facts,
+        )
+        return aio.case_idempotent(product), product
+
+    def reject(self, expected, **kwargs):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(**kwargs)
+        self.assertIn(expected, str(caught.exception))
+
+    def test_an_unchanged_install_is_accepted(self):
+        evidence, product = self.run_case()
+        self.assertEqual(evidence["reinstall_returncode"], 0)
+        self.assertEqual(evidence["credentials"], "root 600")
+        self.assertFalse(evidence["credential_digest_changed"])
+        self.assertEqual(evidence["transfer_count"], 8)
+        self.assertIn("reinstall", product.podman.scripts[3])
+
+    def test_a_duplicate_token_fails_the_case(self):
+        self.reject("Panel inventory",
+                    after=surface_payload(counts={"tokens": 2}))
+
+    def test_a_duplicate_host_fails_the_case(self):
+        self.reject("Panel inventory",
+                    after=surface_payload(counts={"hosts": 8}))
+
+    def test_a_rewritten_nginx_config_fails_the_case(self):
+        self.reject("host resources: nginx", nginx_after="b" * 8)
+
+    def test_a_world_readable_credentials_file_fails_the_case(self):
+        self.reject("root-owned mode 600", credentials_after="root 644")
+
+    def test_a_rotated_subscription_credential_fails_the_case(self):
+        self.reject("rotated the credentials", subscription_after="credentials-2")
+
+    def test_a_failed_repeated_install_fails_the_case(self):
+        product = self.idempotent_product([
+            (json.dumps(surface_payload()), 0),
+            (inventory_output(), 0),
+            (json.dumps(subscription_payload()), 0),
+            ("registration refused", 1),
+        ])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_idempotent(product)
+        self.assertIn("repeated install failed", str(caught.exception))
+
+    def test_traffic_that_stopped_working_fails_the_case(self):
+        facts = transfer_facts()
+        facts["transfer_count"] = 0
+        self.reject("after the repeated install 0 transports", facts=facts)
+
+    def test_the_inventory_is_split_into_sorted_sections(self):
+        sections = aio.inventory_sections(inventory_output())
+        self.assertEqual(sections["credentials"], ["root 600"])
+        self.assertEqual(sections["nginx"], [f"{'a' * 8}  conf.d/gowave-panel.conf"])
+        self.assertEqual(len(sections["units"]), 4)
+
+    def test_the_cases_are_registered_with_their_own_budgets(self):
+        cases = {case.id: case for case in aio.cases(ScriptedPodman(self.context, []))}
+        self.assertEqual(cases["AIO-RESTART"].timeout_seconds,
+                         aio.RESTART_TIMEOUT_SECONDS + aio.TUNNEL_READY_TIMEOUT_SECONDS
+                         + aio.TRAFFIC_TIMEOUT_SECONDS)
+        self.assertEqual(cases["AIO-IDEMPOTENT"].timeout_seconds,
+                         aio.INSTALL_TIMEOUT_SECONDS + aio.TRAFFIC_TIMEOUT_SECONDS)
+
+
 if __name__ == "__main__":
     unittest.main()

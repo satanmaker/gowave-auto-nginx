@@ -231,6 +231,14 @@ def surface(panel: Panel) -> Dict[str, Any]:
         "short_uuid_length": len(str(user.get("shortUuid") or "")),
         "status_field": str(user.get("status", "")),
     }
+
+    status, body = panel.call("GET", "/api/tokens")
+    tokens = [token for token in items(body, "tokens") if isinstance(token, dict)]
+    facts["tokens"] = {
+        "status": status,
+        "count": len(tokens),
+        "name_digest": digest([token.get("name") for token in tokens]),
+    }
     return facts
 
 
@@ -307,6 +315,10 @@ def subscriptions(panel: Panel, payload_dir: Optional[Path]) -> Dict[str, Any]:
             "content_type": media_type(response["content_type"]),
             "bytes": len(body),
         }
+        if name == "xray-json":
+            # The credentials every engine derives from the same user, reduced to
+            # a digest: a repeated install must not rotate them.
+            facts["credential_digest"] = subscription_credentials(body)
         if payload_dir is not None and response["status"] == 200 and body:
             write_payload(payload_dir / f"{name}.payload", body)
     return facts
@@ -384,15 +396,199 @@ def lifecycle(panel: Panel) -> Dict[str, Any]:
     return facts
 
 
+# ------------------------------------------------------------------ revocation
+REVOKE_DIRECTORY = "revoke"
+REVOKE_STATE_NAME = "state.json"
+REVOKE_PATCH_LIMIT_BYTES = 10 * 1024 * 1024 * 1024
+
+
+def subscription_credentials(body: bytes) -> str:
+    """A digest of the credentials a subscription payload carries, never the values.
+
+    Revocation rotates the VLESS UUID and the Trojan password, so a digest that
+    changes between the captured and the re-fetched subscription is how the case
+    shows the Panel's change reached the client without printing a secret.
+    """
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    profiles = parsed if isinstance(parsed, list) else [parsed]
+    credentials: List[Any] = []
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        for outbound in profile.get("outbounds") or []:
+            settings = outbound.get("settings") if isinstance(outbound, dict) else None
+            if not isinstance(settings, dict):
+                continue
+            for vnext in settings.get("vnext") or []:
+                for user in (vnext or {}).get("users") or []:
+                    credentials.append(str((user or {}).get("id") or ""))
+                    credentials.append(str((user or {}).get("password") or ""))
+            for server in settings.get("servers") or []:
+                credentials.append(str((server or {}).get("password") or ""))
+    return digest(credentials)
+
+
+def _revocation_dir(payload_dir: Optional[Path]) -> Path:
+    if payload_dir is None:
+        raise SystemExit("the revoke scope needs --payload-dir: the captured subscription is a secret")
+    directory = payload_dir / REVOKE_DIRECTORY
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return directory
+
+
+def write_state(path: Path, state: Dict[str, Any]) -> None:
+    """Write the hand-off between steps as a 0600 file, next to the payloads."""
+    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(handle, "w", encoding="utf-8") as sink:
+        json.dump(state, sink, sort_keys=True)
+    os.chmod(path, 0o600)
+
+
+def read_state(path: Path) -> Dict[str, Any]:
+    if not path.is_file():
+        raise SystemExit(f"the revocation state file {path} is missing: run --step issue first")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(state, dict) or not state.get("user_id"):
+        raise SystemExit(f"the revocation state file {path} holds no client id")
+    return state
+
+
+def revoke_issue(panel: Panel, directory: Path) -> Dict[str, Any]:
+    """Create a client, capture its subscription, and update a documented field."""
+    facts: Dict[str, Any] = {}
+    status, body = panel.call("GET", "/api/internal-squads")
+    squads = [squad for squad in items(body, "internalSquads") if isinstance(squad, dict)]
+    mvp = next((squad for squad in squads if squad.get("name") == MVP_SQUAD), None)
+    squad_uuid = str((mvp or {}).get("uuid") or "")
+    facts["squad_requested"] = bool(squad_uuid)
+
+    username = f"{CLIENT_PREFIX}revoke-{secrets.token_hex(4)}"
+    request: Dict[str, Any] = {
+        "username": username,
+        "status": "ACTIVE",
+        "trafficLimitStrategy": "NO_RESET",
+        "expireAt": "2099-01-01T00:00:00Z",
+    }
+    if squad_uuid:
+        request["activeInternalSquads"] = [squad_uuid]
+    status, body = panel.call("POST", "/api/users", request)
+    created = payload(body)
+    created = created if isinstance(created, dict) else {}
+    user_id = str(created.get("id") or created.get("uuid") or "")
+    short_uuid = str(created.get("shortUuid") or "")
+    facts["create_status"] = status
+    facts["created_id_present"] = bool(user_id)
+    facts["created_short_uuid_length"] = len(short_uuid)
+    if not user_id or not short_uuid:
+        return facts
+
+    status, _ = panel.call(
+        "PATCH", f"/api/users/{user_id}", {"trafficLimitBytes": REVOKE_PATCH_LIMIT_BYTES}
+    )
+    facts["patch_status"] = status
+    status, body = panel.call("GET", f"/api/users/{user_id}")
+    readback = payload(body)
+    readback = readback if isinstance(readback, dict) else {}
+    facts["patch_visible"] = readback.get("trafficLimitBytes") == REVOKE_PATCH_LIMIT_BYTES
+
+    facts["representations"] = {}
+    credential_digest = ""
+    for name, template, user_agent in REPRESENTATIONS:
+        response = fetch(panel.base_url, template.format(short_uuid=short_uuid), user_agent)
+        body = response["body"]
+        facts["representations"][name] = {
+            "status": response["status"],
+            "content_type": media_type(response["content_type"]),
+            "bytes": len(body),
+        }
+        if response["status"] == 200 and body:
+            write_payload(directory / f"{name}.payload", body)
+            if name == "xray-json":
+                credential_digest = subscription_credentials(body)
+    facts["credential_digest"] = credential_digest
+
+    write_state(directory / REVOKE_STATE_NAME, {
+        "user_id": user_id,
+        "username": username,
+        "short_uuid": short_uuid,
+        "short_uuid_length": len(short_uuid),
+        "credential_digest": credential_digest,
+    })
+    return facts
+
+
+def revoke_apply(panel: Panel, directory: Path) -> Dict[str, Any]:
+    """Revoke the captured access and observe what the Panel and the route now say."""
+    state = read_state(directory / REVOKE_STATE_NAME)
+    user_id = state["user_id"]
+    facts: Dict[str, Any] = {}
+
+    status, body = panel.call("POST", f"/api/users/{user_id}/actions/revoke", {})
+    revoked = payload(body)
+    revoked = revoked if isinstance(revoked, dict) else {}
+    facts["revoke_status"] = status
+    facts["revoked_at_present"] = bool(revoked.get("subRevokedAt"))
+    facts["short_uuid_length"] = len(str(revoked.get("shortUuid") or ""))
+    facts["short_uuid_rotated"] = bool(revoked.get("shortUuid")) and \
+        str(revoked.get("shortUuid")) != str(state.get("short_uuid") or "")
+
+    status, body = panel.call("GET", f"/api/users/{user_id}")
+    user = payload(body)
+    user = user if isinstance(user, dict) else {}
+    facts["status_field"] = str(user.get("status", ""))
+    facts["readback_status"] = status
+
+    # The payload the engines hold is what a client that never refreshed keeps
+    # dialling, so the route it was served from is the one that has to stop
+    # answering — not the new one.
+    old_short_uuid = str(state.get("short_uuid") or "")
+    if old_short_uuid:
+        response = fetch(panel.base_url, f"/api/sub/{old_short_uuid}", MOBILE_USER_AGENT)
+        facts["old_subscription_status"] = response["status"]
+
+    new_short_uuid = str(user.get("shortUuid") or "")
+    facts["new_subscription_status"] = 0
+    facts["credential_digest"] = ""
+    if new_short_uuid and new_short_uuid != old_short_uuid:
+        response = fetch(
+            panel.base_url, f"/api/sub/{new_short_uuid}/v2ray-json", XRAY_USER_AGENT
+        )
+        facts["new_subscription_status"] = response["status"]
+        if response["status"] == 200:
+            facts["credential_digest"] = subscription_credentials(response["body"])
+    facts["credential_digest_changed"] = bool(facts["credential_digest"]) and \
+        facts["credential_digest"] != state.get("credential_digest")
+    return facts
+
+
+def revoke_cleanup(panel: Panel, directory: Path) -> Dict[str, Any]:
+    """Delete the client the run created, so the next run's inventory stays clean."""
+    state = read_state(directory / REVOKE_STATE_NAME)
+    facts: Dict[str, Any] = {}
+    status, _ = panel.call("DELETE", f"/api/users/{state['user_id']}")
+    facts["delete_status"] = status
+    status, _ = panel.call("GET", f"/api/users/by-username/{state['username']}")
+    facts["after_delete_status"] = status
+    return facts
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Collect Panel API facts without leaking secrets")
     parser.add_argument(
         "--scope",
-        choices=("surface", "lifecycle", "subscriptions", "ua-absent", "ua-blank", "all"),
+        choices=("surface", "lifecycle", "subscriptions", "ua-absent", "ua-blank", "revoke", "all"),
         default="all",
     )
     parser.add_argument("--panel-url", default=PANEL_URL)
     parser.add_argument("--credentials", default=CREDENTIALS_FILE)
+    parser.add_argument(
+        "--step",
+        choices=("issue", "apply", "cleanup"),
+        help="Which revocation step to run; each step hands its state to the next one",
+    )
     parser.add_argument(
         "--payload-dir",
         default="",
@@ -414,6 +610,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         facts["policy"] = user_agent_policy(panel, None, "absent")
     if args.scope == "ua-blank":
         facts["policy"] = user_agent_policy(panel, "", "blank")
+    if args.scope == "revoke":
+        directory = _revocation_dir(Path(args.payload_dir) if args.payload_dir else None)
+        steps = {
+            "issue": revoke_issue,
+            "apply": revoke_apply,
+            "cleanup": revoke_cleanup,
+        }
+        if args.step not in steps:
+            raise SystemExit("the revoke scope needs --step issue, --step apply, or --step cleanup")
+        facts["revocation"] = steps[args.step](panel, directory)
     print(json.dumps(facts, sort_keys=True))
     return 0
 

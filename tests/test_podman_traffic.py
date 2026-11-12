@@ -378,6 +378,156 @@ class TestTrafficProbeTransfer(unittest.TestCase):
             traffic_probe.transfer(None, f"127.0.0.1:{closed}", self.label, "xray")
         self.assertIn("did not reach the endpoint", str(caught.exception))
 
+    def test_a_refused_transfer_is_a_result_when_refusal_is_expected(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed = probe.getsockname()[1]
+        report = traffic_probe.transfer(
+            None, f"127.0.0.1:{closed}", self.label, "xray", expect_refusal=True,
+        )
+        self.assertFalse(report["delivered"])
+        self.assertIsNone(report["status"])
+        self.assertEqual(report["engine"], "xray")
+        self.assertTrue(report["reason"])
+        self.assertEqual(EchoStub.received, [])
+
+    def test_a_transfer_the_endpoint_answered_is_delivered_even_when_refusal_is_expected(self):
+        report = traffic_probe.transfer(
+            None, self.destination, self.label, "xray", expect_refusal=True,
+        )
+        self.assertTrue(report["delivered"])
+        self.assertEqual(report["status"], 200)
+        self.assertNotIn("reason", report)
+
+    def test_a_refusal_never_claims_an_endpoint_report(self):
+        report = traffic_probe.refusal("mihomo", self.label, "req-1", None, "ECONNREFUSED")
+        self.assertEqual(report["delivered"], False)
+        self.assertEqual(report["request_id"], "req-1")
+        self.assertEqual(report["reason"], "ECONNREFUSED")
+
+
+class TestTrafficProbeRevocation(unittest.TestCase):
+    """The revoked scope retries propagation and never trusts an error message."""
+
+    def refused(self, engine):
+        return traffic_probe.refusal(
+            engine, {"tag": f"{engine}-tcp", "network": "tcp"}, f"{engine}-req", None, "ECONNRESET",
+        )
+
+    def delivered(self, engine):
+        return {
+            "engine": engine, "tag": f"{engine}-tcp", "network": "tcp",
+            "request_id": f"{engine}-req", "delivered": True, "status": 200,
+            "request_id_match": True, "body_match": True, "source_ip": PLAN.target_ip,
+        }
+
+    def run_scope(self, rounds, diagnostics=None, monkey=None):
+        queue = list(monkey) if monkey is not None else [
+            [self.delivered("xray"), self.delivered("mihomo")],
+            [self.refused("xray"), self.refused("mihomo")],
+        ]
+
+        def transfers(*_args, **_kwargs):
+            return list(queue.pop(0)) if queue else [self.refused("xray")]
+
+        with tempfile.TemporaryDirectory() as workdir:
+            with mock.patch.object(traffic_probe, "xray_transfers", transfers), \
+                    mock.patch.object(traffic_probe, "mihomo_transfers", lambda *a, **k: []), \
+                    mock.patch.object(traffic_probe, "echo_diagnostics",
+                                      lambda *a, **k: diagnostics or {"requests": []}), \
+                    mock.patch.object(traffic_probe.time, "sleep") as sleep:
+                facts = traffic_probe.revoked(
+                    "/secrets/revoke", "/fixtures/ca/root.pem", "203.0.114.30:18080",
+                    Path(workdir), rounds=rounds,
+                )
+        return facts, sleep
+
+    def test_propagation_is_retried_until_every_transport_refuses(self):
+        facts, sleep = self.run_scope(rounds=3)
+        self.assertEqual(facts["rounds"], 2)
+        self.assertEqual(facts["delivered"], 0)
+        self.assertEqual(facts["refused"], 2)
+        self.assertEqual(facts["attempt_count"], 2)
+        self.assertEqual(facts["recorded_request_ids"], 0)
+        sleep.assert_called_once_with(traffic_probe.REVOCATION_ROUND_PAUSE_SECONDS)
+
+    def test_the_scope_fails_when_a_revoked_transport_still_delivers(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_scope(rounds=2, monkey=[[self.delivered("xray")], [self.delivered("xray")]])
+        self.assertIn("still reached the endpoint after 2 rounds", str(caught.exception))
+
+    def test_the_scope_fails_when_the_endpoint_recorded_a_revoked_request(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_scope(rounds=1, monkey=[[self.refused("xray")]],
+                           diagnostics={"requests": [{"request_id": "xray-req"}]})
+        self.assertIn("recorded a request from revoked access", str(caught.exception))
+
+    def test_the_scope_fails_when_no_outbound_could_be_attempted(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_scope(rounds=1, monkey=[[]])
+        self.assertIn("no outbound was exercised", str(caught.exception))
+
+    def test_the_scope_refuses_to_run_without_a_destination(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            with self.assertRaises(SystemExit) as caught:
+                traffic_probe.revoked("/secrets", "/fixtures/ca/root.pem", "", Path(workdir))
+        self.assertIn("destination address is required", str(caught.exception))
+
+
+class TestTrafficProbeReadiness(unittest.TestCase):
+    """The readiness scope: one tunnel, judged by what the endpoint recorded."""
+
+    def run_scope(self, attempt, diagnostics=None, destination="203.0.114.30:18080"):
+        calls = []
+
+        def transfers(*_args, **kwargs):
+            calls.append(kwargs.get("limit"))
+            return [attempt]
+
+        with tempfile.TemporaryDirectory() as workdir:
+            with mock.patch.object(traffic_probe, "xray_transfers", transfers), \
+                    mock.patch.object(traffic_probe, "echo_diagnostics",
+                                      lambda *a, **k: diagnostics or {"requests": []}):
+                facts = traffic_probe.warmup(
+                    "/secrets", "/fixtures/ca/root.pem", destination, Path(workdir),
+                )
+        return facts, calls
+
+    def delivered(self, request_id="xray-req"):
+        return {
+            "engine": "xray", "tag": "xray-tcp", "network": "tcp",
+            "request_id": request_id, "delivered": True, "status": 200,
+            "request_id_match": True, "body_match": True, "source_ip": PLAN.target_ip,
+        }
+
+    def test_one_profile_is_probed_and_the_endpoint_must_record_it(self):
+        facts, calls = self.run_scope(
+            self.delivered(), diagnostics={"requests": [{"request_id": "xray-req"}]},
+        )
+        self.assertTrue(facts["delivered"])
+        self.assertEqual(facts["network"], "tcp")
+        self.assertEqual(calls, [traffic_probe.WARMUP_PROFILES])
+
+    def test_a_proxy_that_answers_without_carrying_the_payload_is_not_ready(self):
+        facts, _ = self.run_scope(self.delivered(), diagnostics={"requests": []})
+        self.assertFalse(facts["delivered"])
+        self.assertFalse(facts["recorded"])
+
+    def test_a_refusal_is_reported_as_not_ready_instead_of_an_error(self):
+        refused = traffic_probe.refusal(
+            "xray", {"tag": "xray-tcp", "network": "tcp"}, "xray-req", None,
+            "HTTP 503 without an endpoint report",
+        )
+        facts, _ = self.run_scope(refused)
+        self.assertFalse(facts["delivered"])
+        self.assertIn("HTTP 503", facts["reason"])
+
+    def test_the_scope_refuses_to_run_without_a_destination(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            with self.assertRaises(SystemExit) as caught:
+                traffic_probe.warmup("/secrets", "/fixtures/ca/root.pem", "", Path(workdir))
+        self.assertIn("destination address is required", str(caught.exception))
+
 
 class ScriptedPodman:
     """Podman stub that answers only the host-side subscription fetch."""
@@ -396,30 +546,37 @@ class ScriptedPodman:
 class StubEngineHost:
     """The installed host, without containers, plus the engine-side probes."""
 
-    def __init__(self, facts=None, returncode=0, stdout=None):
+    def __init__(self, facts=None, returncode=0, stdout=None, bodies=None):
         self.target_name = "aio-1"
         self.panel_domain = aio.PANEL_DOMAIN
         self.reality_domain = aio.REALITY_DOMAIN
         self.vision_domain = None
         self.plan = PLAN
         self.scopes = []
+        self.payload_dirs = []
         self.facts = facts
         self.returncode = returncode
         self.stdout = stdout
+        self.bodies = bodies or {}
 
-    def traffic_facts(self, scope, timeout=900):
+    def traffic_facts(self, scope, timeout=900, payload_dir=None):
         self.scopes.append(scope)
-        body = self.stdout if self.stdout is not None else json.dumps(self.facts or {})
+        self.payload_dirs.append(payload_dir)
+        if scope in self.bodies:
+            body, returncode = json.dumps(self.bodies[scope]), 0
+        else:
+            body = self.stdout if self.stdout is not None else json.dumps(self.facts or {})
+            returncode = self.returncode
         return subprocess.CompletedProcess(
-            ["python3", "traffic_probe.py"], self.returncode, body,
-            "" if self.returncode == 0 else "the endpoint never answered",
+            ["python3", "traffic_probe.py"], returncode, body,
+            "" if returncode == 0 else "the endpoint never answered",
         )
 
 
-def installed_product(context, facts=None, returncode=0, stdout=None):
+def installed_product(context, facts=None, returncode=0, stdout=None, bodies=None):
     podman = ScriptedPodman(context)
     product = aio.AioProduct(podman)
-    product.host = StubEngineHost(facts=facts, returncode=returncode, stdout=stdout)
+    product.host = StubEngineHost(facts=facts, returncode=returncode, stdout=stdout, bodies=bodies)
     product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
     return product, podman
 
@@ -546,6 +703,199 @@ class TestTrafficCase(unittest.TestCase):
         self.assertIn("AIO-TRAFFIC", cases)
         self.assertEqual(cases["AIO-TRAFFIC"].topology, "aio")
         self.assertEqual(cases["AIO-TRAFFIC"].timeout_seconds, aio.TRAFFIC_TIMEOUT_SECONDS)
+
+
+class TestRevocationCase(unittest.TestCase):
+    """AIO-REVOKE judges revocation by what the endpoint refused to record."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.context = RunContext(
+            topology="aio",
+            artifact_root=Path(self.tmp.name),
+            budget_seconds=900,
+            run_id="podman-revoke-test-000000",
+        )
+        self.addCleanup(self.context.run_cleanup)
+
+    def issue(self):
+        return {
+            "squad_requested": True,
+            "create_status": 201,
+            "created_id_present": True,
+            "created_short_uuid_length": 16,
+            "patch_status": 200,
+            "patch_visible": True,
+            "representations": {name: {"status": 200, "bytes": 512} for name in aio.REPRESENTATIONS},
+            "credential_digest": "a" * 64,
+        }
+
+    def applied(self):
+        return {
+            "revoke_status": 200,
+            "revoked_at_present": True,
+            "short_uuid_length": 16,
+            "short_uuid_rotated": True,
+            "status_field": "revoked",
+            "readback_status": 200,
+            "old_subscription_status": 404,
+            "new_subscription_status": 200,
+            "credential_digest": "b" * 64,
+            "credential_digest_changed": True,
+        }
+
+    def cleanup_facts(self):
+        return {"delete_status": 204, "after_delete_status": 404}
+
+    def revoked_facts(self):
+        attempts = [{"engine": engine, "tag": f"{engine}-tcp", "network": "tcp",
+                     "request_id": f"{engine}-req", "delivered": False, "status": None,
+                     "reason": "ConnectionRefusedError"}
+                    for engine in aio.TRAFFIC_ENGINES for _ in range(aio.CORE_INBOUNDS)]
+        return {
+            "attempts": attempts,
+            "attempt_count": len(attempts),
+            "engines": sorted(aio.TRAFFIC_ENGINES),
+            "networks": sorted(aio.TRAFFIC_NETWORKS),
+            "refused": len(attempts),
+            "delivered": 0,
+            "rounds": 2,
+            "endpoint_records": 0,
+            "recorded_request_ids": 0,
+        }
+
+    def run_case(self, positive=None, negative=None, steps=None, calls=None, readiness=None):
+        overrides = steps or {}
+        bodies = {
+            "warmup": readiness or {
+                "delivered": True, "engine": "xray", "network": "tcp",
+                "status": 200, "reason": "", "recorded": True,
+            },
+            "traffic": traffic_facts() if positive is None else positive,
+            "revoked": self.revoked_facts() if negative is None else negative,
+        }
+        product, _ = installed_product(self.context, bodies=bodies)
+        answers = {
+            "issue": self.issue(),
+            "apply": self.applied(),
+            "cleanup": self.cleanup_facts(),
+        }
+        if calls is None:
+            calls = []
+
+        def probe(_product, _case_id, _scope, extra=""):
+            step = extra.split("--step ")[1].split()[0]
+            calls.append(step)
+            return {"revocation": dict(answers[step], **overrides.get(step, {}))}
+
+        with mock.patch.object(aio, "panel_probe", probe):
+            return aio.case_revocation(product), calls, product
+
+    def reject(self, expected, **kwargs):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(**kwargs)
+        self.assertIn(expected, str(caught.exception))
+
+    def test_the_case_accepts_access_the_endpoint_refused_to_record(self):
+        facts, calls, product = self.run_case()
+        self.assertEqual(calls, ["issue", "apply", "cleanup"])
+        self.assertEqual(product.host.scopes, ["warmup", "traffic", "revoked"])
+        self.assertEqual(
+            product.host.payload_dirs, [f"{topology.SECRETS_MOUNT}/revoke"] * 3,
+            "every traffic scope replays the payload captured before the revocation, "
+            "through the mount the engine client actually sees",
+        )
+        self.assertEqual(facts["revoke_status"], 200)
+        self.assertEqual(facts["old_subscription_status"], 404)
+        self.assertEqual(facts["revoked_delivered"], 0)
+        self.assertEqual(facts["recorded_request_ids"], 0)
+        self.assertTrue(facts["credential_digest_changed"])
+
+    def test_the_case_waits_for_the_issued_client_before_transferring(self):
+        readiness = {"delivered": False, "engine": "xray", "network": "tcp",
+                     "status": None, "reason": "HTTP 503 without an endpoint report",
+                     "recorded": False}
+        with mock.patch.object(aio, "wait_until", lambda predicate, *args, **kwargs: predicate()):
+            with self.assertRaises(AssertionError) as caught:
+                self.run_case(readiness=readiness)
+        message = str(caught.exception)
+        self.assertIn("no served outbound carried a payload", message)
+        self.assertIn("HTTP 503 without an endpoint report", message)
+
+    def test_the_case_fails_when_the_client_could_not_be_created(self):
+        self.reject("instead of 201", steps={"issue": {"create_status": 409}})
+
+    def test_the_case_fails_when_the_client_got_no_squad(self):
+        self.reject("no 'Default MVP Squad'", steps={"issue": {"squad_requested": False}})
+
+    def test_the_case_fails_when_the_traffic_limit_was_not_updated(self):
+        self.reject("PATCH /api/users/{id} returned 500", steps={"issue": {"patch_status": 500}})
+
+    def test_the_case_fails_when_a_representation_was_not_served(self):
+        representations = {name: {"status": 200} for name in aio.REPRESENTATIONS}
+        representations["mihomo"] = {"status": 500}
+        self.reject("not served: mihomo", steps={"issue": {"representations": representations}})
+
+    def test_the_case_fails_when_the_issued_client_could_not_transfer(self):
+        data = traffic_facts()
+        data["transfer_count"] = 4
+        self.reject("transferred through 4 transports", positive=data)
+
+    def test_the_case_fails_when_the_issued_payload_left_from_the_client(self):
+        data = traffic_facts()
+        data["source_ips"] = [PLAN.engine_client_ip]
+        self.reject("instead of the installed host", positive=data)
+
+    def test_the_case_fails_when_the_revoke_action_was_refused(self):
+        self.reject("actions/revoke returned 500", steps={"apply": {"revoke_status": 500}})
+
+    def test_the_case_fails_when_no_revocation_was_recorded(self):
+        self.reject("no subRevokedAt", steps={"apply": {"revoked_at_present": False}})
+
+    def test_the_case_fails_when_the_old_subscription_still_answers(self):
+        self.reject("still answers with 200", steps={"apply": {"old_subscription_status": 200}})
+
+    def test_the_case_fails_when_the_credentials_were_not_rotated(self):
+        self.reject("same credentials as before", steps={"apply": {"credential_digest_changed": False}})
+
+    def test_the_case_fails_when_revoked_access_still_delivered(self):
+        data = self.revoked_facts()
+        data["delivered"] = 1
+        data["refused"] = data["attempt_count"] - 1
+        self.reject("still delivered a payload", negative=data)
+
+    def test_the_case_fails_when_the_endpoint_recorded_a_revoked_request(self):
+        data = self.revoked_facts()
+        data["recorded_request_ids"] = 1
+        self.reject("recorded a request sent with revoked access", negative=data)
+
+    def test_the_case_fails_when_the_revoked_scope_attempted_fewer_transports(self):
+        data = self.revoked_facts()
+        data["attempt_count"] = 4
+        data["refused"] = 4
+        self.reject("exercised 4 transports", negative=data)
+
+    def test_the_case_fails_when_the_client_was_not_deleted(self):
+        self.reject("instead of 204", steps={"cleanup": {"delete_status": 500}})
+
+    def test_the_client_is_deleted_even_when_the_positive_run_failed(self):
+        data = traffic_facts()
+        data["transfer_count"] = 0
+        calls = []
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(positive=data, calls=calls)
+        self.assertIn("transferred through 0 transports", str(caught.exception))
+        self.assertEqual(calls, ["issue", "cleanup"],
+                         "the failed run must still delete the client it created")
+
+    def test_the_case_is_part_of_the_aio_suite_with_its_own_budget(self):
+        podman = ScriptedPodman(self.context)
+        cases = {case.id: case for case in aio.cases(podman)}
+        self.assertIn("AIO-REVOKE", cases)
+        self.assertEqual(cases["AIO-REVOKE"].topology, "aio")
+        self.assertEqual(cases["AIO-REVOKE"].timeout_seconds,
+                         aio.TUNNEL_READY_TIMEOUT_SECONDS + 2 * aio.TRAFFIC_TIMEOUT_SECONDS)
 
 
 class RecordingPodman:

@@ -236,7 +236,7 @@ class TestPodmanTopology(unittest.TestCase):
         environment = instance.install_environment()
         self.assertEqual(environment["GOWAVE_ACME_SERVER"], acme_fixture.ACME_DIRECTORY_URL)
         self.assertEqual(environment["GOWAVE_ACME_TEST_MODE"], "1")
-        self.assertEqual(environment["GOWAVE_ACME_TEST_CA_FILE"], "/fixtures/ca/fixture-ca.crt")
+        self.assertEqual(environment["GOWAVE_ACME_TEST_CA_FILE"], "/fixtures/ca/acme-trust.pem")
         self.assertRegex(environment["GOWAVE_ACME_TEST_CA_SHA256"], r"^[0-9a-f]{64}$")
         self.assertEqual(environment["GOWAVE_TLS_CA_FILE"], "/fixtures/ca/issued-root.pem")
         self.assertEqual(environment["GOWAVE_PODMAN_MASTER_ADDRESS"], instance.plan.target_ip)
@@ -244,8 +244,14 @@ class TestPodmanTopology(unittest.TestCase):
 
         target = run_for(podman.runs, instance.target_name)
         self.assertEqual(target["environment"], environment)
-        ca_file = podman.context.secret_dir / "client-ca" / topology.CA_FILE_NAME
-        self.assertEqual(environment["GOWAVE_ACME_TEST_CA_SHA256"], acme_fixture.ca_file_sha256(ca_file))
+        bundle = podman.context.secret_dir / "client-ca" / topology.ACME_CA_BUNDLE_NAME
+        self.assertEqual(environment["GOWAVE_ACME_TEST_CA_SHA256"], acme_fixture.ca_file_sha256(bundle))
+        # The pinned file has to trust Pebble's HTTPS endpoint and also carry the
+        # root its issued certificates chain to; one root cannot do both.
+        text = bundle.read_text(encoding="utf-8")
+        fixture_root = podman.context.secret_dir / "client-ca" / topology.CA_FILE_NAME
+        self.assertIn(fixture_root.read_text(encoding="utf-8"), text)
+        self.assertIn(PEM, text)
         issued = podman.context.secret_dir / "client-ca" / topology.ISSUED_ROOT_NAME
         self.assertEqual(issued.read_text(encoding="utf-8"), PEM)
 

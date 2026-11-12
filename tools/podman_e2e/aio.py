@@ -2,8 +2,8 @@
 
 Every case here runs against one real operator install in one disposable host.
 The install is performed once, by the install case, and later cases reuse that
-host: a second install would prove something the product never promises, and
-re-provisioning per case would hide whether repeated installs are safe.
+host: re-provisioning per case would hide whether repeated installs are safe,
+so a single case owns the second install and measures it on purpose.
 
 Two vantage points are kept apart on purpose. Host-side facts (units, sockets,
 packages, certificate files, the loopback API) are read from the host under
@@ -14,9 +14,11 @@ product code on it.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, List, Optional, Sequence
 
-from . import topology
+from . import panel_surface, topology
+from .podman import wait_until
 from .runner import Case, CaseBlocked, require
 
 INSTALL_CASE_ID = "AIO-INSTALL"
@@ -99,6 +101,39 @@ TRAFFIC_ENGINES: Sequence[str] = ("mihomo", "xray")
 # Two engines over four transports, run sequentially on one client container.
 TRAFFIC_TIMEOUT_SECONDS = 900
 
+# A restart of the product's own units is bounded by the same kind of deadline as
+# any other readiness wait; the interval is coarse because every poll is an exec.
+RESTART_TIMEOUT_SECONDS = 900
+RESTART_INTERVAL_SECONDS = 5
+
+# A bound upstream listener is not a working tunnel: the Panel hands users to the
+# node and the node applies them asynchronously, so the first transfer of a payload
+# that was just issued can still be refused. Readiness is proven by one real
+# payload through one served outbound, polled under this deadline.
+TUNNEL_READY_TIMEOUT_SECONDS = 300
+TUNNEL_READY_INTERVAL_SECONDS = 5
+# One warm-up attempt starts an engine and sends one request; it must not inherit
+# the deadline of the whole matrix.
+TUNNEL_READY_ATTEMPT_TIMEOUT_SECONDS = 180
+
+# The host resources a repeated install must neither duplicate nor rewrite. The
+# Nginx section carries a digest per file, so a regenerated-but-different config
+# is as visible as an added one.
+INVENTORY_SCRIPT = (
+    "echo '==units'\n"
+    "systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null"
+    " | awk '{print $1, $2}'"
+    " | grep -E '^(gowave|gowave-node|nginx|fail2ban)\\.service ' | sort || true\n"
+    "echo '==unit-files'\n"
+    "find /etc/systemd/system -maxdepth 2 -type f"
+    " \\( -name 'gowave*' -o -name 'nginx*' -o -name 'fail2ban*' \\) 2>/dev/null | sort || true\n"
+    "echo '==nginx'\n"
+    "(cd /etc/nginx 2>/dev/null && find nginx.conf conf.d sites-enabled stream-enabled"
+    " modules-enabled -type f 2>/dev/null | sort | xargs -r sha256sum) || true\n"
+    "echo '==credentials'\n"
+    f"stat -c '%U %a' {CREDENTIALS_FILE} 2>/dev/null || echo missing\n"
+)
+
 
 class AioProduct:
     """One disposable AIO host, installed once by the real operator."""
@@ -130,6 +165,26 @@ class AioProduct:
             f"{self.outcome.tail(6000)}",
         )
         return host.evidence(self.outcome)
+
+    def reinstall(self, case_id: str) -> Dict[str, Any]:
+        """Run the operator's install command a second time against the same host.
+
+        The first install's outcome is kept as the host's provenance: a repeated
+        install that fails is a finding of the idempotency case, not a reason to
+        forget that the host was installed correctly the first time.
+        """
+        host = self.require_installed()
+        outcome = host.reinstall()
+        require(
+            case_id,
+            outcome.ok,
+            f"the repeated install failed with exit {outcome.returncode}:\n{outcome.tail(6000)}",
+        )
+        return {
+            "reinstall_returncode": outcome.returncode,
+            "reinstall_duration_seconds": round(outcome.duration, 1),
+            "reinstall_command": outcome.command,
+        }
 
     def require_installed(self) -> topology.AioTopology:
         """The successfully installed host, for cases that must not provision anything themselves."""
@@ -200,10 +255,10 @@ class AioProduct:
             require(case_id, False, f"the client probe did not print JSON: {(result.stdout or '')[:400]}")
             return {}
 
-    def traffic_facts(self, case_id: str, scope: str) -> Dict[str, Any]:
+    def traffic_facts(self, case_id: str, scope: str, payload_dir: Optional[str] = None) -> Dict[str, Any]:
         """Run the engine-side traffic probe and return what the endpoint recorded."""
         host = self.require_installed()
-        result = host.traffic_facts(scope)
+        result = host.traffic_facts(scope, payload_dir=payload_dir)
         detail = (result.stderr or result.stdout or "").strip()[-2000:]
         require(
             case_id,
@@ -215,6 +270,49 @@ class AioProduct:
         except json.JSONDecodeError:
             require(case_id, False, f"the traffic probe did not print JSON: {(result.stdout or '')[:400]}")
             return {}
+
+    def wait_tunnel_ready(self, case_id: str, payload_dir: Optional[str] = None) -> Dict[str, Any]:
+        """Wait until one served outbound really carries a payload to the endpoint.
+
+        A listener that is bound and a Panel that answers say nothing about the
+        data plane: the Panel pushes users to the node and the node applies them
+        asynchronously, so both a freshly issued client and a restarted node can
+        have a tunnel that refuses the first transfer. One payload, confirmed by
+        the endpoint's own log, is the smallest honest proof that the matrix that
+        follows is measuring the product rather than its propagation lag.
+        """
+        host = self.require_installed()
+        observed: Dict[str, Any] = {}
+
+        def carried() -> bool:
+            result = host.traffic_facts(
+                "warmup",
+                timeout=TUNNEL_READY_ATTEMPT_TIMEOUT_SECONDS,
+                payload_dir=payload_dir,
+            )
+            if result.returncode != 0:
+                observed.clear()
+                observed["returncode"] = result.returncode
+                observed["detail"] = (result.stderr or result.stdout or "").strip()[-400:]
+                return False
+            try:
+                facts = json.loads(result.stdout or "")
+            except json.JSONDecodeError:
+                observed.clear()
+                observed["detail"] = f"the readiness probe did not print JSON: {(result.stdout or '')[:200]}"
+                return False
+            observed.clear()
+            observed.update(facts)
+            return bool(facts.get("delivered"))
+
+        ready = wait_until(
+            carried, TUNNEL_READY_TIMEOUT_SECONDS, f"{case_id} data plane",
+            interval_seconds=TUNNEL_READY_INTERVAL_SECONDS,
+        )
+        require(case_id, ready,
+                f"no served outbound carried a payload to the endpoint within "
+                f"{TUNNEL_READY_TIMEOUT_SECONDS}s: {observed}")
+        return observed
 
 
 def _login_preamble() -> str:
@@ -275,6 +373,23 @@ def panel_probe_script() -> str:
         + 'api=$(curl -sS -K "$cfg" -o "$resp" -w \'%{http_code}\' '
         f'{LOOPBACK_PANEL}/api/nodes)\n'
         + 'printf \'login=%s api=%s token_length=%s\\n\' "$login" "$api" "${#token}"\n'
+    )
+
+
+def restart_readiness_script() -> str:
+    """The Panel answers and the stream router's upstream listeners are bound.
+
+    The Panel answering is not the product being up: port 443 hands the REALITY
+    SNI to Xray on :8443 and the panel SNI to 127.0.0.1:7443. A tunnel dialled
+    before Xray has bound its listener is refused by the client engine instead of
+    travelling, so both listeners are part of the readiness deadline. The Xray
+    inbound carries no ``listen`` field, so its port is matched on any address.
+    """
+    return (
+        panel_probe_script()
+        + "upstreams=$(ss -H -ltn 2>/dev/null | awk '{print $4}' "
+          "| grep -cE ':(7443|8443)$' || true)\n"
+        + 'printf \'upstreams=%s\\n\' "${upstreams:-0}"\n'
     )
 
 
@@ -449,7 +564,15 @@ def case_tls_and_identity(product: AioProduct) -> Dict[str, Any]:
 
 def _panel_facts(product: AioProduct, case_id: str, scope: str) -> Dict[str, Any]:
     """Run the host-side probe and return its facts; comparisons stay here."""
-    result = product.host_script(f"python3 {PANEL_SURFACE_SCRIPT} --scope {scope}")
+    return panel_probe(product, case_id, scope)
+
+
+def panel_probe(product: AioProduct, case_id: str, scope: str, extra: str = "") -> Dict[str, Any]:
+    """Run any panel_surface scope on the host, with optional trailing arguments."""
+    arguments = f"--scope {scope}"
+    if extra:
+        arguments += f" {extra}"
+    result = product.host_script(f"python3 {PANEL_SURFACE_SCRIPT} {arguments}")
     require(
         case_id,
         result.returncode == 0,
@@ -579,6 +702,324 @@ def case_client_lifecycle(product: AioProduct) -> Dict[str, Any]:
             f"the deleted client is still served by username "
             f"(status {facts.get('after_delete_status')!r})")
     return facts
+
+
+def case_revocation(product: AioProduct) -> Dict[str, Any]:
+    """AIO-REVOKE: revoked access stops transferring, and the Panel says so.
+
+    The client is created through the real API, its subscription is captured while
+    it still works, and a payload travels through every transport with it — after
+    one transfer has shown that the Panel's asynchronous user push has reached the
+    node. The documented revoke action then rotates the credentials and the
+    subscription path, and the payload the client already holds is replayed by
+    freshly started engines.
+
+    The verdict does not rest on an error message: a closed port would produce the
+    same silence. It rests on the controlled endpoint's own log holding none of
+    those requests, after the Panel has already reported the rotation.
+
+    The client is deleted whether the case passes or not, so a failed run cannot
+    leave inventory that changes the next run's assertions.
+    """
+    host = product.require_installed()
+    # The Panel probe runs on the target, where the payload volume is mounted at
+    # PAYLOAD_MOUNT; the engines run in the client, where the same volume is
+    # mounted read-only at SECRETS_MOUNT.
+    payload_dir = f"{topology.SECRETS_MOUNT}/{panel_surface.REVOKE_DIRECTORY}"
+    issue = panel_probe(
+        product, "AIO-REVOKE", "revoke", f"--step issue --payload-dir {topology.PAYLOAD_MOUNT}",
+    ).get("revocation") or {}
+    require("AIO-REVOKE", issue.get("squad_requested"),
+            "no 'Default MVP Squad' exists, so the revocation client could not be granted an inbound")
+    require("AIO-REVOKE", issue.get("create_status") == 201,
+            f"POST /api/users returned {issue.get('create_status')!r} instead of 201")
+    require("AIO-REVOKE", issue.get("patch_status") == 200,
+            f"PATCH /api/users/{{id}} returned {issue.get('patch_status')!r} instead of 200")
+    require("AIO-REVOKE", issue.get("patch_visible"),
+            "the traffic limit written by PATCH /api/users/{id} is not visible on read back")
+    representations = issue.get("representations") or {}
+    unserved = sorted(name for name, facts in representations.items() if (facts or {}).get("status") != 200)
+    require("AIO-REVOKE", not unserved, f"the created client was not served: {', '.join(unserved)}")
+    require("AIO-REVOKE", bool(issue.get("credential_digest")),
+            "the captured subscription carries no credential to compare against after revoking")
+
+    try:
+        tunnel = product.wait_tunnel_ready("AIO-REVOKE", payload_dir=payload_dir)
+        positive = product.traffic_facts("AIO-REVOKE", "traffic", payload_dir=payload_dir)
+        expected = CORE_INBOUNDS * len(TRAFFIC_ENGINES)
+        require("AIO-REVOKE", int(positive.get("transfer_count") or 0) == expected,
+                f"the issued client transferred through {positive.get('transfer_count')!r} "
+                f"transports, expected {expected}")
+        require("AIO-REVOKE", int(positive.get("missing_request_ids") or 0) == 0,
+                f"the endpoint never saw {positive.get('missing_request_ids')!r} of the issued "
+                "client's requests")
+        unverified = [item["tag"] for item in positive.get("transfers") or []
+                      if not (item.get("request_id_match") and item.get("body_match"))]
+        require("AIO-REVOKE", not unverified,
+                f"the endpoint did not echo the payload for: {', '.join(unverified)}")
+        require("AIO-REVOKE", positive.get("source_ips") == [host.plan.data_target_ip],
+                f"the issued client's payload left from {positive.get('source_ips')!r} "
+                f"instead of the installed host {host.plan.data_target_ip}")
+
+        applied = panel_probe(
+            product, "AIO-REVOKE", "revoke", f"--step apply --payload-dir {topology.PAYLOAD_MOUNT}",
+        ).get("revocation") or {}
+        require("AIO-REVOKE", applied.get("revoke_status") == 200,
+                f"POST /api/users/{{id}}/actions/revoke returned {applied.get('revoke_status')!r}")
+        require("AIO-REVOKE", applied.get("revoked_at_present"),
+                "the revoke action reported no subRevokedAt, so the Panel recorded no revocation")
+        require("AIO-REVOKE", applied.get("short_uuid_rotated"),
+                "the revoke action did not rotate the subscription path")
+        require("AIO-REVOKE", applied.get("old_subscription_status") == 404,
+                f"the revoked subscription path still answers with "
+                f"{applied.get('old_subscription_status')!r} instead of 404")
+        require("AIO-REVOKE", applied.get("new_subscription_status") == 200,
+                f"the rotated subscription path answers {applied.get('new_subscription_status')!r}")
+        require("AIO-REVOKE", applied.get("credential_digest_changed"),
+                "the subscription served after revoking carries the same credentials as before")
+
+        negative = product.traffic_facts("AIO-REVOKE", "revoked", payload_dir=payload_dir)
+        require("AIO-REVOKE", int(negative.get("delivered") or 0) == 0,
+                f"{negative.get('delivered')!r} transports still delivered a payload with revoked access")
+        require("AIO-REVOKE", int(negative.get("refused") or 0) == int(negative.get("attempt_count") or -1),
+                f"{negative.get('refused')!r} of {negative.get('attempt_count')!r} attempts were refused")
+        require("AIO-REVOKE", int(negative.get("attempt_count") or 0) == expected,
+                f"the revoked access exercised {negative.get('attempt_count')!r} transports, "
+                f"expected {expected}")
+        require("AIO-REVOKE", int(negative.get("recorded_request_ids") or 0) == 0,
+                "the endpoint recorded a request sent with revoked access")
+    finally:
+        cleanup = panel_probe(
+            product, "AIO-REVOKE", "revoke", f"--step cleanup --payload-dir {topology.PAYLOAD_MOUNT}",
+        ).get("revocation") or {}
+        require("AIO-REVOKE", cleanup.get("delete_status") == 204,
+                f"deleting the revocation client returned {cleanup.get('delete_status')!r} "
+                "instead of 204")
+        require("AIO-REVOKE", cleanup.get("after_delete_status") == 404,
+                f"the revocation client is still served after deletion "
+                f"(status {cleanup.get('after_delete_status')!r})")
+
+    return {
+        "created_id_present": issue.get("created_id_present"),
+        "created_short_uuid_length": issue.get("created_short_uuid_length"),
+        "representations": ",".join(sorted(representations)),
+        "patch_status": issue.get("patch_status"),
+        "readiness_network": tunnel.get("network"),
+        "positive_transfer_count": positive.get("transfer_count"),
+        "positive_source_ips": ",".join(positive.get("source_ips") or []),
+        "revoke_status": applied.get("revoke_status"),
+        "revoked_at_present": applied.get("revoked_at_present"),
+        "old_subscription_status": applied.get("old_subscription_status"),
+        "new_subscription_status": applied.get("new_subscription_status"),
+        "credential_digest_changed": applied.get("credential_digest_changed"),
+        "revoked_attempt_count": negative.get("attempt_count"),
+        "revoked_refused": negative.get("refused"),
+        "revoked_delivered": negative.get("delivered"),
+        "revoked_rounds": negative.get("rounds"),
+        "revoked_networks": ",".join(negative.get("networks") or []),
+        "recorded_request_ids": negative.get("recorded_request_ids"),
+        "delete_status": cleanup.get("delete_status"),
+    }
+
+
+def inventory_sections(output: str) -> Dict[str, List[str]]:
+    """Split the marked inventory output into one sorted list per resource area."""
+    sections: Dict[str, List[str]] = {}
+    current = ""
+    for line in (output or "").splitlines():
+        if line.startswith("=="):
+            current = line[2:].strip()
+            sections[current] = []
+        elif line.strip() and current:
+            sections[current].append(line.strip())
+    return sections
+
+
+def system_inventory(product: AioProduct, case_id: str) -> Dict[str, List[str]]:
+    """The host resources a repeated install must neither duplicate nor rewrite."""
+    result = product.host_script(INVENTORY_SCRIPT)
+    require(case_id, result.returncode == 0,
+            f"the host inventory probe exited {result.returncode}: "
+            f"{(result.stderr or '').strip()[-800:]}")
+    return inventory_sections(result.stdout or "")
+
+
+def case_restart(product: AioProduct) -> Dict[str, Any]:
+    """AIO-RESTART: the product's own units restart and the service recovers.
+
+    Restarting the product's units is what an operator does after a configuration
+    change or a package update, so the case stops them the way the product starts
+    them and then waits, under one deadline, for the Panel and the tunnel's
+    loopback upstream to come back. The data plane is exercised afterwards because
+    a control plane that recovers while the tunnel stayed down would otherwise
+    look healthy; one served outbound has to carry a payload first, because a node
+    that has its listener back applies its users asynchronously.
+    """
+    host = product.require_installed()
+    product.subscription_payloads("AIO-RESTART")
+
+    started = time.monotonic()
+    restart = product.host_script(f"systemctl restart {' '.join(UNITS)}", timeout=300)
+    require("AIO-RESTART", restart.returncode == 0,
+            f"systemctl restart of the product's units exited {restart.returncode}: "
+            f"{(restart.stderr or restart.stdout or '').strip()[-800:]}")
+
+    observed: Dict[str, str] = {}
+
+    def answers() -> bool:
+        probe = product.host_script(restart_readiness_script())
+        observed["probe_returncode"] = str(probe.returncode)
+        if probe.returncode != 0:
+            return False
+        values = _parse_key_values(probe.stdout or "")
+        observed.update(values)
+        return (
+            values.get("login") == "200"
+            and values.get("api") == "200"
+            and values.get("upstreams") == "2"
+        )
+
+    recovered = wait_until(
+        answers, RESTART_TIMEOUT_SECONDS, "the product after restarting its units",
+        interval_seconds=RESTART_INTERVAL_SECONDS,
+    )
+    downtime = round(time.monotonic() - started, 1)
+    require("AIO-RESTART", recovered,
+            f"the product did not recover within {RESTART_TIMEOUT_SECONDS}s of restarting its "
+            f"units: {observed}")
+
+    active = product.host_script(f"systemctl is-active {' '.join(UNITS)} || true")
+    states = dict(zip(UNITS, (active.stdout or "").split()))
+    inactive = sorted(name for name in UNITS if states.get(name) != "active")
+    require("AIO-RESTART", not inactive,
+            "units are not active after the restart: "
+            + ", ".join(f"{name}={states.get(name)}" for name in inactive))
+
+    tunnel = product.wait_tunnel_ready("AIO-RESTART")
+
+    facts = product.traffic_facts("AIO-RESTART", "traffic")
+    expected = CORE_INBOUNDS * len(TRAFFIC_ENGINES)
+    require("AIO-RESTART", int(facts.get("transfer_count") or 0) == expected,
+            f"after the restart {facts.get('transfer_count')!r} transports carried a payload, "
+            f"expected {expected}")
+    require("AIO-RESTART", int(facts.get("missing_request_ids") or 0) == 0,
+            f"the endpoint never saw {facts.get('missing_request_ids')!r} requests after the restart")
+    unverified = [item["tag"] for item in facts.get("transfers") or []
+                  if not (item.get("request_id_match") and item.get("body_match"))]
+    require("AIO-RESTART", not unverified,
+            f"the endpoint did not echo the payload after the restart for: {', '.join(unverified)}")
+    require("AIO-RESTART", facts.get("source_ips") == [host.plan.data_target_ip],
+            f"the recovered payload left from {facts.get('source_ips')!r} instead of the "
+            f"installed host {host.plan.data_target_ip}")
+
+    return {
+        "restart_units": ",".join(UNITS),
+        "recovery_seconds": downtime,
+        "loopback_login": observed.get("login"),
+        "loopback_api": observed.get("api"),
+        "readiness_network": tunnel.get("network"),
+        "unit_states": ",".join(f"{name}={states.get(name)}" for name in UNITS),
+        "transfer_count": facts.get("transfer_count"),
+        "source_ips": ",".join(facts.get("source_ips") or []),
+    }
+
+
+def case_idempotent(product: AioProduct) -> Dict[str, Any]:
+    """AIO-IDEMPOTENT: the same install again adds nothing and breaks nothing.
+
+    Two independent surfaces have to agree. The Panel inventory is read through
+    the API before and after, so a duplicated node, profile, squad, host or token
+    is a changed count rather than an opinion; the host inventory is read as file
+    lists and digests, so a second NGINX config or a rewritten one is equally
+    visible. The subscription the Panel already served must still carry the same
+    credentials, and the clients that imported it must still transfer.
+    """
+    host = product.require_installed()
+    product.subscription_payloads("AIO-IDEMPOTENT")
+
+    before = _panel_facts(product, "AIO-IDEMPOTENT", "surface")
+    require("AIO-IDEMPOTENT", (before.get("login") or {}).get("status") == 200,
+            "the admin credentials did not work before the repeated install")
+    baseline = before.get("surface") or {}
+    baseline_host = system_inventory(product, "AIO-IDEMPOTENT")
+    baseline_subscription = panel_probe(
+        product, "AIO-IDEMPOTENT", "subscriptions", f"--payload-dir {topology.PAYLOAD_MOUNT}",
+    ).get("subscriptions") or {}
+    require("AIO-IDEMPOTENT", bool(baseline_subscription.get("credential_digest")),
+            "the Panel served no subscription credentials to compare after the repeated install")
+
+    repeat = product.reinstall("AIO-IDEMPOTENT")
+
+    after = _panel_facts(product, "AIO-IDEMPOTENT", "surface")
+    require("AIO-IDEMPOTENT", (after.get("login") or {}).get("status") == 200,
+            "the credentials file no longer authenticates the admin after the repeated install")
+    current = after.get("surface") or {}
+
+    changed = []
+    for area, field in (
+        ("nodes", "count"), ("profiles", "count"), ("squads", "count"),
+        ("hosts", "count"), ("tokens", "count"),
+        ("nodes", "inbound_digest"), ("profiles", "inbound_digest"),
+        ("squads", "mvp_inbound_digest"), ("hosts", "inbound_digest"),
+        ("tokens", "name_digest"),
+    ):
+        was = (baseline.get(area) or {}).get(field)
+        now = (current.get(area) or {}).get(field)
+        if was != now:
+            changed.append(f"{area}.{field}: {was!r} -> {now!r}")
+    require("AIO-IDEMPOTENT", not changed,
+            "the repeated install changed the Panel inventory: " + "; ".join(changed))
+
+    current_host = system_inventory(product, "AIO-IDEMPOTENT")
+    rewritten = [area for area in ("units", "unit-files", "nginx")
+                 if baseline_host.get(area) != current_host.get(area)]
+    require("AIO-IDEMPOTENT", not rewritten,
+            "the repeated install changed host resources: " + ", ".join(rewritten))
+    require("AIO-IDEMPOTENT", current_host.get("credentials") == ["root 600"],
+            f"the credentials file is {current_host.get('credentials')!r} after the repeated "
+            "install instead of root-owned mode 600")
+
+    after_subscription = panel_probe(
+        product, "AIO-IDEMPOTENT", "subscriptions", f"--payload-dir {topology.PAYLOAD_MOUNT}",
+    ).get("subscriptions") or {}
+    require("AIO-IDEMPOTENT",
+            baseline_subscription.get("credential_digest") == after_subscription.get("credential_digest"),
+            "the repeated install rotated the credentials the served subscription carries, so "
+            "every client that already imported it would stop working")
+
+    facts = product.traffic_facts("AIO-IDEMPOTENT", "traffic")
+    expected = CORE_INBOUNDS * len(TRAFFIC_ENGINES)
+    require("AIO-IDEMPOTENT", int(facts.get("transfer_count") or 0) == expected,
+            f"after the repeated install {facts.get('transfer_count')!r} transports carried a "
+            f"payload, expected {expected}")
+    require("AIO-IDEMPOTENT", int(facts.get("missing_request_ids") or 0) == 0,
+            f"the endpoint never saw {facts.get('missing_request_ids')!r} requests after the "
+            "repeated install")
+    unverified = [item["tag"] for item in facts.get("transfers") or []
+                  if not (item.get("request_id_match") and item.get("body_match"))]
+    require("AIO-IDEMPOTENT", not unverified,
+            "the endpoint did not echo the payload after the repeated install for: "
+            + ", ".join(unverified))
+    require("AIO-IDEMPOTENT", facts.get("source_ips") == [host.plan.data_target_ip],
+            f"the payload after the repeated install left from {facts.get('source_ips')!r} instead "
+            f"of the installed host {host.plan.data_target_ip}")
+
+    return {
+        "reinstall_returncode": repeat.get("reinstall_returncode"),
+        "reinstall_duration_seconds": repeat.get("reinstall_duration_seconds"),
+        "panel_counts": ",".join(
+            f"{area}={(current.get(area) or {}).get('count')}"
+            for area in ("nodes", "profiles", "squads", "hosts", "tokens")
+        ),
+        "credentials": ",".join(current_host.get("credentials") or []),
+        "nginx_files": len(current_host.get("nginx") or []),
+        "unit_files": len(current_host.get("unit-files") or []),
+        "credential_digest_changed": (
+            baseline_subscription.get("credential_digest") != after_subscription.get("credential_digest")
+        ),
+        "transfer_count": facts.get("transfer_count"),
+        "source_ips": ",".join(facts.get("source_ips") or []),
+    }
 
 
 def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
@@ -903,4 +1344,11 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04") -> List[Case]:
         Case("SUB-JSON-SHAPES", "aio", lambda context: case_json_shapes(product), timeout_seconds=300),
         Case("AIO-TRAFFIC", "aio", lambda context: case_traffic(product),
              timeout_seconds=TRAFFIC_TIMEOUT_SECONDS),
+        Case("AIO-REVOKE", "aio", lambda context: case_revocation(product),
+             timeout_seconds=TUNNEL_READY_TIMEOUT_SECONDS + 2 * TRAFFIC_TIMEOUT_SECONDS),
+        Case("AIO-RESTART", "aio", lambda context: case_restart(product),
+             timeout_seconds=RESTART_TIMEOUT_SECONDS + TUNNEL_READY_TIMEOUT_SECONDS
+             + TRAFFIC_TIMEOUT_SECONDS),
+        Case("AIO-IDEMPOTENT", "aio", lambda context: case_idempotent(product),
+             timeout_seconds=INSTALL_TIMEOUT_SECONDS + TRAFFIC_TIMEOUT_SECONDS),
     ]
