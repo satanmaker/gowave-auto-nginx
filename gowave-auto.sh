@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCK_FILE="/run/lock/gowave-auto.lock"
-STATE_FILE="/var/lib/gowave-auto-nginx/state.json"
+STATE_FILE="${GOWAVE_STATE_FILE:-/var/lib/gowave-auto-nginx/state.json}"
 JOURNAL_FILE="/var/lib/gowave-auto-nginx/recovery/journal.json"
 CREDENTIALS_FILE="/root/gowave-credentials.txt"
 
@@ -1071,15 +1071,23 @@ cmd_user_links() {
     echo "================================================================================"
     echo "GoWave Subscription Links for user: $identifier"
     echo "================================================================================"
-    echo "Xray Subscription URL (JSON):"
+    # v2rayNG and NekoBox parse a subscription body as base64 share links only; the
+    # /v2ray-json array of full configs is rejected by their subscription updater.
+    echo "v2rayNG / NekoBox / Hiddify / v2rayN 6+ (base64 share links):"
+    echo "  https://$panel_domain/api/sub/$short_uuid"
+    echo ""
+    echo "Xray JSON config array (file or JSON import, not a v2rayNG subscription):"
     echo "  https://$panel_domain/api/sub/$short_uuid/v2ray-json"
     echo ""
-    echo "Mihomo Subscription URL (YAML):"
+    echo "Mihomo / Clash Verge Rev / FlClash (Meta YAML):"
     echo "  https://$panel_domain/api/sub/$short_uuid/mihomo"
+    echo ""
+    echo "Clash / Clash Meta for Android (compact YAML):"
+    echo "  https://$panel_domain/api/sub/$short_uuid/clash"
     echo ""
     echo "NOTE: Upstream GoWave strictly enforces a non-empty User-Agent header!"
     echo "Verification curl examples:"
-    echo "  curl -fsSL -H 'User-Agent: v2rayN/6.0' 'https://$panel_domain/api/sub/$short_uuid/v2ray-json'"
+    echo "  curl -fsSL -H 'User-Agent: v2rayNG/1.8.5' 'https://$panel_domain/api/sub/$short_uuid'"
     echo "  curl -fsSL -H 'User-Agent: ClashMeta/1.19' 'https://$panel_domain/api/sub/$short_uuid/mihomo'"
     echo "================================================================================"
 }
