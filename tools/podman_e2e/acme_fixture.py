@@ -73,10 +73,14 @@ def _openssl(argv: Sequence[str], timeout: int = 60) -> None:
 
 
 def _san_extensions(sans: Sequence[str]) -> str:
+    # OpenSSL 3.5 rejects a leaf whose issuer key id is not resolvable
+    # ("Missing Authority Key Identifier"), so both ids are always emitted.
     return (
         "basicConstraints=critical,CA:FALSE\n"
         "keyUsage=critical,digitalSignature,keyEncipherment\n"
         "extendedKeyUsage=serverAuth\n"
+        "subjectKeyIdentifier=hash\n"
+        "authorityKeyIdentifier=keyid:always\n"
         f"subjectAltName={','.join(sans)}\n"
     )
 
@@ -102,6 +106,7 @@ def generate_fixture_ca(
         "-subj", f"/CN={FIXTURE_CA_COMMON_NAME}",
         "-addext", "basicConstraints=critical,CA:TRUE",
         "-addext", "keyUsage=critical,keyCertSign,cRLSign",
+        "-addext", "subjectKeyIdentifier=hash",
     ])
     _openssl([
         "req", "-newkey", "rsa:2048", "-nodes",
