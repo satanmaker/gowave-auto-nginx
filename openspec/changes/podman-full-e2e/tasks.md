@@ -58,7 +58,7 @@
 - [x] 5.5 Verify Node health/state and configuration consistency across Panel and Worker.
 - [x] 5.6 Obtain the real Panel representations for a Worker-issued profile — base64 links, Xray JSON, and Mihomo YAML — and import each into the client that consumes it.
 - [x] 5.7 Prove payload traversal through Worker for every applicable supported protocol/configuration.
-- [ ] 5.8 Verify untrusted management access is denied and trusted access remains functional.
+- [x] 5.8 Verify untrusted management access is denied and trusted access remains functional.
 - [ ] 5.9 Verify subscription revocation, Worker outage, restart, and recovery behavior.
 - [ ] 5.10 Verify all four independent Vision combinations: neither, Master-only, Worker-only, and both.
 - [ ] 5.10a Verify SSH wrong-host-key rejection before command execution and authorized host-key rotation (new key accepted, old key rejected).
