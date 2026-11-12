@@ -17,13 +17,14 @@ from __future__ import annotations
 import ipaddress
 from typing import Any, Dict, List, Optional, Sequence
 
-from tools.podman_e2e import aio, matrix as matrix_data, topology
+from tools.podman_e2e import aio, matrix as matrix_data, mtls, topology
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, require
 
 INSTALL_CASE_ID = "MN-INSTALL"
 NODE_ADD_CASE_ID = "WRK-04"
 MASTER_ADDRESS_CASE_ID = "PODNET-MASTER-ADDR"
+MTLS_TIMEOUT_SECONDS = 300
 
 NODE_ADD_TIMEOUT_SECONDS = topology.NODE_ADD_TIMEOUT_SECONDS
 NODE_HEALTH_TIMEOUT_SECONDS = 600
@@ -151,6 +152,8 @@ class MultiNodeProduct:
         )
         self.topology: Optional[topology.MultiNodeTopology] = None
         self.node_add_outcome: Optional[topology.InstallOutcome] = None
+        self.mtls_positive_facts: Optional[Dict[str, Any]] = None
+        self.mtls_negative_facts: Optional[Dict[str, Any]] = None
         self.trust: Dict[str, Any] = {}
         self.declared_data_plane: List[str] = []
         self.data_plane_results: Dict[str, str] = {}
@@ -305,6 +308,55 @@ class MultiNodeProduct:
         )
         return observed
 
+    # ------------------------------------------------------------------- mTLS
+    def mtls_positive(self) -> Dict[str, Any]:
+        """The product's own verifier, run on the Master against the Worker.
+
+        One run answers MTLS-01 and MTLS-02, but neither case may lean on the
+        other's conclusion: the handshake and the HTTP outcome are separate
+        observations, and a 401 is a successful handshake with no health answer.
+        """
+        host = self.require_worker()
+        if self.mtls_positive_facts is None:
+            self.mtls_positive_facts = mtls.run_positive(
+                self.podman, host.target_name, host.plan.worker_ip,
+            )
+        return self.mtls_positive_facts
+
+    def mtls_negatives(self) -> Dict[str, Any]:
+        """Every negative mTLS control, run once on the Master and shared."""
+        host = self.require_worker()
+        if self.mtls_negative_facts is None:
+            self.mtls_negative_facts = mtls.run_negatives(
+                self.podman, host.target_name, host.plan.worker_ip,
+            )
+        return self.mtls_negative_facts
+
+    def mtls_negative_report(self, case_id: str) -> Dict[str, Any]:
+        """The negative controls' report, or a block when they produced none.
+
+        A probe that could not run says nothing about the product, so it blocks
+        instead of inventing one failure per case that reads it.
+        """
+        facts = self.mtls_negatives()
+        if facts["returncode"] != 0 or not facts["report"]:
+            raise CaseBlocked(
+                f"{case_id}: the negative mTLS controls produced no report "
+                f"(exit {facts['returncode']}): {facts['tail'] or 'no output'}"
+            )
+        return facts["report"]
+
+    def mtls_negative_outcome(self, case_id: str, key: str) -> Dict[str, Any]:
+        """One negative control's outcome, refused by name when it is missing."""
+        report = self.mtls_negative_report(case_id)
+        outcome = report.get(key)
+        require(
+            case_id,
+            isinstance(outcome, dict),
+            f"the negative controls reported nothing for {key!r}; observed {sorted(report)}",
+        )
+        return outcome
+
     def worker_address_facts(self, case_id: str) -> Dict[str, Any]:
         """What the Worker itself says about the Master address it was given."""
         host = self.require_installed()
@@ -424,6 +476,202 @@ def case_master_address(product: MultiNodeProduct) -> Dict[str, Any]:
     return product.worker_address_facts(MASTER_ADDRESS_CASE_ID)
 
 
+def case_mtls_verifier(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MTLS-01: the product's verifier proves the payload and then the handshake.
+
+    The order is the assertion: the payload check must be printed before the
+    socket attempt, because a handshake against an unverified payload would also
+    succeed. The recorded facts are the verifier's own markers and the Worker's
+    status line — never the payload or the HKDF-derived SNI.
+    """
+    facts = product.mtls_positive()
+    require(
+        "MTLS-01",
+        facts["returncode"] == 0,
+        f"the product's mTLS verifier exited {facts['returncode']}: "
+        f"{facts['tail'] or 'no output'}",
+    )
+    require(
+        "MTLS-01",
+        facts["payload_crypto_pass"],
+        f"the verifier never reported its payload cryptographic verification: "
+        f"{facts['tail'] or 'no output'}",
+    )
+    require(
+        "MTLS-01",
+        facts["payload_verified_before_socket"],
+        "the verifier reported the payload result after the socket attempt, so a "
+        "handshake would have run against an unverified payload",
+    )
+    require(
+        "MTLS-01",
+        facts["handshake_pass"],
+        f"the mTLS handshake did not negotiate TLS 1.3: {facts['tail'] or 'no output'}",
+    )
+    require(
+        "MTLS-01",
+        facts["status_line"],
+        "the verified handshake produced no Node status line",
+    )
+    return {
+        "payload_crypto_pass": True,
+        "payload_verified_before_socket": True,
+        "handshake_line": facts["handshake_line"],
+        "node_response": facts["status_line"],
+    }
+
+
+def case_mtls_http_classification(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MTLS-02: a successful handshake is not yet an authenticated control plane.
+
+    HTTP 200 means the Node answered the health endpoint over mutual TLS. HTTP
+    401 means the handshake passed but the request carried no accepted token, so
+    the health and authenticated-control-plane flags must stay clear.
+    """
+    facts = product.mtls_positive()
+    require(
+        "MTLS-02",
+        facts["handshake_pass"],
+        "the TLS 1.3 handshake never succeeded, so the HTTP outcome says nothing "
+        "about authentication",
+    )
+    require(
+        "MTLS-02",
+        facts["response"] != "none",
+        "the Worker returned no status line after the handshake",
+    )
+    require(
+        "MTLS-02",
+        facts["response"] in ("health", "unauthenticated"),
+        f"the Worker answered {facts['status_line']!r} instead of a health or "
+        f"authentication outcome",
+    )
+    require(
+        "MTLS-02",
+        facts["response"] == "health",
+        f"the mTLS handshake passed but the Worker answered {facts['status_line']!r}: "
+        "MTLS_HANDSHAKE_PASS is set, WORKER_HTTP_HEALTH_PASS is not, and the "
+        "authenticated control plane the Panel relies on was not proven",
+    )
+    return {
+        "mtls_handshake_pass": True,
+        "worker_http_health_pass": True,
+        "node_response": facts["status_line"],
+    }
+
+
+def case_mtls_panel_auth(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MTLS-03: the Panel's own connection state, not a local 401, proves authentication.
+
+    A local client that happens to receive 401 has proven the handshake, not
+    that the Panel authenticates to the Worker. Only the Panel's node registry
+    can say that.
+    """
+    product.require_worker()
+    facts = product.panel_surface("MTLS-03")
+    surface = facts.get("surface") or {}
+    nodes = surface.get("nodes") or {}
+    connected = nodes.get("connected") or {}
+    state = connected.get(topology.WORKER_NODE_NAME)
+    require(
+        "MTLS-03",
+        state is True,
+        f"the Panel reports {topology.WORKER_NODE_NAME!r} as {state!r}; a local "
+        f"handshake outcome cannot stand in for the Panel's authenticated "
+        f"connection, and the Panel registry is the only proof of it",
+    )
+    return {
+        "panel_worker_auth_pass": True,
+        "panel_node_connected": connected,
+        "unauthenticated_nodes_status": surface.get("unauthenticated_nodes_status"),
+    }
+
+
+def case_mtls_untrusted_client(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MTLS-04: a client certificate the Worker's CA never issued is refused."""
+    outcome = product.mtls_negative_outcome("MTLS-04", "untrusted_client")
+    require(
+        "MTLS-04",
+        outcome["outcome"] == "TLS_REJECTED",
+        f"a self-signed client certificate produced {outcome['outcome']} "
+        f"({outcome.get('error') or outcome.get('status_line') or 'no detail'}) "
+        f"instead of a TLS rejection during the handshake",
+    )
+    return {"untrusted_client": outcome}
+
+
+def case_mtls_absent_client(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MTLS-05: no client certificate at all is refused before any handler."""
+    outcome = product.mtls_negative_outcome("MTLS-05", "absent_client")
+    require(
+        "MTLS-05",
+        outcome["outcome"] == "TLS_REJECTED",
+        f"a client that presents no certificate produced {outcome['outcome']} "
+        f"({outcome.get('error') or outcome.get('status_line') or 'no detail'}) "
+        f"instead of a TLS rejection during the handshake",
+    )
+    return {"absent_client": outcome}
+
+
+def case_mtls_mismatched_pair(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MTLS-06: a mismatched certificate and key fails locally, before any socket.
+
+    A remote rejection would be a different finding: it would mean the verifier
+    shipped the broken pair to the Worker. The socket counter is what separates
+    the two.
+    """
+    report = product.mtls_negative_report("MTLS-06")
+    require(
+        "MTLS-06",
+        report.get("mismatched_crypto_failed") is True,
+        "the payload crypto validation accepted a certificate whose public key "
+        "does not match the private key",
+    )
+    require(
+        "MTLS-06",
+        report.get("mismatched_socket_calls") == 0,
+        f"the mismatched-pair validation opened {report.get('mismatched_socket_calls')!r} "
+        f"sockets, so the failure was not local",
+    )
+    return {
+        "mismatched_crypto_failed": True,
+        "sockets_opened": 0,
+        "classification": "client-side validation failure",
+    }
+
+
+def case_mtls_untrusted_ca(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MTLS-07: an untrusted Worker CA is this side's trust failure, not a rejection."""
+    outcome = product.mtls_negative_outcome("MTLS-07", "untrusted_ca")
+    require(
+        "MTLS-07",
+        outcome["outcome"] == "SERVER_CERT_REJECTED",
+        f"with the GoWave CA removed from the trust store the outcome was "
+        f"{outcome['outcome']} ({outcome.get('error') or outcome.get('status_line') or 'no detail'}); "
+        f"only a client-side certificate verification failure isolates the trust "
+        f"store without changing the SNI or the client identity",
+    )
+    return {"untrusted_ca": outcome, "classification": "client-side server verification failure"}
+
+
+def case_mtls_wrong_sni(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MTLS-08: a wrong SNI is measured, not assumed to raise a TLS alert.
+
+    A fallback vhost may complete TLS and answer over the default route, which
+    is routing evidence rather than a handshake failure. Either observation is
+    recorded as it arrived; only "TLS established, nothing answered" is refused.
+    """
+    outcome = product.mtls_negative_outcome("MTLS-08", "wrong_sni")
+    require(
+        "MTLS-08",
+        outcome["outcome"] in ("TLS_REJECTED", "HTTP_RESPONSE"),
+        f"the wrong-SNI attempt produced {outcome['outcome']} "
+        f"({outcome.get('error') or 'no detail'}); TLS that is established but "
+        f"unanswered is not evidence of routing either way",
+    )
+    return {"wrong_sni": outcome}
+
+
 def cases(
     podman: Any, distribution: str = "ubuntu-24.04",
     vision: bool = False, worker_vision: bool = False,
@@ -439,4 +687,20 @@ def cases(
              timeout_seconds=NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
         Case(MASTER_ADDRESS_CASE_ID, "multi-node", lambda context: case_master_address(product),
              timeout_seconds=300),
+        Case("MTLS-01", "multi-node", lambda context: case_mtls_verifier(product),
+             timeout_seconds=MTLS_TIMEOUT_SECONDS),
+        Case("MTLS-02", "multi-node", lambda context: case_mtls_http_classification(product),
+             timeout_seconds=MTLS_TIMEOUT_SECONDS),
+        Case("MTLS-03", "multi-node", lambda context: case_mtls_panel_auth(product),
+             timeout_seconds=MTLS_TIMEOUT_SECONDS),
+        Case("MTLS-04", "multi-node", lambda context: case_mtls_untrusted_client(product),
+             timeout_seconds=MTLS_TIMEOUT_SECONDS),
+        Case("MTLS-05", "multi-node", lambda context: case_mtls_absent_client(product),
+             timeout_seconds=MTLS_TIMEOUT_SECONDS),
+        Case("MTLS-06", "multi-node", lambda context: case_mtls_mismatched_pair(product),
+             timeout_seconds=MTLS_TIMEOUT_SECONDS),
+        Case("MTLS-07", "multi-node", lambda context: case_mtls_untrusted_ca(product),
+             timeout_seconds=MTLS_TIMEOUT_SECONDS),
+        Case("MTLS-08", "multi-node", lambda context: case_mtls_wrong_sni(product),
+             timeout_seconds=MTLS_TIMEOUT_SECONDS),
     ]

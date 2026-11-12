@@ -21,8 +21,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.podman_e2e import matrix, multi_node, topology  # noqa: E402
-from tools.podman_e2e.runner import Case  # noqa: E402
+from tools.podman_e2e import matrix, mtls, multi_node, topology  # noqa: E402
+from tools.podman_e2e.runner import Case, CaseBlocked  # noqa: E402
 
 
 class _StubContext:
@@ -738,6 +738,331 @@ class TestMultiNodeSuite(unittest.TestCase):
         known = {entry["id"] for entry in catalog.build_catalog()["cases"]}
         for case in multi_node.cases(self.podman):
             self.assertIn(case.id, known, f"{case.id} is not in the shared catalog")
+
+    def test_the_mtls_cases_follow_the_verifier_then_the_negative_controls(self):
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertEqual(ids[3:], [f"MTLS-0{number}" for number in range(1, 9)])
+
+
+class TestMtlsVerifierReport(unittest.TestCase):
+    """MTLS-01/02: the verifier's own lines are the only evidence accepted."""
+
+    VERIFIED = """\
+Verifying mTLS 1.3 handshake with HKDF-derived SNI on 10.89.0.11:3002...
+Derived HKDF SNI (rw-v1): 0f1e2d3c4b5a69788796a5b4c3d2e1f0.9a8b7.c0m
+Payload cryptographic verification PASSED (CA signature, node EC keypair match, RSA JWT public key).
+Initiating mutual TLS 1.3 handshake to https://10.89.0.11:3002 with SNI '0f1e...'
+Handshake SUCCESS: TLSv1.3 negotiated.
+Node response: HTTP/1.1 200 OK
+mTLS 1.3 control plane verification PASSED.
+"""
+
+    def test_the_payload_proof_must_precede_the_socket_attempt(self):
+        facts = mtls.parse_verifier_output(self.VERIFIED)
+        self.assertTrue(facts["payload_crypto_pass"])
+        self.assertTrue(facts["payload_verified_before_socket"])
+        self.assertTrue(facts["handshake_pass"])
+
+    def test_a_payload_proof_printed_after_the_handshake_is_not_an_ordered_proof(self):
+        reordered = self.VERIFIED.replace(
+            "Payload cryptographic verification PASSED", "DELAYED-MARKER",
+        ).replace(
+            "mTLS 1.3 control plane verification PASSED.",
+            mtls.PAYLOAD_MARKER,
+        )
+        facts = mtls.parse_verifier_output(reordered)
+        self.assertTrue(facts["payload_crypto_pass"])
+        self.assertFalse(facts["payload_verified_before_socket"],
+                         "the socket attempt preceded the payload proof")
+
+    def test_a_missing_payload_proof_is_reported_as_missing(self):
+        facts = mtls.parse_verifier_output(self.VERIFIED.replace(mtls.PAYLOAD_MARKER, ""))
+        self.assertFalse(facts["payload_crypto_pass"])
+        self.assertFalse(facts["payload_verified_before_socket"])
+
+    def test_http_200_and_401_are_told_apart(self):
+        self.assertEqual(mtls.parse_verifier_output(self.VERIFIED)["response"], "health")
+        unauthenticated = self.VERIFIED.replace("HTTP/1.1 200 OK", "HTTP/1.1 401 Unauthorized")
+        facts = mtls.parse_verifier_output(unauthenticated)
+        self.assertEqual(facts["response"], "unauthenticated")
+        self.assertEqual(facts["status_line"], "HTTP/1.1 401 Unauthorized")
+        self.assertTrue(facts["handshake_pass"], "a 401 is still a completed handshake")
+
+    def test_an_unrecognised_status_is_neither_health_nor_authentication(self):
+        facts = mtls.parse_verifier_output(self.VERIFIED.replace("HTTP/1.1 200 OK", "HTTP/1.1 502 Bad Gateway"))
+        self.assertEqual(facts["response"], "other")
+        self.assertEqual(mtls.classify_response(""), "none")
+
+    def test_the_derived_sni_is_never_recorded(self):
+        self.assertEqual(mtls.sanitized_lines(self.VERIFIED.__str__()), [
+            line for line in self.VERIFIED.splitlines() if not line.startswith(mtls.SNI_PREFIX)
+        ])
+        self.assertNotIn("0f1e2d3c4b5a69788796a5b4c3d2e1f0", mtls.safe_tail(
+            type("Result", (), {"stdout": self.VERIFIED, "stderr": ""})(),
+        ))
+
+    def test_the_positive_check_is_the_operators_own_path(self):
+        script = mtls.positive_script("10.89.0.11", 3002)
+        self.assertIn('secret="$(extract_secret_key)"', script)
+        self.assertIn('verify_node_mtls_health "$secret" 3002 10.89.0.11 full', script)
+        self.assertNotIn("base64", script,
+                         "the extractor output is already encoded and must not be re-encoded")
+
+
+class TestMtlsNegativeReport(unittest.TestCase):
+    """MTLS-04..08: each negative control is classified by who refused."""
+
+    def test_the_report_is_the_last_json_line(self):
+        stdout = 'warning: something\n{"untrusted_client": {"outcome": "TLS_REJECTED"}}\n'
+        self.assertEqual(mtls.parse_negative_report(stdout),
+                         {"untrusted_client": {"outcome": "TLS_REJECTED"}})
+
+    def test_garbage_is_an_empty_report_rather_than_an_exception(self):
+        self.assertEqual(mtls.parse_negative_report("Traceback (most recent call last):\n{"), {})
+        self.assertEqual(mtls.parse_negative_report(""), {})
+
+    def test_the_negative_script_targets_the_worker_and_keeps_the_payload_local(self):
+        script = mtls.negative_script("10.89.0.11", 3002)
+        self.assertIn('worker_ip = "10.89.0.11"', script)
+        self.assertIn("port = 3002", script)
+        self.assertIn("extract_secret_key", script,
+                      "the Master's own extractor is the only accepted source")
+        self.assertIn("SERVER_CERT_REJECTED", script,
+                      "a server-trust failure must not be reported as a Worker rejection")
+
+
+class _MtlsProduct:
+    """A product stub: the verifier facts and the negative report, nothing else."""
+
+    POSITIVE = {
+        "returncode": 0,
+        "payload_crypto_pass": True,
+        "payload_verified_before_socket": True,
+        "handshake_pass": True,
+        "handshake_line": "Handshake SUCCESS: TLSv1.3 negotiated.",
+        "status_line": "HTTP/1.1 200 OK",
+        "response": "health",
+        "tail": "",
+    }
+    REPORT = {
+        "untrusted_client": {"outcome": "TLS_REJECTED", "error": "SSLError"},
+        "absent_client": {"outcome": "TLS_REJECTED", "error": "SSLError"},
+        "mismatched_crypto_failed": True,
+        "mismatched_socket_calls": 0,
+        "untrusted_ca": {"outcome": "SERVER_CERT_REJECTED",
+                         "error": "SSLCertVerificationError"},
+        "wrong_sni": {"outcome": "TLS_REJECTED", "error": "SSLError"},
+    }
+
+    def __init__(self, positive=None, report=None, connected=True, negative_exit=0):
+        self.positive = dict(self.POSITIVE, **(positive or {}))
+        self.facts = {
+            "returncode": negative_exit,
+            "report": dict(self.REPORT) if report is None else report,
+            "tail": "",
+        }
+        self.connected = connected
+
+    def require_worker(self):
+        return None
+
+    def mtls_positive(self):
+        return self.positive
+
+    def mtls_negatives(self):
+        return self.facts
+
+    def mtls_negative_report(self, case_id):
+        return multi_node.MultiNodeProduct.mtls_negative_report(self, case_id)
+
+    def mtls_negative_outcome(self, case_id, key):
+        return multi_node.MultiNodeProduct.mtls_negative_outcome(self, case_id, key)
+
+    def panel_surface(self, case_id):
+        return {"surface": {
+            "nodes": {"connected": {topology.WORKER_NODE_NAME: self.connected}},
+            "unauthenticated_nodes_status": 401,
+        }}
+
+
+class TestMtlsCases(unittest.TestCase):
+    """MTLS-01..08: every case fails closed on the outcome it must not accept."""
+
+    def _run(self, case, product):
+        return case(product)
+
+    def test_the_verified_handshake_is_accepted(self):
+        facts = self._run(multi_node.case_mtls_verifier, _MtlsProduct())
+        self.assertTrue(facts["payload_verified_before_socket"])
+        self.assertEqual(facts["node_response"], "HTTP/1.1 200 OK")
+
+    def test_a_payload_proof_after_the_socket_is_refused(self):
+        product = _MtlsProduct({"payload_verified_before_socket": False})
+        with self.assertRaises(AssertionError) as caught:
+            self._run(multi_node.case_mtls_verifier, product)
+        self.assertIn("after the socket attempt", str(caught.exception))
+
+    def test_a_failed_verifier_is_refused_with_its_own_output(self):
+        product = _MtlsProduct({"returncode": 1, "handshake_pass": False,
+                                "tail": "Error: mTLS 1.3 handshake failed: timeout"})
+        with self.assertRaises(AssertionError) as caught:
+            self._run(multi_node.case_mtls_verifier, product)
+        self.assertIn("exited 1", str(caught.exception))
+        self.assertIn("handshake failed", str(caught.exception))
+
+    def test_http_200_sets_both_flags(self):
+        facts = self._run(multi_node.case_mtls_http_classification, _MtlsProduct())
+        self.assertTrue(facts["mtls_handshake_pass"])
+        self.assertTrue(facts["worker_http_health_pass"])
+
+    def test_http_401_is_a_handshake_without_health(self):
+        product = _MtlsProduct({"response": "unauthenticated",
+                                "status_line": "HTTP/1.1 401 Unauthorized"})
+        with self.assertRaises(AssertionError) as caught:
+            self._run(multi_node.case_mtls_http_classification, product)
+        message = str(caught.exception)
+        self.assertIn("MTLS_HANDSHAKE_PASS", message)
+        self.assertIn("WORKER_HTTP_HEALTH_PASS is not", message)
+
+    def test_a_handshake_that_never_happened_says_nothing_about_http(self):
+        product = _MtlsProduct({"handshake_pass": False})
+        with self.assertRaises(AssertionError) as caught:
+            self._run(multi_node.case_mtls_http_classification, product)
+        self.assertIn("never succeeded", str(caught.exception))
+
+    def test_the_panel_registry_is_the_only_panel_authentication_proof(self):
+        facts = self._run(multi_node.case_mtls_panel_auth, _MtlsProduct(connected=True))
+        self.assertTrue(facts["panel_worker_auth_pass"])
+        for state in (False, None):
+            product = _MtlsProduct(connected=state)
+            with self.assertRaises(AssertionError) as caught:
+                self._run(multi_node.case_mtls_panel_auth, product)
+            self.assertIn("cannot stand in", str(caught.exception))
+
+    def test_an_untrusted_client_certificate_must_be_rejected_by_the_handshake(self):
+        facts = self._run(multi_node.case_mtls_untrusted_client, _MtlsProduct())
+        self.assertEqual(facts["untrusted_client"]["outcome"], "TLS_REJECTED")
+        answered = _MtlsProduct(report=dict(
+            _MtlsProduct.REPORT,
+            untrusted_client={"outcome": "HTTP_RESPONSE", "status_line": "HTTP/1.1 200 OK"},
+        ))
+        with self.assertRaises(AssertionError) as caught:
+            self._run(multi_node.case_mtls_untrusted_client, answered)
+        self.assertIn("HTTP_RESPONSE", str(caught.exception))
+
+    def test_an_absent_client_certificate_must_be_rejected_by_the_handshake(self):
+        facts = self._run(multi_node.case_mtls_absent_client, _MtlsProduct())
+        self.assertEqual(facts["absent_client"]["outcome"], "TLS_REJECTED")
+        silent = _MtlsProduct(report=dict(
+            _MtlsProduct.REPORT, absent_client={"outcome": "NO_RESPONSE", "version": "TLSv1.3"},
+        ))
+        with self.assertRaises(AssertionError) as caught:
+            self._run(multi_node.case_mtls_absent_client, silent)
+        self.assertIn("NO_RESPONSE", str(caught.exception))
+
+    def test_a_mismatched_pair_must_fail_locally_without_a_socket(self):
+        facts = self._run(multi_node.case_mtls_mismatched_pair, _MtlsProduct())
+        self.assertEqual(facts["sockets_opened"], 0)
+        remote = _MtlsProduct(report=dict(_MtlsProduct.REPORT, mismatched_socket_calls=1))
+        with self.assertRaises(AssertionError) as caught:
+            self._run(multi_node.case_mtls_mismatched_pair, remote)
+        self.assertIn("not local", str(caught.exception))
+        accepted = _MtlsProduct(report=dict(_MtlsProduct.REPORT, mismatched_crypto_failed=False))
+        with self.assertRaises(AssertionError) as caught:
+            self._run(multi_node.case_mtls_mismatched_pair, accepted)
+        self.assertIn("does not match", str(caught.exception))
+
+    def test_an_untrusted_ca_is_a_client_side_failure_not_a_worker_rejection(self):
+        facts = self._run(multi_node.case_mtls_untrusted_ca, _MtlsProduct())
+        self.assertEqual(facts["untrusted_ca"]["outcome"], "SERVER_CERT_REJECTED")
+        misclassified = _MtlsProduct(report=dict(
+            _MtlsProduct.REPORT, untrusted_ca={"outcome": "TLS_REJECTED", "error": "SSLError"},
+        ))
+        with self.assertRaises(AssertionError) as caught:
+            self._run(multi_node.case_mtls_untrusted_ca, misclassified)
+        self.assertIn("client-side certificate verification failure", str(caught.exception))
+
+    def test_a_wrong_sni_is_recorded_however_it_arrives(self):
+        for outcome in ("TLS_REJECTED", "HTTP_RESPONSE"):
+            report = dict(_MtlsProduct.REPORT, wrong_sni={"outcome": outcome})
+            facts = self._run(multi_node.case_mtls_wrong_sni, _MtlsProduct(report=report))
+            self.assertEqual(facts["wrong_sni"]["outcome"], outcome)
+        unanswered = _MtlsProduct(report=dict(
+            _MtlsProduct.REPORT, wrong_sni={"outcome": "NO_RESPONSE", "version": "TLSv1.3"},
+        ))
+        with self.assertRaises(AssertionError) as caught:
+            self._run(multi_node.case_mtls_wrong_sni, unanswered)
+        self.assertIn("unanswered", str(caught.exception))
+
+    def test_a_probe_that_produced_no_report_blocks_instead_of_inventing_failures(self):
+        for case in (multi_node.case_mtls_untrusted_client,
+                     multi_node.case_mtls_absent_client,
+                     multi_node.case_mtls_mismatched_pair,
+                     multi_node.case_mtls_untrusted_ca,
+                     multi_node.case_mtls_wrong_sni):
+            with self.assertRaises(CaseBlocked) as caught:
+                case(_MtlsProduct(negative_exit=1, report={}))
+            self.assertIn("produced no report", str(caught.exception))
+
+
+class _RecordingPodman:
+    """A Podman stand-in that records what the mTLS probes ask the Master to run."""
+
+    def __init__(self):
+        self.exec_bash_calls = []
+        self.exec_calls = []
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=0):
+        self.exec_bash_calls.append((name, script, input_text))
+        return type("Result", (), {"returncode": 0, "stdout": TestMtlsVerifierReport.VERIFIED,
+                                   "stderr": ""})()
+
+    def exec(self, name, argv, check=True, input_text=None, timeout=0):
+        self.exec_calls.append((name, list(argv), input_text))
+        return type("Result", (), {"returncode": 0, "stderr": "",
+                                   "stdout": '{"untrusted_client": {"outcome": "TLS_REJECTED"}}'})()
+
+
+class TestMtlsProbeMemoization(unittest.TestCase):
+    """The probes run once per run, on the Master, and never carry the payload."""
+
+    def _product(self):
+        import types
+
+        podman = _RecordingPodman()
+        product = multi_node.MultiNodeProduct.__new__(multi_node.MultiNodeProduct)
+        product.podman = podman
+        product.topology = types.SimpleNamespace(
+            target_name="aio-test",
+            plan=types.SimpleNamespace(worker_ip="10.89.0.11"),
+        )
+        product.node_add_outcome = types.SimpleNamespace(ok=True)
+        product.mtls_positive_facts = None
+        product.mtls_negative_facts = None
+        product.master = types.SimpleNamespace(require_installed=lambda: None)
+        return product, podman
+
+    def test_the_positive_probe_runs_once_for_both_cases(self):
+        product, podman = self._product()
+        product.mtls_positive()
+        product.mtls_positive()
+        self.assertEqual(len(podman.exec_bash_calls), 1)
+        name, script, input_text = podman.exec_bash_calls[0]
+        self.assertEqual(name, "aio-test")
+        self.assertIn("extract_secret_key", script)
+        self.assertIn("10.89.0.11", script)
+        self.assertIsNone(input_text, "the payload is extracted inside the Master")
+
+    def test_the_negative_probe_runs_once_and_keeps_the_payload_out_of_argv(self):
+        product, podman = self._product()
+        product.mtls_negatives()
+        product.mtls_negatives()
+        self.assertEqual(len(podman.exec_calls), 1)
+        name, argv, input_text = podman.exec_calls[0]
+        self.assertEqual(name, "aio-test")
+        self.assertEqual(argv[:2], ["python3", "-c"])
+        self.assertIn("extract_secret_key", argv[2])
+        self.assertIsNone(input_text)
 
 
 if __name__ == "__main__":
