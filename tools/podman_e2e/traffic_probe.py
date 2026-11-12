@@ -843,6 +843,7 @@ def transfer_one(
     network: str,
     security: str,
     host: str = "",
+    expect_refusal: bool = False,
 ) -> Dict[str, Any]:
     """Send one payload through exactly the matrix tuple the arguments name.
 
@@ -856,6 +857,10 @@ def transfer_one(
     and security layer on both nodes, so without it a Worker tuple would match
     the Master's outbound and prove the wrong node. The verdict stays with the
     caller — this returns what the endpoint recorded.
+
+    ``expect_refusal`` reports a refused connection as the result instead of
+    exiting: a node that was taken down is a state the caller wants to observe,
+    and only the caller can tell that apart from a probe that could not run.
     """
     if not destination:
         raise SystemExit("a destination address is required: the payload needs somewhere to go")
@@ -868,9 +873,11 @@ def transfer_one(
         return not host or str(label.get("server")) == host
 
     if engine == "xray":
-        found = xray_transfers(payload_dir, ca_file, destination, workdir, match=selected)
+        found = xray_transfers(payload_dir, ca_file, destination, workdir, match=selected,
+                               expect_refusal=expect_refusal)
     else:
-        found = mihomo_transfers(payload_dir, ca_file, destination, workdir, match=selected)
+        found = mihomo_transfers(payload_dir, ca_file, destination, workdir, match=selected,
+                                 expect_refusal=expect_refusal)
     if len(found) != 1:
         where = f" on {host}" if host else ""
         raise SystemExit(
@@ -917,6 +924,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--host", default="",
         help="The node's dial name, when the topology has more than one",
     )
+    parser.add_argument(
+        "--expect-refusal", action="store_true",
+        help="Report a refused connection as the transfer result, the way the revoked "
+             "scope does, so a node that is down can be observed rather than crash the probe",
+    )
     parser.add_argument("--workdir", default="")
     args = parser.parse_args(argv)
 
@@ -930,6 +942,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         facts = transfer_one(
             args.payload_dir, args.ca, args.destination, workdir,
             args.engine, args.network, args.security, host=args.host,
+            expect_refusal=args.expect_refusal,
         )
     else:
         scopes = {

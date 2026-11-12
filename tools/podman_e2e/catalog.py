@@ -302,6 +302,27 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "topology": ["aio", "multi-node"],
         "promotion_target": "Result Status Semantics",
     },
+    {
+        "id": "MN-REVOKE",
+        "requirement": "Real client data-plane verification",
+        "assertion": "A cluster client's subscription is served and captured once both nodes' tuples have carried a payload from their own egress addresses, the documented revoke action rotates the credentials and the subscription path with the old path returning 404, and freshly started engines replaying the pre-revocation payload deliver nothing through either node while the controlled endpoint records none of their request ids.",
+        "topology": ["multi-node"],
+        "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
+    },
+    {
+        "id": "MN-OUTAGE",
+        "requirement": "Failure injection and recovery",
+        "assertion": "A subscription captured while the cluster is healthy carries a payload through the Worker, `systemctl stop gowave-node.service` on the Worker is observed by the Panel as that node offline while the Master stays connected and still delivers, the same captured payload is refused through the Worker, and after the unit is started again the node reconnects with its control plane established and the same subscription transfers through the Worker once more.",
+        "topology": ["multi-node"],
+        "promotion_target": "Negative Scenario and Fault Injection Tests",
+    },
+    {
+        "id": "MN-RESTART",
+        "requirement": "Failure injection and recovery",
+        "assertion": "`systemctl restart gowave-node.service` on the Worker starts a new node process, leaves the unit active, and leaves the Panel's registry record unchanged in uuid, endpoint, assigned inbounds and recorded version with the node connected again, and the subscription captured before the restart transfers through the Worker without a client re-import or a resync.",
+        "topology": ["multi-node"],
+        "promotion_target": "Negative Scenario and Fault Injection Tests",
+    },
 ]
 
 SCENARIO_RE = re.compile(r"^#### Scenario:\s*(.+?)\s*$")

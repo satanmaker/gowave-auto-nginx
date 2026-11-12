@@ -18,6 +18,7 @@ import ipaddress
 import json
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import aio, denial, matrix as matrix_data, mtls, topology
@@ -31,11 +32,32 @@ WORKER_CONFIG_CASE_ID = "WRK-06"
 MASTER_ADDRESS_CASE_ID = "PODNET-MASTER-ADDR"
 MANAGEMENT_DENIAL_CASE_ID = "FW-01"
 DENIAL_CLASSIFICATION_CASE_ID = "FW-02"
+REVOCATION_CASE_ID = "MN-REVOKE"
+OUTAGE_CASE_ID = "MN-OUTAGE"
+RESTART_CASE_ID = "MN-RESTART"
 MTLS_TIMEOUT_SECONDS = 300
 DENIAL_TIMEOUT_SECONDS = 300
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 WORKER_REPORT_TIMEOUT_SECONDS = 120
+# A stopped node is only reported offline once the Panel's own heartbeat window
+# has expired, and a node that starts again has to re-register and re-apply its
+# users before it carries a payload, so both waits are bounded but generous.
+OUTAGE_TIMEOUT_SECONDS = 420
+RESTART_TIMEOUT_SECONDS = 420
+RECOVERY_INTERVAL_SECONDS = 5
+WORKER_UNIT = "gowave-node.service"
+# A stop waits for the unit's own TimeoutStopSec before the cgroup is killed, so
+# the action's own budget is wider than the readiness windows above.
+WORKER_SERVICE_TIMEOUT_SECONDS = 300
+# The lifecycle cases drive one real tuple rather than the whole matrix: the
+# engine is the one whose single-transfer path the probe already reports on.
+LIFECYCLE_CLIENT = "xray"
+# Each lifecycle case pays for a baseline transfer, the fault, and a recovery
+# poll, besides the bounded waits above; the case budget has to cover all three
+# or a slow engine start would read as a product failure.
+OUTAGE_CASE_TIMEOUT_SECONDS = OUTAGE_TIMEOUT_SECONDS + 3 * aio.DATA_PLANE_TIMEOUT_SECONDS
+RESTART_CASE_TIMEOUT_SECONDS = RESTART_TIMEOUT_SECONDS + 3 * aio.DATA_PLANE_TIMEOUT_SECONDS
 # The subscription cases build the engine image on first use, fetch five
 # representations from the Panel, and run Xray and Mihomo over each of them.
 SUB_SERVED_TIMEOUT_SECONDS = 900
@@ -442,6 +464,17 @@ class MultiNodeProduct:
     def worker_inbound_count(self) -> int:
         return len(matrix_data.inbounds(self.matrix, vision=self.worker_vision))
 
+    def expected_egress_sources(self) -> List[str]:
+        """The node addresses this cluster's served payloads have to leave from.
+
+        A subscription issued by a cluster names both nodes, so a transfer set
+        that lost one of them would otherwise pass while only the other node was
+        proven — the same reason the revocation case counts what the Panel served
+        rather than one install's own inbounds.
+        """
+        host = self.require_worker()
+        return [host.plan.data_target_ip, str(host.plan.data_worker_ip)]
+
     def declare_data_plane(self, case_ids: Sequence[str]) -> None:
         """Record the declared matrix cases; the registry lives on the Master product.
 
@@ -835,6 +868,139 @@ class MultiNodeProduct:
             "listeners": facts["listeners"],
             "node_service": facts["node_service"],
         }
+
+    # ------------------------------------------------- outage and restart
+    def worker_record(self, case_id: str) -> Dict[str, Any]:
+        """The Panel's registry record for the Worker, refused by name when absent."""
+        self.require_worker()
+        return panel_node(self.cluster_facts(case_id), topology.WORKER_NODE_NAME, case_id)
+
+    def worker_tuple(self) -> Tuple[Dict[str, Any], str]:
+        """The one Worker tuple the lifecycle cases drive, in matrix order.
+
+        The fault cases need a real inbound to carry a payload before the fault
+        and after it, so the tuple comes from the matrix the product is serving
+        rather than from a port the harness picked.
+        """
+        inbounds = matrix_data.inbounds(self.matrix, vision=self.worker_vision)
+        if not inbounds:
+            raise CaseBlocked(
+                f"{OUTAGE_CASE_ID}: the matrix declares no inbound for the Worker, so no "
+                "payload could traverse it"
+            )
+        return inbounds[0], LIFECYCLE_CLIENT
+
+    def master_tuple(self) -> Tuple[Dict[str, Any], str]:
+        """The Master tuple the outage case keeps delivering through.
+
+        It is the control that separates "the Worker is down" from "the cluster is
+        down": the same Panel, the same subscription, one node still serving.
+        """
+        inbounds = matrix_data.inbounds(self.matrix, vision=self.vision)
+        if not inbounds:
+            raise CaseBlocked(
+                f"{OUTAGE_CASE_ID}: the matrix declares no inbound for the Master, so the "
+                "degraded half of the outage would have no control"
+            )
+        return inbounds[0], LIFECYCLE_CLIENT
+
+    def node_transfer(
+        self, case_id: str, node: str, inbound: Dict[str, Any], client: str,
+        expect_refusal: bool = False,
+    ) -> Dict[str, Any]:
+        """One transfer through one node's tuple, refusal-tolerant when asked.
+
+        ``expect_refusal`` is what makes a stopped node measurable: the probe
+        returns the refusal instead of exiting, so the case can tell the product's
+        degraded state from a probe that could not run at all.
+        """
+        return self.master.transfer_facts(
+            case_id, str(inbound["id"]), client, node=node,
+            expect_refusal=expect_refusal,
+        )
+
+    def wait_for_worker_connection(
+        self, case_id: str, expected: bool, timeout_seconds: int,
+    ) -> Dict[str, Any]:
+        """Wait until the Panel reports the Worker connected (or not) and return its record.
+
+        The Panel learns a connection state from the node's own traffic, so both
+        directions lag the unit's state: a stopped node keeps its flag until the
+        heartbeat window expires, and a started one is only connected once it
+        answers. The deadline is what turns that lag into a poll.
+        """
+        observed: Dict[str, Any] = {}
+
+        def matches() -> bool:
+            record = self.worker_record(case_id)
+            observed.clear()
+            observed.update(record)
+            return record.get("connected") is expected
+
+        ready = wait_until(
+            matches, timeout_seconds, f"{case_id} Worker connection",
+            interval_seconds=RECOVERY_INTERVAL_SECONDS,
+        )
+        require(
+            case_id,
+            ready,
+            f"the Panel still reports {topology.WORKER_NODE_NAME!r} as "
+            f"{observed.get('connected')!r} after {timeout_seconds}s, expected "
+            f"{'connected' if expected else 'offline'}",
+        )
+        return observed
+
+    def worker_service(self, action: str, case_id: str) -> Dict[str, Any]:
+        """Run the operator's own systemctl action on the Worker's supervising unit.
+
+        The action's exit code travels back with the state it left, because a
+        shell that carried on after a failed stop would otherwise look like a
+        completed outage. The caller decides what the state means: the outage case
+        has to restore the unit even when its body fails, so it cannot assert here.
+        """
+        host = self.require_worker()
+        script = (
+            f"systemctl {action} {WORKER_UNIT} </dev/null; rc=$?\n"
+            "echo '==returncode'\n"
+            'printf \'%s\\n\' "$rc"\n'
+            "echo '==active'\n"
+            f"systemctl is-active {WORKER_UNIT} || true\n"
+            "echo '==mainpid'\n"
+            f"systemctl show {WORKER_UNIT} -p MainPID --value || true\n"
+        )
+        result = self.podman.exec_bash(
+            host.worker_name, script, check=False, timeout=WORKER_SERVICE_TIMEOUT_SECONDS,
+        )
+        sections = aio.inventory_sections(result.stdout or "")
+        raw = (sections.get("returncode") or [""])[0]
+        returncode = int(raw) if raw.lstrip("-").isdigit() else None
+        return {
+            "action": action,
+            "returncode": returncode,
+            "state": (sections.get("active") or [""])[0],
+            "main_pid": (sections.get("mainpid") or [""])[0],
+            "detail": (result.stderr or "").strip()[-400:] if returncode != 0 else "",
+        }
+
+    def worker_main_pid(self, case_id: str) -> str:
+        """The supervising unit's main PID, read on the Worker itself.
+
+        A Panel that never noticed the blip would otherwise let a "restart" pass
+        without one, so the process identity is observed where the process runs.
+        """
+        host = self.require_worker()
+        result = self.podman.exec_bash(
+            host.worker_name,
+            f"systemctl show {WORKER_UNIT} -p MainPID --value || true",
+            check=False, timeout=60,
+        )
+        require(
+            case_id,
+            result.returncode == 0,
+            f"reading {WORKER_UNIT}'s main PID on the Worker exited {result.returncode}: "
+            f"{(result.stderr or result.stdout or '').strip()[-400:]}",
+        )
+        return (result.stdout or "").strip()
 
 
 def case_worker_registration(product: MultiNodeProduct) -> Dict[str, Any]:
@@ -1867,6 +2033,296 @@ def case_worker_config(product: MultiNodeProduct) -> Dict[str, Any]:
     }
 
 
+def case_worker_outage(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-OUTAGE: stopping the Worker degrades the cluster, and removing the fault restores it.
+
+    One subscription is seen three times. It has to carry a payload *before* the
+    fault, or a refusal afterwards says nothing about the fault. It has to be
+    refused while the Worker's own unit is stopped and the Panel has noticed,
+    while the Master keeps delivering — a cluster-wide silence would be an outage
+    of the test rather than the degradation this case claims. And after the unit
+    is started again the same captured payload has to transfer through the Worker
+    once more, with no client re-import and no reseeding.
+
+    The fault is the case's own to remove: the unit is restored even when a
+    check fails, so a defect here cannot turn every later case into evidence
+    about a cluster left broken.
+    """
+    host = product.require_worker()
+    # Nothing is re-fetched after the fault: the client's payload is the one the
+    # Panel issued while the cluster was still healthy.
+    product.master.subscription_payloads(OUTAGE_CASE_ID)
+    inbound, client = product.worker_tuple()
+
+    baseline = product.node_transfer(
+        OUTAGE_CASE_ID, "worker", inbound, client, expect_refusal=True,
+    )
+    require(
+        OUTAGE_CASE_ID,
+        baseline.get("delivered"),
+        f"the Worker never carried a payload before the fault, so a refusal afterwards "
+        f"would not be the outage's: {baseline.get('reason', '')}",
+    )
+    require(
+        OUTAGE_CASE_ID,
+        baseline.get("status") == 200
+        and baseline.get("request_id_match")
+        and baseline.get("body_match"),
+        f"the Worker's baseline transfer returned {baseline.get('status')!r} without the "
+        "endpoint echoing the payload",
+    )
+    require(
+        OUTAGE_CASE_ID,
+        baseline.get("source_ip") == host.plan.data_worker_ip,
+        f"the baseline payload left from {baseline.get('source_ip')!r} instead of the "
+        f"Worker's own data address {host.plan.data_worker_ip}, so it did not traverse it",
+    )
+
+    stopped = product.worker_service("stop", OUTAGE_CASE_ID)
+    require(
+        OUTAGE_CASE_ID,
+        stopped.get("returncode") == 0,
+        f"`systemctl stop {WORKER_UNIT}` on the Worker exited {stopped.get('returncode')!r}: "
+        f"{stopped.get('detail') or 'no output'}",
+    )
+    require(
+        OUTAGE_CASE_ID,
+        stopped.get("state") != "active",
+        f"{WORKER_UNIT} still reports {stopped.get('state')!r} after `systemctl stop`, so "
+        "the Worker was never taken down",
+    )
+
+    offline_at = time.monotonic()
+    try:
+        product.wait_for_worker_connection(OUTAGE_CASE_ID, False, OUTAGE_TIMEOUT_SECONDS)
+        degraded = product.cluster_facts(OUTAGE_CASE_ID)
+        offline = panel_node(degraded, topology.WORKER_NODE_NAME, OUTAGE_CASE_ID)
+        master_record = panel_node(degraded, LOCAL_NODE_NAME, OUTAGE_CASE_ID)
+        require(
+            OUTAGE_CASE_ID,
+            master_record.get("connected") is True,
+            "the Master's own node is reported offline too, so this is a cluster outage "
+            "rather than the Worker's",
+        )
+        offline_seconds = round(time.monotonic() - offline_at, 1)
+
+        refused = product.node_transfer(
+            OUTAGE_CASE_ID, "worker", inbound, client, expect_refusal=True,
+        )
+        require(
+            OUTAGE_CASE_ID,
+            refused.get("delivered") is False,
+            f"the stopped Worker still carried a payload through {inbound['id']} "
+            f"(status {refused.get('status')!r}), so its unit was not what served it",
+        )
+
+        master_inbound, master_client = product.master_tuple()
+        control = product.node_transfer(
+            OUTAGE_CASE_ID, "master", master_inbound, master_client, expect_refusal=True,
+        )
+        require(
+            OUTAGE_CASE_ID,
+            control.get("delivered")
+            and control.get("status") == 200
+            and control.get("request_id_match")
+            and control.get("body_match"),
+            f"the Master stopped delivering at the same time as the Worker, so the "
+            f"refusal cannot be attributed to the Worker: {control.get('reason', '')}",
+        )
+    finally:
+        restored = product.worker_service("start", OUTAGE_CASE_ID)
+
+    require(
+        OUTAGE_CASE_ID,
+        restored.get("returncode") == 0 and restored.get("state") == "active",
+        f"`systemctl start {WORKER_UNIT}` left the Worker at {restored.get('state')!r} "
+        f"(exit {restored.get('returncode')!r}): {restored.get('detail') or 'no output'}",
+    )
+
+    recovered_at = time.monotonic()
+    product.wait_for_worker_connection(OUTAGE_CASE_ID, True, RESTART_TIMEOUT_SECONDS)
+    # A connected node is not yet a serving one: the Panel has to re-apply the
+    # Worker's users, and its own control channel has to be established again.
+    healthy = product.worker_address_facts(OUTAGE_CASE_ID)
+
+    attempt: Dict[str, Any] = {}
+
+    def delivers() -> bool:
+        facts = product.node_transfer(
+            OUTAGE_CASE_ID, "worker", inbound, client, expect_refusal=True,
+        )
+        attempt.clear()
+        attempt.update(facts)
+        return (
+            bool(facts.get("delivered"))
+            and facts.get("status") == 200
+            and bool(facts.get("request_id_match"))
+            and bool(facts.get("body_match"))
+        )
+
+    delivered = wait_until(
+        delivers, RESTART_TIMEOUT_SECONDS,
+        f"{OUTAGE_CASE_ID} Worker data plane after recovery",
+        interval_seconds=RECOVERY_INTERVAL_SECONDS,
+    )
+    require(
+        OUTAGE_CASE_ID,
+        delivered,
+        f"the Worker never carried the same subscription again within "
+        f"{RESTART_TIMEOUT_SECONDS}s of its unit coming back: "
+        f"{attempt.get('reason') or attempt.get('status') or 'no transfer completed'}",
+    )
+    require(
+        OUTAGE_CASE_ID,
+        attempt.get("source_ip") == host.plan.data_worker_ip,
+        f"the recovered payload left from {attempt.get('source_ip')!r} instead of the "
+        f"Worker's data address {host.plan.data_worker_ip}",
+    )
+    return {
+        "worker_inbound": inbound["id"],
+        "worker_client": client,
+        "baseline_status": baseline.get("status"),
+        "baseline_source_ip": baseline.get("source_ip"),
+        "worker_unit_after_stop": stopped.get("state"),
+        "worker_unit_after_start": restored.get("state"),
+        "panel_worker_offline": offline.get("connected") is False,
+        "panel_master_connected": master_record.get("connected") is True,
+        "offline_seconds": offline_seconds,
+        "refused_status": refused.get("status"),
+        "refused_reason": (refused.get("reason") or "")[:160],
+        "master_control_status": control.get("status"),
+        "master_control_source_ip": control.get("source_ip"),
+        "control_peers": ",".join(healthy.get("peers") or []),
+        "recovered_source_ip": attempt.get("source_ip"),
+        "recovery_seconds": round(time.monotonic() - recovered_at, 1),
+    }
+
+
+def case_worker_restart(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-RESTART: restarting the Worker's unit is maintenance, not a re-registration.
+
+    The restart is bounded the way an operator would bound it, and the Panel's
+    own record is what proves the node stayed the node: the same registry uuid,
+    endpoint, assigned inbounds and version, connected again. The main PID is read
+    on the Worker itself, because a Panel that never noticed the blip would let
+    the whole case pass without a restart ever happening. The subscription
+    captured before the restart then has to carry a payload through the Worker
+    again — no client re-import, no new credentials, no reseeding.
+    """
+    host = product.require_worker()
+    product.master.subscription_payloads(RESTART_CASE_ID)
+    inbound, client = product.worker_tuple()
+    before = product.wait_for_worker_report(RESTART_CASE_ID)
+    before_pid = product.worker_main_pid(RESTART_CASE_ID)
+    require(
+        RESTART_CASE_ID,
+        before_pid not in ("", "0"),
+        f"the Worker's unit reported no main PID before the restart ({before_pid!r}), so the "
+        "restart could not be told from a unit that was never running",
+    )
+
+    restarted = product.worker_service("restart", RESTART_CASE_ID)
+    require(
+        RESTART_CASE_ID,
+        restarted.get("returncode") == 0,
+        f"`systemctl restart {WORKER_UNIT}` on the Worker exited {restarted.get('returncode')!r}: "
+        f"{restarted.get('detail') or 'no output'}",
+    )
+    require(
+        RESTART_CASE_ID,
+        restarted.get("state") == "active",
+        f"{WORKER_UNIT} reports {restarted.get('state')!r} right after the restart",
+    )
+    require(
+        RESTART_CASE_ID,
+        restarted.get("main_pid") not in ("", "0", before_pid),
+        f"{WORKER_UNIT} kept main PID {before_pid!r} across the restart, so no new node "
+        "process was started",
+    )
+
+    after = product.wait_for_worker_connection(RESTART_CASE_ID, True, RESTART_TIMEOUT_SECONDS)
+    changed = [
+        f"{field}: {before.get(field)!r} -> {after.get(field)!r}"
+        for field in ("uuid", "address", "port", "profile")
+        if before.get(field) != after.get(field)
+    ]
+    require(
+        RESTART_CASE_ID,
+        not changed,
+        "the restart re-registered the Worker instead of restarting it: " + "; ".join(changed),
+    )
+    require(
+        RESTART_CASE_ID,
+        (after.get("inbounds") or []) == (before.get("inbounds") or []),
+        f"the Panel now assigns the Worker {after.get('inbounds')} instead of the "
+        f"{before.get('inbounds')} it was serving",
+    )
+    require(
+        RESTART_CASE_ID,
+        (after.get("versions") or {}).get("node") == (before.get("versions") or {}).get("node"),
+        f"the Panel records the Worker's node version as "
+        f"{(after.get('versions') or {}).get('node')!r} after the restart, was "
+        f"{(before.get('versions') or {}).get('node')!r}",
+    )
+    require(
+        RESTART_CASE_ID,
+        not (after.get("state") or {}).get("status_message"),
+        f"the Panel records a node status message after the restart: "
+        f"{(after.get('state') or {}).get('status_message')!r}",
+    )
+    healthy = product.worker_address_facts(RESTART_CASE_ID)
+
+    recovered_at = time.monotonic()
+    attempt: Dict[str, Any] = {}
+
+    def delivers() -> bool:
+        facts = product.node_transfer(
+            RESTART_CASE_ID, "worker", inbound, client, expect_refusal=True,
+        )
+        attempt.clear()
+        attempt.update(facts)
+        return (
+            bool(facts.get("delivered"))
+            and facts.get("status") == 200
+            and bool(facts.get("request_id_match"))
+            and bool(facts.get("body_match"))
+        )
+
+    delivered = wait_until(
+        delivers, RESTART_TIMEOUT_SECONDS,
+        f"{RESTART_CASE_ID} Worker data plane after the restart",
+        interval_seconds=RECOVERY_INTERVAL_SECONDS,
+    )
+    require(
+        RESTART_CASE_ID,
+        delivered,
+        f"the Worker never carried the subscription captured before the restart within "
+        f"{RESTART_TIMEOUT_SECONDS}s: "
+        f"{attempt.get('reason') or attempt.get('status') or 'no transfer completed'}",
+    )
+    require(
+        RESTART_CASE_ID,
+        attempt.get("source_ip") == host.plan.data_worker_ip,
+        f"the recovered payload left from {attempt.get('source_ip')!r} instead of the "
+        f"Worker's data address {host.plan.data_worker_ip}",
+    )
+    return {
+        "worker_inbound": inbound["id"],
+        "worker_client": client,
+        "unit_after_restart": restarted.get("state"),
+        "main_pid_before": before_pid,
+        "main_pid_after": restarted.get("main_pid"),
+        "panel_node_uuid": str(after.get("uuid") or ""),
+        "panel_node_endpoint": f"{after.get('address')}:{after.get('port')}",
+        "panel_inbound_count": len(after.get("inbounds") or []),
+        "panel_node_version": (after.get("versions") or {}).get("node"),
+        "control_peers": ",".join(healthy.get("peers") or []),
+        "recovered_status": attempt.get("status"),
+        "recovered_source_ip": attempt.get("source_ip"),
+        "recovery_seconds": round(time.monotonic() - recovered_at, 1),
+    }
+
+
 def data_plane_cases(product: MultiNodeProduct) -> List[Tuple[str, Dict[str, Any], str, str]]:
     """Every matrix tuple this cluster owes: each node's inbounds, both clients.
 
@@ -1947,5 +2403,18 @@ def cases(
              timeout_seconds=SUB_SERVED_TIMEOUT_SECONDS),
         Case("SUB-B64", "multi-node", lambda context: aio.case_share_links(product.master),
              timeout_seconds=SUB_SHARE_LINK_TIMEOUT_SECONDS),
+        # The lifecycle cases run last: they revoke a client and fault the
+        # Worker's own unit, so nothing that observes a healthy cluster may run
+        # after them and no earlier case may be blamed for their state.
+        Case(REVOCATION_CASE_ID, "multi-node",
+             lambda context: aio.case_revocation(
+                 product.master, REVOCATION_CASE_ID,
+                 expected_sources=product.expected_egress_sources(),
+             ),
+             timeout_seconds=aio.TUNNEL_READY_TIMEOUT_SECONDS + 2 * aio.TRAFFIC_TIMEOUT_SECONDS),
+        Case(OUTAGE_CASE_ID, "multi-node", lambda context: case_worker_outage(product),
+             timeout_seconds=OUTAGE_CASE_TIMEOUT_SECONDS),
+        Case(RESTART_CASE_ID, "multi-node", lambda context: case_worker_restart(product),
+             timeout_seconds=RESTART_CASE_TIMEOUT_SECONDS),
     ])
     return suite

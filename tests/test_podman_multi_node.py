@@ -834,12 +834,23 @@ class TestMultiNodeSuite(unittest.TestCase):
         self.assertEqual(product.data_plane_results,
                          {"MN-DP-master-REALITY-xray": "PASS"})
 
-    def test_the_subscription_representations_close_the_suite(self):
+    def test_the_subscription_representations_close_the_data_plane(self):
         # 5.6: what the Panel serves a client has to be both loadable and this
-        # cluster's, so the two shared subscription cases run last, after every
-        # node they depend on exists.
+        # cluster's, so the two shared subscription cases run after every node
+        # they depend on exists.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[-2:], ["SUB-SERVED", "SUB-B64"])
+        self.assertEqual(ids[34:36], ["SUB-SERVED", "SUB-B64"])
+
+    def test_the_lifecycle_cases_run_last_because_they_fault_the_worker(self):
+        # 5.9: revocation and the Worker's own stop/start/restart change the
+        # cluster under the suite, so nothing that observes a healthy cluster may
+        # run after them.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertEqual(
+            ids[-3:],
+            [multi_node.REVOCATION_CASE_ID, multi_node.OUTAGE_CASE_ID,
+             multi_node.RESTART_CASE_ID],
+        )
 
 
 class TestMtlsVerifierReport(unittest.TestCase):
@@ -1161,6 +1172,436 @@ class TestMtlsProbeMemoization(unittest.TestCase):
         self.assertEqual(argv[:2], ["python3", "-c"])
         self.assertIn("extract_secret_key", argv[2])
         self.assertIsNone(input_text)
+
+
+def worker_record(name=None, connected=True, uuid="uuid-digest", inbounds=("in-1", "in-2"),
+                  versions=None, status_message=""):
+    """One Panel registry record, shaped like the cluster probe's own output."""
+    return {
+        "name": name or topology.WORKER_NODE_NAME,
+        "address": topology.allocate_plan([]).worker_ip,
+        "port": multi_node.NODE_PORT,
+        "connected": connected,
+        "uuid": uuid,
+        "profile": "profile-digest",
+        "inbounds": list(inbounds),
+        "inbound_specs": [],
+        "state": {"connecting": False, "disabled": False, "status_message": status_message},
+        "versions": versions or {"node": "v1.2.3", "xray": "v26.11.9"},
+    }
+
+
+def delivered(source_ip):
+    return {
+        "delivered": True, "status": 200, "request_id_match": True, "body_match": True,
+        "source_ip": source_ip, "reason": "",
+    }
+
+
+def refused():
+    return {
+        "delivered": False, "status": None,
+        "reason": "ConnectionRefusedError: [Errno 111] Connection refused",
+    }
+
+
+class _LifecycleProduct(multi_node.MultiNodeProduct):
+    """The real product with its probes and unit actions scripted.
+
+    Only the network- and systemd-facing methods are replaced: the tuple
+    selection, the Panel record reads and every assertion stay the product's own,
+    so a test drives the same decision path the live run does and can script the
+    states a real Worker takes seconds or minutes to reach.
+    """
+
+    def __init__(self, transfers=(), services=(), panel_connected=True, before=None,
+                 main_pid="4242", healthy=None):
+        self._root = tempfile.TemporaryDirectory()
+        super().__init__(_StubPodman(Path(self._root.name)))
+        self.topology = type("Host", (), {
+            "plan": topology.allocate_plan([]),
+            "worker_name": "worker-test",
+            "target_name": "master-test",
+        })()
+        self.node_add_outcome = topology.InstallOutcome(0, "", "", 1.0, "node add")
+        self.before_record = dict(before or worker_record())
+        self.worker_template = dict(self.before_record)
+        self.panel_connected = panel_connected
+        self.main_pid = main_pid
+        self.healthy = healthy or {"peers": ["10.89.0.10"], "node_service": "active"}
+        self._transfers = list(transfers)
+        self._services = list(services)
+        self.transfer_calls = []
+        self.service_calls = []
+        self.master.subscription_payloads = lambda case_id: {}
+
+    def cleanup(self):
+        self._root.cleanup()
+
+    # ------------------------------------------------------------ scripted I/O
+    def require_installed(self):
+        return self.topology
+
+    def require_worker(self):
+        return self.topology
+
+    def set_worker_connected(self, connected):
+        self.panel_connected = connected
+
+    def cluster_facts(self, case_id):
+        worker = dict(self.worker_template)
+        worker["connected"] = self.panel_connected
+        master = dict(self.worker_template)
+        master.update({"name": multi_node.LOCAL_NODE_NAME, "connected": True})
+        return {"nodes": {"records": [worker, master]}}
+
+    def wait_for_worker_report(self, case_id):
+        return dict(self.before_record)
+
+    def worker_main_pid(self, case_id):
+        return self.main_pid
+
+    def worker_address_facts(self, case_id):
+        return dict(self.healthy)
+
+    def node_transfer(self, case_id, node, inbound, client, expect_refusal=False):
+        self.transfer_calls.append((case_id, node, inbound["id"], client, expect_refusal))
+        if not self._transfers:
+            raise AssertionError("the case made an unscripted transfer")
+        return dict(self._transfers.pop(0))
+
+    def worker_service(self, action, case_id):
+        self.service_calls.append(action)
+        if not self._services:
+            raise AssertionError(f"the case ran an unscripted systemctl {action}")
+        return dict(self._services.pop(0))
+
+
+def stop_and_start(stop_state="inactive", start_state="active", start_returncode=0):
+    return [
+        {"action": "stop", "returncode": 0, "state": stop_state, "main_pid": "0", "detail": ""},
+        {"action": "start", "returncode": start_returncode, "state": start_state,
+         "main_pid": "5151" if start_state == "active" else "0", "detail": ""},
+    ]
+
+
+class TestWorkerOutageCase(unittest.TestCase):
+    """MN-OUTAGE fails closed on every way the degradation could be misread."""
+
+    def product(self, **kwargs):
+        product = _LifecycleProduct(**kwargs)
+        self.addCleanup(product.cleanup)
+        return product
+
+    def poll_once(self):
+        return lambda predicate, *args, **kwargs: predicate()
+
+    def transition(self, *actions):
+        """Apply one scripted Panel state per poll, then evaluate the predicate."""
+        pending = list(actions)
+
+        def poll(predicate, *args, **kwargs):
+            if pending:
+                pending.pop(0)()
+            return predicate()
+
+        return poll
+
+    def test_the_degradation_is_observed_and_the_same_subscription_recovers(self):
+        product = self.product(
+            transfers=[
+                delivered(product_ip := topology.allocate_plan([]).data_worker_ip),
+                refused(),
+                delivered(topology.allocate_plan([]).data_target_ip),
+                delivered(product_ip),
+            ],
+            services=stop_and_start(),
+        )
+        with unittest.mock.patch.object(
+            multi_node, "wait_until",
+            self.transition(lambda: product.set_worker_connected(False),
+                            lambda: product.set_worker_connected(True)),
+        ):
+            evidence = multi_node.case_worker_outage(product)
+        self.assertEqual([call[1] for call in product.transfer_calls],
+                         ["worker", "worker", "master", "worker"])
+        self.assertTrue(all(call[4] for call in product.transfer_calls),
+                        "every fault-time transfer has to be refusal-tolerant")
+        self.assertEqual(product.service_calls, ["stop", "start"])
+        self.assertTrue(evidence["panel_worker_offline"])
+        self.assertTrue(evidence["panel_master_connected"])
+        self.assertIsNone(evidence["refused_status"])
+        self.assertEqual(evidence["master_control_source_ip"],
+                         topology.allocate_plan([]).data_target_ip)
+        self.assertEqual(evidence["recovered_source_ip"],
+                         topology.allocate_plan([]).data_worker_ip)
+
+    def test_a_worker_that_keeps_delivering_after_stopping_fails_the_case(self):
+        product = self.product(
+            transfers=[delivered(topology.allocate_plan([]).data_worker_ip),
+                       delivered(topology.allocate_plan([]).data_worker_ip)],
+            services=stop_and_start(),
+        )
+        with unittest.mock.patch.object(
+            multi_node, "wait_until",
+            self.transition(lambda: product.set_worker_connected(False),
+                            lambda: product.set_worker_connected(True)),
+        ):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.case_worker_outage(product)
+        self.assertIn("still carried a payload", str(caught.exception))
+
+    def test_a_fault_the_master_cannot_survive_is_not_attributed_to_the_worker(self):
+        product = self.product(
+            transfers=[delivered(topology.allocate_plan([]).data_worker_ip),
+                       refused(), refused()],
+            services=stop_and_start(),
+        )
+        with unittest.mock.patch.object(
+            multi_node, "wait_until",
+            self.transition(lambda: product.set_worker_connected(False),
+                            lambda: product.set_worker_connected(True)),
+        ):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.case_worker_outage(product)
+        self.assertIn("cannot be attributed to the Worker", str(caught.exception))
+
+    def test_the_fault_is_removed_even_when_a_check_fails(self):
+        product = self.product(
+            transfers=[delivered(topology.allocate_plan([]).data_worker_ip),
+                       delivered(topology.allocate_plan([]).data_worker_ip)],
+            services=stop_and_start(),
+        )
+        with unittest.mock.patch.object(
+            multi_node, "wait_until",
+            self.transition(lambda: product.set_worker_connected(False),
+                            lambda: product.set_worker_connected(True)),
+        ):
+            with self.assertRaises(AssertionError):
+                multi_node.case_worker_outage(product)
+        self.assertEqual(product.service_calls, ["stop", "start"],
+                         "a failed case must still start the unit it stopped")
+
+    def test_a_unit_that_does_not_come_back_fails_the_case(self):
+        product = self.product(
+            transfers=[delivered(topology.allocate_plan([]).data_worker_ip),
+                       refused(),
+                       delivered(topology.allocate_plan([]).data_target_ip)],
+            services=stop_and_start(start_state="failed", start_returncode=1),
+        )
+        with unittest.mock.patch.object(
+            multi_node, "wait_until",
+            self.transition(lambda: product.set_worker_connected(False),
+                            lambda: product.set_worker_connected(True)),
+        ):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.case_worker_outage(product)
+        self.assertIn("left the Worker at 'failed'", str(caught.exception))
+
+    def panel_and_dead_data_plane(self, *actions):
+        """Let the Panel wait follow a scripted state, but never let the data plane return."""
+        pending = list(actions)
+
+        def poll(predicate, timeout_seconds, description, **kwargs):
+            if "Worker connection" in description:
+                if pending:
+                    pending.pop(0)()
+                return predicate()
+            return False
+
+        return poll
+
+    def test_a_worker_that_never_carries_the_subscription_again_fails_the_case(self):
+        product = self.product(
+            transfers=[delivered(topology.allocate_plan([]).data_worker_ip),
+                       refused(),
+                       delivered(topology.allocate_plan([]).data_target_ip)],
+            services=stop_and_start(),
+        )
+        with unittest.mock.patch.object(
+            multi_node, "wait_until",
+            self.panel_and_dead_data_plane(
+                lambda: product.set_worker_connected(False),
+                lambda: product.set_worker_connected(True),
+            ),
+        ):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.case_worker_outage(product)
+        self.assertIn("never carried the same subscription again", str(caught.exception))
+
+    def test_a_panel_that_never_reports_the_worker_offline_fails_the_wait(self):
+        product = self.product()
+        with unittest.mock.patch.object(multi_node, "wait_until", lambda *args, **kwargs: False):
+            with self.assertRaises(AssertionError) as caught:
+                product.wait_for_worker_connection(multi_node.OUTAGE_CASE_ID, False, 1)
+        self.assertIn("still reports", str(caught.exception))
+
+
+class TestWorkerRestartCase(unittest.TestCase):
+    """MN-RESTART proves a new process came up without a new registration."""
+
+    def product(self, **kwargs):
+        product = _LifecycleProduct(**kwargs)
+        self.addCleanup(product.cleanup)
+        return product
+
+    def poll_once(self):
+        return lambda predicate, *args, **kwargs: predicate()
+
+    def restart(self, pid="5151", state="active", returncode=0):
+        return {"action": "restart", "returncode": returncode, "state": state,
+                "main_pid": pid, "detail": ""}
+
+    def test_the_restart_keeps_the_node_and_the_subscription_transfers(self):
+        plan = topology.allocate_plan([])
+        product = self.product(
+            transfers=[delivered(plan.data_worker_ip)],
+            services=[self.restart()],
+        )
+        with unittest.mock.patch.object(multi_node, "wait_until", self.poll_once()):
+            evidence = multi_node.case_worker_restart(product)
+        self.assertEqual(product.service_calls, ["restart"])
+        self.assertEqual(evidence["unit_after_restart"], "active")
+        self.assertEqual(evidence["main_pid_before"], "4242")
+        self.assertEqual(evidence["main_pid_after"], "5151")
+        self.assertEqual(evidence["panel_node_endpoint"],
+                         f"{plan.worker_ip}:{multi_node.NODE_PORT}")
+        self.assertEqual(evidence["recovered_source_ip"], plan.data_worker_ip)
+
+    def test_a_process_that_was_not_replaced_fails_the_case(self):
+        product = self.product(services=[self.restart(pid="4242")])
+        with unittest.mock.patch.object(multi_node, "wait_until", self.poll_once()):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.case_worker_restart(product)
+        self.assertIn("kept main PID", str(caught.exception))
+
+    def test_a_failed_restart_fails_the_case(self):
+        product = self.product(services=[self.restart(state="failed", returncode=1)])
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_worker_restart(product)
+        self.assertIn("systemctl restart gowave-node.service", str(caught.exception))
+
+    def test_a_unit_that_is_not_active_after_the_restart_fails_the_case(self):
+        product = self.product(services=[self.restart(state="activating")])
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_worker_restart(product)
+        self.assertIn("right after the restart", str(caught.exception))
+
+    def test_a_restart_that_re_registers_the_worker_fails_the_case(self):
+        product = self.product(transfers=[], services=[self.restart()])
+        product.worker_template["uuid"] = "another-uuid"
+        with unittest.mock.patch.object(multi_node, "wait_until", self.poll_once()):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.case_worker_restart(product)
+        self.assertIn("re-registered the Worker instead of restarting it",
+                      str(caught.exception))
+
+    def test_a_changed_inbound_assignment_fails_the_case(self):
+        product = self.product(services=[self.restart()])
+        product.worker_template["inbounds"] = ["in-1"]
+        with unittest.mock.patch.object(multi_node, "wait_until", self.poll_once()):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.case_worker_restart(product)
+        self.assertIn("now assigns the Worker", str(caught.exception))
+
+    def test_a_rejected_config_after_the_restart_fails_the_case(self):
+        product = self.product(services=[self.restart()])
+        product.worker_template["state"] = {
+            "connecting": False, "disabled": False, "status_message": "config rejected",
+        }
+        with unittest.mock.patch.object(multi_node, "wait_until", self.poll_once()):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.case_worker_restart(product)
+        self.assertIn("node status message", str(caught.exception))
+
+    def panel_and_dead_data_plane(self, *actions):
+        """Let the Panel wait follow a scripted state, but never let the data plane return."""
+        pending = list(actions)
+
+        def poll(predicate, timeout_seconds, description, **kwargs):
+            if "Worker connection" in description:
+                if pending:
+                    pending.pop(0)()
+                return predicate()
+            return False
+
+        return poll
+
+    def test_a_subscription_that_never_transfers_again_fails_the_case(self):
+        product = self.product(
+            transfers=[refused()], services=[self.restart()],
+        )
+        with unittest.mock.patch.object(
+            multi_node, "wait_until", self.panel_and_dead_data_plane(),
+        ):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.case_worker_restart(product)
+        self.assertIn("never carried the subscription captured before the restart",
+                      str(caught.exception))
+
+
+class _ScriptedPodman:
+    """A podman stub that answers the Worker's unit commands with a fixed script output."""
+
+    def __init__(self, stdout, returncode=0, stderr=""):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.stderr = stderr
+        self.scripts = []
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=0):
+        self.scripts.append((name, script))
+        return type("Result", (), {
+            "returncode": self.returncode, "stdout": self.stdout, "stderr": self.stderr,
+        })()
+
+
+class TestWorkerUnitControl(unittest.TestCase):
+    """The unit action is the operator's own and its exit code is never lost."""
+
+    def product(self, stdout, returncode=0, stderr=""):
+        product = multi_node.MultiNodeProduct.__new__(multi_node.MultiNodeProduct)
+        product.podman = _ScriptedPodman(stdout, returncode, stderr)
+        product.topology = type("Host", (), {
+            "worker_name": "worker-test", "plan": topology.allocate_plan([]),
+        })()
+        product.node_add_outcome = topology.InstallOutcome(0, "", "", 1.0, "node add")
+        product.master = type("Master", (), {"require_installed": lambda self: None})()
+        return product, product.podman
+
+    REPORT = (
+        "==returncode\n0\n"
+        "==active\ninactive\n"
+        "==mainpid\n0\n"
+    )
+
+    def test_the_action_runs_against_the_workers_own_unit(self):
+        product, podman = self.product(self.REPORT)
+        facts = product.worker_service("stop", multi_node.OUTAGE_CASE_ID)
+        name, script = podman.scripts[0]
+        self.assertEqual(name, "worker-test")
+        self.assertIn("systemctl stop gowave-node.service </dev/null", script)
+        self.assertIn("rc=$?", script)
+        self.assertEqual(facts["action"], "stop")
+        self.assertEqual(facts["returncode"], 0)
+        self.assertEqual(facts["state"], "inactive")
+        self.assertEqual(facts["main_pid"], "0")
+
+    def test_a_failed_action_reports_its_exit_code_and_output(self):
+        product, _ = self.product(
+            "==returncode\n1\n==active\nfailed\n==mainpid\n0\n",
+            stderr="Job for gowave-node.service failed because the control process exited",
+        )
+        facts = product.worker_service("restart", multi_node.RESTART_CASE_ID)
+        self.assertEqual(facts["returncode"], 1)
+        self.assertEqual(facts["state"], "failed")
+        self.assertIn("control process exited", facts["detail"])
+
+    def test_an_output_without_a_return_code_is_not_a_success(self):
+        product, _ = self.product("")
+        facts = product.worker_service("start", multi_node.OUTAGE_CASE_ID)
+        self.assertIsNone(facts["returncode"])
+        self.assertEqual(facts["detail"], "")
 
 
 if __name__ == "__main__":

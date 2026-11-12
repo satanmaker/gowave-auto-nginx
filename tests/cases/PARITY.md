@@ -84,6 +84,9 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **GATE-COVERAGE** — promotion target: Result Status Semantics
 - **GATE-PREPUSH** — promotion target: Result Status Semantics
 - **GATE-DIVERGENCE** — promotion target: Result Status Semantics
+- **MN-REVOKE** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-OUTAGE** — promotion target: Negative Scenario and Fault Injection Tests
+- **MN-RESTART** — promotion target: Negative Scenario and Fault Injection Tests
 - **AIO-DP-REALITY-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-REALITY-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-XHTTP-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints

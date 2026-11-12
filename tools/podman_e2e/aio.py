@@ -423,6 +423,7 @@ class AioProduct:
 
     def transfer_facts(
         self, case_id: str, inbound_id: str, client: str, node: str = "",
+        expect_refusal: bool = False,
     ) -> Dict[str, Any]:
         """Run exactly one matrix tuple: one client through one inbound.
 
@@ -434,12 +435,16 @@ class AioProduct:
         transport/security pairs on both nodes, so the probe is narrowed by the
         node's own dial name; otherwise it would run the first match and call it
         this one.
+
+        ``expect_refusal`` keeps a refused connection in the result instead of
+        failing the probe, which is how a case measures a node that was stopped.
         """
         host = self.require_installed()
         inbound = matrix.inbound(self.matrix, inbound_id)
         return self._probe_json(case_id, "the transfer probe", host.transfer_facts(
             client, str(inbound["transport"]), str(inbound["security"]),
             host=matrix_expectations(self, inbound, node)["server"],
+            expect_refusal=expect_refusal,
         ))
 
     def prohibited_facts(self, case_id: str) -> Dict[str, Any]:
@@ -928,8 +933,11 @@ def case_client_lifecycle(product: AioProduct) -> Dict[str, Any]:
     return facts
 
 
-def case_revocation(product: AioProduct) -> Dict[str, Any]:
-    """AIO-REVOKE: revoked access stops transferring, and the Panel says so.
+def case_revocation(
+    product: AioProduct, case_id: str = "AIO-REVOKE",
+    expected_sources: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """AIO-REVOKE/MN-REVOKE: revoked access stops transferring, and the Panel says so.
 
     The client is created through the real API, its subscription is captured while
     it still works, and a payload travels through every transport with it — after
@@ -944,82 +952,89 @@ def case_revocation(product: AioProduct) -> Dict[str, Any]:
 
     The client is deleted whether the case passes or not, so a failed run cannot
     leave inventory that changes the next run's assertions.
+
+    A cluster runs the same body: the client's subscription carries both nodes'
+    inbounds, so the transfer count comes from what the Panel served rather than
+    from the one install's own inbound list, and the egress addresses have to be
+    exactly the nodes that subscription names — an egress set that lost a node
+    would otherwise pass while the revocation was only proven on the other one.
     """
     host = product.require_installed()
+    sources = list(expected_sources or [host.plan.data_target_ip])
     # The Panel probe runs on the target, where the payload volume is mounted at
     # PAYLOAD_MOUNT; the engines run in the client, where the same volume is
     # mounted read-only at SECRETS_MOUNT.
     payload_dir = f"{topology.SECRETS_MOUNT}/{panel_surface.REVOKE_DIRECTORY}"
     issue = panel_probe(
-        product, "AIO-REVOKE", "revoke", f"--step issue --payload-dir {topology.PAYLOAD_MOUNT}",
+        product, case_id, "revoke", f"--step issue --payload-dir {topology.PAYLOAD_MOUNT}",
     ).get("revocation") or {}
-    require("AIO-REVOKE", issue.get("squad_requested"),
+    require(case_id, issue.get("squad_requested"),
             "no 'Default MVP Squad' exists, so the revocation client could not be granted an inbound")
-    require("AIO-REVOKE", issue.get("create_status") == 201,
+    require(case_id, issue.get("create_status") == 201,
             f"POST /api/users returned {issue.get('create_status')!r} instead of 201")
-    require("AIO-REVOKE", issue.get("patch_status") == 200,
+    require(case_id, issue.get("patch_status") == 200,
             f"PATCH /api/users/{{id}} returned {issue.get('patch_status')!r} instead of 200")
-    require("AIO-REVOKE", issue.get("patch_visible"),
+    require(case_id, issue.get("patch_visible"),
             "the traffic limit written by PATCH /api/users/{id} is not visible on read back")
     representations = issue.get("representations") or {}
     unserved = sorted(name for name, facts in representations.items() if (facts or {}).get("status") != 200)
-    require("AIO-REVOKE", not unserved, f"the created client was not served: {', '.join(unserved)}")
-    require("AIO-REVOKE", bool(issue.get("credential_digest")),
+    require(case_id, not unserved, f"the created client was not served: {', '.join(unserved)}")
+    require(case_id, bool(issue.get("credential_digest")),
             "the captured subscription carries no credential to compare against after revoking")
 
     try:
-        tunnel = product.wait_tunnel_ready("AIO-REVOKE", payload_dir=payload_dir)
-        positive = product.traffic_facts("AIO-REVOKE", "traffic", payload_dir=payload_dir)
-        expected = product.inbound_count * len(TRAFFIC_ENGINES)
-        require("AIO-REVOKE", int(positive.get("transfer_count") or 0) == expected,
+        tunnel = product.wait_tunnel_ready(case_id, payload_dir=payload_dir)
+        positive = product.traffic_facts(case_id, "traffic", payload_dir=payload_dir)
+        expected = product.subscription_inbound_count * len(TRAFFIC_ENGINES)
+        require(case_id, int(positive.get("transfer_count") or 0) == expected,
                 f"the issued client transferred through {positive.get('transfer_count')!r} "
                 f"transports, expected {expected}")
-        require("AIO-REVOKE", int(positive.get("missing_request_ids") or 0) == 0,
+        require(case_id, int(positive.get("missing_request_ids") or 0) == 0,
                 f"the endpoint never saw {positive.get('missing_request_ids')!r} of the issued "
                 "client's requests")
         unverified = [item["tag"] for item in positive.get("transfers") or []
                       if not (item.get("request_id_match") and item.get("body_match"))]
-        require("AIO-REVOKE", not unverified,
+        require(case_id, not unverified,
                 f"the endpoint did not echo the payload for: {', '.join(unverified)}")
-        require("AIO-REVOKE", positive.get("source_ips") == [host.plan.data_target_ip],
+        require(case_id, sorted(positive.get("source_ips") or []) == sorted(sources),
                 f"the issued client's payload left from {positive.get('source_ips')!r} "
-                f"instead of the installed host {host.plan.data_target_ip}")
+                f"instead of the node egress addresses {sorted(sources)}")
 
         applied = panel_probe(
-            product, "AIO-REVOKE", "revoke", f"--step apply --payload-dir {topology.PAYLOAD_MOUNT}",
+            product, case_id, "revoke", f"--step apply --payload-dir {topology.PAYLOAD_MOUNT}",
         ).get("revocation") or {}
-        require("AIO-REVOKE", applied.get("revoke_status") == 200,
+        require(case_id, applied.get("revoke_status") == 200,
                 f"POST /api/users/{{id}}/actions/revoke returned {applied.get('revoke_status')!r}")
-        require("AIO-REVOKE", applied.get("revoked_at_present"),
+        require(case_id, applied.get("revoked_at_present"),
                 "the revoke action reported no subRevokedAt, so the Panel recorded no revocation")
-        require("AIO-REVOKE", applied.get("short_uuid_rotated"),
+        require(case_id, applied.get("short_uuid_rotated"),
                 "the revoke action did not rotate the subscription path")
-        require("AIO-REVOKE", applied.get("old_subscription_status") == 404,
+        require(case_id, applied.get("old_subscription_status") == 404,
                 f"the revoked subscription path still answers with "
                 f"{applied.get('old_subscription_status')!r} instead of 404")
-        require("AIO-REVOKE", applied.get("new_subscription_status") == 200,
+        require(case_id, applied.get("new_subscription_status") == 200,
                 f"the rotated subscription path answers {applied.get('new_subscription_status')!r}")
-        require("AIO-REVOKE", applied.get("credential_digest_changed"),
+        require(case_id, applied.get("credential_digest_changed"),
                 "the subscription served after revoking carries the same credentials as before")
 
-        negative = product.traffic_facts("AIO-REVOKE", "revoked", payload_dir=payload_dir)
-        require("AIO-REVOKE", int(negative.get("delivered") or 0) == 0,
+        negative = product.traffic_facts(case_id, "revoked", payload_dir=payload_dir)
+        require(case_id, int(negative.get("delivered") or 0) == 0,
                 f"{negative.get('delivered')!r} transports still delivered a payload with revoked access")
-        require("AIO-REVOKE", int(negative.get("refused") or 0) == int(negative.get("attempt_count") or -1),
+        require(case_id, int(negative.get("refused") or 0) == int(negative.get("attempt_count") or -1),
                 f"{negative.get('refused')!r} of {negative.get('attempt_count')!r} attempts were refused")
-        require("AIO-REVOKE", int(negative.get("attempt_count") or 0) == expected,
+        require(case_id, int(negative.get("attempt_count") or 0) == expected,
                 f"the revoked access exercised {negative.get('attempt_count')!r} transports, "
                 f"expected {expected}")
-        require("AIO-REVOKE", int(negative.get("recorded_request_ids") or 0) == 0,
+        require(case_id, int(negative.get("recorded_request_ids") or 0) == 0,
                 "the endpoint recorded a request sent with revoked access")
     finally:
         cleanup = panel_probe(
-            product, "AIO-REVOKE", "revoke", f"--step cleanup --payload-dir {topology.PAYLOAD_MOUNT}",
+            product, case_id, "revoke", f"--step cleanup --payload-dir {topology.PAYLOAD_MOUNT}",
         ).get("revocation") or {}
-        require("AIO-REVOKE", cleanup.get("delete_status") == 204,
+        require(case_id, cleanup.get("delete_status") == 204,
                 f"deleting the revocation client returned {cleanup.get('delete_status')!r} "
                 "instead of 204")
-        require("AIO-REVOKE", cleanup.get("after_delete_status") == 404,
+        require(case_id, cleanup.get("after_delete_status") == 404,
                 f"the revocation client is still served after deletion "
                 f"(status {cleanup.get('after_delete_status')!r})")
 
@@ -1031,6 +1046,7 @@ def case_revocation(product: AioProduct) -> Dict[str, Any]:
         "readiness_network": tunnel.get("network"),
         "positive_transfer_count": positive.get("transfer_count"),
         "positive_source_ips": ",".join(positive.get("source_ips") or []),
+        "expected_source_ips": ",".join(sorted(sources)),
         "revoke_status": applied.get("revoke_status"),
         "revoked_at_present": applied.get("revoked_at_present"),
         "old_subscription_status": applied.get("old_subscription_status"),
