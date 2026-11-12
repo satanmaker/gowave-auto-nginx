@@ -270,6 +270,7 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn("location /.well-known/acme-challenge/ {", body)
         self.assertIn("root /var/www/gowave-acme;", body)
         self.assertNotIn(f"rm -f {vhost}", body)
+        self.assertIn("return 301 https://\\$host\\$request_uri;", body)
 
         rollback_start = payload.index("compensate_remote_worker() {")
         self.assertIn(vhost, payload[rollback_start:])
