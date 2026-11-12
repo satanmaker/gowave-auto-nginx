@@ -399,6 +399,25 @@ Status: active
         facts = multi_node.parse_worker_control(self.REPORT)
         self.assertEqual(len(facts["peers"]), 1)
 
+    def test_a_dual_stack_socket_reports_the_master_as_plain_ipv4(self):
+        # The node binds ``::``, so an IPv4 Master arrives on an IPv6 socket and
+        # ``ss`` prints the peer as ``[::ffff:10.89.0.10]:port``. Comparing that
+        # text with the plan's address would fail on notation, not on routing.
+        report = self.REPORT.replace(
+            "10.89.0.11:3002     10.89.0.10:54122",
+            "[::ffff:10.89.0.11]:3002     [::ffff:10.89.0.10]:54122",
+        ).replace(
+            "10.89.0.11:3002     10.89.0.10:54124",
+            "[::ffff:10.89.0.11]:3002     [::ffff:10.89.0.10]:54124",
+        )
+        facts = multi_node.parse_worker_control(report)
+        self.assertEqual(facts["peers"], ["10.89.0.10"])
+
+    def test_a_plain_ipv6_peer_keeps_its_own_notation(self):
+        self.assertEqual(multi_node.normalize_peer_host("[fd00::1]"), "fd00::1")
+        self.assertEqual(multi_node.normalize_peer_host("[::ffff:203.0.113.9]"), "203.0.113.9")
+        self.assertEqual(multi_node.normalize_peer_host("[not-an-address]"), "[not-an-address]")
+
     def test_the_firewall_rule_names_the_master_address(self):
         facts = multi_node.parse_worker_control(self.REPORT)
         self.assertEqual(
