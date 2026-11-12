@@ -245,7 +245,18 @@ def engine_representations(overrides=None):
                    "schemes": ["trojan", "vless"]},
         "xray_json": {"shape": "list", "entries": 4, "wrapped": 0, "protocols": ["trojan", "vless"]},
         "mihomo": {"proxies": 4, "proxy_types": ["trojan", "vless"], "groups": 1, "rules": 1,
-                   "match_rule": True, "exit": 0},
+                   "match_rule": True, "exit": 0,
+                   "proxy_details": [
+                       {"name": "REALITY", "type": "vless", "server": "panel.testbed.internal",
+                        "network": "tcp", "tls": "true",
+                        "servername": "reality.testbed.internal"},
+                       {"name": "XHTTP", "type": "vless", "server": "panel.testbed.internal",
+                        "network": "xhttp", "tls": "true"},
+                       {"name": "WS", "type": "vless", "server": "panel.testbed.internal",
+                        "network": "ws", "tls": "true"},
+                       {"name": "TROJAN", "type": "trojan", "server": "panel.testbed.internal",
+                        "network": "tcp", "tls": "true"},
+                   ]},
         "clash": {"proxies": 1, "proxy_types": ["trojan"], "groups": 1, "rules": 1,
                   "match_rule": True, "exit": 0},
         "singbox": {"parsed": True, "outbounds": 4},
@@ -851,6 +862,24 @@ class StubEngineHost:
         self.timeouts.append(timeout)
         return self.results.pop(0)
 
+    def engine_hosts(self):
+        domains = [self.panel_domain, self.reality_domain]
+        if self.vision_domain:
+            domains.append(self.vision_domain)
+        return {domain: self.target_name for domain in domains}
+
+    def subscription_domains(self):
+        required_hosts = {self.panel_domain}
+        required_snis = {self.reality_domain}
+        if self.vision_domain:
+            required_hosts.add(self.vision_domain)
+            required_snis.add(self.vision_domain)
+        return {
+            "allowed": set(self.engine_hosts()),
+            "required_hosts": required_hosts,
+            "required_snis": required_snis,
+        }
+
 
 def panel_result(payload, returncode=0):
     body = payload if isinstance(payload, str) else json.dumps(payload)
@@ -1065,7 +1094,7 @@ class TestSubscriptionCases(unittest.TestCase):
             host_scripts=[panel_result({"subscriptions": served_facts()})],
             engine_results=[engine_result(engine_share_links({
                 "hosts": [aio.PANEL_DOMAIN, topology.REALITY_DOMAIN, topology.VISION_DOMAIN],
-                "snis": [topology.VISION_DOMAIN],
+                "snis": [topology.REALITY_DOMAIN, topology.VISION_DOMAIN],
             }))],
         )
         product.host.vision_domain = topology.VISION_DOMAIN

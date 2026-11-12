@@ -747,9 +747,16 @@ class TestMultiNodeSuite(unittest.TestCase):
         ids = [case.id for case in multi_node.cases(self.podman)]
         self.assertEqual(ids[11:14], ["CLUS-01", "CLUS-02", "CLUS-03"])
 
-    def test_the_worker_state_audit_closes_the_suite(self):
+    def test_the_worker_state_audit_follows_the_cluster_audit(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[14:], ["WRK-05", "WRK-06"])
+        self.assertEqual(ids[14:16], ["WRK-05", "WRK-06"])
+
+    def test_the_subscription_representations_close_the_suite(self):
+        # 5.6: what the Panel serves a client has to be both loadable and this
+        # cluster's, so the two shared subscription cases run last, after every
+        # node they depend on exists.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertEqual(ids[16:], ["SUB-SERVED", "SUB-B64"])
 
 
 class TestMtlsVerifierReport(unittest.TestCase):
