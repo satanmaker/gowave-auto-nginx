@@ -58,6 +58,8 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 
 - **AIO-INSTALL** — promotion target: All-in-One Master VPS Installation Verification
 - **AIO-PACKAGES** — promotion target: All-in-One Master VPS Installation Verification
+- **AIO-AUTH** — promotion target: All-in-One Master VPS Installation Verification
+- **AIO-CLIENT** — promotion target: Real Subscription Delivery and User-Agent Policy
 - **SUB-B64** — promotion target: Real Subscription Delivery and User-Agent Policy
 - **SUB-UA-BLANK** — promotion target: Real Subscription Delivery and User-Agent Policy
 - **SUB-JSON-SHAPES** — promotion target: Real Subscription Delivery and User-Agent Policy

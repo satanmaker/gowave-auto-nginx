@@ -29,6 +29,8 @@ SUITES = {
         "test_podman_topology.TestPodmanTopology",
         "test_podman_aio.TestAioSuite",
         "test_podman_aio.TestAioVerificationCases",
+        "test_podman_aio.TestPanelApiCases",
+        "test_podman_aio.TestPanelSurfaceProbe",
         "test_podman_cleanup.TestPodmanStaleRunRecovery",
         "test_fixture_dns.TestDnsFixture",
         "test_fixture_echo.TestEchoFixture",
