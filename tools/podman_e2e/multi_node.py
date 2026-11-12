@@ -39,11 +39,16 @@ REVOCATION_CASE_ID = "MN-REVOKE"
 OUTAGE_CASE_ID = "MN-OUTAGE"
 RESTART_CASE_ID = "MN-RESTART"
 VISION_CASE_ID = "MN-VISION"
+SSH_KEY_CASE_ID = "MN-SSHKEY"
 MTLS_TIMEOUT_SECONDS = 300
 DENIAL_TIMEOUT_SECONDS = 300
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 VISION_PROBE_TIMEOUT_SECONDS = 120
+SSH_TRUST_TIMEOUT_SECONDS = 240
+# The transaction id only has to satisfy the product's own format; it names a
+# leftover snapshot the case plants on the Worker to observe a remote effect.
+SSH_ROTATION_TX_ID = "worker_install_sshkey_rotation"
 WORKER_REPORT_TIMEOUT_SECONDS = 120
 # A stopped node is only reported offline once the Panel's own heartbeat window
 # has expired, and a node that starts again has to re-register and re-apply its
@@ -854,6 +859,29 @@ class MultiNodeProduct:
         )
         return facts
 
+    def remote_finalize(
+        self, known_hosts: str, transaction: str,
+        timeout: int = SSH_TRUST_TIMEOUT_SECONDS,
+    ) -> Any:
+        """Run the product's own remote-finalize SSH operation on the Worker.
+
+        ``remote_finalize`` is the controller's documented Worker operation: it
+        requires a pinned host key, connects with ``StrictHostKeyChecking=yes``
+        against exactly that file, and deletes the named ACME recovery snapshot.
+        Because the deletion is observable on the Worker, its presence or absence
+        tells an executed remote command from a refused connection.
+        """
+        host = self.require_installed()
+        script = (
+            f"ACME_TX_ID={shlex.quote(transaction)} "
+            f"SSH_KNOWN_HOSTS={shlex.quote(known_hosts)} "
+            f"bash {topology.REPO_IN_CONTAINER}/gowave-node-auto.sh remote_finalize "
+            f"{shlex.quote(host.plan.worker_ip)} 22 root"
+        )
+        return self.podman.exec_bash(
+            host.target_name, script, check=False, timeout=timeout,
+        )
+
     def worker_control_facts(self, case_id: str, timeout: int = 120) -> Dict[str, Any]:
         host = self.require_installed()
         result = self.podman.exec_bash(host.worker_name, worker_control_script(), check=False,
@@ -1282,6 +1310,199 @@ class MultiNodeProduct:
             f"{(result.stderr or result.stdout or '').strip()[-400:]}",
         )
         return (result.stdout or "").strip()
+
+
+def case_ssh_host_key(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-SSHKEY: a wrong or rotated Worker host key stops the controller before it acts.
+
+    The controller sends nothing to the Worker except over OpenSSH with
+    ``StrictHostKeyChecking=yes`` against the operator's pinned ``known_hosts``,
+    so the trust has to hold in both directions: a key that is not the Worker's
+    must abort the operation before its remote effect, and a real rotation must
+    be adoptable only by re-pinning the new key.
+
+    Both are proven through the product's own remote-finalize operation, whose
+    effect — deleting a leftover ACME recovery snapshot — is observable on the
+    Worker afterwards. The case plants that snapshot, so a refused connection and
+    an executed command leave different evidence, and it re-pins before asserting
+    so a failure cannot leave the product path unusable for the rest of the run.
+    """
+    host = product.require_installed()
+    worker_ip = host.plan.worker_ip
+    transaction = f"/var/lib/gowave-auto-nginx/recovery/{SSH_ROTATION_TX_ID}"
+    sentinel = f"{transaction}/sentinel"
+    known_hosts = "/root/.ssh/known_hosts"
+    wrong_pin = "/root/.ssh/known_hosts-wrong-key"
+    finalized = "Worker ACME recovery snapshot finalized."
+
+    def snapshot_present() -> bool:
+        return product.podman.exec(
+            host.worker_name, ["test", "-f", sentinel], check=False,
+        ).returncode == 0
+
+    def pin(path: str, public_key: str) -> None:
+        result = product.podman.exec(
+            host.target_name,
+            ["bash", "-c", f"umask 077; cat > {shlex.quote(path)}"],
+            input_text=f"{worker_ip} {public_key}\n",
+            timeout=120,
+        )
+        require(
+            SSH_KEY_CASE_ID,
+            result.returncode == 0,
+            f"pinning a host key in {path} on the Master exited {result.returncode}: "
+            f"{(result.stderr or '').strip()[-500:]}",
+        )
+
+    prepared = product.podman.exec_bash(host.worker_name, f"""
+set -eu
+umask 077
+install -d -m 0700 {shlex.quote(transaction)}
+: > {shlex.quote(sentinel)}
+test -f {shlex.quote(sentinel)}
+""", check=False, timeout=120)
+    require(
+        SSH_KEY_CASE_ID,
+        prepared.returncode == 0,
+        f"planting the Worker's leftover ACME snapshot exited {prepared.returncode}: "
+        f"{(prepared.stderr or '').strip()[-500:]}",
+    )
+    require(
+        SSH_KEY_CASE_ID,
+        snapshot_present(),
+        f"the planted snapshot {sentinel} is not readable on the Worker",
+    )
+
+    decoy = product.podman.exec_bash(host.target_name, """
+set -eu
+umask 077
+test -f /root/.ssh/mn-sshkey-decoy || ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/mn-sshkey-decoy
+cat /root/.ssh/mn-sshkey-decoy.pub
+""", check=False, timeout=120)
+    decoy_key = (decoy.stdout or "").strip()
+    require(
+        SSH_KEY_CASE_ID,
+        decoy.returncode == 0 and decoy_key.startswith("ssh-ed25519 "),
+        f"the Master did not produce an unrelated ed25519 key to pin instead: "
+        f"{(decoy.stderr or decoy.stdout or '').strip()[-500:]}",
+    )
+
+    pin(wrong_pin, decoy_key)
+    wrong = product.remote_finalize(wrong_pin, SSH_ROTATION_TX_ID)
+    wrong_output = (wrong.stdout or "") + (wrong.stderr or "")
+    wrong_survived = snapshot_present()
+
+    before_key = product.podman.exec(
+        host.worker_name, ["cat", "/etc/ssh/ssh_host_ed25519_key.pub"], check=False,
+    ).stdout.strip()
+    rotation = product.podman.exec_bash(host.worker_name, """
+set -eu
+rm -f /etc/ssh/ssh_host_*
+ssh-keygen -A >/dev/null
+systemctl restart ssh.service
+""", check=False, timeout=180)
+    after_key = product.podman.exec(
+        host.worker_name, ["cat", "/etc/ssh/ssh_host_ed25519_key.pub"], check=False,
+    ).stdout.strip()
+
+    stale = product.remote_finalize(known_hosts, SSH_ROTATION_TX_ID)
+    stale_output = (stale.stdout or "") + (stale.stderr or "")
+    stale_survived = snapshot_present()
+
+    # Pin the new key before any assertion, so a failed expectation cannot leave
+    # the controller unable to reach the Worker it is still managing.
+    re_pinned = after_key.startswith("ssh-ed25519 ")
+    if re_pinned:
+        pin(known_hosts, after_key)
+    accepted = product.remote_finalize(known_hosts, SSH_ROTATION_TX_ID)
+    accepted_output = (accepted.stdout or "") + (accepted.stderr or "")
+    accepted_survived = snapshot_present()
+
+    require(
+        SSH_KEY_CASE_ID,
+        wrong.returncode != 0,
+        f"the controller connected while a different key was pinned for {worker_ip!r}: "
+        f"{wrong_output.strip()[-800:]}",
+    )
+    require(
+        SSH_KEY_CASE_ID,
+        "Host key verification failed" in wrong_output,
+        f"the wrong pin was refused without OpenSSH naming the verification failure: "
+        f"{wrong_output.strip()[-800:]!r}",
+    )
+    require(
+        SSH_KEY_CASE_ID,
+        finalized not in wrong_output and wrong_survived,
+        f"the remote script ran although the pinned host key was not the Worker's: "
+        f"{wrong_output.strip()[-800:]!r}",
+    )
+    require(
+        SSH_KEY_CASE_ID,
+        rotation.returncode == 0,
+        f"rotating the Worker's host keys exited {rotation.returncode}: "
+        f"{(rotation.stderr or '').strip()[-500:]}",
+    )
+    require(
+        SSH_KEY_CASE_ID,
+        re_pinned and after_key != before_key,
+        f"the Worker's ed25519 host key did not change, so the rotation was not "
+        f"exercised: before {before_key.split()[:2]!r}, after {after_key.split()[:2]!r}",
+    )
+    require(
+        SSH_KEY_CASE_ID,
+        stale.returncode != 0,
+        f"the stale pin was accepted after the Worker rotated its host key: "
+        f"{stale_output.strip()[-800:]}",
+    )
+    require(
+        SSH_KEY_CASE_ID,
+        "Host key verification failed" in stale_output,
+        f"the stale pin was refused without OpenSSH naming the verification failure: "
+        f"{stale_output.strip()[-800:]!r}",
+    )
+    require(
+        SSH_KEY_CASE_ID,
+        finalized not in stale_output and stale_survived,
+        f"the remote script ran under the stale pin after rotation: "
+        f"{stale_output.strip()[-800:]!r}",
+    )
+    require(
+        SSH_KEY_CASE_ID,
+        accepted.returncode == 0,
+        f"the re-pinned rotated key was rejected: "
+        f"{(accepted.stderr or accepted.stdout or '').strip()[-800:]}",
+    )
+    require(
+        SSH_KEY_CASE_ID,
+        finalized in accepted_output,
+        f"the re-pinned key did not reach the remote script: "
+        f"{accepted_output.strip()[-800:]!r}",
+    )
+    require(
+        SSH_KEY_CASE_ID,
+        not accepted_survived,
+        f"the remote script reported success but the planted snapshot {sentinel} is "
+        f"still on the Worker",
+    )
+
+    def fingerprint(key: str) -> str:
+        # The head of an ed25519 blob is the same for every key, so the tail is
+        # what tells one host key from another in the evidence.
+        fields = key.split()
+        return f"{fields[0]} …{fields[1][-12:]}" if len(fields) > 1 else "none"
+
+    return {
+        "worker_ip": worker_ip,
+        "known_hosts_entry": known_hosts,
+        "wrong_key_refused": wrong.returncode != 0,
+        "wrong_key_executed_remotely": not wrong_survived,
+        "old_key_rejected": stale.returncode != 0,
+        "old_key_executed_remotely": not stale_survived,
+        "new_key_accepted": accepted.returncode == 0,
+        "new_key_executed_remotely": not accepted_survived,
+        "worker_host_key_before": fingerprint(before_key),
+        "worker_host_key_after": fingerprint(after_key),
+    }
 
 
 def case_worker_registration(product: MultiNodeProduct) -> Dict[str, Any]:
@@ -2851,6 +3072,10 @@ def cases(
     suite = [
         Case(INSTALL_CASE_ID, "multi-node", lambda context: product.install(),
              timeout_seconds=aio.INSTALL_TIMEOUT_SECONDS),
+        # The trust the provisioning path depends on is proven before that path
+        # runs: a wrong pin and a rotated host key must both stop the controller.
+        Case(SSH_KEY_CASE_ID, "multi-node", lambda context: case_ssh_host_key(product),
+             timeout_seconds=SSH_TRUST_TIMEOUT_SECONDS),
         Case(NODE_ADD_CASE_ID, "multi-node", lambda context: case_worker_registration(product),
              timeout_seconds=NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
         Case(MASTER_ADDRESS_CASE_ID, "multi-node", lambda context: case_master_address(product),

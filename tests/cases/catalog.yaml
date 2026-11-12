@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 63
-  total: 188
+  podman_first: 64
+  total: 189
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3679,6 +3679,24 @@ cases:
   driver: null
   driver_status: planned
   promotion_target: Negative Scenario and Fault Injection Tests
+- id: MN-SSHKEY
+  requirement: Preflight SSH Trust and DNS Verification
+  live_scenario: null
+  assertion: Through the controller's own remote-finalize SSH operation, a known_hosts entry holding a
+    key that is not the Worker's is refused by OpenSSH host-key verification before the remote command
+    runs, and after the Worker rotates its host key the stale pin is refused the same way while re-pinning
+    the new key lets the same command run and take its observable effect.
+  assertion_sha256: 5c6433f52cb8e8872d6967267d8ca70a9be2be319a19dc044506819aa56847ec
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Preflight SSH Trust and DNS Verification
 - id: MN-VISION
   requirement: Independent Optional Vision Domains
   live_scenario: null
