@@ -237,7 +237,7 @@ def install_master(
     env_values = {
         "GOWAVE_ACME_SERVER": acme_server,
         "GOWAVE_TLS_CA_FILE": remote_ca_file,
-        "GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER": "1",
+        "GOWAVE_NODE_REQUIRE_PINNED_INSTALLER": "1",
         "GOWAVE_NODE_INSTALLER_COMMIT": config.gowave_node_installer_commit,
         "GOWAVE_NODE_INSTALLER_SHA256": config.gowave_node_installer_sha256,
         "GOWAVE_PANEL_VERSION": config.gowave_panel_version,
@@ -377,7 +377,7 @@ def deploy_worker(
     # Command to run under strace on Master
     env_values = {
         "GOWAVE_ACME_SERVER": acme_server,
-        "GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER": "1",
+        "GOWAVE_NODE_REQUIRE_PINNED_INSTALLER": "1",
         "GOWAVE_NODE_INSTALLER_COMMIT": config.gowave_node_installer_commit,
         "GOWAVE_NODE_INSTALLER_SHA256": config.gowave_node_installer_sha256,
         "GOWAVE_NODE_VERSION": config.gowave_node_version,

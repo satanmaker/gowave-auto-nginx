@@ -225,7 +225,7 @@ unambiguously pinned or verified, preflight SHALL terminate before installation.
 
 - **GIVEN** `GOWAVE_NODE_INSTALLER_COMMIT` is not an explicit 40-hex commit, or the installer artifact SHA256
   does not match mandatory `GOWAVE_NODE_INSTALLER_SHA256`
-- **WHEN** preflight validates the bundled Master installer and immutable remote Worker installer source
+- **WHEN** preflight validates the pinned Master and Worker installer sources
 - **THEN** the runner terminates before installation; neither path may fall back to floating `main` or execute
   an installer whose bytes do not match the configured digest
 
