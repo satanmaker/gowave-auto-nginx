@@ -25,13 +25,23 @@ ACME_MODE_URLS = {
 }
 
 
-def output_matches_pinned_version(output: str, expected: str) -> bool:
-    """Require the exact configured version token in a tool's version output."""
-    normalized = str(expected).strip().lstrip("vV")
-    if not normalized:
+def output_matches_expected_version(output: str, expected: str) -> bool:
+    """Match a tool's reported version against the configured release channel.
+
+    The configured value is normally ``latest``: the installers resolve the
+    upstream channel, so the only honest assertion is that the component reports
+    a version at all. An explicit version/tag keeps the exact-token comparison
+    for a deliberate pin.
+    """
+    text = output or ""
+    normalized = str(expected).strip()
+    if normalized.lower() in ("", "latest"):
+        return re.search(r"(?<![A-Za-z0-9])v?[0-9]+(?:\.[0-9]+)+(?![A-Za-z0-9])", text) is not None
+    pinned = normalized.lstrip("vV")
+    if not pinned:
         return False
-    pattern = rf"(?<![A-Za-z0-9])v?{re.escape(normalized)}(?![A-Za-z0-9])"
-    return re.search(pattern, output or "", flags=re.IGNORECASE) is not None
+    pattern = rf"(?<![A-Za-z0-9])v?{re.escape(pinned)}(?![A-Za-z0-9])"
+    return re.search(pattern, text, flags=re.IGNORECASE) is not None
 
 
 def parse_strace_argv_output(trace_text: str, secrets: List[str]) -> Dict[str, Any]:
@@ -303,14 +313,14 @@ def install_master(
     version_errors = []
     for component, (result, expected) in version_checks.items():
         observed = (result.stdout or "") + "\n" + (result.stderr or "")
-        if not result.ok or not output_matches_pinned_version(observed, expected):
+        if not result.ok or not output_matches_expected_version(observed, expected):
             version_errors.append({
                 "component": component,
                 "expected": expected,
                 "observed": observed.strip()[:300],
             })
     if version_errors:
-        return False, {"error": "Installed Master software does not match configured version pins",
+        return False, {"error": "Installed Master software does not match the configured versions",
                        "version_errors": version_errors}
 
     details = {
@@ -559,7 +569,7 @@ print(json.dumps({
         ("xray_server", worker_xray_ver, config.xray_server_version),
     ):
         observed = (result.stdout or "") + "\n" + (result.stderr or "")
-        if not result.ok or not output_matches_pinned_version(observed, expected):
+        if not result.ok or not output_matches_expected_version(observed, expected):
             worker_state_ok = False
             worker_errors.append(
                 f"Worker {component} version mismatch: expected {expected}, observed {observed.strip()[:200]}"

@@ -26,13 +26,13 @@ WORKER_DOMAIN=worker.example.com
 WORKER_REALITY_DOMAIN=reality-worker.example.com
 SSH_KEY_PATH=/tmp/id_rsa
 SSH_KNOWN_HOSTS=/tmp/known_hosts
-GOWAVE_PANEL_VERSION=0.4.0
-GOWAVE_NODE_VERSION=0.4.0
+GOWAVE_PANEL_VERSION=latest
+GOWAVE_NODE_VERSION=latest
 GOWAVE_NODE_INSTALLER_COMMIT=7b3514d1ab8c674050597820d52d55525d4bece7
 GOWAVE_NODE_INSTALLER_SHA256=9a524f1383d3a6a8be42ac370699b0ec6725678ece4abe5b5bc61e8c2af682d0
-XRAY_SERVER_VERSION=26.11.9
-XRAY_CLIENT_VERSION=26.11.9
-MIHOMO_CLIENT_VERSION=1.19.34
+XRAY_SERVER_VERSION=latest
+XRAY_CLIENT_VERSION=latest
+MIHOMO_CLIENT_VERSION=latest
 ACME_MODE=staging
 TEST_TEARDOWN_POLICY=PRESERVE
 """
@@ -156,9 +156,23 @@ TEST_TEARDOWN_POLICY=PRESERVE
             load_config(p)
         self.assertIn("Missing mandatory configuration keys", str(ctx.exception))
 
-    def test_floating_component_versions_rejected(self):
-        content = self._config_content(GOWAVE_PANEL_VERSION="latest")
-        with self.assertRaisesRegex(ValueError, "explicit pinned version"):
+    def test_latest_channel_is_the_default_component_version(self):
+        cfg = load_config(self._write_config(self.valid_content))
+        for key in (
+            "gowave_panel_version", "gowave_node_version",
+            "xray_server_version", "xray_client_version", "mihomo_client_version",
+        ):
+            self.assertEqual(getattr(cfg, key), "latest", key)
+
+    def test_explicit_component_version_is_accepted(self):
+        content = self._config_content(GOWAVE_PANEL_VERSION="v9.9.9", XRAY_SERVER_VERSION="9.9.9")
+        cfg = load_config(self._write_config(content))
+        self.assertEqual(cfg.gowave_panel_version, "v9.9.9")
+        self.assertEqual(cfg.xray_server_version, "9.9.9")
+
+    def test_non_latest_floating_channel_rejected(self):
+        content = self._config_content(GOWAVE_PANEL_VERSION="stable")
+        with self.assertRaisesRegex(ValueError, "'latest' or an explicit version"):
             load_config(self._write_config(content))
 
     def test_per_host_ssh_credentials_without_shared_paths(self):

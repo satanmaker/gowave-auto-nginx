@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .ssh import SSHClient, SSHResult
 from .redaction import redact
+from .deployment import output_matches_expected_version
 
 REQUIRED_PORTS_DEFAULT = [80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, 10003]
 VISION_PORTS = [8444, 9444]
@@ -73,7 +74,7 @@ def check_control_machine_tools(config: Any) -> Dict[str, ToolCheckResult]:
             match = re.search(r"Xray\s+([0-9\.]+)", proc.stdout)
             ver = match.group(1) if match else proc.stdout.split()[1] if proc.stdout else "unknown"
             expected = getattr(config, "XRAY_CLIENT_VERSION", None)
-            ver_ok = (expected is None) or (ver == expected)
+            ver_ok = (expected is None) or output_matches_expected_version(proc.stdout, expected)
             results["xray"] = ToolCheckResult(
                 tool="xray",
                 ok=ver_ok,
@@ -97,7 +98,7 @@ def check_control_machine_tools(config: Any) -> Dict[str, ToolCheckResult]:
             match = re.search(r"v([0-9\.]+)", proc.stdout)
             ver = match.group(1) if match else proc.stdout.strip()
             expected = getattr(config, "MIHOMO_CLIENT_VERSION", None)
-            ver_ok = (expected is None) or (ver == expected)
+            ver_ok = (expected is None) or output_matches_expected_version(proc.stdout, expected)
             results["mihomo"] = ToolCheckResult(
                 tool="mihomo",
                 ok=ver_ok,
