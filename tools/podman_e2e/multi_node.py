@@ -45,6 +45,12 @@ NODE_HEALTH_INTERVAL_SECONDS = 5
 
 NODE_PORT = 3002
 
+# The node prepends its own stats/traffic API to whatever the Panel assigned it
+# (gowave-node internal/xray/config.go), so the config it loads carries exactly
+# one inbound the Panel never declares, and it must be a unix-socket listener
+# rather than a port the outside world can reach.
+NODE_API_INBOUND_TAG = "GOWAVE_NODE_API_INBOUND"
+
 # Everything the Worker can say about the Master it was told to trust. The
 # address arrives in the Worker's own firewall rule and in the peer of the live
 # control-plane connection, so the proof does not depend on a value the harness
@@ -130,9 +136,9 @@ def applied(path):
     try:
         config = json.loads(raw) if raw.strip() else None
     except json.JSONDecodeError:
-        return {"parsed": False, "inbounds": [], "outbound_count": 0}
+        return {"parsed": False, "inbounds": [], "outbound_count": 0, "api": {}}
     if not isinstance(config, dict):
-        return {"parsed": False, "inbounds": [], "outbound_count": 0}
+        return {"parsed": False, "inbounds": [], "outbound_count": 0, "api": {}}
     inbounds = []
     for entry in config.get("inbounds") or []:
         if not isinstance(entry, dict):
@@ -143,14 +149,23 @@ def applied(path):
             "tag": str(entry.get("tag") or ""),
             "type": str(entry.get("protocol") or ""),
             "port": entry.get("port"),
+            "listen": str(entry.get("listen") or ""),
             "network": str(stream.get("network") or "tcp"),
             "security": str(stream.get("security") or "none"),
         })
     outbounds = config.get("outbounds")
+    api = config.get("api")
+    api = api if isinstance(api, dict) else {}
+    services = api.get("services")
     return {
         "parsed": True,
         "inbounds": inbounds,
         "outbound_count": len(outbounds) if isinstance(outbounds, list) else 0,
+        "api": {
+            "tag": str(api.get("tag") or ""),
+            "listen": str(api.get("listen") or ""),
+            "services": [str(service) for service in services] if isinstance(services, list) else [],
+        },
     }
 
 
@@ -234,6 +249,27 @@ def inbound_key(spec: Dict[str, Any]) -> tuple:
         str(spec.get("network") or "").lower(),
         str(spec.get("security") or "").lower(),
     )
+
+
+def node_api_inbounds(inbounds: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The node's own stats/traffic listener, which the Panel never declares."""
+    return [entry for entry in inbounds if entry.get("tag") == NODE_API_INBOUND_TAG]
+
+
+def serving_inbounds(inbounds: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The inbounds that serve clients, i.e. the ones the Panel assigns."""
+    return [entry for entry in inbounds if entry.get("tag") != NODE_API_INBOUND_TAG]
+
+
+def has_unix_api(api: Dict[str, Any]) -> bool:
+    """Whether the node's own API listens on a unix socket, as the node decides it.
+
+    ``gowave-node`` prepends the API inbound only for a unix API socket, so the
+    expectation has to come from the config's own ``api`` object rather than from
+    the harness assuming the default path.
+    """
+    listen = str(api.get("listen") or "")
+    return ":" not in listen or listen.startswith("unix:")
 
 
 def panel_node(cluster: Dict[str, Any], name: str, case_id: str) -> Dict[str, Any]:
@@ -1431,10 +1467,34 @@ def case_worker_config(product: MultiNodeProduct) -> Dict[str, Any]:
         f"the config the Worker applied at {config_path} is not a JSON object",
     )
     inbounds = [entry for entry in applied.get("inbounds") or [] if isinstance(entry, dict)]
+    api_config = applied.get("api") or {}
+    api = node_api_inbounds(inbounds)
+    if has_unix_api(api_config):
+        require(
+            WORKER_CONFIG_CASE_ID,
+            len(api) == 1,
+            f"the Worker's config carries {len(api)} {NODE_API_INBOUND_TAG} inbounds "
+            f"while its API listens on a unix socket, expected exactly one: the stats "
+            f"service the Panel's traffic accounting queries",
+        )
+        require(
+            WORKER_CONFIG_CASE_ID,
+            api[0].get("type") == "tunnel"
+            and str(api[0].get("listen") or "").startswith(("/", "@")),
+            f"the Worker's {NODE_API_INBOUND_TAG} inbound is not a local unix listener: "
+            f"protocol {api[0].get('type')!r}, listen {api[0].get('listen')!r}",
+        )
     require(
         WORKER_CONFIG_CASE_ID,
-        len(inbounds) == len(declared),
-        f"the Worker loaded {len(inbounds)} inbounds while the Panel assigned it "
+        "StatsService" in (api_config.get("services") or []),
+        f"the Worker's config exposes no StatsService, so the traffic the Panel bills "
+        f"cannot be accounted: {api_config.get('services')!r}",
+    )
+    serving = serving_inbounds(inbounds)
+    require(
+        WORKER_CONFIG_CASE_ID,
+        len(serving) == len(declared),
+        f"the Worker serves {len(serving)} inbounds while the Panel assigned it "
         f"{len(declared)}",
     )
     require(
@@ -1443,7 +1503,7 @@ def case_worker_config(product: MultiNodeProduct) -> Dict[str, Any]:
         "the config the Worker loaded declares no outbounds",
     )
     expected = {inbound_key(spec) for spec in declared}
-    actual = {inbound_key(spec) for spec in inbounds}
+    actual = {inbound_key(spec) for spec in serving}
     missing = sorted(expected - actual)
     extra = sorted(actual - expected)
     require(
@@ -1483,9 +1543,16 @@ def case_worker_config(product: MultiNodeProduct) -> Dict[str, Any]:
     )
     return {
         "declared_inbound_count": len(declared),
-        "worker_inbound_count": len(inbounds),
-        "inbound_ports": sorted({str(entry.get("port")) for entry in inbounds}),
-        "inbound_tags": sorted(str(entry.get("tag") or "") for entry in inbounds),
+        "worker_inbound_count": len(serving),
+        "applied_inbound_count": len(inbounds),
+        "api_inbound": {
+            "tag": api[0].get("tag"),
+            "type": api[0].get("type"),
+            "listen": api[0].get("listen"),
+        } if api else {"tag": "", "type": "", "listen": ""},
+        "api_services": list(api_config.get("services") or []),
+        "inbound_ports": sorted({str(entry.get("port")) for entry in serving}),
+        "inbound_tags": sorted(str(entry.get("tag") or "") for entry in serving),
         "outbound_count": applied.get("outbound_count"),
         "node_port": options.get("NODE_PORT"),
         "runtime_mode": runtime_mode,

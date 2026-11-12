@@ -27,6 +27,17 @@ from test_podman_cluster import healthy_cluster, inbound_specs  # noqa: E402
 
 CORE_LINE = "Xray 26.11.9 (Xray, Penetrates Everything.)"
 
+# The node prepends its own stats/traffic API to whatever the Panel assigned, so
+# a healthy applied config holds this inbound plus the declared ones.
+API_INBOUND = {
+    "tag": multi_node.NODE_API_INBOUND_TAG,
+    "type": "tunnel",
+    "port": None,
+    "listen": "/run/gowave-node/xray.sock",
+    "network": "tcp",
+    "security": "none",
+}
+
 STATUS_TEMPLATE = (
     "\x1b[36m[STATUS]\x1b[0m Checking gowave-node service status...\n\n"
     "  \x1b[32m\u25cf\x1b[0m Daemon (Socket):   {daemon}\n"
@@ -71,8 +82,13 @@ def worker_state(worker_vision=False, node="worker"):
         },
         "applied": {
             "parsed": True,
-            "inbounds": inbound_specs(node, worker_vision),
+            "inbounds": [dict(API_INBOUND)] + inbound_specs(node, worker_vision),
             "outbound_count": 2,
+            "api": {
+                "tag": "GOWAVE_NODE_API",
+                "listen": "",
+                "services": ["HandlerService", "StatsService", "RoutingService"],
+            },
         },
     }
 
@@ -334,10 +350,43 @@ class TestWorkerConfigCase(unittest.TestCase):
         evidence, _product = run_case(multi_node.case_worker_config)
         self.assertEqual(evidence["declared_inbound_count"], 4)
         self.assertEqual(evidence["worker_inbound_count"], 4)
+        self.assertEqual(evidence["applied_inbound_count"], 5)
+        self.assertEqual(evidence["api_inbound"], {
+            "tag": multi_node.NODE_API_INBOUND_TAG,
+            "type": "tunnel",
+            "listen": "/run/gowave-node/xray.sock",
+        })
+        self.assertNotIn(multi_node.NODE_API_INBOUND_TAG, evidence["inbound_tags"])
         self.assertEqual(evidence["outbound_count"], 2)
         self.assertEqual(evidence["runtime_mode"], "0o700")
         self.assertEqual(evidence["config_mode"], "0o600")
         self.assertEqual(evidence["node_port"], str(multi_node.NODE_PORT))
+
+    def test_the_node_api_inbound_is_not_counted_as_a_declared_inbound(self):
+        evidence, _product = run_case(multi_node.case_worker_config)
+        self.assertEqual(evidence["applied_inbound_count"],
+                         evidence["worker_inbound_count"] + 1)
+
+    def test_a_config_without_the_node_api_inbound_is_refused(self):
+        report = worker_state()
+        report["applied"]["inbounds"].pop(0)
+        with self.assertRaises(AssertionError) as caught:
+            run_case(multi_node.case_worker_config, report=report)
+        self.assertIn("expected exactly one", str(caught.exception))
+
+    def test_a_node_api_inbound_on_a_tcp_port_is_refused(self):
+        report = worker_state()
+        report["applied"]["inbounds"][0] = dict(API_INBOUND, listen="127.0.0.1:10085")
+        with self.assertRaises(AssertionError) as caught:
+            run_case(multi_node.case_worker_config, report=report)
+        self.assertIn("not a local unix listener", str(caught.exception))
+
+    def test_a_node_api_inbound_of_another_protocol_is_refused(self):
+        report = worker_state()
+        report["applied"]["inbounds"][0] = dict(API_INBOUND, type="socks")
+        with self.assertRaises(AssertionError) as caught:
+            run_case(multi_node.case_worker_config, report=report)
+        self.assertIn("not a local unix listener", str(caught.exception))
 
     def test_both_nodes_running_vision_expect_five_inbounds_each(self):
         evidence, _product = run_case(
@@ -383,12 +432,34 @@ class TestWorkerConfigCase(unittest.TestCase):
 
     def test_an_inbound_the_panel_did_not_assign_is_refused(self):
         report = worker_state()
-        stray = dict(report["applied"]["inbounds"][0], tag="vless-xhttp-stray")
-        report["applied"]["inbounds"][0] = stray
+        stray = dict(report["applied"]["inbounds"][1], tag="vless-xhttp-stray")
+        report["applied"]["inbounds"][1] = stray
         with self.assertRaises(AssertionError) as caught:
             run_case(multi_node.case_worker_config, report=report)
         self.assertIn("missing", str(caught.exception))
         self.assertIn("unexpected", str(caught.exception))
+
+    def test_a_second_node_api_inbound_is_refused(self):
+        report = worker_state()
+        report["applied"]["inbounds"].append(dict(API_INBOUND, listen="@gowave-second"))
+        with self.assertRaises(AssertionError) as caught:
+            run_case(multi_node.case_worker_config, report=report)
+        self.assertIn("expected exactly one", str(caught.exception))
+
+    def test_a_config_without_the_stats_service_is_refused(self):
+        report = worker_state()
+        report["applied"]["api"]["services"] = ["HandlerService", "RoutingService"]
+        with self.assertRaises(AssertionError) as caught:
+            run_case(multi_node.case_worker_config, report=report)
+        self.assertIn("no StatsService", str(caught.exception))
+
+    def test_a_tcp_api_is_accepted_without_the_unix_inbound(self):
+        report = worker_state()
+        report["applied"]["inbounds"].pop(0)
+        report["applied"]["api"]["listen"] = "127.0.0.1:10085"
+        evidence, _product = run_case(multi_node.case_worker_config, report=report)
+        self.assertEqual(evidence["api_inbound"]["tag"], "")
+        self.assertEqual(evidence["worker_inbound_count"], 4)
 
     def test_an_inbound_the_worker_does_not_load_is_refused(self):
         cluster = healthy_cluster()
