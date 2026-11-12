@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 13
-  total: 138
+  podman_first: 14
+  total: 139
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3140,6 +3140,22 @@ cases:
   live_only_reason: Starts the interactive operator against real disposable VPS instances; live infrastructure
     only.
   promotion_target: null
+- id: AIO-INSTALL
+  requirement: All-in-One Master VPS Installation Verification
+  live_scenario: null
+  assertion: The real operator runs its documented All-in-One install on a clean supported systemd host
+    that offers only what a VPS offers, exits successfully, and needs no test-side product provisioning.
+  assertion_sha256: d271cd3e45cebc1f52e236039c22970fc87f48c1f0d869cf27a3b872c8f3e87b
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: All-in-One Master VPS Installation Verification
 - id: SUB-B64
   requirement: Panel subscription representations
   live_scenario: null

@@ -37,7 +37,7 @@
 ## 4. All-in-One product E2E
 
 - [x] 4.1 Create a clean supported systemd-enabled target image.
-- [ ] 4.2 Execute the real operator full-install path without test-side product provisioning.
+- [x] 4.2 Execute the real operator full-install path without test-side product provisioning.
 - [ ] 4.3 Verify installed packages, systemd units, active services, listening sockets, Panel/API, NGINX, and TLS independently.
 - [ ] 4.4 Exercise Panel authentication and required API lifecycle operations.
 - [ ] 4.5 Obtain every served representation from the real Panel with a client-identifying User-Agent: the base64 share-link list, the Xray JSON config object or profile list (validated in both shapes), and the Mihomo YAML. Load the Mihomo YAML in Mihomo and consume the Xray representations without replacing the Panel-issued outbound.

@@ -105,6 +105,13 @@ LIVE_ONLY_SCENARIOS = {
 
 PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
     {
+        "id": "AIO-INSTALL",
+        "requirement": "All-in-One Master VPS Installation Verification",
+        "assertion": "The real operator runs its documented All-in-One install on a clean supported systemd host that offers only what a VPS offers, exits successfully, and needs no test-side product provisioning.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
         "id": "SUB-B64",
         "requirement": "Panel subscription representations",
         "assertion": "The base64 share-link list at /api/sub/<shortUuid> contains one link per proxy entry with the expected protocol, host, SNI and firefox fingerprint, and an Xray-family client imports it while the raw JSON body imports nothing.",
