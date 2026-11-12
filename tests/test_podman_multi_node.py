@@ -81,6 +81,86 @@ class TestMultiNodePlan(unittest.TestCase):
         self.assertNotEqual(plan.data_worker_ip, plan.data_target_ip)
 
 
+class TestMultiNodeRoles(unittest.TestCase):
+    """5.1: the run's roles exist, own distinct addresses, and are the ones cases name."""
+
+    PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+
+    def setUp(self):
+        # The AIO suite already has a Podman stand-in that records every start,
+        # so the role test uses it rather than a second, weaker imitation.
+        from tests.test_podman_topology import FakePodman
+
+        self.podman = FakePodman()
+        self.addCleanup(self.podman.context.run_cleanup)
+        self.host = topology.MultiNodeTopology(self.podman, egress_resolvers=["192.0.2.53"])
+
+    def _create(self):
+        from tools.podman_e2e import acme_fixture
+
+        with unittest.mock.patch.object(acme_fixture.AcmeFixture, "issued_root",
+                                        return_value=self.PEM), \
+                unittest.mock.patch.object(acme_fixture.AcmeFixture, "wait_ready",
+                                           return_value=None):
+            self.host.create()
+        return self.host
+
+    def _runs(self):
+        return {kwargs["name"]: kwargs for kwargs in self.podman.runs}
+
+    def test_create_starts_every_declared_role_that_is_not_on_demand(self):
+        host = self._create()
+        started = [role["container"] for role in host.require_roles()]
+        self.assertEqual(len(started), 6, "the change declares six roles")
+        self.assertIn(host.client_name, started)
+        self.assertIn(host.target_name, started)
+        self.assertIn(host.worker_name, started)
+        self.assertIn(host.untrusted_name, started)
+        self.assertIn(host.echo_name, started)
+        self.assertIn(host.engine_client_name, started)
+
+    def test_every_role_owns_its_own_addresses(self):
+        host = self._create()
+        addresses = [
+            address for role in host.roles() for address in role["addresses"]
+        ]
+        self.assertEqual(len(set(addresses)), len(addresses),
+                         "two roles sharing an address would make attribution impossible")
+
+    def test_only_the_two_nodes_are_product_installed(self):
+        host = self._create()
+        installed = {role["role"] for role in host.roles() if role["product_installed"]}
+        self.assertEqual(installed, {"master", "worker"})
+
+    def test_the_worker_and_the_master_start_before_the_denial_vantage_is_used(self):
+        host = self._create()
+        order = list(host.started)
+        self.assertLess(order.index(host.target_name), order.index(host.worker_name),
+                        "the Worker is provisioned from the Master, so the Master is first")
+        self.assertLess(order.index(host.worker_name), order.index(host.untrusted_name),
+                        "a denial runs after both nodes exist, or it proves nothing")
+
+    def test_the_worker_is_a_privileged_systemd_host_and_the_denial_role_is_not(self):
+        self._create()
+        runs = self._runs()
+        self.assertTrue(runs[self.host.worker_name]["privileged"])
+        self.assertEqual(runs[self.host.worker_name]["systemd"], "always")
+        self.assertFalse(runs[self.host.untrusted_name]["privileged"])
+        self.assertEqual(runs[self.host.untrusted_name]["systemd"], "false")
+
+    def test_a_role_that_never_started_is_refused_by_name(self):
+        host = self._create()
+        host.started.remove(host.worker_name)
+        with self.assertRaises(topology.TopologyError) as caught:
+            host.require_roles()
+        self.assertIn(host.worker_name, str(caught.exception))
+
+    def test_the_on_demand_engine_role_is_not_required_before_a_case_needs_it(self):
+        host = self._create()
+        self.assertNotIn(host.engine_client_name, host.started)
+        host.require_roles()
+
+
 class TestMultiNodeZone(unittest.TestCase):
     """The fixture zone has to answer for the Worker's names as well."""
 

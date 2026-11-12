@@ -178,16 +178,14 @@ class MultiNodeProduct:
             worker_vision_domain=topology.WORKER_VISION_DOMAIN if self.worker_vision else None,
         )
         host.create()
+        # Every role the run declares must exist before the install is asked to
+        # succeed: a missing vantage would turn later denials and probes into
+        # evidence about nothing.
+        host.require_roles()
         evidence = self.master.install(host=host)
         self.topology = host
         self.trust = host.pin_worker_trust()
         evidence.update({
-            "roles": {
-                "control": host.client_name,
-                "master": host.target_name,
-                "worker": host.worker_name,
-                "untrusted": host.untrusted_name,
-            },
             "worker_trust": self.trust,
             "vision_combination": self.combination,
             "expected_positive_cases": self.positive_case_count,

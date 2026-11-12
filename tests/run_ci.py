@@ -56,6 +56,7 @@ SUITES = {
         "test_podman_matrix.TestProtocolMatrix",
         "test_podman_matrix.TestMatrixCatalog",
         "test_podman_multi_node.TestMultiNodePlan",
+        "test_podman_multi_node.TestMultiNodeRoles",
         "test_podman_multi_node.TestMultiNodeZone",
         "test_podman_multi_node.TestWorkerProvisioningCommand",
         "test_podman_multi_node.TestWorkerControlReport",

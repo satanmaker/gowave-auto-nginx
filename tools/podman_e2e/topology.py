@@ -866,6 +866,84 @@ class MultiNodeTopology(AioTopology):
         self._start_untrusted_client()
         return self
 
+    # ------------------------------------------------------------------ roles
+    def roles(self) -> List[Dict[str, Any]]:
+        """The roles this run creates, and what each of them is there for.
+
+        The inventory is declared rather than inferred: a case that runs from the
+        wrong vantage would otherwise pass for the wrong reason, and a denial that
+        was really a missing role would read as a firewall success.
+        """
+        return [
+            {
+                "role": "control",
+                "container": self.client_name,
+                "addresses": [self.plan.client_ip],
+                "product_installed": False,
+                "trust_anchor": True,
+                "on_demand": False,
+                "purpose": "Independent Control Machine: standard-library probes, no product code.",
+            },
+            {
+                "role": "master",
+                "container": self.target_name,
+                "addresses": [self.plan.target_ip, self.plan.data_target_ip],
+                "product_installed": True,
+                "trust_anchor": True,
+                "on_demand": False,
+                "purpose": "Master/Panel host the operator installs: Panel, local Node, NGINX, Xray.",
+            },
+            {
+                "role": "worker",
+                "container": self.worker_name,
+                "addresses": [self.plan.worker_ip, self.plan.data_worker_ip],
+                "product_installed": True,
+                "trust_anchor": False,
+                "on_demand": False,
+                "purpose": "Separate clean host the operator provisions only through node add.",
+            },
+            {
+                "role": "trusted-client",
+                "container": self.engine_client_name,
+                "addresses": [self.plan.engine_client_ip],
+                "product_installed": False,
+                "trust_anchor": True,
+                # Started by the first case that consumes a Panel payload, so the
+                # install and registration stages do not pay for it.
+                "on_demand": True,
+                "purpose": "Pinned Xray and Mihomo engines that consume what the Panel served.",
+            },
+            {
+                "role": "untrusted-client",
+                "container": self.untrusted_name,
+                "addresses": [self.plan.untrusted_ip],
+                "product_installed": False,
+                "trust_anchor": False,
+                "on_demand": False,
+                "purpose": "Holds no product credential or node identity; every denial case runs here.",
+            },
+            {
+                "role": "external-service",
+                "container": self.echo_name,
+                "addresses": [self.plan.echo_ip, self.plan.data_echo_ip],
+                "product_installed": False,
+                "trust_anchor": True,
+                "on_demand": False,
+                "purpose": "Controlled endpoint outside the nodes that records what actually reached it.",
+            },
+        ]
+
+    def require_roles(self) -> List[Dict[str, Any]]:
+        """The inventory, refusing to continue if a declared role never started."""
+        inventory = self.roles()
+        missing = [
+            role["container"] for role in inventory
+            if not role["on_demand"] and role["container"] not in self.started
+        ]
+        if missing:
+            raise TopologyError(f"the run declares roles that never started: {', '.join(missing)}")
+        return inventory
+
     def _start_worker(self) -> None:
         image_tag = target_image.build(self.podman, self.distribution)
         self.podman.run(
@@ -877,6 +955,7 @@ class MultiNodeTopology(AioTopology):
             # The Worker installs its own packages and manages its own units, so
             # it needs the same egress resolver path the Master has.
             environment={"DEBIAN_FRONTEND": "noninteractive"},
+            systemd="always",
             extra_args=(
                 "--ip", self.plan.worker_ip,
                 "--dns", self.plan.dns_ip,
@@ -1020,6 +1099,8 @@ class MultiNodeTopology(AioTopology):
             "data_worker_ip": self.plan.data_worker_ip,
             "untrusted_ip": self.plan.untrusted_ip,
             "untrusted_container": self.untrusted_name,
+            "role_inventory": self.roles(),
+            "roles_started": list(self.started),
             "pre_install_worker": getattr(self, "worker_clean_facts", {}),
         })
         return record
