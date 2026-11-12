@@ -351,11 +351,11 @@ class TestWorkerConfigCase(unittest.TestCase):
         self.assertEqual(evidence["declared_inbound_count"], 4)
         self.assertEqual(evidence["worker_inbound_count"], 4)
         self.assertEqual(evidence["applied_inbound_count"], 5)
-        self.assertEqual(evidence["api_inbound"], {
-            "tag": multi_node.NODE_API_INBOUND_TAG,
-            "type": "tunnel",
-            "listen": "/run/gowave-node/xray.sock",
-        })
+        self.assertEqual(evidence["api_inbound_tag"], multi_node.NODE_API_INBOUND_TAG)
+        self.assertEqual(evidence["api_inbound_type"], "tunnel")
+        self.assertEqual(evidence["api_inbound_listen"], "/run/gowave-node/xray.sock")
+        self.assertEqual(evidence["api_services"],
+                         "HandlerService,StatsService,RoutingService")
         self.assertNotIn(multi_node.NODE_API_INBOUND_TAG, evidence["inbound_tags"])
         self.assertEqual(evidence["outbound_count"], 2)
         self.assertEqual(evidence["runtime_mode"], "0o700")
@@ -458,7 +458,7 @@ class TestWorkerConfigCase(unittest.TestCase):
         report["applied"]["inbounds"].pop(0)
         report["applied"]["api"]["listen"] = "127.0.0.1:10085"
         evidence, _product = run_case(multi_node.case_worker_config, report=report)
-        self.assertEqual(evidence["api_inbound"]["tag"], "")
+        self.assertEqual(evidence["api_inbound_tag"], "")
         self.assertEqual(evidence["worker_inbound_count"], 4)
 
     def test_an_inbound_the_worker_does_not_load_is_refused(self):
