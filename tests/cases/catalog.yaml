@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 37
-  total: 162
+  podman_first: 38
+  total: 163
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3156,6 +3156,23 @@ cases:
   driver: null
   driver_status: planned
   promotion_target: All-in-One Master VPS Installation Verification
+- id: MN-INSTALL
+  requirement: Distributed Worker VPS Deployment Verification
+  live_scenario: null
+  assertion: The real operator runs its documented All-in-One install on a clean Master host while a second
+    clean supported systemd host sits beside it untouched, and the Worker stays unprovisioned until the
+    operator registers it.
+  assertion_sha256: 05f02eb3b3bb431d639f4170ce3362f9bfee2e5cd7b4d55d84ecc5a1d53c2943
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Distributed Worker VPS Deployment Verification
 - id: AIO-PACKAGES
   requirement: All-in-One Master VPS Installation Verification
   live_scenario: null

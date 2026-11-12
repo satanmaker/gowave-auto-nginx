@@ -57,6 +57,7 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 ## Podman-first cases awaiting live promotion
 
 - **AIO-INSTALL** — promotion target: All-in-One Master VPS Installation Verification
+- **MN-INSTALL** — promotion target: Distributed Worker VPS Deployment Verification
 - **AIO-PACKAGES** — promotion target: All-in-One Master VPS Installation Verification
 - **AIO-AUTH** — promotion target: All-in-One Master VPS Installation Verification
 - **AIO-CLIENT** — promotion target: Real Subscription Delivery and User-Agent Policy
