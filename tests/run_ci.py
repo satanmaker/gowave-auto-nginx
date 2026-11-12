@@ -76,6 +76,7 @@ SUITES = {
         "test_podman_readiness.TestBoundedReadinessHelpers",
         "test_podman_runner.TestPodmanRunnerContract",
         "test_podman_runner.TestPodmanRunOwnership",
+        "test_podman_runner.TestArtifactOwnership",
     ),
     "integration": (
         "test_api_client.TestAPIClient",

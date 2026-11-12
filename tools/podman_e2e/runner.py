@@ -32,6 +32,26 @@ INCOMPLETE = "INCOMPLETE"
 FAILING_STATES = {FAIL, BLOCKED, INCOMPLETE}
 
 
+def hand_back_artifacts(path: Path) -> None:
+    """Give the operator who invoked the suite the artifacts a root run produced.
+
+    Root is needed for Podman, but the run's output is a developer artifact: a
+    0700 tree owned by root would leave the person who asked for the evidence
+    unable to read it, which is exactly what happened to the first Multi-Node
+    run. Outside ``sudo`` the function is a no-op and ownership never changes.
+    """
+    uid = os.environ.get("SUDO_UID")
+    gid = os.environ.get("SUDO_GID")
+    if os.geteuid() != 0 or not uid or not gid:
+        return
+    targets = [path, *path.rglob("*")] if path.is_dir() else [path]
+    for target in targets:
+        try:
+            os.chown(target, int(uid), int(gid))
+        except OSError:
+            continue
+
+
 @dataclass
 class CaseResult:
     id: str
@@ -105,6 +125,9 @@ class RunContext:
         self.run_id = run_id or f"podman-{topology}-{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
         self.artifact_dir = artifact_root / self.run_id
         self.artifact_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # The tree is readable as it is produced, not only when the run ends:
+        # an operator watching a long run needs the evidence before the verdict.
+        hand_back_artifacts(self.artifact_dir)
         self.budget_seconds = budget_seconds
         self.started = time.monotonic()
         self.labels = {"gowave.e2e.run": self.run_id, "gowave.e2e.topology": topology}
@@ -166,6 +189,7 @@ class RunContext:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         path.write_text(redact(text), encoding="utf-8")
         path.chmod(0o600)
+        hand_back_artifacts(path)
         return path
 
     def run_cleanup(self) -> List[str]:
@@ -287,6 +311,7 @@ class Runner:
         overall = overall_status(self.results)
         data["overall"] = overall
         write_result(self.context.artifact_dir, data)
+        hand_back_artifacts(self.context.artifact_dir)
         return 0 if overall == PASS else 1
 
 
