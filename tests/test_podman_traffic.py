@@ -544,6 +544,38 @@ class TestTrafficProbeTransferOne(unittest.TestCase):
                 ])
         self.assertEqual(probe.call_args.kwargs["host"], topology.WORKER_DOMAIN)
 
+    def test_the_refusal_tolerance_reaches_the_scope_from_the_command_line(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            with mock.patch.object(traffic_probe, "transfer_one",
+                                   return_value={"outbounds": 1}) as probe, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                traffic_probe.main([
+                    "--scope", "transfer",
+                    "--ca", "/fixtures/ca/root.pem",
+                    "--destination", "203.0.114.30:18080",
+                    "--engine", "xray",
+                    "--network", "tcp",
+                    "--security", "reality",
+                    "--expect-refusal",
+                    "--workdir", workdir,
+                ])
+        self.assertIs(probe.call_args.kwargs["expect_refusal"], True)
+
+    def test_the_refusal_tolerance_reaches_the_engine(self):
+        calls = []
+
+        def transfers(*_args, **kwargs):
+            calls.append(kwargs)
+            return [self.labels()[0]]
+
+        with tempfile.TemporaryDirectory() as workdir:
+            with mock.patch.object(traffic_probe, "xray_transfers", transfers):
+                traffic_probe.transfer_one(
+                    "/secrets", "/fixtures/ca/root.pem", "203.0.114.30:18080", Path(workdir),
+                    "xray", "tcp", "reality", expect_refusal=True,
+                )
+        self.assertIs(calls[0]["expect_refusal"], True)
+
     def test_the_scope_refuses_an_engine_the_matrix_does_not_pin(self):
         with tempfile.TemporaryDirectory() as workdir:
             with self.assertRaises(SystemExit) as caught:
@@ -771,6 +803,7 @@ class StubEngineHost:
         self.payload_dirs = []
         self.transfers = []
         self.transfer_hosts = []
+        self.transfer_refusals = []
         self.facts = facts
         self.returncode = returncode
         self.stdout = stdout
@@ -801,9 +834,10 @@ class StubEngineHost:
             raise topology.TopologyError(f"the test host has one node, not {node!r}")
         return str(self.plan.data_target_ip)
 
-    def transfer_facts(self, engine, network, security, timeout=300, host=""):
+    def transfer_facts(self, engine, network, security, timeout=300, host="", expect_refusal=False):
         self.transfers.append((engine, network, security))
         self.transfer_hosts.append(host)
+        self.transfer_refusals.append(expect_refusal)
         body = self.stdout if self.stdout is not None else json.dumps(self.facts or {})
         return self._probe(body, self.returncode)
 
@@ -1165,7 +1199,8 @@ class TestRevocationCase(unittest.TestCase):
             "recorded_request_ids": 0,
         }
 
-    def run_case(self, positive=None, negative=None, steps=None, calls=None, readiness=None):
+    def run_case(self, positive=None, negative=None, steps=None, calls=None, readiness=None,
+                 expected_sources=None):
         overrides = steps or {}
         bodies = {
             "warmup": readiness or {
@@ -1190,7 +1225,9 @@ class TestRevocationCase(unittest.TestCase):
             return {"revocation": dict(answers[step], **overrides.get(step, {}))}
 
         with mock.patch.object(aio, "panel_probe", probe):
-            return aio.case_revocation(product), calls, product
+            return aio.case_revocation(
+                product, expected_sources=expected_sources,
+            ), calls, product
 
     def reject(self, expected, **kwargs):
         with self.assertRaises(AssertionError) as caught:
@@ -1245,7 +1282,12 @@ class TestRevocationCase(unittest.TestCase):
     def test_the_case_fails_when_the_issued_payload_left_from_the_client(self):
         data = traffic_facts()
         data["source_ips"] = [PLAN.engine_client_ip]
-        self.reject("instead of the installed host", positive=data)
+        self.reject("instead of the node egress addresses", positive=data)
+
+    def test_the_case_fails_when_the_payload_left_from_a_node_outside_the_cluster(self):
+        data = traffic_facts()
+        self.reject("instead of the node egress addresses",
+                    positive=data, expected_sources=[PLAN.data_worker_ip])
 
     def test_the_case_fails_when_the_revoke_action_was_refused(self):
         self.reject("actions/revoke returned 500", steps={"apply": {"revoke_status": 500}})
@@ -1478,6 +1520,13 @@ class TestTrafficTopology(unittest.TestCase):
         self.instance.transfer_facts("xray", "tcp", "reality", host=topology.WORKER_DOMAIN)
         argv = self.podman.execs[-1][1]
         self.assertEqual(argv[argv.index("--host") + 1], topology.WORKER_DOMAIN)
+
+    def test_the_transfer_scope_carries_the_refusal_tolerance_only_when_asked(self):
+        self.instance.transfer_facts("xray", "tcp", "reality")
+        self.assertNotIn("--expect-refusal", self.podman.execs[-1][1],
+                         "a transfer that must deliver has to fail the probe, not report a refusal")
+        self.instance.transfer_facts("xray", "tcp", "reality", expect_refusal=True)
+        self.assertIn("--expect-refusal", self.podman.execs[-1][1])
 
     def test_the_engine_client_reaches_both_the_control_plane_and_the_endpoint(self):
         self.instance.engine_client()

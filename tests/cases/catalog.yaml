@@ -1,14 +1,14 @@
 version: 1
 schema: gowave-case-catalog/v1
 live_spec: openspec/specs/live-vps-e2e/spec.md
-live_spec_sha256: 7c0db7d11281cba30eda21abf8d626c2a55283bdf9096fcc167af53807b8fffa
+live_spec_sha256: 485975c572e46198c2b42e05f01e3c25284aa22353f9704c9dcda2d937494863
 counts:
   live_total: 125
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 59
-  total: 184
+  podman_first: 62
+  total: 187
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -606,13 +606,13 @@ cases:
 
     does not match mandatory `GOWAVE_NODE_INSTALLER_SHA256`
 
-    **WHEN** preflight validates the bundled Master installer and immutable remote Worker installer source
+    **WHEN** preflight validates the pinned Master and Worker installer sources
 
     **THEN** the runner terminates before installation; neither path may fall back to floating `main`
     or execute
 
     an installer whose bytes do not match the configured digest'
-  assertion_sha256: cec9cb8f251ea997cbfe2e9b6e6f39d33b2e60aba7b583dcfada71de59e0a974
+  assertion_sha256: d59eadca48afc6122812c5c7af0264566b46fce45a3399dca895a55de3084ea6
   runs_in:
   - podman
   - live
@@ -3623,6 +3623,62 @@ cases:
   driver: null
   driver_status: planned
   promotion_target: Result Status Semantics
+- id: MN-REVOKE
+  requirement: Real client data-plane verification
+  live_scenario: null
+  assertion: A cluster client's subscription is served and captured once both nodes' tuples have carried
+    a payload from their own egress addresses, the documented revoke action rotates the credentials and
+    the subscription path with the old path returning 404, and freshly started engines replaying the pre-revocation
+    payload deliver nothing through either node while the controlled endpoint records none of their request
+    ids.
+  assertion_sha256: 8ee07a46dce9ab34d5f2ff2d9f3946a50b4c3f445da6b9ce01c01fbaaf96212d
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-OUTAGE
+  requirement: Failure injection and recovery
+  live_scenario: null
+  assertion: A subscription captured while the cluster is healthy carries a payload through the Worker,
+    `systemctl stop gowave-node.service` on the Worker is observed by the Panel as that node offline while
+    the Master stays connected and still delivers, the same captured payload is refused through the Worker,
+    and after the unit is started again the node reconnects with its control plane established and the
+    same subscription transfers through the Worker once more.
+  assertion_sha256: e9167e51a378a1ae3df8722a83d3cd042fee62d9d0c85a6988a08e7a4fec4671
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Negative Scenario and Fault Injection Tests
+- id: MN-RESTART
+  requirement: Failure injection and recovery
+  live_scenario: null
+  assertion: '`systemctl restart gowave-node.service` on the Worker starts a new node process, leaves
+    the unit active, and leaves the Panel''s registry record unchanged in uuid, endpoint, assigned inbounds
+    and recorded version with the node connected again, and the subscription captured before the restart
+    transfers through the Worker without a client re-import or a resync.'
+  assertion_sha256: 1e17ffd51123384ca44c6c46304ffee5d11270dc3a31425437c9ca519845288e
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Negative Scenario and Fault Injection Tests
 - id: AIO-DP-REALITY-xray
   requirement: Real client data-plane verification
   live_scenario: null

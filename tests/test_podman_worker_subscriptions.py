@@ -380,7 +380,7 @@ class _NodeHost(StubEngineHost):
     def node_data_ip(self, node=""):
         return str(self.plan.data_worker_ip if node == "worker" else self.plan.data_target_ip)
 
-    def transfer_facts(self, engine, network, security, timeout=300, host=""):
+    def transfer_facts(self, engine, network, security, timeout=300, host="", expect_refusal=False):
         self.transfers.append((engine, network, security, host))
         return subprocess.CompletedProcess(
             ["python3", "traffic_probe.py"], 0, json.dumps(self.transfer), "",

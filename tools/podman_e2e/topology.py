@@ -663,6 +663,7 @@ class AioTopology:
 
     def transfer_facts(
         self, engine: str, network: str, security: str, timeout: int = 300, host: str = "",
+        expect_refusal: bool = False,
     ) -> Any:
         """Run one matrix tuple: one client through one inbound, to the endpoint.
 
@@ -674,6 +675,9 @@ class AioTopology:
         ``host`` names the node the tuple belongs to. A cluster serves the same
         transport/security pair on both nodes, so without it the probe would run
         the Master's outbound and call it the Worker's.
+
+        ``expect_refusal`` turns a refused connection into the returned result,
+        which is how a case observes a node that was deliberately taken down.
         """
         self.engine_client()
         return self.podman.exec(
@@ -688,6 +692,7 @@ class AioTopology:
                 "--network", network,
                 "--security", security,
                 *(["--host", host] if host else []),
+                *(["--expect-refusal"] if expect_refusal else []),
             ],
             check=False,
             timeout=timeout,
