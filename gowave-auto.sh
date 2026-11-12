@@ -458,9 +458,6 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
         cleanup_acme_snapshot "$acme_tx_id" "$vision_domain"
     fi
     cleanup_deploy_hook_manifest "$acme_tx_id"
-    # Read shortUuid
-    local user_short_uuid
-    user_short_uuid=$(python3 -c "import json; print(json.load(open('$STATE_FILE')).get('defaultUserShortUuid', ''))" 2>/dev/null || echo "default-user")
 
     echo "================================================================================"
     echo "                   GoWave Auto NGINX Installation Complete                      "
@@ -469,15 +466,7 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
     echo "Admin Username:      $admin_user"
     echo "Saved Credentials:   $CREDENTIALS_FILE (mode 0600)"
     echo ""
-    echo "--- Client Subscription Links for 'default-user' ---"
-    echo "Xray JSON:           https://$panel_domain/api/sub/$user_short_uuid/v2ray-json"
-    echo "Mihomo YAML:         https://$panel_domain/api/sub/$user_short_uuid/mihomo"
-    echo ""
-    echo "MANDATORY REQUIREMENT: Clients MUST send a non-empty User-Agent header!"
-    echo "Example verification commands:"
-    echo "  curl -fsSL -H 'User-Agent: v2rayN/6.0' 'https://$panel_domain/api/sub/$user_short_uuid/v2ray-json'"
-    echo "  curl -fsSL -H 'User-Agent: ClashMeta/1.19' 'https://$panel_domain/api/sub/$user_short_uuid/mihomo'"
-    echo "================================================================================"
+    cmd_user_links default-user
 }
 
 cmd_node() {
