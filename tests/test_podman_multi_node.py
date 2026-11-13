@@ -1458,12 +1458,13 @@ class TestMultiNodeSuite(unittest.TestCase):
     def test_the_lifecycle_cases_run_last_because_they_fault_the_worker(self):
         # 5.9: revocation and the Worker's own stop/start/restart change the
         # cluster under the suite, so nothing that observes a healthy cluster may
-        # run after them.
+        # run after them. 6.12 then re-provisions that Worker and renames the
+        # Master, so it closes the run instead of reading what they left behind.
         ids = [case.id for case in multi_node.cases(self.podman)]
         self.assertEqual(
-            ids[-3:],
+            ids[-4:],
             [multi_node.REVOCATION_CASE_ID, multi_node.OUTAGE_CASE_ID,
-             multi_node.RESTART_CASE_ID],
+             multi_node.RESTART_CASE_ID, multi_node.ACME80_CASE_ID],
         )
 
     def test_the_nginx_configuration_case_precedes_the_lifecycle_cases(self):
@@ -4238,6 +4239,311 @@ class TestIpv6PolicyCase(unittest.TestCase):
         with self.assertRaises(AssertionError) as caught:
             self.contract(facts)
         self.assertIn("control port 3002", str(caught.exception))
+
+
+_ACME_TOKEN_SHA = hashlib.sha256(multi_node.ACME_CHALLENGE_TOKEN.encode("utf-8")).hexdigest()
+_ACME_MASTER_VHOST_LINES = (
+    "7:    listen 80 default_server;",
+    "8:    listen [::]:80;",
+    "9:    server_name panel.testbed.internal reality.testbed.internal "
+    "testbed.internal www.testbed.internal;",
+    "14:        root /var/www/gowave-acme;",
+)
+_ACME_WORKER_VHOST_LINES = (
+    "3:    listen 80;",
+    "4:    server_name worker.testbed.internal worker-reality.testbed.internal;",
+    "6:        root /var/www/gowave-acme;",
+)
+_ACME_POST_CHANGE_MASTER_VHOST_LINES = (
+    "7:    listen 80 default_server;",
+    "8:    listen [::]:80;",
+    "9:    server_name panel2.testbed.internal reality2.testbed.internal "
+    "testbed.internal www.testbed.internal;",
+    "14:        root /var/www/gowave-acme;",
+)
+_ACME_POST_CHANGE_MASTER_MAP = (
+    "map $ssl_preread_server_name $sni_backend {",
+    "    panel2.testbed.internal 127.0.0.1:7443;",
+    "    reality2.testbed.internal 127.0.0.1:8443;",
+    "    testbed.internal 127.0.0.1:9443;",
+    "    www.testbed.internal 127.0.0.1:9443;",
+    "    default 127.0.0.1:8443;",
+    "}",
+)
+_ACME_POST_CHANGE_LINEAGES = {
+    "/etc/letsencrypt/live/reality2.testbed.internal/cert.pem": [
+        "reality2.testbed.internal", "testbed.internal", "www.testbed.internal",
+    ],
+}
+
+
+def _acme_vhost_output(lines, enabled=("gowave",), stale=(), webroot=True, present=True):
+    rows = [f"present\t{1 if present else 0}"] + [f"line\t{line}" for line in lines]
+    rows.append(f"webroot\t{1 if webroot else 0}")
+    rows += [f"enabled\t{name}" for name in enabled]
+    rows += [f"stale\t{name}" for name in stale]
+    return "\n".join(rows) + "\n"
+
+
+class _Acme80Podman:
+    """Both roles' port 80 trees, the client's probes, and the domain change."""
+
+    def __init__(self, master=None, master_after=None, worker=None, decoy=None,
+                 change_returncode=0):
+        self.master = master if master is not None else _acme_vhost_output(_ACME_MASTER_VHOST_LINES)
+        self.master_after = master_after if master_after is not None else (
+            _acme_vhost_output(_ACME_POST_CHANGE_MASTER_VHOST_LINES)
+        )
+        self.worker = worker if worker is not None else _acme_vhost_output(_ACME_WORKER_VHOST_LINES)
+        self.decoy = decoy if decoy is not None else (
+            "9:    server_name reality2.testbed.internal testbed.internal "
+            "www.testbed.internal;\n"
+            "12:    ssl_certificate /etc/letsencrypt/live/reality2.testbed.internal/"
+            "fullchain.pem;\n"
+        )
+        self.change_returncode = change_returncode
+        self.changed = False
+        self.scripts = []
+
+    def master_tree(self):
+        return self.master_after if self.changed else self.master
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        self.scripts.append((container, script))
+        if "domain-change" in script:
+            if self.change_returncode == 0:
+                self.changed = True
+            return subprocess.CompletedProcess(["bash", "-lc"], self.change_returncode, "", "")
+        if "acme-challenge" in script and "sha256sum" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0,
+                f"challenge\t/var/www/gowave-acme\t{_ACME_TOKEN_SHA}\n", "")
+        if "sites-enabled" in script:
+            output = self.master_tree() if container == "aio-master" else self.worker
+            return subprocess.CompletedProcess(["bash", "-lc"], 0, output, "")
+        if "mapraw" in script:
+            if container == "worker-01":
+                map_lines = _DECOY_ROUTE_WORKER_MAP
+                lineages = _DECOY_ROUTE_WORKER_LINEAGES
+                bound = {"443": ["0.0.0.0"], "9443": ["127.0.0.1"]}
+            else:
+                map_lines = _ACME_POST_CHANGE_MASTER_MAP
+                lineages = _ACME_POST_CHANGE_LINEAGES
+                bound = {"443": ["0.0.0.0", "[::]"], "9443": ["127.0.0.1"]}
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0,
+                _decoy_route_output(map_lines, lineages=lineages, bound=bound), "")
+        if "ssl_certificate" in script:
+            return subprocess.CompletedProcess(["bash", "-lc"], 0, self.decoy, "")
+        return subprocess.CompletedProcess(["bash", "-lc"], 0, "", "")
+
+    def exec(self, container, argv, check=True, input_text=None, timeout=120):
+        raise AssertionError(f"unexpected python probe in {container}: {argv}")
+
+
+class _Acme80Host:
+    """The two roles, their names, and the re-provision the case asks for."""
+
+    target_name = "aio-master"
+    panel_domain = topology.PANEL_DOMAIN
+    reality_domain = topology.REALITY_DOMAIN
+    worker_name = "worker-01"
+    worker_domain = "worker.testbed.internal"
+    worker_reality_domain = "worker-reality.testbed.internal"
+
+    def __init__(self, status=None, node_add_returncode=0):
+        self.status = status or {}
+        self.node_add_returncode = node_add_returncode
+        self.node_add_calls = 0
+        self.zone_writes = []
+        self.plan = type("Plan", (), {"target_ip": "10.89.0.10", "worker_ip": "10.89.0.11"})()
+        self._zone = {"ttl": 60, "records": {}, "behavior": {"mode": "answer"}}
+
+    def client_http(self, url, timeout=30, **kwargs):
+        name = url.split("://", 1)[1].split("/", 1)[0]
+        status = self.status.get(name, 200)
+        payload = multi_node.ACME_CHALLENGE_TOKEN.encode("utf-8")
+        probe = {
+            "url": url,
+            "method": "GET",
+            "status": status,
+            "headers": {"content-type": "text/plain"},
+            "body_length": len(payload),
+            "body_sha256": hashlib.sha256(payload).hexdigest(),
+            "body_snippet": payload.decode(),
+            "peer": {"san": [], "tls_version": ""},
+        }
+        return {"url": url, "returncode": 0, "stdout": json.dumps(probe),
+                "stderr": "", "probe": probe}
+
+    def zone(self):
+        return json.loads(json.dumps(self._zone))
+
+    def write_dns_zone(self, data):
+        self.zone_writes.append(data)
+
+    def node_add(self, name=None):
+        self.node_add_calls += 1
+        return type("Outcome", (), {
+            "returncode": self.node_add_returncode, "stdout": "", "stderr": "",
+        })()
+
+
+class _Acme80Product:
+    def __init__(self, podman, host):
+        self.podman = podman
+        self.host = host
+
+    def require_worker(self):
+        return self.host
+
+
+class TestAcme80Case(unittest.TestCase):
+    """NGX-WORKER-ACME80: port 80 keeps renewing across a re-provision."""
+
+    def run_case(self, podman=None, host=None):
+        podman = podman if podman is not None else _Acme80Podman()
+        host = host if host is not None else _Acme80Host()
+        return multi_node.case_acme80(_Acme80Product(podman, host))
+
+    def test_the_vhost_parser_reads_every_directive_it_checks(self):
+        facts = multi_node.parse_acme_vhost(_acme_vhost_output(_ACME_MASTER_VHOST_LINES))
+        self.assertTrue(facts["present"])
+        self.assertEqual(facts["listen"], ["80 default_server", "[::]:80"])
+        self.assertIn("panel.testbed.internal", facts["server_name"])
+        self.assertEqual(facts["root"], "/var/www/gowave-acme")
+        self.assertTrue(facts["webroot"])
+        self.assertEqual(facts["enabled"], ["gowave"])
+
+    def test_a_vhost_that_does_not_listen_on_80_is_rejected(self):
+        facts = multi_node.parse_acme_vhost(_acme_vhost_output(_ACME_MASTER_VHOST_LINES))
+        facts["listen"] = ["443 ssl"]
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.require_acme_vhost("NGX-WORKER-ACME80", "the Master", facts,
+                                          ["panel.testbed.internal"], True)
+        self.assertIn("does not listen on 80", str(caught.exception))
+
+    def test_a_master_vhost_without_default_server_is_rejected(self):
+        lines = tuple(line.replace(" default_server", "")
+                      for line in _ACME_MASTER_VHOST_LINES)
+        facts = multi_node.parse_acme_vhost(_acme_vhost_output(lines))
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.require_acme_vhost("NGX-WORKER-ACME80", "the Master", facts,
+                                          ["panel.testbed.internal"], True)
+        self.assertIn("default-server role is missing", str(caught.exception))
+
+    def test_a_vhost_that_does_not_name_the_installed_domain_is_rejected(self):
+        facts = multi_node.parse_acme_vhost(_acme_vhost_output(_ACME_MASTER_VHOST_LINES))
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.require_acme_vhost("NGX-WORKER-ACME80", "the Master", facts,
+                                          ["panel2.testbed.internal"], True)
+        self.assertIn("does not answer for ['panel2.testbed.internal']",
+                      str(caught.exception))
+
+    def test_a_vhost_serving_another_root_is_rejected(self):
+        lines = tuple(line.replace("/var/www/gowave-acme", "/var/www/html")
+                      for line in _ACME_MASTER_VHOST_LINES)
+        facts = multi_node.parse_acme_vhost(_acme_vhost_output(lines))
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.require_acme_vhost("NGX-WORKER-ACME80", "the Master", facts,
+                                          ["panel.testbed.internal"], True)
+        self.assertIn("/var/www/html", str(caught.exception))
+
+    def test_a_challenge_that_answers_with_a_redirect_is_rejected(self):
+        host = _Acme80Host(status={topology.PANEL_DOMAIN: 301})
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("instead of serving the challenge", str(caught.exception))
+
+    def test_both_roles_serve_the_token_before_and_after_a_re_provision(self):
+        podman = _Acme80Podman()
+        host = _Acme80Host()
+        evidence = self.run_case(podman=podman, host=host)
+        self.assertEqual(host.node_add_calls, 1)
+        for role in ("master", "worker"):
+            with self.subTest(role=role):
+                self.assertEqual(evidence["roles"][role]["challenge"]["status"], 200)
+                self.assertEqual(evidence["roles"][role]["challenge"]["body_sha256"],
+                                 _ACME_TOKEN_SHA)
+                self.assertEqual(
+                    evidence["roles"][role]["after_reconfigure"]["challenge"]["status"], 200)
+        self.assertTrue(evidence["roles"]["worker"]["routes_unchanged"])
+
+    def test_a_re_provision_that_moves_the_workers_routes_is_rejected(self):
+        class MovingPodman(_Acme80Podman):
+            calls = 0
+
+            def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+                if container == "worker-01" and "mapraw" in script:
+                    type(self).calls += 1
+                    map_lines = (_DECOY_ROUTE_WORKER_MAP if type(self).calls == 1 else (
+                        "map $ssl_preread_server_name $worker_dest {",
+                        "    worker.testbed.internal 127.0.0.1:7443;",
+                        "    worker-reality.testbed.internal 127.0.0.1:8443;",
+                        "    testbed.internal 127.0.0.1:9443;",
+                        "    default 127.0.0.1:8443;",
+                        "}",
+                    ))
+                    return subprocess.CompletedProcess(
+                        ["bash", "-lc"], 0,
+                        _decoy_route_output(map_lines,
+                                            lineages=_DECOY_ROUTE_WORKER_LINEAGES,
+                                            bound={"443": ["0.0.0.0"], "9443": ["127.0.0.1"]}),
+                        "")
+                return super().exec_bash(container, script, check=check,
+                                         input_text=input_text, timeout=timeout)
+
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=MovingPodman())
+        self.assertIn("reconfiguration changed a tree", str(caught.exception))
+
+    def test_the_domain_change_re_renders_the_decoy_and_drops_the_old_name(self):
+        podman = _Acme80Podman()
+        host = _Acme80Host()
+        evidence = self.run_case(podman=podman, host=host)
+        self.assertEqual(host.zone_writes[-1]["records"][multi_node.ACME_NEW_PANEL_DOMAIN],
+                         {"A": ["10.89.0.10"]})
+        self.assertEqual(evidence["domain_change"]["panel"],
+                         multi_node.ACME_NEW_PANEL_DOMAIN)
+        self.assertIn(multi_node.ACME_NEW_REALITY_DOMAIN,
+                      evidence["after_domain_change"]["server_name"])
+        self.assertEqual(evidence["after_domain_change"]["challenge"]["status"], 200)
+        self.assertEqual(evidence["decoy"]["certificate"],
+                         "/etc/letsencrypt/live/reality2.testbed.internal/fullchain.pem")
+        self.assertIn("reality2.testbed.internal", evidence["decoy"]["server_lines"][0])
+
+    def test_a_stale_sites_enabled_entry_is_rejected(self):
+        podman = _Acme80Podman(master_after=_acme_vhost_output(
+            _ACME_POST_CHANGE_MASTER_VHOST_LINES,
+            enabled=("gowave", "old-panel"),
+            stale=("/etc/nginx/sites-available/old-panel",),
+        ))
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=podman)
+        self.assertIn("kept a stale entry", str(caught.exception))
+
+    def test_a_failed_domain_change_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_Acme80Podman(change_returncode=1))
+        self.assertIn("domain-change` exited 1", str(caught.exception))
+
+    def test_the_scripts_name_the_shipped_vhosts_and_the_operator_command(self):
+        podman = _Acme80Podman()
+        host = _Acme80Host()
+        self.run_case(podman=podman, host=host)
+        scripts = {container: [script for target, script in podman.scripts
+                               if target == container] for container in
+                   ("aio-master", "worker-01")}
+        self.assertTrue(any(multi_node.ACME_MASTER_VHOST in script
+                            for script in scripts["aio-master"]))
+        self.assertTrue(any(multi_node.ACME_WORKER_VHOST in script
+                            for script in scripts["worker-01"]))
+        self.assertTrue(any(multi_node.ACME_CHALLENGE_TOKEN in script
+                            for script in scripts["worker-01"]))
+        change = [script for script in scripts["aio-master"] if "domain-change" in script]
+        self.assertEqual(len(change), 1)
+        self.assertIn("gowave-auto.sh domain-change", change[0])
+        self.assertIn(multi_node.ACME_NEW_PANEL_DOMAIN, change[0])
 
 
 if __name__ == "__main__":

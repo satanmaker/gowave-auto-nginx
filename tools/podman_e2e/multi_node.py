@@ -15,6 +15,7 @@ operator ships.
 from __future__ import annotations
 
 import base64
+import hashlib
 import ipaddress
 import json
 import os
@@ -166,6 +167,24 @@ DECOY_ROUTE_BACKENDS: Dict[str, int] = {"panel": 7443, "reality": 8443, "vision"
 # A refused connection answers at once and a filtered one has to be waited out,
 # so each attempt from a client network is bounded by its own short timeout.
 DECOY_ROUTE_PATH_TIMEOUT_SECONDS = 5
+# The ACME vhost on port 80 is what certbot's HTTP-01 renewal revalidates
+# through, so it has to outlive a Worker re-provision and a domain change.
+ACME80_CASE_ID = "NGX-WORKER-ACME80"
+ACME80_TIMEOUT_SECONDS = 600
+# A Worker re-provision is the operator's own `node add` again, and the domain
+# change re-issues two lineages, so the case is bounded by both.
+ACME80_DOMAIN_CHANGE_TIMEOUT_SECONDS = 420
+ACME_WEBROOT = "/var/www/gowave-acme"
+ACME_MASTER_VHOST = "/etc/nginx/conf.d/gowave-http.conf"
+ACME_WORKER_VHOST = "/etc/nginx/conf.d/00-worker-acme-challenge.conf"
+ACME_CHALLENGE_DIR = "/.well-known/acme-challenge"
+# The token is the whole file: a 404, the redirect, or the decoy page all hash
+# differently, so a served challenge cannot be mistaken for any of them.
+ACME_CHALLENGE_TOKEN = "gowave-e2e-http01-token"
+# The names the domain change installs, inside the fixture's own zone so the
+# product's resolution precondition and certbot's HTTP-01 both still hold.
+ACME_NEW_PANEL_DOMAIN = "panel2.testbed.internal"
+ACME_NEW_REALITY_DOMAIN = "reality2.testbed.internal"
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 VISION_PROBE_TIMEOUT_SECONDS = 120
@@ -4717,6 +4736,355 @@ def case_decoy_route(product: MultiNodeProduct) -> Dict[str, Any]:
     return evidence
 
 
+def acme_challenge_script(token: str) -> str:
+    """Put a token in the role's own ACME webroot, where HTTP-01 reads it."""
+    return f"""set -u
+root={ACME_WEBROOT}
+mkdir -p "$root{ACME_CHALLENGE_DIR}" || exit 1
+printf '%s' {shlex.quote(token)} > "$root{ACME_CHALLENGE_DIR}/{shlex.quote(token)}" || exit 1
+chmod 0644 "$root{ACME_CHALLENGE_DIR}/{shlex.quote(token)}"
+printf 'challenge\\t%s\\t%s\\n' "$root" "$(sha256sum "$root{ACME_CHALLENGE_DIR}/{shlex.quote(token)}" | cut -d' ' -f1)"
+"""
+
+
+def acme_vhost_script(vhost: str, old_domain: str) -> str:
+    """One role's port 80 vhost, its enabled sites, and any entry naming the old name."""
+    return f"""set -u
+vhost={shlex.quote(vhost)}
+if [ -f "$vhost" ]; then
+    printf 'present\\t1\\n'
+    grep -nE '^[[:space:]]*(listen|server_name|root|ssl_certificate)[[:space:]]' "$vhost" | sed 's/^/line\\t/'
+else
+    printf 'present\\t0\\n'
+fi
+if [ -d {ACME_WEBROOT} ]; then printf 'webroot\\t1\\n'; else printf 'webroot\\t0\\n'; fi
+ls -1 /etc/nginx/sites-enabled 2>/dev/null | sed 's/^/enabled\\t/' || true
+grep -rlF -- {shlex.quote(old_domain)} /etc/nginx/sites-enabled /etc/nginx/sites-available 2>/dev/null | sed 's/^/stale\\t/' || true
+"""
+
+
+def parse_acme_vhost(output: str) -> Dict[str, Any]:
+    """The vhost's directives, the enabled sites, and the stale entries."""
+    facts: Dict[str, Any] = {
+        "present": False, "lines": [], "listen": [], "server_name": [],
+        "root": "", "certificate": "", "webroot": False, "enabled": [], "stale": [],
+    }
+    for line in (output or "").splitlines():
+        fields = line.split("\t")
+        kind = fields[0] if fields else ""
+        if kind == "present" and len(fields) == 2:
+            facts["present"] = fields[1].strip() == "1"
+        elif kind == "line" and len(fields) == 2:
+            facts["lines"].append(fields[1])
+            directive = fields[1].split(":", 1)[-1].strip().rstrip(";").strip()
+            name, _, value = directive.partition(" ")
+            value = value.strip()
+            if name == "listen":
+                facts["listen"].append(value)
+            elif name == "server_name":
+                facts["server_name"].extend(value.split())
+            elif name == "root":
+                facts["root"] = value
+            elif name == "ssl_certificate":
+                facts["certificate"] = value
+        elif kind == "webroot" and len(fields) == 2:
+            facts["webroot"] = fields[1].strip() == "1"
+        elif kind == "enabled" and len(fields) == 2:
+            facts["enabled"].append(fields[1])
+        elif kind == "stale" and len(fields) == 2:
+            facts["stale"].append(fields[1])
+    return facts
+
+
+def require_acme_vhost(case_id: str, label: str, facts: Dict[str, Any],
+                       names: Sequence[str], default_server: bool) -> Dict[str, Any]:
+    """The port 80 vhost is there, answers 80, and serves the challenge root."""
+    require(
+        case_id,
+        facts["present"],
+        f"{label} has no port 80 ACME vhost, so certbot's HTTP-01 renewal would have "
+        "nothing to revalidate through",
+    )
+    listening = [line for line in facts["listen"] if line.split()[0:1] == ["80"]]
+    require(
+        case_id,
+        listening,
+        f"{label}'s port 80 vhost does not listen on 80: {facts['listen']}",
+    )
+    require(
+        case_id,
+        any("default_server" in line for line in listening) == default_server,
+        f"{label}'s port 80 vhost declares {listening}, so its default-server role is "
+        f"{'missing' if default_server else 'unexpected'}",
+    )
+    missing = [name for name in names if name and name not in facts["server_name"]]
+    require(
+        case_id,
+        not missing,
+        f"{label}'s port 80 vhost does not answer for {missing}: {facts['server_name']}",
+    )
+    require(
+        case_id,
+        facts["root"] == ACME_WEBROOT,
+        f"{label}'s port 80 vhost serves challenges from {facts['root']!r} instead of "
+        f"{ACME_WEBROOT}",
+    )
+    require(
+        case_id,
+        facts["webroot"],
+        f"{label} holds no {ACME_WEBROOT} directory, so the vhost's challenge root is empty",
+    )
+    return facts
+
+
+def acme_challenge_fetch(case_id: str, host: topology.MultiNodeTopology, name: str,
+                         token: str) -> Dict[str, Any]:
+    """The challenge answers over plain HTTP on the name's own vhost."""
+    url = f"http://{name}{ACME_CHALLENGE_DIR}/{token}"
+    report = host.client_http(url, timeout=COVER_SITE_PROBE_TIMEOUT_SECONDS)
+    probe = report.get("probe") or {}
+    require(
+        case_id,
+        report.get("returncode") == 0 and probe,
+        f"GET {url} produced no report (exit {report.get('returncode')}): "
+        f"{report.get('stderr') or 'the probe printed nothing'}",
+    )
+    require(
+        case_id,
+        probe.get("status") == 200,
+        f"GET {url} answered {probe.get('status')} (location "
+        f"{(probe.get('headers') or {}).get('location', '')!r}) instead of serving the "
+        "challenge, so a renewal would fail",
+    )
+    expected = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    require(
+        case_id,
+        probe.get("body_sha256") == expected,
+        f"GET {url} served {probe.get('body_sha256')} instead of the token written into "
+        f"{ACME_WEBROOT}, so the vhost answers from somewhere else",
+    )
+    return {
+        "url": url,
+        "status": probe.get("status"),
+        "body_sha256": probe.get("body_sha256"),
+    }
+
+
+def domain_change_script(panel_domain: str, reality_domain: str) -> str:
+    """The operator's own domain change, unmodified and without a TTY."""
+    return (
+        f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh domain-change "
+        f"{shlex.quote(panel_domain)} {shlex.quote(reality_domain)}\n"
+    )
+
+
+def case_acme80(product: MultiNodeProduct) -> Dict[str, Any]:
+    """NGX-WORKER-ACME80: port 80 keeps revalidating across a re-provision.
+
+    Certificate renewal revalidates through the port 80 vhost, so a Worker
+    re-provision must not remove it and a domain change must re-render it for
+    the new names. The case writes a token into each role's own ACME webroot
+    and fetches it from the independent client, which is exactly what certbot
+    asks an HTTP-01 challenge to do; it repeats that after re-running the
+    operator's `node add` on the Worker, and after a real `domain-change` on
+    the Master, where the decoy, the lineage and the enabled sites are read
+    again for the new names.
+    """
+    case_id = ACME80_CASE_ID
+    host = product.require_worker()
+    token = ACME_CHALLENGE_TOKEN
+    old_panel = host.panel_domain
+    roles = (
+        ("master", "the Master", host.target_name, host.panel_domain, ACME_MASTER_VHOST, True),
+        ("worker", "the Worker", host.worker_name, host.worker_domain, ACME_WORKER_VHOST, False),
+    )
+    evidence: Dict[str, Any] = {"token": token, "roles": {}}
+
+    def read_role(key: str, label: str, container: str, name: str, vhost: str,
+                  default_server: bool, names: Sequence[str]) -> Dict[str, Any]:
+        written = product.podman.exec_bash(
+            container, acme_challenge_script(token), check=False, timeout=120,
+        )
+        require(
+            case_id,
+            written.returncode == 0,
+            f"{label} could not write its own challenge token: "
+            f"{(written.stderr or '').strip()[-400:]}",
+        )
+        read = product.podman.exec_bash(
+            container, acme_vhost_script(vhost, old_panel), check=False, timeout=120,
+        )
+        require(
+            case_id,
+            read.returncode == 0,
+            f"{label} could not read its port 80 tree: {(read.stderr or '').strip()[-400:]}",
+        )
+        facts = require_acme_vhost(
+            case_id, label, parse_acme_vhost(read.stdout or ""), names, default_server,
+        )
+        return {
+            "vhost": vhost,
+            "server_name": facts["server_name"],
+            "listen": facts["listen"],
+            "root": facts["root"],
+            "certificate": facts["certificate"],
+            "enabled": facts["enabled"],
+            "stale": facts["stale"],
+            "challenge": acme_challenge_fetch(case_id, host, name, token),
+        }
+
+    masters = [role for role in roles if role[0] == "master"][0]
+    workers = [role for role in roles if role[0] == "worker"][0]
+    evidence["roles"]["master"] = read_role(
+        *masters, names=[host.panel_domain, host.reality_domain],
+    )
+    evidence["roles"]["worker"] = read_role(
+        *workers, names=[host.worker_domain, host.worker_reality_domain],
+    )
+    require(
+        case_id,
+        "default" not in evidence["roles"]["master"]["enabled"],
+        f"the Master still enables the distribution's default site "
+        f"({evidence['roles']['master']['enabled']}), which competes for port 80",
+    )
+
+    # The Worker's route is install-time state too: a re-provision may re-render
+    # it, but it may not move the decoy or the SNI routes when nothing changed.
+    def worker_route() -> Dict[str, Any]:
+        read = product.podman.exec_bash(
+            host.worker_name, decoy_route_script(ACME_WORKER_VHOST), check=False, timeout=120,
+        )
+        require(
+            case_id,
+            read.returncode == 0,
+            f"the Worker could not read its stream map: {(read.stderr or '').strip()[-400:]}",
+        )
+        facts = parse_decoy_route(read.stdout or "")
+        return {"map": facts["map"], "bound_9443": facts["bound"].get(str(DECOY_LISTENER_PORT), [])}
+
+    before = worker_route()
+    changed = host.node_add()
+    require(
+        case_id,
+        changed.returncode == 0,
+        f"re-running the operator's `node add` on the Worker exited {changed.returncode}: "
+        f"{(changed.stderr or changed.stdout or '').strip()[-600:]}",
+    )
+    after = worker_route()
+    require(
+        case_id,
+        before == after,
+        f"re-provisioning the Worker moved its routes: {before} became {after}, so a "
+        "reconfiguration changed a tree that had no domain change to apply",
+    )
+    evidence["roles"]["worker"]["routes_unchanged"] = after == before
+    evidence["roles"]["worker"]["routes"] = after
+    evidence["roles"]["master"]["after_reconfigure"] = read_role(
+        *masters, names=[host.panel_domain, host.reality_domain],
+    )
+    evidence["roles"]["worker"]["after_reconfigure"] = read_role(
+        *workers, names=[host.worker_domain, host.worker_reality_domain],
+    )
+
+    # A domain change is the one flow that has to move the decoy and the
+    # lineage; the new names are added to the fixture zone first, so the
+    # product's own resolution precondition and certbot's HTTP-01 both hold.
+    zone = host.zone()
+    zone["records"][ACME_NEW_PANEL_DOMAIN] = {"A": [host.plan.target_ip]}
+    zone["records"][ACME_NEW_REALITY_DOMAIN] = {"A": [host.plan.target_ip]}
+    host.write_dns_zone(zone)
+    renamed = product.podman.exec_bash(
+        host.target_name, domain_change_script(ACME_NEW_PANEL_DOMAIN, ACME_NEW_REALITY_DOMAIN),
+        check=False, timeout=ACME80_DOMAIN_CHANGE_TIMEOUT_SECONDS,
+    )
+    require(
+        case_id,
+        renamed.returncode == 0,
+        f"`gowave-auto.sh domain-change` exited {renamed.returncode}: "
+        f"{(renamed.stderr or renamed.stdout or '').strip()[-800:]}",
+    )
+    evidence["domain_change"] = {
+        "panel": ACME_NEW_PANEL_DOMAIN,
+        "reality": ACME_NEW_REALITY_DOMAIN,
+        "returncode": renamed.returncode,
+    }
+
+    post = product.podman.exec_bash(
+        host.target_name, acme_vhost_script(ACME_MASTER_VHOST, old_panel),
+        check=False, timeout=120,
+    )
+    facts = require_acme_vhost(
+        case_id, "the Master after the domain change", parse_acme_vhost(post.stdout or ""),
+        [ACME_NEW_PANEL_DOMAIN, ACME_NEW_REALITY_DOMAIN], True,
+    )
+    require(
+        case_id,
+        not facts["stale"],
+        f"the Master's enabled and available sites still name {old_panel}: "
+        f"{facts['stale']}, so the old name kept a stale entry",
+    )
+    require(
+        case_id,
+        "default" not in facts["enabled"],
+        f"the domain change reinstated the distribution's default site: {facts['enabled']}",
+    )
+    evidence["after_domain_change"] = {
+        "server_name": facts["server_name"],
+        "listen": facts["listen"],
+        "root": facts["root"],
+        "enabled": facts["enabled"],
+        "stale": facts["stale"],
+        "challenge": acme_challenge_fetch(case_id, host, ACME_NEW_PANEL_DOMAIN, token),
+    }
+
+    route = product.podman.exec_bash(
+        host.target_name, decoy_route_script("/etc/nginx/conf.d/gowave-decoy.conf"),
+        check=False, timeout=120,
+    )
+    require(
+        case_id,
+        route.returncode == 0,
+        f"the Master could not read its re-rendered decoy: "
+        f"{(route.stderr or '').strip()[-400:]}",
+    )
+    rendered = parse_decoy_route(route.stdout or "")
+    apex = topology.COVER_APEX
+    require_decoy_routes(
+        case_id, "the Master after the domain change", rendered, [apex, f"www.{apex}"],
+        {"panel": ACME_NEW_PANEL_DOMAIN, "reality": ACME_NEW_REALITY_DOMAIN},
+    )
+    lineage = require_cover_lineage(
+        case_id, "the Master after the domain change", rendered, [apex, f"www.{apex}"],
+    )
+    certificate = (
+        f"/etc/letsencrypt/live/{ACME_NEW_REALITY_DOMAIN}/fullchain.pem"
+    )
+    decoy = product.podman.exec_bash(
+        host.target_name,
+        "set -u\ngrep -nE '^[[:space:]]*(server_name|ssl_certificate)[[:space:]]' "
+        "/etc/nginx/conf.d/gowave-decoy.conf\n",
+        check=False, timeout=120,
+    )
+    require(
+        case_id,
+        certificate in (decoy.stdout or ""),
+        f"the re-rendered decoy does not name {certificate}: {(decoy.stdout or '').strip()}",
+    )
+    require(
+        case_id,
+        ACME_NEW_REALITY_DOMAIN in (decoy.stdout or "")
+        and apex in (decoy.stdout or ""),
+        f"the re-rendered decoy does not name the new pair: {(decoy.stdout or '').strip()}",
+    )
+    evidence["decoy"] = {
+        "routes": dict(rendered["map"]),
+        "lineage": lineage,
+        "server_lines": (decoy.stdout or "").splitlines(),
+        "certificate": certificate,
+    }
+    return evidence
+
+
 def cover_probe_matrix(server_ip: str, other_ip: str) -> Sequence[Dict[str, Any]]:
     """Every way the installed apex pair can fail to resolve to one role.
 
@@ -5631,5 +5999,10 @@ def cases(
              timeout_seconds=OUTAGE_CASE_TIMEOUT_SECONDS),
         Case(RESTART_CASE_ID, "multi-node", lambda context: case_worker_restart(product),
              timeout_seconds=RESTART_CASE_TIMEOUT_SECONDS),
+        # This case re-provisions the Worker and then changes the Master's own
+        # names, so it runs after every case that reads the installed cluster:
+        # nothing after it may be blamed for the domains it installs.
+        Case(ACME80_CASE_ID, "multi-node", lambda context: case_acme80(product),
+             timeout_seconds=ACME80_TIMEOUT_SECONDS),
     ])
     return suite
