@@ -87,6 +87,7 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **TLS-VERIFY-ANCHORS** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **MN-BACKUP** — promotion target: Signal-Safe and Verifiable Transaction Compensation
 - **MN-BACKUP-VOL** — promotion target: Signal-Safe and Verifiable Transaction Compensation
+- **MN-BACKUP-BAD** — promotion target: Signal-Safe and Verifiable Transaction Compensation
 - **MN-RESTORE** — promotion target: Signal-Safe and Verifiable Transaction Compensation
 - **PODNET-MASTER-ADDR** — promotion target: Distributed Worker VPS Deployment Verification
 - **WRK-06** — promotion target: Distributed Worker VPS Deployment Verification
