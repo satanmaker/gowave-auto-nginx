@@ -214,6 +214,18 @@ BACKUP_PANEL_REQUIRED_PREFIXES = (
 BACKUP_NODE_PATHS = ("opt/gowave-node/.env",)
 # The key whose presence makes each archive secret-bearing. Only the name is read.
 BACKUP_SECRET_KEYS: Dict[str, str] = {"panel": "APP_SECRET", "node": "SECRET_KEY"}
+# A restore is only proven by what it undoes: this case creates a client and a
+# Worker environment edit, backs the role up, destroys both, and asks the
+# product's own restore to bring them back byte for byte.
+RESTORE_CASE_ID = "MN-RESTORE"
+RESTORE_CASE_TIMEOUT_SECONDS = 1800
+RESTORE_STEP_TIMEOUT_SECONDS = 240
+RESTORE_COMMAND_TIMEOUT_SECONDS = 300
+# The marker an injected Worker environment edit leaves behind. It names nothing
+# the node reads, so the running node is undisturbed until the restore replaces
+# the file.
+RESTORE_SENTINEL_KEY = "GOWAVE_E2E_RESTORE_SENTINEL"
+RESTORE_NODE_ENV = "/opt/gowave-node/.env"
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 VISION_PROBE_TIMEOUT_SECONDS = 120
@@ -5393,6 +5405,340 @@ def case_backup_types(product: MultiNodeProduct) -> Dict[str, Any]:
     return evidence
 
 
+def restore_step_script(step: str) -> str:
+    """One Panel-side restore step, run where the loopback API lives."""
+    return (
+        f"python3 {aio.PANEL_SURFACE_SCRIPT} --scope restore --step {step} "
+        f"--payload-dir {topology.PAYLOAD_MOUNT}\n"
+    )
+
+
+def node_env_probe_script() -> str:
+    """The Worker environment's fingerprint, and nothing out of the file itself."""
+    return (
+        "set -u\n"
+        f"digest=$(sha256sum {RESTORE_NODE_ENV} 2>/dev/null | awk '{{print $1}}')\n"
+        f"sentinel=$(grep -c '^{RESTORE_SENTINEL_KEY}=' {RESTORE_NODE_ENV} 2>/dev/null || true)\n"
+        "active=$(systemctl is-active gowave-node.service 2>/dev/null || true)\n"
+        'printf \'digest=%s sentinel=%s active=%s\\n\' '
+        '"${digest:-}" "${sentinel:-0}" "${active:-unknown}"\n'
+    )
+
+
+def parse_node_env_probe(output: str) -> Dict[str, str]:
+    """The key=value fields the Worker probe prints, refused when they are malformed.
+
+    The probe prints all three fields on one line, so the report is read as a
+    token stream rather than line by line; a token without a value carries no
+    fact and is dropped.
+    """
+    values: Dict[str, str] = {}
+    for token in (output or "").split():
+        key, separator, value = token.partition("=")
+        if separator:
+            values[key.strip()] = value.strip()
+    return values
+
+
+def require_node_env(
+    case_id: str, label: str, facts: Dict[str, str], digest: str,
+) -> None:
+    """The Worker environment is back to the exact bytes the archive captured."""
+    require(
+        case_id,
+        facts.get("digest") == digest and bool(digest),
+        f"{label}: the Worker environment hashes to {facts.get('digest')!r} instead of "
+        f"the captured {digest!r}, so the restore did not restore its credentials",
+    )
+    require(
+        case_id,
+        facts.get("sentinel", "0") == "0",
+        f"{label}: the Worker environment still carries the injected "
+        f"{RESTORE_SENTINEL_KEY} marker, so the restore did not replace the file",
+    )
+    require(
+        case_id,
+        facts.get("active") == "active",
+        f"{label}: gowave-node.service is {facts.get('active')!r} after the restore",
+    )
+
+
+def case_backup_restore(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-RESTORE: the product restores what a backup captured, on both roles.
+
+    The targets are the ones this run provisioned through the operator, so a
+    restore is asked to put back state those very commands created. What the
+    restore has to undo is chosen to be observable without reading a secret: a
+    client created through the Panel API and then deleted, and a Worker
+    environment file with one marker appended. Each archive is written by the
+    product, each restore is the product's own command, and the verdict comes
+    from the Panel's API, the Worker's own unit, and every served outbound
+    carrying a payload again.
+    """
+    case_id = RESTORE_CASE_ID
+    host = product.require_worker()
+    evidence: Dict[str, Any] = {"roles": {}}
+
+    # ---------------------------------------------------------------- capture
+    captured = product.podman.exec_bash(
+        host.target_name, restore_step_script("capture"), check=False,
+        timeout=RESTORE_STEP_TIMEOUT_SECONDS,
+    )
+    require(
+        case_id,
+        captured.returncode == 0,
+        f"the Panel probe could not capture a client before the backup: "
+        f"{(captured.stderr or captured.stdout or '').strip()[-400:]}",
+    )
+    try:
+        capture_facts = (json.loads(captured.stdout or "") or {}).get("restore") or {}
+    except json.JSONDecodeError:
+        raise AssertionError(
+            f"{case_id}: the capture step did not print a JSON object: "
+            f"{(captured.stdout or '')[:400]}"
+        )
+    require(
+        case_id,
+        capture_facts.get("create_status") == 201,
+        f"POST /api/users returned {capture_facts.get('create_status')!r} instead of 201, "
+        "so there is no client for the restore to bring back",
+    )
+    require(
+        case_id,
+        capture_facts.get("readback_username_matches") is True,
+        "the Panel did not read back the client it had just created",
+    )
+    served = {
+        name: entry
+        for name, entry in (capture_facts.get("representations") or {}).items()
+        if isinstance(entry, dict)
+    }
+    require(
+        case_id,
+        served and all(entry.get("status") == 200 for entry in served.values()),
+        f"the captured client was not served every representation: {served}",
+    )
+    evidence["roles"]["master"] = {
+        "users_in_archive": capture_facts.get("users_in_archive"),
+        "create_status": capture_facts.get("create_status"),
+        "representations": served,
+    }
+
+    # ------------------------------------------------------------- the Worker
+    before = product.podman.exec_bash(
+        host.worker_name, node_env_probe_script(), check=False,
+        timeout=RESTORE_STEP_TIMEOUT_SECONDS,
+    )
+    require(
+        case_id,
+        before.returncode == 0,
+        f"the Worker environment probe exited {before.returncode}: "
+        f"{(before.stderr or '').strip()[-400:]}",
+    )
+    env_before = parse_node_env_probe(before.stdout or "")
+    require(
+        case_id,
+        bool(env_before.get("digest")),
+        f"the Worker environment probe reported no digest: {(before.stdout or '').strip()[:200]}",
+    )
+    require(
+        case_id,
+        env_before.get("sentinel", "0") == "0",
+        "the Worker environment already carries the restore marker, so the case cannot "
+        "tell whether the restore replaced the file",
+    )
+
+    # ---------------------------------------------------------------- backups
+    archives: Dict[str, str] = {}
+    for role, container, type_name in (
+        ("master", host.target_name, "panel"),
+        ("worker", host.worker_name, "node"),
+    ):
+        created = product.podman.exec_bash(
+            container, backup_script(type_name), check=False,
+            timeout=BACKUP_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            created.returncode == 0,
+            f"the {type_name} backup this restore needs exited {created.returncode}: "
+            f"{(created.stderr or created.stdout or '').strip()[-400:]}",
+        )
+        archive = parse_backup_archive(created.stdout or "")
+        require(
+            case_id,
+            bool(archive),
+            f"the {type_name} backup did not name the archive it wrote: "
+            f"{(created.stdout or '').strip()[-400:]}",
+        )
+        archives[role] = archive
+
+    # ----------------------------------------------------------- destroy state
+    mutated = product.podman.exec_bash(
+        host.target_name, restore_step_script("mutate"), check=False,
+        timeout=RESTORE_STEP_TIMEOUT_SECONDS,
+    )
+    require(
+        case_id,
+        mutated.returncode == 0,
+        f"the Panel probe could not delete the captured client: "
+        f"{(mutated.stderr or mutated.stdout or '').strip()[-400:]}",
+    )
+    try:
+        mutate_facts = (json.loads(mutated.stdout or "") or {}).get("restore") or {}
+    except json.JSONDecodeError:
+        raise AssertionError(
+            f"{case_id}: the mutate step did not print a JSON object: "
+            f"{(mutated.stdout or '')[:400]}"
+        )
+    require(
+        case_id,
+        mutate_facts.get("delete_status") == 204,
+        f"DELETE /api/users/{{id}} returned {mutate_facts.get('delete_status')!r} instead of 204",
+    )
+    require(
+        case_id,
+        mutate_facts.get("user_present_after_delete") is False,
+        "the Panel still lists the client after deleting it, so the restore has "
+        "nothing to prove",
+    )
+    require(
+        case_id,
+        mutate_facts.get("subscription_after_delete_status") != 200,
+        "the deleted client's subscription route still answered 200, so the Panel's "
+        "own change never reached it",
+    )
+
+    marked = product.podman.exec_bash(
+        host.worker_name,
+        f"printf '%s\\n' '{RESTORE_SENTINEL_KEY}=1' >> {RESTORE_NODE_ENV}\n",
+        check=False, timeout=RESTORE_STEP_TIMEOUT_SECONDS,
+    )
+    require(
+        case_id,
+        marked.returncode == 0,
+        f"the case could not mark the Worker environment: {(marked.stderr or '').strip()[-400:]}",
+    )
+    edited = product.podman.exec_bash(
+        host.worker_name, node_env_probe_script(), check=False,
+        timeout=RESTORE_STEP_TIMEOUT_SECONDS,
+    )
+    env_edited = parse_node_env_probe(edited.stdout or "")
+    require(
+        case_id,
+        env_edited.get("sentinel") == "1" and env_edited.get("digest") != env_before["digest"],
+        f"the Worker environment did not change after the injected marker: {env_edited}",
+    )
+
+    # --------------------------------------------------------------- restores
+    restored: Dict[str, Any] = {}
+    for role, container, type_name in (
+        ("master", host.target_name, "panel"),
+        ("worker", host.worker_name, "node"),
+    ):
+        result = product.podman.exec_bash(
+            container,
+            f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh restore "
+            f"{shlex.quote(archives[role])} --type {type_name}\n",
+            check=False, timeout=RESTORE_COMMAND_TIMEOUT_SECONDS,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        require(
+            case_id,
+            result.returncode == 0,
+            f"the {type_name} restore exited {result.returncode}: {output.strip()[-800:]}",
+        )
+        require(
+            case_id,
+            "Restore completed and verified successfully." in output,
+            f"the {type_name} restore did not report its own success: {output.strip()[-800:]}",
+        )
+        restored[role] = {
+            "type": type_name,
+            "archive": archives[role],
+            "returncode": result.returncode,
+            "tail": output.strip().splitlines()[-3:],
+        }
+
+    # ---------------------------------------------------------------- verify
+    verify = product.podman.exec_bash(
+        host.target_name, restore_step_script("verify"), check=False,
+        timeout=RESTORE_STEP_TIMEOUT_SECONDS,
+    )
+    require(
+        case_id,
+        verify.returncode == 0,
+        f"the Panel probe could not verify the restored state: "
+        f"{(verify.stderr or verify.stdout or '').strip()[-400:]}",
+    )
+    try:
+        verify_facts = (json.loads(verify.stdout or "") or {}).get("restore") or {}
+    except json.JSONDecodeError:
+        raise AssertionError(
+            f"{case_id}: the verify step did not print a JSON object: "
+            f"{(verify.stdout or '')[:400]}"
+        )
+    require(
+        case_id,
+        verify_facts.get("readback_status") == 200,
+        f"GET /api/users/{{id}} returned {verify_facts.get('readback_status')!r} after the "
+        "restore, so the deleted client did not come back",
+    )
+    require(
+        case_id,
+        verify_facts.get("username_restored") is True
+        and verify_facts.get("short_uuid_restored") is True,
+        f"the restored client is {verify_facts.get('username_restored')!r}/"
+        f"{verify_facts.get('short_uuid_restored')!r} rather than the captured identity",
+    )
+    require(
+        case_id,
+        verify_facts.get("inventory_restored") is True,
+        f"the Panel lists {verify_facts.get('users_restored')!r} clients after the "
+        "restore instead of the inventory the archive captured",
+    )
+    identical = verify_facts.get("representations_identical") or {}
+    require(
+        case_id,
+        identical and all(identical.values()),
+        f"the restored client is not served the bytes it was served before the restore: {identical}",
+    )
+
+    after = product.podman.exec_bash(
+        host.worker_name, node_env_probe_script(), check=False,
+        timeout=RESTORE_STEP_TIMEOUT_SECONDS,
+    )
+    require_node_env(case_id, "after the restore", parse_node_env_probe(after.stdout or ""),
+                     env_before["digest"])
+
+    # The engines are only ready when a payload really leaves: the client's
+    # payloads are fetched here so the readiness wait has something to send.
+    product.master.subscription_payloads(case_id)
+    nodes = product.wait_for_nodes(case_id, expected=2)
+    traffic = product.master.wait_tunnel_ready(case_id)
+
+    after_facts = parse_node_env_probe(after.stdout or "")
+    evidence["roles"]["worker"] = {
+        "environment_sha256": env_before["digest"],
+        "environment_restored": after_facts.get("digest") == env_before["digest"],
+        "unit": after_facts.get("active"),
+    }
+    evidence.update({
+        "restore": restored,
+        "panel": {
+            "users_in_archive": capture_facts.get("users_in_archive"),
+            "users_restored": verify_facts.get("users_restored"),
+            "identity_restored": verify_facts.get("readback_status") == 200
+            and verify_facts.get("username_restored") is True
+            and verify_facts.get("short_uuid_restored") is True,
+            "representations_identical": identical,
+        },
+        "nodes": nodes,
+        "data_plane": traffic.get("delivered"),
+    })
+    return evidence
+
+
 def cover_probe_matrix(server_ip: str, other_ip: str) -> Sequence[Dict[str, Any]]:
     """Every way the installed apex pair can fail to resolve to one role.
 
@@ -6299,6 +6645,11 @@ def cases(
         # lineages they carry are install-time state of exactly those roles.
         Case(BACKUP_CASE_ID, "multi-node", lambda context: case_backup_types(product),
              timeout_seconds=BACKUP_TIMEOUT_SECONDS),
+        # The restore runs beside the backup it depends on being possible, and
+        # before the lifecycle cases: it puts the cluster back the way the
+        # operator built it instead of reading what a fault left behind.
+        Case(RESTORE_CASE_ID, "multi-node", lambda context: case_backup_restore(product),
+             timeout_seconds=RESTORE_CASE_TIMEOUT_SECONDS),
         # The lifecycle cases run last: they revoke a client and fault the
         # Worker's own unit, so nothing that observes a healthy cluster may run
         # after them and no earlier case may be blamed for their state.

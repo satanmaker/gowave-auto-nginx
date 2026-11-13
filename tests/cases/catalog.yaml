@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 75
-  total: 200
+  podman_first: 76
+  total: 201
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3677,6 +3677,26 @@ cases:
     certificate lineage and run state with every declared checksum present and no binary, while the Worker
     archive carries exactly its environment file, and the product''s own validator accepts both.'
   assertion_sha256: 9dee0ceb150d7c34c5d99078f1c28a18f077a7ec8481ce4f8f1e8dafee735545
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Signal-Safe and Verifiable Transaction Compensation
+- id: MN-RESTORE
+  requirement: Backup and Restore Format v1
+  live_scenario: null
+  assertion: 'A Panel archive and a Worker archive, both written by the product on the roles this run
+    provisioned, are restored by the product''s own restore command on those roles: a client created through
+    the Panel API and then deleted comes back with its identity, the inventory and the exact bytes of
+    every representation it was served, the Worker''s environment file returns to the bytes the archive
+    captured (the injected marker gone) with its unit active, and both nodes reconnect and carry data-plane
+    payload through every served outbound afterwards.'
+  assertion_sha256: b4c1c146366ff98cf64edbe4855a25084a80a07d5af5a56e26dcafc0640ddd01
   runs_in:
   - podman
   state: incubating
