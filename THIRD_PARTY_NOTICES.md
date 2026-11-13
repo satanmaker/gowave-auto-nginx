@@ -61,9 +61,11 @@ GoWave Auto NGINX interacts with separately obtained and deployed upstream compo
 
 ### Adapted guidance (no source copied)
 
-The failure-path, deletion-guard and acceptance-evidence rules in `AGENTS.md`
-were reworked from the following projects. No source file, script or skill was
-copied; the rules are restatements in this codebase's own terms.
+The failure-path, deletion-guard, bulk-edit-anchoring and acceptance-evidence
+rules in `AGENTS.md` were reworked from the following projects. No source file,
+script or skill was copied; the rules are restatements in this codebase's own
+terms.
 
 - **konstruktoid/agent-instructions-skills** — [repository](https://github.com/konstruktoid/agent-instructions-skills), Apache License 2.0, Copyright (C) konstruktoid and contributors. Origin of the strict-mode, `EXIT`-trap and destructive-path material.
 - **wshobson/agents** — [repository](https://github.com/wshobson/agents), MIT License, Copyright (c) 2024 Seth Hobson. Origin of the acceptance-evidence and instruction-authoring rules.
+- **Aider-AI/aider** — [repository](https://github.com/Aider-AI/aider), Apache License 2.0, Copyright (C) Aider-AI contributors. Origin of the bounded repair-loop rule, the unique-anchor rule for bulk edits, and the habit of keeping run artifacts out of what the agent reads.

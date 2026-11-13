@@ -67,6 +67,9 @@ All Bash scripts (`*.sh`) must follow these strict requirements:
 6. **Failure Paths and Cleanup**:
    - A `trap ... RETURN` handler never runs when `errexit` abandons a function, so the scratch directory survives the failed run. Register every `mktemp -d` with `track_temp_dir` (`modules/tempdir.sh`), which installs one idempotent `EXIT` cleanup, and remove the directory early with `release_temp_dir` where the caller is done with it.
    - Install the trap before the resource it protects exists, and keep the handler idempotent and ending in `return 0`.
+7. **Bulk Edits Prove Their Anchor**:
+   - Before a `sed -i`, `perl -pi` or any rewrite that reaches several files or a streamed payload, count the matches first (`grep -c`) and require exactly the number the change is about. The same function bodies exist in several copies inside the `gowave-node-auto.sh` payload heredocs, so a pattern unique in one copy silently rewrites its siblings.
+   - A rewrite whose match count differs from the expected one is refused and re-anchored, never widened into a looser pattern until something matches.
 
 ---
 
@@ -97,6 +100,7 @@ A green exit status is not evidence that a change landed. `"exited 0"` and `"liv
 2. **State the sample**: a report names the window it read and how much it read — log lines pulled, distinct failures against total occurrences, and whether repeated entries are one failure retried rather than several. Truncation must be visible.
 3. **Staleness is a result, not a detail**: an artifact proves only what the tree under review contains. A run directory is acceptable evidence when the commit it recorded is an ancestor of the reviewed tree; otherwise it is a harness cursor.
 4. **Name what was not run**, and never present an unrun check as a pass.
+5. **One cause, one repair attempt**: when a check fails for the same reason a second time, stop and report the cause rather than trying another variant. This one stays a rule and not a mechanism, because the number of attempts is not something a test can observe.
 
 ---
 
