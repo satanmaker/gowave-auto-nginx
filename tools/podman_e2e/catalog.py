@@ -324,6 +324,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
     },
     {
+        "id": "MN-BACKUP-BAD",
+        "requirement": "Backup and Restore Format v1",
+        "assertion": "An archive the product did not write, or wrote incompletely, is refused by the product's own restore on the role it names — truncated, garbage, checksum-mismatched, missing a member its manifest declares, missing the member its type requires, and of the wrong type are each rejected with their own message and no traceback, while the untouched archives of both roles still pass the 15-point preflight; every refusal leaves Master's unit state, NGINX, environment and database bytes and snapshot count, and the Worker's environment digest and unit, exactly as they were, so a partially applied restore can never be mistaken for a refused one.",
+        "topology": ["multi-node"],
+        "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
+    },
+    {
         "id": "MN-RESTORE",
         "requirement": "Backup and Restore Format v1",
         "assertion": "A Panel archive and a Worker archive, both written by the product on the roles this run provisioned, are restored by the product's own restore command on those roles: a client created through the Panel API and then deleted comes back with its identity, the inventory and the exact bytes of every representation it was served, the Worker's environment file returns to the bytes the archive captured (the injected marker gone) with its unit active, and both nodes reconnect and carry data-plane payload through every served outbound afterwards.",

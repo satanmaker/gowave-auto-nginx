@@ -58,6 +58,12 @@ NODE_ALLOWLIST_PATTERNS = [
     "opt/gowave-node/.env",
 ]
 
+# A restore applies what the archive carries, so an archive without its
+# mandatory member would apply less than the contract promises and still
+# report success. Both are checked by name, not by what meta.json claims.
+PANEL_REQUIRED_MEMBERS = ["opt/gowave/gowave.db"]
+NODE_REQUIRED_MEMBERS = ["opt/gowave-node/.env"]
+
 FORBIDDEN_SUBSTRINGS = [
     "renewal-hooks",
     "modules-enabled",
@@ -74,8 +80,16 @@ member_count = 0
 meta_data = None
 meta_bytes = b""
 
-with tarfile.open(archive_path, "r:gz") as tar:
-    members = tar.getmembers()
+try:
+    tar = tarfile.open(archive_path, "r:gz")
+except (tarfile.TarError, OSError, EOFError) as exc:
+    fail(f"Archive is not a readable Format v1 tar.gz: {exc}")
+
+with tar:
+    try:
+        members = tar.getmembers()
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        fail(f"Archive is not a readable Format v1 tar.gz: {exc}")
     member_count = len(members)
 
     # Check member count limit (5,000)
@@ -149,6 +163,7 @@ with tarfile.open(archive_path, "r:gz") as tar:
         file_checksums[rel] = digest.lower()
 
     seen_members = set()
+    regular_files = set()
     for m in members:
         clean_name = m.name
         if clean_name.startswith("./"):
@@ -213,10 +228,14 @@ with tarfile.open(archive_path, "r:gz") as tar:
 
         # 11. Checksum validation against meta.json
         if m.isreg():
+            regular_files.add(rel_path)
             expected_sha = file_checksums.get(rel_path)
             if not expected_sha:
                 fail(f"Missing SHA-256 metadata for regular file: {rel_path}")
-            content = tar.extractfile(m).read()
+            try:
+                content = tar.extractfile(m).read()
+            except (tarfile.TarError, OSError, EOFError) as exc:
+                fail(f"Archive member {rel_path} could not be read back: {exc}")
             actual_sha = hashlib.sha256(content).hexdigest()
             if actual_sha != expected_sha:
                 fail(f"Checksum mismatch for member {rel_path}: expected {expected_sha}, got {actual_sha}")
@@ -224,12 +243,27 @@ with tarfile.open(archive_path, "r:gz") as tar:
         # 4. Clear SUID / SGID bits
         m.mode &= ~(0o4000 | 0o2000 | 0o1000)
 
+    # 16. Completeness: everything the manifest declares is in the archive, and
+    # the type's mandatory member is present under that name. meta.json alone is
+    # not evidence: an archive can be rewritten with a shorter manifest, and a
+    # restore of it would apply a partial state and still report success.
+    absent = [rel for rel in file_checksums if rel not in regular_files]
+    if absent:
+        fail(f"Missing archive member declared in meta.json: {absent[0]}")
+    required_members = PANEL_REQUIRED_MEMBERS if backup_type == "panel" else NODE_REQUIRED_MEMBERS
+    for rel in required_members:
+        if rel not in regular_files:
+            fail(f"Archive of type '{backup_type}' is missing its required member: {rel}")
+
     # Extract if staging_target is requested
     if staging_target:
         os.makedirs(staging_target, mode=0o700, exist_ok=True)
         for m in members:
             # Force secure extraction
-            tar.extract(m, path=staging_target)
+            try:
+                tar.extract(m, path=staging_target)
+            except (tarfile.TarError, OSError, EOFError) as exc:
+                fail(f"Archive member {m.name} could not be extracted: {exc}")
 
 print("15-point preflight archive validation PASSED.")
 PY

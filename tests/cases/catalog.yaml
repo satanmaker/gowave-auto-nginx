@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 77
-  total: 202
+  podman_first: 78
+  total: 203
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3697,6 +3697,27 @@ cases:
     and no line carrying a private key or secret-bearing variable, so the volume's removal by label during
     cleanup leaves nothing behind.
   assertion_sha256: 45b6c1c7e8101b8ccb36fe14a9d399cf280c066ba1a080b21531ed66be4640db
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Signal-Safe and Verifiable Transaction Compensation
+- id: MN-BACKUP-BAD
+  requirement: Backup and Restore Format v1
+  live_scenario: null
+  assertion: An archive the product did not write, or wrote incompletely, is refused by the product's
+    own restore on the role it names — truncated, garbage, checksum-mismatched, missing a member its manifest
+    declares, missing the member its type requires, and of the wrong type are each rejected with their
+    own message and no traceback, while the untouched archives of both roles still pass the 15-point preflight;
+    every refusal leaves Master's unit state, NGINX, environment and database bytes and snapshot count,
+    and the Worker's environment digest and unit, exactly as they were, so a partially applied restore
+    can never be mistaken for a refused one.
+  assertion_sha256: 8b83dccf60cd5fea78e6fc1836d075df814338a3731380e565367d19f06ecd5a
   runs_in:
   - podman
   state: incubating

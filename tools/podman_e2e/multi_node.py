@@ -15,13 +15,16 @@ operator ships.
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
+import io
 import ipaddress
 import json
 import os
 import re
 import shlex
 import stat
+import tarfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -239,6 +242,21 @@ BACKUP_VOLUME_DIRECTORY_MODE = "700"
 # itself, and a secret-bearing variable is written as a name plus a value.
 ARTIFACT_FORBIDDEN_MARKERS = ("BEGIN PRIVATE KEY", "SECRET_KEY=", "APP_SECRET=")
 ARTIFACT_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz")
+# A restore refuses an archive it cannot honour -- and refuses it before it stops
+# a service, takes a snapshot or writes a single live file.
+REJECT_CASE_ID = "MN-BACKUP-BAD"
+REJECT_CASE_TIMEOUT_SECONDS = 1800
+REJECT_COMMAND_TIMEOUT_SECONDS = 300
+# Each variant breaks exactly one promise of the format, so the case can name
+# the promise that was broken rather than "some error happened".
+REJECT_VARIANTS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("truncated", ("not a readable Format v1 tar.gz", "could not be read back")),
+    ("garbage", ("not a readable Format v1 tar.gz",)),
+    ("checksum", ("Checksum mismatch for member opt/gowave/.env",)),
+    ("incomplete", ("Missing archive member declared in meta.json: opt/gowave/.env",)),
+    ("no-database", ("missing its required member: opt/gowave/gowave.db",)),
+    ("wrong-type", ("Backup type mismatch",)),
+)
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 VISION_PROBE_TIMEOUT_SECONDS = 120
@@ -5387,6 +5405,321 @@ def case_backup_volume(product: MultiNodeProduct) -> Dict[str, Any]:
     return evidence
 
 
+def master_state_probe_script() -> str:
+    """What a refused restore must leave exactly as it found it.
+
+    The service, its NGINX in front of it, the two files a panel archive replaces
+    and the count of recovery snapshots: a restore that rejects its input before
+    preflight changes none of them, and one that half-applies an archive changes
+    at least one.
+    """
+    return (
+        "set -u\n"
+        "unit=$(systemctl is-active gowave.service 2>/dev/null || true)\n"
+        "nginx=$(systemctl is-active nginx 2>/dev/null || true)\n"
+        "env=$(sha256sum /opt/gowave/.env 2>/dev/null | cut -d' ' -f1 || true)\n"
+        "db=$(sha256sum /opt/gowave/gowave.db 2>/dev/null | cut -d' ' -f1 || true)\n"
+        "snapshots=$(find /var/lib/gowave-auto-nginx/recovery -maxdepth 1 -name 'restore-*' "
+        "2>/dev/null | wc -l)\n"
+        "printf 'unit=%s nginx=%s env=%s db=%s snapshots=%s\\n' "
+        '"${unit}" "${nginx}" "${env}" "${db}" "${snapshots}"\n'
+    )
+
+
+def restore_command(archive: str, type_name: str) -> str:
+    """The operator's own restore verb, on an archive the case chose."""
+    return (
+        f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh restore "
+        f"{shlex.quote(archive)} --type {shlex.quote(type_name)}\n"
+    )
+
+
+def rewrite_archive(
+    source: Path,
+    target: Path,
+    drop: Sequence[str] = (),
+    replace: Optional[Dict[str, bytes]] = None,
+    manifest_drop: Sequence[str] = (),
+) -> Path:
+    """Copy a real archive while breaking exactly one thing about it.
+
+    Members keep their type, mode and link target, so the only difference the
+    validator can see is the one the case asked for: a removed member, a rewritten
+    payload under an unchanged checksum, or a manifest that no longer declares it.
+    """
+    replaced = dict(replace or {})
+    dropped = set(drop)
+    with tarfile.open(source, "r:gz") as src:
+        members = src.getmembers()
+        payloads = {
+            member.name: (src.extractfile(member).read() if member.isreg() else None)
+            for member in members
+        }
+    manifest_name = next(
+        (name for name in payloads if name in ("meta.json", "./meta.json")), "",
+    )
+    if not manifest_name:
+        raise AssertionError(f"{source} carries no manifest to rewrite")
+    manifest = json.loads((payloads[manifest_name] or b"{}").decode("utf-8"))
+    if manifest_drop:
+        manifest["files"] = [
+            entry for entry in manifest.get("files") or []
+            if entry.get("path") not in set(manifest_drop)
+        ]
+    with tarfile.open(target, "w:gz") as dst:
+        for member in members:
+            clean = member.name[2:] if member.name.startswith("./") else member.name
+            if clean in dropped or clean == "meta.json":
+                continue
+            data = payloads[member.name]
+            if member.isreg() and clean in replaced:
+                data = replaced[clean]
+            info = copy.copy(member)
+            if data is not None:
+                info.size = len(data)
+            dst.addfile(info, io.BytesIO(data) if data is not None else None)
+        blob = json.dumps(manifest).encode("utf-8")
+        info = tarfile.TarInfo(manifest_name)
+        info.size = len(blob)
+        info.mode = 0o600
+        dst.addfile(info, io.BytesIO(blob))
+    target.chmod(0o600)
+    return target
+
+
+def rejected_archives(
+    store: Path, panel: str, worker_store: Path, node: str,
+) -> Dict[str, Path]:
+    """One broken archive per promise of the format, all written beside the real one."""
+    panel_source = store / Path(panel).name
+    node_source = worker_store / Path(node).name
+    created: Dict[str, Path] = {}
+
+    truncated = store / "rejected-truncated.tar.gz"
+    content = panel_source.read_bytes()
+    truncated.write_bytes(content[: max(1, len(content) // 3)])
+    truncated.chmod(0o600)
+    created["truncated"] = truncated
+
+    garbage = store / "rejected-garbage.tar.gz"
+    garbage.write_bytes(b"not a Format v1 archive\n")
+    garbage.chmod(0o600)
+    created["garbage"] = garbage
+
+    created["checksum"] = rewrite_archive(
+        panel_source, store / "rejected-checksum.tar.gz",
+        replace={"files/opt/gowave/.env": b"APP_SECRET=replaced-by-the-case\n"},
+    )
+    created["incomplete"] = rewrite_archive(
+        panel_source, store / "rejected-incomplete.tar.gz",
+        drop=("files/opt/gowave/.env",),
+    )
+    created["no-database"] = rewrite_archive(
+        panel_source, store / "rejected-no-database.tar.gz",
+        drop=("files/opt/gowave/gowave.db",),
+        manifest_drop=("opt/gowave/gowave.db",),
+    )
+    wrong_type = store / "rejected-wrong-type.tar.gz"
+    wrong_type.write_bytes(node_source.read_bytes())
+    wrong_type.chmod(0o600)
+    created["wrong-type"] = wrong_type
+    return created
+
+
+def case_backup_rejected(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-BACKUP-BAD: an archive that cannot deliver its contract is refused, untouched.
+
+    A restore of a corrupt archive must not be a partial restore. Each variant below
+    breaks exactly one promise the format makes — the stream reads, the manifest
+    names every member, the manifest's checksums hold, the mandatory member is
+    there, the archive is the type it is applied as — and each attempt has to be
+    refused with a message naming that promise while the Master's service, its
+    NGINX, its database, its environment and the recovery snapshot count stay
+    exactly as they were.
+    """
+    case_id = REJECT_CASE_ID
+    host = product.require_worker()
+    volumes = getattr(host, "backup_volumes", None) or {}
+    require(
+        case_id,
+        {"master", "worker"} <= set(volumes),
+        f"the roles do not each carry an archive volume: {sorted(volumes)}",
+    )
+    stores = {role: Path(str(volumes[role].get("mountpoint") or "")) for role in ("master", "worker")}
+
+    archives: Dict[str, str] = {}
+    for role, container, type_name in (
+        ("master", host.target_name, "panel"),
+        ("worker", host.worker_name, "node"),
+    ):
+        created = product.podman.exec_bash(
+            container, backup_script(type_name), check=False,
+            timeout=BACKUP_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            created.returncode == 0,
+            f"{container} could not write the {type_name} archive this case corrupts: "
+            f"{(created.stderr or created.stdout or '').strip()[-400:]}",
+        )
+        archive = parse_backup_archive(created.stdout or "")
+        require(
+            case_id,
+            archive.startswith(topology.BACKUP_STORE.rstrip("/") + "/"),
+            f"{container} wrote its {type_name} archive to {archive!r}, which is not "
+            f"inside {topology.BACKUP_STORE}",
+        )
+        archives[role] = archive
+
+    # The control: the archives the variants come from are accepted by the same
+    # validator, so a rejection below is the corruption and not a broken fixture.
+    for role, container, type_name in (
+        ("master", host.target_name, "panel"),
+        ("worker", host.worker_name, "node"),
+    ):
+        verified = product.podman.exec_bash(
+            container, backup_verify_script(archives[role], type_name), check=False,
+            timeout=BACKUP_READ_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            verified.returncode == 0
+            and "15-point preflight archive validation PASSED" in (verified.stdout or ""),
+            f"the product's own validator refuses the untouched {type_name} archive, so "
+            f"a rejection below would prove nothing: {(verified.stderr or '').strip()[-400:]}",
+        )
+
+    before = product.podman.exec_bash(
+        host.target_name, master_state_probe_script(), check=False,
+        timeout=REJECT_COMMAND_TIMEOUT_SECONDS,
+    )
+    require(
+        case_id,
+        before.returncode == 0,
+        f"the Master state probe exited {before.returncode}: {(before.stderr or '').strip()[-400:]}",
+    )
+    before_facts = parse_key_value_fields(before.stdout or "")
+    require(
+        case_id,
+        before_facts.get("unit") == "active",
+        f"gowave.service is {before_facts.get('unit')!r} before the first rejection, so a "
+        "service that stays up afterwards would prove nothing",
+    )
+
+    variants = rejected_archives(stores["master"], archives["master"],
+                                 stores["worker"], archives["worker"])
+    evidence: Dict[str, Any] = {"refused": []}
+    for name, fragments in REJECT_VARIANTS:
+        path = variants[name]
+        inside = f"{topology.BACKUP_STORE}/{path.name}"
+        result = product.podman.exec_bash(
+            host.target_name, restore_command(inside, "panel"), check=False,
+            timeout=REJECT_COMMAND_TIMEOUT_SECONDS,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        require(
+            case_id,
+            result.returncode != 0,
+            f"the {name} archive was not refused: restore exited 0 with "
+            f"{output.strip()[-400:]}",
+        )
+        require(
+            case_id,
+            "Restore completed and verified successfully." not in output,
+            f"the {name} archive was refused and still reported success: "
+            f"{output.strip()[-400:]}",
+        )
+        require(
+            case_id,
+            any(fragment in output for fragment in fragments),
+            f"the {name} archive was refused for another reason than {fragments}: "
+            f"{output.strip()[-400:]}",
+        )
+        require(
+            case_id,
+            "Traceback" not in output,
+            f"the {name} archive crashed the validator instead of being refused: "
+            f"{output.strip()[-400:]}",
+        )
+        after = product.podman.exec_bash(
+            host.target_name, master_state_probe_script(), check=False,
+            timeout=REJECT_COMMAND_TIMEOUT_SECONDS,
+        )
+        after_facts = parse_key_value_fields(after.stdout or "")
+        require(
+            case_id,
+            after_facts == before_facts,
+            f"the refused {name} archive changed the Master: it was {before_facts} and "
+            f"is now {after_facts}",
+        )
+        message = next(
+            (line.strip() for line in output.splitlines()
+             if "Validation Error:" in line or line.startswith("[FAIL]")),
+            output.strip().splitlines()[-1] if output.strip() else "",
+        )
+        evidence["refused"].append({
+            "variant": name,
+            "archive": inside,
+            "returncode": result.returncode,
+            "message": message,
+            "state": after_facts,
+        })
+
+    # The Worker path is refused the same way, before its own unit is touched.
+    node_before = product.podman.exec_bash(
+        host.worker_name, node_env_probe_script(), check=False,
+        timeout=REJECT_COMMAND_TIMEOUT_SECONDS,
+    )
+    node_before_facts = parse_node_env_probe(node_before.stdout or "")
+    require(
+        case_id,
+        node_before_facts.get("active") == "active" and bool(node_before_facts.get("digest")),
+        f"the Worker is not healthy enough for a refusal to mean anything: {node_before_facts}",
+    )
+    node_variant = stores["worker"] / "rejected-node-truncated.tar.gz"
+    node_content = (stores["worker"] / Path(archives["worker"]).name).read_bytes()
+    node_variant.write_bytes(node_content[: max(1, len(node_content) // 3)])
+    node_variant.chmod(0o600)
+    refused_node = product.podman.exec_bash(
+        host.worker_name,
+        restore_command(f"{topology.BACKUP_STORE}/{node_variant.name}", "node"),
+        check=False, timeout=REJECT_COMMAND_TIMEOUT_SECONDS,
+    )
+    node_output = (refused_node.stdout or "") + (refused_node.stderr or "")
+    require(
+        case_id,
+        refused_node.returncode != 0,
+        f"the truncated Worker archive was not refused: {node_output.strip()[-400:]}",
+    )
+    require(
+        case_id,
+        "not a readable Format v1 tar.gz" in node_output
+        or "could not be read back" in node_output,
+        f"the truncated Worker archive was refused for another reason: {node_output.strip()[-400:]}",
+    )
+    node_after = product.podman.exec_bash(
+        host.worker_name, node_env_probe_script(), check=False,
+        timeout=REJECT_COMMAND_TIMEOUT_SECONDS,
+    )
+    require_node_env(case_id, "after a refused Worker restore",
+                     parse_node_env_probe(node_after.stdout or ""),
+                     node_before_facts.get("digest", ""))
+
+    evidence["node_refused"] = {
+        "archive": f"{topology.BACKUP_STORE}/{node_variant.name}",
+        "returncode": refused_node.returncode,
+        "unit": parse_node_env_probe(node_after.stdout or "").get("active"),
+        "environment_unchanged": True,
+    }
+    evidence["control"] = {
+        "panel": archives["master"],
+        "node": archives["worker"],
+        "validation": "15-point preflight archive validation PASSED.",
+    }
+    evidence["master_state"] = before_facts
+    return evidence
+
+
 def backup_probe_script(archive: str) -> str:
     """Read an archive back without printing a single value it protects."""
     return (
@@ -6886,6 +7219,11 @@ def cases(
         # immediately after the archive contracts and while both roles are whole.
         Case(BACKUP_VOLUME_CASE_ID, "multi-node", lambda context: case_backup_volume(product),
              timeout_seconds=BACKUP_VOLUME_TIMEOUT_SECONDS),
+        # Every refusal below is proven against the same live Master, so it runs
+        # before the restore changes what that state is, and after the archive
+        # formats it corrupts have been read.
+        Case(REJECT_CASE_ID, "multi-node", lambda context: case_backup_rejected(product),
+             timeout_seconds=REJECT_CASE_TIMEOUT_SECONDS),
         # The restore runs beside the backup it depends on being possible, and
         # before the lifecycle cases: it puts the cluster back the way the
         # operator built it instead of reading what a fault left behind.

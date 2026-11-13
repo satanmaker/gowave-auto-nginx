@@ -5347,6 +5347,263 @@ class TestBackupVolumeCase(unittest.TestCase):
                         ids.index(multi_node.RESTORE_CASE_ID))
 
 
+_REJECT_PANEL_ARCHIVE = "gowave-backup-panel-1794603001.tar.gz"
+_REJECT_NODE_ARCHIVE = "gowave-backup-node-1794603002.tar.gz"
+_REJECT_MESSAGES = {
+    "truncated": "Validation Error: Archive is not a readable Format v1 tar.gz: "
+                 "unexpected end of data",
+    "garbage": "Validation Error: Archive is not a readable Format v1 tar.gz: "
+               "file could not be opened successfully",
+    "checksum": "Validation Error: Checksum mismatch for member opt/gowave/.env: "
+                "expected 0, got 1",
+    "incomplete": "Validation Error: Missing archive member declared in meta.json: "
+                  "opt/gowave/.env",
+    "no-database": "Validation Error: Archive of type 'panel' is missing its required "
+                   "member: opt/gowave/gowave.db",
+    "wrong-type": "Validation Error: Backup type mismatch: expected panel, got node",
+    "node-truncated": "Validation Error: Archive is not a readable Format v1 tar.gz: "
+                      "unexpected end of data",
+}
+
+
+def _write_format_archive(path, type_name, members):
+    """A real Format v1 archive: a manifest plus the members it declares."""
+    entries = [{"path": rel, "sha256": hashlib.sha256(content).hexdigest()}
+               for rel, content in members]
+    with tarfile.open(path, "w:gz") as tar:
+        blob = json.dumps({
+            "format_version": 1,
+            "backup_type": type_name,
+            "files": entries,
+        }).encode()
+        info = tarfile.TarInfo("meta.json")
+        info.size = len(blob)
+        tar.addfile(info, io.BytesIO(blob))
+        for rel, content in members:
+            info = tarfile.TarInfo(f"files/{rel}")
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    os.chmod(path, 0o600)
+    return path
+
+
+class _RejectPodman:
+    """The product's archive verbs, with a configurable refusal per variant."""
+
+    def __init__(self, store, worker_store, state=None, node_state=None,
+                 verify_returncode=0,
+                 verify_stdout="15-point preflight archive validation PASSED.\n",
+                 restore_returncode=None, restore_output=None, mutate_state=None,
+                 node_digest_after=None):
+        self.store = Path(store)
+        self.worker_store = Path(worker_store)
+        self.state = dict(state or {"unit": "active", "nginx": "active",
+                                    "env": "a" * 64, "db": "b" * 64, "snapshots": "0"})
+        self.node_state = dict(node_state or {"digest": "c" * 64, "sentinel": "0",
+                                              "active": "active"})
+        self.verify_returncode = verify_returncode
+        self.verify_stdout = verify_stdout
+        self.restore_returncode = restore_returncode or {}
+        self.restore_output = restore_output or {}
+        self.mutate_state = set(mutate_state or ())
+        self.node_digest_after = node_digest_after
+        self.scripts = []
+
+    def arch(self, type_name):
+        return (f"{topology.BACKUP_STORE}/{_REJECT_PANEL_ARCHIVE}"
+                if type_name == "panel" else
+                f"{topology.BACKUP_STORE}/{_REJECT_NODE_ARCHIVE}")
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        self.scripts.append((container, script))
+        if "gowave-auto.sh backup" in script:
+            type_name = "panel" if "--type panel" in script else "node"
+            label = "Panel" if type_name == "panel" else "Node"
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0,
+                f"{label} backup created successfully: {self.arch(type_name)} "
+                "(mode 0600).\n", "")
+        if "gowave-backup.sh verify" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], self.verify_returncode,
+                self.verify_stdout if self.verify_returncode == 0 else "",
+                "" if self.verify_returncode == 0 else "Validation Error: refused\n")
+        if "gowave-auto.sh restore" in script:
+            archive = script.split(" restore ", 1)[1].split()[0].strip("'\"")
+            name = Path(archive).name
+            returncode = self.restore_returncode.get(name, 1)
+            if name in self.mutate_state:
+                self.state["db"] = "d" * 64
+            if self.node_digest_after and "--type node" in script:
+                self.node_state["digest"] = self.node_digest_after
+            if name in self.restore_output:
+                return subprocess.CompletedProcess(
+                    ["bash", "-lc"], returncode, self.restore_output[name], "")
+            if returncode == 0:
+                return subprocess.CompletedProcess(
+                    ["bash", "-lc"], 0,
+                    "Restore completed and verified successfully.\n", "")
+            variant = name[len("rejected-"):-len(".tar.gz")]
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], returncode, "", _REJECT_MESSAGES.get(variant, "") + "\n")
+        if "snapshots=" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0,
+                " ".join(f"{key}={value}" for key, value in self.state.items()) + "\n", "")
+        if "sentinel=" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0,
+                " ".join(f"{key}={value}" for key, value in self.node_state.items()) + "\n", "")
+        raise AssertionError(f"unexpected script in {container}: {script[:120]}")
+
+
+class TestBackupRejectCase(unittest.TestCase):
+    """MN-BACKUP-BAD: a restore refuses what it cannot honour, and touches nothing."""
+
+    def setUp(self):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        base = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        self.base = base
+        self.store = base / "volume-master"
+        self.worker_store = base / "volume-worker"
+        self.store.mkdir()
+        self.worker_store.mkdir()
+        os.chmod(self.store, 0o700)
+        os.chmod(self.worker_store, 0o700)
+        self.panel = _write_format_archive(
+            self.store / _REJECT_PANEL_ARCHIVE, "panel", (
+                ("opt/gowave/gowave.db", b"SQLite format 3\x00" + b"\x00" * 512),
+                ("opt/gowave/.env", b"APP_SECRET=original\n"),
+                ("var/lib/gowave-auto-nginx/state.json", b'{"version": 1}\n'),
+            ))
+        self.node = _write_format_archive(
+            self.worker_store / _REJECT_NODE_ARCHIVE, "node", (
+                ("opt/gowave-node/.env", b"SECRET_KEY=original\nNODE_PORT=2096\n"),
+            ))
+        self.volumes = {
+            "master": {"name": "backups-master-deadbeef", "mountpoint": str(self.store)},
+            "worker": {"name": "backups-worker-deadbeef", "mountpoint": str(self.worker_store)},
+        }
+
+    def run_case(self, **kwargs):
+        podman = _RejectPodman(self.store, self.worker_store, **kwargs)
+        evidence = multi_node.case_backup_rejected(
+            _VolumeProduct(podman, _VolumeHost(self.volumes)))
+        return evidence, podman
+
+    def test_it_refuses_every_variant_and_leaves_the_master_untouched(self):
+        evidence, _ = self.run_case()
+        refused = {entry["variant"]: entry for entry in evidence["refused"]}
+        self.assertEqual(sorted(refused), sorted(name for name, _ in multi_node.REJECT_VARIANTS))
+        for name, entry in refused.items():
+            self.assertNotEqual(entry["returncode"], 0)
+            self.assertIn("Validation Error:", entry["message"])
+            self.assertEqual(entry["state"]["db"], "b" * 64)
+        self.assertIn("required member: opt/gowave/gowave.db", refused["no-database"]["message"])
+        self.assertIn("Checksum mismatch", refused["checksum"]["message"])
+        self.assertEqual(evidence["master_state"]["snapshots"], "0")
+        self.assertEqual(evidence["node_refused"]["returncode"], 1)
+        self.assertEqual(evidence["control"]["panel"],
+                         f"{topology.BACKUP_STORE}/{_REJECT_PANEL_ARCHIVE}")
+
+    def test_each_variant_breaks_exactly_one_promise_of_the_format(self):
+        self.run_case()
+        original = self.panel.read_bytes()
+
+        truncated = (self.store / "rejected-truncated.tar.gz").read_bytes()
+        self.assertLess(len(truncated), len(original))
+        self.assertEqual((self.store / "rejected-garbage.tar.gz").read_bytes(),
+                         b"not a Format v1 archive\n")
+        self.assertEqual(
+            (self.store / "rejected-wrong-type.tar.gz").read_bytes(),
+            self.node.read_bytes())
+
+        with tarfile.open(self.store / "rejected-checksum.tar.gz", "r:gz") as tar:
+            manifest = json.loads(tar.extractfile("meta.json").read())
+            self.assertEqual(tar.extractfile("files/opt/gowave/.env").read(),
+                             b"APP_SECRET=replaced-by-the-case\n")
+            self.assertIn("opt/gowave/.env", [entry["path"] for entry in manifest["files"]])
+            self.assertNotEqual(
+                next(entry["sha256"] for entry in manifest["files"]
+                     if entry["path"] == "opt/gowave/.env"),
+                hashlib.sha256(b"APP_SECRET=replaced-by-the-case\n").hexdigest())
+
+        with tarfile.open(self.store / "rejected-incomplete.tar.gz", "r:gz") as tar:
+            names = tar.getnames()
+            manifest = json.loads(tar.extractfile("meta.json").read())
+        self.assertNotIn("files/opt/gowave/.env", names)
+        self.assertIn("opt/gowave/.env", [entry["path"] for entry in manifest["files"]])
+
+        with tarfile.open(self.store / "rejected-no-database.tar.gz", "r:gz") as tar:
+            names = tar.getnames()
+            manifest = json.loads(tar.extractfile("meta.json").read())
+        self.assertNotIn("files/opt/gowave/gowave.db", names)
+        self.assertNotIn("opt/gowave/gowave.db", [entry["path"] for entry in manifest["files"]])
+
+    def test_an_archive_the_product_applies_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(restore_returncode={"rejected-incomplete.tar.gz": 0})
+        self.assertIn("was not refused", str(caught.exception))
+
+    def test_a_rejection_that_still_reports_success_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(restore_output={
+                "rejected-garbage.tar.gz":
+                    "Validation Error: Archive is not a readable Format v1 tar.gz: x\n"
+                    "Restore completed and verified successfully.\n",
+            })
+        self.assertIn("still reported success", str(caught.exception))
+
+    def test_a_rejection_for_another_reason_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(restore_output={"rejected-checksum.tar.gz": "boom\n"})
+        self.assertIn("refused for another reason", str(caught.exception))
+
+    def test_a_traceback_instead_of_a_rejection_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(restore_output={
+                "rejected-truncated.tar.gz":
+                    "Traceback (most recent call last):\n"
+                    "Validation Error: Archive is not a readable Format v1 tar.gz: x\n",
+            })
+        self.assertIn("crashed the validator", str(caught.exception))
+
+    def test_a_refusal_that_changes_the_master_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(mutate_state={"rejected-checksum.tar.gz"})
+        self.assertIn("changed the Master", str(caught.exception))
+
+    def test_an_archive_the_product_refuses_before_the_case_corrupts_it_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(verify_returncode=1)
+        self.assertIn("would prove nothing", str(caught.exception))
+
+    def test_a_master_that_is_not_running_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(state={"unit": "inactive", "nginx": "active", "env": "a" * 64,
+                                 "db": "b" * 64, "snapshots": "0"})
+        self.assertIn("a service that stays up afterwards would prove nothing",
+                      str(caught.exception))
+
+    def test_a_worker_that_stops_answering_after_a_refusal_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(node_digest_after="e" * 64)
+        self.assertIn("after a refused Worker restore", str(caught.exception))
+
+    def test_the_case_runs_between_the_volume_proof_and_the_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite = multi_node.cases(_StubPodman(Path(directory)))
+        ids = [case.id for case in suite]
+        case = suite[ids.index(multi_node.REJECT_CASE_ID)]
+        self.assertEqual(case.topology, "multi-node")
+        self.assertEqual(case.timeout_seconds, multi_node.REJECT_CASE_TIMEOUT_SECONDS)
+        self.assertLess(ids.index(multi_node.BACKUP_VOLUME_CASE_ID),
+                        ids.index(multi_node.REJECT_CASE_ID))
+        self.assertLess(ids.index(multi_node.REJECT_CASE_ID),
+                        ids.index(multi_node.RESTORE_CASE_ID))
+
+
 _RESTORE_REPRESENTATIONS = ("base64", "xray-json", "mihomo", "clash", "singbox")
 _RESTORE_SUFFIXES = {
     "": "base64",
