@@ -141,6 +141,62 @@ class TestNginxRouting(unittest.TestCase):
                 )
                 self.assertNotEqual(res.returncode, 0, "cover site must stay disabled")
 
+    def test_cover_domain_for_names_every_refusal(self):
+        """The decoy decision returns the apex or says why it cannot."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "bin"
+            fake_bin.mkdir()
+            getent = fake_bin / "getent"
+            getent.write_text(
+                "#!/usr/bin/env bash\n"
+                'printf \'%s\\n\' "${FAKE_RESOLVED:-203.0.113.10} STREAM ${2}"\n'
+            )
+            getent.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+            def run(domain, server_ip="", resolved="203.0.113.10"):
+                environment["FAKE_RESOLVED"] = resolved
+                return subprocess.run(
+                    ["bash", "-c",
+                     f'source "{NGINX_SH}" && cover_domain_for "{domain}" "{server_ip}"'],
+                    capture_output=True, text=True, env=environment,
+                )
+
+            # A registrable apex that both names resolve to.
+            res = run("panel.example.com", "203.0.113.10")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout.strip(), "example.com")
+            self.assertEqual(res.stderr, "")
+
+            # The last two labels win, however deep the deployment domain is.
+            res = run("a.panel.sub.example.org", "203.0.113.10")
+            self.assertEqual(res.stdout.strip(), "example.org")
+
+            # No subdomain: nothing to derive, and the refusal names the cause.
+            res = run("example.com", "203.0.113.10")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout, "")
+            self.assertIn("example.com has no subdomain", res.stderr)
+
+            # A single label is refused the same way instead of silently.
+            res = run("localhost", "")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout, "")
+            self.assertIn("localhost has no subdomain", res.stderr)
+
+            # An apex that does not resolve is a different, named refusal.
+            res = run("panel.example.com", "203.0.113.10", resolved="198.51.100.7")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout, "")
+            self.assertIn("do not resolve to 203.0.113.10", res.stderr)
+
+            # No domain at all is not an error and not a refusal to explain.
+            res = run("", "")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout, "")
+            self.assertEqual(res.stderr, "")
+
     def test_render_cover_site_substitutes_every_placeholder(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             cover_dir = Path(tmpdir) / "cover-reality"

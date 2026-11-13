@@ -1490,6 +1490,170 @@ class TestMultiNodeSuite(unittest.TestCase):
         self.assertEqual(suite[aio.TLS_CASE_ID].topology, "multi-node")
 
 
+class _CoverPodman:
+    """A stub that answers with a role's decision output and its rendered vhost."""
+
+    ROLES = {"aio-master": "master", "worker-01": "worker"}
+
+    def __init__(self, decision=None, configs=None, decision_returncode=0):
+        self.decision = decision
+        self.decision_returncode = decision_returncode
+        self.configs = configs if configs is not None else {
+            "master": _cover_vhost("reality.testbed.internal"),
+            "worker": _cover_vhost("worker-reality.testbed.internal"),
+        }
+        self.scripts = {}
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        self.scripts[self.ROLES[container]] = script
+        if self.decision_returncode:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], self.decision_returncode, "", "no such function")
+        stdout = self.decision
+        if stdout is None:
+            stdout = _cover_decision_output()
+        return subprocess.CompletedProcess(["bash", "-lc"], 0, stdout, "")
+
+    def exec(self, container, argv, check=True, input_text=None, timeout=120):
+        text = self.configs.get(self.ROLES[container])
+        if text is None:
+            return subprocess.CompletedProcess(
+                argv, 1, "", "cat: No such file or directory")
+        return subprocess.CompletedProcess(argv, 0, text, "")
+
+
+class _CoverProduct:
+    def __init__(self, podman):
+        self.podman = podman
+
+    def require_worker(self):
+        return type("Worker", (), {
+            "target_name": "aio-master",
+            "worker_name": "worker-01",
+            "worker_domain": topology.WORKER_DOMAIN,
+        })()
+
+
+def _cover_vhost(reality_domain, names="testbed.internal www.testbed.internal"):
+    names = f" {names}" if names else ""
+    return (
+        "server {\n"
+        "    listen 127.0.0.1:9443 ssl proxy_protocol;\n"
+        f"    server_name {reality_domain}{names};\n"
+        "}\n"
+    )
+
+
+def _cover_decision_output(answers=None, refusals=None):
+    answers = multi_node.COVER_APEX_ANSWERS if answers is None else answers
+    if refusals is None:
+        refusals = {
+            domain: f"Camouflage apex disabled — {domain} has no subdomain, "
+                    "so no cover apex exists."
+            for domain in ("example.com", "localhost")
+        }
+    lines = [f"derived\t{domain}\t{apex}" for domain, apex in answers.items()]
+    lines += [f"refusals\t{domain}\t{message}" for domain, message in refusals.items()]
+    return "\n".join(lines) + "\n"
+
+
+class TestCoverDeriveCase(unittest.TestCase):
+    """NGX-COVER-DERIVE reads both roles, so neither copy can hide a wrong apex."""
+
+    def _run(self, podman):
+        return multi_node.case_cover_derive(_CoverProduct(podman))
+
+    def test_both_roles_report_the_derived_apex_and_its_two_names(self):
+        evidence = self._run(_CoverPodman())
+        self.assertEqual(evidence["master"]["cover_domain"], "testbed.internal")
+        self.assertEqual(evidence["worker"]["cover_domain"], "testbed.internal")
+        self.assertEqual(evidence["master"]["derived"], multi_node.COVER_APEX_ANSWERS)
+        self.assertIn("www.testbed.internal", evidence["worker"]["server_names"])
+        self.assertEqual(evidence["master"]["vhost"],
+                         "/etc/nginx/conf.d/gowave-decoy.conf")
+        self.assertEqual(evidence["worker"]["vhost"],
+                         "/etc/nginx/conf.d/gowave-worker-decoy.conf")
+
+    def test_each_role_runs_its_own_copy_of_the_decision(self):
+        podman = _CoverPodman()
+        self._run(podman)
+        self.assertIn(f"source {topology.REPO_IN_CONTAINER}/modules/nginx.sh",
+                      podman.scripts["master"])
+        self.assertIn("gowave-node-auto.sh", podman.scripts["worker"])
+        for function in multi_node.COVER_DECISION_FUNCTIONS:
+            self.assertIn(function, podman.scripts["worker"])
+        self.assertNotIn("modules/nginx.sh", podman.scripts["worker"])
+
+    def test_the_generated_tables_run_the_shipped_decisions(self):
+        # The payload extraction is the fragile half of the Worker probe, so both
+        # roles' scripts are executed against the files this checkout ships.
+        for role in ("master", "worker"):
+            with self.subTest(role=role):
+                script = multi_node.cover_decision_script(role).replace(
+                    topology.REPO_IN_CONTAINER, str(REPO_ROOT))
+                res = subprocess.run(["bash", "-c", script],
+                                     capture_output=True, text=True)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                facts = multi_node.parse_cover_decision(res.stdout)
+                self.assertEqual(facts["derived"], multi_node.COVER_APEX_ANSWERS)
+                for domain in ("example.com", "localhost"):
+                    self.assertIn("has no subdomain", facts["refusals"][domain])
+
+    def test_an_unknown_role_is_refused(self):
+        with self.assertRaises(ValueError):
+            multi_node.cover_decision_script("denial")
+
+    def test_a_silent_refusal_is_rejected(self):
+        podman = _CoverPodman(decision=_cover_decision_output(refusals={}))
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("without saying why", str(caught.exception))
+
+    def test_a_first_two_label_derivation_is_rejected(self):
+        podman = _CoverPodman(configs={
+            "master": _cover_vhost("reality.testbed.internal",
+                                   "panel.testbed www.panel.testbed"),
+            "worker": _cover_vhost("worker-reality.testbed.internal"),
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("first-two-label derivation", str(caught.exception))
+
+    def test_a_decoy_bound_to_no_derived_apex_is_rejected(self):
+        podman = _CoverPodman(configs={
+            "master": _cover_vhost("reality.testbed.internal", ""),
+            "worker": _cover_vhost("worker-reality.testbed.internal"),
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("is not bound to the derived apex", str(caught.exception))
+
+    def test_a_decision_that_cannot_run_is_rejected(self):
+        podman = _CoverPodman(decision_returncode=127)
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("could not run its own cover-domain decision", str(caught.exception))
+
+    def test_a_missing_vhost_is_rejected_by_path(self):
+        podman = _CoverPodman(configs={"master": None, "worker": _cover_vhost("w.testbed.internal")})
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("/etc/nginx/conf.d/gowave-decoy.conf", str(caught.exception))
+
+    def test_the_case_runs_after_the_tls_surface_and_before_the_lifecycle_cases(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ids = [case.id for case in multi_node.cases(_StubPodman(Path(tmp.name)))]
+        suite = {case.id: case for case in multi_node.cases(_StubPodman(Path(tmp.name)))}
+        self.assertLess(ids.index(aio.TLS_CASE_ID),
+                        ids.index(multi_node.COVER_DERIVE_CASE_ID))
+        self.assertLess(ids.index(multi_node.COVER_DERIVE_CASE_ID),
+                        ids.index(multi_node.REVOCATION_CASE_ID))
+        self.assertEqual(suite[multi_node.COVER_DERIVE_CASE_ID].timeout_seconds,
+                         multi_node.COVER_DERIVE_TIMEOUT_SECONDS)
+        self.assertEqual(suite[multi_node.COVER_DERIVE_CASE_ID].topology, "multi-node")
+
+
 class TestMtlsVerifierReport(unittest.TestCase):
     """MTLS-01/02: the verifier's own lines are the only evidence accepted."""
 

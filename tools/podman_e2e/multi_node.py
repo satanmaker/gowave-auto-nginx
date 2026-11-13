@@ -48,6 +48,9 @@ EGRESS_CASE_ID = "MN-EGRESS"
 # One requirement, one case id: the AIO suite runs the same contract on its own
 # host, and a cluster runs it on both roles.
 NGINX_CONFIG_CASE_ID = aio.NGX_CONFIG_CASE_ID
+# A cluster renders two decoys from two scripts, so the derivation that names
+# them is asserted on both roles instead of on whichever one is cheaper to read.
+COVER_DERIVE_CASE_ID = "NGX-COVER-DERIVE"
 MTLS_TIMEOUT_SECONDS = 300
 MATRIX_TIMEOUT_SECONDS = 120
 EGRESS_TIMEOUT_SECONDS = 300
@@ -75,6 +78,34 @@ IPV6_CASE_ID = "FW-04"
 IPV6_PUBLISHED_PORTS: Sequence[int] = (denial.SSH_PORT, denial.HTTP_PORT, denial.HTTPS_PORT)
 IPV6_ATTEMPT_TIMEOUT_SECONDS = 5
 IPV6_TIMEOUT_SECONDS = 300
+# The cover case runs one function table and reads one vhost per role; the ceiling
+# is a hang guard for those four `podman exec` calls, not a budget.
+COVER_DERIVE_TIMEOUT_SECONDS = 180
+# The camouflage apex is the last two labels of the deployment domain, so these
+# are the answers the deployed decision has to produce. A domain with fewer than
+# three labels has no subdomain to strip: the decoy has no apex of its own and
+# the refusal is part of the contract instead of an empty render.
+COVER_APEX_TABLE: Sequence[str] = (
+    topology.PANEL_DOMAIN,
+    "panel.sub.example.org",
+    "example.com",
+    "localhost",
+    "",
+)
+COVER_APEX_ANSWERS = {
+    topology.PANEL_DOMAIN: "testbed.internal",
+    "panel.sub.example.org": "example.org",
+    "example.com": "",
+    "localhost": "",
+    "": "",
+}
+# Both roles ship their own copy of one decision: the Master sources it from
+# modules/nginx.sh, while the Worker's copy travels inside the payload streamed
+# from gowave-node-auto.sh and is never written to its disk, so the file the
+# payload was cut from is where that role's deployed text can be read.
+COVER_DECISION_FUNCTIONS: Sequence[str] = (
+    "derive_cover_domain", "cover_domains_resolve_here", "cover_domain_for",
+)
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 VISION_PROBE_TIMEOUT_SECONDS = 120
@@ -3840,6 +3871,153 @@ def case_tls_surface(product: MultiNodeProduct) -> Dict[str, Any]:
     }
 
 
+def cover_decision_loader(role: str) -> str:
+    """The lines that put this role's own copy of the decision in scope."""
+    if role == "master":
+        return f"source {topology.REPO_IN_CONTAINER}/modules/nginx.sh"
+    if role != "worker":
+        raise ValueError(f"unknown cover-domain role: {role!r}")
+    # The Worker keeps no copy of its payload, so the functions are read back out
+    # of the file the payload was cut from instead of a file it never wrote.
+    return "\n".join(
+        f"eval \"$(sed -n '/^{name}() {{/,/^}}$/p' "
+        f"{topology.REPO_IN_CONTAINER}/gowave-node-auto.sh)\""
+        for name in COVER_DECISION_FUNCTIONS
+    )
+
+
+def cover_decision_script(role: str) -> str:
+    """The apex table run through the copy of the decision the role ships."""
+    domains = " ".join(shlex.quote(domain) for domain in COVER_APEX_TABLE)
+    refusals = " ".join(shlex.quote(domain) for domain in ("example.com", "localhost"))
+    return f"""set -eu
+{cover_decision_loader(role)}
+for domain in {domains}; do
+    printf 'derived\t%s\t%s\n' "$domain" "$(derive_cover_domain "$domain")"
+done
+for domain in {refusals}; do
+    printf 'refusals\t%s\t%s\n' "$domain" "$(cover_domain_for "$domain" "" 2>&1 >/dev/null)"
+done
+"""
+
+
+def parse_cover_decision(output: str) -> Dict[str, Dict[str, str]]:
+    facts: Dict[str, Dict[str, str]] = {"derived": {}, "refusals": {}}
+    for line in output.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 3:
+            continue
+        kind, domain, value = fields
+        if kind in facts:
+            facts[kind][domain] = value
+    return facts
+
+
+def require_cover_decision(case_id: str, role: str,
+                           facts: Dict[str, Dict[str, str]]) -> None:
+    derived = facts["derived"]
+    require(
+        case_id,
+        derived == COVER_APEX_ANSWERS,
+        f"{role} derives the camouflage apex differently: {derived!r} instead of "
+        f"{COVER_APEX_ANSWERS!r}",
+    )
+    for domain in ("example.com", "localhost"):
+        message = facts["refusals"].get(domain, "")
+        require(
+            case_id,
+            "has no subdomain" in message,
+            f"{role} renders no cover lineage for {domain!r} without saying why: "
+            f"{message!r}",
+        )
+
+
+def cover_vhost_names(case_id: str, role: str, path: str, text: str) -> List[str]:
+    match = re.search(r"^[ \t]*server_name[ \t]+([^;]+);", text, re.MULTILINE)
+    require(case_id, match, f"{role}'s cover vhost {path} declares no server_name")
+    return match.group(1).split()
+
+
+def require_cover_vhost_names(case_id: str, role: str, names: Sequence[str],
+                              apex: str, domain: str) -> None:
+    # A first-two-label derivation would name the deployment's own subdomain, so
+    # it is checked first: its presence explains the wrong apex better than the
+    # missing one does.
+    first_two = ".".join(domain.rstrip(".").split(".")[:2])
+    for wrong in (first_two, f"www.{first_two}"):
+        require(
+            case_id,
+            wrong not in names,
+            f"{role}'s cover vhost carries {wrong!r}, the first-two-label derivation, "
+            f"instead of the apex {apex!r}: {list(names)}",
+        )
+    require(
+        case_id,
+        apex in names and f"www.{apex}" in names,
+        f"{role}'s cover vhost is not bound to the derived apex {apex!r}: {list(names)}",
+    )
+
+
+def case_cover_derive(product: MultiNodeProduct) -> Dict[str, Any]:
+    """NGX-COVER-DERIVE: both roles derive the camouflage apex from their own domain.
+
+    The Master and the Worker render their decoys from two scripts, so the
+    derivation is proven on each role's own copy of the decision. The table is run
+    in the container because the refusal for a domain without a subdomain cannot
+    be observed on an install whose domain has one. Each role's real decoy vhost
+    then has to be bound to the derived apex and its www name, and must not carry
+    the first-two-label derivation a wrong implementation would have produced.
+    """
+    host = product.require_worker()
+    roles = (
+        ("master", "the Master", host.target_name, topology.PANEL_DOMAIN,
+         "/etc/nginx/conf.d/gowave-decoy.conf"),
+        ("worker", "the Worker", host.worker_name, host.worker_domain,
+         "/etc/nginx/conf.d/gowave-worker-decoy.conf"),
+    )
+    evidence: Dict[str, Any] = {}
+    for key, label, container, domain, path in roles:
+        labels = domain.rstrip(".").split(".")
+        require(
+            COVER_DERIVE_CASE_ID,
+            len(labels) >= 3,
+            f"{label}'s deployment domain {domain!r} has no subdomain, so this run "
+            "cannot show a decoy bound to a derived apex",
+        )
+        apex = ".".join(labels[-2:])
+
+        decided = product.podman.exec_bash(
+            container, cover_decision_script(key), check=False, timeout=120,
+        )
+        require(
+            COVER_DERIVE_CASE_ID,
+            decided.returncode == 0,
+            f"{label} could not run its own cover-domain decision: "
+            f"{(decided.stderr or '').strip()[-500:]}",
+        )
+        facts = parse_cover_decision(decided.stdout or "")
+        require_cover_decision(COVER_DERIVE_CASE_ID, label, facts)
+
+        rendered = product.podman.exec(container, ["cat", path], check=False)
+        require(
+            COVER_DERIVE_CASE_ID,
+            rendered.returncode == 0,
+            f"{label} has no decoy vhost at {path}: "
+            f"{(rendered.stderr or '').strip()[-500:]}",
+        )
+        names = cover_vhost_names(COVER_DERIVE_CASE_ID, label, path, rendered.stdout)
+        require_cover_vhost_names(COVER_DERIVE_CASE_ID, label, names, apex, domain)
+        evidence[key] = {
+            "deployment_domain": domain,
+            "cover_domain": apex,
+            "derived": facts["derived"],
+            "refusals": facts["refusals"],
+            "vhost": path,
+            "server_names": names,
+        }
+    return evidence
+
+
 def case_worker_outage(product: MultiNodeProduct) -> Dict[str, Any]:
     """MN-OUTAGE: stopping the Worker degrades the cluster, and removing the fault restores it.
 
@@ -4272,6 +4450,11 @@ def cases(
         # through a handshake this case would otherwise have taken first.
         Case(aio.TLS_CASE_ID, "multi-node", lambda context: case_tls_surface(product),
              timeout_seconds=TLS_CASE_TIMEOUT_SECONDS),
+        # Both decoys are read while the cluster is healthy: the apex a vhost is
+        # bound to is install-time state, so a later outage cannot change it.
+        Case(COVER_DERIVE_CASE_ID, "multi-node",
+             lambda context: case_cover_derive(product),
+             timeout_seconds=COVER_DERIVE_TIMEOUT_SECONDS),
         # The lifecycle cases run last: they revoke a client and fault the
         # Worker's own unit, so nothing that observes a healthy cluster may run
         # after them and no earlier case may be blamed for their state.

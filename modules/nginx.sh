@@ -65,6 +65,28 @@ cover_domains_resolve_here() {
     done
 }
 
+# The single cover-site decision: the apex to use on stdout, nothing when the
+# decoy stays off, and a reason on stderr either way. A deployment domain
+# without a subdomain has no registrable apex to camouflage, so saying so is
+# the refusal -- an empty render would leave the operator guessing.
+cover_domain_for() {
+    local panel_domain="${1:-}"
+    local server_ip="${2:-}"
+    local cover_domain
+    cover_domain=$(derive_cover_domain "$panel_domain")
+    if [[ -z "$cover_domain" ]]; then
+        if [[ -n "$panel_domain" ]]; then
+            echo "Camouflage apex disabled — $panel_domain has no subdomain, so no cover apex exists." >&2
+        fi
+        return 0
+    fi
+    if ! cover_domains_resolve_here "$cover_domain" "$server_ip"; then
+        echo "Camouflage apex disabled — $cover_domain / www.$cover_domain do not resolve to ${server_ip:-this host}, so HTTP-01 would fail." >&2
+        return 0
+    fi
+    printf '%s\n' "$cover_domain"
+}
+
 # Copy the camouflage template into the webroot and substitute its placeholders.
 # Files are rewritten through temporary siblings so a reader never sees a
 # half-rendered page.
