@@ -578,6 +578,66 @@ acquire_mutation_lock() {
     return 1
 }
 
+# The deploy hook outlives both the transaction that installed it and its
+# recovery snapshot, which is deleted once the install commits. Ownership is
+# therefore recorded outside the snapshot as well, so the next transaction can
+# still tell its own hook from one an operator or another product left behind.
+deploy_hook_ownership_record() {
+    printf '%s\n' "${1:-/var/lib/gowave-auto-nginx/recovery}/deploy-hook-ownership.json"
+}
+
+deploy_hook_record_matches() {
+    local record="$1"
+    local hook_file="$2"
+    local digest="$3"
+    if [[ ! -f "$record" || -L "$record" ]]; then
+        return 1
+    fi
+    python3 - "$record" "$hook_file" "$digest" <<'PY'
+import json
+import sys
+
+record_path, hook_path, digest = sys.argv[1:4]
+try:
+    with open(record_path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if (
+    isinstance(data, dict)
+    and data.get("created_by_tx") is True
+    and data.get("path") == hook_path
+    and data.get("sha256") == digest
+) else 1)
+PY
+}
+
+deploy_hook_owned_by_prior_transaction() {
+    local hook_file="$1"
+    local recovery_root="$2"
+    if [[ ! -f "$hook_file" || -L "$hook_file" ]]; then
+        return 1
+    fi
+    if [[ ! -d "$recovery_root" || -L "$recovery_root" ]]; then
+        return 1
+    fi
+    local digest
+    digest=$(sha256sum -- "$hook_file" 2>/dev/null | awk '{print $1}' || true)
+    if [[ -z "$digest" ]]; then
+        return 1
+    fi
+    if deploy_hook_record_matches "$(deploy_hook_ownership_record "$recovery_root")" "$hook_file" "$digest"; then
+        return 0
+    fi
+    local manifest
+    for manifest in "${recovery_root}"/*/deploy-hook-manifest.json; do
+        if deploy_hook_record_matches "$manifest" "$hook_file" "$digest"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 verify_deploy_hook_preflight() {
     local hook_file="${1:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
     local transaction_id="${2:-}"
@@ -593,6 +653,13 @@ verify_deploy_hook_preflight() {
                     return 0
                 fi
             fi
+        fi
+        # A repeated install finds the hook an earlier transaction installed. It is
+        # only recognised as ours when that transaction recorded this exact path and
+        # the file still hashes to what was recorded, so a hook written or edited by
+        # someone else stays a refusal rather than a file this product overwrites.
+        if deploy_hook_owned_by_prior_transaction "$hook_file" "$recovery_root"; then
+            return 0
         fi
         echo "Error: Pre-existing unowned Certbot deploy hook found at $hook_file. Refusing to overwrite unmanaged host resource." >&2
         return 1
@@ -753,6 +820,20 @@ EOF
         echo "Error: Could not sync Certbot deploy-hook directory after installation." >&2
         return 1
     }
+    local ownership_record ownership_tmp
+    ownership_record=$(deploy_hook_ownership_record "$recovery_root")
+    ownership_tmp="${ownership_record}.tmp.$$"
+    python3 -c 'import json, os, sys; record, tx_id, path, digest = sys.argv[1:5]; flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0); fd = os.open(record, flags, 0o600); stream = os.fdopen(fd, "w", encoding="utf-8"); json.dump({"transaction_id": tx_id, "path": path, "created_by_tx": True, "sha256": digest}, stream, indent=2); stream.flush(); os.fsync(stream.fileno()); stream.close()' "$ownership_tmp" "$transaction_id" "$hook_file" "$digest" || {
+        rm -f -- "$ownership_tmp" || true
+        echo "Error: Could not record deploy-hook ownership for later transactions." >&2
+        return 1
+    }
+    if ! chmod 0600 -- "$ownership_tmp" || ! sync "$ownership_tmp" ||
+        ! mv -f -- "$ownership_tmp" "$ownership_record" || ! sync "$recovery_root"; then
+        rm -f -- "$ownership_tmp" || true
+        echo "Error: Could not publish the deploy-hook ownership record." >&2
+        return 1
+    fi
     echo "Configured managed ACME renewal hook in $hook_file."
 }
 rollback_managed_deploy_hook() {
@@ -853,6 +934,10 @@ PY
     }
     sync "$(dirname "$hook_file")" || {
         echo "Error: Could not sync deploy-hook directory after rollback." >&2
+        return 1
+    }
+    rm -f -- "$(deploy_hook_ownership_record "$recovery_root")" || {
+        echo "Error: Could not clear the deploy-hook ownership record after rollback." >&2
         return 1
     }
     return 0
@@ -1533,6 +1618,66 @@ acquire_mutation_lock() {
     return 1
 }
 
+# The deploy hook outlives both the transaction that installed it and its
+# recovery snapshot, which is deleted once the install commits. Ownership is
+# therefore recorded outside the snapshot as well, so the next transaction can
+# still tell its own hook from one an operator or another product left behind.
+deploy_hook_ownership_record() {
+    printf '%s\n' "${1:-/var/lib/gowave-auto-nginx/recovery}/deploy-hook-ownership.json"
+}
+
+deploy_hook_record_matches() {
+    local record="$1"
+    local hook_file="$2"
+    local digest="$3"
+    if [[ ! -f "$record" || -L "$record" ]]; then
+        return 1
+    fi
+    python3 - "$record" "$hook_file" "$digest" <<'PY'
+import json
+import sys
+
+record_path, hook_path, digest = sys.argv[1:4]
+try:
+    with open(record_path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if (
+    isinstance(data, dict)
+    and data.get("created_by_tx") is True
+    and data.get("path") == hook_path
+    and data.get("sha256") == digest
+) else 1)
+PY
+}
+
+deploy_hook_owned_by_prior_transaction() {
+    local hook_file="$1"
+    local recovery_root="$2"
+    if [[ ! -f "$hook_file" || -L "$hook_file" ]]; then
+        return 1
+    fi
+    if [[ ! -d "$recovery_root" || -L "$recovery_root" ]]; then
+        return 1
+    fi
+    local digest
+    digest=$(sha256sum -- "$hook_file" 2>/dev/null | awk '{print $1}' || true)
+    if [[ -z "$digest" ]]; then
+        return 1
+    fi
+    if deploy_hook_record_matches "$(deploy_hook_ownership_record "$recovery_root")" "$hook_file" "$digest"; then
+        return 0
+    fi
+    local manifest
+    for manifest in "${recovery_root}"/*/deploy-hook-manifest.json; do
+        if deploy_hook_record_matches "$manifest" "$hook_file" "$digest"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 verify_deploy_hook_preflight() {
     local hook_file="${1:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
     local transaction_id="${2:-}"
@@ -1548,6 +1693,13 @@ verify_deploy_hook_preflight() {
                     return 0
                 fi
             fi
+        fi
+        # A repeated install finds the hook an earlier transaction installed. It is
+        # only recognised as ours when that transaction recorded this exact path and
+        # the file still hashes to what was recorded, so a hook written or edited by
+        # someone else stays a refusal rather than a file this product overwrites.
+        if deploy_hook_owned_by_prior_transaction "$hook_file" "$recovery_root"; then
+            return 0
         fi
         echo "Error: Pre-existing unowned Certbot deploy hook found at $hook_file. Refusing to overwrite unmanaged host resource." >&2
         return 1
@@ -1708,6 +1860,20 @@ EOF
         echo "Error: Could not sync Certbot deploy-hook directory after installation." >&2
         return 1
     }
+    local ownership_record ownership_tmp
+    ownership_record=$(deploy_hook_ownership_record "$recovery_root")
+    ownership_tmp="${ownership_record}.tmp.$$"
+    python3 -c 'import json, os, sys; record, tx_id, path, digest = sys.argv[1:5]; flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0); fd = os.open(record, flags, 0o600); stream = os.fdopen(fd, "w", encoding="utf-8"); json.dump({"transaction_id": tx_id, "path": path, "created_by_tx": True, "sha256": digest}, stream, indent=2); stream.flush(); os.fsync(stream.fileno()); stream.close()' "$ownership_tmp" "$transaction_id" "$hook_file" "$digest" || {
+        rm -f -- "$ownership_tmp" || true
+        echo "Error: Could not record deploy-hook ownership for later transactions." >&2
+        return 1
+    }
+    if ! chmod 0600 -- "$ownership_tmp" || ! sync "$ownership_tmp" ||
+        ! mv -f -- "$ownership_tmp" "$ownership_record" || ! sync "$recovery_root"; then
+        rm -f -- "$ownership_tmp" || true
+        echo "Error: Could not publish the deploy-hook ownership record." >&2
+        return 1
+    fi
     echo "Configured managed ACME renewal hook in $hook_file."
 }
 rollback_managed_deploy_hook() {
@@ -1808,6 +1974,10 @@ PY
     }
     sync "$(dirname "$hook_file")" || {
         echo "Error: Could not sync deploy-hook directory after rollback." >&2
+        return 1
+    }
+    rm -f -- "$(deploy_hook_ownership_record "$recovery_root")" || {
+        echo "Error: Could not clear the deploy-hook ownership record after rollback." >&2
         return 1
     }
     return 0
@@ -3004,6 +3174,12 @@ PY
     }
     sync "$(dirname "$hook_file")" || {
         echo "Error: Could not sync deploy-hook directory after rollback." >&2
+        return 1
+    }
+    # This standalone recovery script carries no ownership helper, so the record
+    # that outlives the snapshot is cleared by its documented path.
+    rm -f -- "${recovery_root}/deploy-hook-ownership.json" || {
+        echo "Error: Could not clear the deploy-hook ownership record after rollback." >&2
         return 1
     }
     return 0

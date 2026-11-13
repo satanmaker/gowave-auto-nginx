@@ -20,6 +20,33 @@ def node_sh_without_bundle(directory: Path) -> Path:
     return copy
 
 
+def capture_remote_script(directory, *command) -> str:
+    """Run a remote-* subcommand against a mock ssh and return the streamed script."""
+    directory = Path(directory)
+    known_hosts = directory / "known_hosts"
+    known_hosts.write_text(
+        "127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGMockKeyMockKeyMockKeyMockKeyMockKeyMockKey\n"
+    )
+    bin_dir = directory / "bin"
+    bin_dir.mkdir()
+    capture = directory / "payload.sh"
+    mock_ssh = bin_dir / "ssh"
+    mock_ssh.write_text(f'#!/bin/sh\ncat > "{capture}"\nexit 0\n')
+    mock_ssh.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env["SSH_KNOWN_HOSTS"] = str(known_hosts)
+    env["SECRET_KEY"] = "bW9jay1zZWNyZXQ="
+    result = subprocess.run(
+        [str(REPO_ROOT / "gowave-node-auto.sh"), *command],
+        env=env, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"stdout: {result.stdout}, stderr: {result.stderr}")
+    return capture.read_text()
+
+
 class TestNodeIntegration(unittest.TestCase):
     def test_recovery_directory_is_created_private_and_owned_by_caller(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1576,28 +1603,7 @@ class TestWorkerPayloadBootstrap(unittest.TestCase):
     """
 
     def capture(self, tmp, *command):
-        tmp = Path(tmp)
-        known_hosts = tmp / "known_hosts"
-        known_hosts.write_text(
-            "127.0.0.1 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGMockKeyMockKeyMockKeyMockKeyMockKeyMockKey\n"
-        )
-        bin_dir = tmp / "bin"
-        bin_dir.mkdir()
-        capture = tmp / "payload.sh"
-        mock_ssh = bin_dir / "ssh"
-        mock_ssh.write_text(f'#!/bin/sh\ncat > "{capture}"\nexit 0\n')
-        mock_ssh.chmod(0o755)
-
-        env = os.environ.copy()
-        env["PATH"] = f"{bin_dir}:{env['PATH']}"
-        env["SSH_KNOWN_HOSTS"] = str(known_hosts)
-        env["SECRET_KEY"] = "bW9jay1zZWNyZXQ="
-        result = subprocess.run(
-            [str(REPO_ROOT / "gowave-node-auto.sh"), *command],
-            env=env, capture_output=True, text=True,
-        )
-        self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}, stderr: {result.stderr}")
-        return capture.read_text()
+        return capture_remote_script(tmp, *command)
 
     def payload(self, tmp):
         return self.capture(tmp, "remote_payload", "127.0.0.1", "22",
@@ -1727,6 +1733,79 @@ class TestWorkerReapply(unittest.TestCase):
 
     def test_the_cli_advertises_the_subcommand(self):
         self.assertIn("node {add|list|reapply|rollback}", self.text)
+
+
+class TestWorkerDeployHookOwnership(unittest.TestCase):
+    """The Worker payload must accept the deploy hook an earlier payload installed.
+
+    A reconfiguration streams the payload again under a new ACME transaction id,
+    and `remote_finalize` deletes that transaction directory once the install
+    commits, taking its `deploy-hook-manifest.json` with it. The hook itself stays
+    on the host on purpose, so ownership is recorded where the finalizer cannot
+    reach it; otherwise the second install refuses the Worker's own hook and the
+    whole reconfiguration fails.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload = capture_remote_script(
+                tmpdir, "remote_payload", "127.0.0.1", "22",
+                "worker.example.com", "reality.example.com", "root",
+            )
+        start = payload.index("deploy_hook_ownership_record() {")
+        end = payload.index("\nsetup_system_prereqs() {", start)
+        assert end > start
+        cls.functions = payload[start:end]
+
+    def run_hook_functions(self, tmp, body):
+        script = Path(tmp) / "hook-functions.sh"
+        script.write_text(self.functions + "\n" + body, encoding="utf-8")
+        return subprocess.run(
+            ["bash", str(script), str(Path(tmp) / "renewal-hooks" / "deploy" / "gowave-nginx.sh"),
+             str(Path(tmp) / "recovery")],
+            capture_output=True, text=True,
+        )
+
+    def test_a_repeated_install_accepts_the_hook_after_the_snapshot_is_finalized(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_hook_functions(
+                tmpdir,
+                "\n".join((
+                    "hook=\"$1\"",
+                    "recovery=\"$2\"",
+                    'install_managed_deploy_hook "worker_install_one" "$hook" "$recovery" || exit 10',
+                    # This is what remote_finalize does once the install commits.
+                    'rm -rf -- "$recovery/worker_install_one" || exit 11',
+                    'install_managed_deploy_hook "worker_install_two" "$hook" "$recovery" || exit 12',
+                    'rollback_managed_deploy_hook "worker_install_two" "$hook" "$recovery" || exit 13',
+                )),
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}, stderr: {result.stderr}")
+            self.assertFalse((Path(tmpdir) / "renewal-hooks" / "deploy" / "gowave-nginx.sh").exists(),
+                             "the rolled-back hook must not survive the transaction")
+            self.assertFalse((Path(tmpdir) / "recovery" / "deploy-hook-ownership.json").exists(),
+                             "ownership must be cleared with the hook it described")
+
+    def test_the_record_names_the_file_so_an_operator_edit_still_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self.run_hook_functions(
+                tmpdir,
+                "\n".join((
+                    "hook=\"$1\"",
+                    "recovery=\"$2\"",
+                    'install_managed_deploy_hook "worker_install_one" "$hook" "$recovery" || exit 10',
+                    'record="$recovery/deploy-hook-ownership.json"',
+                    '[[ -f "$record" && ! -L "$record" ]] || exit 11',
+                    '[[ "$(stat -c %a -- "$record")" == "600" ]] || exit 12',
+                    'rm -rf -- "$recovery/worker_install_one" || exit 13',
+                    "printf '#!/bin/sh\\necho hijacked\\n' > \"$hook\" || exit 14",
+                    'verify_deploy_hook_preflight "$hook" "worker_install_two" "$recovery" && exit 15',
+                    "exit 0",
+                )),
+            )
+            self.assertEqual(result.returncode, 0, f"stdout: {result.stdout}, stderr: {result.stderr}")
+            self.assertIn("Pre-existing unowned Certbot deploy hook found", result.stderr)
 
 
 if __name__ == "__main__":
