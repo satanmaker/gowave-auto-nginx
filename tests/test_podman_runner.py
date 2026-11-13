@@ -28,6 +28,7 @@ from tools.podman_e2e.runner import (  # noqa: E402
     RunContext,
     Runner,
     overall_status,
+    repository_state,
 )
 
 
@@ -49,6 +50,23 @@ class TestPodmanRunnerContract(unittest.TestCase):
         suite = ET.parse(context.artifact_dir / "junit.xml").getroot()
         self.assertEqual(suite.attrib["tests"], "1")
         self.assertEqual(suite.attrib["failures"], "0")
+
+    def test_the_result_names_the_commit_it_measured(self):
+        # A run is evidence only for the revision it started on, so the artifact
+        # carries that revision instead of leaving it to a timestamp argument.
+        context = self.context()
+        runner = Runner(context)
+        runner.add(Case("AIO-SMOKE", "aio", lambda ctx: {}))
+        self.assertEqual(runner.execute(), 0)
+        report = json.loads((context.artifact_dir / "result.json").read_text())
+        repository = report["environment"]["repository"]
+        self.assertRegex(repository["commit"], r"^[0-9a-f]{40}$")
+        self.assertIn(repository["tree"], ("clean", "dirty"))
+
+    def test_a_missing_revision_is_reported_instead_of_failing_the_run(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.assertEqual(repository_state(Path(tmpdir)),
+                             {"commit": "unknown", "tree": "unknown"})
 
     def test_assertion_failure_is_never_green(self):
         context = self.context()
