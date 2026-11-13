@@ -301,6 +301,34 @@ class TestPanelDeployment(unittest.TestCase):
             self.assertIn("ADMIN_PASSWORD=mysecretpass123", content)
             self.assertIn("SCOPED_API_TOKEN=tok-abc", content)
 
+    def test_every_domain_change_journal_update_can_import_the_modules(self):
+        """The journal rewrites go through `modules.recovery`, so PYTHONPATH must be set.
+
+        `domain-change` runs from whatever directory the operator happens to be in,
+        including a bare container shell, so a bare `python3 -` cannot import the
+        repository's `modules` package and the change dies mid-transaction.
+        """
+        text = (REPO_ROOT / "gowave-auto.sh").read_text(encoding="utf-8")
+        start = text.index("cmd_domain_change() {")
+        body = text[start:text.index("\"Domain change completed and verified successfully.\"", start)]
+        lines = body.splitlines()
+
+        checked = 0
+        for index, line in enumerate(lines):
+            if "python3" not in line:
+                continue
+            block = []
+            for follower in lines[index + 1:]:
+                block.append(follower)
+                if follower.strip() == "PY":
+                    break
+            if not any("from modules" in entry for entry in block):
+                continue
+            checked += 1
+            self.assertIn("PYTHONPATH=", line, f"journal update at line {index} cannot import modules: {line}")
+
+        self.assertGreaterEqual(checked, 4, "the domain change lost its journal updates")
+
 
 if __name__ == "__main__":
     unittest.main()
