@@ -1484,6 +1484,7 @@ class RecordingPodman:
         self.context = RunContext(topology="aio", artifact_root=self.artifacts, budget_seconds=3600)
         self.networks = []
         self.connects = []
+        self.volumes = []
         self.runs = []
         self.builds = []
         self.execs = []
@@ -1499,6 +1500,15 @@ class RecordingPodman:
     def network_connect(self, name, network, ip=None):
         self.connects.append((name, network, ip))
         return name
+
+    def volume_create(self, name):
+        self.volumes.append(name)
+        return name
+
+    def volume_mountpoint(self, name):
+        mountpoint = self.context.secret_dir / "volumes" / name
+        mountpoint.mkdir(parents=True, exist_ok=True)
+        return mountpoint
 
     def run(self, **kwargs):
         self.runs.append(kwargs)

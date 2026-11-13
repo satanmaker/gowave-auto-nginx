@@ -23,6 +23,7 @@ class FakePodman:
         self.context = RunContext(topology="aio", artifact_root=self.artifacts, budget_seconds=3600)
         self.networks = []
         self.connects = []
+        self.volumes = []
         self.used_subnets = ["10.89.0.0/24", "10.90.0.0/24", "10.88.0.0/16"]
         self.runs = []
         self.waits = []
@@ -43,6 +44,16 @@ class FakePodman:
     def network_connect(self, name, network, ip=None):
         self.connects.append((name, network, ip))
         return name
+
+    def volume_create(self, name):
+        """The run's archive volume; a real one is a Podman volume, a directory here."""
+        self.volumes.append(name)
+        return name
+
+    def volume_mountpoint(self, name):
+        mountpoint = self.context.secret_dir / "volumes" / name
+        mountpoint.mkdir(parents=True, exist_ok=True)
+        return mountpoint
 
     def run(self, **kwargs):
         self.runs.append(kwargs)

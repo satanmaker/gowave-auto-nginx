@@ -317,6 +317,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
     },
     {
+        "id": "MN-BACKUP-VOL",
+        "requirement": "Backup and Restore Format v1",
+        "assertion": "Both unencrypted archives are written into a /var/backups/gowave that is a run-owned Podman volume of its own — a filesystem distinct from the container's root, owned by root at mode 0700 with exactly one mount entry and carrying the run's cleanup label — each role's archive lands on that volume at mode 0600, and the run's artifact tree holds no gzip stream, no file named or suffixed as an archive, and no line carrying a private key or secret-bearing variable, so the volume's removal by label during cleanup leaves nothing behind.",
+        "topology": ["multi-node"],
+        "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
+    },
+    {
         "id": "MN-RESTORE",
         "requirement": "Backup and Restore Format v1",
         "assertion": "A Panel archive and a Worker archive, both written by the product on the roles this run provisioned, are restored by the product's own restore command on those roles: a client created through the Panel API and then deleted comes back with its identity, the inventory and the exact bytes of every representation it was served, the Worker's environment file returns to the bytes the archive captured (the injected marker gone) with its unit active, and both nodes reconnect and carry data-plane payload through every served outbound afterwards.",
