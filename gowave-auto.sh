@@ -1190,7 +1190,7 @@ PY
     sed -i "s/^PANEL_DOMAIN=.*/PANEL_DOMAIN=$new_panel_domain/" "$GOWAVE_DIR/.env"
     sed -i "s|^SUB_PUBLIC_DOMAIN=.*|SUB_PUBLIC_DOMAIN=$new_panel_domain/api/sub|" "$GOWAVE_DIR/.env"
 
-    python3 - "$JOURNAL_FILE" <<'PY'
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$JOURNAL_FILE" <<'PY'
 import json, sys, time
 from pathlib import Path
 p=Path(sys.argv[1]); data=json.loads(p.read_text())
