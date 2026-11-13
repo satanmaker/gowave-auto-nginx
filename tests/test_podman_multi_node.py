@@ -179,6 +179,29 @@ class TestMultiNodeRoles(unittest.TestCase):
             host.require_roles()
         self.assertIn(host.worker_name, str(caught.exception))
 
+    def test_the_master_is_the_runs_dual_stack_host_and_the_worker_is_not(self):
+        # 6.7: the product reads the kernel rather than a flag, so the two branches
+        # only exist if both roles are given opposite answers before either install
+        # runs. Swapping them would make the case inspect one branch twice.
+        host = self._create()
+        master = "".join(script for name, script in self.podman.scripts
+                         if name == host.target_name)
+        worker = "".join(script for name, script in self.podman.scripts
+                         if name == host.worker_name)
+        self.assertIn("echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6", master)
+        self.assertIn("echo 0 > /proc/sys/net/ipv6/conf/lo/disable_ipv6", master)
+        self.assertIn("readarray -t addresses < /proc/net/if_inet6", master)
+        self.assertNotIn("echo 1 > /proc/sys/net/ipv6", master)
+        self.assertIn("echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6", worker)
+        self.assertIn("echo 1 > /proc/sys/net/ipv6/conf/lo/disable_ipv6", worker)
+        self.assertNotIn("echo 0 > /proc/sys/net/ipv6", worker)
+        self.assertEqual(host.ipv6_address, topology.IPV6_HOST_ADDRESS)
+        self.assertIn(
+            (host.target_name, ["cat", "/proc/net/if_inet6"]),
+            [tuple(entry) for entry in self.podman.execs],
+            "the address the product will read has to be confirmed, not assumed",
+        )
+
     def test_the_on_demand_engine_role_is_not_required_before_a_case_needs_it(self):
         host = self._create()
         self.assertNotIn(host.engine_client_name, host.started)
@@ -1327,29 +1350,43 @@ class TestMultiNodeSuite(unittest.TestCase):
                          multi_node.FIREWALL_TIMEOUT_SECONDS)
         self.assertEqual(suite[multi_node.MASTER_ACCESS_CASE_ID].topology, "multi-node")
 
+    def test_the_ipv6_case_follows_the_firewall_pair(self):
+        # 6.7: FW-04 re-reads the same decisions through the other address family
+        # while both roles are healthy, so a later change to either install cannot
+        # be read as an IPv6 effect.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertEqual(ids[15], multi_node.IPV6_CASE_ID)
+        self.assertLess(ids.index(multi_node.MASTER_ACCESS_CASE_ID),
+                        ids.index(multi_node.IPV6_CASE_ID))
+        self.assertLess(ids.index(multi_node.IPV6_CASE_ID), ids.index("CLUS-01"))
+        suite = {case.id: case for case in multi_node.cases(self.podman)}
+        self.assertEqual(suite[multi_node.IPV6_CASE_ID].timeout_seconds,
+                         multi_node.IPV6_TIMEOUT_SECONDS)
+        self.assertEqual(suite[multi_node.IPV6_CASE_ID].topology, "multi-node")
+
     def test_the_cluster_audit_follows_the_control_plane_proof(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[15:18], ["CLUS-01", "CLUS-02", "CLUS-03"])
+        self.assertEqual(ids[16:19], ["CLUS-01", "CLUS-02", "CLUS-03"])
 
     def test_the_worker_state_audit_follows_the_cluster_audit(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[18:20], ["WRK-05", "WRK-06"])
+        self.assertEqual(ids[19:21], ["WRK-05", "WRK-06"])
 
     def test_the_vision_independence_case_follows_the_worker_config(self):
         # 5.10: the per-node Vision proof reads the config WRK-06 has just
         # compared, so it runs once that assignment is established and before any
         # data plane traffic.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[18:21], ["WRK-05", "WRK-06", multi_node.VISION_CASE_ID])
+        self.assertEqual(ids[19:22], ["WRK-05", "WRK-06", multi_node.VISION_CASE_ID])
 
     def test_the_data_plane_cases_follow_the_worker_audit(self):
         # 5.7: a payload has to traverse the Worker too, so the matrix tuples of
         # both nodes run once the Worker's own config is applied.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[21], "MN-DP-master-REALITY-xray")
-        self.assertEqual(ids[28], "MN-DP-master-TROJAN-GRPC-mihomo")
-        self.assertEqual(ids[29], "MN-DP-worker-REALITY-xray")
-        self.assertEqual(ids[36], "MN-DP-worker-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[22], "MN-DP-master-REALITY-xray")
+        self.assertEqual(ids[29], "MN-DP-master-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[30], "MN-DP-worker-REALITY-xray")
+        self.assertEqual(ids[37], "MN-DP-worker-TROJAN-GRPC-mihomo")
 
     def test_every_node_contributes_its_own_matrix_tuples(self):
         data = matrix.load()
@@ -1408,8 +1445,8 @@ class TestMultiNodeSuite(unittest.TestCase):
         # 5.12: attribution reads the same run and the endpoint, so it follows the
         # count and still precedes revocation, which would revoke a client.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[36], "MN-DP-worker-TROJAN-GRPC-mihomo")
-        self.assertEqual(ids[37:41], [multi_node.MATRIX_CASE_ID, multi_node.EGRESS_CASE_ID,
+        self.assertEqual(ids[37], "MN-DP-worker-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[38:42], [multi_node.MATRIX_CASE_ID, multi_node.EGRESS_CASE_ID,
                                       "SUB-SERVED", "SUB-B64"])
         suite = {case.id: case for case in multi_node.cases(self.podman)}
         self.assertEqual(suite[multi_node.MATRIX_CASE_ID].timeout_seconds,
@@ -1432,7 +1469,7 @@ class TestMultiNodeSuite(unittest.TestCase):
         # 6.1: both roles' trees are validated and reloaded while the cluster is
         # healthy, so a later revocation cannot be read as a reload effect.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[41], multi_node.NGINX_CONFIG_CASE_ID)
+        self.assertEqual(ids[42], multi_node.NGINX_CONFIG_CASE_ID)
         self.assertLess(ids.index(multi_node.NGINX_CONFIG_CASE_ID),
                         ids.index(multi_node.REVOCATION_CASE_ID))
         self.assertLess(ids.index("SUB-B64"), ids.index(multi_node.NGINX_CONFIG_CASE_ID))
@@ -1444,8 +1481,8 @@ class TestMultiNodeSuite(unittest.TestCase):
         # 6.2: both roles' certificates are read from a healthy cluster, so a
         # later Worker shutdown cannot be blamed for what the client saw here.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[42], aio.TLS_CASE_ID)
-        self.assertEqual(ids[41], multi_node.NGINX_CONFIG_CASE_ID)
+        self.assertEqual(ids[43], aio.TLS_CASE_ID)
+        self.assertEqual(ids[42], multi_node.NGINX_CONFIG_CASE_ID)
         self.assertLess(ids.index(aio.TLS_CASE_ID), ids.index(multi_node.REVOCATION_CASE_ID))
         suite = {case.id: case for case in multi_node.cases(self.podman)}
         self.assertEqual(suite[aio.TLS_CASE_ID].timeout_seconds,
@@ -2592,6 +2629,246 @@ class TestMasterAccessCase(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("reported nothing for 'panel-api'", message)
         self.assertIn("'operator-ssh'", message)
+
+
+class TestIpv6PolicyCase(unittest.TestCase):
+    """FW-04 only means something if both branches are forced, not inherited.
+
+    A run whose host happens to have no IPv6 exercises the disabled branch twice
+    and still reads green, so every failure below is a way that could happen: an
+    enabled host whose install ignored the kernel, a v6 chain that mirrors
+    nothing, an internal port published on the second stack, or an IPv4-only host
+    that was in fact reachable over IPv6.
+    """
+
+    PORTS = multi_node.FIREWALL_PORTS
+
+    def rules(self, chain, allows=(), blocks=(), scoped=None):
+        """A rule dump in the shape the parser produces, with the given verdicts."""
+        allow_map = {port: [] for port in self.PORTS}
+        block_map = {port: [] for port in self.PORTS}
+        for port in allows:
+            allow_map[port] = [{"target": "ACCEPT", "source": "",
+                                "line": f"-A {chain} -p tcp -m tcp --dport {port} -j ACCEPT"}]
+        for port, source in (scoped or {}).items():
+            allow_map[port] = [{"target": "ACCEPT", "source": source,
+                                "line": f"-A {chain} -s {source} -p tcp -m tcp --dport {port} -j ACCEPT"}]
+        for port in blocks:
+            block_map[port] = [{"target": "DROP", "source": "",
+                                "line": f"-A {chain} -p tcp -m tcp --dport {port} -j DROP"}]
+        return {"allows": allow_map, "blocks": block_map}
+
+    def master(self):
+        """The dual-stack role: both families carry the same decisions."""
+        v6 = self.rules("ufw6-user-input", allows=(22, 80, 443), blocks=(3002,))
+        v4 = self.rules("ufw-user-input", allows=(22, 80, 443), blocks=(3002,))
+        return {
+            "active": True,
+            "default_incoming": "deny",
+            "input_policy": "DROP",
+            "allows": v4["allows"],
+            "blocks": v4["blocks"],
+            "counters": {port: [] for port in self.PORTS},
+            # A wildcard v6 socket is what `ss` reports for a `listen [::]`.
+            "listeners": {22: ["0.0.0.0", "[::]"], 80: ["0.0.0.0", "[::]"],
+                          443: ["0.0.0.0", "[::]"],
+                          3002: ["127.0.0.1"], 7443: ["127.0.0.1"]},
+            "ipv6": {
+                "declared": "yes",
+                "kernel_addresses": ["fd00000000000000000000000000000a"],
+                "kernel_disabled": False,
+                "active": True,
+                "allows": v6["allows"],
+                "blocks": v6["blocks"],
+                "counters": {port: [] for port in self.PORTS},
+                "listens": {"[::]:443": ["stream.conf"], "[::]:80": ["panel.conf"]},
+                "rules_returncode": 0,
+                "chain_returncode": 0,
+                "error": "",
+            },
+        }
+
+    def worker(self):
+        """The IPv4-only role: no address, no v6 chain, unchanged v4 rules."""
+        v6 = self.rules("ufw6-user-input")
+        v4 = self.rules("ufw-user-input", allows=(22, 80, 443), scoped={3002: "10.89.0.10"})
+        return {
+            "active": True,
+            "default_incoming": "deny",
+            "input_policy": "DROP",
+            "allows": v4["allows"],
+            "blocks": v4["blocks"],
+            "counters": {port: [] for port in self.PORTS},
+            "listeners": {22: ["0.0.0.0"], 80: ["0.0.0.0"], 443: ["0.0.0.0"],
+                          3002: ["0.0.0.0"], 7443: []},
+            "ipv6": {
+                "declared": "no",
+                "kernel_addresses": [],
+                "kernel_disabled": True,
+                "active": False,
+                "allows": v6["allows"],
+                "blocks": v6["blocks"],
+                "counters": {port: [] for port in self.PORTS},
+                "listens": {},
+                "rules_returncode": 0,
+                "chain_returncode": 1,
+                "error": "No chain/target/match by that name.",
+            },
+        }
+
+    def path(self, outcome, address=None, port=443, **extra):
+        observed = {
+            "address": address or topology.IPV6_HOST_ADDRESS,
+            "port": port,
+            "outcome": outcome,
+            "elapsed_ms": 4,
+            "detail": "",
+        }
+        observed.update(extra)
+        return observed
+
+    def facts(self):
+        return {
+            "master": self.master(),
+            "worker": self.worker(),
+            "address": topology.IPV6_HOST_ADDRESS,
+            "master_paths": {
+                "https": self.path("CONNECTED", port=443),
+                "http": self.path("CONNECTED", port=80),
+                "node": self.path("REFUSED", port=3002),
+                "panel-api": self.path("REFUSED", port=7443),
+            },
+            "worker_paths": {
+                "ssh-port": self.path("UNREACHABLE", address="::1", port=22,
+                                 detail="[Errno 99] Cannot assign requested address"),
+            },
+            "limitation": {"status": "NOT_APPLICABLE", "reason": "no IPv6 origin in this network"},
+        }
+
+    def contract(self, facts=None):
+        return multi_node.ipv6_contract(facts or self.facts(), "FW-04")
+
+    def test_the_two_branches_are_evidence(self):
+        evidence = self.contract()
+        self.assertTrue(evidence["master"]["v6_chain"])
+        self.assertEqual(evidence["master"]["declared"], "yes")
+        self.assertEqual(sorted(evidence["master"]["v6_listens"]),
+                         ["[::]:443", "[::]:80"])
+        self.assertEqual(evidence["master"]["paths"]["node"]["outcome"], "REFUSED")
+        self.assertTrue(evidence["worker"]["kernel_disabled"])
+        self.assertEqual(evidence["worker"]["declared"], "no")
+        self.assertEqual(evidence["worker"]["v6_rules"]["allows"]["3002"], [])
+        self.assertEqual(evidence["limitation"]["status"], "NOT_APPLICABLE")
+
+    def test_a_host_with_ipv6_whose_firewall_declares_it_off_is_a_finding(self):
+        facts = self.facts()
+        facts["master"]["ipv6"]["declared"] = "no"
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("IPV6=no", str(caught.exception))
+
+    def test_an_enabled_host_without_a_v6_chain_is_unfiltered(self):
+        facts = self.facts()
+        facts["master"]["ipv6"]["active"] = False
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("no ufw6-user-input chain", str(caught.exception))
+
+    def test_the_node_port_may_not_be_accepted_on_the_v6_stack(self):
+        facts = self.facts()
+        facts["master"]["ipv6"]["allows"][3002] = self.rules(
+            "ufw6-user-input", allows=(3002,),
+        )["allows"][3002]
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("accept the local node port", str(caught.exception))
+
+    def test_a_v6_chain_without_the_node_block_is_not_a_mirror(self):
+        facts = self.facts()
+        facts["master"]["ipv6"]["blocks"][3002] = []
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("no block for the local node port", str(caught.exception))
+
+    def test_an_internal_port_published_on_v6_is_a_finding(self):
+        facts = self.facts()
+        facts["master"]["ipv6"]["listens"]["[::]:7443"] = ["panel.conf"]
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("listen [::]` for the internal port 7443", str(caught.exception))
+
+    def test_an_enabled_host_that_renders_no_v6_listener_did_not_read_the_kernel(self):
+        facts = self.facts()
+        del facts["master"]["ipv6"]["listens"]["[::]:443"]
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("renders no `listen [::]` for port 443", str(caught.exception))
+
+    def test_a_rendered_listener_without_a_wildcard_socket_is_not_a_publication(self):
+        # A rendered ``listen [::]:443`` that never became a socket is a config
+        # file, not a service: the case has to read the live socket table.
+        facts = self.facts()
+        facts["master"]["listeners"][443] = ["0.0.0.0"]
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("binds no wildcard IPv6 socket", str(caught.exception))
+
+    def test_a_node_port_answered_over_v6_is_published(self):
+        facts = self.facts()
+        facts["master_paths"]["node"] = self.path("CONNECTED", port=3002)
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("answered over IPv6", str(caught.exception))
+
+    def test_a_v6_timeout_is_not_the_same_observation_as_no_socket(self):
+        facts = self.facts()
+        facts["master_paths"]["panel-api"] = self.path("TIMEOUT", port=7443)
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("timeout would mean the v6 rule set dropped a packet",
+                      str(caught.exception))
+
+    def test_a_master_without_an_address_never_exercised_the_enabled_branch(self):
+        facts = self.facts()
+        facts["master"]["ipv6"]["kernel_addresses"] = []
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("enabled branch was never reachable", str(caught.exception))
+
+    def test_an_ipv4_only_worker_declaring_v6_was_misread_by_the_install(self):
+        facts = self.facts()
+        facts["worker"]["ipv6"]["declared"] = "yes"
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("misread the host", str(caught.exception))
+
+    def test_a_worker_with_v6_listeners_is_not_an_ipv4_only_host(self):
+        facts = self.facts()
+        facts["worker"]["ipv6"]["listens"]["[::]:443"] = ["stream.conf"]
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("renders `listen [::]` entries", str(caught.exception))
+
+    def test_a_reachable_worker_over_v6_means_the_stack_was_never_absent(self):
+        facts = self.facts()
+        facts["worker_paths"]["ssh-port"] = self.path("CONNECTED", address="::1", port=22)
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("no IPv6' from 'IPv6 blocked", str(caught.exception))
+
+    def test_enabling_v6_may_not_close_the_ipv4_port(self):
+        facts = self.facts()
+        facts["master"]["allows"][443] = []
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("stopped publishing port 443 on IPv4", str(caught.exception))
+
+    def test_the_worker_keeps_its_scoped_control_port_allow(self):
+        facts = self.facts()
+        facts["worker"]["allows"][3002] = []
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("control port 3002", str(caught.exception))
 
 
 if __name__ == "__main__":

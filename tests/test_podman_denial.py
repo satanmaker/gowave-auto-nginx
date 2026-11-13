@@ -521,5 +521,126 @@ class TestHostFirewallParsers(unittest.TestCase):
         self.assertEqual(facts["blocks"][denial.NODE_PORT], [])
 
 
+class TestHostFirewallIpv6Parsers(unittest.TestCase):
+    """FW-04 reads the same host again through the other address family.
+
+    The product's IPv6 branch is a set of decisions written to three places, and
+    the reader has to keep them apart: what the kernel offers, what
+    ``/etc/default/ufw`` declares, and what the v6 chain actually carries. A
+    report from an IPv4-only host has to read as the disabled branch rather than
+    as a v6 stack that happens to have no rules.
+    """
+
+    Ports = [
+        denial.SSH_PORT, denial.HTTP_PORT, denial.HTTPS_PORT,
+        denial.NODE_PORT, denial.PANEL_API_PORT,
+    ]
+
+    Ipv6Rules = [
+        "-P INPUT DROP",
+        "-A INPUT -i lo -j ACCEPT",
+        f"-A ufw6-user-input -p tcp -m tcp --dport {denial.SSH_PORT} -j ACCEPT",
+        f"-A ufw6-user-input -p tcp -m tcp --dport {denial.HTTP_PORT} -j ACCEPT",
+        f"-A ufw6-user-input -p tcp -m tcp --dport {denial.HTTPS_PORT} -j ACCEPT",
+        f"-A ufw6-user-input -p tcp -m tcp --dport {denial.NODE_PORT} -j DROP",
+    ]
+
+    Ipv6Chain = [
+        "Chain ufw6-user-input (1 references)",
+        "target     prot opt source               destination         ",
+        "ACCEPT     tcp      ::/0                 ::/0                 tcp dpt:443",
+        "    3      180 DROP       tcp      ::/0                 ::/0                 tcp dpt:3002",
+    ]
+
+    IfInet6 = ["fd00000000000000000000000000000a 02 80 00 80     lo"]
+
+    Listens = {"[::]:443": ["stream.conf"], "[::]:80": ["panel.conf"]}
+
+    def report(self, **overrides):
+        base = {
+            "ports": list(self.Ports),
+            "ufw": ["Status: active", "Default: deny (incoming), allow (outgoing)"],
+            "rules": [],
+            "chain": [],
+            "policy": ["Chain INPUT (policy DROP 1 packets, 60 bytes)"],
+            "listeners": [],
+            "if_inet6": list(self.IfInet6),
+            "disable_ipv6": "0",
+            "ufw_default": ["IPV6=yes"],
+            "ipv6_rules": list(self.Ipv6Rules),
+            "ipv6_chain": list(self.Ipv6Chain),
+            "ipv6_listens": dict(self.Listens),
+            "ipv6_rules_returncode": 0,
+            "ipv6_chain_returncode": 0,
+        }
+        base.update(overrides)
+        return base
+
+    def facts(self, **overrides):
+        return denial.parse_host_firewall(self.report(**overrides), self.Ports)
+
+    def test_the_enabled_branch_mirrors_the_decisions_and_the_listeners(self):
+        facts = self.facts()
+        self.assertEqual(facts["ipv6"]["declared"], "yes")
+        self.assertFalse(facts["ipv6"]["kernel_disabled"])
+        self.assertTrue(facts["ipv6"]["active"])
+        self.assertEqual(facts["ipv6"]["kernel_addresses"], ["fd00000000000000000000000000000a"])
+        for port in (denial.SSH_PORT, denial.HTTP_PORT, denial.HTTPS_PORT):
+            self.assertTrue(denial.open_to_every_source(facts["ipv6"], port))
+        self.assertFalse(denial.open_to_every_source(facts["ipv6"], denial.NODE_PORT))
+        self.assertEqual(facts["ipv6"]["blocks"][denial.NODE_PORT][0]["target"], "DROP")
+        self.assertEqual(facts["ipv6"]["allows"][denial.PANEL_API_PORT], [])
+        self.assertEqual(denial.ipv6_listens_for(facts, denial.HTTPS_PORT), ["[::]:443"])
+        self.assertEqual(denial.ipv6_listens_for(facts, denial.HTTP_PORT), ["[::]:80"])
+        self.assertEqual(denial.ipv6_listens_for(facts, denial.NODE_PORT), [])
+
+    def test_the_v6_counters_come_from_the_v6_chain(self):
+        facts = self.facts()
+        self.assertEqual(denial.packets_for(facts["ipv6"], denial.NODE_PORT), 3)
+        self.assertEqual(denial.packets_for(facts["ipv6"], denial.HTTPS_PORT), 0)
+
+    def test_an_ipv4_only_host_reads_as_the_disabled_branch(self):
+        facts = self.facts(
+            if_inet6=[],
+            disable_ipv6="1",
+            ufw_default=["IPV6=no"],
+            ipv6_rules=[],
+            ipv6_chain=[],
+            ipv6_chain_returncode=1,
+            ipv6_chain_error="No chain/target/match by that name.",
+            ipv6_listens={},
+        )
+        self.assertEqual(facts["ipv6"]["declared"], "no")
+        self.assertTrue(facts["ipv6"]["kernel_disabled"])
+        self.assertEqual(facts["ipv6"]["kernel_addresses"], [])
+        self.assertFalse(facts["ipv6"]["active"], "a missing chain is not a chain with no rules")
+        self.assertEqual(facts["ipv6"]["allows"][denial.NODE_PORT], [])
+        self.assertEqual(facts["ipv6"]["listens"], {})
+        self.assertIn("No chain", facts["ipv6"]["error"])
+
+    def test_the_v4_decisions_are_not_read_from_the_v6_dump(self):
+        facts = self.facts(rules=[], ipv6_rules=list(self.Ipv6Rules))
+        self.assertEqual(facts["allows"][denial.HTTPS_PORT], [])
+        self.assertEqual(facts["blocks"][denial.NODE_PORT], [])
+        self.assertFalse(denial.open_to_every_source(facts, denial.SSH_PORT))
+
+    def test_a_missing_listener_section_is_empty_rather_than_an_error(self):
+        facts = self.facts()
+        facts["ipv6"].pop("listens")
+        self.assertEqual(denial.ipv6_listens_for(facts, denial.HTTPS_PORT), [])
+
+    def test_the_collector_reads_both_families_and_the_hosts_own_ipv6_state(self):
+        # The v6 branch is decided from these three inputs, so a collector that
+        # stopped asking for one of them would turn the case into a guess. The
+        # switch is read from the kernel file, not through ``sysctl``: the clean
+        # image ships no ``procps``, and the product's own check reads the file.
+        script = denial.host_firewall_script([denial.HTTPS_PORT])
+        for needle in ("ip6tables", "-S", "ufw6-user-input", "/proc/net/if_inet6",
+                       "/proc/sys/net/ipv6/conf/all/disable_ipv6", "/etc/default/ufw",
+                       "/etc/nginx/stream-enabled"):
+            self.assertIn(needle, script)
+        self.assertIn('run("cat", "/proc/sys/net/ipv6/conf/all/disable_ipv6")', script)
+
+
 if __name__ == "__main__":
     unittest.main()

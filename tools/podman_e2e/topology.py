@@ -121,6 +121,26 @@ WORKER_VISION_DOMAIN = "worker-vision.testbed.internal"
 # back, so the cases match the registered node instead of counting nodes.
 WORKER_NODE_NAME = "worker-1"
 
+# The product reads the kernel, not a flag, to decide whether it publishes IPv6
+# listeners and mirrors its firewall rules onto ip6tables. A run that has to
+# exercise the enabled branch therefore has to hand one host an IPv6 stack: the
+# kernel restores its own ::1 on loopback as soon as the interface's IPv6 is
+# switched back on, and the clean image ships neither ``ip`` nor ``sysctl``, so
+# the switch is written straight to /proc/sys with a shell builtin.
+IPV6_HOST_ADDRESS = "::1"
+ENABLE_IPV6_SCRIPT = """
+set -eu
+echo 0 > /proc/sys/net/ipv6/conf/all/disable_ipv6
+echo 0 > /proc/sys/net/ipv6/conf/lo/disable_ipv6
+readarray -t addresses < /proc/net/if_inet6
+[ "${#addresses[@]}" -gt 0 ]
+"""
+DISABLE_IPV6_SCRIPT = """
+set -eu
+echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
+echo 1 > /proc/sys/net/ipv6/conf/lo/disable_ipv6
+"""
+
 # The probe the client role runs: standard library only, so its verdict cannot
 # depend on anything the product installed.
 HTTP_PROBE_SCRIPT = f"{REPO_IN_CONTAINER}/tools/podman_e2e/http_probe.py"
@@ -339,6 +359,11 @@ class AioTopology:
     _clean_facts: Dict[str, Any] = field(default_factory=dict)
     echo_dir: Optional[Path] = None
     dns_dir: Optional[Path] = None
+    # Whether the disposable host stands in for a dual-stack VPS. Off by
+    # default, because a plain IPv4 host is what most of the run measures; the
+    # IPv6 case turns it on for the role it has to prove.
+    ipv6_host: bool = False
+    ipv6_address: str = field(default="", init=False)
 
     def __post_init__(self) -> None:
         target_image.distribution(self.distribution)
@@ -520,6 +545,36 @@ class AioTopology:
         # the container keeps the private default route it installs packages over.
         self.podman.network_connect(self.target_name, self.data_network, ip=self.plan.data_target_ip)
         self._clean_facts = target_image.assert_clean(self.podman, self.target_name)
+        if self.ipv6_host:
+            self._enable_ipv6(self.target_name)
+            self.ipv6_address = IPV6_HOST_ADDRESS
+
+    def _enable_ipv6(self, container: str) -> None:
+        """Turn one role's IPv6 stack back on, before its install runs.
+
+        The product decides from ``/proc/net/if_inet6`` and the kernel's own
+        ``disable_ipv6`` switch whether it publishes ``[::]`` listeners and
+        mirrors its firewall decisions onto ip6tables, so the enabled branch is
+        only reachable if the role has IPv6 before the operator installs. The
+        kernel restores ``::1`` on loopback by itself; nothing is added to the
+        run network, and the products that are published are proven by their
+        wildcard ``[::]`` bind rather than by this address.
+        """
+        self.podman.exec_bash(container, ENABLE_IPV6_SCRIPT, timeout=120)
+        proc = self.podman.exec(
+            container, ["cat", "/proc/net/if_inet6"], check=False, timeout=60,
+        )
+        addresses = [line.split()[0] for line in (proc.stdout or "").splitlines() if line.strip()]
+        if not addresses:
+            raise TopologyError(
+                f"{container} reports no IPv6 address after enabling it, so the product would "
+                "still take its IPv4-only branch"
+            )
+        expected = ipaddress.ip_address(IPV6_HOST_ADDRESS).exploded.replace(":", "")
+        if expected not in [address.lower() for address in addresses]:
+            raise TopologyError(
+                f"{container} did not keep {IPV6_HOST_ADDRESS}: it reports {addresses}"
+            )
 
     def _start_echo(self) -> None:
         """The controlled endpoint the data plane has to reach.
@@ -1036,6 +1091,11 @@ class MultiNodeTopology(AioTopology):
     worker_domain: str = WORKER_DOMAIN
     worker_reality_domain: str = WORKER_REALITY_DOMAIN
     worker_vision_domain: Optional[str] = None
+    # The Master runs with its IPv6 stack switched on and the Worker without one,
+    # so a single run covers both branches the product can take. The split is
+    # declared here rather than inherited from whatever the container runtime
+    # happens to enable.
+    ipv6_host: bool = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -1211,6 +1271,9 @@ class MultiNodeTopology(AioTopology):
         )
         self.started.append(self.worker_name)
         self.podman.wait_systemd(self.worker_name, timeout_seconds=180)
+        # The Worker is the run's IPv4-only host: the product has to take its
+        # disabled branch there no matter what the container runtime defaults to.
+        self.podman.exec_bash(self.worker_name, DISABLE_IPV6_SCRIPT, timeout=120)
         self.podman.exec_bash(self.worker_name, WORKER_SSH_SETUP_SCRIPT, timeout=120)
         # The Worker's public address, for the egress-attribution cases: the
         # endpoint must see Worker traffic leave from Worker, not from Master.

@@ -600,9 +600,11 @@ print(json.dumps(report))
 # Three views of one rule set: what UFW says it is, what the kernel is actually
 # enforcing (with the packet counters that prove our attempts traversed it), and
 # which address each declared port is bound to. The bind addresses separate
-# "nothing listens there" from "the packet was filtered".
+# "nothing listens there" from "the packet was filtered". The IPv6 half is
+# collected unconditionally: a host without IPv6 reports an empty address table
+# and an absent ``ufw6`` chain, which is itself the product's disabled branch.
 _HOST_FIREWALL = r'''
-import json, subprocess
+import glob, json, os, subprocess
 
 PORTS = __PORTS__
 
@@ -639,6 +641,55 @@ report["chain_error"] = (err or out).strip()[-400:]
 code, out, err = run("ss", "-ltn")
 report["listeners_returncode"] = code
 report["listeners"] = [line.rstrip() for line in out.splitlines() if line.strip()]
+
+# What the host itself declares about IPv6: the kernel's address table and its
+# disable switch are the two inputs the product's own check reads, and the
+# ``IPV6=`` line in /etc/default/ufw is the decision it wrote down.
+code, out, err = run("cat", "/proc/net/if_inet6")
+report["if_inet6_returncode"] = code
+report["if_inet6"] = [line.rstrip() for line in out.splitlines() if line.strip()]
+
+# ``procps`` is not among the packages the product installs and not part of the
+# clean image, so the switch is read from the kernel's own file rather than
+# through ``sysctl`` — the same file the product's check reads.
+code, out, err = run("cat", "/proc/sys/net/ipv6/conf/all/disable_ipv6")
+report["disable_ipv6_returncode"] = code
+report["disable_ipv6"] = (out or err).strip()[-80:]
+
+code, out, err = run("grep", "-E", "^IPV6=", "/etc/default/ufw")
+report["ufw_default_returncode"] = code
+report["ufw_default"] = [line.rstrip() for line in out.splitlines() if line.strip()]
+
+code, out, err = run("ip6tables", "-S")
+report["ipv6_rules_returncode"] = code
+report["ipv6_rules"] = [line.rstrip() for line in out.splitlines() if line.strip()]
+report["ipv6_rules_error"] = (err or out).strip()[-400:]
+
+code, out, err = run("ip6tables", "-L", "ufw6-user-input", "-v", "-n", "-x")
+report["ipv6_chain_returncode"] = code
+report["ipv6_chain"] = [line.rstrip() for line in out.splitlines() if line.strip()]
+report["ipv6_chain_error"] = (err or out).strip()[-400:]
+
+# The rendered ``listen [::]`` lines, because a wildcard v6 socket proves the
+# process asked for the v6 stack rather than inheriting an address by accident.
+report["ipv6_listens"] = {}
+for root in ("/etc/nginx/stream-enabled", "/etc/nginx/conf.d"):
+    for path in sorted(glob.glob(os.path.join(root, "*.conf"))):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                lines = handle.readlines()
+        except OSError:
+            continue
+        for line in lines:
+            stripped = line.strip()
+            if not stripped.startswith("listen ") or "[::]" not in stripped:
+                continue
+            fields = stripped.split()
+            if len(fields) < 2:
+                continue
+            report["ipv6_listens"].setdefault(fields[1].rstrip(";"), []).append(
+                os.path.basename(path)
+            )
 
 print(json.dumps(report))
 '''
@@ -737,19 +788,20 @@ def parse_default_incoming(ufw_lines: Sequence[str]) -> str:
     return ""
 
 
-def parse_host_firewall(report: Dict[str, Any], ports: Sequence[int]) -> Dict[str, Any]:
-    """One host's effective policy, split per port by what it does to a packet."""
+def _scan_rules(
+    rules: Sequence[str], ports: Sequence[int],
+) -> Dict[str, Dict[int, List[Dict[str, Any]]]]:
+    """Per-port ACCEPT and block rules, read from an ``ip*tables -S`` dump.
+
+    UFW writes its decisions into ``ufw-user-input`` (``ufw6-user-input`` for
+    IPv6), which INPUT only jumps to, so ``-S INPUT`` alone shows none of them;
+    the whole table has to be read and split by what each rule does to the port.
+    """
     declared = [int(port) for port in ports]
-    # UFW writes its allow and deny rules into ``ufw-user-input``, which INPUT
-    # only jumps to, so the decisions are read from ``iptables -S`` (every chain,
-    # in its ``-j`` form) and the counters from the same chain's verbose listing.
-    rules = [str(line) for line in report.get("rules") or []]
-    chain = [str(line) for line in report.get("chain") or []]
-    ufw = [str(line) for line in report.get("ufw") or []]
     allows: Dict[int, List[Dict[str, Any]]] = {port: [] for port in declared}
     blocks: Dict[int, List[Dict[str, Any]]] = {port: [] for port in declared}
     for line in rules:
-        fields = line.split()
+        fields = str(line).split()
         if "--dport" not in fields:
             continue
         index = fields.index("--dport")
@@ -760,11 +812,71 @@ def parse_host_firewall(report: Dict[str, Any], ports: Sequence[int]) -> Dict[st
             continue
         target = fields[fields.index("-j") + 1] if "-j" in fields else ""
         source = fields[fields.index("-s") + 1].split("/")[0] if "-s" in fields else ""
-        entry = {"target": target, "source": source, "line": line.strip()}
+        entry = {"target": target, "source": source, "line": str(line).strip()}
         if target in ("ACCEPT", "RETURN"):
             allows[port].append(entry)
         elif target in ("REJECT", "DROP"):
             blocks[port].append(entry)
+    return {"allows": allows, "blocks": blocks}
+
+
+def parse_ipv6_policy(report: Dict[str, Any], ports: Sequence[int]) -> Dict[str, Any]:
+    """One host's IPv6 half: what the kernel offers and what the product did.
+
+    The product reads the kernel, so the two facts that decide the branch are
+    read from the same place it reads them: the address table and the
+    ``disable_ipv6`` switch. The decision is then read back from the three
+    surfaces it writes — the ``IPV6=`` line in /etc/default/ufw, the mirrored
+    ``ip6tables`` rules, and the rendered ``listen [::]`` lines.
+    """
+    declared = [int(port) for port in ports]
+    rules = [str(line) for line in report.get("ipv6_rules") or []]
+    chain = [str(line) for line in report.get("ipv6_chain") or []]
+    scanned = _scan_rules(rules, declared)
+    addresses = [
+        str(line).split()[0].lower() for line in report.get("if_inet6") or [] if str(line).strip()
+    ]
+    setting = ""
+    for line in (str(entry) for entry in report.get("ufw_default") or []):
+        name, separator, value = line.partition("=")
+        if separator and name.strip() == "IPV6":
+            setting = value.strip().lower()
+    return {
+        "declared": setting,
+        "kernel_addresses": addresses,
+        "kernel_disabled": str(report.get("disable_ipv6") or "").strip() == "1",
+        "active": bool([line for line in chain if line.startswith("Chain ")]),
+        "allows": scanned["allows"],
+        "blocks": scanned["blocks"],
+        "counters": {port: parse_counters(chain, port) for port in declared},
+        "listens": {
+            str(address): [str(name) for name in files]
+            for address, files in (report.get("ipv6_listens") or {}).items()
+        },
+        "rules_returncode": report.get("ipv6_rules_returncode"),
+        "chain_returncode": report.get("ipv6_chain_returncode"),
+        "error": report.get("ipv6_chain_error") or report.get("ipv6_rules_error") or "",
+    }
+
+
+def ipv6_listens_for(facts: Dict[str, Any], port: int) -> List[str]:
+    """The rendered ``listen [::]`` addresses that publish this port, if any."""
+    return [
+        address for address in (facts.get("ipv6") or {}).get("listens", {})
+        if address.endswith(f":{port}")
+    ]
+
+
+def parse_host_firewall(report: Dict[str, Any], ports: Sequence[int]) -> Dict[str, Any]:
+    """One host's effective policy, split per port by what it does to a packet."""
+    declared = [int(port) for port in ports]
+    # The decisions are read from ``iptables -S`` (every chain, in its ``-j``
+    # form) and the counters from the same chain's verbose listing.
+    rules = [str(line) for line in report.get("rules") or []]
+    chain = [str(line) for line in report.get("chain") or []]
+    ufw = [str(line) for line in report.get("ufw") or []]
+    scanned = _scan_rules(rules, declared)
+    allows, blocks = scanned["allows"], scanned["blocks"]
     policy = parse_input_policy([str(line) for line in report.get("policy") or []])
     return {
         "active": any(line.strip() == "Status: active" for line in ufw),
@@ -779,6 +891,7 @@ def parse_host_firewall(report: Dict[str, Any], ports: Sequence[int]) -> Dict[st
         "listeners": parse_listeners(
             [str(line) for line in report.get("listeners") or []], declared,
         ),
+        "ipv6": parse_ipv6_policy(report, declared),
         "rules_returncode": report.get("rules_returncode"),
         "chain_returncode": report.get("chain_returncode"),
         "error": report.get("chain_error") or report.get("rules_error") or "",
