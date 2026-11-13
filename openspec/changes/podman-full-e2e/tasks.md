@@ -72,7 +72,7 @@
 - [x] 6.3 Exercise ACME issuance and renewal through Pebble using the real Certbot webroot HTTP-01 path and the target's actual NGINX challenge route; do not pre-seed certificates or mock successful challenges.
 - [x] 6.4 Exercise challenge and ACME outage failures and recovery.
 - [x] 6.4a Separately verify A/AAAA selection, TTL/cache expiry, NXDOMAIN, and stale/wrong DNS answers from target and independent-client vantage points.
-- [ ] 6.5 Verify decoy/fallback does not expose internal management interfaces.
+- [x] 6.5 Verify decoy/fallback does not expose internal management interfaces.
 - [ ] 6.6 Verify firewall allow/deny paths from each relevant network origin using real connection attempts.
 - [ ] 6.7 Cover IPv4/IPv6 behavior according to the declared product support/configuration.
 - [ ] 6.8 Assert cover-domain derivation from `panel_domain`: the last two labels form the apex, and a domain with fewer than three labels produces no cover lineage and must be handled explicitly instead of silently rendering nothing.
