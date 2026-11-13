@@ -1525,7 +1525,10 @@ def acme_probe(
             "present": lineage_present,
             "values": {
                 "authenticator": authenticator,
-                "webroot_path": webroot_path,
+                # Certbot serialises the webroot list with a trailing comma, so the
+                # probe reports the raw value and the parsed list it means.
+                "webroot_path": f"{webroot_path},",
+                "webroot_paths": [webroot_path],
                 "server": server,
             },
         },
@@ -1636,7 +1639,7 @@ class TestAcmeRenewalCase(unittest.TestCase):
                     before=acme_probe("before", authenticator="dns-01"))
 
     def test_a_renewal_that_writes_its_challenge_elsewhere_fails_the_case(self):
-        self.reject("instead of /var/www/gowave-acme",
+        self.reject("writes its challenge under ['/var/www/elsewhere']",
                     before=acme_probe("before", webroot_path="/var/www/elsewhere"))
 
     def test_a_lineage_against_another_acme_directory_fails_the_case(self):
@@ -1755,7 +1758,7 @@ class TestAcmeRenewalProbe(unittest.TestCase):
             "privkey = /etc/letsencrypt/live/" + domain + "/privkey.pem\n"
             f"server = {acme_fixture.ACME_DIRECTORY_URL}\n"
             "authenticator = webroot\n"
-            f"webroot_path = {aio.ACME_WEBROOT}\n"
+            f"webroot_path = {aio.ACME_WEBROOT},\n"
             "[[webroot_map]]\n",
             encoding="utf-8",
         )
@@ -1872,7 +1875,10 @@ class TestAcmeRenewalProbe(unittest.TestCase):
             facts = self.run_probe("before", layout, main_pid)
         self.assertEqual(facts["mode"], "before")
         self.assertEqual(facts["lineage"]["values"]["authenticator"], "webroot")
-        self.assertEqual(facts["lineage"]["values"]["webroot_path"], aio.ACME_WEBROOT)
+        # Certbot writes the webroot as a list, so the raw value keeps its trailing
+        # comma and the parsed list is what the case compares.
+        self.assertEqual(facts["lineage"]["values"]["webroot_path"], f"{aio.ACME_WEBROOT},")
+        self.assertEqual(facts["lineage"]["values"]["webroot_paths"], [aio.ACME_WEBROOT])
         self.assertEqual(facts["live"]["serial"], "0A1B")
         self.assertEqual(len(facts["archive"]), 1)
         self.assertEqual(facts["service"]["worker_pids"], ["4243", "4244"])
