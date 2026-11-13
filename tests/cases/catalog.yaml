@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 78
-  total: 203
+  podman_first: 81
+  total: 206
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3427,6 +3427,61 @@ cases:
     independent Control Machine while the Panel's loopback API still authenticates, and after the unit
     is started the same public call succeeds again inside one bounded deadline.
   assertion_sha256: b2341c365fe95a47b51d60e20d85e975ddb046b56aaf3f2ecdcab8182b9a1453
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: AIO-CHANNEL-NOOP
+  requirement: All-in-One Master VPS Installation Verification
+  live_scenario: null
+  assertion: The channel command invoked for the channel the host is already on reports that nothing changed,
+    exits successfully, and takes no snapshot, rewrites no environment file or journal, and leaves the
+    Panel process in place, so a repeated lifecycle call is a no-op rather than a restart.
+  assertion_sha256: 83bb3666fd33a392b051f481fc08c7d996e9c6fe533e383c9330bf75ad8b9d9c
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: AIO-CHANNEL-ROLLBACK
+  requirement: Signal-Safe and Verifiable Transaction Compensation
+  live_scenario: null
+  assertion: 'A channel switch whose restarted Panel cannot start is undone from the snapshot taken before
+    it: the binary, database, frontend, environment, state.json, NGINX tree and ACME lineage come back
+    identical to the pre-switch state after each was overwritten, the journal ends ROLLED_BACK rather
+    than staying at APPLYING, and the restored installation answers its authenticated API and carries
+    a payload through every served outbound of both pinned clients.'
+  assertion_sha256: 07bc8c791adabbee3270ee2a22277055e016be1fbebedd760a8b60a14766f2bb
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Signal-Safe and Verifiable Transaction Compensation
+- id: AIO-CHANNEL-DEV
+  requirement: All-in-One Master VPS Installation Verification
+  live_scenario: null
+  assertion: 'The documented stable-to-dev transition is a snapshot, an environment rewrite and a restart:
+    the journal ends COMMITTED with the target channel recorded, exactly one snapshot holds the pre-switch
+    tree, the Panel answers its health route and serves every representation, both pinned clients transfer
+    a payload through every served outbound, and the guarded dev-to-stable direction is still refused
+    without --force and changes nothing.'
+  assertion_sha256: a9a7a1149179ec497ead2c5413f6319ddec3be64b624b4cc254ab6c0c787d99f
   runs_in:
   - podman
   state: incubating

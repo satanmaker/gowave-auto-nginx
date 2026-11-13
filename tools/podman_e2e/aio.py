@@ -4342,6 +4342,911 @@ def case_decoy(product: AioProduct) -> Dict[str, Any]:
     return decoy_isolation_contract(product, DECOY_CASE_ID)
 
 
+CHANNEL_NOOP_CASE_ID = "AIO-CHANNEL-NOOP"
+CHANNEL_DEV_CASE_ID = "AIO-CHANNEL-DEV"
+CHANNEL_ROLLBACK_CASE_ID = "AIO-CHANNEL-ROLLBACK"
+
+# One switch captures a snapshot, rewrites the channel, restarts the panel and
+# polls its health for thirty seconds before it commits or restores the whole
+# tree, so the ceiling covers the failure path and not the happy one.
+CHANNEL_TIMEOUT_SECONDS = 1200
+CHANNEL_RECOVERY_ROOT = "/var/lib/gowave-auto-nginx/recovery"
+CHANNEL_ONCE_FAIL_UNIT = "/etc/systemd/system/gowave.service.d/99-e2e-once-fail.conf"
+CHANNEL_ONCE_FAIL_EXEC = "/usr/local/sbin/gowave-e2e-once-fail"
+CHANNEL_ONCE_FAIL_MARKER = "/root/gowave-e2e-once.marker"
+
+
+def channel_state_paths(base: str = "") -> Dict[str, str]:
+    """The files a channel switch snapshots, read from the live tree or a snapshot.
+
+    A snapshot is laid out as ``<root>/.env``, ``<root>/gowave.db``, ... while the
+    live product keeps them under ``/opt/gowave`` and the state directory, so the
+    same probe can compare both without knowing which one it was handed.
+    """
+    if base:
+        return {
+            "env": f"{base}/.env",
+            "db": f"{base}/gowave.db",
+            "binary": f"{base}/gowave-server",
+            "frontend": f"{base}/frontend",
+            "state": f"{base}/state.json",
+            "nginx": f"{base}/etc/nginx",
+            "letsencrypt": f"{base}/etc/letsencrypt",
+            "journal": "",
+            "recovery_root": "",
+        }
+    return {
+        "env": "/opt/gowave/.env",
+        "db": "/opt/gowave/gowave.db",
+        "binary": "/opt/gowave/gowave-server",
+        "frontend": "/opt/gowave/frontend",
+        "state": "/var/lib/gowave-auto-nginx/state.json",
+        "nginx": "/etc/nginx",
+        "letsencrypt": "/etc/letsencrypt",
+        "journal": f"{CHANNEL_RECOVERY_ROOT}/journal.json",
+        "recovery_root": CHANNEL_RECOVERY_ROOT,
+    }
+
+
+CHANNEL_STATE_PROBE = r"""
+import hashlib, json, os, sqlite3, subprocess, sys, urllib.request
+
+paths = json.loads(sys.argv[1])
+
+
+def digest_file(path):
+    if not path or not os.path.isfile(path):
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def digest_tree(root):
+    if not root or not os.path.isdir(root):
+        return None
+    digest = hashlib.sha256()
+    for base, directories, files in os.walk(root):
+        directories.sort()
+        for name in sorted(files):
+            path = os.path.join(base, name)
+            relative = os.path.relpath(path, root)
+            digest.update(b"f\0" + relative.encode() + b"\0")
+            if os.path.islink(path):
+                digest.update(b"L" + os.readlink(path).encode())
+            else:
+                digest.update((digest_file(path) or "").encode())
+        for name in directories:
+            relative = os.path.relpath(os.path.join(base, name), root)
+            digest.update(b"d\0" + relative.encode() + b"\0")
+    return digest.hexdigest()
+
+
+def database(path):
+    if not path or not os.path.isfile(path):
+        return {}
+    record = {"bytes": digest_file(path)}
+    try:
+        connection = sqlite3.connect("file:" + path + "?mode=ro", uri=True)
+        try:
+            record["integrity"] = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            dump = "\n".join(connection.iterdump())
+        finally:
+            connection.close()
+    except sqlite3.Error as error:
+        record["integrity"] = "error: " + str(error)
+        return record
+    record["logical"] = hashlib.sha256(dump.encode()).hexdigest()
+    return record
+
+
+def environment(path):
+    values = {}
+    if not path or not os.path.isfile(path):
+        return values
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if "=" in line and not line.lstrip().startswith("#"):
+                key, value = line.rstrip("\n").split("=", 1)
+                values[key] = value
+    return {
+        key: values.get(key)
+        for key in ("GOWAVE_CHANNEL", "APP_HOST", "APP_PORT", "E2E_CHANNEL_SABOTAGE")
+    }
+
+
+def first_chain(root):
+    live = os.path.join(root or "", "live")
+    if not root or not os.path.isdir(live):
+        return ""
+    for name in sorted(os.listdir(live)):
+        candidate = os.path.join(live, name, "fullchain.pem")
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+
+journal = {}
+if paths.get("journal") and os.path.isfile(paths["journal"]):
+    try:
+        with open(paths["journal"], encoding="utf-8") as handle:
+            journal = json.load(handle)
+    except ValueError:
+        journal = {"invalid": True}
+
+snapshots = []
+root = paths.get("recovery_root") or ""
+if root and os.path.isdir(root):
+    snapshots = sorted(name for name in os.listdir(root) if name.startswith("update-"))
+
+unit = {}
+show = subprocess.run(
+    ["systemctl", "show", "gowave.service", "-p", "ActiveState", "-p", "SubState",
+     "-p", "MainPID", "-p", "ActiveEnterTimestamp"],
+    capture_output=True, text=True,
+)
+for line in show.stdout.splitlines():
+    key, _, value = line.partition("=")
+    unit[key] = value
+
+health = None
+try:
+    with urllib.request.urlopen(
+        "http://127.0.0.1:3000/api/system/health", timeout=5
+    ) as response:
+        health = response.status
+except Exception as error:  # noqa: BLE001 - the probe reports, the case decides
+    health = type(error).__name__ + ": " + str(error)
+
+print(json.dumps({
+    "environment": environment(paths.get("env")),
+    "env_digest": digest_file(paths.get("env")),
+    "binary": digest_file(paths.get("binary")),
+    "database": database(paths.get("db")),
+    "frontend": digest_tree(paths.get("frontend")),
+    "frontend_index": digest_file(os.path.join(paths.get("frontend") or "", "index.html")),
+    "state": digest_file(paths.get("state")),
+    "nginx": digest_tree(paths.get("nginx")),
+    "nginx_conf": digest_file(os.path.join(paths.get("nginx") or "", "nginx.conf")),
+    "letsencrypt": digest_tree(paths.get("letsencrypt")),
+    "lineage_chain": digest_file(first_chain(paths.get("letsencrypt"))),
+    "journal": journal,
+    "snapshots": snapshots,
+    "unit": unit,
+    "health": health,
+}, sort_keys=True))
+"""
+
+
+def channel_state(product: AioProduct, case_id: str, base: str = "") -> Dict[str, Any]:
+    """Read the files a switch snapshots and restores, plus the unit and API that use them."""
+    payload = shlex.quote(json.dumps(channel_state_paths(base), sort_keys=True))
+    script = f"python3 - {payload} <<'PY'\n{CHANNEL_STATE_PROBE}\nPY"
+    return probe_json(case_id, "the channel state probe", product.host_script(script))
+
+
+def channel_command(action: str) -> str:
+    return f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh channel {action}"
+
+
+def channel_health(product: AioProduct) -> str:
+    """The Panel's own health route, as the switch's post-restart probe reads it."""
+    result = product.host_script(
+        "curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "
+        "http://127.0.0.1:3000/api/system/health || true"
+    )
+    return (result.stdout or "").strip()
+
+
+def wait_for_channel_health(product: AioProduct, case_id: str, timeout: int = 180) -> str:
+    observed = {"health": ""}
+
+    def answers() -> bool:
+        observed["health"] = channel_health(product)
+        return observed["health"] == "200"
+
+    wait_until(answers, timeout, f"{case_id} Panel health", interval_seconds=2)
+    return observed["health"]
+
+
+def channel_client_surface(product: AioProduct, case_id: str, step: str) -> Dict[str, Any]:
+    """Read what the Panel serves its client, before a switch and after it.
+
+    What a switch or a rollback did to the database is read through this surface
+    rather than from the file: the Panel keeps writing to SQLite while it runs, so
+    a byte or dump comparison would be measuring its write log. The client list and
+    the bytes each representation serves are what a client can actually observe.
+    """
+    return panel_probe(
+        product, case_id, "channel", f"--step {step} --payload-dir {topology.PAYLOAD_MOUNT}",
+    ).get("channel") or {}
+
+
+def require_channel_snapshot(
+    case_id: str, before: Dict[str, Any], snapshot: Dict[str, Any], snapshot_path: str,
+) -> None:
+    """The snapshot must hold the pre-switch state, not what the switch wrote over it.
+
+    The database is compared by its integrity and by having a logical dump at
+    all, never by its bytes against the live file: the product takes the snapshot
+    through the SQLite online backup API, which writes the same content in a
+    different page layout. That the content really is the pre-switch content is
+    established by the caller, which reads the client surface the Panel serves
+    before the switch and again after the rollback restored this very file.
+    """
+    require(
+        case_id, snapshot.get("environment", {}).get("GOWAVE_CHANNEL") == "stable",
+        f"the snapshot in {snapshot_path} records channel "
+        f"{snapshot.get('environment', {}).get('GOWAVE_CHANNEL')!r} instead of the stable channel "
+        "the host was on before the switch",
+    )
+    require(
+        case_id, snapshot.get("database", {}).get("integrity") == "ok",
+        f"the snapshot database in {snapshot_path} does not pass integrity_check: "
+        f"{snapshot.get('database', {}).get('integrity')!r}",
+    )
+    require(
+        case_id, bool(snapshot.get("database", {}).get("logical")),
+        f"the snapshot database in {snapshot_path} has no readable schema, so it is not a "
+        "database the Panel can be started on",
+    )
+    for field, label in (
+        ("env_digest", "the environment file"),
+        ("binary", "the Panel binary"),
+        ("frontend", "the frontend tree"),
+        ("frontend_index", "the frontend document"),
+        ("state", "state.json"),
+        ("nginx", "the NGINX tree"),
+        ("nginx_conf", "the NGINX configuration"),
+        ("letsencrypt", "the ACME tree"),
+        ("lineage_chain", "the REALITY certificate chain"),
+    ):
+        require(
+            case_id, snapshot.get(field) == before.get(field) and before.get(field),
+            f"the snapshot in {snapshot_path} does not preserve {label}: "
+            f"{snapshot.get(field)!r} vs {before.get(field)!r}",
+        )
+
+
+def require_channel_traffic(
+    product: AioProduct, case_id: str, host: topology.AioTopology,
+) -> Dict[str, Any]:
+    """Both engines must still carry a payload through every served outbound afterwards.
+
+    The restart the switch performs makes the node apply its users again, so the
+    readiness wait runs first: a transport that is still warming up must not be
+    read as a switch that broke the data plane.
+    """
+    tunnel = product.wait_tunnel_ready(case_id)
+    facts = product.traffic_facts(case_id, "traffic")
+    facts["tunnel_network"] = tunnel.get("network")
+    expected = product.inbound_count * len(TRAFFIC_ENGINES)
+    require(
+        case_id, int(facts.get("transfer_count") or 0) == expected,
+        f"{facts.get('transfer_count')!r} transports carried a payload after the switch, "
+        f"expected {expected}",
+    )
+    require(
+        case_id, int(facts.get("missing_request_ids") or 0) == 0,
+        f"the endpoint never saw {facts.get('missing_request_ids')!r} requests after the switch",
+    )
+    unverified = [
+        item["tag"] for item in facts.get("transfers") or []
+        if not (item.get("request_id_match") and item.get("body_match"))
+    ]
+    require(
+        case_id, not unverified,
+        f"the endpoint did not echo the payload after the switch for: {', '.join(unverified)}",
+    )
+    require(
+        case_id, facts.get("source_ips") == [host.plan.data_target_ip],
+        f"the recovered payload left from {facts.get('source_ips')!r} instead of the installed "
+        f"host {host.plan.data_target_ip}",
+    )
+    return facts
+
+
+def case_channel_noop(product: AioProduct) -> Dict[str, Any]:
+    """AIO-CHANNEL-NOOP: asking for the channel already configured is not a switch.
+
+    The command returns before it snapshots or restarts anything, so the proof is
+    an unchanged host: no new snapshot directory, the same journal, the same
+    environment, and the same running Panel process. A no-op that restarted the
+    service would still be a mutation the operator did not ask for.
+    """
+    product.require_installed()
+    before = channel_state(product, CHANNEL_NOOP_CASE_ID)
+    require(
+        CHANNEL_NOOP_CASE_ID,
+        before.get("environment", {}).get("GOWAVE_CHANNEL") == "stable",
+        f"the host is on channel {before.get('environment', {}).get('GOWAVE_CHANNEL')!r}, so "
+        "the same-channel no-op has nothing to compare",
+    )
+    require(
+        CHANNEL_NOOP_CASE_ID, before.get("unit", {}).get("ActiveState") == "active",
+        f"gowave.service is {before.get('unit', {}).get('ActiveState')!r} before the no-op",
+    )
+
+    repeat = product.host_script(channel_command("stable"), timeout=300)
+    require(
+        CHANNEL_NOOP_CASE_ID, repeat.returncode == 0,
+        f"`gowave-auto.sh channel stable` on the stable channel exited "
+        f"{repeat.returncode}: {(repeat.stderr or repeat.stdout or '').strip()[-600:]}",
+    )
+    require(
+        CHANNEL_NOOP_CASE_ID, "already on channel 'stable'" in (repeat.stdout or ""),
+        "the same-channel invocation did not report that the host was already on the channel: "
+        f"{(repeat.stdout or repeat.stderr or '').strip()[-600:]}",
+    )
+
+    after = channel_state(product, CHANNEL_NOOP_CASE_ID)
+    require(
+        CHANNEL_NOOP_CASE_ID, after.get("snapshots") == before.get("snapshots"),
+        f"the same-channel invocation took a snapshot: {after.get('snapshots')!r} vs "
+        f"{before.get('snapshots')!r}",
+    )
+    require(
+        CHANNEL_NOOP_CASE_ID, after.get("journal") == before.get("journal"),
+        "the same-channel invocation rewrote the recovery journal",
+    )
+    require(
+        CHANNEL_NOOP_CASE_ID, after.get("env_digest") == before.get("env_digest"),
+        "the same-channel invocation rewrote /opt/gowave/.env",
+    )
+    for field in ("MainPID", "ActiveEnterTimestamp"):
+        require(
+            CHANNEL_NOOP_CASE_ID,
+            after.get("unit", {}).get(field) == before.get("unit", {}).get(field),
+            f"the same-channel invocation changed gowave.service {field}: "
+            f"{after.get('unit', {}).get(field)!r} vs {before.get('unit', {}).get(field)!r}",
+        )
+    return {
+        "channel": before.get("environment", {}).get("GOWAVE_CHANNEL"),
+        "snapshots_before": len(before.get("snapshots") or []),
+        "snapshots_after": len(after.get("snapshots") or []),
+        "journal_state": (before.get("journal") or {}).get("state"),
+        "main_pid": before.get("unit", {}).get("MainPID"),
+        "message": (repeat.stdout or "").strip()[-200:],
+    }
+
+
+CHANNEL_ROLLBACK_BODY = r"""
+recovery=/var/lib/gowave-auto-nginx/recovery
+rm -f /root/gowave-e2e-once.marker /tmp/gowave-e2e-sabotage.json
+install -d -m 0755 /usr/local/sbin
+cat > /usr/local/sbin/gowave-e2e-once-fail <<'ONCE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+marker=/root/gowave-e2e-once.marker
+if [[ -e "$marker" ]]; then
+    exit 0
+fi
+touch "$marker"
+python3 - <<'PY'
+import hashlib, json, os
+
+root = "/var/lib/gowave-auto-nginx/recovery"
+snapshots = sorted(
+    os.path.join(root, name) for name in os.listdir(root) if name.startswith("update-")
+)
+if not snapshots:
+    raise SystemExit("the channel switch restarted without taking a snapshot")
+snapshot = snapshots[-1]
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def replace(path, data, mode=0o644):
+    with open(path, "wb") as handle:
+        handle.write(data)
+    os.chmod(path, mode)
+
+
+lineage = ""
+if os.path.isdir("/etc/letsencrypt/live"):
+    names = sorted(os.listdir("/etc/letsencrypt/live"))
+    if names:
+        lineage = os.path.join("/etc/letsencrypt/live", names[0], "fullchain.pem")
+
+replace("/opt/gowave/gowave-server", b"#!/bin/sh\nexit 1\n", 0o755)
+replace("/opt/gowave/gowave.db", b"this is not a sqlite database\n")
+if os.path.isfile("/opt/gowave/frontend/index.html"):
+    replace("/opt/gowave/frontend/index.html", b"<html>e2e sabotage</html>\n")
+with open("/opt/gowave/.env", "ab") as handle:
+    handle.write(b"E2E_CHANNEL_SABOTAGE=1\n")
+replace("/var/lib/gowave-auto-nginx/state.json", b"{}\n")
+replace("/etc/nginx/nginx.conf", b"# e2e sabotage\n")
+if lineage and os.path.exists(lineage):
+    with open(lineage, "ab") as handle:
+        handle.write(b"\n# e2e sabotage\n")
+
+targets = {
+    "binary": "/opt/gowave/gowave-server",
+    "database": "/opt/gowave/gowave.db",
+    "frontend_index": "/opt/gowave/frontend/index.html",
+    "environment": "/opt/gowave/.env",
+    "state": "/var/lib/gowave-auto-nginx/state.json",
+    "nginx_conf": "/etc/nginx/nginx.conf",
+    "lineage_chain": lineage,
+}
+record = {
+    "snapshot": snapshot,
+    "targets": {
+        name: digest(path) for name, path in targets.items() if path and os.path.isfile(path)
+    },
+}
+with open("/tmp/gowave-e2e-sabotage.json", "w", encoding="utf-8") as handle:
+    json.dump(record, handle, sort_keys=True)
+PY
+exit 1
+ONCE
+chmod 0755 /usr/local/sbin/gowave-e2e-once-fail
+install -d -m 0755 /etc/systemd/system/gowave.service.d
+cat > /etc/systemd/system/gowave.service.d/99-e2e-once-fail.conf <<'UNIT'
+[Service]
+# `+` runs the hook with full privileges: gowave.service is User=gowave, and the
+# files the rollback has to restore are root-owned.
+ExecStartPre=+/usr/local/sbin/gowave-e2e-once-fail
+UNIT
+systemctl daemon-reload
+
+rc=0
+bash "$repo/gowave-auto.sh" channel dev >/tmp/gowave-e2e-channel.out 2>/tmp/gowave-e2e-channel.err || rc=$?
+
+rm -f /etc/systemd/system/gowave.service.d/99-e2e-once-fail.conf
+systemctl daemon-reload
+
+RC="$rc" python3 - <<'PY'
+import json, os, subprocess, urllib.request
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()[-4000:]
+    except OSError:
+        return ""
+
+
+def journal():
+    try:
+        with open("/var/lib/gowave-auto-nginx/recovery/journal.json", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+unit = {}
+show = subprocess.run(
+    ["systemctl", "show", "gowave.service", "-p", "ActiveState", "-p", "SubState",
+     "-p", "MainPID"],
+    capture_output=True, text=True,
+)
+for line in show.stdout.splitlines():
+    key, _, value = line.partition("=")
+    unit[key] = value
+
+health = None
+try:
+    with urllib.request.urlopen(
+        "http://127.0.0.1:3000/api/system/health", timeout=5
+    ) as response:
+        health = response.status
+except Exception as error:  # noqa: BLE001 - reported, the case decides
+    health = type(error).__name__ + ": " + str(error)
+
+sabotage = {}
+try:
+    with open("/tmp/gowave-e2e-sabotage.json", encoding="utf-8") as handle:
+        sabotage = json.load(handle)
+except (OSError, ValueError):
+    sabotage = {}
+
+print(json.dumps({
+    "returncode": int(os.environ["RC"]),
+    "stdout": read("/tmp/gowave-e2e-channel.out"),
+    "stderr": read("/tmp/gowave-e2e-channel.err"),
+    "sabotage": sabotage,
+    "journal": journal(),
+    "unit": unit,
+    "health": health,
+}, sort_keys=True))
+PY
+"""
+
+
+def channel_rollback_script() -> str:
+    """Run the real switch with a one-shot start failure that fires after the snapshot.
+
+    The injected fault is the documented trigger — a release that cannot start —
+    and it is also the only fault that can carry sabotage: an ``ExecStartPre``
+    hook runs after the snapshot and after the environment rewrite, so everything
+    it damages is restored from the snapshot rather than from the state it left.
+    The hook fails once and succeeds afterwards, which lets the rollback's own
+    restart bring the Panel back; the sabotage record tells the case which bytes
+    the rollback had to undo.
+    """
+    return (
+        "set -Eeuo pipefail\n"
+        "umask 077\n"
+        f"repo={shlex.quote(topology.REPO_IN_CONTAINER)}\n"
+        f"{CHANNEL_ROLLBACK_BODY.strip()}\n"
+    )
+
+
+def channel_rollback_cleanup_script() -> str:
+    """Remove the injected fault and let the product recover if its switch did not.
+
+    Cleanup runs even when the case has already failed, so an unfixed abort cannot
+    leave every later case measuring a broken panel. The product's own boot
+    recovery command is the healer, not a harness restore.
+    """
+    return f"""set -Eeuo pipefail
+rm -f {shlex.quote(CHANNEL_ONCE_FAIL_UNIT)} {shlex.quote(CHANNEL_ONCE_FAIL_EXEC)} \
+{shlex.quote(CHANNEL_ONCE_FAIL_MARKER)}
+systemctl daemon-reload
+state=$(python3 - <<'PY' || true
+import json
+try:
+    with open("/var/lib/gowave-auto-nginx/recovery/journal.json", encoding="utf-8") as handle:
+        print(json.load(handle).get("state", ""))
+except (OSError, ValueError):
+    print("")
+PY
+)
+if [[ -n "$state" && "$state" != "ROLLED_BACK" && "$state" != "COMMITTED" ]]; then
+    bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh recover --boot-files || true
+fi
+systemctl start gowave.service || true
+systemctl is-active gowave.service || true
+"""
+
+
+def case_channel_dev(product: AioProduct) -> Dict[str, Any]:
+    """AIO-CHANNEL-DEV: the supported stable-to-dev transition is a snapshot and a restart.
+
+    The shipped command does not download a release; it records the channel,
+    restarts the Panel under it and commits only after the service answers. The
+    case therefore asserts exactly that contract: the snapshot holds the
+    pre-switch tree, the journal ends COMMITTED, the unit is active, both engines
+    still carry a payload, and the guarded dev-to-stable direction stays refused
+    without ``--force`` because no safe downgrade contract exists.
+    """
+    host = product.require_installed()
+    before = channel_state(product, CHANNEL_DEV_CASE_ID)
+    require(
+        CHANNEL_DEV_CASE_ID,
+        before.get("environment", {}).get("GOWAVE_CHANNEL") == "stable",
+        f"the host is on channel {before.get('environment', {}).get('GOWAVE_CHANNEL')!r}, so "
+        "a stable-to-dev transition has nothing to switch",
+    )
+    product.subscription_payloads(CHANNEL_DEV_CASE_ID)
+    captured = channel_client_surface(product, CHANNEL_DEV_CASE_ID, "capture")
+    require(
+        CHANNEL_DEV_CASE_ID,
+        captured.get("readback_status") == 200 and captured.get("short_uuid_length"),
+        "the Panel served no default client before the switch, so there is nothing for it to keep: "
+        f"{captured!r}",
+    )
+
+    switch = product.host_script(channel_command("dev"), timeout=CHANNEL_TIMEOUT_SECONDS)
+    require(
+        CHANNEL_DEV_CASE_ID, switch.returncode == 0,
+        f"`gowave-auto.sh channel dev` exited {switch.returncode}:\n"
+        f"{(switch.stderr or switch.stdout or '').strip()[-2000:]}",
+    )
+    require(
+        CHANNEL_DEV_CASE_ID, "Switched to channel 'dev' successfully." in (switch.stdout or ""),
+        "the switch did not report the committed transition: "
+        f"{(switch.stdout or switch.stderr or '').strip()[-600:]}",
+    )
+
+    after = channel_state(product, CHANNEL_DEV_CASE_ID)
+    require(
+        CHANNEL_DEV_CASE_ID,
+        after.get("environment", {}).get("GOWAVE_CHANNEL") == "dev",
+        f"/opt/gowave/.env records channel "
+        f"{after.get('environment', {}).get('GOWAVE_CHANNEL')!r} after switching to dev",
+    )
+    created = sorted(set(after.get("snapshots") or []) - set(before.get("snapshots") or []))
+    require(
+        CHANNEL_DEV_CASE_ID, len(created) == 1,
+        f"the switch left {len(created)} new snapshots ({created!r}) instead of one",
+    )
+    snapshot_path = f"{CHANNEL_RECOVERY_ROOT}/{created[0]}"
+    journal = after.get("journal") or {}
+    require(
+        CHANNEL_DEV_CASE_ID,
+        journal.get("state") == "COMMITTED"
+        and journal.get("snapshot_dir") == snapshot_path
+        and journal.get("target_version") == "dev",
+        f"the journal after the switch is {journal!r} instead of a COMMITTED dev transition "
+        f"naming {snapshot_path}",
+    )
+    snapshot = channel_state(product, CHANNEL_DEV_CASE_ID, base=snapshot_path)
+    require_channel_snapshot(CHANNEL_DEV_CASE_ID, before, snapshot, snapshot_path)
+
+    # A channel label is not a data migration: the Panel must come back serving
+    # the same client, with the same inventory and every representation it served
+    # before. The database is read through that surface rather than by its bytes.
+    require(
+        CHANNEL_DEV_CASE_ID, after.get("database", {}).get("integrity") == "ok",
+        f"the database the switch left behind does not pass integrity_check: "
+        f"{after.get('database', {}).get('integrity')!r}",
+    )
+    surface = channel_client_surface(product, CHANNEL_DEV_CASE_ID, "verify")
+    require(
+        CHANNEL_DEV_CASE_ID, surface.get("inventory_identical") is True,
+        f"the switch changed the client inventory: {surface.get('users')!r} clients after "
+        f"{surface.get('users_captured')!r} before",
+    )
+    require(
+        CHANNEL_DEV_CASE_ID, surface.get("user_present") is True,
+        "the client the Panel served before the switch is gone from its inventory afterwards",
+    )
+    unserved = sorted(
+        name for name, entry in (surface.get("representations") or {}).items()
+        if entry.get("status") != 200
+    )
+    require(
+        CHANNEL_DEV_CASE_ID, not unserved,
+        f"the Panel stopped serving {', '.join(unserved)} after the switch: "
+        f"{surface.get('representations')!r}",
+    )
+    require(
+        CHANNEL_DEV_CASE_ID, after.get("unit", {}).get("ActiveState") == "active",
+        f"gowave.service is {after.get('unit', {}).get('ActiveState')!r} after the switch",
+    )
+    health = wait_for_channel_health(product, CHANNEL_DEV_CASE_ID)
+    require(
+        CHANNEL_DEV_CASE_ID, health == "200",
+        f"the Panel health route answered {health!r} after the switch",
+    )
+    traffic = require_channel_traffic(product, CHANNEL_DEV_CASE_ID, host)
+
+    # The reverse direction is documented as unsafe without --force; the case
+    # records the refusal as the reason dev-to-stable is not an automatic
+    # rollback scenario, and checks that the refusal changed nothing.
+    refusal = product.host_script(channel_command("stable"), timeout=300)
+    require(
+        CHANNEL_DEV_CASE_ID, refusal.returncode != 0,
+        "`gowave-auto.sh channel stable` without --force switched off the dev channel, so the "
+        "documented downgrade guardrail is not enforced",
+    )
+    guard = (refusal.stderr or "") + (refusal.stdout or "")
+    require(
+        CHANNEL_DEV_CASE_ID, "irreversible database migrations" in guard and "--force" in guard,
+        "the dev-to-stable refusal did not name the irreversible migrations and the --force "
+        f"confirmation: {guard.strip()[-600:]}",
+    )
+    guarded = channel_state(product, CHANNEL_DEV_CASE_ID)
+    require(
+        CHANNEL_DEV_CASE_ID,
+        guarded.get("environment", {}).get("GOWAVE_CHANNEL") == "dev"
+        and guarded.get("env_digest") == after.get("env_digest")
+        and guarded.get("snapshots") == after.get("snapshots"),
+        "the refused downgrade still changed the channel, the environment or the snapshots",
+    )
+    return {
+        "channel_before": "stable",
+        "channel_after": after.get("environment", {}).get("GOWAVE_CHANNEL"),
+        "snapshot": created[0],
+        "journal_state": journal.get("state"),
+        "snapshot_target_version": journal.get("target_version"),
+        "unit_state": after.get("unit", {}).get("ActiveState"),
+        "health": health,
+        "clients_served": surface.get("users"),
+        "transfer_count": traffic.get("transfer_count"),
+        "source_ips": ",".join(traffic.get("source_ips") or []),
+        "downgrade_refused": refusal.returncode,
+        "downgrade_message": guard.strip()[-300:],
+    }
+
+
+def case_channel_rollback(product: AioProduct) -> Dict[str, Any]:
+    """AIO-CHANNEL-ROLLBACK: a release that cannot start is undone from the snapshot.
+
+    Every area ``prepare_update_snapshot`` captures is overwritten by the injected
+    start hook and has to come back byte for byte, with the database compared by
+    its logical dump: the Panel binary, the database, the frontend, the
+    environment, state.json, the NGINX tree and the ACME lineage. The sabotage
+    digests prove the rollback had something to restore rather than finding the
+    tree already intact; the API and both client engines prove the restored tree
+    is a working Panel and not only a matching hash.
+    """
+    host = product.require_installed()
+    product.subscription_payloads(CHANNEL_ROLLBACK_CASE_ID)
+    before = channel_state(product, CHANNEL_ROLLBACK_CASE_ID)
+    require(
+        CHANNEL_ROLLBACK_CASE_ID,
+        before.get("environment", {}).get("GOWAVE_CHANNEL") == "stable",
+        f"the host is on channel {before.get('environment', {}).get('GOWAVE_CHANNEL')!r}, so a "
+        "failed stable-to-dev switch would not be a stable-to-dev switch",
+    )
+    # The client surface is what proves the database really came back: the file is
+    # compared by its integrity, and the content is compared by what the Panel
+    # serves from it, because a running Panel writes to its database between reads.
+    captured = channel_client_surface(product, CHANNEL_ROLLBACK_CASE_ID, "capture")
+    require(
+        CHANNEL_ROLLBACK_CASE_ID,
+        captured.get("readback_status") == 200 and captured.get("short_uuid_length"),
+        "the Panel served no default client before the switch, so a restored database would "
+        f"have nothing to prove: {captured!r}",
+    )
+    try:
+        switch = probe_json(
+            CHANNEL_ROLLBACK_CASE_ID, "the injected channel switch",
+            product.host_script(channel_rollback_script(), timeout=CHANNEL_TIMEOUT_SECONDS),
+        )
+        sabotage = switch.get("sabotage") or {}
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, sabotage.get("targets"),
+            "the injected start hook never ran after the switch took its snapshot, so the "
+            f"rollback had nothing to restore: {switch.get('stdout', '')[-400:]!r}",
+        )
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, switch.get("returncode") not in (None, 0),
+            "the channel switch reported success although the restarted Panel never started",
+        )
+        journal = switch.get("journal") or {}
+        snapshot_name = (sabotage.get("snapshot") or "").rsplit("/", 1)[-1]
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, journal.get("state") == "ROLLED_BACK",
+            f"the failed switch left the journal at {journal.get('state')!r} instead of "
+            f"ROLLED_BACK: {(switch.get('stderr') or '').strip()[-800:]}",
+        )
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, snapshot_name and journal.get("snapshot_dir", "").endswith(
+                snapshot_name
+            ),
+            f"the rolled-back journal names {journal.get('snapshot_dir')!r}, not the snapshot "
+            f"the sabotage was taken against ({snapshot_name!r})",
+        )
+        evidence = (switch.get("stderr") or "") + (switch.get("stdout") or "")
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, "File rollback completed and services verified." in evidence,
+            "the switch did not report a completed file rollback: "
+            f"{evidence.strip()[-800:]}",
+        )
+
+        after = channel_state(product, CHANNEL_ROLLBACK_CASE_ID)
+        require(
+            CHANNEL_ROLLBACK_CASE_ID,
+            after.get("environment", {}).get("GOWAVE_CHANNEL") == "stable",
+            "the rollback did not restore the pre-switch channel in /opt/gowave/.env",
+        )
+        require(
+            CHANNEL_ROLLBACK_CASE_ID,
+            after.get("environment", {}).get("E2E_CHANNEL_SABOTAGE") is None,
+            "the marker the sabotage appended to /opt/gowave/.env survived the rollback",
+        )
+        require(
+            CHANNEL_ROLLBACK_CASE_ID,
+            after.get("database", {}).get("integrity") == "ok",
+            f"the restored database does not pass integrity_check: "
+            f"{after.get('database', {}).get('integrity')!r}",
+        )
+        # What the sabotage changed, read from the same probe the case uses: the
+        # digests are taken by the injected hook itself, so a target it could not
+        # reach would otherwise let an untouched file look restored.
+        before_digest = {
+            "binary": before.get("binary"),
+            "database": before.get("database", {}).get("bytes"),
+            "frontend_index": before.get("frontend_index"),
+            "environment": before.get("env_digest"),
+            "state": before.get("state"),
+            "nginx_conf": before.get("nginx_conf"),
+            "lineage_chain": before.get("lineage_chain"),
+        }
+        for injected, label, mandatory in (
+            ("binary", "the Panel binary", True),
+            ("database", "the database file", True),
+            ("environment", "the environment file", True),
+            ("state", "state.json", True),
+            # The remaining areas exist on an installed host but are read from the
+            # tree, so the hook reports them only where the file is really there.
+            ("frontend_index", "the frontend document", False),
+            ("nginx_conf", "the NGINX configuration", False),
+            ("lineage_chain", "the REALITY certificate chain", False),
+        ):
+            if before_digest[injected] is None and not mandatory:
+                continue
+            require(
+                CHANNEL_ROLLBACK_CASE_ID,
+                sabotage["targets"].get(injected)
+                and sabotage["targets"].get(injected) != before_digest[injected],
+                f"the sabotage did not change {label}, so its restoration is unproven: "
+                f"{sabotage['targets'].get(injected)!r} vs {before_digest[injected]!r}",
+            )
+        restored = {
+            "env_digest": "the environment file",
+            "binary": "the Panel binary",
+            "frontend": "the frontend tree",
+            "frontend_index": "the frontend document",
+            "state": "state.json",
+            "nginx": "the NGINX tree",
+            "nginx_conf": "the NGINX configuration",
+            "letsencrypt": "the ACME tree",
+            "lineage_chain": "the REALITY certificate chain",
+        }
+        for field, label in restored.items():
+            require(
+                CHANNEL_ROLLBACK_CASE_ID, after.get(field) == before.get(field),
+                f"the rollback did not restore {label}: {after.get(field)!r} vs "
+                f"{before.get(field)!r}",
+            )
+        snapshot = channel_state(
+            product, CHANNEL_ROLLBACK_CASE_ID, base=f"{CHANNEL_RECOVERY_ROOT}/{snapshot_name}",
+        )
+        require_channel_snapshot(
+            CHANNEL_ROLLBACK_CASE_ID, before, snapshot,
+            f"{CHANNEL_RECOVERY_ROOT}/{snapshot_name}",
+        )
+
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, after.get("unit", {}).get("ActiveState") == "active",
+            f"gowave.service is {after.get('unit', {}).get('ActiveState')!r} after the rollback",
+        )
+        surface = channel_client_surface(product, CHANNEL_ROLLBACK_CASE_ID, "verify")
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, surface.get("inventory_identical") is True,
+            f"the restored database serves {surface.get('users')!r} clients instead of the "
+            f"{surface.get('users_captured')!r} it held before the switch",
+        )
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, surface.get("user_present") is True,
+            "the client the snapshot held is missing from the restored inventory",
+        )
+        changed_representations = sorted(
+            name for name, identical in (surface.get("representations_identical") or {}).items()
+            if not identical
+        )
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, not changed_representations,
+            f"the restored database serves different bytes for "
+            f"{', '.join(changed_representations)}: {surface.get('representations')!r}",
+        )
+        health = wait_for_channel_health(product, CHANNEL_ROLLBACK_CASE_ID)
+        require(
+            CHANNEL_ROLLBACK_CASE_ID, health == "200",
+            f"the Panel health route answered {health!r} after the rollback",
+        )
+        traffic = require_channel_traffic(product, CHANNEL_ROLLBACK_CASE_ID, host)
+        return {
+            "switch_returncode": switch.get("returncode"),
+            "journal_state": journal.get("state"),
+            "snapshot": snapshot_name,
+            "sabotaged_targets": ",".join(sorted(sabotage["targets"])),
+            "channel_after": after.get("environment", {}).get("GOWAVE_CHANNEL"),
+            "unit_state": after.get("unit", {}).get("ActiveState"),
+            "health": health,
+            "clients_served": surface.get("users"),
+            "representations_identical": sum(
+                1 for identical in (surface.get("representations_identical") or {}).values()
+                if identical
+            ),
+            "transfer_count": traffic.get("transfer_count"),
+            "source_ips": ",".join(traffic.get("source_ips") or []),
+        }
+    finally:
+        healing = product.host_script(channel_rollback_cleanup_script(), timeout=CHANNEL_TIMEOUT_SECONDS)
+        healed = channel_state(product, CHANNEL_ROLLBACK_CASE_ID)
+        if healing.returncode != 0 or healed.get("unit", {}).get("ActiveState") != "active":
+            product.context.evidence_text(
+                "channel-rollback-cleanup.log",
+                f"exit {healing.returncode}\n{(healing.stdout or '')[-2000:]}\n"
+                f"{(healing.stderr or '')[-4000:]}\nunit {healed.get('unit')!r}",
+            )
+
+
 def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False) -> List[Case]:
     """The AIO suite: the install case plus every case that reuses its host.
 
@@ -4420,5 +5325,18 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case("AIO-NEG-ACME", "aio", lambda context: case_acme_fail_closed(product), timeout_seconds=300),
         Case("AIO-NEG-DEP", "aio", lambda context: case_public_dependency(product),
              timeout_seconds=RECOVERY_TIMEOUT_SECONDS + 300),
+        # The channel cases come last because a switch restarts the Panel, and an
+        # earlier case must never be measured across one. Their own order is the
+        # contract: the same-channel no-op is proven before anything mutates the
+        # channel, the failed switch starts from stable, and only the last case
+        # leaves the host on dev, which has no safe automatic way back.
+        Case(CHANNEL_NOOP_CASE_ID, "aio", lambda context: case_channel_noop(product),
+             timeout_seconds=600),
+        Case(CHANNEL_ROLLBACK_CASE_ID, "aio", lambda context: case_channel_rollback(product),
+             timeout_seconds=CHANNEL_TIMEOUT_SECONDS + TUNNEL_READY_TIMEOUT_SECONDS
+             + TRAFFIC_TIMEOUT_SECONDS),
+        Case(CHANNEL_DEV_CASE_ID, "aio", lambda context: case_channel_dev(product),
+             timeout_seconds=CHANNEL_TIMEOUT_SECONDS + TUNNEL_READY_TIMEOUT_SECONDS
+             + TRAFFIC_TIMEOUT_SECONDS),
     ])
     return suite

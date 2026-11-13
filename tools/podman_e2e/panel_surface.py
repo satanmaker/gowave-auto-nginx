@@ -19,6 +19,7 @@ type, and a byte count.
     python3 /repo/tools/podman_e2e/panel_surface.py --scope surface
     python3 /repo/tools/podman_e2e/panel_surface.py --scope cluster
     python3 /repo/tools/podman_e2e/panel_surface.py --scope subscriptions --payload-dir /payloads
+    python3 /repo/tools/podman_e2e/panel_surface.py --scope channel --step capture --payload-dir /payloads
 """
 from __future__ import annotations
 
@@ -933,13 +934,97 @@ def restore_verify(panel: Panel, directory: Path) -> Dict[str, Any]:
     return facts
 
 
+# ------------------------------------------------------------------ channel
+CHANNEL_DIRECTORY = "channel"
+CHANNEL_STATE_NAME = "state.json"
+
+
+def _channel_dir(payload_dir: Optional[Path]) -> Path:
+    if payload_dir is None:
+        raise SystemExit("the channel scope needs --payload-dir: the captured payloads are secrets")
+    directory = payload_dir / CHANNEL_DIRECTORY
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return directory
+
+
+def channel_capture(panel: Panel, directory: Path) -> Dict[str, Any]:
+    """Capture the client surface a channel switch or a rollback has to leave alone.
+
+    The switch itself ships as a label plus a restart, and the rollback restores
+    the database the Panel serves. Neither is allowed to take a client away or
+    hand it different bytes, so what is captured is the digest of the whole
+    client list together with the digest of every representation the default
+    client is served. The database is compared through this surface rather than by
+    its file bytes: the Panel keeps writing to SQLite while it runs, so the served
+    content is the stable statement about what the switch did.
+    """
+    facts: Dict[str, Any] = {}
+    status, body = panel.call("GET", f"/api/users/by-username/{DEFAULT_USER}")
+    user = payload(body)
+    user = user if isinstance(user, dict) else {}
+    user_id = str(user.get("id") or user.get("uuid") or "")
+    short_uuid = str(user.get("shortUuid") or "")
+    facts["readback_status"] = status
+    facts["short_uuid_length"] = len(short_uuid)
+    if not user_id or not short_uuid:
+        return facts
+
+    status, body = panel.call("GET", "/api/users")
+    users = [entry for entry in items(body, "users") if isinstance(entry, dict)]
+    facts["inventory_status"] = status
+    facts["users"] = len(users)
+    representations = representation_digests(panel, short_uuid, directory)
+    facts["representations"] = {
+        name: {"status": entry["status"], "bytes": entry["bytes"]}
+        for name, entry in representations.items()
+    }
+    write_state(directory / CHANNEL_STATE_NAME, {
+        "user_id": user_id,
+        "short_uuid": short_uuid,
+        "inventory": user_inventory(users),
+        "users": len(users),
+        "representations": representations,
+    })
+    return facts
+
+
+def channel_verify(panel: Panel, directory: Path) -> Dict[str, Any]:
+    """Compare the client surface against the capture taken before the switch."""
+    state = read_state(directory / CHANNEL_STATE_NAME, "capture")
+    facts: Dict[str, Any] = {}
+
+    status, body = panel.call("GET", "/api/users")
+    users = [entry for entry in items(body, "users") if isinstance(entry, dict)]
+    facts["inventory_status"] = status
+    facts["users"] = len(users)
+    facts["users_captured"] = state.get("users")
+    facts["inventory_identical"] = user_inventory(users) == state.get("inventory")
+    facts["user_present"] = any(
+        str(entry.get("id") or entry.get("uuid") or "") == state["user_id"] for entry in users
+    )
+
+    captured = state.get("representations") or {}
+    representations = representation_digests(panel, str(state.get("short_uuid") or ""), None)
+    facts["representations"] = {
+        name: {"status": entry["status"], "bytes": entry["bytes"]}
+        for name, entry in representations.items()
+    }
+    facts["representations_identical"] = {
+        name: bool(captured.get(name))
+        and entry["status"] == captured[name]["status"]
+        and entry["sha256"] == captured[name]["sha256"]
+        for name, entry in representations.items()
+    }
+    return facts
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Collect Panel API facts without leaking secrets")
     parser.add_argument(
         "--scope",
         choices=(
             "surface", "cluster", "lifecycle", "subscriptions",
-            "ua-absent", "ua-blank", "revoke", "restore", "all",
+            "ua-absent", "ua-blank", "revoke", "restore", "channel", "all",
         ),
         default="all",
     )
@@ -995,6 +1080,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "the restore scope needs --step capture, --step mutate, or --step verify"
             )
         facts["restore"] = steps[args.step](panel, directory)
+    if args.scope == "channel":
+        directory = _channel_dir(Path(args.payload_dir) if args.payload_dir else None)
+        steps = {"capture": channel_capture, "verify": channel_verify}
+        if args.step not in steps:
+            raise SystemExit("the channel scope needs --step capture or --step verify")
+        facts["channel"] = steps[args.step](panel, directory)
     print(json.dumps(facts, sort_keys=True))
     return 0
 
