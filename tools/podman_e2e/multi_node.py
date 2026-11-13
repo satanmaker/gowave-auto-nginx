@@ -264,6 +264,21 @@ SSH_TRUST_TIMEOUT_SECONDS = 240
 # The transaction id only has to satisfy the product's own format; it names a
 # leftover snapshot the case plants on the Worker to observe a remote effect.
 SSH_ROTATION_TX_ID = "worker_install_sshkey_rotation"
+# The Worker's SSH daemon is what the controller speaks to; the node itself is a
+# unit and a control port, so the two can be faulted separately.
+SSH_DOWN_CASE_ID = "MN-SSH-DOWN"
+SSH_UNIT = "ssh.service"
+SSH_DOWN_TX_ID = "worker_install_sshdown"
+SSH_DOWN_TIMEOUT_SECONDS = 900
+# OpenSSH names the reason it never reached a listener; each of these is a
+# transport failure rather than the host-key verification SSHKEY measures.
+SSH_CONNECT_FAILURES: Tuple[str, ...] = (
+    "ssh: connect to host",
+    "Connection refused",
+    "Connection timed out",
+    "No route to host",
+    "Network is unreachable",
+)
 WORKER_REPORT_TIMEOUT_SECONDS = 120
 # A stopped node is only reported offline once the Panel's own heartbeat window
 # has expired, and a node that starts again has to re-register and re-apply its
@@ -1753,6 +1768,204 @@ systemctl restart ssh.service
         "new_key_executed_remotely": not accepted_survived,
         "worker_host_key_before": fingerprint(before_key),
         "worker_host_key_after": fingerprint(after_key),
+    }
+
+
+def case_ssh_service_down(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-SSH-DOWN: a Worker whose sshd is down is still a node, and comes back.
+
+    Everything the operator does to a Worker travels over OpenSSH, so losing the
+    daemon must stop those operations before they act — and it must stop nothing
+    else: the node keeps its unit and keeps carrying payload, because the control
+    plane and the data plane never used that port.
+
+    The observation is the same one SSHKEY uses: the controller's remote-finalize
+    operation deletes a leftover ACME snapshot on the Worker, so a refused
+    connection and an executed command leave different evidence. The case restores
+    the unit in a ``finally`` and then repeats the very operation that was
+    refused, which is what separates "the daemon came back" from "the host is
+    still unreachable".
+    """
+    host = product.require_installed()
+    worker_ip = host.plan.worker_ip
+    transaction = f"/var/lib/gowave-auto-nginx/recovery/{SSH_DOWN_TX_ID}"
+    sentinel = f"{transaction}/sentinel"
+    known_hosts = "/root/.ssh/known_hosts"
+    finalized = "Worker ACME recovery snapshot finalized."
+
+    def snapshot_present() -> bool:
+        return product.podman.exec(
+            host.worker_name, ["test", "-f", sentinel], check=False,
+        ).returncode == 0
+
+    def ssh_state(action: str) -> Dict[str, Any]:
+        result = product.podman.exec_bash(
+            host.worker_name,
+            f"systemctl {action} {SSH_UNIT} </dev/null; rc=$?\n"
+            f"systemctl is-active {SSH_UNIT} || true\n"
+            f"echo \"rc=$rc\"\n",
+            check=False, timeout=120,
+        )
+        lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        state = lines[0] if lines else ""
+        code = next((line.partition("=")[2] for line in lines if line.startswith("rc=")), "")
+        return {
+            "action": action,
+            "returncode": int(code) if code.lstrip("-").isdigit() else None,
+            "state": state,
+            "detail": (result.stderr or "").strip()[-400:],
+        }
+
+    prepared = product.podman.exec_bash(host.worker_name, f"""
+set -eu
+umask 077
+install -d -m 0700 {shlex.quote(transaction)}
+: > {shlex.quote(sentinel)}
+test -f {shlex.quote(sentinel)}
+""", check=False, timeout=120)
+    require(
+        SSH_DOWN_CASE_ID,
+        prepared.returncode == 0 and snapshot_present(),
+        f"planting the Worker's leftover ACME snapshot exited {prepared.returncode}: "
+        f"{(prepared.stderr or '').strip()[-500:]}",
+    )
+
+    product.master.subscription_payloads(SSH_DOWN_CASE_ID)
+    inbound, client = product.worker_tuple()
+    baseline = product.node_transfer(
+        SSH_DOWN_CASE_ID, "worker", inbound, client, expect_refusal=True,
+    )
+    require(
+        SSH_DOWN_CASE_ID,
+        baseline.get("delivered")
+        and baseline.get("status") == 200
+        and baseline.get("request_id_match")
+        and baseline.get("body_match"),
+        f"the Worker never carried a payload before its sshd was stopped, so the "
+        f"degraded state would not be attributable to the fault: "
+        f"{baseline.get('reason', '')}",
+    )
+    require(
+        SSH_DOWN_CASE_ID,
+        baseline.get("source_ip") == host.plan.data_worker_ip,
+        f"the baseline payload left from {baseline.get('source_ip')!r} instead of the "
+        f"Worker's own data address {host.plan.data_worker_ip}",
+    )
+
+    stopped = ssh_state("stop")
+    require(
+        SSH_DOWN_CASE_ID,
+        stopped.get("returncode") == 0 and stopped.get("state") != "active",
+        f"`systemctl stop {SSH_UNIT}` on the Worker exited {stopped.get('returncode')!r} "
+        f"leaving it {stopped.get('state')!r}: {stopped.get('detail') or 'no output'}",
+    )
+
+    refused: Dict[str, Any] = {}
+    during: Dict[str, Any] = {}
+    unit_during = ""
+    refused_survived = True
+    started: Dict[str, Any] = {}
+    try:
+        refused = product.remote_finalize(known_hosts, SSH_DOWN_TX_ID)
+        refused_output = (refused.stdout or "") + (refused.stderr or "")
+        refused_survived = snapshot_present()
+        unit_during = (product.podman.exec_bash(
+            host.worker_name, f"systemctl is-active {WORKER_UNIT} || true",
+            check=False, timeout=60,
+        ).stdout or "").strip()
+        during = product.node_transfer(
+            SSH_DOWN_CASE_ID, "worker", inbound, client, expect_refusal=True,
+        )
+
+        require(
+            SSH_DOWN_CASE_ID,
+            refused.returncode != 0,
+            f"the controller's remote operation exited 0 while the Worker's {SSH_UNIT} was "
+            f"stopped: {refused_output.strip()[-800:]}",
+        )
+        require(
+            SSH_DOWN_CASE_ID,
+            any(marker in refused_output for marker in SSH_CONNECT_FAILURES),
+            f"the refused operation did not name a connection failure: "
+            f"{refused_output.strip()[-800:]!r}",
+        )
+        # A host-key failure here would mean sshd answered after all, so the
+        # refusal would be about the pin rather than about the daemon.
+        require(
+            SSH_DOWN_CASE_ID,
+            "Host key verification failed" not in refused_output,
+            f"the operation was refused by host-key verification, so {SSH_UNIT} was still "
+            f"answering: {refused_output.strip()[-800:]!r}",
+        )
+        require(
+            SSH_DOWN_CASE_ID,
+            finalized not in refused_output and refused_survived,
+            f"the remote script ran although the Worker's sshd was stopped: "
+            f"{refused_output.strip()[-800:]!r}",
+        )
+        require(
+            SSH_DOWN_CASE_ID,
+            unit_during == "active",
+            f"{WORKER_UNIT} is {unit_during!r} on the Worker whose {SSH_UNIT} was stopped, "
+            "so losing SSH took the node with it",
+        )
+        require(
+            SSH_DOWN_CASE_ID,
+            during.get("delivered") is True
+            and during.get("status") == 200
+            and during.get("request_id_match")
+            and during.get("body_match"),
+            f"the Worker stopped carrying payload while only its sshd was down "
+            f"(status {during.get('status')!r}): {during.get('reason', '')}",
+        )
+        require(
+            SSH_DOWN_CASE_ID,
+            during.get("source_ip") == host.plan.data_worker_ip,
+            f"the payload during the fault left from {during.get('source_ip')!r} instead of "
+            f"the Worker's data address {host.plan.data_worker_ip}",
+        )
+    finally:
+        # The controller needs this daemon back whatever the checks above decided.
+        started = ssh_state("start")
+
+    require(
+        SSH_DOWN_CASE_ID,
+        started.get("returncode") == 0 and started.get("state") == "active",
+        f"`systemctl start {SSH_UNIT}` left the Worker's daemon {started.get('state')!r} "
+        f"(exit {started.get('returncode')!r}): {started.get('detail') or 'no output'}",
+    )
+
+    recovered = product.remote_finalize(known_hosts, SSH_DOWN_TX_ID)
+    recovered_output = (recovered.stdout or "") + (recovered.stderr or "")
+    recovered_survived = snapshot_present()
+    require(
+        SSH_DOWN_CASE_ID,
+        recovered.returncode == 0,
+        f"the same operation was still refused after {SSH_UNIT} was started: "
+        f"{recovered_output.strip()[-800:]}",
+    )
+    require(
+        SSH_DOWN_CASE_ID,
+        finalized in recovered_output and not recovered_survived,
+        f"the operation reported success without removing the planted snapshot {sentinel}: "
+        f"{recovered_output.strip()[-800:]!r}",
+    )
+
+    return {
+        "worker_ip": worker_ip,
+        "ssh_unit_after_stop": stopped.get("state"),
+        "ssh_unit_after_start": started.get("state"),
+        "refused_returncode": refused.returncode,
+        "refusal_names_transport": str(
+            any(marker in ((refused.stdout or "") + (refused.stderr or ""))
+                for marker in SSH_CONNECT_FAILURES)
+        ).lower(),
+        "remote_effect_during_fault": str(not refused_survived).lower(),
+        "worker_unit_with_sshd_down": unit_during,
+        "worker_status_with_sshd_down": during.get("status"),
+        "worker_source_ip_with_sshd_down": during.get("source_ip"),
+        "recovered_returncode": recovered.returncode,
+        "remote_effect_after_restore": str(not recovered_survived).lower(),
     }
 
 
@@ -7172,6 +7385,15 @@ def cases(
     suite.append(Case(
         EGRESS_CASE_ID, "multi-node", lambda context: case_egress(product),
         timeout_seconds=EGRESS_TIMEOUT_SECONDS,
+    ))
+    # Losing the Worker's daemon is the same trust question as SSHKEY asked from
+    # the other side. It cannot run before the Worker is registered: its baseline
+    # payload has to traverse the Worker, which only the provisioned cluster
+    # carries. It runs here because the matrix above has warmed both nodes' data
+    # planes, and it restores the unit itself before returning.
+    suite.append(Case(
+        SSH_DOWN_CASE_ID, "multi-node", lambda context: case_ssh_service_down(product),
+        timeout_seconds=SSH_DOWN_TIMEOUT_SECONDS,
     ))
     suite.extend([
         Case("SUB-SERVED", "multi-node", lambda context: aio.case_subscriptions(product.master),

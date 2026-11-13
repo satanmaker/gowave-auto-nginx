@@ -1311,6 +1311,229 @@ class TestSshHostKeyCase(unittest.TestCase):
                         ids.index(multi_node.NODE_ADD_CASE_ID))
 
 
+class _SshDownPodman:
+    """A two-host stand-in for OpenSSH, the Worker's units, and its data plane.
+
+    Five rules the case depends on are encoded here: sshd is one unit whose state
+    decides whether the controller's operation connects, the node is a different
+    unit that the daemon cannot take with it, the planted snapshot disappears only
+    when a remote command really runs, and the Worker keeps carrying payload
+    while its own daemon is down. Each flag below breaks exactly one rule.
+    """
+
+    def __init__(
+        self, *, stop_leaves_active=False, leaks_command=False,
+        refusal="ssh: connect to host 10.89.0.12 port 22: Connection refused",
+        worker_unit="active", down_delivered=True, down_status=200,
+        down_source_ip=None, start_fails=False, delete_on_recovery=True,
+    ):
+        self.ssh_active = True
+        self.sentinel = False
+        self.state_calls = []
+        self.remote_calls = 0
+        self.stop_leaves_active = stop_leaves_active
+        self.leaks_command = leaks_command
+        self.refusal = refusal
+        self.worker_unit = worker_unit
+        self.down_delivered = down_delivered
+        self.down_status = down_status
+        self.down_source_ip = down_source_ip
+        self.start_fails = start_fails
+        self.delete_on_recovery = delete_on_recovery
+
+    # ------------------------------------------------------------ podman API
+    def exec(self, name, argv, check=True, input_text=None, timeout=None):
+        if name == "worker" and argv[:2] == ["test", "-f"]:
+            return _SshCompleted(0 if self.sentinel else 1)
+        raise AssertionError(f"unexpected exec on {name}: {argv}")
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=None):
+        ssh_unit = multi_node.SSH_UNIT
+        if name == "worker" and "install -d" in script:
+            self.sentinel = True
+            self.state_calls.append("plant")
+            return _SshCompleted(0)
+        if name == "worker" and f"systemctl stop {ssh_unit}" in script:
+            self.state_calls.append("stop")
+            if not self.stop_leaves_active:
+                self.ssh_active = False
+            state = "active" if self.ssh_active else "inactive"
+            return _SshCompleted(0, f"{state}\nrc=0\n")
+        if name == "worker" and f"systemctl start {ssh_unit}" in script:
+            self.state_calls.append("start")
+            if self.start_fails:
+                return _SshCompleted(1, "inactive\nrc=1\n")
+            self.ssh_active = True
+            return _SshCompleted(0, "active\nrc=0\n")
+        if name == "worker" and f"systemctl is-active {multi_node.WORKER_UNIT}" in script:
+            return _SshCompleted(0, self.worker_unit + "\n")
+        if name == "master" and "remote_finalize" in script:
+            return self._remote_finalize()
+        raise AssertionError(f"unexpected bash script on {name}: {script[:200]!r}")
+
+    # ------------------------------------------------------------- the rules
+    def _remote_finalize(self):
+        self.remote_calls += 1
+        if not self.ssh_active:
+            if self.leaks_command:
+                self.sentinel = False
+                return _SshCompleted(
+                    255, "Worker ACME recovery snapshot finalized.\n", self.refusal + "\n",
+                )
+            return _SshCompleted(255, "", self.refusal + "\n")
+        if self.delete_on_recovery:
+            self.sentinel = False
+        return _SshCompleted(0, "Worker ACME recovery snapshot finalized.\n")
+
+
+class _SshDownProduct:
+    """The case's product surface, with the real remote-finalize command builder."""
+
+    def __init__(self, podman):
+        self.podman = podman
+        self.host = type("Host", (), {
+            "plan": topology.allocate_plan([]),
+            "target_name": "master",
+            "worker_name": "worker",
+        })()
+        self.master = type("Master", (), {
+            "subscription_payloads": lambda _self, case_id: {},
+        })()
+        self.transfers = 0
+        self.asserted_transfer = ()
+        if podman.down_source_ip is None:
+            podman.down_source_ip = self.host.plan.data_worker_ip
+
+    def require_installed(self):
+        return self.host
+
+    def worker_tuple(self):
+        return {"id": 1}, "v2rayNG/1.10.0"
+
+    def node_transfer(self, case_id, node, inbound, client, expect_refusal=False):
+        self.asserted_transfer = (case_id, node, inbound, client, expect_refusal)
+        self.transfers += 1
+        # The baseline is the control the case reads before the fault, so it is
+        # always a delivered payload; only the transfer taken while sshd is down
+        # is the fault's to degrade.
+        delivered = True if self.transfers == 1 else self.podman.down_delivered
+        status = 200 if self.transfers == 1 else self.podman.down_status
+        source_ip = (self.host.plan.data_worker_ip if self.transfers == 1
+                     else self.podman.down_source_ip)
+        return {
+            "delivered": delivered,
+            "status": status,
+            "request_id_match": True,
+            "body_match": True,
+            "source_ip": source_ip,
+            "reason": "",
+        }
+
+    def remote_finalize(self, known_hosts, transaction, timeout=0):
+        return multi_node.MultiNodeProduct.remote_finalize(
+            self, known_hosts, transaction, timeout,
+        )
+
+
+class TestSshServiceDownCase(unittest.TestCase):
+    """MN-SSH-DOWN: losing sshd blocks the controller and nothing else."""
+
+    def _run(self, **flags):
+        product = _SshDownProduct(_SshDownPodman(**flags))
+        return multi_node.case_ssh_service_down(product), product
+
+    def test_a_worker_without_sshd_refuses_the_operation_and_keeps_serving(self):
+        evidence, product = self._run()
+        self.assertEqual(evidence["ssh_unit_after_stop"], "inactive")
+        self.assertEqual(evidence["ssh_unit_after_start"], "active")
+        self.assertNotEqual(evidence["refused_returncode"], 0)
+        self.assertEqual(evidence["refusal_names_transport"], "true")
+        self.assertEqual(evidence["remote_effect_during_fault"], "false")
+        self.assertEqual(evidence["worker_unit_with_sshd_down"], "active")
+        self.assertEqual(evidence["worker_status_with_sshd_down"], 200)
+        self.assertEqual(evidence["worker_source_ip_with_sshd_down"],
+                         product.host.plan.data_worker_ip)
+        self.assertEqual(evidence["recovered_returncode"], 0)
+        self.assertEqual(evidence["remote_effect_after_restore"], "true")
+        self.assertEqual(evidence["worker_ip"], product.host.plan.worker_ip)
+        self.assertEqual(product.asserted_transfer[1], "worker")
+        self.assertIs(product.asserted_transfer[4], True)
+        self.assertEqual(product.podman.state_calls, ["plant", "stop", "start"])
+        self.assertEqual(product.podman.remote_calls, 2)
+        self.assertIs(product.podman.ssh_active, True)
+        self.assertIs(product.podman.sentinel, False)
+
+    def test_a_stop_that_leaves_the_daemon_active_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(stop_leaves_active=True)
+        self.assertIn("leaving it 'active'", str(caught.exception))
+
+    def test_a_refusal_that_still_runs_the_script_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(leaks_command=True)
+        self.assertIn("the remote script ran although the Worker's sshd was stopped",
+                      str(caught.exception))
+
+    def test_a_refusal_that_does_not_name_the_transport_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(refusal="kex_exchange_identification: Connection closed by remote host")
+        self.assertIn("did not name a connection failure", str(caught.exception))
+
+    def test_a_refusal_left_to_host_key_verification_is_refused(self):
+        # Both lines are needed: the case accepts only a refusal that names the
+        # transport, so a verification failure has to be the extra one.
+        with self.assertRaises(AssertionError) as caught:
+            self._run(refusal=(
+                "Host key verification failed.\n"
+                "ssh: connect to host 10.89.0.12 port 22: Connection refused"
+            ))
+        self.assertIn("was refused by host-key verification", str(caught.exception))
+
+    def test_losing_ssh_that_takes_the_node_with_it_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(worker_unit="inactive")
+        self.assertIn("losing SSH took the node with it", str(caught.exception))
+
+    def test_a_node_that_stops_carrying_payload_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(down_delivered=False, down_status=0)
+        self.assertIn("stopped carrying payload while only its sshd was down",
+                      str(caught.exception))
+
+    def test_a_payload_that_left_from_another_address_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(down_source_ip="10.89.0.2")
+        self.assertIn("instead of the Worker's data address", str(caught.exception))
+
+    def test_a_fault_that_does_not_restore_the_daemon_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(start_fails=True)
+        self.assertIn("left the Worker's daemon 'inactive'", str(caught.exception))
+
+    def test_a_recovery_that_leaves_the_snapshot_is_refused(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._run(delete_on_recovery=False)
+        self.assertIn("reported success without removing the planted snapshot",
+                      str(caught.exception))
+
+    def test_a_failed_check_still_brings_the_daemon_back(self):
+        # Every later case needs the controller's SSH path, so a red here must
+        # not leave the Worker unreachable.
+        product = _SshDownProduct(_SshDownPodman(worker_unit="inactive"))
+        with self.assertRaises(AssertionError):
+            multi_node.case_ssh_service_down(product)
+        self.assertIs(product.podman.ssh_active, True)
+        self.assertIn("start", product.podman.state_calls)
+
+    def test_the_suite_runs_the_fault_after_the_worker_it_faults(self):
+        ids = [case.id for case in multi_node.cases(_StubPodman(Path(tempfile.mkdtemp())))]
+        self.assertLess(ids.index(multi_node.SSH_KEY_CASE_ID),
+                        ids.index(multi_node.SSH_DOWN_CASE_ID))
+        self.assertLess(ids.index(multi_node.NODE_ADD_CASE_ID),
+                        ids.index(multi_node.SSH_DOWN_CASE_ID))
+        self.assertLess(ids.index(multi_node.SSH_DOWN_CASE_ID), ids.index("SUB-SERVED"))
+
+
 class TestMultiNodeSuite(unittest.TestCase):
     """The declared suite is what the runner executes, and its ids are stable."""
 
@@ -1460,8 +1683,14 @@ class TestMultiNodeSuite(unittest.TestCase):
         # count and still precedes revocation, which would revoke a client.
         ids = [case.id for case in multi_node.cases(self.podman)]
         self.assertEqual(ids[37], "MN-DP-worker-TROJAN-GRPC-mihomo")
-        self.assertEqual(ids[38:42], [multi_node.MATRIX_CASE_ID, multi_node.EGRESS_CASE_ID,
-                                      "SUB-SERVED", "SUB-B64"])
+        for earlier, later in (
+            ("MN-DP-worker-TROJAN-GRPC-mihomo", multi_node.MATRIX_CASE_ID),
+            (multi_node.MATRIX_CASE_ID, multi_node.EGRESS_CASE_ID),
+            (multi_node.EGRESS_CASE_ID, multi_node.SSH_DOWN_CASE_ID),
+            (multi_node.SSH_DOWN_CASE_ID, "SUB-SERVED"),
+            ("SUB-SERVED", "SUB-B64"),
+        ):
+            self.assertLess(ids.index(earlier), ids.index(later))
         suite = {case.id: case for case in multi_node.cases(self.podman)}
         self.assertEqual(suite[multi_node.MATRIX_CASE_ID].timeout_seconds,
                          multi_node.MATRIX_TIMEOUT_SECONDS)
@@ -1484,7 +1713,6 @@ class TestMultiNodeSuite(unittest.TestCase):
         # 6.1: both roles' trees are validated and reloaded while the cluster is
         # healthy, so a later revocation cannot be read as a reload effect.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[42], multi_node.NGINX_CONFIG_CASE_ID)
         self.assertLess(ids.index(multi_node.NGINX_CONFIG_CASE_ID),
                         ids.index(multi_node.REVOCATION_CASE_ID))
         self.assertLess(ids.index("SUB-B64"), ids.index(multi_node.NGINX_CONFIG_CASE_ID))
@@ -1496,8 +1724,7 @@ class TestMultiNodeSuite(unittest.TestCase):
         # 6.2: both roles' certificates are read from a healthy cluster, so a
         # later Worker shutdown cannot be blamed for what the client saw here.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[43], aio.TLS_CASE_ID)
-        self.assertEqual(ids[42], multi_node.NGINX_CONFIG_CASE_ID)
+        self.assertLess(ids.index(multi_node.NGINX_CONFIG_CASE_ID), ids.index(aio.TLS_CASE_ID))
         self.assertLess(ids.index(aio.TLS_CASE_ID), ids.index(multi_node.REVOCATION_CASE_ID))
         suite = {case.id: case for case in multi_node.cases(self.podman)}
         self.assertEqual(suite[aio.TLS_CASE_ID].timeout_seconds,
