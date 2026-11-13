@@ -76,7 +76,7 @@
 - [x] 6.6 Verify firewall allow/deny paths from each relevant network origin using real connection attempts.
 - [x] 6.7 Cover IPv4/IPv6 behavior according to the declared product support/configuration.
 - [x] 6.8 Assert cover-domain derivation from `panel_domain`: the last two labels form the apex, and a domain with fewer than three labels produces no cover lineage and must be handled explicitly instead of silently rendering nothing.
-- [ ] 6.9 Prove the apex and `www.<apex>` resolution precondition from the target's own resolver: successful rendering when both resolve to the host IPv4, and the operator's documented refusal when either name does not.
+- [x] 6.9 Prove the apex and `www.<apex>` resolution precondition from the target's own resolver: successful rendering when both resolve to the host IPv4, and the operator's documented refusal when either name does not.
 - [ ] 6.10 Verify the rendered cover site: expected `*.html`/`*.css`/`*.svg` assets present, brand derived from the apex's second-to-last label, no surviving `{{` placeholder, and a served page whose content does not expose Panel/API or management paths.
 - [ ] 6.11 Verify decoy routing and isolation: apex and `www` SNI terminate on the loopback listener `127.0.0.1:9443`, the listener is unreachable from client networks, every VPN SNI keeps its own route, and the REALITY certificate lineage covers the apex and `www.<apex>`.
 - [ ] 6.12 Verify the port 80 ACME vhost survives a Worker install and reconfiguration on both roles, so renewal keeps a reachable HTTP-01 path, and that a domain change re-renders the decoy and lineage without stale `sites-enabled` entries.
