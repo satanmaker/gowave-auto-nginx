@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 71
-  total: 196
+  podman_first: 72
+  total: 197
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3474,6 +3474,26 @@ cases:
   topology:
   - aio
   - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: NGINX SNI Routing and REALITY Decoy Verification
+- id: DECOY-01
+  requirement: NGINX SNI Routing and REALITY Decoy Verification
+  live_scenario: null
+  assertion: From an independent Control Machine, the camouflage listener answers the cover apex, its
+    www, the REALITY name without REALITY authentication, and an SNI the stream map does not list with
+    the same rendered cover site, and refuses every path the panel vhost serves — /api/, /api/sub/, /api/nodes,
+    /api/auth/login, /xhttp-down/, /ws, /trojan-grpc and the scanned /metrics and /server-status — with
+    that site's own 404 document rather than any management response, while the Panel's management surface
+    still authenticates over loopback and refuses an anonymous /api/nodes call on its own name.
+  assertion_sha256: 4be82af66d57e2e8b27a657a2e1db348ec3d9cc3034ea409e93b58c93b8e0568
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
   gate: pre-push
   driver: null
   driver_status: planned
