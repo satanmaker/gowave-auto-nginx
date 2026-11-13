@@ -170,9 +170,10 @@ DECOY_ROUTE_PATH_TIMEOUT_SECONDS = 5
 # The ACME vhost on port 80 is what certbot's HTTP-01 renewal revalidates
 # through, so it has to outlive a Worker re-provision and a domain change.
 ACME80_CASE_ID = "NGX-WORKER-ACME80"
-ACME80_TIMEOUT_SECONDS = 600
-# A Worker re-provision is the operator's own `node add` again, and the domain
-# change re-issues two lineages, so the case is bounded by both.
+ACME80_TIMEOUT_SECONDS = 900
+# A Worker re-provision re-streams the whole payload, and the domain change
+# re-issues two lineages, so each half is bounded on its own.
+ACME80_REAPPLY_TIMEOUT_SECONDS = 540
 ACME80_DOMAIN_CHANGE_TIMEOUT_SECONDS = 420
 ACME_WEBROOT = "/var/www/gowave-acme"
 ACME_MASTER_VHOST = "/etc/nginx/conf.d/gowave-http.conf"
@@ -4870,6 +4871,11 @@ def acme_challenge_fetch(case_id: str, host: topology.MultiNodeTopology, name: s
     }
 
 
+def node_reapply_script(name: str) -> str:
+    """The operator's own Worker re-apply, unmodified and without a TTY."""
+    return f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node reapply {shlex.quote(name)}\n"
+
+
 def domain_change_script(panel_domain: str, reality_domain: str) -> str:
     """The operator's own domain change, unmodified and without a TTY."""
     return (
@@ -4885,10 +4891,10 @@ def case_acme80(product: MultiNodeProduct) -> Dict[str, Any]:
     re-provision must not remove it and a domain change must re-render it for
     the new names. The case writes a token into each role's own ACME webroot
     and fetches it from the independent client, which is exactly what certbot
-    asks an HTTP-01 challenge to do; it repeats that after re-running the
-    operator's `node add` on the Worker, and after a real `domain-change` on
-    the Master, where the decoy, the lineage and the enabled sites are read
-    again for the new names.
+    asks an HTTP-01 challenge to do; it repeats that after re-applying the
+    Worker payload with the operator's `node reapply`, and after a real
+    `domain-change` on the Master, where the decoy, the lineage and the enabled
+    sites are read again for the new names.
     """
     case_id = ACME80_CASE_ID
     host = product.require_worker()
@@ -4963,13 +4969,20 @@ def case_acme80(product: MultiNodeProduct) -> Dict[str, Any]:
         return {"map": facts["map"], "bound_9443": facts["bound"].get(str(DECOY_LISTENER_PORT), [])}
 
     before = worker_route()
-    changed = host.node_add()
+    changed = product.podman.exec_bash(
+        host.target_name, node_reapply_script(host.worker_name),
+        check=False, timeout=ACME80_REAPPLY_TIMEOUT_SECONDS,
+    )
     require(
         case_id,
         changed.returncode == 0,
-        f"re-running the operator's `node add` on the Worker exited {changed.returncode}: "
+        f"re-applying the Worker payload with `node reapply` exited {changed.returncode}: "
         f"{(changed.stderr or changed.stdout or '').strip()[-600:]}",
     )
+    evidence["reapply"] = {
+        "command": node_reapply_script(host.worker_name).strip(),
+        "returncode": changed.returncode,
+    }
     after = worker_route()
     require(
         case_id,

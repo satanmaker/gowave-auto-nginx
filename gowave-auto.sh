@@ -941,8 +941,131 @@ for n in data.get('nodes', []):
                 VISION_DOMAIN="$vision_domain" \
                 "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"
             ;;
+        reapply)
+            acquire_lock
+            local name="${1:-}"
+            local ssh_user="${2:-root}"
+            local ssh_port="${3:-22}"
+
+            if [[ -z "$name" ]]; then
+                echo "Usage: gowave-auto.sh node reapply <worker-name> [ssh-user] [ssh-port]" >&2
+                return 1
+            fi
+            if [[ ! -f "$STATE_FILE" ]]; then
+                echo "Error: no state.json found; no Worker is registered to re-apply." >&2
+                return 1
+            fi
+            if [[ ! "$ssh_port" =~ ^[0-9]+$ ]] || (( ssh_port < 1 || ssh_port > 65535 )); then
+                echo "Error: SSH port must be between 1 and 65535." >&2
+                return 2
+            fi
+            if [[ ! "$ssh_user" =~ ^[A-Za-z_][A-Za-z0-9._-]{0,31}$ ]]; then
+                echo "Error: invalid SSH username." >&2
+                return 2
+            fi
+
+            # The host is already registered with the Panel, so a re-apply
+            # converges it with the identity the operator added instead of
+            # registering a second node: every argument is read back from
+            # state.json and the Panel side is left untouched.
+            local identity_text=""
+            if ! identity_text=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$STATE_FILE" "$name" <<'PY'
+import json
+import sys
+
+state_path, name = sys.argv[1:]
+nodes = json.load(open(state_path, encoding="utf-8")).get("nodes", [])
+matches = [item for item in nodes if isinstance(item, dict) and item.get("name") == name]
+if not matches:
+    raise SystemExit(f"Worker name is not registered in state.json: {name}")
+node = matches[0]
+for field in ("address", "port", "workerDomain", "realityDomain"):
+    if not node.get(field):
+        raise SystemExit(f"state.json node '{name}' is missing {field}.")
+print(node["address"])
+print(node["port"])
+print(node["workerDomain"])
+print(node["realityDomain"])
+print(node.get("visionDomain") or "")
+PY
+            ); then
+                echo "Error: cannot re-apply Worker '$name': $identity_text" >&2
+                return 1
+            fi
+            local -a identity=()
+            mapfile -t identity <<< "$identity_text"
+            if (( ${#identity[@]} != 5 )); then
+                echo "Error: state.json node '$name' did not yield its identity." >&2
+                return 1
+            fi
+            local ip="${identity[0]}"
+            local node_port="${identity[1]}"
+            local worker_domain="${identity[2]}"
+            local reality_domain="${identity[3]}"
+            local vision_domain="${identity[4]}"
+            if [[ ! "$node_port" =~ ^[0-9]+$ ]] || (( node_port < 1 || node_port > 65535 )); then
+                echo "Error: state.json node '$name' carries an invalid port: $node_port" >&2
+                return 1
+            fi
+
+            local known_hosts="${SSH_KNOWN_HOSTS:-/root/.ssh/known_hosts}"
+            local host_key="$ip"
+            if [[ "$ssh_port" != "22" ]]; then
+                host_key="[$ip]:$ssh_port"
+            fi
+            if [[ ! -s "$known_hosts" ]] || ! ssh-keygen -F "$host_key" -f "$known_hosts" >/dev/null 2>&1; then
+                echo "Error: SSH host key for $host_key is not pre-pinned in $known_hosts." >&2
+                echo "Verify the fingerprint out of band before re-applying." >&2
+                return 1
+            fi
+
+            local secret_key
+            if ! secret_key=$(extract_secret_key "$GOWAVE_DIR"); then
+                echo "Error: unable to extract the Worker secret; the host was not touched." >&2
+                return 1
+            fi
+            validate_acme_server "${GOWAVE_ACME_SERVER:-}" || return 1
+            local panel_ip panel_ipv6
+            panel_ip=$(resolve_panel_ipv4) || return 1
+            panel_ipv6=$(resolve_panel_ipv6) || return 1
+            if [[ -z "$panel_ip" && -z "$panel_ipv6" ]]; then
+                echo "Error: unable to determine a public Panel IP address; refusing an untrusted firewall fallback." >&2
+                return 1
+            fi
+            local acme_test_ca_b64=""
+            if [[ "${GOWAVE_ACME_TEST_MODE:-0}" == "1" && "${GOWAVE_ACME_SERVER:-}" == "$GOWAVE_ACME_TEST_ENDPOINT" ]]; then
+                validate_acme_test_ca || return 1
+                acme_test_ca_b64=$(base64 -w 0 "$GOWAVE_ACME_TEST_CA_FILE")
+            fi
+
+            # The payload is streamed again instead of rebuilt: the Worker keeps
+            # no copy of it, so this is the only path that reconverges a host
+            # that is already installed.
+            local acme_tx_id="worker_install_reapply_$(date +%s)_${BASHPID}"
+            echo "Re-applying the Worker payload to '$name' ($ip:$ssh_port)..."
+            if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
+                XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
+                GOWAVE_ACME_SERVER="${GOWAVE_ACME_SERVER:-}" \
+                GOWAVE_ACME_TEST_MODE="${GOWAVE_ACME_TEST_MODE:-0}" \
+                GOWAVE_ACME_TEST_CA_FILE="${GOWAVE_ACME_TEST_CA_FILE:-}" \
+                GOWAVE_ACME_TEST_CA_SHA256="${GOWAVE_ACME_TEST_CA_SHA256:-}" \
+                GOWAVE_ACME_TEST_CA_B64="$acme_test_ca_b64" \
+                GOWAVE_PODMAN_TEST_MODE="${GOWAVE_PODMAN_TEST_MODE:-0}" \
+                GOWAVE_NODE_INSTALLER_COMMIT="${GOWAVE_NODE_INSTALLER_COMMIT:-}" \
+                GOWAVE_NODE_INSTALLER_SHA256="${GOWAVE_NODE_INSTALLER_SHA256:-}" \
+                VISION_DOMAIN="$vision_domain" \
+                SSH_KNOWN_HOSTS="$known_hosts" "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
+                echo "Error: re-applying Worker '$name' failed; its Panel registration is unchanged." >&2
+                return 1
+            fi
+            if ! ACME_TX_ID="$acme_tx_id" SSH_KNOWN_HOSTS="$known_hosts" \
+                "$SCRIPT_DIR/gowave-node-auto.sh" remote_finalize "$ip" "$ssh_port" "$ssh_user"; then
+                echo "WARNING: Worker '$name' was re-applied, but its ACME recovery snapshot could not be finalized." >&2
+            fi
+            echo "Worker '$name' re-applied."
+            ;;
         *)
-            echo "Usage: gowave-auto.sh node {add|list|rollback}"
+            echo "Usage: gowave-auto.sh node {add|list|reapply|rollback}"
             ;;
     esac
 }
