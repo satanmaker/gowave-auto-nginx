@@ -13,8 +13,10 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 import unittest.mock
@@ -4571,6 +4573,425 @@ class TestAcme80Case(unittest.TestCase):
         self.assertEqual(len(change), 1)
         self.assertIn("gowave-auto.sh domain-change", change[0])
         self.assertIn(multi_node.ACME_NEW_PANEL_DOMAIN, change[0])
+
+
+_BACKUP_PANEL_ARCHIVE = "/var/backups/gowave/gowave-backup-panel-1763078400.tar.gz"
+_BACKUP_NODE_ARCHIVE = "/var/backups/gowave/gowave-backup-node-1763078401.tar.gz"
+_BACKUP_SECRET_SENTINEL = "s3cr3t-value-that-must-never-be-evidenced"
+
+
+def _backup_facts(path, backup_type, paths, *, declared=None, mode="0o600",
+                  env_keys=None, private_keys=(), sqlite_header=None):
+    """One archive as `backup_probe_script` reports it back."""
+    paths = tuple(paths)
+    return {
+        "path": path,
+        "mode": mode,
+        "size": 20480,
+        "sha256": hashlib.sha256(path.encode("utf-8")).hexdigest(),
+        "format_version": 1,
+        "type": backup_type,
+        "paths": sorted(paths),
+        "declared": sorted(paths if declared is None else declared),
+        "env_keys": {} if env_keys is None else env_keys,
+        "private_key_members": sorted(private_keys),
+        "sqlite_header": ("opt/gowave/gowave.db" in paths
+                          if sqlite_header is None else sqlite_header),
+    }
+
+
+_BACKUP_PANEL_PATHS = (
+    "etc/letsencrypt/archive/panel.testbed.internal/cert1.pem",
+    "etc/letsencrypt/archive/panel.testbed.internal/privkey1.pem",
+    "etc/letsencrypt/live/panel.testbed.internal/fullchain.pem",
+    "etc/letsencrypt/renewal/panel.testbed.internal.conf",
+    "etc/nginx/conf.d/gowave-panel.conf",
+    "etc/nginx/stream-enabled/gowave-stream.conf",
+    "opt/gowave/.env",
+    "opt/gowave/gowave.db",
+    "var/lib/gowave-auto-nginx/state.json",
+)
+_BACKUP_NODE_PATHS = ("opt/gowave-node/.env",)
+
+
+def _panel_facts(**overrides):
+    facts = _backup_facts(
+        _BACKUP_PANEL_ARCHIVE, "panel", _BACKUP_PANEL_PATHS,
+        env_keys={"opt/gowave/.env": ["APP_SECRET", "GOWAVE_PROXY"]},
+        private_keys=("etc/letsencrypt/archive/panel.testbed.internal/privkey1.pem",),
+    )
+    facts.update(overrides)
+    return facts
+
+
+def _node_facts(**overrides):
+    facts = _backup_facts(
+        _BACKUP_NODE_ARCHIVE, "node", _BACKUP_NODE_PATHS,
+        env_keys={"opt/gowave-node/.env": ["NODE_PORT", "SECRET_KEY", "SNI_VERIFICATION"]},
+        sqlite_header=False,
+    )
+    facts.update(overrides)
+    return facts
+
+
+def _write_backup_archive(directory, name, backup_type, members, *, mode=0o600,
+                          format_version=1):
+    """A real Format v1 archive: `members` is (relative path, payload) pairs."""
+    path = os.path.join(directory, name)
+    meta = json.dumps({
+        "format_version": format_version,
+        "backup_type": backup_type,
+        "files": [{"path": rel, "sha256": hashlib.sha256(payload).hexdigest()}
+                  for rel, payload in members],
+    }).encode("utf-8")
+    with tarfile.open(path, "w:gz") as tar:
+        info = tarfile.TarInfo("meta.json")
+        info.size = len(meta)
+        info.mode = 0o600
+        tar.addfile(info, io.BytesIO(meta))
+        for rel, payload in members:
+            info = tarfile.TarInfo(f"files/{rel}")
+            info.size = len(payload)
+            info.mode = 0o600
+            tar.addfile(info, io.BytesIO(payload))
+    os.chmod(path, mode)
+    return path
+
+
+class TestBackupProbeScript(unittest.TestCase):
+    """`backup_probe_script` reads an archive without disclosing what it holds."""
+
+    def probe(self, archive):
+        script = multi_node.backup_probe_script(archive)
+        result = subprocess.run(["bash", "-c", script], capture_output=True,
+                                text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout, json.loads(result.stdout)
+
+    def test_it_reports_the_inventory_and_never_a_secret_value(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = _write_backup_archive(directory, "panel.tar.gz", "panel", (
+                ("opt/gowave/gowave.db", b"SQLite format 3\x00" + b"\x00" * 32),
+                ("opt/gowave/.env",
+                 f"APP_SECRET={_BACKUP_SECRET_SENTINEL}\nGOWAVE_PROXY=external\n".encode()),
+                ("etc/letsencrypt/archive/panel.testbed.internal/privkey1.pem",
+                 b"-----BEGIN PRIVATE KEY-----\n" + _BACKUP_SECRET_SENTINEL.encode() + b"\n"),
+                ("etc/letsencrypt/archive/panel.testbed.internal/cert1.pem",
+                 b"-----BEGIN CERTIFICATE-----\n"),
+                ("etc/nginx/conf.d/gowave-panel.conf", b"server {}\n"),
+            ))
+            stdout, facts = self.probe(archive)
+
+        self.assertNotIn(_BACKUP_SECRET_SENTINEL, stdout)
+        self.assertEqual(facts["path"], archive)
+        self.assertEqual(facts["mode"], "0o600")
+        self.assertEqual(facts["format_version"], 1)
+        self.assertEqual(facts["type"], "panel")
+        self.assertEqual(facts["paths"], sorted([
+            "etc/letsencrypt/archive/panel.testbed.internal/cert1.pem",
+            "etc/letsencrypt/archive/panel.testbed.internal/privkey1.pem",
+            "etc/nginx/conf.d/gowave-panel.conf",
+            "opt/gowave/.env",
+            "opt/gowave/gowave.db",
+        ]))
+        self.assertEqual(facts["declared"], facts["paths"])
+        self.assertEqual(facts["env_keys"], {"opt/gowave/.env": ["APP_SECRET", "GOWAVE_PROXY"]})
+        self.assertEqual(facts["private_key_members"],
+                         ["etc/letsencrypt/archive/panel.testbed.internal/privkey1.pem"])
+        self.assertIs(facts["sqlite_header"], True)
+        self.assertGreater(facts["size"], 0)
+        self.assertEqual(len(facts["sha256"]), 64)
+
+    def test_a_symlinked_live_member_is_counted_but_never_followed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "panel.tar.gz")
+            meta = json.dumps({
+                "format_version": 1,
+                "backup_type": "panel",
+                "files": [{"path": "etc/letsencrypt/archive/a/privkey1.pem",
+                           "sha256": "0" * 64}],
+            }).encode()
+            with tarfile.open(path, "w:gz") as tar:
+                info = tarfile.TarInfo("meta.json")
+                info.size = len(meta)
+                tar.addfile(info, io.BytesIO(meta))
+                info = tarfile.TarInfo("files/etc/letsencrypt/live/a/fullchain.pem")
+                info.type = tarfile.SYMTYPE
+                info.linkname = "../../archive/a/fullchain1.pem"
+                tar.addfile(info)
+            os.chmod(path, 0o600)
+            _, facts = self.probe(path)
+
+        self.assertEqual(facts["paths"], ["etc/letsencrypt/live/a/fullchain.pem"])
+        self.assertEqual(facts["private_key_members"], [])
+        self.assertIs(facts["sqlite_header"], False)
+
+    def test_a_non_sqlite_database_is_reported_as_such(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = _write_backup_archive(directory, "panel.tar.gz", "panel", (
+                ("opt/gowave/gowave.db", b"not a database"),
+            ))
+            _, facts = self.probe(archive)
+        self.assertIs(facts["sqlite_header"], False)
+
+
+class _BackupPodman:
+    """Both roles' archive creation, the probe, and the product's validator."""
+
+    ROLES = {"aio-master": "panel", "worker-01": "node"}
+
+    def __init__(self, facts=None, backup_returncode=None, verify_returncode=None,
+                 verify_stdout="15-point preflight archive validation PASSED.\n"):
+        self.facts = {"panel": _panel_facts(), "node": _node_facts()}
+        for type_name, replacement in (facts or {}).items():
+            self.facts[type_name] = replacement
+        self.backup_returncode = backup_returncode or {}
+        self.verify_returncode = verify_returncode or {}
+        self.verify_stdout = verify_stdout
+        self.scripts = []
+
+    @staticmethod
+    def archive_path(type_name):
+        return _BACKUP_PANEL_ARCHIVE if type_name == "panel" else _BACKUP_NODE_ARCHIVE
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        self.scripts.append((container, script))
+        type_name = self.ROLES[container]
+        if "tarfile" in script:
+            return subprocess.CompletedProcess(["bash", "-lc"], 0,
+                                               json.dumps(self.facts[type_name]) + "\n", "")
+        if "gowave-backup.sh verify" in script:
+            rc = self.verify_returncode.get(type_name, 0)
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], rc,
+                self.verify_stdout if rc == 0 else "",
+                "" if rc == 0 else "ERROR: archive member is outside strict allowlist\n")
+        rc = self.backup_returncode.get(type_name, 0)
+        label = "Panel" if type_name == "panel" else "Node"
+        return subprocess.CompletedProcess(
+            ["bash", "-lc"], rc,
+            f"{label} backup created successfully: {self.archive_path(type_name)} "
+            "(mode 0600).\n" if rc == 0 else "",
+            "" if rc == 0 else f"ERROR: {label} backup root is missing\n")
+
+    def exec(self, container, argv, check=True, input_text=None, timeout=120):
+        raise AssertionError(f"unexpected python probe in {container}: {argv}")
+
+
+class _BackupHost:
+    target_name = "aio-master"
+    worker_name = "worker-01"
+
+
+class _BackupProduct:
+    def __init__(self, podman, host):
+        self.podman = podman
+        self.host = host
+
+    def require_worker(self):
+        return self.host
+
+
+class TestBackupCase(unittest.TestCase):
+    """MN-BACKUP: both archive types come out of the operator's own interface."""
+
+    def run_case(self, podman=None, host=None):
+        return multi_node.case_backup_types(_BackupProduct(
+            podman if podman is not None else _BackupPodman(),
+            host if host is not None else _BackupHost()))
+
+    def test_it_records_both_archives_and_only_their_inventory(self):
+        podman = _BackupPodman()
+        evidence = self.run_case(podman=podman)
+        master = evidence["roles"]["master"]
+        worker = evidence["roles"]["worker"]
+        self.assertEqual(master["type"], "panel")
+        self.assertEqual(master["path"], _BACKUP_PANEL_ARCHIVE)
+        self.assertEqual(master["mode"], "0o600")
+        self.assertEqual(master["members"], sorted(_BACKUP_PANEL_PATHS))
+        self.assertEqual(master["secret_keys"], {"opt/gowave/.env": ["APP_SECRET", "GOWAVE_PROXY"]})
+        self.assertEqual([path.rsplit("/", 1)[-1] for path in master["private_key_members"]],
+                         ["privkey1.pem"])
+        self.assertIn("PASSED", master["validation"][0])
+        self.assertEqual(worker["type"], "node")
+        self.assertEqual(worker["members"], sorted(_BACKUP_NODE_PATHS))
+        self.assertEqual(worker["secret_keys"],
+                         {"opt/gowave-node/.env": ["NODE_PORT", "SECRET_KEY", "SNI_VERIFICATION"]})
+        self.assertNotIn(_BACKUP_SECRET_SENTINEL, json.dumps(evidence))
+
+    def test_each_role_runs_the_archive_type_it_owns(self):
+        podman = _BackupPodman()
+        self.run_case(podman=podman)
+        created = [(container, script) for container, script in podman.scripts
+                   if "gowave-auto.sh backup" in script]
+        self.assertEqual([container for container, _ in created],
+                         ["aio-master", "worker-01"])
+        self.assertIn("backup --type panel", created[0][1])
+        self.assertIn("backup --type node", created[1][1])
+        verified = [(container, script) for container, script in podman.scripts
+                    if "gowave-backup.sh verify" in script]
+        self.assertEqual([container for container, _ in verified],
+                         ["aio-master", "worker-01"])
+        self.assertIn(f"verify {_BACKUP_PANEL_ARCHIVE} panel", verified[0][1])
+        self.assertIn(f"verify {_BACKUP_NODE_ARCHIVE} node", verified[1][1])
+
+    def test_an_archive_that_is_not_root_only_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"panel": _panel_facts(mode="0o644")}))
+        self.assertIn("not root-only", str(caught.exception))
+
+    def test_a_panel_archive_without_a_required_member_fails_the_case(self):
+        paths = tuple(path for path in _BACKUP_PANEL_PATHS
+                      if path != "var/lib/gowave-auto-nginx/state.json")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"panel": _panel_facts(paths=paths)}))
+        self.assertIn("state.json", str(caught.exception))
+
+    def test_a_panel_archive_without_a_lineage_half_fails_the_case(self):
+        paths = tuple(path for path in _BACKUP_PANEL_PATHS
+                      if not path.startswith("etc/letsencrypt/renewal/"))
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"panel": _panel_facts(paths=paths)}))
+        self.assertIn("etc/letsencrypt/renewal/", str(caught.exception))
+
+    def test_a_panel_archive_without_a_usable_database_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(
+                facts={"panel": _panel_facts(sqlite_header=False)}))
+        self.assertIn("no usable database", str(caught.exception))
+
+    def test_a_panel_archive_without_a_private_key_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(
+                facts={"panel": _panel_facts(private_key_members=[])}))
+        self.assertIn("could not restore a lineage", str(caught.exception))
+
+    def test_a_panel_archive_that_sweeps_in_the_binary_fails_the_case(self):
+        paths = _BACKUP_PANEL_PATHS + ("opt/gowave/gowave-server",)
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"panel": _panel_facts(paths=paths)}))
+        self.assertIn("forbids", str(caught.exception))
+
+    def test_a_panel_archive_that_sweeps_in_the_worker_fails_the_case(self):
+        paths = _BACKUP_PANEL_PATHS + ("opt/gowave-node/.env",)
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"panel": _panel_facts(paths=paths)}))
+        self.assertIn("two role archives are mixed", str(caught.exception))
+
+    def test_a_panel_archive_without_its_secret_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"panel": _panel_facts(
+                env_keys={"opt/gowave/.env": ["GOWAVE_PROXY"]})}))
+        self.assertIn("APP_SECRET", str(caught.exception))
+
+    def test_a_worker_archive_carrying_anything_else_fails_the_case(self):
+        paths = _BACKUP_NODE_PATHS + ("opt/gowave-node/gowave-node",)
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"node": _node_facts(paths=paths)}))
+        self.assertIn("credentials-only", str(caught.exception))
+
+    def test_a_worker_archive_without_its_secret_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"node": _node_facts(
+                env_keys={"opt/gowave-node/.env": ["NODE_PORT"]})}))
+        self.assertIn("SECRET_KEY", str(caught.exception))
+
+    def test_declared_checksums_for_absent_members_fail_the_case(self):
+        declared = _BACKUP_PANEL_PATHS + ("opt/gowave/missing.conf",)
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(
+                facts={"panel": _panel_facts(declared=declared)}))
+        self.assertIn("opt/gowave/missing.conf", str(caught.exception))
+
+    def test_an_archive_of_the_wrong_type_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(facts={"node": _node_facts(type="panel")}))
+        self.assertIn("wrong contract", str(caught.exception))
+
+    def test_a_failed_creation_fails_the_case_with_the_product_error(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(backup_returncode={"panel": 1}))
+        self.assertIn("could not create a panel archive", str(caught.exception))
+        self.assertIn("backup root is missing", str(caught.exception))
+
+    def test_a_creation_without_the_archives_path_fails_the_case(self):
+        class SilentPodman(_BackupPodman):
+            def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+                result = super().exec_bash(container, script, check=check,
+                                           input_text=input_text, timeout=timeout)
+                if "gowave-auto.sh backup" in script:
+                    return subprocess.CompletedProcess(result.args, 0, "Done.\n", "")
+                return result
+
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=SilentPodman())
+        self.assertIn("did not name the archive", str(caught.exception))
+
+    def test_a_validator_that_refuses_the_archive_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(verify_returncode={"node": 1}))
+        self.assertIn("own validator refused", str(caught.exception))
+        self.assertIn("strict allowlist", str(caught.exception))
+
+    def test_a_validator_that_does_not_report_its_verdict_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_BackupPodman(verify_stdout=""))
+        self.assertIn("own validator refused", str(caught.exception))
+
+    def test_it_reads_the_archive_the_product_named_rather_than_a_default(self):
+        class ElsewherePodman(_BackupPodman):
+            def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+                result = super().exec_bash(container, script, check=check,
+                                           input_text=input_text, timeout=timeout)
+                if "gowave-auto.sh backup" in script and container == "aio-master":
+                    return subprocess.CompletedProcess(
+                        result.args, 0,
+                        "Panel backup created successfully: "
+                        "/var/backups/gowave/custom-panel.tar.gz (mode 0600).\n", "")
+                return result
+
+        podman = ElsewherePodman(facts={"panel": _panel_facts(
+            path="/var/backups/gowave/custom-panel.tar.gz")})
+        evidence = self.run_case(podman=podman)
+        probed = [script for container, script in podman.scripts
+                  if container == "aio-master" and "tarfile" in script]
+        self.assertEqual(len(probed), 1)
+        self.assertIn("/var/backups/gowave/custom-panel.tar.gz", probed[0])
+        self.assertEqual(evidence["roles"]["master"]["path"],
+                         "/var/backups/gowave/custom-panel.tar.gz")
+
+    def test_the_case_reads_its_archives_before_the_lifecycle_block(self):
+        # Both archives carry install-time credentials and lineages of a role
+        # the lifecycle cases revoke or stop, so this case reads them first.
+        with tempfile.TemporaryDirectory() as directory:
+            suite = multi_node.cases(_StubPodman(Path(directory)))
+        ids = [case.id for case in suite]
+        self.assertEqual(suite[ids.index(multi_node.BACKUP_CASE_ID)].topology, "multi-node")
+        self.assertEqual(suite[ids.index(multi_node.BACKUP_CASE_ID)].timeout_seconds,
+                         multi_node.BACKUP_TIMEOUT_SECONDS)
+        self.assertLess(ids.index(multi_node.COVER_UNRESOLVED_CASE_ID),
+                        ids.index(multi_node.BACKUP_CASE_ID))
+        self.assertLess(ids.index(multi_node.BACKUP_CASE_ID),
+                        ids.index(multi_node.REVOCATION_CASE_ID))
+
+
+class TestBackupArchiveParsing(unittest.TestCase):
+    """The archive path is the one line the product prints, and nothing else."""
+
+    def test_the_last_created_line_names_the_archive(self):
+        stdout = (
+            "Preparing archive...\n"
+            "Panel backup created successfully: /tmp/one.tar.gz (mode 0600).\n"
+            "Node backup created successfully: /var/backups/two.tar.gz (mode 0600).\n"
+        )
+        self.assertEqual(multi_node.parse_backup_archive(stdout),
+                         "/var/backups/two.tar.gz")
+
+    def test_a_relative_or_absent_path_names_no_archive(self):
+        self.assertEqual(multi_node.parse_backup_archive(
+            "Panel backup created successfully: gowave-backup-panel-1.tar.gz"), "")
+        self.assertEqual(multi_node.parse_backup_archive("Done.\n"), "")
+        self.assertEqual(multi_node.parse_backup_archive(""), "")
 
 
 if __name__ == "__main__":

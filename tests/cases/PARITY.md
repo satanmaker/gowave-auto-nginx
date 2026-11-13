@@ -85,6 +85,7 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **NGX-COVER-UNRESOLVED** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **NGX-WORKER-ACME80** — promotion target: Distributed Worker VPS Deployment Verification
 - **TLS-VERIFY-ANCHORS** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **MN-BACKUP** — promotion target: Signal-Safe and Verifiable Transaction Compensation
 - **PODNET-MASTER-ADDR** — promotion target: Distributed Worker VPS Deployment Verification
 - **WRK-06** — promotion target: Distributed Worker VPS Deployment Verification
 - **ACME-REJECT-ARB** — promotion target: Global Certbot Deploy Hook Ownership

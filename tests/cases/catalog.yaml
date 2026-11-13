@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 74
-  total: 199
+  podman_first: 75
+  total: 200
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3668,6 +3668,25 @@ cases:
   driver: null
   driver_status: planned
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: MN-BACKUP
+  requirement: Backup and Restore Format v1
+  live_scenario: null
+  assertion: 'Both archive types are produced through the operator''s own interface — --type panel on
+    Master and --type node on Worker — as mode-0600 Format v1 archives whose actual contents match their
+    documented allowlists: the Panel archive carries the database, environment, NGINX vhosts, the complete
+    certificate lineage and run state with every declared checksum present and no binary, while the Worker
+    archive carries exactly its environment file, and the product''s own validator accepts both.'
+  assertion_sha256: 9dee0ceb150d7c34c5d99078f1c28a18f077a7ec8481ce4f8f1e8dafee735545
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Signal-Safe and Verifiable Transaction Compensation
 - id: PODNET-MASTER-ADDR
   requirement: Podman-only Master address selection for Worker provisioning
   live_scenario: null
