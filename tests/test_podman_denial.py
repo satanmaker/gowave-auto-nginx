@@ -455,6 +455,54 @@ class TestHostFirewallParsers(unittest.TestCase):
     def test_a_probe_without_a_report_is_empty(self):
         self.assertEqual(denial.parse_tcp_paths("bash: python3: not found\n"), {})
 
+    def test_the_shell_probe_carries_every_attempt_as_data(self):
+        script = denial.tcp_paths_shell_script([
+            {"label": "untrusted-master-443", "address": "10.89.0.10", "port": 443,
+             "timeout": 5},
+            {"label": "untrusted-master-9443", "address": "10.89.0.10", "port": 9443,
+             "timeout": 5},
+        ])
+        self.assertIn("dev/tcp/$address/$port", script)
+        self.assertIn("untrusted-master-443\t10.89.0.10\t443\t5\n", script)
+        self.assertIn("untrusted-master-9443\t10.89.0.10\t9443\t5\n", script)
+
+    def test_a_shell_attempt_that_would_break_the_report_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            denial.tcp_paths_shell_script([
+                {"label": "bad\tlabel", "address": "10.89.0.10", "port": 443},
+            ])
+        self.assertIn("separator", str(caught.exception))
+
+    def test_the_shell_probe_is_read_by_label_with_its_own_outcome(self):
+        observed = denial.parse_shell_tcp_paths(
+            "path\tclient-443\t10.89.0.11\t443\tCONNECTED\t3\t\n"
+            "path\tclient-9443\t10.89.0.11\t9443\tREFUSED\t1\tconnect: Connection refused\n"
+            "noise\n"
+        )
+        self.assertEqual(sorted(observed), ["client-443", "client-9443"])
+        self.assertEqual(observed["client-443"]["outcome"], "CONNECTED")
+        self.assertEqual(observed["client-443"]["port"], 443)
+        self.assertEqual(observed["client-9443"]["outcome"], "REFUSED")
+        self.assertIn("Connection refused", observed["client-9443"]["detail"])
+
+    def test_the_probe_that_needs_no_python_runs_through_the_shell(self):
+        from types import SimpleNamespace
+        from unittest import mock
+
+        podman = SimpleNamespace(exec_bash=mock.Mock(return_value=SimpleNamespace(
+            returncode=0,
+            stdout="path\tuntrusted-9443\t10.89.0.11\t9443\tTIMEOUT\t5001\t\n",
+            stderr="",
+        )))
+        observed = denial.tcp_paths_shell(
+            podman, "untrusted-01",
+            [{"label": "untrusted-9443", "address": "10.89.0.11", "port": 9443,
+              "timeout": 5}],
+        )
+        self.assertEqual(observed["untrusted-9443"]["outcome"], "TIMEOUT")
+        self.assertEqual(observed["returncode"], 0)
+        podman.exec_bash.assert_called_once()
+
     def test_the_listeners_are_read_per_port_and_only_for_declared_ports(self):
         bound = denial.parse_listeners(
             self.Listeners + ["LISTEN 0      4096       [::]:3000          [::]:*"],
