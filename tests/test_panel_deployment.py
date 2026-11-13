@@ -3,7 +3,9 @@ import hashlib
 import http.server
 import json
 import os
+import shlex
 import socket
+import ssl
 import subprocess
 import tarfile
 import tempfile
@@ -14,6 +16,100 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PREFLIGHT_SH = REPO_ROOT / "modules" / "preflight.sh"
 PANEL_SH = REPO_ROOT / "modules" / "panel.sh"
+
+
+def verify_probe_script(directory: Path) -> Path:
+    """The product's public TLS/SNI probe, lifted out of the entrypoint script.
+
+    `gowave-auto.sh` routes on `$1` at the bottom, so a test cannot simply source
+    it; slice the one function out instead, the way the domain-change journal
+    test reads its body.
+    """
+    text = (REPO_ROOT / "gowave-auto.sh").read_text(encoding="utf-8")
+    body = text[text.index("verify_public_tls_sni() {"):text.index("acquire_lock() {")]
+    script = Path(directory) / "verify_public_tls_sni.sh"
+    script.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body, encoding="utf-8")
+    return script
+
+
+def issue_self_signed(directory: Path, name: str, san: str):
+    """A self-signed certificate that doubles as its own trust anchor."""
+    key = Path(directory) / f"{name}.key"
+    cert = Path(directory) / f"{name}.crt"
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(key), "-out", str(cert), "-days", "30",
+        "-subj", f"/CN={name}", "-addext", f"subjectAltName=DNS:{san}",
+    ], check=True, stderr=subprocess.DEVNULL)
+    return cert, key
+
+
+def run_public_tls_probe(script: Path, domain: str, address: str, attempts: int, ca_file: Path):
+    env = os.environ.copy()
+    env["GOWAVE_TLS_CA_FILE"] = str(ca_file)
+    command = (
+        f'source {shlex.quote(str(script))} && '
+        f"verify_public_tls_sni {shlex.quote(domain)} {shlex.quote(address)} {attempts}"
+    )
+    return subprocess.run(
+        ["bash", "-c", command], capture_output=True, text=True, env=env, timeout=120,
+    )
+
+
+class TlsListener:
+    """Answer each connection with the next certificate in the list.
+
+    A reload leaves the previous nginx generation answering for a moment with the
+    certificate the change replaced, and this models exactly that: the first
+    connection gets one certificate, every later one the next in line.
+    """
+
+    def __init__(self, chains):
+        self._contexts = []
+        for cert, key in chains:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certfile=str(cert), keyfile=str(key))
+            self._contexts.append(context)
+        self._sock = socket.socket()
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(8)
+        self._sock.settimeout(0.2)
+        self.address = f"127.0.0.1:{self._sock.getsockname()[1]}"
+        self.connections = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        while not self._stop.is_set():
+            try:
+                raw, _ = self._sock.accept()
+            except (socket.timeout, OSError):
+                continue
+            index = min(self.connections, len(self._contexts) - 1)
+            self.connections += 1
+            try:
+                with self._contexts[index].wrap_socket(raw, server_side=True) as tls:
+                    tls.recv(1024)
+            except (ssl.SSLError, OSError):
+                pass
+            finally:
+                try:
+                    raw.close()
+                except OSError:
+                    pass
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=5)
+        self._sock.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
 
 
 class TestPanelDeployment(unittest.TestCase):
@@ -285,6 +381,81 @@ class TestPanelDeployment(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_public_tls_probe_accepts_the_certificate_the_listener_serves(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            script = verify_probe_script(tmp)
+            cert, key = issue_self_signed(tmp, "panel", "panel.testbed.internal")
+
+            with TlsListener([(cert, key)]) as listener:
+                res = run_public_tls_probe(
+                    script, "panel.testbed.internal", listener.address, 1, cert,
+                )
+
+            self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_public_tls_probe_fails_closed_on_a_foreign_name(self):
+        # The listener answers with a perfectly valid certificate for another
+        # host, which is what a half-applied reload looks like. The probe must
+        # name the certificate it actually got instead of failing silently.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            script = verify_probe_script(tmp)
+            good, good_key = issue_self_signed(tmp, "panel", "panel.testbed.internal")
+            foreign, foreign_key = issue_self_signed(tmp, "other", "other.testbed.internal")
+
+            with TlsListener([(foreign, foreign_key)]) as listener:
+                res = run_public_tls_probe(
+                    script, "panel.testbed.internal", listener.address, 1, good,
+                )
+
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("did not prove TLS for panel.testbed.internal", res.stderr)
+            self.assertIn("wrong certificate", res.stderr)
+            self.assertIn("DNS:other.testbed.internal", res.stderr)
+
+    def test_public_tls_probe_fails_closed_on_an_untrusted_chain(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            script = verify_probe_script(tmp)
+            served, served_key = issue_self_signed(tmp, "panel", "panel.testbed.internal")
+            stranger, _ = issue_self_signed(tmp, "stranger", "panel.testbed.internal")
+
+            with TlsListener([(served, served_key)]) as listener:
+                res = run_public_tls_probe(
+                    script, "panel.testbed.internal", listener.address, 1, stranger,
+                )
+
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("did not prove TLS for panel.testbed.internal", res.stderr)
+
+    def test_public_tls_probe_waits_for_a_reload_to_settle(self):
+        """A reload only signals the master; the old workers answer for a moment.
+
+        The first handshake therefore still gets the previous certificate, and a
+        single-shot probe would abort a domain change whose listener is already
+        correct. The probe has to judge the settled listener, while a listener
+        that never settles still fails (the two tests above).
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            script = verify_probe_script(tmp)
+            old, old_key = issue_self_signed(tmp, "old", "panel1.testbed.internal")
+            new, new_key = issue_self_signed(tmp, "new", "panel.testbed.internal")
+
+            with TlsListener([(old, old_key), (new, new_key)]) as listener:
+                settled = run_public_tls_probe(
+                    script, "panel.testbed.internal", listener.address, 3, new,
+                )
+                self.assertEqual(settled.returncode, 0, settled.stderr)
+                self.assertGreaterEqual(listener.connections, 2)
+
+            with TlsListener([(old, old_key)]) as stale:
+                single = run_public_tls_probe(
+                    script, "panel.testbed.internal", stale.address, 1, new,
+                )
+                self.assertNotEqual(single.returncode, 0)
 
     def test_save_credentials_bash(self):
         with tempfile.TemporaryDirectory() as tmpdir:

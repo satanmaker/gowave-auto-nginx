@@ -30,6 +30,8 @@ reload_nginx_strict() {
 
 verify_public_tls_sni() {
     local domain="$1"
+    local connect="${2:-127.0.0.1:443}"
+    local attempts="${3:-10}"
     command -v timeout >/dev/null 2>&1 || { echo "Fatal: timeout is required for TLS verification." >&2; return 1; }
     local ca_opts=(-CApath /etc/ssl/certs)
     if [[ -n "${GOWAVE_TLS_CA_FILE:-}" ]]; then
@@ -39,15 +41,71 @@ verify_public_tls_sni() {
         fi
         ca_opts=(-CAfile "$GOWAVE_TLS_CA_FILE")
     fi
-    if timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$domain" \
-        -verify_return_error -verify_hostname "$domain" "${ca_opts[@]}" -brief </dev/null; then
-        return 0
-    fi
-    # "hostname mismatch" alone leaves an operator guessing whether the wrong
-    # certificate or the wrong SNI route answered, so name both on failure.
-    local served routed certificate
-    served=$(timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$domain" </dev/null 2>/dev/null \
-        | openssl x509 -noout -subject -issuer -ext subjectAltName 2>/dev/null || true)
+    local workdir
+    workdir=$(mktemp -d "${TMPDIR:-/tmp}/gowave-tls-sni.XXXXXX") || {
+        echo "Fatal: Could not create a temporary directory for TLS verification." >&2
+        return 1
+    }
+    # `systemctl reload nginx` only hands the new configuration to the master:
+    # the previous worker generation keeps its own certificates until it drains,
+    # so the first handshake after a reload can still be answered with what the
+    # change just replaced. Wait for the listener to settle, but judge every
+    # attempt strictly -- a name the served certificate does not cover, or a
+    # chain the trust store does not anchor, still fails closed.
+    local attempt name_check trust_check served
+    for ((attempt = 1; attempt <= attempts; attempt++)); do
+        rm -f -- "$workdir/chain.pem" "$workdir/leaf.pem" "$workdir/untrusted.pem"
+        timeout 10 openssl s_client -connect "$connect" -servername "$domain" -showcerts \
+            "${ca_opts[@]}" </dev/null >"$workdir/chain.pem" 2>"$workdir/handshake.log" || true
+        # s_client interleaves its banner with the PEM chain, so split the
+        # certificates out instead of trusting the raw stream.
+        awk -v leaf="$workdir/leaf.pem" -v rest="$workdir/untrusted.pem" '
+            /^-----BEGIN CERTIFICATE-----$/ {
+                seen += 1
+                inside = 1
+                target = (seen == 1) ? leaf : rest
+                print > target
+                next
+            }
+            /^-----END CERTIFICATE-----$/ {
+                if (inside) {
+                    print > target
+                    inside = 0
+                }
+                next
+            }
+            inside { print > target }
+        ' "$workdir/chain.pem" 2>/dev/null || true
+        if [[ -s "$workdir/leaf.pem" ]]; then
+            name_check=$(openssl x509 -noout -checkhost "$domain" -in "$workdir/leaf.pem" 2>&1 || true)
+            if [[ "$name_check" == "Hostname $domain does match certificate" ]]; then
+                if [[ -s "$workdir/untrusted.pem" ]]; then
+                    trust_check=$(openssl verify "${ca_opts[@]}" -untrusted "$workdir/untrusted.pem" \
+                        "$workdir/leaf.pem" 2>&1 || true)
+                else
+                    trust_check=$(openssl verify "${ca_opts[@]}" "$workdir/leaf.pem" 2>&1 || true)
+                fi
+                if [[ "$trust_check" == *": OK" ]]; then
+                    rm -rf -- "$workdir"
+                    return 0
+                fi
+                served=$(printf '%s' "$trust_check" | tr -s '[:space:]' ' ' | cut -c1-300)
+            else
+                served=$(openssl x509 -noout -ext subjectAltName -in "$workdir/leaf.pem" 2>/dev/null \
+                    | tr -s '[:space:]' ' ' || true)
+                served="wrong certificate: ${served:-no subjectAltName}"
+            fi
+        else
+            served="no certificate was served"
+        fi
+        if ((attempt < attempts)); then
+            # Give the previous worker generation time to finish draining.
+            sleep 1
+        fi
+    done
+    # The bare error leaves an operator guessing whether the wrong certificate
+    # or the wrong SNI route answered, so name everything on failure.
+    local routed certificate
     routed=$(grep -F "$domain " /etc/nginx/stream-enabled/gowave-stream.conf 2>/dev/null \
         | head -n 1 || true)
     certificate=$(grep -E '^[[:space:]]*ssl_certificate[[:space:]]' /etc/nginx/conf.d/gowave-panel.conf 2>/dev/null \
@@ -55,8 +113,12 @@ verify_public_tls_sni() {
     echo "Error: The port 443 listener did not prove TLS for $domain." >&2
     echo "  SNI map entry: ${routed:-none}" >&2
     echo "  Panel listener certificate: ${certificate:-none}" >&2
-    echo "  Served certificate:" >&2
-    printf '%s\n' "${served:-  unreadable}" >&2
+    echo "  Last attempt answered with: ${served:-unreadable}" >&2
+    if [[ -s "$workdir/handshake.log" ]]; then
+        echo "  Handshake log:" >&2
+        tail -n 5 "$workdir/handshake.log" >&2 || true
+    fi
+    rm -rf -- "$workdir"
     return 1
 }
 
