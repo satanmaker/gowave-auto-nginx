@@ -67,6 +67,14 @@ FIREWALL_PORTS: Sequence[int] = (
 # origin plus both readings of the rule set.
 FIREWALL_ATTEMPT_TIMEOUT_SECONDS = 5
 FIREWALL_TIMEOUT_SECONDS = 300
+# FW-04 asks the same question through the other address family. The product
+# decides from the kernel whether to publish IPv6 listeners and to mirror its
+# rules onto ip6tables, so the run keeps one dual-stack role (the Master) and one
+# IPv4-only role (the Worker) and reads both branches in a single run.
+IPV6_CASE_ID = "FW-04"
+IPV6_PUBLISHED_PORTS: Sequence[int] = (denial.SSH_PORT, denial.HTTP_PORT, denial.HTTPS_PORT)
+IPV6_ATTEMPT_TIMEOUT_SECONDS = 5
+IPV6_TIMEOUT_SECONDS = 300
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 VISION_PROBE_TIMEOUT_SECONDS = 120
@@ -2405,6 +2413,356 @@ def case_master_access(product: MultiNodeProduct) -> Dict[str, Any]:
     )
 
 
+def ipv6_facts(product: MultiNodeProduct, case_id: str) -> Dict[str, Any]:
+    """Both roles' IPv6 declarations, and what the Master's v6 sockets answer.
+
+    The Master runs with its IPv6 stack switched on, the Worker without one, and
+    the product was installed on both after that was settled — so each role's own
+    surfaces say which branch its install took. The Master's v6 sockets are then
+    dialled for real from the host itself: an internal port that answers there is
+    published, and one that is refused has no v6 socket at all, which is a
+    different observation from a packet the v6 rules dropped.
+    """
+    host = product.require_worker()
+    ports = FIREWALL_PORTS
+    master = denial.host_firewall(product.podman, host.target_name, ports)
+    require(
+        case_id,
+        master.get("chain_returncode") == 0,
+        f"the Master's IPv4 rules could not be read (exit {master.get('chain_returncode')}): "
+        f"{master.get('error') or master.get('detail') or 'no output'}",
+    )
+    worker = denial.host_firewall(product.podman, host.worker_name, ports)
+    require(
+        case_id,
+        worker.get("chain_returncode") == 0,
+        f"the Worker's IPv4 rules could not be read (exit {worker.get('chain_returncode')}): "
+        f"{worker.get('error') or worker.get('detail') or 'no output'}",
+    )
+
+    address = host.ipv6_address
+    require(
+        case_id,
+        bool(address),
+        "the Master never received an IPv6 address, so this run cannot exercise the product's "
+        "enabled branch and would pass by inspecting the disabled one twice",
+    )
+    attempts = [
+        {
+            "label": label,
+            "address": address,
+            "port": port,
+            "timeout": IPV6_ATTEMPT_TIMEOUT_SECONDS,
+        }
+        for label, port in (
+            ("https", denial.HTTPS_PORT),
+            ("http", denial.HTTP_PORT),
+            ("node", denial.NODE_PORT),
+            ("panel-api", denial.PANEL_API_PORT),
+        )
+    ]
+    master_paths = denial.tcp_paths(product.podman, host.target_name, attempts)
+    require(
+        case_id,
+        any(key not in ("returncode", "detail") for key in master_paths),
+        f"the Master's IPv6 probe produced no report (exit {master_paths.get('returncode')}): "
+        f"{master_paths.get('detail') or 'no output'}",
+    )
+    worker_paths = denial.tcp_paths(
+        product.podman,
+        host.worker_name,
+        [{
+            "label": "ssh-port",
+            "address": "::1",
+            "port": denial.SSH_PORT,
+            "timeout": IPV6_ATTEMPT_TIMEOUT_SECONDS,
+        }],
+    )
+    require(
+        case_id,
+        any(key not in ("returncode", "detail") for key in worker_paths),
+        f"the Worker's IPv6 probe produced no report (exit {worker_paths.get('returncode')}): "
+        f"{worker_paths.get('detail') or 'no output'}",
+    )
+    return {
+        "master": master,
+        "worker": worker,
+        "address": address,
+        "master_paths": master_paths,
+        "worker_paths": worker_paths,
+        # Whatever the case proves, it cannot prove this: the run network is
+        # IPv4-only, so there is no IPv6 origin to probe from and no AAAA record
+        # to route. Saying so in the evidence is cheaper than letting a reader
+        # assume the Control Machine half was measured.
+        "limitation": {
+            "status": "NOT_APPLICABLE",
+            "reason": (
+                "the run network carries IPv4 only, so no IPv6 origin and no AAAA routing exist "
+                "for the Control Machine probe; a real external IPv6 source is live-only"
+            ),
+        },
+    }
+
+
+def ipv6_contract(facts: Dict[str, Any], case_id: str) -> Dict[str, Any]:
+    """Each role's branch, read back from the surfaces the product writes.
+
+    The Master is the dual-stack host: its kernel has an address, so the install
+    must declare ``IPV6=yes``, mirror the same allow/deny decisions onto the v6
+    chain, and publish ``[::]`` listeners for exactly the ports it publishes on
+    IPv4. The Worker is the IPv4-only host: no address, ``IPV6=no``, no v6 chain,
+    no ``[::]`` listener — and its IPv4 rule set is unchanged, which is what makes
+    the branch a decision rather than a side effect.
+    """
+    master, worker = facts["master"], facts["worker"]
+    master_v6, worker_v6 = master["ipv6"], worker["ipv6"]
+    ports = FIREWALL_PORTS
+
+    require(
+        case_id,
+        master_v6["kernel_addresses"],
+        "the Master reports no address in /proc/net/if_inet6, which is the input the product's "
+        "own check reads: the enabled branch was never reachable in this run",
+    )
+    require(
+        case_id,
+        not master_v6["kernel_disabled"],
+        "the Master's kernel disables IPv6, so its install could not take the enabled branch",
+    )
+    require(
+        case_id,
+        master_v6["declared"] == "yes",
+        f"the Master has IPv6 but /etc/default/ufw declares "
+        f"IPV6={master_v6['declared'] or 'nothing'}: the firewall would not filter v6 traffic at all",
+    )
+    require(
+        case_id,
+        master_v6["active"],
+        "the Master has no ufw6-user-input chain, so enabling IPv6 left the v6 stack unfiltered "
+        "instead of mirroring the rule set onto it",
+    )
+    for port in IPV6_PUBLISHED_PORTS:
+        require(
+            case_id,
+            denial.open_to_every_source(master_v6, port),
+            f"the Master's v6 rules do not open port {port} to every source, so enabling IPv6 "
+            f"closed a port its IPv4 rules publish: "
+            f"{[entry['line'] for entry in master_v6['allows'][port]]}",
+        )
+    require(
+        case_id,
+        not master_v6["allows"][denial.NODE_PORT],
+        f"the Master's v6 rules accept the local node port {denial.NODE_PORT}, so the isolation "
+        f"the IPv4 rules apply is missing on the v6 stack: "
+        f"{[entry['line'] for entry in master_v6['allows'][denial.NODE_PORT]]}",
+    )
+    require(
+        case_id,
+        master_v6["blocks"][denial.NODE_PORT],
+        f"the Master's v6 rules carry no block for the local node port {denial.NODE_PORT}, so v6 "
+        "traffic to it would be answered by the default policy alone rather than by a decision "
+        "about that port",
+    )
+    require(
+        case_id,
+        not master_v6["allows"][denial.PANEL_API_PORT],
+        f"the Master's v6 rules accept the panel API port {denial.PANEL_API_PORT}, so the "
+        "management interface is reachable over IPv6",
+    )
+    for port in (denial.HTTPS_PORT, denial.HTTP_PORT):
+        require(
+            case_id,
+            denial.ipv6_listens_for(master, port),
+            f"the Master renders no `listen [::]` for port {port} although the host has IPv6, so "
+            "the services it publishes on IPv4 are silently IPv4-only",
+        )
+    for port in (denial.NODE_PORT, denial.PANEL_API_PORT):
+        require(
+            case_id,
+            not denial.ipv6_listens_for(master, port),
+            f"the Master renders a `listen [::]` for the internal port {port}: "
+            f"{denial.ipv6_listens_for(master, port)}",
+        )
+    for port in (denial.HTTPS_PORT, denial.HTTP_PORT):
+        addresses = master["listeners"][port]
+        require(
+            case_id,
+            "[::]" in addresses,
+            f"the Master binds no wildcard IPv6 socket on port {port} (`ss` reports {addresses}), "
+            "so the rendered listener never became a socket an IPv6 peer could reach",
+        )
+    # Enabling the v6 stack must not have displaced the v4 one: FW-03 measures
+    # the same decisions in detail, so this only pins coexistence.
+    require(
+        case_id,
+        denial.open_to_every_source(master, denial.HTTPS_PORT),
+        "the Master stopped publishing port 443 on IPv4 once IPv6 was enabled",
+    )
+
+    https = _master_access_path("Master", "https", facts["master_paths"], case_id)
+    require(
+        case_id,
+        https["outcome"] == "CONNECTED",
+        f"[{facts['address']}]:{denial.HTTPS_PORT} ended "
+        f"{https['outcome'] or 'without a verdict'} ({https['detail'] or 'no detail'}), so the "
+        "port the case says is published on IPv6 has no v6 socket",
+    )
+    http = _master_access_path("Master", "http", facts["master_paths"], case_id)
+    require(
+        case_id,
+        http["outcome"] == "CONNECTED",
+        f"[{facts['address']}]:{denial.HTTP_PORT} ended "
+        f"{http['outcome'] or 'without a verdict'} ({http['detail'] or 'no detail'}), so the ACME "
+        "path the product publishes on IPv4 is unreachable over IPv6",
+    )
+    for label, port in (("node", denial.NODE_PORT), ("panel-api", denial.PANEL_API_PORT)):
+        entry = _master_access_path("Master", label, facts["master_paths"], case_id)
+        require(
+            case_id,
+            entry["outcome"] != "CONNECTED",
+            f"the internal {label} port {port} answered over IPv6 at [{facts['address']}], so "
+            "enabling IPv6 published a management port that IPv4 keeps off the network",
+        )
+        require(
+            case_id,
+            entry["outcome"] in ("REFUSED", "UNREACHABLE"),
+            f"the {label} port {port} over IPv6 ended "
+            f"{entry['outcome'] or 'without a verdict'} ({entry['detail'] or 'no detail'}): a "
+            "timeout would mean the v6 rule set dropped a packet, while the port simply having no "
+            "v6 socket is what keeps it unpublished",
+        )
+
+    require(
+        case_id,
+        worker_v6["kernel_disabled"],
+        "the Worker's kernel does not disable IPv6, so this run has no IPv4-only host and the "
+        "product's disabled branch was never exercised",
+    )
+    require(
+        case_id,
+        not worker_v6["kernel_addresses"],
+        f"the Worker reports IPv6 addresses {worker_v6['kernel_addresses']}, so it is not the "
+        "IPv4-only host this case measures",
+    )
+    require(
+        case_id,
+        worker_v6["declared"] == "no",
+        f"the Worker has no IPv6 but /etc/default/ufw declares "
+        f"IPV6={worker_v6['declared'] or 'nothing'}, so the install misread the host",
+    )
+    require(
+        case_id,
+        not worker_v6["active"],
+        "the Worker carries a ufw6-user-input chain although its host has no IPv6",
+    )
+    for port in ports:
+        require(
+            case_id,
+            not worker_v6["allows"][port] and not worker_v6["blocks"][port],
+            f"the Worker's v6 rules name port {port} although the host has no IPv6: "
+            f"{[entry['line'] for entry in worker_v6['allows'][port] + worker_v6['blocks'][port]]}",
+        )
+    require(
+        case_id,
+        not worker_v6["listens"],
+        f"the Worker renders `listen [::]` entries although its host has no IPv6: "
+        f"{worker_v6['listens']}",
+    )
+    for port in IPV6_PUBLISHED_PORTS:
+        require(
+            case_id,
+            denial.open_to_every_source(worker, port),
+            f"the Worker stopped publishing port {port} on IPv4 in its IPv4-only branch: "
+            f"{[entry['line'] for entry in worker['allows'][port]]}",
+        )
+    require(
+        case_id,
+        worker["allows"][denial.NODE_PORT],
+        f"the Worker's IPv4 rules carry no allow for the control port {denial.NODE_PORT} from the "
+        "Master, so the IPv4-only branch is not the shape FW-01 measures",
+    )
+    require(
+        case_id,
+        not denial.open_to_every_source(worker, denial.NODE_PORT),
+        f"the Worker's IPv4 rules open the control port {denial.NODE_PORT} to every source",
+    )
+    ssh = _master_access_path("Worker", "ssh-port", facts["worker_paths"], case_id)
+    require(
+        case_id,
+        ssh["outcome"] == "UNREACHABLE",
+        f"the Worker's attempt on its own SSH port over IPv6 ended "
+        f"{ssh['outcome'] or 'without a verdict'} ({ssh['detail'] or 'no detail'}): on a host "
+        "where the stack is absent the attempt has to fail before it can be filtered, which is "
+        "how a reader tells 'no IPv6' from 'IPv6 blocked'",
+    )
+
+    def paths(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        return {
+            label: {
+                "address": entry.get("address"),
+                "port": entry.get("port"),
+                "outcome": entry.get("outcome"),
+                "elapsed_ms": entry.get("elapsed_ms"),
+                "detail": entry.get("detail"),
+            }
+            for label, entry in report.items()
+            if isinstance(entry, dict)
+        }
+
+    def rules(facts_one: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "allows": {
+                str(port): [entry["line"] for entry in facts_one["allows"][port]]
+                for port in ports
+            },
+            "blocks": {
+                str(port): [entry["line"] for entry in facts_one["blocks"][port]]
+                for port in ports
+            },
+        }
+
+    return {
+        "address": facts["address"],
+        "master": {
+            "kernel_addresses": master_v6["kernel_addresses"],
+            "kernel_disabled": master_v6["kernel_disabled"],
+            "declared": master_v6["declared"],
+            "v6_chain": master_v6["active"],
+            "v6_rules": rules(master_v6),
+            "v6_listens": master_v6["listens"],
+            "v4_rules": rules(master),
+            "v4_listeners": {str(port): master["listeners"][port] for port in ports},
+            "paths": paths(facts["master_paths"]),
+        },
+        "worker": {
+            "kernel_addresses": worker_v6["kernel_addresses"],
+            "kernel_disabled": worker_v6["kernel_disabled"],
+            "declared": worker_v6["declared"],
+            "v6_chain": worker_v6["active"],
+            "v6_rules": rules(worker_v6),
+            "v6_listens": worker_v6["listens"],
+            "v4_rules": rules(worker),
+            "paths": paths(facts["worker_paths"]),
+        },
+        "limitation": facts["limitation"],
+    }
+
+
+def case_ipv6_policy(product: MultiNodeProduct) -> Dict[str, Any]:
+    """FW-04: both IPv6 branches the product can take, on hosts that force each one.
+
+    The product never asks whether IPv6 should be filtered; it reads the kernel
+    and either publishes ``[::]`` listeners and mirrors its rules onto ip6tables,
+    or leaves the v6 stack alone. A run that only ever installs on an IPv4 host
+    proves the second branch and calls it IPv6 support. So the Master's IPv6
+    stack is switched on before the install, the Worker is pinned to an IPv4-only
+    host, and the case reads each role's decision back from where the product
+    wrote it: ``/etc/default/ufw``, the v6 chain, the rendered listeners and the
+    wildcard sockets they became, and a real connection to each port.
+    """
+    return ipv6_contract(ipv6_facts(product, IPV6_CASE_ID), IPV6_CASE_ID)
+
+
 def case_cluster_hosts(product: MultiNodeProduct) -> Dict[str, Any]:
     """CLUS-01: every Host names one node, one of its inbounds, and the pinned fingerprint.
 
@@ -3849,6 +4207,12 @@ def cases(
         Case(MASTER_ACCESS_CASE_ID, "multi-node",
              lambda context: case_master_access(product),
              timeout_seconds=FIREWALL_TIMEOUT_SECONDS),
+        # Both IPv6 branches in one case: the Master was installed on a host with
+        # an address and the Worker on one without, so each role's own surfaces
+        # say which branch its install took.
+        Case(IPV6_CASE_ID, "multi-node",
+             lambda context: case_ipv6_policy(product),
+             timeout_seconds=IPV6_TIMEOUT_SECONDS),
         Case("CLUS-01", "multi-node", lambda context: case_cluster_hosts(product),
              timeout_seconds=CLUSTER_TIMEOUT_SECONDS),
         Case("CLUS-02", "multi-node", lambda context: case_cluster_squad(product),

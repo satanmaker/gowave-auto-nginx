@@ -28,6 +28,7 @@ class FakePodman:
         self.waits = []
         self.builds = []
         self.execs = []
+        self.scripts = []
         self.install_script = ""
         self.install_output = install_output
         self.install_returncode = install_returncode
@@ -64,9 +65,17 @@ class FakePodman:
             return subprocess.CompletedProcess(
                 argv, 0, "init=systemd\nsystemd=systemd 255\nsshd=active\n", ""
             )
+        if list(argv) == ["cat", "/proc/net/if_inet6"]:
+            # ``/proc/net/if_inet6`` prints the address as 32 hex digits with no
+            # separators, which is what the product's own check reads.
+            address = ipaddress.ip_address(topology.IPV6_HOST_ADDRESS).exploded.replace(":", "")
+            return subprocess.CompletedProcess(
+                argv, 0, f"{address} 02 80 00 00 00     lo\n", ""
+            )
         raise AssertionError(f"unexpected exec: {argv}")
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
+        self.scripts.append((name, script))
         self.install_script = script
         return subprocess.CompletedProcess(["bash", "-lc", script], self.install_returncode, self.install_output, "")
 
@@ -316,6 +325,14 @@ class TestPodmanTopology(unittest.TestCase):
         argv = podman.execs[-1][1]
         self.assertEqual(argv[argv.index("--max-tls") + 1], "TLSv1.1")
         self.assertIn("--ca", argv)
+
+    def test_the_aio_host_stays_ipv4_only_unless_the_run_asks_for_ipv6(self):
+        # 6.7: the IPv6 branch belongs to the run that has to prove it, so an
+        # ordinary All-in-One host keeps the address table a plain VPS has.
+        instance, podman = self.create()
+        self.assertFalse(instance.ipv6_host)
+        self.assertEqual(instance.ipv6_address, "")
+        self.assertNotIn("disable_ipv6=0", "".join(script for _name, script in podman.scripts))
 
     def test_unsupported_distribution_is_rejected_before_any_container(self):
         podman = FakePodman()
