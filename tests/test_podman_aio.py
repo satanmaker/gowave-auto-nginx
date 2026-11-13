@@ -882,6 +882,65 @@ class TestChannelCases(unittest.TestCase):
         self.assertLess(hook.index("systemd-run"), hook.index("exit 1"))
         self.assertIn(aio.CHANNEL_SABOTAGE_EXEC, aio.channel_rollback_cleanup_script())
 
+    def test_the_sabotage_damages_the_chain_the_probe_reads(self):
+        # Certbot keeps a README beside the lineages, so taking the first name
+        # under live/ leaves the chain untouched while every other target is
+        # damaged — the case then reports a restored chain it never broke. The
+        # script is executed here, not pattern-matched: the digests it records
+        # have to belong to the files it really wrote.
+        tmp = Path(self.tmp.name)
+        source = aio.channel_rollback_script()
+        marker = f"cat > {aio.CHANNEL_SABOTAGE_EXEC} <<'PY'\n"
+        body = source.split(marker, 1)[1].split("\nPY\n", 1)[0]
+        for absolute in ("/var/lib/gowave-auto-nginx", "/etc/letsencrypt", "/etc/nginx",
+                         "/opt/gowave"):
+            body = body.replace(absolute, str(tmp / absolute.lstrip("/")))
+        record_path = tmp / "sabotage.json"
+        body = body.replace("/tmp/gowave-e2e-sabotage.json", str(record_path))
+
+        (tmp / "var/lib/gowave-auto-nginx/recovery/update-1").mkdir(parents=True)
+        (tmp / "var/lib/gowave-auto-nginx/state.json").write_text("{}\n", encoding="utf-8")
+        live = tmp / "etc/letsencrypt/live"
+        (live / "README").parent.mkdir(parents=True, exist_ok=True)
+        (live / "README").write_text("certbot readme\n", encoding="utf-8")
+        chains = {}
+        for domain in ("panel.testbed.internal", "reality.testbed.internal"):
+            (live / domain).mkdir(parents=True)
+            chains[domain] = live / domain / "fullchain.pem"
+            chains[domain].write_text(f"certificate for {domain}\n", encoding="utf-8")
+        gowave = tmp / "opt/gowave"
+        (gowave / "frontend").mkdir(parents=True)
+        (gowave / "gowave-server").write_text("binary\n", encoding="utf-8")
+        (gowave / "gowave.db").write_bytes(b"database\n")
+        (gowave / "frontend/index.html").write_text("<html>panel</html>\n", encoding="utf-8")
+        (gowave / ".env").write_text("GOWAVE_CHANNEL=stable\n", encoding="utf-8")
+        (tmp / "etc/nginx").mkdir(parents=True)
+        (tmp / "etc/nginx/nginx.conf").write_text("events {}\n", encoding="utf-8")
+
+        script = tmp / "sabotage.py"
+        script.write_text(body, encoding="utf-8")
+        completed = subprocess.run(
+            [sys.executable, str(script)], capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(record["snapshot"], str(tmp / "var/lib/gowave-auto-nginx/recovery/update-1"))
+        self.assertEqual(
+            sorted(record["targets"]),
+            ["binary", "database", "environment", "frontend_index", "lineage_chain",
+             "nginx_conf", "state"],
+        )
+        # The probe reports the first lineage it finds under live/, skipping the
+        # README because it carries no chain; the recorded digest has to be that
+        # same file's, and no lineage may be left intact.
+        served = chains["panel.testbed.internal"]
+        self.assertEqual(record["targets"]["lineage_chain"],
+                         hashlib.sha256(served.read_bytes()).hexdigest())
+        for domain, path in chains.items():
+            self.assertTrue(path.read_text(encoding="utf-8").endswith("# e2e sabotage\n"), domain)
+        self.assertIn("E2E_CHANNEL_SABOTAGE=1", (gowave / ".env").read_text(encoding="utf-8"))
+
     def test_the_rollback_case_fails_when_an_area_the_hook_hit_stayed_damaged(self):
         before = self.state()
         sabotage = {

@@ -4605,7 +4605,7 @@ def require_channel_snapshot(
         ("nginx", "the NGINX tree"),
         ("nginx_conf", "the NGINX configuration"),
         ("letsencrypt", "the ACME tree"),
-        ("lineage_chain", "the REALITY certificate chain"),
+        ("lineage_chain", "the ACME lineage chain"),
     ):
         require(
             case_id, snapshot.get(field) == before.get(field) and before.get(field),
@@ -4756,11 +4756,18 @@ def replace(path, data, mode=0o644):
         os.replace(staging, path)
 
 
-lineage = ""
-if os.path.isdir("/etc/letsencrypt/live"):
-    names = sorted(os.listdir("/etc/letsencrypt/live"))
-    if names:
-        lineage = os.path.join("/etc/letsencrypt/live", names[0], "fullchain.pem")
+# Every lineage on the host is damaged, because the probe that reports this
+# digest takes the first fullchain.pem it finds under live/ and the rollback
+# restores the whole tree; picking one name here would leave the case's
+# reading of "was the chain restored" hinging on the sort order.
+chains = []
+live = "/etc/letsencrypt/live"
+if os.path.isdir(live):
+    for name in sorted(os.listdir(live)):
+        candidate = os.path.join(live, name, "fullchain.pem")
+        if os.path.isfile(candidate):
+            chains.append(candidate)
+lineage = chains[0] if chains else ""
 
 replace("/opt/gowave/gowave-server", b"#!/bin/sh\nexit 1\n", 0o755)
 replace("/opt/gowave/gowave.db", b"this is not a sqlite database\n")
@@ -4771,10 +4778,10 @@ with open("/opt/gowave/.env", "rb") as handle:
 replace("/opt/gowave/.env", environment + b"E2E_CHANNEL_SABOTAGE=1\n", 0o640)
 replace("/var/lib/gowave-auto-nginx/state.json", b"{}\n")
 replace("/etc/nginx/nginx.conf", b"# e2e sabotage\n")
-if lineage and os.path.exists(lineage):
-    with open(lineage, "rb") as handle:
+for chain_path in chains:
+    with open(chain_path, "rb") as handle:
         chain = handle.read()
-    replace(lineage, chain + b"\n# e2e sabotage\n")
+    replace(chain_path, chain + b"\n# e2e sabotage\n")
 
 targets = {
     "binary": "/opt/gowave/gowave-server",
@@ -5206,7 +5213,7 @@ def case_channel_rollback(product: AioProduct) -> Dict[str, Any]:
             # tree, so the hook reports them only where the file is really there.
             ("frontend_index", "the frontend document", False),
             ("nginx_conf", "the NGINX configuration", False),
-            ("lineage_chain", "the REALITY certificate chain", False),
+            ("lineage_chain", "the ACME lineage chain", False),
         ):
             if before_digest[injected] is None and not mandatory:
                 continue
@@ -5226,7 +5233,7 @@ def case_channel_rollback(product: AioProduct) -> Dict[str, Any]:
             "nginx": "the NGINX tree",
             "nginx_conf": "the NGINX configuration",
             "letsencrypt": "the ACME tree",
-            "lineage_chain": "the REALITY certificate chain",
+            "lineage_chain": "the ACME lineage chain",
         }
         for field, label in restored.items():
             require(
