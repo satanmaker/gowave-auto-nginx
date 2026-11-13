@@ -1699,6 +1699,15 @@ class TestWorkerReapply(unittest.TestCase):
         self.assertNotIn("associate_node", self.branch)
         self.assertNotIn("provision_config_profile", self.branch)
 
+    def test_the_identity_is_read_by_label_so_an_empty_name_survives(self):
+        # A Worker without Vision prints an empty fifth field, and command
+        # substitution strips trailing empty lines, so a positional read loses
+        # the name it was asked for and refuses a perfectly valid node.
+        self.assertIn("while IFS='=' read -r key value", self.branch)
+        self.assertIn('address) ip="$value"', self.branch)
+        self.assertIn('vision_domain) vision_domain="$value"', self.branch)
+        self.assertNotIn("mapfile", self.branch)
+
     def test_it_streams_the_shipped_payload_with_only_the_registered_identity(self):
         self.assertIn('"$SCRIPT_DIR/gowave-node-auto.sh" remote_payload', self.branch)
         call = [line for line in self.branch.splitlines() if "remote_payload" in line]
