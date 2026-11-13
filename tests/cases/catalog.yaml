@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 72
-  total: 197
+  podman_first: 73
+  total: 198
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3565,6 +3565,27 @@ cases:
   assertion: The cover apex is the last two labels of panel_domain and a domain with fewer than three
     labels produces no cover lineage and is handled explicitly.
   assertion_sha256: d743362e7871c15495dfb5416fab2506507b5e62cb80de64d51396639b031863
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: NGINX SNI Routing and REALITY Decoy Verification
+- id: NGX-COVER-SITE
+  requirement: Camouflage decoy and certificate lineage
+  live_scenario: null
+  assertion: 'The rendered cover site is a complete branded site: every template document is present,
+    the brand is derived from the apex''s second-to-last label and appears in the front page''s title,
+    header and footer, no document keeps a template placeholder, no document names the panel, its API
+    routes or the loopback decoy listeners, and an independent client fetching every page and every asset
+    the pages reference from the apex receives byte-identical copies of the files the host rendered with
+    the MIME type NGINX assigns each asset kind.'
+  assertion_sha256: 7160341fa0529b200270d703188f8d22df9a92901e45cbdce650001cd1a1b96e
   runs_in:
   - podman
   state: incubating
