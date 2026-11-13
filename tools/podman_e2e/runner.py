@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import tempfile
 import threading
 import time
@@ -30,6 +31,34 @@ NOT_APPLICABLE = "NOT_APPLICABLE"
 INCOMPLETE = "INCOMPLETE"
 
 FAILING_STATES = {FAIL, BLOCKED, INCOMPLETE}
+
+
+def repository_state(checkout: Optional[Path] = None) -> Dict[str, str]:
+    """The commit and tree state the run is measuring, recorded with its result.
+
+    A run is only evidence for the code it started on, and a run started before a
+    fix cannot contain it. Recording the revision makes that comparison a fact in
+    the artifact instead of a timestamp argument — the checkout is declared safe
+    because ``sudo`` runs the suite as root inside an operator-owned tree, and a
+    missing git is reported as an unknown revision rather than failing the run.
+    """
+    root = checkout or Path(__file__).resolve().parent.parent.parent
+
+    def git(*args: str) -> str:
+        try:
+            completed = subprocess.run(
+                ["git", "-c", f"safe.directory={root}", "-C", str(root), *args],
+                capture_output=True, text=True, check=False, timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return completed.stdout.strip() if completed.returncode == 0 else ""
+
+    commit = git("rev-parse", "HEAD")
+    if not commit:
+        return {"commit": "unknown", "tree": "unknown"}
+    dirty = bool(git("status", "--porcelain", "--untracked-files=no"))
+    return {"commit": commit, "tree": "dirty" if dirty else "clean"}
 
 
 def operator_identity(artifact_root: Path) -> Optional[tuple[int, int]]:
@@ -342,7 +371,7 @@ class Runner:
             "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - self.context.elapsed())),
             "duration": round(self.context.elapsed(), 3),
             "budget_seconds": self.context.budget_seconds,
-            "environment": self.context.environment,
+            "environment": {**self.context.environment, "repository": repository_state()},
             "cases": [result.to_dict() for result in self.results],
         }
         overall = overall_status(self.results)
