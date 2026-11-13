@@ -481,6 +481,12 @@ ACME_LINEAGE_DIR = "/etc/letsencrypt/live"
 # certificate it received are then that invocation's own words instead of a line
 # the install or an earlier phase left behind.
 ACME_RENEWAL_LOG_DIR = "/tmp/gowave-e2e-acme-logs"
+# ``certbot renew`` reports through ``_renew_describe_results``, whose only
+# success line is this summary. "Successfully received certificate." is printed
+# by ``_report_new_cert``, which the certonly and run verbs use, so it can never
+# appear in a renew transcript: looking for it made a successful renewal read as
+# "no certificate received".
+CERTBOT_RENEWAL_SUCCEEDED = "Congratulations, all renewals succeeded"
 # One phase costs a full Certbot renewal against the local directory plus the
 # master replacing its workers; the ceilings are hang guards, not expectations.
 ACME_PROBE_TIMEOUT_SECONDS = 180
@@ -785,13 +791,13 @@ def acme_renewal_script(
     )
 
 
-ACME_OUTAGE_SCRIPT = r"""python3 - MODE_PLACEHOLDER WEBROOT_PLACEHOLDER ORIGINAL_MODE_PLACEHOLDER HOST_PLACEHOLDER MARKER_PLACEHOLDER HOSTS_PLACEHOLDER <<'PY'
+ACME_OUTAGE_SCRIPT = r"""python3 - MODE_PLACEHOLDER WEBROOT_PLACEHOLDER PRIOR_OCTAL_PLACEHOLDER HOST_PLACEHOLDER MARKER_PLACEHOLDER HOSTS_PLACEHOLDER <<'PY'
 import json
 import os
 import subprocess
 import sys
 
-MODE, WEBROOT, ORIGINAL_MODE, HOST, MARKER, HOSTS = sys.argv[1:7]
+MODE, WEBROOT, PRIOR_MODE, HOST, MARKER, HOSTS = sys.argv[1:7]
 
 
 def run(argv, timeout=60):
@@ -856,7 +862,7 @@ if MODE == "challenge-block":
     os.chmod(WEBROOT, 0o700)
     report["webroot_mode_after"] = webroot_mode()
 elif MODE == "challenge-restore":
-    os.chmod(WEBROOT, int(ORIGINAL_MODE, 8))
+    os.chmod(WEBROOT, int(PRIOR_MODE, 8))
     report["webroot_mode_after"] = webroot_mode()
 elif MODE == "directory-block":
     report["resolution_after"] = blackhole()
@@ -870,12 +876,18 @@ PY
 def acme_outage_script(
     mode: str, webroot_mode: str = "", hosts_file: str = ACME_HOSTS_FILE,
 ) -> str:
-    """Install or remove one outage: the webroot the validator reads, or the directory."""
+    """Install or remove one outage: the webroot the validator reads, or the directory.
+
+    The placeholder names must not contain one another: substitutions run in the
+    order written, so a prior-mode token ending in ``MODE_PLACEHOLDER`` had its
+    tail rewritten into the mode name and the restore path then parsed that marker
+    as an octal mode.
+    """
     return (
         ACME_OUTAGE_SCRIPT
         .replace("MODE_PLACEHOLDER", shlex.quote(mode))
         .replace("WEBROOT_PLACEHOLDER", ACME_WEBROOT)
-        .replace("ORIGINAL_MODE_PLACEHOLDER", shlex.quote(webroot_mode))
+        .replace("PRIOR_OCTAL_PLACEHOLDER", shlex.quote(webroot_mode))
         .replace("HOST_PLACEHOLDER", acme_fixture.FIXTURE_HOST)
         .replace("MARKER_PLACEHOLDER", ACME_BLACKHOLE_MARKER)
         .replace("HOSTS_PLACEHOLDER", shlex.quote(hosts_file))
@@ -2729,9 +2741,10 @@ def require_renewal_issued(case_id: str, role: str, domain: str, facts: Dict[str
             f"challenge route this case validates is not the one that was used (a CA that "
             f"reuses a valid authorization asks for no challenge at all): "
             f"{transcript.strip()[-800:]}")
-    require(case_id, "Successfully received certificate" in transcript,
-            f"{role}: Certbot never reported receiving a renewed certificate for {domain}: "
-            f"{renewal.get('tail')}")
+    require(case_id, CERTBOT_RENEWAL_SUCCEEDED in transcript,
+            f"{role}: `certbot renew` for {domain} exited 0 without printing its "
+            f"completed-renewal summary ({CERTBOT_RENEWAL_SUCCEEDED!r}), so no certificate "
+            f"was received: {renewal.get('tail')}")
     before = facts.get("archive") or []
     after = facts.get("archive_after") or []
     require(case_id, len(after) > len(before),
@@ -3009,8 +3022,8 @@ def require_renewal_failed(
     require(case_id, matched,
             f"{role}: the renewal for {domain} failed without naming the {kind} it was denied: "
             f"{transcript.strip()[-800:]}")
-    require(case_id, "Successfully received certificate" not in transcript,
-            f"{role}: the renewal for {domain} reported receiving a certificate while the "
+    require(case_id, CERTBOT_RENEWAL_SUCCEEDED not in transcript,
+            f"{role}: the renewal for {domain} reported a completed renewal while the "
             f"{kind} was down: {transcript.strip()[-800:]}")
     return {
         "returncode": renewal.get("returncode"),

@@ -1541,7 +1541,7 @@ def acme_probe(
     if mode != "renew":
         return facts
     text = transcript if transcript is not None else (
-        f"http-01 challenge for {domain}\nSuccessfully received certificate"
+        f"http-01 challenge for {domain}\n{aio.CERTBOT_RENEWAL_SUCCEEDED}: "
     )
     facts.update({
         "renewal": {"returncode": renewal_exit, "stdout": text, "stderr": "",
@@ -1684,14 +1684,14 @@ class TestAcmeRenewalCase(unittest.TestCase):
     def test_a_renewal_that_never_performs_http01_fails_the_case(self):
         self.reject("did not perform an HTTP-01 challenge",
                     after=acme_probe("renew", transcript="dns-01 challenge for "
-                                     f"{aio.PANEL_DOMAIN}\nSuccessfully received certificate"))
+                                     f"{aio.PANEL_DOMAIN}\n{aio.CERTBOT_RENEWAL_SUCCEEDED}: "))
 
     def test_a_renewal_the_ca_answered_without_a_challenge_names_the_reuse(self):
         # Pebble answers with an already-valid authorization half the time, and
         # such an order performs no challenge: the log says so and is quoted.
         reused = acme_probe("renew", transcript=(
             f"Renewing an existing certificate for {aio.PANEL_DOMAIN}\n"
-            "Successfully received certificate"
+            f"{aio.CERTBOT_RENEWAL_SUCCEEDED}: "
         ))
         caught = self.reject("reuses a valid authorization", after=reused)
         self.assertIn(f"Renewing an existing certificate for {aio.PANEL_DOMAIN}",
@@ -1699,6 +1699,16 @@ class TestAcmeRenewalCase(unittest.TestCase):
 
     def test_a_renewal_that_receives_no_certificate_fails_the_case(self):
         self.reject("exited 1", after=acme_probe("renew", renewal_exit=1))
+
+    def test_a_certonly_success_line_does_not_stand_in_for_a_renewal(self):
+        # `certbot renew` prints "Congratulations, all renewals succeeded";
+        # "Successfully received certificate." belongs to certonly/run and can
+        # never appear here, so demanding it read a real renewal as a failure.
+        certonly = acme_probe("renew", transcript=(
+            f"http-01 challenge for {aio.PANEL_DOMAIN}\nSuccessfully received certificate."
+        ))
+        caught = self.reject("without printing its completed-renewal summary", after=certonly)
+        self.assertIn(aio.CERTBOT_RENEWAL_SUCCEEDED, str(caught.exception))
 
     def test_a_renewal_that_reuses_the_serial_fails_the_case(self):
         self.reject("still reports certificate serial '0A1B'",
@@ -1840,13 +1850,13 @@ class TestAcmeRenewalProbe(unittest.TestCase):
             "done\n"
             'mkdir -p "$log_dir"\n'
             f"printf '%s\\n' 'http-01 challenge for {domain}' >> \"$log_dir/letsencrypt.log\"\n"
-            "printf '%s\\n' 'Successfully received certificate' >> \"$log_dir/letsencrypt.log\"\n"
+            f"printf '%s\\n' '{aio.CERTBOT_RENEWAL_SUCCEEDED}: ' >> \"$log_dir/letsencrypt.log\"\n"
             'printf %s "$REQUESTS_CA_BUNDLE" > ' + str(anchor) + "\n"
             f"printf 'new' > {archive}/cert2.pem\n"
             f"printf 'new' > {live}/fullchain.pem\n"
             f"touch {marker}\n"
             f"printf '%s\\n' 'http-01 challenge for {domain}'\n"
-            "printf '%s\\n' 'Successfully received certificate'\n"
+            f"printf '%s\\n' '{aio.CERTBOT_RENEWAL_SUCCEEDED}: '\n"
             "exit 0\n"
         ))
         write("systemctl", (
@@ -1922,7 +1932,7 @@ class TestAcmeRenewalProbe(unittest.TestCase):
             anchor = layout["anchor"].read_text(encoding="utf-8")
         self.assertEqual(facts["renewal"]["returncode"], 0)
         self.assertIn(f"http-01 challenge for {aio.PANEL_DOMAIN}", facts["certbot_log"])
-        self.assertIn("Successfully received certificate", facts["certbot_log"])
+        self.assertIn(aio.CERTBOT_RENEWAL_SUCCEEDED, facts["certbot_log"])
         self.assertEqual(facts["live_after"]["serial"], "0C2D")
         self.assertEqual(len(facts["archive_after"]), 2)
         self.assertEqual([item["serial"] for item in facts["archive_after"]], ["0A1B", "0C2D"])
@@ -2123,7 +2133,7 @@ class TestAcmeOutageCase(unittest.TestCase):
     def test_a_reused_authorization_during_the_outage_quotes_the_log(self):
         reused = acme_probe("renew", issued_epoch=self.installed, transcript=(
             f"Renewing an existing certificate for {aio.PANEL_DOMAIN}\n"
-            "Successfully received certificate"
+            f"{aio.CERTBOT_RENEWAL_SUCCEEDED}: "
         ))
         caught = self.reject("reuses a valid authorization", challenge_attempt=reused)
         self.assertIn("Renewing an existing certificate", str(caught.exception))
@@ -2223,17 +2233,15 @@ class TestAcmeOutageProbe(unittest.TestCase):
         return {"webroot": webroot, "hosts": hosts}
 
     def run_probe(self, mode: str, layout: dict, original_mode: str = "") -> dict:
+        # The rendered command is executed whole, heredoc and argv line included:
+        # the invocation line is what the topology runs, so a substitution that
+        # rewrites its own arguments has to fail here rather than in a live run.
         script = (
             aio.acme_outage_script(mode, original_mode, str(layout["hosts"]))
             .replace(aio.ACME_WEBROOT, str(layout["webroot"]))
         )
-        _, _, body = script.partition("<<'PY'\n")
-        body = body.rsplit("\nPY\n", 1)[0]
-        args = [mode, str(layout["webroot"]), original_mode, acme_fixture.FIXTURE_HOST,
-                aio.ACME_BLACKHOLE_MARKER, str(layout["hosts"])]
         result = subprocess.run(
-            [sys.executable, "-c", body, *args],
-            capture_output=True, text=True, check=False,
+            ["bash", "-c", script], capture_output=True, text=True, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
