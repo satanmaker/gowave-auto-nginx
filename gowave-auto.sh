@@ -184,17 +184,13 @@ PY
     # The camouflage site lives on the registrable apex of the panel domain so
     # that a browser reaching for the bare domain lands on a plausible static
     # site. ACME validates it over port 80 on this host, so it is only enabled
-    # when both the apex and www already resolve here.
-    local cover_domain=""
-    cover_domain=$(derive_cover_domain "$panel_domain")
-    if [[ -n "$cover_domain" ]]; then
-        local server_ip=""
-        server_ip=$(resolve_panel_ipv4) || return 1
-        if ! cover_domains_resolve_here "$cover_domain" "$server_ip"; then
-            echo "Warning: camouflage apex site disabled — $cover_domain / www.$cover_domain do not resolve to this host (${server_ip:-unknown}); HTTP-01 would fail." >&2
-            cover_domain=""
-        fi
+    # when both the apex and www already resolve here; the decision names its
+    # own refusal, including a panel domain that has no apex to derive.
+    local cover_domain="" cover_server_ip=""
+    if [[ -n "$(derive_cover_domain "$panel_domain")" ]]; then
+        cover_server_ip=$(resolve_panel_ipv4) || return 1
     fi
+    cover_domain=$(cover_domain_for "$panel_domain" "$cover_server_ip")
 
     echo "==> Starting GoWave Auto NGINX All-in-One Deployment..."
     echo "Panel Domain:   $panel_domain"
@@ -207,7 +203,7 @@ PY
     if [[ -n "$cover_domain" ]]; then
         echo "Cover Site:     $cover_domain (+ www) — camouflage website on the apex"
     else
-        echo "Cover Site:     Disabled (apex does not resolve here or panel domain has no subdomain)"
+        echo "Cover Site:     Disabled"
     fi
 
     # Step 1: Preflight Environment Inspection
@@ -997,11 +993,7 @@ PY
     check_acme_lineage "$new_reality_domain" "$effective_acme_server" || return 1
 
     local cover_domain=""
-    cover_domain=$(derive_cover_domain "$new_panel_domain")
-    if [[ -n "$cover_domain" ]] && ! cover_domains_resolve_here "$cover_domain" "$srv_ip"; then
-        echo "Warning: camouflage apex site disabled — $cover_domain / www.$cover_domain do not resolve to this host (${srv_ip:-unknown})." >&2
-        cover_domain=""
-    fi
+    cover_domain=$(cover_domain_for "$new_panel_domain" "$srv_ip")
 
     local snap_dir
     snap_dir=$(prepare_update_snapshot "domain-change")

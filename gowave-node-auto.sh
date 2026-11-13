@@ -2095,6 +2095,28 @@ cover_domains_resolve_here() {
     done
 }
 
+# The single cover-site decision, identical to the Master's: the apex on
+# stdout, nothing when the decoy stays off, and the reason on stderr. A domain
+# without a subdomain has no registrable apex, and an empty render would leave
+# the operator guessing which of the two refusals happened.
+cover_domain_for() {
+    local panel_domain="${1:-}"
+    local server_ip="${2:-}"
+    local cover_domain
+    cover_domain=$(derive_cover_domain "$panel_domain")
+    if [[ -z "$cover_domain" ]]; then
+        if [[ -n "$panel_domain" ]]; then
+            echo "Camouflage apex disabled — $panel_domain has no subdomain, so no cover apex exists." >&2
+        fi
+        return 0
+    fi
+    if ! cover_domains_resolve_here "$cover_domain" "$server_ip"; then
+        echo "Camouflage apex disabled — $cover_domain / www.$cover_domain do not resolve to ${server_ip:-this host}, so HTTP-01 would fail." >&2
+        return 0
+    fi
+    printf '%s\n' "$cover_domain"
+}
+
 render_cover_site() {
     local cover_root="$1"
     local domain="${2:-}"
@@ -2143,22 +2165,18 @@ configure_edge_nginx() {
 
     # Camouflage apex: the bare domain of this Worker serves the static decoy.
     # ACME validates it over port 80 here, so it requires the apex and www
-    # records to point at this host.
-    local cover_domain=""
-    cover_domain=$(derive_cover_domain "$WORKER_DOMAIN")
-    if [[ -n "$cover_domain" ]]; then
-        local server_ip=""
+    # records to point at this host; the decision names its own refusal, so a
+    # domain without a subdomain is reported instead of rendering nothing.
+    local cover_domain="" cover_server_ip=""
+    if [[ -n "$(derive_cover_domain "$WORKER_DOMAIN")" ]]; then
         if [[ "${GOWAVE_PODMAN_TEST_MODE:-0}" == "1" ]]; then
-            server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+            cover_server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
         else
-            server_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me 2>/dev/null || \
-                        curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)
-        fi
-        if ! cover_domains_resolve_here "$cover_domain" "$server_ip"; then
-            echo "Warning: worker camouflage apex site disabled — $cover_domain / www.$cover_domain do not resolve to this host (${server_ip:-unknown}); HTTP-01 would fail." >&2
-            cover_domain=""
+            cover_server_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me 2>/dev/null || \
+                              curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)
         fi
     fi
+    cover_domain=$(cover_domain_for "$WORKER_DOMAIN" "$cover_server_ip")
     local cover_names=""
     if [[ -n "$cover_domain" ]]; then
         cover_names=" $cover_domain www.$cover_domain"

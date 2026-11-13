@@ -509,6 +509,78 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertIn("IPV6=yes", run(0))
             self.assertIn("--force enable", calls.read_text())
 
+    @staticmethod
+    def _payload_slice(function: str) -> str:
+        script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        start = script.index("cat <<'RUNNER_FUNCS'")
+        payload = script[start:script.index("\nRUNNER_FUNCS\n", start)]
+        at = payload.index(function + "() {")
+        return payload[at:payload.index("\n}\n", at) + len("\n}\n")]
+
+    def test_the_worker_derives_the_cover_apex_with_the_masters_decision(self):
+        """A role-local copy of the decoy decision may not drift from modules/nginx.sh."""
+        master = (REPO_ROOT / "modules" / "nginx.sh").read_text()
+
+        def master_slice(function: str) -> str:
+            at = master.index(function + "() {")
+            return master[at:master.index("\n}\n", at) + len("\n}\n")]
+
+        for function in ("derive_cover_domain", "cover_domains_resolve_here", "cover_domain_for"):
+            with self.subTest(function=function):
+                self.assertEqual(self._payload_slice(function), master_slice(function))
+
+    def test_the_worker_names_every_cover_refusal(self):
+        """The decoy is either derived or refused out loud, never silently skipped."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir) / "bin"
+            fake_bin.mkdir()
+            getent = fake_bin / "getent"
+            getent.write_text(
+                "#!/usr/bin/env bash\n"
+                'printf \'%s\\n\' "${FAKE_RESOLVED:-203.0.113.10} STREAM ${2}"\n'
+            )
+            getent.chmod(0o755)
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+            exports = (self._payload_slice("derive_cover_domain")
+                       + self._payload_slice("cover_domains_resolve_here"))
+
+            def run(domain: str, resolved: str = "203.0.113.10"):
+                environment["FAKE_RESOLVED"] = resolved
+                body = f'cover_domain_for "{domain}" "203.0.113.10"; echo "rc=$?"\n'
+                res = self._run_payload_function("cover_domain_for", body, exports,
+                                                env=environment)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                return res
+
+            # The last two labels are the apex, whatever the deployment depth.
+            res = run("worker.testbed.internal")
+            self.assertIn("testbed.internal", res.stdout)
+            self.assertNotIn("worker.testbed", res.stdout)
+            self.assertEqual(res.stderr, "")
+
+            # A domain without a subdomain has no apex to camouflage.
+            res = run("example.com")
+            self.assertNotIn("example.com\n", res.stdout)
+            self.assertIn("example.com has no subdomain", res.stderr)
+
+            res = run("localhost")
+            self.assertIn("localhost has no subdomain", res.stderr)
+
+            # Apex present but not pointing here is a different, named refusal.
+            res = run("worker.testbed.internal", resolved="198.51.100.7")
+            self.assertNotIn("testbed.internal", res.stdout)
+            self.assertIn("do not resolve to 203.0.113.10", res.stderr)
+
+    def test_the_worker_resolves_its_public_ipv4_only_when_an_apex_exists(self):
+        script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        block = script.index("# Camouflage apex: the bare domain of this Worker")
+        cover = script[block:script.index("local cover_names=", block)]
+        self.assertIn('cover_domain=$(cover_domain_for "$WORKER_DOMAIN"', cover)
+        self.assertLess(cover.index('derive_cover_domain "$WORKER_DOMAIN"'),
+                        cover.index("ifconfig.me"),
+                        "the public IPv4 lookup must sit behind the apex decision")
+
     def test_worker_rollbacks_remove_only_project_owned_dns_drop_in(self):
         """Both rollback paths must gate DNS drop-in removal on the project marker."""
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
