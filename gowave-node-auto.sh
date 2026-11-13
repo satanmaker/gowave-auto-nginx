@@ -1971,7 +1971,16 @@ configure_host_security() {
     configure_worker_dot
 }
 
+# Whether this host has IPv6 is decided by the address table's content, never
+# by its size: procfs reports a zero inode size for /proc/net/if_inet6 however
+# many addresses it prints.
+kernel_has_ipv6() {
+    local if_inet6="${1:-/proc/net/if_inet6}"
+    [[ -f "$if_inet6" ]] && grep -q '[^[:space:]]' "$if_inet6" 2>/dev/null
+}
+
 configure_firewall() {
+    local ufw_default="${1:-/etc/default/ufw}"
     local panel_ip="${PANEL_IP:-}" panel_ipv6="${PANEL_IPV6:-}" ssh_port="${SSH_PORT:-22}"
     if [[ -z "$panel_ip" && -z "$panel_ipv6" ]]; then
         echo "Fatal: PANEL_IP or PANEL_IPV6 is required; refusing an unscoped Node API firewall rule." >&2
@@ -2013,6 +2022,16 @@ PY
     fi
     if [[ -n "$panel_ipv6" ]]; then
         ufw allow proto tcp from "$panel_ipv6" to any port "$NODE_PORT" comment "GoWave Control Plane IPv6"
+    fi
+    # UFW's own declaration has to follow the same host decision the listeners
+    # render, or the distro default claims a v6 stack this host does not have
+    # (and, where that default is ``no``, leaves a v6 listener unfiltered).
+    if [[ -f "$ufw_default" ]]; then
+        if kernel_has_ipv6; then
+            sed -i 's/^IPV6=.*/IPV6=yes/' "$ufw_default" || true
+        else
+            sed -i 's/^IPV6=.*/IPV6=no/' "$ufw_default" || true
+        fi
     fi
     ufw --force enable
     ufw status | grep -q '^Status: active$' || {
@@ -2246,9 +2265,8 @@ EOF
     fi
 
     local listen_v6=""
-    # procfs reports a zero size for the address table, so its content decides
-    # whether this host has IPv6 — the same rule the panel installer applies.
-    if [[ -f /proc/net/if_inet6 ]] && grep -q '[^[:space:]]' /proc/net/if_inet6 2>/dev/null; then
+    # One host decision drives the listener and the firewall declaration.
+    if kernel_has_ipv6; then
         listen_v6="listen [::]:443 so_keepalive=on;"
     fi
 
