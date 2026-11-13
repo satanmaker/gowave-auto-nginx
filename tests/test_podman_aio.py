@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -3168,6 +3169,282 @@ class TestDecoyCase(unittest.TestCase):
         self.assertEqual(record["state"], "incubating")
         self.assertEqual(record["runs_in"], ["podman"])
         self.assertEqual(record["topology"], ["aio"])
+
+
+class TestFaultCases(unittest.TestCase):
+    """AIO-FAULT-PANEL / -XRAY / -LATENCY: the rendered probes, executed.
+
+    Every one of these cases injects a fault on purpose, so the probe carries the
+    destructive half of the case: what it reads decides whether the case may run
+    at all, and what it puts back decides whether the next case measures a host
+    someone broke. The commands are executed whole — heredoc and argv line
+    included — because that is the line the topology runs.
+    """
+
+    UNIT_FIELDS = (
+        "Id=gowave-node.service\n"
+        "ActiveState=active\n"
+        "SubState=running\n"
+        "MainPID=411\n"
+        "NRestarts=0\n"
+        "ActiveEnterTimestamp=Sat 2026-11-14 01:00:00 UTC"
+    )
+    PANEL_STATE = {
+        "env_digest": "sha256:env",
+        "binary": "sha256:binary",
+        "frontend": "sha256:frontend",
+        "frontend_index": "sha256:index",
+        "state": "sha256:state",
+        "nginx": "sha256:nginx",
+        "nginx_conf": "sha256:nginx.conf",
+        "letsencrypt": "sha256:acme",
+        "lineage_chain": "sha256:lineage",
+        "database": {"integrity": "ok", "logical": "CREATE TABLE users(name TEXT);"},
+        "unit": {"ActiveState": "active", "SubState": "running"},
+        "health": 200,
+    }
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+        self.workspace = Path(self.tmp.name)
+        self.bin = self.workspace / "bin"
+        self.bin.mkdir()
+        self.log = self.workspace / "calls.log"
+        self.env = dict(os.environ)
+        self.env["PATH"] = f"{self.bin}:{self.env.get('PATH', '')}"
+
+    # ------------------------------------------------------------ the helpers
+    def write_shim(self, name, body):
+        path = self.bin / name
+        path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        path.chmod(0o755)
+
+    def run_script(self, script):
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, env=self.env, check=False,
+        )
+
+    def calls(self):
+        if not self.log.exists():
+            return []
+        return self.log.read_text(encoding="utf-8").splitlines()
+
+    def systemctl_shim(self, units=()):
+        listing = "".join(f"    printf '%s\\n' '{line}'\n" for line in units) or "    :\n"
+        self.write_shim("systemctl", (
+            f'printf "%s\\n" "$@" >> "{self.log}"\n'
+            'case "$*" in\n'
+            "  *list-units*)\n"
+            + listing
+            + "    ;;\n"
+            "  *)\n"
+            "    cat <<'EOF'\n"
+            + self.UNIT_FIELDS
+            + "\nEOF\n"
+            "    ;;\n"
+            "esac\n"
+        ))
+
+    def proc_tree(self, entries):
+        root = self.workspace / "proc"
+        root.mkdir()
+        for pid, (comm, ppid, cgroup) in entries.items():
+            directory = root / str(pid)
+            directory.mkdir()
+            (directory / "comm").write_text(comm + "\n", encoding="utf-8")
+            (directory / "status").write_text(
+                f"Name:\t{comm}\nPPid:\t{ppid}\n", encoding="utf-8",
+            )
+            (directory / "cgroup").write_text(f"0::{cgroup}\n", encoding="utf-8")
+        (root / "loadavg").write_text("0.00 0.01 0.05\n", encoding="utf-8")
+        return root
+
+    def core_script(self, mode, root, timeout=0.0):
+        return aio.core_fault_script(mode, timeout).replace('PROC = "/proc"', f'PROC = "{root}"')
+
+    def core_process(self, seconds=30):
+        """A process whose comm is rw-core, so the probe can find and signal it."""
+        binary = self.workspace / "rw-core"
+        binary.write_bytes(Path("/bin/sleep").read_bytes())
+        binary.chmod(0o755)
+        process = subprocess.Popen([str(binary), str(seconds)])
+        self.addCleanup(lambda: (process.kill(), process.wait(10)))
+        return process
+
+    def network_tree(self, names=("eth0", "lo", "wlan0")):
+        root = self.workspace / "net"
+        root.mkdir()
+        for name in names:
+            (root / name).mkdir()
+        return root
+
+    def netem_shim(self, fail_on=""):
+        failure = (
+            f'if [ "$1 $2 $3 $4" = "qdisc replace dev {fail_on}" ]; then exit 1; fi\n'
+            if fail_on else ""
+        )
+        self.write_shim("tc", (
+            f'printf "%s\\n" "$*" >> "{self.log}"\n' + failure + "exit 0\n"
+        ))
+
+    # ------------------------------------------------------- the shared contract
+    def test_configuration_compares_the_database_by_integrity_and_the_rest_byte_for_byte(self):
+        before = dict(self.PANEL_STATE)
+        moved = json.loads(json.dumps(before))
+        moved["database"]["bytes"] = "sha256:checkpointed"
+        aio.require_configuration_unchanged("AIO-FAULT-TEST", before, moved, "while it was down")
+        moved["nginx_conf"] = "sha256:rewritten"
+        with self.assertRaises(AssertionError) as caught:
+            aio.require_configuration_unchanged(
+                "AIO-FAULT-TEST", before, moved, "while it was down",
+            )
+        self.assertIn("changed the NGINX configuration", str(caught.exception))
+
+    # ------------------------------------------------------------- core process
+    def test_the_core_scan_reads_the_unit_from_the_cores_own_cgroup(self):
+        self.systemctl_shim(units=(
+            "xray-supervisor.service loaded active running Stray Xray",
+        ))
+        root = self.proc_tree({
+            101: ("rw-core", 1, "/system.slice/gowave-node.service"),
+            202: ("python3", 1, "/system.slice/gowave-node.service"),
+            303: ("rw-core", 1, "/system.slice/other.service"),
+        })
+        result = self.run_script(self.core_script("scan", root))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual([item["pid"] for item in report["cores_before"]], [101, 303])
+        self.assertEqual([item["in_unit"] for item in report["cores_before"]], [True, False])
+        self.assertEqual(report["xray_units"], ["xray-supervisor.service"])
+        self.assertEqual(report["unit_before"]["Id"], "gowave-node.service")
+        self.assertIn("gowave-node.service", self.calls())
+
+    def test_the_core_restart_signals_nothing_when_the_unit_owns_no_core(self):
+        self.systemctl_shim()
+        core = self.core_process()
+        root = self.proc_tree({core.pid: ("rw-core", 1, "/system.slice/other.service")})
+        result = self.run_script(self.core_script("restart", root, timeout=1.0))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertIn("expected exactly one core process inside gowave-node.service",
+                      report["error"])
+        self.assertNotIn("killed_pid", report)
+        self.assertIsNone(core.poll(), "the probe signalled a core it does not supervise")
+
+    def test_the_core_restart_kills_the_core_the_unit_owns_and_reports_what_replaced_it(self):
+        self.systemctl_shim()
+        core = self.core_process()
+        root = self.proc_tree({core.pid: ("rw-core", 1, "/system.slice/gowave-node.service")})
+        result = self.run_script(self.core_script("restart", root, timeout=1.0))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["killed_pid"], core.pid)
+        self.assertEqual([item["pid"] for item in report["cores_after"]], [core.pid])
+        self.assertGreaterEqual(report["restart_seconds"], 1.0)
+        self.assertEqual(report["unit_after"]["NRestarts"], "0")
+        # The probe is not the core's parent, so nothing can have collected it:
+        # the exit is the one SIGKILL produces, against the pid the probe named.
+        self.assertEqual(core.wait(timeout=10), -signal.SIGKILL)
+
+    # ----------------------------------------------------------------- latency
+    def test_the_latency_fault_delays_every_interface_but_loopback(self):
+        self.netem_shim()
+        root = self.network_tree()
+        result = self.run_script(aio.latency_fault_apply_script().replace("/sys/class/net", str(root)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[0], "delayed: eth0 wlan0")
+        self.assertEqual(self.calls(), [
+            "qdisc replace dev eth0 root netem delay 300ms",
+            "qdisc replace dev wlan0 root netem delay 300ms",
+            "qdisc show",
+        ])
+
+    def test_a_latency_fault_that_fails_on_a_later_interface_removes_the_earlier_one(self):
+        self.netem_shim(fail_on="wlan0")
+        root = self.network_tree()
+        result = self.run_script(aio.latency_fault_apply_script().replace("/sys/class/net", str(root)))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("latency could not be injected on wlan0", result.stderr)
+        self.assertIn("qdisc del dev eth0 root", self.calls())
+
+    def test_clearing_the_latency_leaves_no_qdisc_behind(self):
+        self.netem_shim()
+        root = self.network_tree()
+        result = self.run_script(
+            aio.LATENCY_FAULT_CLEAR_SCRIPT.strip().replace("/sys/class/net", str(root)),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[0], "cleared")
+        self.assertEqual(self.calls(), [
+            "qdisc del dev eth0 root",
+            "qdisc del dev wlan0 root",
+            "qdisc show",
+        ])
+
+    def test_timing_the_public_surface_reads_the_delay_the_client_feels(self):
+        product, _ = installed_product(self.context, [])
+        product.host.client_reports = [
+            {"url": f"{aio.PUBLIC_PANEL}/", "returncode": 0, "stdout": "{}", "stderr": "",
+             "probe": {"status": 200, "seconds": seconds}}
+            for seconds in (0.12, 0.14, 0.13)
+        ]
+        samples = aio.public_latency(product, product.host, aio.LATENCY_FAULT_CASE_ID)
+        self.assertEqual(samples, [0.12, 0.14, 0.13])
+        self.assertEqual(len(product.host.client_calls), aio.LATENCY_FAULT_SAMPLES)
+
+    def test_a_probe_that_reports_no_elapsed_time_cannot_time_the_fault(self):
+        product, _ = installed_product(self.context, [])
+        product.host.client_reports = [
+            {"url": f"{aio.PUBLIC_PANEL}/", "returncode": 0, "stdout": "{}", "stderr": "",
+             "probe": {"status": 200}},
+        ]
+        with self.assertRaises(AssertionError) as caught:
+            aio.public_latency(product, product.host, aio.LATENCY_FAULT_CASE_ID)
+        self.assertIn("reported no elapsed time", str(caught.exception))
+
+    # -------------------------------------------------------------- the cases
+    def test_the_panel_outage_case_fails_when_https_still_answers_with_the_unit_down(self):
+        product, _ = installed_product(self.context, [("inactive\n", 0)])
+        down = json.loads(json.dumps(self.PANEL_STATE))
+        down["unit"] = {"ActiveState": "inactive", "SubState": "dead"}
+        down["health"] = "ConnectionRefusedError: [Errno 111] Connection refused"
+        product.host.client_reports = [
+            {"url": f"{aio.PUBLIC_PANEL}/", "returncode": 0, "stdout": "{}", "stderr": "",
+             "probe": {"status": 200}},
+        ]
+        with mock.patch.object(aio, "channel_state", side_effect=[
+            self.PANEL_STATE, down,
+        ]), mock.patch.object(
+            aio, "channel_client_surface",
+            return_value={"readback_status": 200, "short_uuid_length": 4},
+        ), mock.patch.object(product, "wait_tunnel_ready", return_value={}):
+            with self.assertRaises(AssertionError) as caught:
+                aio.case_panel_service_down(product)
+        self.assertIn("expected NGINX's 502", str(caught.exception))
+        self.assertIn(f"systemctl stop {aio.PANEL_SERVICE}", product.podman.scripts[0])
+
+    def test_the_fault_cases_are_registered_before_the_idempotent_case_and_catalogued(self):
+        suite = aio.cases(ScriptedPodman(self.context, []))
+        cases = {case.id: case for case in suite}
+        ids = [case.id for case in suite]
+        for case_id, timeout in (
+            (aio.PANEL_FAULT_CASE_ID, aio.PANEL_FAULT_TIMEOUT_SECONDS),
+            (aio.CORE_FAULT_CASE_ID, aio.CORE_FAULT_TIMEOUT_SECONDS),
+            (aio.LATENCY_FAULT_CASE_ID, aio.LATENCY_FAULT_TIMEOUT_SECONDS),
+        ):
+            self.assertIn(case_id, cases)
+            self.assertEqual(cases[case_id].topology, "aio")
+            self.assertEqual(cases[case_id].timeout_seconds, timeout)
+            self.assertLess(ids.index(case_id), ids.index("AIO-IDEMPOTENT"))
+        records = {case["id"]: case for case in catalog.load_catalog()["cases"]}
+        for case_id in (
+            aio.PANEL_FAULT_CASE_ID, aio.CORE_FAULT_CASE_ID, aio.LATENCY_FAULT_CASE_ID,
+        ):
+            self.assertEqual(records[case_id]["state"], "incubating")
+            self.assertEqual(records[case_id]["runs_in"], ["podman"])
+            self.assertEqual(records[case_id]["topology"], ["aio"])
 
 
 if __name__ == "__main__":

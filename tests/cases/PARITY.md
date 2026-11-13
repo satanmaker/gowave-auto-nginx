@@ -77,6 +77,9 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **AIO-CHANNEL-ROLLBACK** — promotion target: Signal-Safe and Verifiable Transaction Compensation
 - **AIO-CHANNEL-DEV** — promotion target: All-in-One Master VPS Installation Verification
 - **AIO-FAULT-DISK** — promotion target: Backup and Restore Format v1
+- **AIO-FAULT-PANEL** — promotion target: All-in-One Master VPS Installation Verification
+- **AIO-FAULT-XRAY** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **AIO-FAULT-LATENCY** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **NGX-05** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **TLS-01** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **DECOY-01** — promotion target: NGINX SNI Routing and REALITY Decoy Verification

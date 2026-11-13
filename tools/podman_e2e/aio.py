@@ -2516,6 +2516,529 @@ def case_backup_store_full(product: AioProduct) -> Dict[str, Any]:
     }
 
 
+# ------------------------------------------------------------- fault contracts
+FAULT_CONFIGURATION_FIELDS = (
+    ("env_digest", "the environment file"),
+    ("binary", "the Panel binary"),
+    ("frontend", "the frontend tree"),
+    ("frontend_index", "the frontend document"),
+    ("state", "state.json"),
+    ("nginx", "the NGINX tree"),
+    ("nginx_conf", "the NGINX configuration"),
+    ("letsencrypt", "the ACME tree"),
+    ("lineage_chain", "the ACME lineage chain"),
+)
+
+
+def require_configuration_unchanged(
+    case_id: str, before: Dict[str, Any], after: Dict[str, Any], what: str,
+) -> None:
+    """Nothing the operator owns moved while the fault was in place.
+
+    The database is read by its integrity only. A running Panel writes to SQLite
+    on its own schedule, so its rows are a moving target outside the one case
+    that stops the Panel first; that case compares the rows separately, because
+    there nothing can have written them.
+    """
+    require(
+        case_id, after.get("database", {}).get("integrity") == "ok",
+        f"the database does not pass integrity_check {what}: "
+        f"{after.get('database', {}).get('integrity')!r}",
+    )
+    for field, label in FAULT_CONFIGURATION_FIELDS:
+        require(
+            case_id, after.get(field) == before.get(field) and before.get(field),
+            f"{what} changed {label}: {after.get(field)!r} vs {before.get(field)!r}",
+        )
+
+
+# --------------------------------------------------------------- Panel outage
+PANEL_FAULT_CASE_ID = "AIO-FAULT-PANEL"
+PANEL_FAULT_TIMEOUT_SECONDS = 900
+PANEL_SERVICE = "gowave.service"
+# What NGINX answers for a vhost whose upstream refuses the connection.
+PANEL_FAULT_UNAVAILABLE_STATUS = 502
+
+
+def case_panel_service_down(product: AioProduct) -> Dict[str, Any]:
+    """AIO-FAULT-PANEL: a Panel that is down takes its own surface, not the tunnels.
+
+    The Panel is the control plane: an operator restarting it, or a host that
+    lost it, must leave what is already configured working. The case stops the
+    unit and reads the result from both sides — NGINX still answers on 443, but
+    the Panel's own routes come back as a gateway error, while every served
+    outbound still carries a payload. Nothing on disk may move while the unit is
+    down, which is what separates a stopped control plane from a damaged one, and
+    the same client has to be served the same bytes once the unit is started.
+    """
+    host = product.require_installed()
+    case = PANEL_FAULT_CASE_ID
+    before = channel_state(product, case)
+    require(
+        case, before.get("unit", {}).get("ActiveState") == "active",
+        f"{PANEL_SERVICE} is {before.get('unit', {}).get('ActiveState')!r} before the fault",
+    )
+    require(
+        case, before.get("health") == 200,
+        f"the Panel health route answered {before.get('health')!r} before the fault",
+    )
+    captured = channel_client_surface(product, case, "capture")
+    require(
+        case, captured.get("readback_status") == 200 and captured.get("short_uuid_length"),
+        f"the Panel served no default client before the fault, so its return would prove "
+        f"nothing: {captured!r}",
+    )
+    product.wait_tunnel_ready(case)
+
+    stop = product.host_script(
+        f"systemctl stop {PANEL_SERVICE}; systemctl is-active {PANEL_SERVICE} || true",
+        timeout=120,
+    )
+    require(
+        case, stop.returncode == 0 and (stop.stdout or "").strip().endswith("inactive"),
+        f"{PANEL_SERVICE} did not stop: {(stop.stdout or stop.stderr or '').strip()[-600:]!r}",
+    )
+
+    down = channel_state(product, case)
+    require(
+        case, down.get("unit", {}).get("ActiveState") == "inactive",
+        f"{PANEL_SERVICE} is {down.get('unit', {}).get('ActiveState')!r} after the stop",
+    )
+    require(
+        case, down.get("health") != 200,
+        f"the Panel health route still answered {down.get('health')!r} with the unit stopped",
+    )
+    require_configuration_unchanged(case, before, down, "while the Panel was stopped")
+    require(
+        case, down.get("database", {}).get("logical") == before.get("database", {}).get("logical"),
+        "the stopped Panel changed the rows it had stored: "
+        f"{down.get('database', {}).get('logical')!r} vs "
+        f"{before.get('database', {}).get('logical')!r}",
+    )
+
+    page = host.client_http(f"{PUBLIC_PANEL}/", timeout=30)
+    require(
+        case, page["probe"].get("status") == PANEL_FAULT_UNAVAILABLE_STATUS,
+        f"the public Panel surface answered {page['probe'].get('status')!r} with the unit "
+        f"stopped, expected NGINX's {PANEL_FAULT_UNAVAILABLE_STATUS}: "
+        f"{(page.get('stderr') or page.get('stdout') or '').strip()[-600:]!r}",
+    )
+    # The route a client fetches its configuration from is the Panel's too, so it
+    # has to fail with the same gateway error rather than with a subscription.
+    subscription = host.client_http(f"{PUBLIC_PANEL}/api/sub/000000000000", timeout=30)
+    require(
+        case, subscription["probe"].get("status") == PANEL_FAULT_UNAVAILABLE_STATUS,
+        f"the subscription route answered {subscription['probe'].get('status')!r} with the "
+        f"Panel stopped, expected {PANEL_FAULT_UNAVAILABLE_STATUS}: "
+        f"{(subscription.get('stderr') or subscription.get('stdout') or '').strip()[-600:]!r}",
+    )
+
+    # The data plane is the node's, not the Panel's: the tunnels that were already
+    # configured must keep carrying payload while the control plane is down.
+    during = require_channel_traffic(product, case, host)
+
+    start = product.host_script(f"systemctl start {PANEL_SERVICE}", timeout=120)
+    require(
+        case, start.returncode == 0,
+        f"{PANEL_SERVICE} did not start: {(start.stderr or start.stdout or '').strip()[-600:]!r}",
+    )
+    health = wait_for_channel_health(product, case)
+    require(case, health == "200", f"the Panel health route answered {health!r} after the restart")
+
+    surface = channel_client_surface(product, case, "verify")
+    require(
+        case, surface.get("inventory_identical") is True,
+        f"the outage changed the client inventory: {surface.get('users')!r} clients after "
+        f"{surface.get('users_captured')!r} before",
+    )
+    require(
+        case, surface.get("user_present") is True,
+        "the client the Panel served before the outage is gone from its inventory afterwards",
+    )
+    identical = surface.get("representations_identical") or {}
+    require(
+        case, identical and all(identical.values()),
+        f"the Panel did not come back serving the same bytes: {surface.get('representations')!r}",
+    )
+
+    after = channel_state(product, case)
+    require(
+        case, after.get("unit", {}).get("ActiveState") == "active",
+        f"{PANEL_SERVICE} is {after.get('unit', {}).get('ActiveState')!r} after the restart",
+    )
+    require_configuration_unchanged(case, before, after, "after the Panel came back")
+    recovered = require_channel_traffic(product, case, host)
+
+    return {
+        "public_status_with_panel_down": page["probe"].get("status"),
+        "subscription_status_with_panel_down": subscription["probe"].get("status"),
+        "health_with_panel_down": str(down.get("health"))[:120],
+        "unit_sub_state_with_panel_down": down.get("unit", {}).get("SubState"),
+        "transfers_with_panel_down": during.get("transfer_count"),
+        "health_after": str(after.get("health")),
+        "inventory_identical": str(surface.get("inventory_identical")).lower(),
+        "representations_identical": str(bool(identical) and all(identical.values())).lower(),
+        "transfers_after": recovered.get("transfer_count"),
+    }
+
+
+# ------------------------------------------------------------- core supervision
+CORE_FAULT_CASE_ID = "AIO-FAULT-XRAY"
+CORE_FAULT_TIMEOUT_SECONDS = 900
+CORE_FAULT_RESTART_TIMEOUT_SECONDS = 120
+CORE_FAULT_UNIT = "gowave-node.service"
+CORE_FAULT_CORE_NAMES = ("rw-core", "xray")
+
+CORE_FAULT_PROBE = r"""
+import json, os, signal, subprocess, sys, time
+
+MODE, unit, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])
+PROC = "/proc"
+NAMES = set("CORE_NAMES_PLACEHOLDER".split(","))
+
+
+def text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return ""
+
+
+def parent_of(pid):
+    for line in text("%s/%d/status" % (PROC, pid)).splitlines():
+        if line.startswith("PPid:"):
+            return int(line.split()[1])
+    return 0
+
+
+def unit_facts():
+    show = subprocess.run(
+        ["systemctl", "show", unit, "-p", "Id", "-p", "ActiveState", "-p", "SubState",
+         "-p", "MainPID", "-p", "NRestarts", "-p", "ActiveEnterTimestamp"],
+        capture_output=True, text=True,
+    )
+    fields = {}
+    for line in (show.stdout or "").splitlines():
+        key, _, value = line.partition("=")
+        fields[key] = value
+    return fields
+
+
+def supervising_units():
+    listing = subprocess.run(
+        ["systemctl", "list-units", "--all", "--type=service", "--no-legend", "--plain"],
+        capture_output=True, text=True,
+    )
+    names = []
+    for line in (listing.stdout or "").splitlines():
+        columns = line.split()
+        if columns and "xray" in columns[0].lower():
+            names.append(columns[0])
+    return sorted(names)
+
+
+def scan():
+    found = []
+    for entry in os.listdir(PROC):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        comm = text("%s/%d/comm" % (PROC, pid)).strip()
+        if comm not in NAMES:
+            continue
+        found.append({
+            "pid": pid,
+            "comm": comm,
+            "ppid": parent_of(pid),
+            "in_unit": unit in text("%s/%d/cgroup" % (PROC, pid)),
+        })
+    return sorted(found, key=lambda item: item["pid"])
+
+
+report = {"unit_before": unit_facts(), "xray_units": supervising_units(), "cores_before": scan()}
+if MODE != "restart":
+    print(json.dumps(report, sort_keys=True))
+    raise SystemExit(0)
+
+cores = report["cores_before"]
+if len(cores) != 1 or not cores[0]["in_unit"]:
+    report["error"] = (
+        "expected exactly one core process inside %s, saw %s" % (unit, json.dumps(cores))
+    )
+    print(json.dumps(report, sort_keys=True))
+    raise SystemExit(0)
+
+killed = cores[0]["pid"]
+started = time.monotonic()
+os.kill(killed, signal.SIGKILL)
+cores_after = []
+while time.monotonic() - started < timeout:
+    cores_after = scan()
+    if cores_after and all(item["pid"] != killed for item in cores_after):
+        break
+    time.sleep(1)
+report["killed_pid"] = killed
+report["cores_after"] = cores_after
+report["restart_seconds"] = round(time.monotonic() - started, 2)
+report["unit_after"] = unit_facts()
+print(json.dumps(report, sort_keys=True))
+"""
+
+
+def core_fault_script(mode: str, timeout: float) -> str:
+    """Kill the node's core, or only look at it, without going through a unit."""
+    return (
+        "python3 - "
+        + " ".join([
+            shlex.quote(mode), shlex.quote(CORE_FAULT_UNIT), shlex.quote(str(timeout)),
+        ])
+        + " <<'PY'\n"
+        + CORE_FAULT_PROBE.replace("CORE_NAMES_PLACEHOLDER", ",".join(CORE_FAULT_CORE_NAMES)).strip()
+        + "\nPY\n"
+    )
+
+
+def case_core_process_killed(product: AioProduct) -> Dict[str, Any]:
+    """AIO-FAULT-XRAY: the node replaces a killed core, and no unit of its own appears.
+
+    Xray is supervised by ``gowave-node`` and by nothing else. Killing the core
+    with SIGKILL is the fault the policy exists for: the node has to bring it
+    back inside its own unit, systemd must not have restarted the node to do it,
+    and no separate xray unit may appear. The case is read from the host's own
+    process table and cgroups, and the data plane is exercised afterwards because
+    a node that respawns its core without reapplying users would otherwise look
+    recovered.
+    """
+    host = product.require_installed()
+    case = CORE_FAULT_CASE_ID
+    before = channel_state(product, case)
+    require(
+        case, before.get("unit", {}).get("ActiveState") == "active",
+        f"{PANEL_SERVICE} is {before.get('unit', {}).get('ActiveState')!r} before the fault",
+    )
+    product.wait_tunnel_ready(case)
+
+    scan = probe_json(case, "the core scan", product.host_script(core_fault_script("scan", 0)))
+    cores = scan.get("cores_before") or []
+    require(
+        case, len(cores) == 1 and cores[0].get("in_unit"),
+        f"expected one core process inside {CORE_FAULT_UNIT}, saw {cores!r}",
+    )
+    require(
+        case, not (scan.get("xray_units") or []),
+        f"a unit of its own supervises the core: {scan.get('xray_units')!r}",
+    )
+
+    facts = probe_json(
+        case, "the core fault",
+        product.host_script(
+            core_fault_script("restart", CORE_FAULT_RESTART_TIMEOUT_SECONDS),
+            timeout=CORE_FAULT_TIMEOUT_SECONDS,
+        ),
+    )
+    require(
+        case, not facts.get("error"),
+        f"the fault could not be injected: {facts.get('error')!r}",
+    )
+    killed = facts.get("killed_pid")
+    after_cores = facts.get("cores_after") or []
+    require(
+        case, len(after_cores) == 1 and after_cores[0].get("pid") != killed,
+        f"the core the case killed (pid {killed!r}) was not replaced inside "
+        f"{CORE_FAULT_RESTART_TIMEOUT_SECONDS}s: {after_cores!r}",
+    )
+    require(
+        case, after_cores[0].get("in_unit"),
+        f"the replacement core runs outside {CORE_FAULT_UNIT}: {after_cores[0]!r}",
+    )
+    unit_before = facts.get("unit_before") or {}
+    unit_after = facts.get("unit_after") or {}
+    require(
+        case,
+        unit_after.get("MainPID") == unit_before.get("MainPID")
+        and unit_after.get("ActiveEnterTimestamp") == unit_before.get("ActiveEnterTimestamp")
+        and unit_after.get("NRestarts") == unit_before.get("NRestarts"),
+        "the node's own unit was restarted to bring the core back: "
+        f"MainPID {unit_before.get('MainPID')!r} -> {unit_after.get('MainPID')!r}, "
+        f"NRestarts {unit_before.get('NRestarts')!r} -> {unit_after.get('NRestarts')!r}",
+    )
+    require(
+        case, unit_after.get("ActiveState") == "active",
+        f"{CORE_FAULT_UNIT} is {unit_after.get('ActiveState')!r} after the core was replaced",
+    )
+
+    traffic = require_channel_traffic(product, case, host)
+    after = channel_state(product, case)
+    require_configuration_unchanged(case, before, after, "while the core was replaced")
+
+    return {
+        "core_comm": (facts.get("cores_before") or [{}])[0].get("comm"),
+        "killed_pid": killed,
+        "core_pid_after": after_cores[0].get("pid"),
+        "core_ppid_after": after_cores[0].get("ppid"),
+        "restart_seconds": facts.get("restart_seconds"),
+        "node_main_pid": unit_after.get("MainPID"),
+        "node_restarts": unit_after.get("NRestarts"),
+        "xray_units": ",".join(facts.get("xray_units") or []),
+        "transfer_count": traffic.get("transfer_count"),
+    }
+
+
+# ----------------------------------------------------------------- latency fault
+LATENCY_FAULT_CASE_ID = "AIO-FAULT-LATENCY"
+LATENCY_FAULT_TIMEOUT_SECONDS = 900
+LATENCY_FAULT_DELAY_MS = 300
+LATENCY_FAULT_SAMPLES = 3
+# One request pays the delay on several server-to-client flights (handshake and
+# response), so the observable rise is well above the configured 300 ms; the
+# floor is kept under it so a slower machine cannot turn the case red.
+LATENCY_FAULT_MINIMUM_RISE_SECONDS = 0.45
+LATENCY_FAULT_BASELINE_TOLERANCE_SECONDS = 0.2
+
+LATENCY_FAULT_APPLY_SCRIPT = r"""
+ifaces=""
+remove() {
+    for applied in $ifaces; do
+        tc qdisc del dev "$applied" root 2>/dev/null || true
+    done
+}
+for path in /sys/class/net/*; do
+    name=$(basename "$path")
+    if [[ "$name" == "lo" ]]; then
+        continue
+    fi
+    if ! tc qdisc replace dev "$name" root netem delay DELAY_PLACEHOLDER 2>/dev/null; then
+        remove
+        echo "latency could not be injected on $name" >&2
+        exit 1
+    fi
+    ifaces="$ifaces $name"
+done
+echo "delayed:$ifaces"
+tc qdisc show | sed -n '1,40p'
+"""
+
+LATENCY_FAULT_CLEAR_SCRIPT = r"""
+for path in /sys/class/net/*; do
+    name=$(basename "$path")
+    if [[ "$name" == "lo" ]]; then
+        continue
+    fi
+    tc qdisc del dev "$name" root 2>/dev/null || true
+done
+echo "cleared"
+tc qdisc show | sed -n '1,20p'
+"""
+
+
+def latency_fault_apply_script() -> str:
+    return LATENCY_FAULT_APPLY_SCRIPT.replace("DELAY_PLACEHOLDER", f"{LATENCY_FAULT_DELAY_MS}ms").strip()
+
+
+def public_latency(
+    product: AioProduct, host: topology.AioTopology, case_id: str,
+) -> List[float]:
+    """Time the public Panel surface from the Control Machine, not from the host."""
+    samples: List[float] = []
+    for _ in range(LATENCY_FAULT_SAMPLES):
+        report = host.client_http(f"{PUBLIC_PANEL}/", timeout=60)
+        status = report["probe"].get("status")
+        require(
+            case_id, status == 200,
+            f"the public Panel surface answered {status!r} while it was being timed: "
+            f"{(report.get('stderr') or report.get('stdout') or '').strip()[-600:]!r}",
+        )
+        seconds = report["probe"].get("seconds")
+        require(
+            case_id, isinstance(seconds, (int, float)),
+            f"the HTTP probe reported no elapsed time: {report['probe']!r}",
+        )
+        samples.append(float(seconds))
+    return samples
+
+
+def case_public_latency(product: AioProduct) -> Dict[str, Any]:
+    """AIO-FAULT-LATENCY: a slower host still works, and the delay is provably gone.
+
+    The fault is a netem delay on every interface of the host under test, which is
+    what a degraded link looks like to the client: the Panel answers and the
+    tunnels carry payload, only slower. The claim is measured on both sides —
+    the request time the Control Machine observes and the transfers the endpoint
+    confirms — and the delay is removed in the case's own ``finally``, so a case
+    that fails part-way cannot leave the next one measuring a host it slowed.
+    """
+    host = product.require_installed()
+    case = LATENCY_FAULT_CASE_ID
+    before = channel_state(product, case)
+    require(
+        case, before.get("unit", {}).get("ActiveState") == "active",
+        f"{PANEL_SERVICE} is {before.get('unit', {}).get('ActiveState')!r} before the fault",
+    )
+    baseline = public_latency(product, host, case)
+    traffic: Dict[str, Any] = {}
+    cleared: Any = None
+    try:
+        applied = product.host_script(latency_fault_apply_script(), timeout=120)
+        require(
+            case, applied.returncode == 0 and "delayed:" in (applied.stdout or ""),
+            f"the latency fault could not be injected: "
+            f"{(applied.stderr or applied.stdout or '').strip()[-800:]!r}",
+        )
+        delayed = public_latency(product, host, case)
+        traffic = require_channel_traffic(product, case, host)
+    finally:
+        cleared = product.host_script(LATENCY_FAULT_CLEAR_SCRIPT.strip(), timeout=120)
+    require(
+        case, cleared is not None and cleared.returncode == 0,
+        f"the injected delay could not be removed: "
+        f"{(getattr(cleared, 'stderr', '') or '').strip()[-800:]!r}",
+    )
+
+    recovered = public_latency(product, host, case)
+    baseline_median = _median(baseline)
+    delayed_median = _median(delayed)
+    recovered_median = _median(recovered)
+    require(
+        case, delayed_median - baseline_median >= LATENCY_FAULT_MINIMUM_RISE_SECONDS,
+        f"the injected {LATENCY_FAULT_DELAY_MS} ms delay did not reach the client: "
+        f"{delayed_median:.3f}s against {baseline_median:.3f}s before it",
+    )
+    require(
+        case, recovered_median <= baseline_median + LATENCY_FAULT_BASELINE_TOLERANCE_SECONDS,
+        f"the client still waits {recovered_median:.3f}s after the delay was removed, "
+        f"against {baseline_median:.3f}s before it",
+    )
+
+    after = channel_state(product, case)
+    require(
+        case, after.get("unit", {}).get("ActiveState") == "active",
+        f"{PANEL_SERVICE} is {after.get('unit', {}).get('ActiveState')!r} after the fault",
+    )
+    require(
+        case, after.get("health") == 200,
+        f"the Panel health route answered {after.get('health')!r} after the fault",
+    )
+    require_configuration_unchanged(case, before, after, "while the host was delayed")
+
+    return {
+        "delay_ms": str(LATENCY_FAULT_DELAY_MS),
+        "baseline_seconds": ",".join(f"{value:.3f}" for value in baseline),
+        "delayed_seconds": ",".join(f"{value:.3f}" for value in delayed),
+        "recovered_seconds": ",".join(f"{value:.3f}" for value in recovered),
+        "transfers_with_delay": traffic.get("transfer_count"),
+        "health_after": str(after.get("health")),
+    }
+
+
+def _median(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
 def case_negative_destination(product: AioProduct) -> Dict[str, Any]:
     """AIO-NEG-DEST: a destination the product's egress policy excludes is denied.
 
@@ -5641,6 +6164,12 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # a fault produced must never be the one the idempotency case measures.
         Case(BACKUP_FAULT_CASE_ID, "aio", lambda context: case_backup_store_full(product),
              timeout_seconds=BACKUP_FAULT_TIMEOUT_SECONDS),
+        Case(PANEL_FAULT_CASE_ID, "aio", lambda context: case_panel_service_down(product),
+             timeout_seconds=PANEL_FAULT_TIMEOUT_SECONDS),
+        Case(CORE_FAULT_CASE_ID, "aio", lambda context: case_core_process_killed(product),
+             timeout_seconds=CORE_FAULT_TIMEOUT_SECONDS),
+        Case(LATENCY_FAULT_CASE_ID, "aio", lambda context: case_public_latency(product),
+             timeout_seconds=LATENCY_FAULT_TIMEOUT_SECONDS),
         Case("AIO-IDEMPOTENT", "aio", lambda context: case_idempotent(product),
              timeout_seconds=INSTALL_TIMEOUT_SECONDS + TRAFFIC_TIMEOUT_SECONDS),
         Case("AIO-NEG-DEST", "aio", lambda context: case_negative_destination(product),
