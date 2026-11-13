@@ -398,7 +398,8 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn("configure_dot() {", payload)
         self.assertIn("--prepare-dns", payload)
 
-    def _run_payload_function(self, function: str, body: str, exports: str = "") -> subprocess.CompletedProcess:
+    def _run_payload_function(self, function: str, body: str, exports: str = "",
+                              env=None) -> subprocess.CompletedProcess:
         script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
         funcs_start = script.index("cat <<'RUNNER_FUNCS'")
         payload = script[funcs_start:script.index("\nRUNNER_FUNCS\n", funcs_start)]
@@ -411,7 +412,8 @@ class TestNodeIntegration(unittest.TestCase):
             + payload[start:end]
             + "\n"
         )
-        return subprocess.run(["bash", "-c", prelude + body], capture_output=True, text=True)
+        return subprocess.run(["bash", "-c", prelude + body], capture_output=True, text=True,
+                              env=env)
 
     def test_worker_payload_dot_runs_shipped_security_helper(self):
         helper = "import json, sys\nprint(json.dumps({'status': 'configured'}))\nsys.exit(0)\n"
@@ -436,6 +438,76 @@ class TestNodeIntegration(unittest.TestCase):
         res = self._run_payload_function("configure_dot", "configure_dot\n")
         self.assertEqual(res.returncode, 1)
         self.assertIn("was not delivered", res.stderr)
+
+    def test_kernel_has_ipv6_reads_the_address_table_rather_than_measuring_it(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            table = Path(tmpdir) / "if_inet6"
+            body = (
+                f'table="{table}"\n'
+                'if kernel_has_ipv6 "$table"; then echo present; else echo absent; fi\n'
+            )
+            table.write_text("")
+            res = self._run_payload_function("kernel_has_ipv6", body)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("absent", res.stdout)
+
+            table.write_text("   \n")
+            res = self._run_payload_function("kernel_has_ipv6", body)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("absent", res.stdout)
+
+            table.write_text(
+                "00000000000000000000000000000001 01 80 10 80       lo\n"
+            )
+            res = self._run_payload_function("kernel_has_ipv6", body)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("present", res.stdout)
+
+    def test_the_worker_firewall_declares_the_same_ipv6_branch_it_renders(self):
+        """The distro default must not outvote the host decision the listeners use."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        self.assertEqual(worker_script.count("kernel_has_ipv6"), 3,
+                         "the host decision must be defined once and used by both sites")
+        listen_at = worker_script.index('local listen_v6=""')
+        listen = worker_script[listen_at:worker_script.index("\n    fi", listen_at)]
+        self.assertIn("kernel_has_ipv6", listen)
+        self.assertNotIn("/proc/net/if_inet6", listen)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            calls = root / "ufw.log"
+            calls.write_text("")
+            ufw = fake_bin / "ufw"
+            ufw.write_text(
+                "#!/usr/bin/env bash\n"
+                f'printf \'%s\\n\' "$*" >> "{calls}"\n'
+                'if [[ "$*" == "status" ]]; then echo "Status: active"; fi\n'
+            )
+            ufw.chmod(0o755)
+            declaration = root / "ufw-default"
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+            def run(decision: int) -> str:
+                declaration.write_text("# configured by the distribution\nIPV6=yes\n")
+                exports = (
+                    "kernel_has_ipv6() { return %d; }\n"
+                    'export PANEL_IP="10.89.0.10"\nexport SSH_PORT=22\nexport NODE_PORT=3002\n'
+                    % decision
+                )
+                res = self._run_payload_function(
+                    "configure_firewall", f'configure_firewall "{declaration}"\n', exports,
+                    env=environment,
+                )
+                self.assertEqual(res.returncode, 0, res.stderr)
+                return declaration.read_text()
+
+            self.assertIn("IPV6=no", run(1))
+            self.assertNotIn("IPV6=yes", run(1))
+            self.assertIn("IPV6=yes", run(0))
+            self.assertIn("--force enable", calls.read_text())
 
     def test_worker_rollbacks_remove_only_project_owned_dns_drop_in(self):
         """Both rollback paths must gate DNS drop-in removal on the project marker."""
