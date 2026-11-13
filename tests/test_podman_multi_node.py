@@ -1684,6 +1684,365 @@ class TestCoverDeriveCase(unittest.TestCase):
         self.assertEqual(suite[multi_node.COVER_DERIVE_CASE_ID].topology, "multi-node")
 
 
+_COVER_OTHER_IP = "10.89.0.2"
+_COVER_LINEAGE = "/etc/letsencrypt/live/reality.testbed.internal/cert.pem"
+
+
+def _cover_probe_output(probes, answers=None, rendered=None, reasons=None):
+    """The steered matrix as the deployed decision would print it."""
+    lines = []
+    for probe in probes:
+        answers_for = (answers or {}).get(probe["domain"], probe["answers"])
+        for name, expected in answers_for.items():
+            lines.append(f"resolved\t{name}\t{expected}")
+        failing = [name for name, expected in answers_for.items()
+                   if expected != probe["server_ip"]]
+        if rendered and probe["domain"] in rendered:
+            lines.append(f"decision\t{probe['domain']}\t{probe['apex']}\t")
+            continue
+        reason = (reasons or {}).get(
+            probe["domain"],
+            multi_node.cover_refusal_message(failing, probe["server_ip"]),
+        )
+        lines.append(f"decision\t{probe['domain']}\t\t{reason}")
+    return "\n".join(lines) + "\n"
+
+
+def _cover_state_output(domain, apex, answers, own, apex_rendered, reason,
+                        claims=(), lineages=None, site_bytes="4096"):
+    """One role's state script output; `claims` may be a single line or a tuple."""
+    if isinstance(claims, str):
+        claims = (claims,)
+    lines = [f"resolved\t{name}\t{answers.get(name, '')}"
+             for name in (apex, f"www.{apex}")]
+    lines += [f"self\t{address}" for address in own]
+    lines.append(f"decision\t{domain}\t{apex_rendered}\t{reason}")
+    lines.append(f"site\t{multi_node.COVER_SITE_INDEX}\t{site_bytes}")
+    lines += [f"claim\t{claim}" for claim in claims]
+    for path, text in (lineages or {}).items():
+        lines.append(f"lineage\t{path}\t{text}")
+    return "\n".join(lines) + "\n"
+
+
+def _cover_default_states(probes):
+    """One rendered role and one refusing role, both as a healthy run leaves them."""
+    apex = topology.COVER_APEX
+    both = {apex: _COVER_MASTER_IP, f"www.{apex}": _COVER_MASTER_IP}
+    master = _cover_state_output(
+        topology.PANEL_DOMAIN, apex, both,
+        (_COVER_MASTER_IP, "203.0.114.10"), apex, "",
+        claims=(f"/etc/nginx/conf.d/gowave-decoy.conf:12:    server_name "
+                f"reality.{apex} {apex} www.{apex};"),
+        lineages={_COVER_LINEAGE: "X509v3 Subject Alternative Name:   "
+                                  f"DNS:reality.{apex}, DNS:{apex}, DNS:www.{apex}"},
+    )
+    reason = multi_node.cover_refusal_message([apex, f"www.{apex}"], _COVER_WORKER_IP)
+    worker = _cover_state_output(
+        topology.WORKER_DOMAIN, apex, both,
+        (_COVER_WORKER_IP,), "", reason,
+        claims=("/etc/nginx/conf.d/gowave-worker-decoy.conf:12:    server_name "
+                f"worker-reality.{apex};",),
+        lineages={
+            "/etc/letsencrypt/live/worker-reality.testbed.internal/cert.pem":
+                "X509v3 Subject Alternative Name:   DNS:worker-reality.testbed.internal",
+        },
+        site_bytes="4096",
+    )
+    return {"master": master, "worker": worker}
+
+
+class _CoverHost:
+    """The topology surface the refusal case reads: zone, plan, and role names."""
+
+    target_name = "aio-master"
+    worker_name = "worker-01"
+    worker_domain = topology.WORKER_DOMAIN
+
+    class plan:
+        target_ip = _COVER_MASTER_IP
+        worker_ip = _COVER_WORKER_IP
+        echo_ip = _COVER_OTHER_IP
+
+    def __init__(self):
+        self.zones = []
+
+    def zone(self):
+        return {
+            "ttl": 60,
+            "records": {topology.PANEL_DOMAIN: {"A": [_COVER_MASTER_IP]}},
+            "behavior": {"mode": "answer", "delay_ms": 0},
+        }
+
+    def write_dns_zone(self, data):
+        self.zones.append(data)
+
+
+class _CoverUnresolvedPodman:
+    """Answers the steered matrix and the role state from per-role facts."""
+
+    ROLES = {"aio-master": "master", "worker-01": "worker"}
+
+    def __init__(self, probes=None, probe_outputs=None, states=None,
+                 probe_returncode=0, state_returncode=0):
+        self.probes = probes or multi_node.cover_probe_matrix(
+            _COVER_MASTER_IP, _COVER_OTHER_IP)
+        self.probe_outputs = probe_outputs or {
+            role: _cover_probe_output(self.probes)
+            for role in ("master", "worker")
+        }
+        self.states = states or _cover_default_states(self.probes)
+        self.probe_returncode = probe_returncode
+        self.state_returncode = state_returncode
+        self.scripts = {}
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        role = self.ROLES[container]
+        self.scripts.setdefault(role, []).append(script)
+        if "grep -rHnE" in script:
+            code, output = self.state_returncode, self.states[role]
+        else:
+            code, output = self.probe_returncode, self.probe_outputs[role]
+        if code:
+            return subprocess.CompletedProcess(["bash", "-lc"], code, "", "boom")
+        return subprocess.CompletedProcess(["bash", "-lc"], 0, output, "")
+
+
+class _CoverUnresolvedProduct:
+    def __init__(self, podman, host=None):
+        self.podman = podman
+        self.host = host or _CoverHost()
+
+    def require_worker(self):
+        return self.host
+
+
+class TestCoverUnresolvedCase(unittest.TestCase):
+    """NGX-COVER-UNRESOLVED steers the apex pair and reads both roles' state."""
+
+    def _run(self, podman, host=None):
+        product = _CoverUnresolvedProduct(podman, host)
+        return multi_node.case_cover_unresolved(product), product
+
+    def test_every_probe_refuses_and_names_the_records_it_withheld(self):
+        evidence, _ = self._run(_CoverUnresolvedPodman())
+        for role in ("master", "worker"):
+            with self.subTest(role=role):
+                probes = evidence["probes"][role]
+                self.assertEqual([probe["apex_rendered"] for probe in probes],
+                                 ["", "", ""])
+                answers = {probe["domain"]: probe["answers"] for probe in probes}
+                reasons = {probe["domain"]: probe["refusal"] for probe in probes}
+                apex_only = multi_node.COVER_PROBE_NAMES["apex_only"]
+                www_only = multi_node.COVER_PROBE_NAMES["www_only"]
+                elsewhere = multi_node.COVER_PROBE_NAMES["elsewhere"]
+                self.assertEqual(answers[f"panel.{apex_only}"],
+                                 {apex_only: _COVER_MASTER_IP,
+                                  f"www.{apex_only}": ""})
+                self.assertIn(f"www.{apex_only} does not resolve",
+                              reasons[f"panel.{apex_only}"])
+                self.assertIn(f"{www_only} does not resolve",
+                              reasons[f"panel.{www_only}"])
+                self.assertIn(f"{elsewhere} / www.{elsewhere} do not resolve",
+                              reasons[f"panel.{elsewhere}"])
+
+    def test_the_role_that_holds_the_apex_shows_it_rendered(self):
+        evidence, _ = self._run(_CoverUnresolvedPodman())
+        master = evidence["master"]
+        self.assertEqual(master["server_ip"], _COVER_MASTER_IP)
+        self.assertEqual(master["apex_rendered"], topology.COVER_APEX)
+        self.assertEqual(master["cover_page_bytes"], 4096)
+        self.assertEqual(master["covered_by"], [_COVER_LINEAGE])
+
+    def test_the_role_that_does_not_hold_the_apex_shows_it_withheld(self):
+        evidence, _ = self._run(_CoverUnresolvedPodman())
+        worker = evidence["worker"]
+        self.assertEqual(worker["apex_rendered"], "")
+        self.assertIn("Camouflage apex disabled", worker["refusal"])
+        self.assertNotIn(topology.COVER_APEX, worker["claimed_names"])
+        self.assertNotIn(f"www.{topology.COVER_APEX}", worker["claimed_names"])
+
+    def test_the_zone_is_steered_and_then_restored(self):
+        evidence, product = self._run(_CoverUnresolvedPodman())
+        self.assertTrue(evidence["zone_restored"])
+        self.assertEqual(len(product.host.zones), 2)
+        steered = product.host.zones[0]["records"]
+        self.assertEqual(steered[multi_node.COVER_PROBE_NAMES["apex_only"]],
+                         {"A": [_COVER_MASTER_IP]})
+        self.assertNotIn(f"www.{multi_node.COVER_PROBE_NAMES['apex_only']}", steered)
+        self.assertEqual(steered[multi_node.COVER_PROBE_NAMES["elsewhere"]],
+                         {"A": [_COVER_OTHER_IP]})
+        # The installed names keep their answers, so a later case cannot inherit
+        # a steered zone.
+        self.assertEqual(product.host.zones[-1], product.host.zone())
+
+    def test_the_zone_is_restored_when_a_check_fails(self):
+        podman = _CoverUnresolvedPodman(probe_returncode=127)
+        product = _CoverUnresolvedProduct(podman)
+        with self.assertRaises(AssertionError):
+            multi_node.case_cover_unresolved(product)
+        self.assertEqual(len(product.host.zones), 2)
+        self.assertEqual(product.host.zones[-1], product.host.zone())
+
+    def test_a_probe_the_fixture_answered_differently_is_rejected(self):
+        probes = multi_node.cover_probe_matrix(_COVER_MASTER_IP, _COVER_OTHER_IP)
+        answers = {probes[0]["domain"]: probes[0]["answers"]}
+        answers[probes[0]["domain"]] = {probes[0]["apex"]: _COVER_MASTER_IP,
+                                        f"www.{probes[0]['apex']}": _COVER_MASTER_IP}
+        podman = _CoverUnresolvedPodman(
+            probe_outputs={"master": _cover_probe_output(probes, answers=answers),
+                           "worker": _cover_probe_output(probes)})
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("cannot stand for the half of the pair", str(caught.exception))
+
+    def test_a_probe_that_renders_the_apex_is_rejected(self):
+        probes = multi_node.cover_probe_matrix(_COVER_MASTER_IP, _COVER_OTHER_IP)
+        rendered = {probes[0]["domain"]: probes[0]["apex"]}
+        podman = _CoverUnresolvedPodman(
+            probe_outputs={"master": _cover_probe_output(probes, rendered=rendered),
+                           "worker": _cover_probe_output(probes)})
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("so a lineage ACME cannot validate would be requested",
+                      str(caught.exception))
+
+    def test_a_refusal_that_blames_the_wrong_record_is_rejected(self):
+        probes = multi_node.cover_probe_matrix(_COVER_MASTER_IP, _COVER_OTHER_IP)
+        reasons = {probes[0]["domain"]:
+                   f"Camouflage apex disabled — {probes[0]['apex']} does not resolve "
+                   f"to {probes[0]['server_ip']}, so HTTP-01 would fail."}
+        podman = _CoverUnresolvedPodman(
+            probe_outputs={"master": _cover_probe_output(probes, reasons=reasons),
+                           "worker": _cover_probe_output(probes)})
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("instead of naming the records that did not resolve",
+                      str(caught.exception))
+
+    def test_a_rendered_role_without_a_claiming_vhost_is_rejected(self):
+        podman = _CoverUnresolvedPodman()
+        apex = topology.COVER_APEX
+        states = dict(podman.states)
+        states["master"] = _cover_state_output(
+            topology.PANEL_DOMAIN, apex,
+            {apex: _COVER_MASTER_IP, f"www.{apex}": _COVER_MASTER_IP},
+            (_COVER_MASTER_IP,), apex, "",
+            claims=(f"/etc/nginx/conf.d/gowave-decoy.conf:12:    server_name "
+                    f"reality.{apex};",),
+            lineages={_COVER_LINEAGE: f"DNS:reality.{apex}, DNS:{apex}, DNS:www.{apex}"},
+        )
+        podman.states = states
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("rendered no vhost claiming", str(caught.exception))
+
+    def test_a_rendered_role_without_a_lineage_for_the_pair_is_rejected(self):
+        podman = _CoverUnresolvedPodman()
+        apex = topology.COVER_APEX
+        states = dict(podman.states)
+        states["master"] = _cover_state_output(
+            topology.PANEL_DOMAIN, apex,
+            {apex: _COVER_MASTER_IP, f"www.{apex}": _COVER_MASTER_IP},
+            (_COVER_MASTER_IP,), apex, "",
+            claims=(f"/etc/nginx/conf.d/gowave-decoy.conf:12:    server_name "
+                    f"reality.{apex} {apex} www.{apex};",),
+            lineages={_COVER_LINEAGE: f"DNS:reality.{apex}"},
+        )
+        podman.states = states
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("holds no certificate covering both", str(caught.exception))
+
+    def test_a_rendered_role_without_a_page_is_rejected(self):
+        podman = _CoverUnresolvedPodman()
+        apex = topology.COVER_APEX
+        states = dict(podman.states)
+        states["master"] = _cover_state_output(
+            topology.PANEL_DOMAIN, apex,
+            {apex: _COVER_MASTER_IP, f"www.{apex}": _COVER_MASTER_IP},
+            (_COVER_MASTER_IP,), apex, "",
+            claims=(f"gowave-decoy.conf:12:    server_name reality.{apex} {apex} "
+                    f"www.{apex};",),
+            lineages={_COVER_LINEAGE: f"DNS:{apex}, DNS:www.{apex}"},
+            site_bytes="",
+        )
+        podman.states = states
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("left no rendered cover page", str(caught.exception))
+
+    def test_a_refusing_role_that_still_claims_the_apex_is_rejected(self):
+        podman = _CoverUnresolvedPodman()
+        apex = topology.COVER_APEX
+        states = dict(podman.states)
+        states["worker"] = states["worker"].replace(
+            f"server_name worker-reality.{apex};",
+            f"server_name worker-reality.{apex} {apex} www.{apex};",
+        )
+        podman.states = states
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("leaving a partial decoy", str(caught.exception))
+
+    def test_a_refusing_role_that_already_issued_the_lineage_is_rejected(self):
+        podman = _CoverUnresolvedPodman()
+        apex = topology.COVER_APEX
+        states = dict(podman.states)
+        states["worker"] += (f"lineage\t/etc/letsencrypt/live/worker-reality.{apex}/cert.pem\t"
+                             f"DNS:worker-reality.{apex}, DNS:{apex}\n")
+        podman.states = states
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("the refusal came after issuance", str(caught.exception))
+
+    def test_a_state_that_cannot_be_read_is_rejected(self):
+        podman = _CoverUnresolvedPodman(state_returncode=2)
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("could not report its cover state", str(caught.exception))
+
+    def test_the_rendered_scripts_run_the_shipped_decisions(self):
+        # The extracted payload is the fragile half, so both roles' scripts are
+        # executed against the files this checkout ships.
+        probes = multi_node.cover_probe_matrix(_COVER_MASTER_IP, _COVER_OTHER_IP)
+        for role in ("master", "worker"):
+            with self.subTest(role=role):
+                script = multi_node.cover_probe_script(role, probes).replace(
+                    topology.REPO_IN_CONTAINER, str(REPO_ROOT))
+                res = subprocess.run(["bash", "-c", script],
+                                     capture_output=True, text=True)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                facts = multi_node.parse_cover_state(res.stdout)
+                self.assertEqual(len(facts["decisions"]), len(probes))
+                self.assertEqual(
+                    set(facts["resolved"]),
+                    {name for probe in probes
+                     for name in (probe["apex"], f"www.{probe['apex']}")},
+                )
+
+    def test_the_state_script_reads_the_files_a_rendered_apex_leaves(self):
+        script = multi_node.cover_state_script(
+            "master", topology.PANEL_DOMAIN, _COVER_MASTER_IP)
+        for fragment in (multi_node.COVER_SITE_INDEX, "server_name", "subjectAltName",
+                         "hostname -I", "getent ahostsv4"):
+            self.assertIn(fragment, script)
+        self.assertIn(f"source {topology.REPO_IN_CONTAINER}/modules/nginx.sh", script)
+
+    def test_the_case_runs_beside_the_derivation_and_before_the_lifecycle_cases(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ids = [case.id for case in multi_node.cases(_StubPodman(Path(tmp.name)))]
+        suite = {case.id: case for case in multi_node.cases(_StubPodman(Path(tmp.name)))}
+        self.assertLess(ids.index(multi_node.COVER_DERIVE_CASE_ID),
+                        ids.index(multi_node.COVER_UNRESOLVED_CASE_ID))
+        self.assertLess(ids.index(multi_node.COVER_UNRESOLVED_CASE_ID),
+                        ids.index(multi_node.REVOCATION_CASE_ID))
+        case = suite[multi_node.COVER_UNRESOLVED_CASE_ID]
+        self.assertEqual(case.timeout_seconds,
+                         multi_node.COVER_UNRESOLVED_TIMEOUT_SECONDS)
+        self.assertEqual(case.topology, "multi-node")
+
+
 class TestMtlsVerifierReport(unittest.TestCase):
     """MTLS-01/02: the verifier's own lines are the only evidence accepted."""
 

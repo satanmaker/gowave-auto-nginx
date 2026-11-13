@@ -2084,15 +2084,28 @@ cover_brand_from_domain() {
     printf '%s\n' "${out% }"
 }
 
+# ACME validates the cover domains over port 80 on this host, so they are only
+# usable when both records already resolve to its public IPv4 address. Each name
+# that does not is printed, one per line, so the refusal can point at the record
+# an operator has to fix instead of blaming the pair.
+cover_domains_not_resolving() {
+    local cover_domain="${1:-}"
+    local server_ip="${2:-}"
+    local name resolved
+    [[ -n "$cover_domain" ]] || return 0
+    for name in "$cover_domain" "www.$cover_domain"; do
+        resolved=$(getent ahostsv4 "$name" 2>/dev/null | awk 'NR==1 {print $1}')
+        if [[ -z "$server_ip" || "$resolved" != "$server_ip" ]]; then
+            printf '%s\n' "$name"
+        fi
+    done
+}
+
 cover_domains_resolve_here() {
     local cover_domain="${1:-}"
     local server_ip="${2:-}"
     [[ -n "$cover_domain" && -n "$server_ip" ]] || return 1
-    local name resolved
-    for name in "$cover_domain" "www.$cover_domain"; do
-        resolved=$(getent ahostsv4 "$name" 2>/dev/null | awk 'NR==1 {print $1}')
-        [[ "$resolved" == "$server_ip" ]] || return 1
-    done
+    [[ -z "$(cover_domains_not_resolving "$cover_domain" "$server_ip")" ]]
 }
 
 # The single cover-site decision, identical to the Master's: the apex on
@@ -2102,7 +2115,7 @@ cover_domains_resolve_here() {
 cover_domain_for() {
     local panel_domain="${1:-}"
     local server_ip="${2:-}"
-    local cover_domain
+    local cover_domain unresolved
     cover_domain=$(derive_cover_domain "$panel_domain")
     if [[ -z "$cover_domain" ]]; then
         if [[ -n "$panel_domain" ]]; then
@@ -2110,8 +2123,13 @@ cover_domain_for() {
         fi
         return 0
     fi
-    if ! cover_domains_resolve_here "$cover_domain" "$server_ip"; then
-        echo "Camouflage apex disabled — $cover_domain / www.$cover_domain do not resolve to ${server_ip:-this host}, so HTTP-01 would fail." >&2
+    unresolved=$(cover_domains_not_resolving "$cover_domain" "$server_ip")
+    if [[ -n "$unresolved" ]]; then
+        if [[ "$unresolved" == *$'\n'* ]]; then
+            echo "Camouflage apex disabled — ${unresolved//$'\n'/ / } do not resolve to ${server_ip:-this host}, so HTTP-01 would fail." >&2
+        else
+            echo "Camouflage apex disabled — $unresolved does not resolve to ${server_ip:-this host}, so HTTP-01 would fail." >&2
+        fi
         return 0
     fi
     printf '%s\n' "$cover_domain"

@@ -525,7 +525,8 @@ class TestNodeIntegration(unittest.TestCase):
             at = master.index(function + "() {")
             return master[at:master.index("\n}\n", at) + len("\n}\n")]
 
-        for function in ("derive_cover_domain", "cover_domains_resolve_here", "cover_domain_for"):
+        for function in ("derive_cover_domain", "cover_domains_resolve_here",
+                         "cover_domains_not_resolving", "cover_domain_for"):
             with self.subTest(function=function):
                 self.assertEqual(self._payload_slice(function), master_slice(function))
 
@@ -537,16 +538,22 @@ class TestNodeIntegration(unittest.TestCase):
             getent = fake_bin / "getent"
             getent.write_text(
                 "#!/usr/bin/env bash\n"
-                'printf \'%s\\n\' "${FAKE_RESOLVED:-203.0.113.10} STREAM ${2}"\n'
+                'name="${2}"\n'
+                'if [[ -n "${FAKE_UNRESOLVED:-}" && "$name" == "$FAKE_UNRESOLVED" ]]; then\n'
+                "    exit 2\n"
+                "fi\n"
+                'printf \'%s\\n\' "${FAKE_RESOLVED:-203.0.113.10} STREAM ${name}"\n'
             )
             getent.chmod(0o755)
             environment = os.environ.copy()
             environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
             exports = (self._payload_slice("derive_cover_domain")
+                       + self._payload_slice("cover_domains_not_resolving")
                        + self._payload_slice("cover_domains_resolve_here"))
 
-            def run(domain: str, resolved: str = "203.0.113.10"):
+            def run(domain: str, resolved: str = "203.0.113.10", unresolved: str = ""):
                 environment["FAKE_RESOLVED"] = resolved
+                environment["FAKE_UNRESOLVED"] = unresolved
                 body = f'cover_domain_for "{domain}" "203.0.113.10"; echo "rc=$?"\n'
                 res = self._run_payload_function("cover_domain_for", body, exports,
                                                 env=environment)
@@ -571,6 +578,20 @@ class TestNodeIntegration(unittest.TestCase):
             res = run("worker.testbed.internal", resolved="198.51.100.7")
             self.assertNotIn("testbed.internal", res.stdout)
             self.assertIn("do not resolve to 203.0.113.10", res.stderr)
+
+            # One half of the pair missing names that half, so the operator knows
+            # which record to fix instead of re-checking both.
+            res = run("worker.testbed.internal", unresolved="www.testbed.internal")
+            self.assertEqual(res.stdout.strip(), "rc=0")
+            self.assertIn("Camouflage apex disabled — www.testbed.internal does not "
+                          "resolve to 203.0.113.10, so HTTP-01 would fail.", res.stderr)
+            self.assertNotIn("testbed.internal /", res.stderr)
+            self.assertNotIn("— testbed.internal does not", res.stderr)
+
+            res = run("worker.testbed.internal", unresolved="testbed.internal")
+            self.assertIn("Camouflage apex disabled — testbed.internal does not "
+                          "resolve to 203.0.113.10, so HTTP-01 would fail.", res.stderr)
+            self.assertNotIn("www.testbed.internal", res.stderr)
 
     def test_the_worker_resolves_its_public_ipv4_only_when_an_apex_exists(self):
         script = (REPO_ROOT / "gowave-node-auto.sh").read_text()

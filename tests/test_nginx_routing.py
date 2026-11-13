@@ -149,14 +149,19 @@ class TestNginxRouting(unittest.TestCase):
             getent = fake_bin / "getent"
             getent.write_text(
                 "#!/usr/bin/env bash\n"
-                'printf \'%s\\n\' "${FAKE_RESOLVED:-203.0.113.10} STREAM ${2}"\n'
+                'name="${2}"\n'
+                'if [[ -n "${FAKE_UNRESOLVED:-}" && "$name" == "$FAKE_UNRESOLVED" ]]; then\n'
+                "    exit 2\n"
+                "fi\n"
+                'printf \'%s\\n\' "${FAKE_RESOLVED:-203.0.113.10} STREAM ${name}"\n'
             )
             getent.chmod(0o755)
             environment = os.environ.copy()
             environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
 
-            def run(domain, server_ip="", resolved="203.0.113.10"):
+            def run(domain, server_ip="", resolved="203.0.113.10", unresolved=""):
                 environment["FAKE_RESOLVED"] = resolved
+                environment["FAKE_UNRESOLVED"] = unresolved
                 return subprocess.run(
                     ["bash", "-c",
                      f'source "{NGINX_SH}" && cover_domain_for "{domain}" "{server_ip}"'],
@@ -190,6 +195,20 @@ class TestNginxRouting(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertEqual(res.stdout, "")
             self.assertIn("do not resolve to 203.0.113.10", res.stderr)
+
+            # Half of the pair is named on its own, so the operator knows which
+            # record to fix rather than re-checking both.
+            res = run("panel.example.com", "203.0.113.10",
+                      unresolved="www.example.com")
+            self.assertEqual(res.stdout, "")
+            self.assertIn("Camouflage apex disabled — www.example.com does not resolve "
+                          "to 203.0.113.10", res.stderr)
+
+            res = run("panel.example.com", "203.0.113.10", unresolved="example.com")
+            self.assertEqual(res.stdout, "")
+            self.assertIn("Camouflage apex disabled — example.com does not resolve "
+                          "to 203.0.113.10", res.stderr)
+            self.assertNotIn("www.example.com", res.stderr)
 
             # No domain at all is not an error and not a refusal to explain.
             res = run("", "")
