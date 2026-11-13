@@ -26,12 +26,8 @@ Supported platforms: **Ubuntu 24.04 / 26.04 LTS, Debian 12 / 13**, bash + root o
 
 ## Quick start
 
-This default branch carries the specification baseline and the audit trail. The complete modular
-product — lifecycle modules, hardened NGINX/Xray assets, cover-site generation and the E2E runners —
-rides on the `feature/podman-full-e2e` integration branch and lands here at acceptance close. To run:
-
 ```bash
-git clone -b feature/podman-full-e2e https://github.com/satanmaker/gowave-auto-nginx.git
+git clone https://github.com/satanmaker/gowave-auto-nginx.git
 cd gowave-auto-nginx
 sudo ./gowave-auto.sh install vpn.example.com cdn.example.com acme@example.com
 sudo ./gowave-auto.sh node add worker-1 203.0.113.10 worker-1.example.com cdn.example.com
@@ -49,24 +45,28 @@ Omitting arguments drops into interactive prompts. Administrative credentials ar
 - **Zero-leak credentials** — secrets travel via stdin or `0600` temp files with signal traps; never
   command-line arguments, never logs. GoWave and Xray credentials are unlinked immediately after use.
 
-## Specification-driven acceptance
+## Specification-driven with real acceptance runs
 
-The behaviour is pinned by an OpenSpec change under `openspec/changes/gowave-auto-nginx/`: six
-capability specifications (lifecycle management, traffic routing, protocol profiles, panel-node
-integration, VPS security, backup/recovery) carry **48 requirements / 95 GIVEN-WHEN-THEN acceptance
-scenarios**. Scenarios are executed by two runners — **Podman E2E** (a rootful 4-distribution container
-testbed) and **Live VPS E2E** (the same catalog against real clean-room servers) — rather than only
-eyeballed in code review; both runners ship on the integration branch.
+The behaviour is pinned by OpenSpec specifications in `openspec/specs/`: two specs carry
+**32 requirements / 139 GIVEN-WHEN-THEN acceptance scenarios**. Each scenario is executed by one of two
+runners rather than only eyeballed in code review:
+
+- **Podman E2E** (`tools/run_podman_e2e.py`) — a rootful 4-distribution container testbed that
+  incubates every new scenario in minutes.
+- **Live VPS E2E** (`tools/run_live_vps.py`) — the same acceptance catalog driven against real clean-room
+  virtual servers; scenarios graduate here from the container suite.
 
 ## Repository layout
 
 ```
-gowave-auto.sh            lifecycle manager CLI entrypoint (install, update, node, domain-change, backup, uninstall)
+gowave-auto.sh            lifecycle manager (install, update, node, domain-change, backup, uninstall)
 gowave-node-auto.sh       distributed edge worker orchestrator
-modules/                  panel API client and transactional recovery tooling (Python + shell)
-openspec/                 pinned change: proposal, design, tasks, capability specs, decision register
-tests/                    security, panel-API and node-integration suites
-tools/                    test tooling
+modules/                  lock, os detection, preflight, security, panel API, node, nginx, recovery
+config/ assets/           systemd units, logrotate, NGINX templates, SNI decoy sites
+openspec/                 specs + active changes (proposal → design → tasks, strict validation)
+tools/                    E2E runners (podman, live VPS), acceptance gate, release prep
+tests/                    podman multi-node, security, recovery, panel API suites
+docs/                     live-VPS testing guide, E2E scenario catalog
 ```
 
 ## Provenance
