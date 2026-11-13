@@ -16,9 +16,11 @@ from __future__ import annotations
 import json
 import shlex
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from . import matrix, panel_surface, topology
+from . import client_trust, matrix, panel_surface, topology
 from .podman import wait_until
 from .runner import Case, CaseBlocked, require
 
@@ -457,6 +459,329 @@ def ngx_config_script(mode: str, primary_domain: str) -> str:
         .replace("HOOK_PLACEHOLDER", NGX_CONFIG_HOOK)
         .replace("RELOAD_WAIT_PLACEHOLDER", str(int(NGX_CONFIG_RELOAD_WAIT_SECONDS)))
     )
+
+
+TLS_CASE_ID = "TLS-01"
+# One role costs four independent handshakes from the client plus one host-side
+# configuration read; the ceiling is a hang guard, not an expectation.
+TLS_PROBE_TIMEOUT_SECONDS = 60
+TLS_TIMEOUT_SECONDS = 300
+# The versions the product documents for its HTTPS vhosts. A role that inherits
+# a platform default instead would accept whatever the distribution shipped,
+# which is exactly the difference an independent client cannot see on its own.
+TLS_POLICY_PROTOCOLS = ("TLSv1.2", "TLSv1.3")
+# A certificate with less headroom than this has no time left for the renewal
+# that is supposed to replace it.
+TLS_MINIMUM_REMAINING_SECONDS = 86400
+
+TLS_POLICY_SCRIPT = r"""python3 - DOMAIN_PLACEHOLDER <<'PY'
+import glob
+import json
+import re
+import sys
+
+DOMAIN = sys.argv[1]
+CONFIG_GLOBS = ("/etc/nginx/conf.d/*.conf", "/etc/nginx/sites-enabled/*")
+
+
+# Every top-level server block, by brace depth. A server_name token is not a
+# block, so a candidate whose first semicolon comes before its opening brace is
+# skipped instead of swallowing the rest of the file.
+def server_blocks(text):
+    blocks = []
+    index = 0
+    while True:
+        start = text.find("server", index)
+        if start == -1:
+            return blocks
+        brace = text.find("{", start + len("server"))
+        semicolon = text.find(";", start + len("server"))
+        if brace == -1:
+            return blocks
+        if semicolon != -1 and semicolon < brace:
+            index = start + len("server")
+            continue
+        depth = 0
+        end = None
+        for position in range(brace, len(text)):
+            char = text[position]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = position + 1
+                    break
+        if end is None:
+            return blocks
+        blocks.append(text[start:end])
+        index = end
+
+
+def directives(block, name):
+    return [match.strip() for match in re.findall(r"^\s*" + name + r"\s+([^;]+);", block, re.M)]
+
+
+def main():
+    matched = []
+    paths = sorted({path for pattern in CONFIG_GLOBS for path in glob.glob(pattern)})
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        for block in server_blocks(text):
+            names = [token for line in directives(block, "server_name") for token in line.split()]
+            listens = directives(block, "listen")
+            if DOMAIN not in names:
+                continue
+            # The port 80 ACME vhost carries the same server name without
+            # terminating TLS, so only an `ssl` listener describes the HTTPS face.
+            if not any("ssl" in listen.split() for listen in listens):
+                continue
+            matched.append({
+                "file": path,
+                "server_names": names,
+                "listen": listens,
+                "ssl_protocols": directives(block, "ssl_protocols"),
+                "ssl_certificate": directives(block, "ssl_certificate"),
+            })
+    print(json.dumps({"domain": DOMAIN, "blocks": matched}, sort_keys=True))
+
+
+main()
+PY
+"""
+
+
+def tls_policy_facts(
+    podman: Any, container: str, case_id: str, domain: str,
+    timeout: int = TLS_PROBE_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Read the HTTPS vhost one role generated for its own name."""
+    result = podman.exec_bash(
+        container,
+        TLS_POLICY_SCRIPT.replace("DOMAIN_PLACEHOLDER", shlex.quote(domain)),
+        check=False,
+        timeout=timeout,
+    )
+    return probe_json(case_id, f"the NGINX TLS policy probe on {container}", result)
+
+
+def require_role_tls_policy(case_id: str, role: str, domain: str, facts: Dict[str, Any]) -> Dict[str, Any]:
+    """The role serves its own lineage and pins its protocol list itself.
+
+    Inheriting `ssl_protocols` from the platform is the defect this assertion
+    exists for: the same product would then accept legacy protocols on one
+    supported distribution and refuse them on another, and nothing in the served
+    certificate would say so.
+    """
+    require(case_id, facts.get("domain") == domain,
+            f"{role}: the policy probe answered for {facts.get('domain')!r} instead of {domain!r}")
+    blocks = facts.get("blocks") or []
+    require(case_id, len(blocks) == 1,
+            f"{role}: {len(blocks)} HTTPS server blocks claim {domain!r} "
+            f"({[block.get('file') for block in blocks]}), so the vhost that terminates TLS "
+            "for this role cannot be read unambiguously")
+    block = blocks[0]
+    protocol_lines = block.get("ssl_protocols") or []
+    require(case_id, protocol_lines,
+            f"{role}: the HTTPS vhost in {block.get('file')} inherits its TLS protocol policy "
+            "instead of pinning one, so the accepted versions follow the platform default")
+    protocols = [token for line in protocol_lines for token in line.split()]
+    require(case_id, set(protocols) == set(TLS_POLICY_PROTOCOLS),
+            f"{role}: the HTTPS vhost in {block.get('file')} allows {protocols} instead of "
+            f"{list(TLS_POLICY_PROTOCOLS)}")
+    certificates = block.get("ssl_certificate") or []
+    require(case_id, len(certificates) == 1,
+            f"{role}: the HTTPS vhost in {block.get('file')} names {len(certificates)} certificates "
+            f"({certificates}) instead of the one lineage issued for {domain!r}")
+    lineage = f"{LETSENCRYPT_ROOT}/{domain}/"
+    require(case_id, certificates[0].startswith(lineage),
+            f"{role}: the HTTPS vhost serves {certificates[0]!r} instead of the lineage the "
+            f"operator issued for this name ({lineage}...)")
+    return {
+        "file": block.get("file"),
+        "listen": block.get("listen"),
+        "ssl_protocols": protocols,
+        "ssl_certificate": certificates[0],
+    }
+
+
+def _certificate_time(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def require_certificate_window(
+    case_id: str, role: str, peer: Dict[str, Any], now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """The certificate the client validated is inside its own validity window."""
+    not_before = _certificate_time(str(peer.get("not_before") or ""))
+    not_after = _certificate_time(str(peer.get("not_after") or ""))
+    require(case_id, not_before is not None and not_after is not None,
+            f"{role}: the served certificate exposes no validity window "
+            f"({peer.get('not_before')!r} .. {peer.get('not_after')!r})")
+    require(case_id, not_before < not_after,
+            f"{role}: the served certificate expires before it becomes valid "
+            f"({not_before.isoformat()} .. {not_after.isoformat()})")
+    moment = now or datetime.now(timezone.utc)
+    require(case_id, not_before <= moment,
+            f"{role}: the served certificate is not valid yet "
+            f"({not_before.isoformat()} > {moment.isoformat()})")
+    require(case_id, moment < not_after,
+            f"{role}: the served certificate has expired "
+            f"({not_after.isoformat()} <= {moment.isoformat()})")
+    remaining = int((not_after - moment).total_seconds())
+    require(case_id, remaining >= TLS_MINIMUM_REMAINING_SECONDS,
+            f"{role}: the served certificate expires in {remaining}s, less than the "
+            f"{TLS_MINIMUM_REMAINING_SECONDS}s a renewal path needs to replace it")
+    return {
+        "not_before": not_before.isoformat(),
+        "not_after": not_after.isoformat(),
+        "remaining_seconds": remaining,
+    }
+
+
+def require_client_certificate(
+    case_id: str, role: str, domain: str, report: Dict[str, Any], expected_status: int,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """An independent client validates the name, the chain, and the handshake.
+
+    The probe trusts only the run CA, so a successful call proves the served
+    chain is the one the fixture directory issued; the SAN set is then compared
+    exactly, because a certificate that also covers another name would let the
+    client validate something this role was never issued.
+    """
+    probe = report.get("probe") or {}
+    require(case_id, report.get("returncode") == 0,
+            f"{role}: the independent client could not verify https://{domain}/ through the "
+            f"fixture CA: {probe.get('error') or report.get('stderr')}")
+    require(case_id, probe.get("status") == expected_status,
+            f"{role}: https://{domain}/ answered {probe.get('status')!r} instead of "
+            f"{expected_status}")
+    peer = probe.get("peer") or {}
+    san = sorted(str(name) for name in peer.get("san") or [])
+    require(case_id, san == [domain],
+            f"{role}: the certificate served for {domain} covers {san}, so the name an "
+            "independent client validated is not the lineage this role was issued")
+    version = str(peer.get("tls_version", ""))
+    require(case_id, version.startswith("TLSv1.3"),
+            f"{role}: the public handshake negotiated {version!r} instead of TLSv1.3")
+    require(case_id, peer.get("issuer"),
+            f"{role}: the served certificate reports no issuer, so its chain is not described "
+            "by the handshake at all")
+    window = require_certificate_window(case_id, role, peer, now=now)
+    return {
+        "status": probe.get("status"),
+        "san": san,
+        "tls_version": version,
+        "cipher": peer.get("cipher"),
+        "issuer": peer.get("issuer"),
+        **window,
+    }
+
+
+def require_tls12_accepted(case_id: str, role: str, domain: str, report: Dict[str, Any]) -> Dict[str, Any]:
+    """The version the generated vhost lists is really offered to a client."""
+    probe = report.get("probe") or {}
+    require(case_id, report.get("returncode") == 0,
+            f"{role}: a client limited to TLS 1.2 could not complete the handshake on "
+            f"https://{domain}/ although the generated vhost allows it: "
+            f"{probe.get('error') or report.get('stderr')}")
+    version = str((probe.get("peer") or {}).get("tls_version", ""))
+    require(case_id, version.startswith("TLSv1.2"),
+            f"{role}: a client limited to TLS 1.2 negotiated {version!r}")
+    return {"tls_version": version}
+
+
+def require_legacy_protocol_refused(case_id: str, role: str, domain: str, report: Dict[str, Any]) -> Dict[str, Any]:
+    """A legacy protocol has to fail the handshake, not reach the vhost."""
+    probe = report.get("probe") or {}
+    version = str((probe.get("peer") or {}).get("tls_version", ""))
+    require(case_id, report.get("returncode") != 0,
+            f"{role}: https://{domain}/ completed a session pinned to TLS 1.1 "
+            f"({version!r}), so the generated vhost accepts a protocol the product does "
+            "not document")
+    require(case_id, not version,
+            f"{role}: the TLS 1.1 probe failed after negotiating {version!r}, so the refusal is "
+            "not the protocol policy's")
+    return {
+        "refused": True,
+        "error": str(probe.get("error") or report.get("stderr") or "").strip()[:300],
+    }
+
+
+def require_untrusted_chain_refused(case_id: str, role: str, domain: str, report: Dict[str, Any]) -> Dict[str, Any]:
+    """Without the fixture anchor the same call has to fail as a chain error.
+
+    This is what keeps the positive handshake honest: a certificate that also
+    verified against the client's system store would pass either way, and the
+    fixture CA would then be a global trust change nobody asked for.
+    """
+    probe = report.get("probe") or {}
+    require(case_id, report.get("returncode") != 0,
+            f"{role}: https://{domain}/ verified without the fixture CA, so either the served "
+            "chain is not the fixture directory's or the fixture CA reached the client's system "
+            "trust store")
+    error = str(probe.get("error") or report.get("stderr") or "").strip()
+    try:
+        client_trust.verify_chain_failure(error)
+    except client_trust.ClientTrustError as failure:
+        require(case_id, False,
+                f"{role}: the unanchored client failed without a certificate-chain error: {failure}")
+    return {"refused": True, "error": error[:300]}
+
+
+def tls_surface_contract(
+    product: AioProduct, case_id: str, role: str, domain: str, expected_status: int,
+    container: str = "",
+) -> Dict[str, Any]:
+    """Prove one role's HTTPS certificate and protocol policy from outside it.
+
+    ``container`` names the host the vhost was generated on; it defaults to the
+    install's own host. The client-side probes always run from the Control
+    Machine role, which resolves the name through the fixture zone, so the
+    handshake is what a real client would get rather than what the host believes
+    about itself.
+    """
+    host = product.require_installed()
+    target = container or host.target_name
+    policy = require_role_tls_policy(
+        case_id, role, domain, tls_policy_facts(product.podman, target, case_id, domain),
+    )
+    url = f"https://{domain}/"
+    verified = require_client_certificate(
+        case_id, role, domain,
+        host.client_http(url, expect_status=expected_status, expect_san=[domain], timeout=30),
+        expected_status,
+    )
+    tls12 = require_tls12_accepted(
+        case_id, role, domain, host.client_http(url, timeout=30, max_tls="TLSv1.2"),
+    )
+    # No pin succeeds here for a documented reason: the vhost lists its versions.
+    legacy = require_legacy_protocol_refused(
+        case_id, role, domain, host.client_http(url, timeout=30, max_tls="TLSv1.1"),
+    )
+    untrusted = require_untrusted_chain_refused(
+        case_id, role, domain, host.client_http(url, timeout=30, anchor=False),
+    )
+    return {
+        "role": role,
+        "domain": domain,
+        "policy": policy,
+        "verified": verified,
+        "tls12_pinned": tls12,
+        "legacy_refused": legacy,
+        "untrusted_refused": untrusted,
+    }
 
 
 def probe_json(case_id: str, label: str, result: Any) -> Dict[str, Any]:
@@ -1006,6 +1331,21 @@ def case_tls_and_identity(product: AioProduct) -> Dict[str, Any]:
         "short_uuid_source": "api",
         "credentials_short_uuid_key": False,
     }
+
+
+def case_tls_surface(product: AioProduct) -> Dict[str, Any]:
+    """TLS-01: an independent client validates the certificate the host serves.
+
+    AIO-05 reads the lineage on disk; this case asks the client, which is the
+    only vantage point that can tell what the public handshake actually presents. The
+    certificate has to cover exactly the name it is served for, sit inside its
+    validity window, chain to the run CA, and negotiate TLS 1.3 — while a client
+    pinned to TLS 1.1 is refused and the same call without the run CA fails as a
+    chain error.
+    """
+    return tls_surface_contract(
+        product, TLS_CASE_ID, "the All-in-One host", PANEL_DOMAIN, 200,
+    )
 
 
 def _panel_facts(product: AioProduct, case_id: str, scope: str) -> Dict[str, Any]:
@@ -2248,6 +2588,10 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case("AIO-01", "aio", lambda context: case_panel_ready(product), timeout_seconds=300),
         Case("AIO-03", "aio", lambda context: case_credentials(product), timeout_seconds=300),
         Case("AIO-05", "aio", lambda context: case_tls_and_identity(product), timeout_seconds=300),
+        # The public certificate is read before the tree is reloaded, so a later
+        # case's reload cannot be mistaken for a defect in what this one measured.
+        Case(TLS_CASE_ID, "aio", lambda context: case_tls_surface(product),
+             timeout_seconds=TLS_TIMEOUT_SECONDS),
         # The configuration case only observes and reloads: it runs before any
         # traffic so a reload it caused can never be read as a data-plane fault.
         Case(NGX_CONFIG_CASE_ID, "aio", lambda context: case_nginx_config(product),

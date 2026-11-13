@@ -2304,6 +2304,8 @@ server {
 
     ssl_certificate /etc/letsencrypt/live/$WORKER_DOMAIN/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/$WORKER_DOMAIN/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
 
     location ^~ /xhttp-down/ {
         proxy_pass http://127.0.0.1:10001;

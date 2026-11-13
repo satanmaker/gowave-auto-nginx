@@ -25,26 +25,52 @@ from urllib.parse import urlsplit
 DEFAULT_TIMEOUT = 20
 SNIPPET_LIMIT = 300
 
+# The names are the ones an operator reads in `nginx -T` and OpenSSL output, so a
+# pinned handshake reports the same protocol token the generated vhost names.
+TLS_VERSION_PINS = {
+    "TLSv1": ssl.TLSVersion.TLSv1,
+    "TLSv1.1": ssl.TLSVersion.TLSv1_1,
+    "TLSv1.2": ssl.TLSVersion.TLSv1_2,
+    "TLSv1.3": ssl.TLSVersion.TLSv1_3,
+}
+
 
 class ProbeError(RuntimeError):
     pass
 
 
-def build_context(ca_file: Optional[str], insecure: bool) -> ssl.SSLContext:
+def build_context(
+    ca_file: Optional[str], insecure: bool, min_tls: str = "", max_tls: str = "",
+) -> ssl.SSLContext:
     if insecure:
         # Only for a case that is explicitly measuring a rejection: verification
         # is switched off so the alert itself becomes the observation.
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-        return context
-    if ca_file:
-        context = ssl.create_default_context(cafile=ca_file)
     else:
-        context = ssl.create_default_context()
-    context.check_hostname = True
-    context.verify_mode = ssl.CERT_REQUIRED
+        if ca_file:
+            context = ssl.create_default_context(cafile=ca_file)
+        else:
+            context = ssl.create_default_context()
+        context.check_hostname = True
+        context.verify_mode = ssl.CERT_REQUIRED
+    # Pinning bounds the client's offer; whether the server accepts the version
+    # is then the server's answer, which is what a protocol-policy case reads.
+    if min_tls:
+        context.minimum_version = _tls_version(min_tls)
+    if max_tls:
+        context.maximum_version = _tls_version(max_tls)
     return context
+
+
+def _tls_version(name: str) -> "ssl.TLSVersion":
+    try:
+        return TLS_VERSION_PINS[name]
+    except KeyError:
+        raise ProbeError(
+            f"unsupported TLS version pin {name!r}; use one of {', '.join(TLS_VERSION_PINS)}"
+        ) from None
 
 
 def peer_report(sock: Any) -> Dict[str, Any]:
@@ -63,6 +89,7 @@ def peer_report(sock: Any) -> Dict[str, Any]:
         "subject": subject,
         "issuer": issuer,
         "san": san,
+        "not_before": cert.get("notBefore", ""),
         "not_after": cert.get("notAfter", ""),
         "tls_version": sock.version() if hasattr(sock, "version") else "",
         "cipher": (sock.cipher() or ("", "", 0))[0] if hasattr(sock, "cipher") else "",
@@ -77,6 +104,8 @@ def fetch(
     method: str = "GET",
     body: Optional[str] = None,
     timeout: int = DEFAULT_TIMEOUT,
+    min_tls: str = "",
+    max_tls: str = "",
 ) -> Dict[str, Any]:
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https"):
@@ -95,7 +124,7 @@ def fetch(
         request_headers[name.strip()] = value.strip()
 
     if parts.scheme == "https":
-        context = build_context(ca_file, insecure)
+        context = build_context(ca_file, insecure, min_tls=min_tls, max_tls=max_tls)
         connection: http.client.HTTPConnection = http.client.HTTPSConnection(
             host, parts.port or 443, context=context, timeout=timeout,
         )
@@ -156,6 +185,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--expect-absent", default=None)
     parser.add_argument("--expect-san", action="append", default=None)
     parser.add_argument("--expect-tls", default=None, help="Required TLS version prefix, e.g. TLSv1.3")
+    parser.add_argument(
+        "--min-tls", default="", choices=sorted(TLS_VERSION_PINS),
+        help="Lowest protocol version the probe offers",
+    )
+    parser.add_argument(
+        "--max-tls", default="", choices=sorted(TLS_VERSION_PINS),
+        help="Highest protocol version the probe offers, for measuring a server's protocol policy",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -167,12 +204,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             method=args.method,
             body=args.body,
             timeout=args.timeout,
+            min_tls=args.min_tls,
+            max_tls=args.max_tls,
         )
     except (ProbeError, OSError, ssl.SSLError) as exc:
-        print(json.dumps({"url": args.url, "error": f"{type(exc).__name__}: {exc}"}, sort_keys=True))
+        print(json.dumps({
+            "url": args.url,
+            "tls_pins": {"min": args.min_tls, "max": args.max_tls},
+            "error": f"{type(exc).__name__}: {exc}",
+        }, sort_keys=True))
         return 1
 
     failures = evaluate(report, args)
+    report["tls_pins"] = {"min": args.min_tls, "max": args.max_tls}
     report["failures"] = failures
     if failures:
         report["error"] = "; ".join(failures)

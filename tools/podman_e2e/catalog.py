@@ -233,6 +233,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "NGINX SNI Routing and REALITY Decoy Verification",
     },
     {
+        "id": "TLS-01",
+        "requirement": "NGINX SNI Routing and REALITY Decoy Verification",
+        "assertion": "On every role the product exposes over HTTPS, an independent client that trusts only the fixture CA completes a TLSv1.3 handshake whose certificate names exactly that role's domain, is inside its validity window with renewal headroom, and chains to the issuing CA; the same client still negotiates TLSv1.2, is refused when it pins TLSv1.1, and fails chain verification when the CA is withheld — while the role's generated vhost states its protocol list itself instead of inheriting the distribution default.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "NGINX SNI Routing and REALITY Decoy Verification",
+    },
+    {
         "id": "NGX-COVER-DERIVE",
         "requirement": "Camouflage decoy and certificate lineage",
         "assertion": "The cover apex is the last two labels of panel_domain and a domain with fewer than three labels produces no cover lineage and is handled explicitly.",

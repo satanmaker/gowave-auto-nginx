@@ -9,6 +9,8 @@ import threading
 import types
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional, Sequence
@@ -1333,6 +1335,251 @@ class TestNginxConfigCase(unittest.TestCase):
         self.assertEqual(record["topology"], ["aio", "multi-node"])
         self.assertEqual(record["promotion_target"],
                          "NGINX SNI Routing and REALITY Decoy Verification")
+
+
+def tls_policy(domain=aio.PANEL_DOMAIN, **overrides):
+    """The host-side policy report for one HTTPS vhost, with a field overridden."""
+    block = {
+        "file": "/etc/nginx/conf.d/gowave-panel.conf",
+        "server_names": [domain],
+        "listen": ["127.0.0.1:7443 ssl proxy_protocol"],
+        "ssl_protocols": ["TLSv1.2 TLSv1.3"],
+        "ssl_certificate": [f"/etc/letsencrypt/live/{domain}/fullchain.pem"],
+    }
+    block.update(overrides)
+    if block.pop("omit", False):
+        return json.dumps({"domain": domain, "blocks": []})
+    return json.dumps({"domain": domain, "blocks": [block]})
+
+
+def certificate_day(days: float = 0) -> str:
+    """A certificate time relative to now, in the form the peer report carries."""
+    return format_datetime(datetime.now(timezone.utc) + timedelta(days=days))
+
+
+def tls_report(
+    domain=aio.PANEL_DOMAIN, status=200, san=None, version="TLSv1.3",
+    not_before=None, not_after=None,
+    issuer="CN=Pebble Intermediate CA", returncode=0, error="",
+):
+    """One independent-client handshake report, as the probe prints it."""
+    peer = {
+        "san": [domain] if san is None else san,
+        "tls_version": version,
+        "cipher": "TLS_AES_256_GCM_SHA384",
+        "issuer": issuer,
+        "not_before": certificate_day(-30) if not_before is None else not_before,
+        "not_after": certificate_day(60) if not_after is None else not_after,
+    }
+    probe = {"url": f"https://{domain}/", "status": status, "peer": peer}
+    if error:
+        probe["error"] = error
+    return {"returncode": returncode, "probe": probe, "stdout": json.dumps(probe), "stderr": ""}
+
+
+def tls_refused(error):
+    """A handshake the probe could not complete."""
+    return {"returncode": 1, "probe": {"url": "https://x/", "error": error}, "stdout": "", "stderr": ""}
+
+
+class TestTlsSurfaceCase(unittest.TestCase):
+    """TLS-01: the certificate a client validates is the one this role serves."""
+
+    CHAIN_ERROR = (
+        "SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+        "unable to get local issuer certificate"
+    )
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def contract(self, policy=None, verified=None, tls12=None, legacy=None, untrusted=None):
+        product, podman = installed_product(
+            self.context, [((tls_policy() if policy is None else policy), 0)],
+        )
+        product.host.client_reports = [
+            tls_report() if verified is None else verified,
+            tls_report(version="TLSv1.2") if tls12 is None else tls12,
+            tls_refused("SSLError: [SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure")
+            if legacy is None else legacy,
+            tls_refused(self.CHAIN_ERROR) if untrusted is None else untrusted,
+        ]
+        return aio.case_tls_surface(product), podman
+
+    def reject(self, expected, **kwargs):
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(**kwargs)
+        self.assertIn(expected, str(caught.exception))
+        return caught
+
+    def test_a_healthy_host_reports_the_handshake_it_observed(self):
+        evidence, podman = self.contract()
+        self.assertEqual(evidence["role"], "the All-in-One host")
+        self.assertEqual(evidence["domain"], aio.PANEL_DOMAIN)
+        self.assertEqual(evidence["policy"]["ssl_protocols"], ["TLSv1.2", "TLSv1.3"])
+        self.assertEqual(evidence["verified"]["san"], [aio.PANEL_DOMAIN])
+        self.assertEqual(evidence["verified"]["tls_version"], "TLSv1.3")
+        self.assertEqual(evidence["tls12_pinned"]["tls_version"], "TLSv1.2")
+        self.assertTrue(evidence["legacy_refused"]["refused"])
+        self.assertTrue(evidence["untrusted_refused"]["refused"])
+        self.assertGreater(evidence["verified"]["remaining_seconds"],
+                           aio.TLS_MINIMUM_REMAINING_SECONDS)
+        self.assertEqual(len(podman.scripts), 1)
+        self.assertIn(aio.PANEL_DOMAIN, podman.scripts[0])
+
+    def test_a_vhost_that_inherits_its_protocol_policy_is_refused(self):
+        self.reject("inherits its TLS protocol policy",
+                    policy=tls_policy(ssl_protocols=[]))
+
+    def test_a_vhost_that_allows_a_legacy_protocol_is_refused(self):
+        self.reject("allows",
+                    policy=tls_policy(ssl_protocols=["TLSv1 TLSv1.1 TLSv1.2 TLSv1.3"]))
+
+    def test_a_vhost_serving_another_lineage_is_refused(self):
+        self.reject("instead of the lineage",
+                    policy=tls_policy(ssl_certificate=["/etc/letsencrypt/live/other.testbed.internal/fullchain.pem"]))
+
+    def test_two_https_blocks_for_one_name_are_refused(self):
+        self.reject("HTTPS server blocks claim",
+                    policy=json.dumps({"domain": aio.PANEL_DOMAIN, "blocks": [
+                        json.loads(tls_policy())["blocks"][0],
+                        json.loads(tls_policy())["blocks"][0],
+                    ]}))
+
+    def test_a_missing_https_block_is_refused(self):
+        self.reject("HTTPS server blocks claim", policy=tls_policy(omit=True))
+
+    def test_a_certificate_covering_an_extra_name_is_refused(self):
+        self.reject("covers",
+                    verified=tls_report(san=[aio.PANEL_DOMAIN, aio.REALITY_DOMAIN]))
+
+    def test_a_certificate_that_is_not_yet_valid_is_refused(self):
+        self.reject("not valid yet",
+                    verified=tls_report(not_before=certificate_day(1)))
+
+    def test_an_expired_certificate_is_refused(self):
+        self.reject("has expired",
+                    verified=tls_report(not_after=certificate_day(-1)))
+
+    def test_a_certificate_without_renewal_headroom_is_refused(self):
+        self.reject("renewal path needs",
+                    verified=tls_report(not_after=certificate_day(0.25)))
+
+    def test_a_handshake_that_did_not_negotiate_tls13_is_refused(self):
+        self.reject("instead of TLSv1.3", verified=tls_report(version="TLSv1.2"))
+
+    def test_a_wrong_http_status_is_refused(self):
+        self.reject("answered", verified=tls_report(status=502))
+
+    def test_a_client_that_cannot_verify_the_chain_is_refused(self):
+        self.reject("could not verify", verified=tls_refused(self.CHAIN_ERROR))
+
+    def test_a_vhost_that_refuses_the_documented_version_is_refused(self):
+        self.reject("although the generated vhost allows it",
+                    tls12=tls_refused("SSLError: [SSL: UNSUPPORTED_PROTOCOL] unsupported protocol"))
+
+    def test_a_tls12_pin_that_negotiated_another_version_is_refused(self):
+        self.reject("negotiated", tls12=tls_report(version="TLSv1.3"))
+
+    def test_a_legacy_protocol_that_completed_a_session_is_refused(self):
+        self.reject("completed a session pinned to TLS 1.1",
+                    legacy=tls_report(version="TLSv1.1", status=200))
+
+    def test_a_chain_that_verifies_without_the_fixture_ca_is_refused(self):
+        self.reject("verified without the fixture CA", untrusted=tls_report())
+
+    def test_a_failure_that_is_not_a_chain_error_is_refused(self):
+        self.reject("without a certificate-chain error",
+                    untrusted=tls_refused("ConnectionRefusedError: [Errno 111] Connection refused"))
+
+    def test_the_case_is_registered_against_the_public_surface_and_catalogued(self):
+        cases = {case.id: case for case in aio.cases(ScriptedPodman(self.context, []))}
+        self.assertIn(aio.TLS_CASE_ID, cases)
+        self.assertEqual(cases[aio.TLS_CASE_ID].timeout_seconds, aio.TLS_TIMEOUT_SECONDS)
+        self.assertEqual(cases[aio.TLS_CASE_ID].topology, "aio")
+        ids = [case.id for case in aio.cases(ScriptedPodman(self.context, []))]
+        self.assertLess(ids.index(aio.TLS_CASE_ID), ids.index("SUB-SERVED"))
+        entry = {case["id"]: case for case in catalog.load_catalog()["cases"]}
+        record = entry[aio.TLS_CASE_ID]
+        self.assertEqual(record["state"], "incubating")
+        self.assertEqual(record["runs_in"], ["podman"])
+        self.assertEqual(record["topology"], ["aio", "multi-node"])
+
+
+class TestTlsPolicyParse(unittest.TestCase):
+    """The policy probe reads vhosts, not a file the harness thinks it knows."""
+
+    CONF = """\
+server {
+    listen 80;
+    server_name panel.testbed.internal;
+    location /.well-known/acme-challenge/ { root /var/www/gowave-acme; }
+}
+server {
+    listen 127.0.0.1:7443 ssl proxy_protocol;
+    server_name panel.testbed.internal;
+    ssl_certificate /etc/letsencrypt/live/panel.testbed.internal/fullchain.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    location / { return 404; }
+}
+server {
+    listen 127.0.0.1:9443 ssl proxy_protocol;
+    server_name reality.testbed.internal testbed.internal www.testbed.internal;
+    ssl_protocols TLSv1.3;
+}
+"""
+
+    def run_probe(self, conf, domain=aio.PANEL_DOMAIN):
+        script = aio.TLS_POLICY_SCRIPT.replace(
+            "DOMAIN_PLACEHOLDER", f"'{domain}'",
+        )
+        _, _, body = script.partition("<<'PY'\n")
+        self.assertIn("import json", body, "the probe script must carry a heredoc body")
+        body = body.rsplit("\nPY\n", 1)[0]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "conf.d"
+            root.mkdir()
+            (root / "panel.conf").write_text(conf, encoding="utf-8")
+            runner = body.replace(
+                'CONFIG_GLOBS = ("/etc/nginx/conf.d/*.conf", "/etc/nginx/sites-enabled/*")',
+                f'CONFIG_GLOBS = ("{root}/*.conf",)',
+            )
+            return subprocess.run(
+                [sys.executable, "-c", runner, str(domain)],
+                capture_output=True, text=True, check=False,
+            )
+
+    def test_the_ssl_vhost_is_read_and_the_port_80_challenge_vhost_ignored(self):
+        result = self.run_probe(self.CONF)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        facts = json.loads(result.stdout)
+        self.assertEqual(len(facts["blocks"]), 1)
+        block = facts["blocks"][0]
+        self.assertEqual(block["listen"], ["127.0.0.1:7443 ssl proxy_protocol"])
+        self.assertEqual(block["ssl_protocols"], ["TLSv1.2 TLSv1.3"])
+        self.assertEqual(block["ssl_certificate"],
+                         ["/etc/letsencrypt/live/panel.testbed.internal/fullchain.pem"])
+
+    def test_a_name_without_an_https_vhost_reports_no_block(self):
+        result = self.run_probe(self.CONF, domain="absent.testbed.internal")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["blocks"], [])
+
+    def test_the_cover_names_of_the_decoy_do_not_match_the_panel_contract(self):
+        cover = self.run_probe(self.CONF, domain="testbed.internal")
+        self.assertEqual(cover.returncode, 0, cover.stderr)
+        blocks = json.loads(cover.stdout)["blocks"]
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["listen"], ["127.0.0.1:9443 ssl proxy_protocol"])
+        # The decoy apex answers for its own names without claiming the Panel's
+        # lineage, so the panel contract cannot be satisfied by that block.
+        self.assertEqual(blocks[0]["ssl_certificate"], [])
+        panel = self.run_probe(self.CONF)
+        self.assertEqual(panel.returncode, 0, panel.stderr)
+        panel_names = json.loads(panel.stdout)["blocks"][0]["server_names"]
+        self.assertNotIn("testbed.internal", panel_names)
 
 
 if __name__ == "__main__":

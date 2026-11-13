@@ -777,11 +777,16 @@ class AioTopology:
         body: Optional[str] = None,
         insecure: bool = False,
         timeout: int = 30,
+        min_tls: str = "",
+        max_tls: str = "",
+        anchor: bool = True,
     ) -> Dict[str, Any]:
         """Fetch a URL from the Control Machine role and return the probe report.
 
         The probe trusts the run CA only, so a certificate the product obtained
-        from the fixture directory is the only one that can pass.
+        from the fixture directory is the only one that can pass. ``anchor=False``
+        withholds that CA, which is how a case proves the anchor is what made the
+        handshake succeed rather than the client's own store.
         """
         argv = [
             "python3", HTTP_PROBE_SCRIPT,
@@ -791,8 +796,12 @@ class AioTopology:
         ]
         if insecure:
             argv.append("--insecure")
-        else:
+        elif anchor:
             argv += ["--ca", f"{CA_MOUNT}/{ISSUED_ROOT_NAME}"]
+        if min_tls:
+            argv += ["--min-tls", min_tls]
+        if max_tls:
+            argv += ["--max-tls", max_tls]
         if expect_status is not None:
             argv += ["--expect-status", str(expect_status)]
         if expect_body is not None:

@@ -87,6 +87,9 @@ SUB_SHARE_LINK_TIMEOUT_SECONDS = 600
 # The configuration contract runs three probes per role and, on restore, waits
 # for that role's master to replace its workers.
 NGX_CONFIG_CASE_TIMEOUT_SECONDS = 2 * aio.NGX_CONFIG_TIMEOUT_SECONDS
+# The public certificate contract costs four client handshakes per role, and a
+# cluster has two roles with two independent lineages.
+TLS_CASE_TIMEOUT_SECONDS = 2 * aio.TLS_TIMEOUT_SECONDS
 
 # The name the installer gives the node the Panel runs on. Without it, a cluster
 # audit could be satisfied by any two nodes rather than the ones the product
@@ -3046,6 +3049,31 @@ def case_nginx_config(product: MultiNodeProduct) -> Dict[str, Any]:
     return evidence
 
 
+def case_tls_surface(product: MultiNodeProduct) -> Dict[str, Any]:
+    """TLS-01: each role's own certificate is validated by the independent client.
+
+    The Master and the Worker are issued separate lineages by separate scripts
+    and terminate TLS for different names, so a certificate read on one says
+    nothing about the other. Each role's HTTPS vhost is read on the host that
+    generated it, and the handshake is driven from the Control Machine, which
+    resolves each name through the fixture zone to the node that serves it.
+
+    The Worker serves no Panel page, so its own vhost answers 404 on `/`: that
+    is the documented edge behaviour and still proves which vhost terminated
+    the connection.
+    """
+    host = product.require_worker()
+    return {
+        "master": aio.tls_surface_contract(
+            product.master, aio.TLS_CASE_ID, "the Master", topology.PANEL_DOMAIN, 200,
+        ),
+        "worker": aio.tls_surface_contract(
+            product.master, aio.TLS_CASE_ID, "the Worker", host.worker_domain, 404,
+            container=host.worker_name,
+        ),
+    }
+
+
 def case_worker_outage(product: MultiNodeProduct) -> Dict[str, Any]:
     """MN-OUTAGE: stopping the Worker degrades the cluster, and removing the fault restores it.
 
@@ -3461,6 +3489,11 @@ def cases(
         # configuration change this case made.
         Case(NGINX_CONFIG_CASE_ID, "multi-node", lambda context: case_nginx_config(product),
              timeout_seconds=NGX_CONFIG_CASE_TIMEOUT_SECONDS),
+        # Both roles' public certificates are measured before the lifecycle cases
+        # for the same reason: a Worker outage or restart must not be read
+        # through a handshake this case would otherwise have taken first.
+        Case(aio.TLS_CASE_ID, "multi-node", lambda context: case_tls_surface(product),
+             timeout_seconds=TLS_CASE_TIMEOUT_SECONDS),
         # The lifecycle cases run last: they revoke a client and fault the
         # Worker's own unit, so nothing that observes a healthy cluster may run
         # after them and no earlier case may be blamed for their state.
