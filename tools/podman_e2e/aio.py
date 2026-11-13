@@ -571,6 +571,9 @@ def certificate(path):
         "-issuer", "-dates", "-ext", "subjectAltName",
     ))
     facts = {"path": path, "present": True, "returncode": result["returncode"]}
+    if result["returncode"] != 0:
+        facts["error"] = tail(result)
+        return facts
     san = []
     collecting = False
     for raw in (result["stdout"] or "").splitlines():
@@ -2647,13 +2650,18 @@ def require_certificate_was_issued_in_this_run(
     A certificate baked into an image or copied in by the harness would still be
     served, still chain to the fixture CA, and still pass a TLS case — its
     ``notBefore`` is the one fact that puts its issuance inside this run.
+
+    Readability is the reader's exit status, not a ``subject`` field: Certbot
+    builds a SAN-only CSR with no subject at all, so the certificate this product
+    legitimately obtains has an empty subject and only the SAN carries the name.
     """
     live = facts.get("live") or {}
     require(case_id, live.get("present"),
             f"{role}: no certificate is installed at {live.get('path')!r} for {domain}")
-    require(case_id, live.get("returncode") == 0 and live.get("subject"),
+    require(case_id, live.get("returncode") == 0,
             f"{role}: the installed certificate for {domain} could not be read: "
-            f"{live.get('path')!r}")
+            f"{live.get('path')!r} (`openssl x509` exited {live.get('returncode')!r}: "
+            f"{live.get('error') or 'no diagnostics'})")
     issued = live.get("not_before_epoch")
     require(case_id, isinstance(issued, int),
             f"{role}: the installed certificate reports no parseable notBefore "

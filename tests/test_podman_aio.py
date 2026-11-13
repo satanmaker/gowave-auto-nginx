@@ -1650,6 +1650,25 @@ class TestAcmeRenewalCase(unittest.TestCase):
         self.reject("keeps no renewal lineage",
                     before=acme_probe("before", lineage_present=False))
 
+    def test_a_certificate_without_a_common_name_is_read_by_its_san(self):
+        # Certbot 2.9.0 builds a SAN-only CSR, so the fixture CA signs a leaf with
+        # an empty subject: the lineage is complete and readable all the same.
+        without_cn = acme_probe("before")
+        without_cn["live"].update({"subject": "", "san": [aio.PANEL_DOMAIN]})
+        evidence, _podman = self.contract(before=without_cn)
+        self.assertEqual(evidence["installed_certificate"]["serial"], "0A1B")
+
+    def test_a_certificate_the_reader_cannot_parse_reports_the_readers_words(self):
+        unreadable = acme_probe("before")
+        unreadable["live"] = {
+            "path": f"{aio.ACME_LINEAGE_DIR}/{aio.PANEL_DOMAIN}/fullchain.pem",
+            "present": True,
+            "returncode": 1,
+            "error": "Could not read certificate from fullchain.pem",
+        }
+        caught = self.reject("`openssl x509` exited 1", before=unreadable)
+        self.assertIn("Could not read certificate from fullchain.pem", str(caught.exception))
+
     def test_a_certificate_that_predates_the_run_is_refused_as_seeded(self):
         self.reject("it was seeded rather than obtained",
                     before=acme_probe("before", issued_epoch=acme_moment(3 * 86400)))
@@ -1901,6 +1920,23 @@ class TestAcmeRenewalProbe(unittest.TestCase):
         self.assertEqual(facts["service_after"]["worker_pids"], ["5100", "5101"])
         self.assertEqual(anchor, "/fixtures/ca/acme-trust.pem",
                          "the renewal has to be handed the fixture CA the install used")
+
+    def test_an_unreadable_certificate_keeps_the_readers_own_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main_pid = self.spare_pid()
+            layout = self.build_target(Path(tmpdir), main_pid)
+            failing = layout["bindir"] / "openssl"
+            failing.write_text(
+                "#!/bin/sh\n"
+                "echo 'Could not read certificate from fullchain.pem' >&2\n"
+                "exit 1\n",
+                encoding="utf-8",
+            )
+            failing.chmod(0o755)
+            facts = self.run_probe("before", layout, main_pid)
+        self.assertTrue(facts["live"]["present"])
+        self.assertEqual(facts["live"]["returncode"], 1)
+        self.assertIn("Could not read certificate", facts["live"]["error"])
 
     def test_the_renewal_uses_the_lineages_own_name_and_a_forced_reissue(self):
         script = aio.acme_renewal_script("renew", aio.PANEL_DOMAIN, "/ca.pem")
