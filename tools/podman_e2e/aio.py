@@ -476,9 +476,10 @@ ACME_WEBROOT = "/var/www/gowave-acme"
 ACME_RENEWAL_DIR = "/etc/letsencrypt/renewal"
 ACME_ARCHIVE_DIR = "/etc/letsencrypt/archive"
 ACME_LINEAGE_DIR = "/etc/letsencrypt/live"
-# Certbot rotates no log per invocation, so the renewal writes into a directory
-# of its own: the challenge type it chose and the certificate it received are
-# then this invocation's own words instead of a line the install left behind.
+# Certbot appends every invocation to one log per directory, so each renewal gets
+# a directory of its own beneath this one: the challenge type it chose and the
+# certificate it received are then that invocation's own words instead of a line
+# the install or an earlier phase left behind.
 ACME_RENEWAL_LOG_DIR = "/tmp/gowave-e2e-acme-logs"
 # One phase costs a full Certbot renewal against the local directory plus the
 # master replacing its workers; the ceilings are hang guards, not expectations.
@@ -492,6 +493,19 @@ ACME_TIMEOUT_SECONDS = 600
 # is wide because a slow install still has to fit inside it.
 ACME_ISSUANCE_WINDOW_SECONDS = 7200
 
+ACME_OUTAGE_CASE_ID = "ACME-02"
+# Four Certbot runs plus three reloads and the client calls around them; the
+# unreachable-directory attempt alone spends its own retry budget before it fails.
+ACME_OUTAGE_TIMEOUT_SECONDS = 1200
+# A failed attempt is waited for with no reload budget: the renewal must leave the
+# running master alone, so waiting for new workers would only slow the failure down.
+ACME_OUTAGE_RELOAD_WAIT_SECONDS = 0
+# The line that puts the pinned directory behind a loopback address on the target,
+# and the marker that removes it again without touching the host's own entries.
+ACME_BLACKHOLE_MARKER = "gowave-e2e-acme-blackhole"
+# The file the target's own resolver reads for the pinned directory's name.
+ACME_HOSTS_FILE = "/etc/hosts"
+
 ACME_RENEWAL_SCRIPT = r"""python3 - MODE_PLACEHOLDER DOMAIN_PLACEHOLDER CA_PLACEHOLDER <<'PY'
 import calendar
 import json
@@ -504,7 +518,11 @@ MODE = sys.argv[1]
 DOMAIN = sys.argv[2]
 CA_FILE = sys.argv[3]
 WEBROOT = "WEBROOT_PLACEHOLDER"
-LOG_DIR = "LOG_DIR_PLACEHOLDER"
+LOG_ROOT = "LOG_DIR_PLACEHOLDER"
+# Certbot appends to one log per directory, so each invocation gets its own: the
+# challenge type and the certificate it received are then this run's own words
+# instead of a line an earlier phase left behind.
+LOG_DIR = os.path.join(LOG_ROOT, "%s-%d" % (MODE, time.time_ns()))
 RENEWAL_DIR = "RENEWAL_DIR_PLACEHOLDER"
 ARCHIVE_DIR = "ARCHIVE_DIR_PLACEHOLDER"
 LINEAGE_DIR = "LINEAGE_DIR_PLACEHOLDER"
@@ -734,7 +752,9 @@ PY
 """
 
 
-def acme_renewal_script(mode: str, domain: str, ca_file: str) -> str:
+def acme_renewal_script(
+    mode: str, domain: str, ca_file: str, reload_wait: int = ACME_RENEWAL_WAIT_SECONDS,
+) -> str:
     """The ACME probe for one phase: read the lineage, or renew and read it again."""
     return (
         ACME_RENEWAL_SCRIPT
@@ -746,8 +766,105 @@ def acme_renewal_script(mode: str, domain: str, ca_file: str) -> str:
         .replace("RENEWAL_DIR_PLACEHOLDER", ACME_RENEWAL_DIR)
         .replace("ARCHIVE_DIR_PLACEHOLDER", ACME_ARCHIVE_DIR)
         .replace("LINEAGE_DIR_PLACEHOLDER", ACME_LINEAGE_DIR)
-        .replace("RELOAD_WAIT_PLACEHOLDER", str(int(ACME_RENEWAL_WAIT_SECONDS)))
+        .replace("RELOAD_WAIT_PLACEHOLDER", str(int(reload_wait)))
         .replace("RENEWAL_TIMEOUT_PLACEHOLDER", str(int(ACME_RENEWAL_TIMEOUT_SECONDS)))
+    )
+
+
+ACME_OUTAGE_SCRIPT = r"""python3 - MODE_PLACEHOLDER WEBROOT_PLACEHOLDER ORIGINAL_MODE_PLACEHOLDER HOST_PLACEHOLDER MARKER_PLACEHOLDER HOSTS_PLACEHOLDER <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+MODE, WEBROOT, ORIGINAL_MODE, HOST, MARKER, HOSTS = sys.argv[1:7]
+
+
+def run(argv, timeout=60):
+    try:
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"returncode": 127, "stdout": "", "stderr": "%s: %s" % (type(error).__name__, error)}
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout or "",
+        "stderr": completed.stderr or "",
+    }
+
+
+def webroot_mode():
+    try:
+        return oct(os.stat(WEBROOT).st_mode & 0o777)[2:].rjust(4, "0")
+    except OSError:
+        return ""
+
+
+def resolution():
+    return (run(("getent", "hosts", HOST))["stdout"] or "").strip()
+
+
+def hosts_lines():
+    try:
+        with open(HOSTS, encoding="utf-8") as handle:
+            return handle.read().splitlines()
+    except OSError:
+        return []
+
+
+def write_hosts(lines):
+    # /etc/hosts is a bind mount inside the container, so it is rewritten in
+    # place: renaming a file over it would leave the mount pointing at a deleted
+    # inode and the next process reading the host's view instead of this one's.
+    with open(HOSTS, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def blackhole():
+    write_hosts([line for line in hosts_lines() if MARKER not in line]
+                + ["127.0.0.1 %s  # %s" % (HOST, MARKER)])
+    return resolution()
+
+
+def unblackhole():
+    write_hosts([line for line in hosts_lines() if MARKER not in line])
+    return resolution()
+
+
+report = {
+    "mode": MODE,
+    "webroot": WEBROOT,
+    "webroot_mode": webroot_mode(),
+    "resolution": resolution(),
+}
+if MODE == "challenge-block":
+    os.chmod(WEBROOT, 0o700)
+    report["webroot_mode_after"] = webroot_mode()
+elif MODE == "challenge-restore":
+    os.chmod(WEBROOT, int(ORIGINAL_MODE, 8))
+    report["webroot_mode_after"] = webroot_mode()
+elif MODE == "directory-block":
+    report["resolution_after"] = blackhole()
+elif MODE == "directory-restore":
+    report["resolution_after"] = unblackhole()
+print(json.dumps(report, sort_keys=True))
+PY
+"""
+
+
+def acme_outage_script(
+    mode: str, webroot_mode: str = "", hosts_file: str = ACME_HOSTS_FILE,
+) -> str:
+    """Install or remove one outage: the webroot the validator reads, or the directory."""
+    return (
+        ACME_OUTAGE_SCRIPT
+        .replace("MODE_PLACEHOLDER", shlex.quote(mode))
+        .replace("WEBROOT_PLACEHOLDER", ACME_WEBROOT)
+        .replace("ORIGINAL_MODE_PLACEHOLDER", shlex.quote(webroot_mode))
+        .replace("HOST_PLACEHOLDER", acme_fixture.FIXTURE_HOST)
+        .replace("MARKER_PLACEHOLDER", ACME_BLACKHOLE_MARKER)
+        .replace("HOSTS_PLACEHOLDER", shlex.quote(hosts_file))
     )
 
 
@@ -2476,11 +2593,12 @@ def case_nginx_config(product: AioProduct) -> Dict[str, Any]:
 
 def acme_renewal_facts(
     podman: Any, container: str, case_id: str, mode: str, domain: str, ca_file: str,
-    timeout: int = ACME_PROBE_TIMEOUT_SECONDS,
+    timeout: int = ACME_PROBE_TIMEOUT_SECONDS, reload_wait: int = ACME_RENEWAL_WAIT_SECONDS,
 ) -> Dict[str, Any]:
     """One phase of the ACME contract: the lineage as it is, or renewed and read again."""
     result = podman.exec_bash(
-        container, acme_renewal_script(mode, domain, ca_file), check=False, timeout=timeout,
+        container, acme_renewal_script(mode, domain, ca_file, reload_wait),
+        check=False, timeout=timeout,
     )
     return probe_json(case_id, f"the ACME {mode} probe on {container}", result)
 
@@ -2767,6 +2885,322 @@ def case_acme_renewal(product: AioProduct) -> Dict[str, Any]:
     Certbot renew the lineage and checks that the leaf a client receives changed.
     """
     return acme_renewal_contract(product, ACME_CASE_ID, "the All-in-One host", PANEL_DOMAIN)
+
+
+def acme_outage_facts(
+    podman: Any, container: str, case_id: str, mode: str, webroot_mode: str = "",
+    timeout: int = ACME_PROBE_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """One outage phase: install the failure, remove it, or report what it left behind."""
+    result = podman.exec_bash(
+        container, acme_outage_script(mode, webroot_mode), check=False, timeout=timeout,
+    )
+    return probe_json(case_id, f"the ACME outage {mode} probe on {container}", result)
+
+
+def acme_renewal_attempt(
+    podman: Any, container: str, case_id: str, domain: str, ca_file: str,
+) -> Dict[str, Any]:
+    """A forced renewal that is expected to fail, with no reload budget to spend."""
+    return acme_renewal_facts(
+        podman, container, case_id, "renew", domain, ca_file,
+        reload_wait=ACME_OUTAGE_RELOAD_WAIT_SECONDS,
+    )
+
+
+def require_challenge_route_is_down(
+    case_id: str, role: str, domain: str, probe: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Positive control: the token route really stopped answering before Certbot is blamed.
+
+    A renewal that fails while the route still serves tokens would mean the case
+    broke something else, and the failure it then reported would name the wrong
+    cause; the control is what keeps the assertion attributable.
+    """
+    report = probe.get("probe") or {}
+    served = probe.get("returncode") == 0 and report.get("status") == 200
+    require(case_id, not served,
+            f"{role}: the product's port 80 vhost still served a challenge token for {domain} "
+            "after the webroot was closed, so the challenge outage this phase measures never "
+            "happened")
+    return {
+        "url": report.get("url"),
+        "status": report.get("status"),
+        "returncode": probe.get("returncode"),
+        "error": (report.get("error") or (probe.get("stderr") or "").strip()[-300:]),
+    }
+
+
+def require_directory_is_unreachable(
+    case_id: str, role: str, facts: Dict[str, Any], reachable: bool,
+) -> Dict[str, Any]:
+    """Positive control for the directory phase: the name now answers loopback.
+
+    Certbot resolves the pinned directory per invocation, so pointing that name
+    at the target itself is an outage it has to notice; reading the resolution
+    back proves the outage was in place instead of assuming it.
+    """
+    resolution = str(facts.get("resolution_after") or facts.get("resolution") or "")
+    loopback = "127.0.0.1" in resolution
+    require(case_id, loopback is not reachable,
+            f"{role}: the target resolved {acme_fixture.FIXTURE_HOST} to {resolution!r} when the "
+            f"directory was supposed to be {'reachable' if reachable else 'unreachable'}")
+    return {"resolution": resolution, "loopback": loopback}
+
+
+FAILED_RENEWAL_MARKERS = {
+    "challenge": ("Some challenges have failed", "Challenge failed", "unauthorized"),
+    "directory": ("Connection refused", "ConnectionError", "Max retries exceeded",
+                  "Failed to establish a new connection"),
+}
+
+
+def require_renewal_failed(
+    case_id: str, role: str, domain: str, facts: Dict[str, Any], kind: str,
+) -> Dict[str, Any]:
+    """A forced renewal reports the failure this phase installed, and no certificate.
+
+    Certbot exits non-zero and quotes the validator's own verdict, so the failure
+    is attributable to the outage rather than to a client that could not reach the
+    host: the same transcript has to carry the HTTP-01 attempt for this domain, or
+    the directory's own connection error.
+    """
+    renewal = facts.get("renewal") or {}
+    require(case_id, facts.get("mode") == "renew",
+            f"{role}: the failed-attempt probe answered for {facts.get('mode')!r}")
+    require(case_id, renewal.get("returncode") not in (0, None),
+            f"{role}: `certbot renew --force-renewal` for {domain} exited "
+            f"{renewal.get('returncode')!r} although the {kind} was down, so the outage never "
+            f"reached the renewal this case is about: {renewal.get('tail')}")
+    transcript = "\n".join([
+        str(facts.get("certbot_log") or ""),
+        str(renewal.get("stdout") or ""),
+        str(renewal.get("stderr") or ""),
+    ])
+    if kind == "challenge":
+        require(case_id, f"http-01 challenge for {domain}" in transcript,
+                f"{role}: the renewal for {domain} never attempted an HTTP-01 challenge, so the "
+                f"challenge route that failed is not the one it used: {renewal.get('tail')}")
+    markers = FAILED_RENEWAL_MARKERS[kind]
+    matched = [marker for marker in markers if marker in transcript]
+    require(case_id, matched,
+            f"{role}: the renewal for {domain} failed without naming the {kind} it was denied: "
+            f"{renewal.get('tail')}")
+    require(case_id, "Successfully received certificate" not in transcript,
+            f"{role}: the renewal for {domain} reported receiving a certificate while the "
+            f"{kind} was down: {renewal.get('tail')}")
+    return {
+        "returncode": renewal.get("returncode"),
+        "reported": matched,
+        "duration_seconds": renewal.get("duration_seconds"),
+        "tail": str(renewal.get("tail") or "")[-600:],
+    }
+
+
+def require_failure_left_the_lineage_alone(
+    case_id: str, role: str, domain: str, facts: Dict[str, Any],
+) -> Dict[str, Any]:
+    """A failed renewal neither replaced nor extended the lineage on disk.
+
+    Certbot only saves on success, so the archive growing without a new leaf — or
+    the leaf changing without a served reload — would mean the certificate the
+    host depends on was mutated by an attempt that never succeeded.
+    """
+    before = facts.get("live") or {}
+    after = facts.get("live_after") or {}
+    require(case_id, before.get("present") and after.get("present"),
+            f"{role}: the lineage for {domain} disappeared after a failed renewal "
+            f"({before.get('path')!r})")
+    require(case_id, before.get("serial") == after.get("serial")
+            and before.get("not_before_epoch") == after.get("not_before_epoch"),
+            f"{role}: a failed renewal for {domain} changed the installed certificate "
+            f"({before.get('serial')!r}/{before.get('not_before')!r} -> "
+            f"{after.get('serial')!r}/{after.get('not_before')!r})")
+    archive_before = len(facts.get("archive") or [])
+    archive_after = len(facts.get("archive_after") or [])
+    require(case_id, archive_before == archive_after,
+            f"{role}: a failed renewal for {domain} added a certificate to the archive "
+            f"({archive_before} -> {archive_after})")
+    return {
+        "serial": after.get("serial"),
+        "not_before": after.get("not_before"),
+        "archive": archive_after,
+    }
+
+
+def require_failure_left_the_certificate_serving(
+    case_id: str, role: str, domain: str, facts: Dict[str, Any], report: Dict[str, Any],
+    expected_status: int,
+) -> Dict[str, Any]:
+    """The client still receives the working leaf, so the outage never reached 443.
+
+    This is the half of the contract that protects the users during a failed
+    renewal: the validator failing must not take the served certificate with it.
+    """
+    verified = require_client_certificate(case_id, role, domain, report, expected_status)
+    unchanged = (facts.get("live") or {}).get("not_before_epoch")
+    require(case_id, isinstance(unchanged, int),
+            f"{role}: the installed certificate for {domain} reports no parseable notBefore")
+    served = verified.get("not_before")
+    expected = datetime.fromtimestamp(unchanged, timezone.utc).isoformat()
+    require(case_id, served == expected,
+            f"{role}: after a failed renewal for {domain} a client is served a certificate "
+            f"starting at {served!r} instead of the {expected!r} the lineage already held, so the "
+            "failed attempt disturbed the certificate the host was serving")
+    return verified
+
+
+def require_recovery_issued(
+    case_id: str, role: str, domain: str, facts: Dict[str, Any], previous: Dict[str, Any],
+) -> Dict[str, Any]:
+    """With the outage gone, the same forced renewal succeeds and replaces the leaf."""
+    issuance = require_renewal_issued(case_id, role, domain, facts)
+    require(case_id, issuance.get("serial_after") != previous.get("serial"),
+            f"{role}: the renewal after recovery for {domain} reports the serial the failed "
+            f"attempt left behind ({issuance.get('serial_after')!r}), so nothing was reissued")
+    return issuance
+
+
+def _release_acme_outage(
+    product: AioProduct, target: str, case_id: str, mode: str, argument: str = "",
+) -> Dict[str, Any]:
+    """Remove an outage; a cleanup that fails must not replace the reason the case did.
+
+    The host is left as the outage phase found it either way, so the report is
+    returned for the success path and swallowed when an assertion is already on
+    its way out of the case.
+    """
+    try:
+        return acme_outage_facts(product.podman, target, case_id, mode, argument)
+    except AssertionError:
+        return {}
+
+
+def acme_outage_contract(
+    product: AioProduct, case_id: str, role: str, domain: str,
+    container: str = "", expected_status: int = 200,
+) -> Dict[str, Any]:
+    """Prove both ACME failures fail closed, and that the lineage survives them.
+
+    Two outages are installed one after the other, each with a positive control
+    that shows the outage is real before Certbot is asked about it: the webroot
+    the validator reads stops answering, and the pinned directory becomes
+    unreachable from the target. In both, the renewal must fail, name its own
+    cause, and leave the installed lineage and the certificate on 443 exactly as
+    they were; after the outage is removed, the same forced renewal must succeed.
+    Nothing is answered or reissued by the harness.
+    """
+    host = product.require_installed()
+    target = container or host.target_name
+    ca_file = str(host.install_environment().get("GOWAVE_ACME_TEST_CA_FILE", ""))
+    now = time.time()
+    before = acme_renewal_facts(product.podman, target, case_id, "before", domain, ca_file)
+    require_webroot_lineage(case_id, role, domain, before)
+    installed = require_certificate_was_issued_in_this_run(case_id, role, domain, before, now)
+
+    blocked = acme_outage_facts(product.podman, target, case_id, "challenge-block")
+    original_mode = str(blocked.get("webroot_mode") or "")
+    challenge: Dict[str, Any] = {}
+    directory: Dict[str, Any] = {}
+    try:
+        require(case_id, blocked.get("webroot_mode_after") == "0700",
+                f"{role}: the product's ACME webroot is {blocked.get('webroot_mode_after')!r} "
+                "after the outage, so the validator's path was never closed")
+        challenge["control"] = require_challenge_route_is_down(
+            case_id, role, domain, _acme_route_probe(product, case_id, role, domain),
+        )
+        attempt = acme_renewal_attempt(product.podman, target, case_id, domain, ca_file)
+        challenge["failure"] = require_renewal_failed(case_id, role, domain, attempt, "challenge")
+        challenge["lineage"] = require_failure_left_the_lineage_alone(
+            case_id, role, domain, attempt,
+        )
+        challenge["served"] = require_failure_left_the_certificate_serving(
+            case_id, role, domain, attempt,
+            host.client_http(f"https://{domain}/", expect_status=expected_status,
+                             expect_san=[domain], timeout=30),
+            expected_status,
+        )
+    except BaseException:
+        _release_acme_outage(product, target, case_id, "challenge-restore", original_mode)
+        raise
+    restored = acme_outage_facts(
+        product.podman, target, case_id, "challenge-restore", original_mode,
+    )
+    require(case_id, restored.get("webroot_mode_after") == original_mode,
+            f"{role}: the ACME webroot was left at {restored.get('webroot_mode_after')!r} instead "
+            f"of {original_mode!r} after the outage was removed")
+    challenge["restored_mode"] = restored.get("webroot_mode_after")
+    challenge["route_after_restore"] = require_webroot_route(
+        case_id, role, domain, _acme_route_probe(product, case_id, role, domain),
+    )
+    recovered = acme_renewal_facts(product.podman, target, case_id, "renew", domain, ca_file)
+    challenge["recovery"] = require_recovery_issued(
+        case_id, role, domain, recovered, {"serial": (before.get("live") or {}).get("serial")},
+    )
+    require_renewed_certificate_is_served(
+        case_id, role, domain, recovered,
+        host.client_http(f"https://{domain}/", expect_status=expected_status,
+                         expect_san=[domain], timeout=30),
+        expected_status,
+    )
+
+    blackholed = acme_outage_facts(product.podman, target, case_id, "directory-block")
+    try:
+        directory["control"] = require_directory_is_unreachable(
+            case_id, role, blackholed, reachable=False,
+        )
+        attempt = acme_renewal_attempt(product.podman, target, case_id, domain, ca_file)
+        directory["failure"] = require_renewal_failed(case_id, role, domain, attempt, "directory")
+        directory["lineage"] = require_failure_left_the_lineage_alone(
+            case_id, role, domain, attempt,
+        )
+        directory["served"] = require_failure_left_the_certificate_serving(
+            case_id, role, domain, attempt,
+            host.client_http(f"https://{domain}/", expect_status=expected_status,
+                             expect_san=[domain], timeout=30),
+            expected_status,
+        )
+    except BaseException:
+        _release_acme_outage(product, target, case_id, "directory-restore")
+        raise
+    released = acme_outage_facts(product.podman, target, case_id, "directory-restore")
+    directory["resolution_after_release"] = require_directory_is_unreachable(
+        case_id, role, released, reachable=True,
+    )["resolution"]
+    renewed = acme_renewal_facts(product.podman, target, case_id, "renew", domain, ca_file)
+    directory["recovery"] = require_recovery_issued(
+        case_id, role, domain, renewed,
+        {"serial": (recovered.get("live_after") or {}).get("serial")},
+    )
+    require_renewed_certificate_is_served(
+        case_id, role, domain, renewed,
+        host.client_http(f"https://{domain}/", expect_status=expected_status,
+                         expect_san=[domain], timeout=30),
+        expected_status,
+    )
+
+    return {
+        "role": role,
+        "domain": domain,
+        "webroot": ACME_WEBROOT,
+        "installed_certificate": installed,
+        "challenge_outage": challenge,
+        "directory_outage": directory,
+    }
+
+
+def case_acme_outage(product: AioProduct) -> Dict[str, Any]:
+    """ACME-02: both ACME failures fail closed, and the lineage survives them.
+
+    A renewal is the one operation a host performs unattended, so the two ways it
+    can be denied — the validator cannot read the challenge, the directory cannot
+    be reached — are exactly the cases where a wrong reaction would either drop
+    the working certificate or silently keep serving an expired one. The case
+    installs each outage, proves Certbot reports it, proves the lineage and the
+    served certificate are untouched, then removes the outage and proves the same
+    renewal now succeeds.
+    """
+    return acme_outage_contract(product, ACME_OUTAGE_CASE_ID, "the All-in-One host", PANEL_DOMAIN)
 
 
 def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
@@ -3202,6 +3636,10 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # across a reload this one caused.
         Case(ACME_CASE_ID, "aio", lambda context: case_acme_renewal(product),
              timeout_seconds=ACME_TIMEOUT_SECONDS),
+        # The outage case renews twice more, so it also runs before any traffic:
+        # each recovery reloads NGINX onto a fresh lineage.
+        Case(ACME_OUTAGE_CASE_ID, "aio", lambda context: case_acme_outage(product),
+             timeout_seconds=ACME_OUTAGE_TIMEOUT_SECONDS),
         Case("AIO-AUTH", "aio", lambda context: case_panel_auth(product), timeout_seconds=300),
         Case("AIO-CLIENT", "aio", lambda context: case_client_lifecycle(product), timeout_seconds=300),
         Case("SUB-SERVED", "aio", lambda context: case_subscriptions(product), timeout_seconds=600),

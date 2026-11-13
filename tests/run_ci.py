@@ -44,6 +44,8 @@ SUITES = {
         "test_podman_aio.TestTlsPolicyParse",
         "test_podman_aio.TestAcmeRenewalCase",
         "test_podman_aio.TestAcmeRenewalProbe",
+        "test_podman_aio.TestAcmeOutageCase",
+        "test_podman_aio.TestAcmeOutageProbe",
         "test_podman_subscriptions.TestPanelSubscriptionProbe",
         "test_podman_subscriptions.TestSubscriptionClientProbe",
         "test_podman_subscriptions.TestSubscriptionCases",

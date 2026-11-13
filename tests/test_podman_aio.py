@@ -1905,6 +1905,318 @@ class TestAcmeRenewalProbe(unittest.TestCase):
         self.assertIn(aio.ACME_WEBROOT, script)
 
 
+def acme_outage_report(mode: str, **overrides) -> dict:
+    """One outage phase as the host probe reports it, with the effect that phase has."""
+    report = {
+        "mode": mode,
+        "webroot": aio.ACME_WEBROOT,
+        "webroot_mode": "0755",
+        "resolution": f"172.30.0.9 {acme_fixture.FIXTURE_HOST}",
+    }
+    if mode == "challenge-block":
+        report["webroot_mode_after"] = "0700"
+    elif mode == "challenge-restore":
+        report["webroot_mode_after"] = "0755"
+    elif mode == "directory-block":
+        report["resolution_after"] = f"127.0.0.1 {acme_fixture.FIXTURE_HOST}"
+    elif mode == "directory-restore":
+        report["resolution"] = f"127.0.0.1 {acme_fixture.FIXTURE_HOST}"
+        report["resolution_after"] = f"172.30.0.9 {acme_fixture.FIXTURE_HOST}"
+    report.update(overrides)
+    return report
+
+
+FAILED_CHALLENGE_TRANSCRIPT = (
+    "http-01 challenge for {domain}\n"
+    "Certbot failed to authenticate some domains (authenticator: webroot)\n"
+    "Some challenges have failed."
+)
+
+FAILED_DIRECTORY_TRANSCRIPT = (
+    "An unexpected error occurred:\n"
+    "requests.exceptions.ConnectionError: HTTPSConnectionPool(host='{host}', port=14000): "
+    "Max retries exceeded with url: /dir (Caused by NewConnectionError(... Connection refused))"
+)
+
+
+def acme_failed_attempt(kind: str = "challenge", **overrides) -> dict:
+    """A forced renewal the outage denied: it reports the failure and saves nothing."""
+    domain = overrides.pop("domain", aio.PANEL_DOMAIN)
+    transcript = overrides.pop("transcript", None)
+    if transcript is None:
+        template = (FAILED_CHALLENGE_TRANSCRIPT if kind == "challenge"
+                    else FAILED_DIRECTORY_TRANSCRIPT)
+        transcript = template.format(domain=domain, host=acme_fixture.FIXTURE_HOST)
+    facts = acme_probe(
+        "renew", domain=domain, renewal_exit=1, transcript=transcript,
+        installed_serial=overrides.pop("serial", "0A1B"), **overrides,
+    )
+    facts["live_after"] = dict(facts["live"])
+    facts["archive_after"] = list(facts["archive"])
+    facts["service_after"] = dict(facts["service"])
+    return facts
+
+
+class TestAcmeOutageCase(unittest.TestCase):
+    """ACME-02: both ACME outages fail closed and leave the working lineage serving."""
+
+    installed = acme_moment(900)
+    first_renewal = acme_moment(600)
+    second_renewal = acme_moment(60)
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def phases(self) -> dict:
+        return {
+            "before": acme_probe("before", issued_epoch=self.installed),
+            "challenge_block": acme_outage_report("challenge-block"),
+            "challenge_attempt": acme_failed_attempt("challenge", issued_epoch=self.installed),
+            "challenge_restore": acme_outage_report("challenge-restore"),
+            "challenge_recovered": acme_probe(
+                "renew", issued_epoch=self.installed, renewed_epoch=self.first_renewal,
+            ),
+            "directory_block": acme_outage_report("directory-block"),
+            "directory_attempt": acme_failed_attempt(
+                "directory", issued_epoch=self.first_renewal, serial="0C2D",
+            ),
+            "directory_restore": acme_outage_report("directory-restore"),
+            "directory_renewed": acme_probe(
+                "renew", issued_epoch=self.first_renewal, installed_serial="0C2D",
+                renewed_epoch=self.second_renewal, renewed_serial="0E3F",
+            ),
+        }
+
+    def contract(self, routes=None, served=None, **phases):
+        """Run the case over the phases, the token routes, and the client handshakes."""
+        plan = self.phases()
+        plan.update(phases)
+        scripts = [
+            (json.dumps(plan["before"]), 0),
+            (json.dumps(plan["challenge_block"]), 0),
+            ("", 0), ("", 0),
+            (json.dumps(plan["challenge_attempt"]), 0),
+            (json.dumps(plan["challenge_restore"]), 0),
+            ("", 0), ("", 0),
+            (json.dumps(plan["challenge_recovered"]), 0),
+            (json.dumps(plan["directory_block"]), 0),
+            (json.dumps(plan["directory_attempt"]), 0),
+            (json.dumps(plan["directory_restore"]), 0),
+            (json.dumps(plan["directory_renewed"]), 0),
+        ]
+        product, podman = installed_product(self.context, scripts)
+        if routes is None:
+            routes = [acme_route_report(status=403), acme_route_report()]
+        if served is None:
+            served = [acme_served_report(plan[name]) for name in (
+                "challenge_attempt", "challenge_recovered",
+                "directory_attempt", "directory_renewed",
+            )]
+        # The case reads the route, then a handshake, then the route again, then
+        # the three handshakes that follow each renewal.
+        product.host.client_reports = [
+            routes[0], served[0], routes[1], served[1], served[2], served[3],
+        ]
+        return aio.case_acme_outage(product), podman
+
+    def reject(self, expected: str, **kwargs):
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(**kwargs)
+        self.assertIn(expected, str(caught.exception))
+        return caught
+
+    def test_each_outage_fails_closed_and_the_lineage_survives_both(self):
+        evidence, podman = self.contract()
+        self.assertEqual(evidence["role"], "the All-in-One host")
+        self.assertEqual(evidence["installed_certificate"]["serial"], "0A1B")
+        challenge = evidence["challenge_outage"]
+        self.assertEqual(challenge["control"]["status"], 403, "the closed route refused the token")
+        self.assertIn("Some challenges have failed", challenge["failure"]["reported"])
+        self.assertEqual(challenge["lineage"]["serial"], "0A1B")
+        self.assertEqual(challenge["lineage"]["archive"], 1)
+        self.assertEqual(challenge["restored_mode"], "0755")
+        self.assertEqual(challenge["route_after_restore"]["status"], 200)
+        self.assertEqual(challenge["recovery"]["serial_after"], "0C2D")
+        directory = evidence["directory_outage"]
+        self.assertTrue(directory["control"]["loopback"])
+        self.assertTrue(directory["failure"]["reported"])
+        self.assertEqual(directory["lineage"]["serial"], "0C2D")
+        self.assertTrue(directory["resolution_after_release"].startswith("172.30.0.9"))
+        self.assertEqual(directory["recovery"]["serial_after"], "0E3F")
+        self.assertEqual(len(podman.scripts), 13)
+        self.assertTrue(podman.scripts[0].startswith("python3 - before "))
+        self.assertTrue(podman.scripts[4].startswith("python3 - renew "))
+        self.assertIn(aio.ACME_BLACKHOLE_MARKER, podman.scripts[9])
+        self.assertIn(str(aio.ACME_OUTAGE_RELOAD_WAIT_SECONDS), podman.scripts[4])
+
+    def test_the_failed_attempt_is_not_waited_for_like_a_reload(self):
+        _evidence, podman = self.contract()
+        self.assertIn(f"RELOAD_WAIT_SECONDS = {aio.ACME_OUTAGE_RELOAD_WAIT_SECONDS}",
+                      podman.scripts[4])
+        self.assertIn(f"RELOAD_WAIT_SECONDS = {aio.ACME_RENEWAL_WAIT_SECONDS}",
+                      podman.scripts[8])
+
+    def test_a_webroot_that_never_closed_fails_the_case(self):
+        self.reject("so the validator's path was never closed",
+                    challenge_block=acme_outage_report("challenge-block",
+                                                       webroot_mode_after="0755"))
+
+    def test_a_renewal_that_succeeds_during_the_challenge_outage_fails_the_case(self):
+        self.reject("although the challenge was down",
+                    challenge_attempt=acme_probe("renew", issued_epoch=self.installed))
+
+    def test_a_failure_that_never_attempted_http01_fails_the_case(self):
+        self.reject("never attempted an HTTP-01 challenge",
+                    challenge_attempt=acme_failed_attempt(
+                        "challenge", issued_epoch=self.installed,
+                        transcript="Some challenges have failed.",
+                    ))
+
+    def test_a_failure_that_does_not_name_its_cause_fails_the_case(self):
+        self.reject("failed without naming the challenge",
+                    challenge_attempt=acme_failed_attempt(
+                        "challenge", issued_epoch=self.installed,
+                        transcript=f"http-01 challenge for {aio.PANEL_DOMAIN}\nunknown problem",
+                    ))
+
+    def test_a_failed_attempt_that_replaced_the_leaf_fails_the_case(self):
+        attempt = acme_failed_attempt("challenge", issued_epoch=self.installed)
+        attempt["live_after"] = acme_certificate(
+            f"{aio.ACME_LINEAGE_DIR}/{aio.PANEL_DOMAIN}/fullchain.pem", "0E3F",
+            self.first_renewal,
+        )
+        self.reject("changed the installed certificate", challenge_attempt=attempt)
+
+    def test_a_failed_attempt_that_grew_the_archive_fails_the_case(self):
+        attempt = acme_failed_attempt("challenge", issued_epoch=self.installed)
+        attempt["archive_after"] = list(attempt["archive"]) + list(attempt["archive"])
+        self.reject("added a certificate to the archive", challenge_attempt=attempt)
+
+    def test_a_served_certificate_that_changed_after_the_failure_fails_the_case(self):
+        plan = self.phases()
+        self.reject(
+            "disturbed the certificate the host was serving",
+            served=[
+                tls_report(not_before=certificate_day(-2)),
+                acme_served_report(plan["challenge_recovered"]),
+                acme_served_report(plan["directory_attempt"]),
+                acme_served_report(plan["directory_renewed"]),
+            ],
+        )
+
+    def test_a_webroot_left_closed_fails_the_case(self):
+        self.reject("instead of '0755' after the outage was removed",
+                    challenge_restore=acme_outage_report("challenge-restore",
+                                                         webroot_mode_after="0700"))
+
+    def test_a_recovery_that_reuses_the_serial_fails_the_case(self):
+        self.reject("still reports certificate serial '0A1B'",
+                    challenge_recovered=acme_probe(
+                        "renew", issued_epoch=self.installed,
+                        renewed_epoch=self.first_renewal, renewed_serial="0A1B",
+                    ))
+
+    def test_a_directory_that_stayed_reachable_fails_the_case(self):
+        self.reject("when the directory was supposed to be unreachable",
+                    directory_block=acme_outage_report("directory-block",
+                                                       resolution_after=f"172.30.0.9 {acme_fixture.FIXTURE_HOST}"))
+
+    def test_a_directory_left_unreachable_fails_the_case(self):
+        self.reject("when the directory was supposed to be reachable",
+                    directory_restore=acme_outage_report(
+                        "directory-restore",
+                        resolution_after=f"127.0.0.1 {acme_fixture.FIXTURE_HOST}",
+                    ))
+
+    def test_the_case_is_registered_before_any_traffic_and_carries_a_bounded_budget(self):
+        cases = {case.id: case for case in aio.cases(ScriptedPodman(self.context, []))}
+        self.assertIn(aio.ACME_OUTAGE_CASE_ID, cases)
+        self.assertEqual(cases[aio.ACME_OUTAGE_CASE_ID].timeout_seconds,
+                         aio.ACME_OUTAGE_TIMEOUT_SECONDS)
+        self.assertEqual(cases[aio.ACME_OUTAGE_CASE_ID].topology, "aio")
+        ids = [case.id for case in aio.cases(ScriptedPodman(self.context, []))]
+        self.assertLess(ids.index(aio.ACME_CASE_ID), ids.index(aio.ACME_OUTAGE_CASE_ID))
+        self.assertLess(ids.index(aio.ACME_OUTAGE_CASE_ID), ids.index("AIO-AUTH"))
+
+    def test_the_case_is_catalogued_as_an_incubating_podman_first_case(self):
+        entry = {case["id"]: case for case in catalog.load_catalog()["cases"]}
+        self.assertIn(aio.ACME_OUTAGE_CASE_ID, entry)
+        record = entry[aio.ACME_OUTAGE_CASE_ID]
+        self.assertEqual(record["state"], "incubating")
+        self.assertEqual(record["runs_in"], ["podman"])
+        self.assertEqual(record["topology"], ["aio"])
+        self.assertEqual(record["promotion_target"], "Global Certbot Deploy Hook Ownership")
+
+
+class TestAcmeOutageProbe(unittest.TestCase):
+    """ACME-02's outage probe: what it changes on a real tree, and what it puts back."""
+
+    def build_target(self, tmpdir: Path) -> dict:
+        webroot = tmpdir / "webroot"
+        webroot.mkdir()
+        webroot.chmod(0o755)
+        hosts = tmpdir / "hosts"
+        hosts.write_text("127.0.0.1 localhost\n172.30.0.9 pebble.testnet\n", encoding="utf-8")
+        return {"webroot": webroot, "hosts": hosts}
+
+    def run_probe(self, mode: str, layout: dict, original_mode: str = "") -> dict:
+        script = (
+            aio.acme_outage_script(mode, original_mode, str(layout["hosts"]))
+            .replace(aio.ACME_WEBROOT, str(layout["webroot"]))
+        )
+        _, _, body = script.partition("<<'PY'\n")
+        body = body.rsplit("\nPY\n", 1)[0]
+        args = [mode, str(layout["webroot"]), original_mode, acme_fixture.FIXTURE_HOST,
+                aio.ACME_BLACKHOLE_MARKER, str(layout["hosts"])]
+        result = subprocess.run(
+            [sys.executable, "-c", body, *args],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_closing_the_webroot_records_what_it_found_and_what_it_did(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            layout = self.build_target(Path(tmpdir))
+            facts = self.run_probe("challenge-block", layout)
+            after = layout["webroot"].stat().st_mode & 0o777
+        self.assertEqual(facts["webroot_mode"], "0755")
+        self.assertEqual(facts["webroot_mode_after"], "0700")
+        self.assertEqual(after, 0o700)
+
+    def test_restoring_puts_the_original_mode_back(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            layout = self.build_target(Path(tmpdir))
+            layout["webroot"].chmod(0o750)
+            self.run_probe("challenge-block", layout)
+            facts = self.run_probe("challenge-restore", layout, "0750")
+            after = layout["webroot"].stat().st_mode & 0o777
+        self.assertEqual(facts["webroot_mode_after"], "0750")
+        self.assertEqual(after, 0o750)
+
+    def test_blackholing_the_directory_keeps_the_hosts_entry_and_leaves_the_rest(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            layout = self.build_target(Path(tmpdir))
+            self.run_probe("directory-block", layout)
+            lines = layout["hosts"].read_text(encoding="utf-8").splitlines()
+            self.run_probe("directory-restore", layout)
+            restored = layout["hosts"].read_text(encoding="utf-8").splitlines()
+        self.assertIn(f"127.0.0.1 {acme_fixture.FIXTURE_HOST}  # {aio.ACME_BLACKHOLE_MARKER}", lines)
+        self.assertIn("127.0.0.1 localhost", lines)
+        self.assertFalse([line for line in restored if aio.ACME_BLACKHOLE_MARKER in line])
+        self.assertEqual(restored, ["127.0.0.1 localhost", "172.30.0.9 pebble.testnet"])
+
+    def test_a_second_block_does_not_duplicate_the_line(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            layout = self.build_target(Path(tmpdir))
+            self.run_probe("directory-block", layout)
+            self.run_probe("directory-block", layout)
+            lines = layout["hosts"].read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len([line for line in lines if aio.ACME_BLACKHOLE_MARKER in line]), 1)
+
+
 def certificate_day(days: float = 0) -> str:
     """A certificate time relative to now, in the form the peer report carries."""
     return format_datetime(datetime.now(timezone.utc) + timedelta(days=days))
