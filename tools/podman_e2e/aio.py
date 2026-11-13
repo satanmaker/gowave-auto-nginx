@@ -4717,8 +4717,8 @@ def case_channel_noop(product: AioProduct) -> Dict[str, Any]:
 
 
 CHANNEL_ROLLBACK_BODY = r"""
-recovery=/var/lib/gowave-auto-nginx/recovery
-rm -f /root/gowave-e2e-once.marker /tmp/gowave-e2e-sabotage.json
+rm -f /root/gowave-e2e-once.marker /tmp/gowave-e2e-sabotage.json \
+      /tmp/gowave-e2e-hook.err /tmp/gowave-e2e-sabotage.err
 install -d -m 0755 /usr/local/sbin
 cat > /usr/local/sbin/gowave-e2e-sabotage.py <<'PY'
 import hashlib, json, os
@@ -4741,9 +4741,19 @@ def digest(path):
 
 
 def replace(path, data, mode=0o644):
-    with open(path, "wb") as handle:
-        handle.write(data)
-    os.chmod(path, mode)
+    # A file the running Panel owns may refuse an in-place rewrite even to root,
+    # while the directory it sits in still allows a rename, so the staging route
+    # is the second attempt rather than a separate branch of the case.
+    try:
+        with open(path, "wb") as handle:
+            handle.write(data)
+        os.chmod(path, mode)
+    except OSError:
+        staging = path + ".e2e-sabotage"
+        with open(staging, "wb") as handle:
+            handle.write(data)
+        os.chmod(staging, mode)
+        os.replace(staging, path)
 
 
 lineage = ""
@@ -4756,13 +4766,15 @@ replace("/opt/gowave/gowave-server", b"#!/bin/sh\nexit 1\n", 0o755)
 replace("/opt/gowave/gowave.db", b"this is not a sqlite database\n")
 if os.path.isfile("/opt/gowave/frontend/index.html"):
     replace("/opt/gowave/frontend/index.html", b"<html>e2e sabotage</html>\n")
-with open("/opt/gowave/.env", "ab") as handle:
-    handle.write(b"E2E_CHANNEL_SABOTAGE=1\n")
+with open("/opt/gowave/.env", "rb") as handle:
+    environment = handle.read()
+replace("/opt/gowave/.env", environment + b"E2E_CHANNEL_SABOTAGE=1\n", 0o640)
 replace("/var/lib/gowave-auto-nginx/state.json", b"{}\n")
 replace("/etc/nginx/nginx.conf", b"# e2e sabotage\n")
 if lineage and os.path.exists(lineage):
-    with open(lineage, "ab") as handle:
-        handle.write(b"\n# e2e sabotage\n")
+    with open(lineage, "rb") as handle:
+        chain = handle.read()
+    replace(lineage, chain + b"\n# e2e sabotage\n")
 
 targets = {
     "binary": "/opt/gowave/gowave-server",
@@ -4786,14 +4798,24 @@ chmod 0755 /usr/local/sbin/gowave-e2e-sabotage.py
 cat > /usr/local/sbin/gowave-e2e-once-fail <<'ONCE'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+exec 2>>/tmp/gowave-e2e-hook.err
+echo "hook started in uid $(id -u)" >&2
 marker=/root/gowave-e2e-once.marker
 if [[ -e "$marker" ]]; then
     exit 0
 fi
 touch "$marker"
-# The harness starts this hook from systemd, which hands it /dev/null instead of
-# the script text, so the sabotage has to be an executable of its own.
-python3 /usr/local/sbin/gowave-e2e-sabotage.py
+# The gowave unit's sandbox reaches this hook even with the '+' prefix: measured
+# in the testbed, root inside it cannot rewrite a gowave-owned database. The
+# damage therefore runs as a transient unit, which systemd starts with the
+# manager's own privileges, and only falls back to the hook's sandbox if that
+# unit cannot be created at all.
+if ! systemd-run --wait --collect --quiet --unit=gowave-e2e-sabotage \
+        /bin/bash -c 'python3 /usr/local/sbin/gowave-e2e-sabotage.py 2>>/tmp/gowave-e2e-sabotage.err' \
+        2>>/tmp/gowave-e2e-hook.err; then
+    echo "the transient sabotage unit failed; retrying inside the hook" >&2
+    python3 /usr/local/sbin/gowave-e2e-sabotage.py 2>>/tmp/gowave-e2e-sabotage.err || true
+fi
 exit 1
 ONCE
 chmod 0755 /usr/local/sbin/gowave-e2e-once-fail
@@ -4805,6 +4827,10 @@ cat > /etc/systemd/system/gowave.service.d/99-e2e-once-fail.conf <<'UNIT'
 ExecStartPre=+/usr/local/sbin/gowave-e2e-once-fail
 UNIT
 systemctl daemon-reload
+# Read the unit as systemd parsed it, before the fault is disarmed: a drop-in that
+# never reached the unit is why a hook would not run at all.
+configured=$(systemctl show gowave.service -p ExecStartPre -p ActiveState)
+sandbox=$(systemctl show gowave.service -p CapabilityBoundingSet -p ProtectSystem -p ReadWritePaths -p PrivateTmp -p NoNewPrivileges)
 
 rc=0
 bash "$repo/gowave-auto.sh" channel dev >/tmp/gowave-e2e-channel.out 2>/tmp/gowave-e2e-channel.err || rc=$?
@@ -4812,7 +4838,7 @@ bash "$repo/gowave-auto.sh" channel dev >/tmp/gowave-e2e-channel.out 2>/tmp/gowa
 rm -f /etc/systemd/system/gowave.service.d/99-e2e-once-fail.conf
 systemctl daemon-reload
 
-RC="$rc" python3 - <<'PY'
+CONFIGURED="$configured" SANDBOX="$sandbox" RC="$rc" python3 - <<'PY'
 import json, os, subprocess, urllib.request
 
 
@@ -4866,6 +4892,14 @@ print(json.dumps({
     "journal": journal(),
     "unit": unit,
     "health": health,
+    # The injected fault leaves three traces that tell its own story: the unit
+    # as systemd parsed it, whether the hook was ever entered, and whether the
+    # sabotage record it writes came out.
+    "configured": os.environ.get("CONFIGURED", ""),
+    "sandbox": os.environ.get("SANDBOX", ""),
+    "hook_log": read("/tmp/gowave-e2e-hook.err"),
+    "sabotage_log": read("/tmp/gowave-e2e-sabotage.err"),
+    "sabotage_present": os.path.isfile("/tmp/gowave-e2e-sabotage.json"),
 }, sort_keys=True))
 PY
 """
@@ -4880,7 +4914,8 @@ def channel_rollback_script() -> str:
     it damages is restored from the snapshot rather than from the state it left.
     The hook fails once and succeeds afterwards, which lets the rollback's own
     restart bring the Panel back; the sabotage record tells the case which bytes
-    the rollback had to undo.
+    the rollback had to undo. The damage itself is handed to a transient unit,
+    because the started unit's sandbox also covers its own ``ExecStartPre``.
     """
     return (
         "set -Eeuo pipefail\n"
@@ -4900,6 +4935,7 @@ def channel_rollback_cleanup_script() -> str:
     return f"""set -Eeuo pipefail
 rm -f {shlex.quote(CHANNEL_ONCE_FAIL_UNIT)} {shlex.quote(CHANNEL_ONCE_FAIL_EXEC)} \
 {shlex.quote(CHANNEL_SABOTAGE_EXEC)} {shlex.quote(CHANNEL_ONCE_FAIL_MARKER)}
+systemctl reset-failed gowave-e2e-sabotage.service >/dev/null 2>&1 || true
 systemctl daemon-reload
 state=$(python3 - <<'PY' || true
 import json
@@ -5099,7 +5135,13 @@ def case_channel_rollback(product: AioProduct) -> Dict[str, Any]:
         require(
             CHANNEL_ROLLBACK_CASE_ID, sabotage.get("targets"),
             "the injected start hook never ran after the switch took its snapshot, so the "
-            f"rollback had nothing to restore: {switch.get('stdout', '')[-400:]!r}",
+            "rollback had nothing to restore: "
+            f"unit configured as {(switch.get('configured') or '').strip()!r}, "
+            f"sandbox {(switch.get('sandbox') or '').strip()!r}, "
+            f"hook log {(switch.get('hook_log') or '<empty>').strip()[-600:]!r}, "
+            f"sabotage log {(switch.get('sabotage_log') or '<empty>').strip()[-600:]!r}, "
+            f"switch stderr {(switch.get('stderr') or '').strip()[-500:]!r}, "
+            f"unit {switch.get('unit')!r}",
         )
         require(
             CHANNEL_ROLLBACK_CASE_ID, switch.get("returncode") not in (None, 0),
