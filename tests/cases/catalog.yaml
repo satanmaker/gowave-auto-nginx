@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 67
-  total: 192
+  podman_first: 68
+  total: 193
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3446,6 +3446,27 @@ cases:
     workers and the 443 listener untouched — and the same hook does reload it, without replacing the master,
     once the snippet is removed.
   assertion_sha256: 56b66444d0fbc95522cfe904fed412572e9c8642ffba37dc8f5c8df207bf0709
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: NGINX SNI Routing and REALITY Decoy Verification
+- id: TLS-01
+  requirement: NGINX SNI Routing and REALITY Decoy Verification
+  live_scenario: null
+  assertion: On every role the product exposes over HTTPS, an independent client that trusts only the
+    fixture CA completes a TLSv1.3 handshake whose certificate names exactly that role's domain, is inside
+    its validity window with renewal headroom, and chains to the issuing CA; the same client still negotiates
+    TLSv1.2, is refused when it pins TLSv1.1, and fails chain verification when the CA is withheld — while
+    the role's generated vhost states its protocol list itself instead of inheriting the distribution
+    default.
+  assertion_sha256: d43be13b1e53254f1dd2d7f05e1c6e9f973e4544eeab64d22e5c7705be3e7c47
   runs_in:
   - podman
   state: incubating

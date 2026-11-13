@@ -24,7 +24,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TESTS_DIR))
 
-from tools.podman_e2e import matrix, mtls, multi_node, topology  # noqa: E402
+from tools.podman_e2e import aio, matrix, mtls, multi_node, topology  # noqa: E402
 from tools.podman_e2e.runner import Case, CaseBlocked  # noqa: E402
 from test_podman_aio import BROKEN_TAIL, nginx_probe  # noqa: E402
 
@@ -1428,6 +1428,18 @@ class TestMultiNodeSuite(unittest.TestCase):
         self.assertEqual(suite[multi_node.NGINX_CONFIG_CASE_ID].timeout_seconds,
                          multi_node.NGX_CONFIG_CASE_TIMEOUT_SECONDS)
 
+    def test_the_tls_surface_case_precedes_the_lifecycle_cases(self):
+        # 6.2: both roles' certificates are read from a healthy cluster, so a
+        # later Worker shutdown cannot be blamed for what the client saw here.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertEqual(ids[41], aio.TLS_CASE_ID)
+        self.assertEqual(ids[40], multi_node.NGINX_CONFIG_CASE_ID)
+        self.assertLess(ids.index(aio.TLS_CASE_ID), ids.index(multi_node.REVOCATION_CASE_ID))
+        suite = {case.id: case for case in multi_node.cases(self.podman)}
+        self.assertEqual(suite[aio.TLS_CASE_ID].timeout_seconds,
+                         multi_node.TLS_CASE_TIMEOUT_SECONDS)
+        self.assertEqual(suite[aio.TLS_CASE_ID].topology, "multi-node")
+
 
 class TestMtlsVerifierReport(unittest.TestCase):
     """MTLS-01/02: the verifier's own lines are the only evidence accepted."""
@@ -2317,6 +2329,72 @@ class TestNginxConfigCase(unittest.TestCase):
         product.node_add_outcome = None
         with self.assertRaises(CaseBlocked) as caught:
             multi_node.case_nginx_config(product)
+        self.assertIn(multi_node.NODE_ADD_CASE_ID, str(caught.exception))
+
+
+class _TlsProduct(_NginxConfigProduct):
+    """The real product with only the wiring TLS-01 reads left live."""
+
+
+class TestTlsSurfaceCase(unittest.TestCase):
+    """TLS-01: each role's own certificate is validated from the Control Machine."""
+
+    def product(self):
+        product = _TlsProduct([])
+        self.addCleanup(product.cleanup)
+        return product
+
+    def contract(self, calls):
+        def record(host, case_id, role, domain, expected_status, container=""):
+            calls.append({
+                "host": host, "case_id": case_id, "role": role, "domain": domain,
+                "status": expected_status, "container": container,
+            })
+            return {"role": role, "domain": domain}
+        return record
+
+    def test_both_roles_are_validated_for_their_own_names(self):
+        product = self.product()
+        calls = []
+        with unittest.mock.patch.object(aio, "tls_surface_contract", self.contract(calls)):
+            evidence = multi_node.case_tls_surface(product)
+        self.assertEqual([call["role"] for call in calls], ["the Master", "the Worker"])
+        self.assertEqual([call["domain"] for call in calls],
+                         [topology.PANEL_DOMAIN, topology.WORKER_DOMAIN])
+        # The Master serves the Panel page; the Worker's own vhost answers 404,
+        # which is what still proves which vhost terminated the connection.
+        self.assertEqual([call["status"] for call in calls], [200, 404])
+        self.assertEqual([call["container"] for call in calls], ["", "worker-test"])
+        self.assertEqual(set(call["case_id"] for call in calls), {aio.TLS_CASE_ID})
+        self.assertEqual(set(evidence), {"master", "worker"})
+
+    def test_the_handshake_is_always_driven_from_the_control_machine(self):
+        product = self.product()
+        calls = []
+        with unittest.mock.patch.object(aio, "tls_surface_contract", self.contract(calls)):
+            multi_node.case_tls_surface(product)
+        self.assertTrue(all(call["host"] is product.master for call in calls),
+                        "no role may be probed from the host it runs on")
+
+    def test_a_worker_finding_names_the_worker_and_the_reason(self):
+        product = self.product()
+
+        def refuse(host, case_id, role, domain, expected_status, container=""):
+            if role == "the Worker":
+                aio.require(case_id, False, f"{role}: the certificate names "
+                            f"{domain!r} instead of {domain!r}")
+            return {"role": role, "domain": domain}
+
+        with unittest.mock.patch.object(aio, "tls_surface_contract", refuse):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.case_tls_surface(product)
+        self.assertIn("the Worker", str(caught.exception))
+
+    def test_a_case_without_a_provisioned_worker_is_blocked(self):
+        product = self.product()
+        product.node_add_outcome = None
+        with self.assertRaises(CaseBlocked) as caught:
+            multi_node.case_tls_surface(product)
         self.assertIn(multi_node.NODE_ADD_CASE_ID, str(caught.exception))
 
 

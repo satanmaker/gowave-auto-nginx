@@ -293,6 +293,30 @@ class TestPodmanTopology(unittest.TestCase):
         self.assertIn("ubuntu-24.04", record["images_resolved"])
         self.assertEqual(record["install_command"], instance.install_script())
 
+    def test_the_client_probe_carries_the_fixture_anchor_unless_it_is_withheld(self):
+        instance, podman = self.create()
+
+        def answer(name, argv, check=True, input_text=None, timeout=300):
+            podman.execs.append((name, list(argv)))
+            return subprocess.CompletedProcess(argv, 0, '{"url": "https://probe/"}', "")
+
+        podman.exec = answer
+        url = f"https://{topology.PANEL_DOMAIN}/"
+        instance.client_http(url)
+        argv = podman.execs[-1][1]
+        self.assertEqual(argv[argv.index("--ca") + 1],
+                         f"{topology.CA_MOUNT}/{topology.ISSUED_ROOT_NAME}")
+        # Withholding the anchor is the only way an unanchored handshake can be
+        # measured; switching verification off instead would prove nothing.
+        instance.client_http(url, anchor=False)
+        argv = podman.execs[-1][1]
+        self.assertNotIn("--ca", argv)
+        self.assertNotIn("--insecure", argv)
+        instance.client_http(url, max_tls="TLSv1.1")
+        argv = podman.execs[-1][1]
+        self.assertEqual(argv[argv.index("--max-tls") + 1], "TLSv1.1")
+        self.assertIn("--ca", argv)
+
     def test_unsupported_distribution_is_rejected_before_any_container(self):
         podman = FakePodman()
         self.addCleanup(podman.context.run_cleanup)

@@ -292,6 +292,27 @@ class TestNodeIntegration(unittest.TestCase):
         uninstall = script[uninstall_start:script.index("\nROLLBACK_REMOTE_SCRIPT", uninstall_start)]
         self.assertIn(vhost, uninstall)
 
+    def test_worker_edge_https_vhost_pins_its_own_tls_versions(self):
+        """Worker Edge HTTPS must state ssl_protocols; inheriting a platform default
+        would make the same product accept different versions per distribution."""
+        script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        funcs_start = script.index("cat <<'RUNNER_FUNCS'")
+        payload = script[funcs_start:script.index("\nRUNNER_FUNCS\n", funcs_start)]
+
+        start = payload.index("configure_edge_nginx() {")
+        # The function writes several vhosts whose heredocs own top-level braces,
+        # so the slice ends at the next function rather than at the first "\n}\n".
+        end = payload.index("\ncore_version_matches() {", start)
+        body = payload[start:end]
+
+        self.assertIn("cat > /etc/nginx/conf.d/gowave-worker-https.conf", body)
+        vhost_start = body.index("cat > /etc/nginx/conf.d/gowave-worker-https.conf")
+        https = body[vhost_start:body.index("\nEOF\n", vhost_start)]
+        self.assertIn("ssl_protocols TLSv1.2 TLSv1.3;", https)
+        self.assertIn("ssl_ciphers HIGH:!aNULL:!MD5;", https)
+        self.assertIn("ssl_certificate /etc/letsencrypt/live/$WORKER_DOMAIN/fullchain.pem;", https)
+        self.assertNotIn("ssl_protocols TLSv1.3;", https)
+
     def test_standalone_remote_rollback_reports_non_acme_cleanup_failures(self):
         """Standalone rollback must fail if service, NGINX, hook, or scratch cleanup is incomplete."""
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()

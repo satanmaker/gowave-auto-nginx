@@ -75,6 +75,7 @@ class TestNginxRouting(unittest.TestCase):
 
             c = out.read_text()
             self.assertIn("server_name panel.example.com;", c)
+            self.assertIn("ssl_protocols TLSv1.2 TLSv1.3;", c)
             self.assertIn("set_real_ip_from 127.0.0.1;", c)
             self.assertIn("real_ip_header proxy_protocol;", c)
             self.assertIn("location ^~ /api/sub/ {", c)
