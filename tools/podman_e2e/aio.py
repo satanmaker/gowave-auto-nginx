@@ -110,11 +110,13 @@ RESTART_INTERVAL_SECONDS = 5
 # A bound upstream listener is not a working tunnel: the Panel hands users to the
 # node and the node applies them asynchronously, so the first transfer of a payload
 # that was just issued can still be refused. Readiness is proven by one real
-# payload through one served outbound, polled under this deadline.
+# payload through every served outbound of both engines, polled under this
+# deadline: a case that then asserts the whole matrix has to wait for the whole
+# matrix, or it reports propagation lag as a transport failure.
 TUNNEL_READY_TIMEOUT_SECONDS = 300
 TUNNEL_READY_INTERVAL_SECONDS = 5
-# One warm-up attempt starts an engine and sends one request; it must not inherit
-# the deadline of the whole matrix.
+# One warm-up attempt starts an engine per profile and sends one request through
+# each; it must not inherit the deadline of the whole matrix.
 TUNNEL_READY_ATTEMPT_TIMEOUT_SECONDS = 180
 
 # The host resources a repeated install must neither duplicate nor rewrite. The
@@ -385,11 +387,15 @@ def drive_hook():
     facts = {
         "present": present,
         "executable": os.access(HOOK, os.X_OK),
+        "executed": MODE != "before",
         "returncode": None,
         "stdout": "",
         "stderr": "",
     }
-    if not present:
+    # The baseline phase only reports the guard: driving it there would reload the
+    # master with the untouched tree, and every worker the reload creates would
+    # then look like a worker the break phase gained.
+    if not present or MODE == "before":
         return facts
     result = run((HOOK,), timeout=120)
     facts.update({
@@ -1005,14 +1011,16 @@ class AioProduct:
         return probe_json(case_id, label, result)
 
     def wait_tunnel_ready(self, case_id: str, payload_dir: Optional[str] = None) -> Dict[str, Any]:
-        """Wait until one served outbound really carries a payload to the endpoint.
+        """Wait until every served outbound really carries a payload to the endpoint.
 
         A listener that is bound and a Panel that answers say nothing about the
         data plane: the Panel pushes users to the node and the node applies them
         asynchronously, so both a freshly issued client and a restarted node can
-        have a tunnel that refuses the first transfer. One payload, confirmed by
-        the endpoint's own log, is the smallest honest proof that the matrix that
-        follows is measuring the product rather than its propagation lag.
+        have a tunnel that refuses the first transfer. A payload per outbound,
+        confirmed by the endpoint's own log, is what tells the matrix that follows
+        it is measuring the product rather than its propagation lag — one warm
+        transport would let the deadline expire on a case that still asserts the
+        rest.
         """
         host = self.require_installed()
         observed: Dict[str, Any] = {}
@@ -1043,7 +1051,7 @@ class AioProduct:
             interval_seconds=TUNNEL_READY_INTERVAL_SECONDS,
         )
         require(case_id, ready,
-                f"no served outbound carried a payload to the endpoint within "
+                f"not every served outbound carried a payload to the endpoint within "
                 f"{TUNNEL_READY_TIMEOUT_SECONDS}s: {observed}")
         return observed
 
@@ -1649,8 +1657,9 @@ def case_restart(product: AioProduct) -> Dict[str, Any]:
     them and then waits, under one deadline, for the Panel and the tunnel's
     loopback upstream to come back. The data plane is exercised afterwards because
     a control plane that recovers while the tunnel stayed down would otherwise
-    look healthy; one served outbound has to carry a payload first, because a node
-    that has its listener back applies its users asynchronously.
+    look healthy; every served outbound has to carry a payload first, because a
+    node that has its listener back applies its users asynchronously and a
+    transport that is still warming up would otherwise be read as broken.
     """
     host = product.require_installed()
     product.subscription_payloads("AIO-RESTART")
@@ -2020,6 +2029,11 @@ def require_refused_reload(
     and left the running master, its workers and its listener exactly as they
     were. Requiring the whole trio is what tells "the reload was suppressed" from
     "the hook crashed before it could matter".
+
+    The worker baseline is the break phase's own reading, taken after the snippet
+    was planted and before the guard ran: comparing against the earlier baseline
+    phase would count any reload that happened between the two probes as a reload
+    the guard caused, which is what the phase itself is here to measure.
     """
     require(case_id, broken.get("mode") == "break",
             f"{role}: the failing probe answered for {broken.get('mode')!r}")
@@ -2037,16 +2051,20 @@ def require_refused_reload(
             f"{role}: the managed deploy hook exited {hook.get('returncode')!r} on an invalid "
             f"configuration instead of leaving NGINX alone: {hook.get('stderr') or hook.get('stdout')}")
     baseline = before.get("before_hook") or {}
+    same_phase = broken.get("before_hook") or {}
     after = broken.get("after_hook") or {}
+    require(case_id, same_phase.get("worker_pids"),
+            f"{role}: the break probe read no worker before driving the guard "
+            f"({same_phase.get('worker_pids')!r}), so no reload could be observed")
     require(case_id, after.get("active") == "active",
             f"{role}: NGINX stopped after the deploy hook ran against an invalid configuration")
     require(case_id, after.get("main_pid") == baseline.get("main_pid"),
             f"{role}: the deploy hook replaced the NGINX master on an invalid configuration "
             f"({baseline.get('main_pid')} -> {after.get('main_pid')})")
-    appeared = sorted(set(after.get("worker_pids") or []) - set(baseline.get("worker_pids") or []))
+    appeared = sorted(set(after.get("worker_pids") or []) - set(same_phase.get("worker_pids") or []))
     require(case_id, not appeared,
             f"{role}: the deploy hook reloaded NGINX with an invalid configuration "
-            f"(new worker(s) {appeared})")
+            f"({same_phase.get('worker_pids')} -> {after.get('worker_pids')})")
     require(case_id, int(after.get("listeners_443") or 0) >= 1,
             f"{role}: the 443 listener disappeared while the loaded configuration was untouched")
 
@@ -2132,8 +2150,12 @@ def nginx_config_reload_contract(
         "generated_config_server_names": (before.get("dump") or {}).get("server_name_lines"),
         "invalid_configuration": {
             "nginx_test_returncode": (broken.get("test") or {}).get("returncode"),
+            "nginx_test_tail": (broken.get("test") or {}).get("tail"),
             "hook_returncode": (broken.get("hook") or {}).get("returncode"),
+            "hook_stdout": (broken.get("hook") or {}).get("stdout"),
+            "hook_stderr": (broken.get("hook") or {}).get("stderr"),
             "master_pid": (broken.get("after_hook") or {}).get("main_pid"),
+            "worker_pids_before_hook": (broken.get("before_hook") or {}).get("worker_pids"),
             "worker_pids": (broken.get("after_hook") or {}).get("worker_pids"),
             "listener_443": (broken.get("after_hook") or {}).get("listeners_443"),
         },
