@@ -72,8 +72,10 @@ check_os() {
 
 check_kernel_ipv6() {
     local if_inet6="${1:-/proc/net/if_inet6}"
-    # Check proc file existence and non-empty content
-    if [[ ! -f "$if_inet6" ]] || [[ ! -s "$if_inet6" ]]; then
+    # The address table has to be read, not measured: procfs reports a zero
+    # inode size for /proc/net/if_inet6 however many addresses it prints, so
+    # ``[[ -s ]]`` answers "empty" even on a dual-stack host.
+    if [[ ! -f "$if_inet6" ]] || ! grep -q '[^[:space:]]' "$if_inet6" 2>/dev/null; then
         return 1
     fi
     # Check sysctl disable_ipv6 if sysctl is available
