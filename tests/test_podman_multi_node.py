@@ -4996,6 +4996,357 @@ class TestBackupArchiveParsing(unittest.TestCase):
         self.assertEqual(multi_node.parse_backup_archive(""), "")
 
 
+_VOLUME_RUN_ID = "podman-multi-node-20260101T000000-deadbeef"
+_VOLUME_SUFFIX = "deadbeef"
+_VOLUME_PANEL_ARCHIVE = "gowave-backup-panel-1794600459.tar.gz"
+_VOLUME_NODE_ARCHIVE = "gowave-backup-node-1794600460.tar.gz"
+
+
+def _volume_probe_report(**overrides):
+    facts = {
+        "target_type": "ext4",
+        "root_type": "overlay",
+        "owner": "root",
+        "mode": "700",
+        "mounts": "1",
+    }
+    facts.update(overrides)
+    return " ".join(f"{key}={value}" for key, value in facts.items()) + "\n"
+
+
+class _VolumeContext:
+    def __init__(self, artifact_dir):
+        self.run_id = _VOLUME_RUN_ID
+        self.topology = "multi-node"
+        self.artifact_dir = str(artifact_dir)
+
+
+class _VolumePodman:
+    """The archive store as the container sees it, and the product's own writes."""
+
+    ROLES = {"aio-master": "master", "worker-01": "worker"}
+    LABELS = {"master": "Panel", "worker": "Node"}
+
+    def __init__(self, context, mountpoints, labelled, probes=None,
+                 backup_returncode=None, archive_override=None,
+                 stored_mode=0o600, write_archive=True):
+        self.context = context
+        self.mountpoints = mountpoints
+        self.labelled = labelled
+        self.probes = probes or {}
+        self.backup_returncode = backup_returncode or {}
+        self.archive_override = archive_override or {}
+        self.stored_mode = stored_mode
+        self.write_archive = write_archive
+        self.scripts = []
+
+    @property
+    def archives(self):
+        return {
+            "master": f"{topology.BACKUP_STORE}/{_VOLUME_PANEL_ARCHIVE}",
+            "worker": f"{topology.BACKUP_STORE}/{_VOLUME_NODE_ARCHIVE}",
+        }
+
+    def labelled_volumes(self):
+        return list(self.labelled)
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        self.scripts.append((container, script))
+        role = self.ROLES[container]
+        if "root_type=" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0, self.probes.get(role, _volume_probe_report()), "")
+        returncode = self.backup_returncode.get(role, 0)
+        if returncode != 0:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], returncode, "",
+                f"ERROR: {self.LABELS[role]} backup root is missing\n")
+        archive = self.archive_override.get(role, self.archives[role])
+        if self.write_archive:
+            stored = self.mountpoints[role] / Path(archive).name
+            stored.write_bytes(b"archive")
+            os.chmod(stored, self.stored_mode)
+        return subprocess.CompletedProcess(
+            ["bash", "-lc"], 0,
+            f"{self.LABELS[role]} backup created successfully: {archive} (mode 0600).\n", "")
+
+
+class _VolumeHost:
+    target_name = "aio-master"
+    worker_name = "worker-01"
+
+    def __init__(self, volumes):
+        self.backup_volumes = volumes
+
+
+class _VolumeProduct:
+    def __init__(self, podman, host):
+        self.podman = podman
+        self.host = host
+
+    def require_worker(self):
+        return self.host
+
+
+class TestBackupVolumeProbe(unittest.TestCase):
+    """What the container is asked about its archive store before anything is written."""
+
+    def test_the_probe_asks_what_the_store_is_and_where_it_is_mounted(self):
+        script = multi_node.backup_volume_probe_script()
+        self.assertIn(topology.BACKUP_STORE, script)
+        self.assertIn("stat -f -c '%T'", script)
+        self.assertIn("/proc/self/mounts", script)
+        for field in ("target_type", "root_type", "owner", "mode", "mounts"):
+            self.assertIn(f"{field}=", script)
+
+    def test_a_root_only_mount_of_its_own_is_accepted(self):
+        multi_node.require_backup_volume("MN-BACKUP-VOL", "the Master", {
+            "target_type": "ext4", "root_type": "overlay",
+            "owner": "root", "mode": "700", "mounts": "1",
+        })
+
+    def test_a_store_on_the_container_filesystem_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.require_backup_volume("MN-BACKUP-VOL", "the Master", {
+                "target_type": "overlay", "root_type": "overlay",
+                "owner": "root", "mode": "700", "mounts": "1",
+            })
+        self.assertIn("container layer", str(caught.exception))
+
+    def test_a_missing_store_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.require_backup_volume("MN-BACKUP-VOL", "the Master", {
+                "target_type": "missing", "root_type": "overlay",
+                "owner": "missing", "mode": "missing", "mounts": "0",
+            })
+        self.assertIn("container layer", str(caught.exception))
+
+    def test_a_store_readable_by_another_user_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.require_backup_volume("MN-BACKUP-VOL", "the Master", {
+                "target_type": "ext4", "root_type": "overlay",
+                "owner": "root", "mode": "755", "mounts": "1",
+            })
+        self.assertIn("readable by another user", str(caught.exception))
+
+    def test_a_store_owned_by_a_normal_user_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.require_backup_volume("MN-BACKUP-VOL", "the Master", {
+                "target_type": "ext4", "root_type": "overlay",
+                "owner": "gowave", "mode": "700", "mounts": "1",
+            })
+        self.assertIn("owned by 'gowave'", str(caught.exception))
+
+    def test_a_store_that_is_not_a_single_mount_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.require_backup_volume("MN-BACKUP-VOL", "the Master", {
+                "target_type": "ext4", "root_type": "overlay",
+                "owner": "root", "mode": "700", "mounts": "0",
+            })
+        self.assertIn("mount entries", str(caught.exception))
+
+
+class TestArtifactLeaks(unittest.TestCase):
+    """The artifact tree is scanned by shape, never by trusting a file name alone."""
+
+    def test_an_empty_tree_holds_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            leaks = multi_node.artifact_leaks(Path(directory), (_VOLUME_PANEL_ARCHIVE,))
+        self.assertEqual(leaks["files"], 0)
+        self.assertEqual(leaks["gzip_files"], [])
+        self.assertEqual(leaks["archive_names"], [])
+        self.assertEqual(leaks["archive_suffixes"], [])
+        self.assertEqual(leaks["secret_markers"], [])
+
+    def test_a_gzip_stream_is_found_whatever_it_is_called(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "payload.bin").write_bytes(b"\x1f\x8b\x08\x00rest")
+            leaks = multi_node.artifact_leaks(Path(directory), ())
+        self.assertEqual(leaks["gzip_files"], ["payload.bin"])
+
+    def test_a_file_named_after_the_archive_is_found(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "nested").mkdir()
+            (Path(directory) / "nested" / _VOLUME_PANEL_ARCHIVE).write_bytes(b"copy")
+            leaks = multi_node.artifact_leaks(Path(directory), (_VOLUME_PANEL_ARCHIVE,))
+        self.assertEqual(leaks["archive_names"], [f"nested/{_VOLUME_PANEL_ARCHIVE}"])
+
+    def test_an_archive_suffix_is_found_even_under_another_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "state.tar.gz").write_bytes(b"copy")
+            leaks = multi_node.artifact_leaks(Path(directory), ())
+        self.assertEqual(leaks["archive_suffixes"], ["state.tar.gz"])
+
+    def test_a_protected_value_written_by_a_probe_is_found(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "probe.log").write_text(
+                "environment_sha256=0f\nAPP_SECRET=deadbeef\n", encoding="utf-8")
+            leaks = multi_node.artifact_leaks(Path(directory), ())
+        self.assertEqual(leaks["secret_markers"], ["probe.log:APP_SECRET="])
+
+    def test_plain_text_is_not_an_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "result.json").write_text(
+                json.dumps({"overall": "PASS"}), encoding="utf-8")
+            leaks = multi_node.artifact_leaks(Path(directory), (_VOLUME_PANEL_ARCHIVE,))
+        self.assertEqual(leaks["files"], 1)
+        self.assertEqual(leaks["gzip_files"], [])
+        self.assertEqual(leaks["archive_names"], [])
+        self.assertEqual(leaks["secret_markers"], [])
+
+
+class TestBackupVolumeCase(unittest.TestCase):
+    """MN-BACKUP-VOL: the unencrypted archives never leave a run-owned volume."""
+
+    def setUp(self):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        base = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+        self.base = base
+        self.artifact_dir = base / "artifacts"
+        self.artifact_dir.mkdir()
+        self.mountpoints = {}
+        for role in ("master", "worker"):
+            mountpoint = base / f"volume-{role}"
+            mountpoint.mkdir()
+            os.chmod(mountpoint, 0o700)
+            self.mountpoints[role] = mountpoint
+        self.names = {role: f"backups-{role}-{_VOLUME_SUFFIX}" for role in ("master", "worker")}
+
+    def run_case(self, volumes=None, labelled=None, mountpoints=None, modes=None, **kwargs):
+        mountpoints = mountpoints if mountpoints is not None else self.mountpoints
+        for role, mode in (modes or {}).items():
+            os.chmod(mountpoints[role], mode)
+        if volumes is None:
+            volumes = {
+                role: {"name": self.names[role], "mountpoint": str(mountpoints[role])}
+                for role in ("master", "worker")
+            }
+        podman = _VolumePodman(
+            _VolumeContext(self.artifact_dir), mountpoints,
+            labelled=list(self.names.values()) if labelled is None else labelled,
+            **kwargs)
+        evidence = multi_node.case_backup_volume(
+            _VolumeProduct(podman, _VolumeHost(volumes)))
+        return evidence, podman
+
+    def test_it_proves_both_roles_store_their_archive_on_a_run_owned_volume(self):
+        evidence, _ = self.run_case()
+        master = evidence["roles"]["master"]
+        worker = evidence["roles"]["worker"]
+        self.assertEqual(master["volume"], self.names["master"])
+        self.assertEqual(master["filesystem"], "ext4")
+        self.assertEqual(master["root_filesystem"], "overlay")
+        self.assertEqual(master["owner"], "root")
+        self.assertEqual(master["directory_mode"], "700")
+        self.assertEqual(master["archive"], f"{topology.BACKUP_STORE}/{_VOLUME_PANEL_ARCHIVE}")
+        self.assertTrue(master["archive_on_volume"])
+        self.assertEqual(worker["archive"], f"{topology.BACKUP_STORE}/{_VOLUME_NODE_ARCHIVE}")
+        self.assertEqual(evidence["artifacts"]["files"], 0)
+        self.assertEqual(evidence["cleanup"]["labelled_volumes"], sorted(self.names.values()))
+
+    def test_the_volume_is_inspected_before_the_product_writes_into_it(self):
+        _, podman = self.run_case()
+        master = [script for container, script in podman.scripts
+                  if container == "aio-master"]
+        self.assertEqual(len(master), 2)
+        self.assertIn("root_type=", master[0])
+        self.assertIn("gowave-auto.sh backup", master[1])
+        self.assertIn("backup --type panel", master[1])
+        worker = [script for container, script in podman.scripts
+                  if container == "worker-01"]
+        self.assertIn("backup --type node", worker[1])
+
+    def test_a_store_that_is_part_of_the_image_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(probes={"master": _volume_probe_report(target_type="overlay")})
+        self.assertIn("container layer", str(caught.exception))
+
+    def test_a_store_readable_by_others_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(probes={"worker": _volume_probe_report(mode="755")})
+        self.assertIn("readable by another user", str(caught.exception))
+
+    def test_a_volume_named_outside_this_run_fails_the_case(self):
+        volumes = {
+            role: {"name": f"backups-{role}", "mountpoint": str(self.mountpoints[role])}
+            for role in ("master", "worker")
+        }
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(volumes=volumes)
+        self.assertIn("not scoped to this run", str(caught.exception))
+
+    def test_a_volume_the_cleanup_would_not_reclaim_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(labelled=[])
+        self.assertIn("cleanup would leave it behind", str(caught.exception))
+
+    def test_a_host_mountpoint_readable_by_others_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(modes={"master": 0o755})
+        self.assertIn("not root-only", str(caught.exception))
+
+    def test_a_role_without_an_archive_volume_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(volumes={"master": {
+                "name": self.names["master"],
+                "mountpoint": str(self.mountpoints["master"]),
+            }})
+        self.assertIn("do not each carry an archive volume", str(caught.exception))
+
+    def test_a_failed_creation_fails_the_case_with_the_product_error(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(backup_returncode={"worker": 1})
+        self.assertIn("could not write a node archive", str(caught.exception))
+        self.assertIn("backup root is missing", str(caught.exception))
+
+    def test_an_archive_outside_the_store_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(archive_override={"master": "/tmp/panel.tar.gz"})
+        self.assertIn("not inside the archive store", str(caught.exception))
+
+    def test_an_archive_that_never_reached_the_volume_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(write_archive=False)
+        self.assertIn("is not on the host volume", str(caught.exception))
+
+    def test_an_archive_readable_by_others_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(stored_mode=0o644)
+        self.assertIn("instead of 0o600", str(caught.exception))
+
+    def test_a_gzip_file_in_the_artifact_tree_fails_the_case(self):
+        (self.artifact_dir / "payload.bin").write_bytes(b"\x1f\x8b\x08\x00rest")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case()
+        self.assertIn("gzip files", str(caught.exception))
+
+    def test_an_archive_copied_into_the_artifact_tree_fails_the_case(self):
+        (self.artifact_dir / _VOLUME_PANEL_ARCHIVE).write_bytes(b"copy")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case()
+        self.assertIn("by name", str(caught.exception))
+
+    def test_a_protected_value_in_the_artifact_tree_fails_the_case(self):
+        (self.artifact_dir / "probe.log").write_text(
+            "SECRET_KEY=deadbeef\n", encoding="utf-8")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case()
+        self.assertIn("protected value", str(caught.exception))
+
+    def test_the_case_runs_right_after_the_archive_contracts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite = multi_node.cases(_StubPodman(Path(directory)))
+        ids = [case.id for case in suite]
+        case = suite[ids.index(multi_node.BACKUP_VOLUME_CASE_ID)]
+        self.assertEqual(case.topology, "multi-node")
+        self.assertEqual(case.timeout_seconds, multi_node.BACKUP_VOLUME_TIMEOUT_SECONDS)
+        self.assertLess(ids.index(multi_node.BACKUP_CASE_ID),
+                        ids.index(multi_node.BACKUP_VOLUME_CASE_ID))
+        self.assertLess(ids.index(multi_node.BACKUP_VOLUME_CASE_ID),
+                        ids.index(multi_node.RESTORE_CASE_ID))
+
+
 _RESTORE_REPRESENTATIONS = ("base64", "xray-json", "mihomo", "clash", "singbox")
 _RESTORE_SUFFIXES = {
     "": "base64",

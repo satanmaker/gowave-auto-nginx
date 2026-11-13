@@ -21,7 +21,9 @@ import json
 import os
 import re
 import shlex
+import stat
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
@@ -226,6 +228,17 @@ RESTORE_COMMAND_TIMEOUT_SECONDS = 300
 # the file.
 RESTORE_SENTINEL_KEY = "GOWAVE_E2E_RESTORE_SENTINEL"
 RESTORE_NODE_ENV = "/opt/gowave-node/.env"
+# The archives are unencrypted, so they live on a run-owned volume: the case
+# proves the directory is that volume and that no archive reaches an artifact.
+BACKUP_VOLUME_CASE_ID = "MN-BACKUP-VOL"
+BACKUP_VOLUME_TIMEOUT_SECONDS = 600
+# An archive keeps the product's own 0600 file mode; the volume around it is
+# root-only, because the payloads inside are readable by whoever reads the file.
+BACKUP_VOLUME_DIRECTORY_MODE = "700"
+# Nothing an artifact may contain: an archive is gzip, a private key announces
+# itself, and a secret-bearing variable is written as a name plus a value.
+ARTIFACT_FORBIDDEN_MARKERS = ("BEGIN PRIVATE KEY", "SECRET_KEY=", "APP_SECRET=")
+ARTIFACT_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz")
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 VISION_PROBE_TIMEOUT_SECONDS = 120
@@ -5154,6 +5167,226 @@ def backup_verify_script(archive: str, type_name: str) -> str:
     )
 
 
+def backup_volume_probe_script() -> str:
+    """Inside one role: what the archive directory is, and whether it is a volume.
+
+    The root filesystem is read beside it, because a directory that is merely part
+    of the container layer would report the same filesystem type and would vanish
+    with the container — the archive store has to be a mount of its own.
+    """
+    store = topology.BACKUP_STORE
+    return (
+        "set -u\n"
+        f"target=$(stat -f -c '%T' {store} 2>/dev/null || echo missing)\n"
+        "root=$(stat -f -c '%T' / 2>/dev/null || echo missing)\n"
+        f"owner=$(stat -c '%U' {store} 2>/dev/null || echo missing)\n"
+        f"mode=$(stat -c '%a' {store} 2>/dev/null || echo missing)\n"
+        f"mounts=$(grep -c ' {store} ' /proc/self/mounts 2>/dev/null || true)\n"
+        "printf 'target_type=%s root_type=%s owner=%s mode=%s mounts=%s\\n' "
+        '"${target}" "${root}" "${owner}" "${mode}" "${mounts:-0}"\n'
+    )
+
+
+def require_backup_volume(
+    case_id: str, label: str, facts: Dict[str, str],
+) -> None:
+    """The archive store is a root-only mount of its own, not part of the image."""
+    require(
+        case_id,
+        facts.get("target_type") not in ("", "missing", None)
+        and facts.get("target_type") != facts.get("root_type"),
+        f"{label}: the archive store reports filesystem {facts.get('target_type')!r} "
+        f"while the root is {facts.get('root_type')!r}, so the archives sit in the "
+        "container layer rather than on a volume of their own",
+    )
+    require(
+        case_id,
+        facts.get("owner") == "root",
+        f"{label}: the archive store is owned by {facts.get('owner')!r}, so an "
+        "unencrypted archive would be readable by another user",
+    )
+    require(
+        case_id,
+        facts.get("mode") == BACKUP_VOLUME_DIRECTORY_MODE,
+        f"{label}: the archive store is mode {facts.get('mode')!r} instead of "
+        f"{BACKUP_VOLUME_DIRECTORY_MODE}, so an unencrypted archive would be "
+        "readable by another user",
+    )
+    require(
+        case_id,
+        facts.get("mounts") == "1",
+        f"{label}: the archive store has {facts.get('mounts')!r} mount entries "
+        "instead of exactly one, so it is not the single run-owned volume",
+    )
+
+
+def artifact_leaks(directory: Path, archive_names: Sequence[str]) -> Dict[str, Any]:
+    """What an artifact tree holds, scanned by shape rather than by name.
+
+    The archives are secret-bearing, so the check is on what they *are*: a gzip
+    stream, a file named after an archive, or a line a probe would only write if it
+    printed a value. Everything here is a fact about the tree, never content.
+    """
+    files = [path for path in directory.rglob("*") if path.is_file()]
+    gzip_files: List[str] = []
+    named: List[str] = []
+    markers: List[str] = []
+    suffixes: List[str] = []
+    for path in files:
+        relative = str(path.relative_to(directory))
+        if any(name and name in path.name for name in archive_names):
+            named.append(relative)
+        if path.name.endswith(ARTIFACT_ARCHIVE_SUFFIXES):
+            suffixes.append(relative)
+        try:
+            content = path.read_bytes()
+        except OSError:
+            continue
+        if content[:2] == b"\x1f\x8b":
+            gzip_files.append(relative)
+        for marker in ARTIFACT_FORBIDDEN_MARKERS:
+            if marker.encode("utf-8") in content:
+                markers.append(f"{relative}:{marker}")
+    return {
+        "files": len(files),
+        "gzip_files": sorted(gzip_files),
+        "archive_names": sorted(named),
+        "archive_suffixes": sorted(suffixes),
+        "secret_markers": sorted(markers),
+    }
+
+
+def case_backup_volume(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-BACKUP-VOL: the archives live on a run-owned volume no artifact can reach.
+
+    Both archives are unencrypted copies of a role's credentials and lineage, so
+    where they are written is part of the format's contract: the store is a mount
+    of its own, root-only, named after this run, removed by the same label the
+    cleanup uses — and nothing in the artifact tree is an archive, a gzip stream,
+    or a line carrying a value the archive protects.
+    """
+    case_id = BACKUP_VOLUME_CASE_ID
+    host = product.require_worker()
+    volumes = getattr(host, "backup_volumes", None) or {}
+    require(
+        case_id,
+        {"master", "worker"} <= set(volumes),
+        f"the roles do not each carry an archive volume: {sorted(volumes)}",
+    )
+    run_suffix = str(product.podman.context.run_id).rsplit("-", 1)[-1]
+    owned = product.podman.labelled_volumes()
+    artifacts = Path(product.podman.context.artifact_dir)
+    evidence: Dict[str, Any] = {"roles": {}}
+    archive_names: List[str] = []
+
+    for role, container, label, type_name in (
+        ("master", host.target_name, "the Master", "panel"),
+        ("worker", host.worker_name, "the Worker", "node"),
+    ):
+        name = str(volumes[role].get("name") or "")
+        mountpoint = Path(str(volumes[role].get("mountpoint") or ""))
+        require(
+            case_id,
+            name and run_suffix in name,
+            f"{label}'s archive volume is named {name!r}, so it is not scoped to this run",
+        )
+        require(
+            case_id,
+            name in owned,
+            f"{label}'s archive volume {name!r} does not carry this run's cleanup "
+            f"label, so cleanup would leave it behind ({sorted(owned)})",
+        )
+        require(
+            case_id,
+            mountpoint.is_dir(),
+            f"{label}'s archive volume {name!r} has no directory at {mountpoint}",
+        )
+        require(
+            case_id,
+            stat.S_IMODE(mountpoint.stat().st_mode) == 0o700,
+            f"{label}'s archive volume {name!r} is mode "
+            f"{oct(stat.S_IMODE(mountpoint.stat().st_mode))} on the host, so it is "
+            "not root-only",
+        )
+
+        probed = product.podman.exec_bash(
+            container, backup_volume_probe_script(), check=False,
+            timeout=BACKUP_READ_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            probed.returncode == 0,
+            f"{label} could not describe its archive store: "
+            f"{(probed.stderr or probed.stdout or '').strip()[-400:]}",
+        )
+        facts = parse_key_value_fields(probed.stdout or "")
+        require_backup_volume(case_id, label, facts)
+
+        created = product.podman.exec_bash(
+            container, backup_script(type_name), check=False,
+            timeout=BACKUP_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            created.returncode == 0,
+            f"{label} could not write a {type_name} archive into its volume: "
+            f"{(created.stderr or created.stdout or '').strip()[-400:]}",
+        )
+        archive = parse_backup_archive(created.stdout or "")
+        require(
+            case_id,
+            archive.startswith(topology.BACKUP_STORE.rstrip("/") + "/"),
+            f"{label}'s {type_name} archive is at {archive!r}, which is not inside "
+            f"the archive store {topology.BACKUP_STORE}",
+        )
+        stored = mountpoint / Path(archive).name
+        require(
+            case_id,
+            stored.is_file(),
+            f"{label}'s {type_name} archive {Path(archive).name} is not on the host "
+            f"volume at {stored}",
+        )
+        require(
+            case_id,
+            stat.S_IMODE(stored.stat().st_mode) == 0o600,
+            f"{label}'s {type_name} archive is mode "
+            f"{oct(stat.S_IMODE(stored.stat().st_mode))} instead of 0o600",
+        )
+        archive_names.append(Path(archive).name)
+        evidence["roles"][role] = {
+            "volume": name,
+            "volume_mode": "0o700",
+            "filesystem": facts.get("target_type"),
+            "root_filesystem": facts.get("root_type"),
+            "owner": facts.get("owner"),
+            "directory_mode": facts.get("mode"),
+            "archive": archive,
+            "archive_mode": "0o600",
+            "archive_on_volume": True,
+        }
+
+    leaks = artifact_leaks(artifacts, archive_names)
+    require(
+        case_id,
+        not leaks["gzip_files"],
+        f"the artifact tree holds gzip files, so an archive reached it: {leaks['gzip_files']}",
+    )
+    require(
+        case_id,
+        not leaks["archive_names"] and not leaks["archive_suffixes"],
+        f"the artifact tree holds an archive by name: {leaks['archive_names'] + leaks['archive_suffixes']}",
+    )
+    require(
+        case_id,
+        not leaks["secret_markers"],
+        "the artifact tree holds a line a probe would only write by printing a "
+        f"protected value: {leaks['secret_markers']}",
+    )
+    evidence["artifacts"] = leaks
+    evidence["cleanup"] = {"labelled_volumes": sorted(owned)}
+    return evidence
+
+
 def backup_probe_script(archive: str) -> str:
     """Read an archive back without printing a single value it protects."""
     return (
@@ -5425,12 +5658,12 @@ def node_env_probe_script() -> str:
     )
 
 
-def parse_node_env_probe(output: str) -> Dict[str, str]:
-    """The key=value fields the Worker probe prints, refused when they are malformed.
+def parse_key_value_fields(output: str) -> Dict[str, str]:
+    """The key=value fields a role-side probe prints, however it lays them out.
 
-    The probe prints all three fields on one line, so the report is read as a
-    token stream rather than line by line; a token without a value carries no
-    fact and is dropped.
+    Role probes print their facts as ``key=value`` tokens, either one per line or
+    all on one line, so the report is read as a token stream; a token without a
+    value carries no fact and is dropped.
     """
     values: Dict[str, str] = {}
     for token in (output or "").split():
@@ -5438,6 +5671,10 @@ def parse_node_env_probe(output: str) -> Dict[str, str]:
         if separator:
             values[key.strip()] = value.strip()
     return values
+
+
+def parse_node_env_probe(output: str) -> Dict[str, str]:
+    return parse_key_value_fields(output)
 
 
 def require_node_env(
@@ -6645,6 +6882,10 @@ def cases(
         # lineages they carry are install-time state of exactly those roles.
         Case(BACKUP_CASE_ID, "multi-node", lambda context: case_backup_types(product),
              timeout_seconds=BACKUP_TIMEOUT_SECONDS),
+        # The volume case writes one archive per role into the store, so it runs
+        # immediately after the archive contracts and while both roles are whole.
+        Case(BACKUP_VOLUME_CASE_ID, "multi-node", lambda context: case_backup_volume(product),
+             timeout_seconds=BACKUP_VOLUME_TIMEOUT_SECONDS),
         # The restore runs beside the backup it depends on being possible, and
         # before the lifecycle cases: it puts the cluster back the way the
         # operator built it instead of reading what a fault left behind.

@@ -159,6 +159,9 @@ DNS_PROBE_TIMEOUT_SECONDS = 60
 # the artifact directory.
 PAYLOAD_MOUNT = "/payloads"
 SECRETS_MOUNT = "/secrets"
+# Where the product keeps its unencrypted archives: a run-owned volume, removed
+# by the same label the rest of the run's resources are removed by.
+BACKUP_STORE = "/var/backups/gowave"
 
 INSTALL_TIMEOUT_SECONDS = 5400
 
@@ -364,6 +367,22 @@ class AioTopology:
     # IPv6 case turns it on for the role it has to prove.
     ipv6_host: bool = False
     ipv6_address: str = field(default="", init=False)
+    # The name the installed host's archive volume is recorded under.
+    target_role: str = "aio"
+    # The role's archive volume: the archives carry install-time secrets, so they
+    # are kept on a run-owned volume the cleanup removes by its own label rather
+    # than in the container layer or anywhere an artifact could reach them.
+    backup_volumes: Dict[str, Dict[str, str]] = field(default_factory=dict)
+
+    def _backup_volume(self, role: str) -> str:
+        name = self.context.resource_name(f"backups-{role}")
+        self.podman.volume_create(name)
+        mountpoint = self.podman.volume_mountpoint(name)
+        # Podman leaves a fresh volume world-readable; the archives are not
+        # encrypted, so the volume itself is closed to everyone but root.
+        os.chmod(mountpoint, 0o700)
+        self.backup_volumes[role] = {"name": name, "mountpoint": str(mountpoint)}
+        return name
 
     def __post_init__(self) -> None:
         target_image.distribution(self.distribution)
@@ -530,6 +549,9 @@ class AioTopology:
                 # The subscription routes are loopback-only, so the payloads are
                 # fetched on the host and handed to the engine client from here.
                 f"{self.payload_dir}:{PAYLOAD_MOUNT}:Z",
+                # The product writes its archives here; a run-owned volume keeps
+                # them out of the container layer and out of every artifact.
+                f"{self._backup_volume(self.target_role)}:{BACKUP_STORE}:Z",
             ),
             environment=self.install_environment(),
             systemd="always",
@@ -1096,6 +1118,7 @@ class MultiNodeTopology(AioTopology):
     # declared here rather than inherited from whatever the container runtime
     # happens to enable.
     ipv6_host: bool = True
+    target_role: str = "master"
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -1259,6 +1282,9 @@ class MultiNodeTopology(AioTopology):
             network=self.network,
             aliases=(self.worker_domain,),
             privileged=True,
+            # The Worker's archives are as secret-bearing as the Master's, so they
+            # get their own run-owned volume and the same closed directory.
+            volumes=(f"{self._backup_volume('worker')}:{BACKUP_STORE}:Z",),
             # The Worker installs its own packages and manages its own units, so
             # it needs the same egress resolver path the Master has.
             environment={"DEBIAN_FRONTEND": "noninteractive"},

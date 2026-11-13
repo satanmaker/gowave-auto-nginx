@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 76
-  total: 201
+  podman_first: 77
+  total: 202
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3677,6 +3677,26 @@ cases:
     certificate lineage and run state with every declared checksum present and no binary, while the Worker
     archive carries exactly its environment file, and the product''s own validator accepts both.'
   assertion_sha256: 9dee0ceb150d7c34c5d99078f1c28a18f077a7ec8481ce4f8f1e8dafee735545
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Signal-Safe and Verifiable Transaction Compensation
+- id: MN-BACKUP-VOL
+  requirement: Backup and Restore Format v1
+  live_scenario: null
+  assertion: Both unencrypted archives are written into a /var/backups/gowave that is a run-owned Podman
+    volume of its own — a filesystem distinct from the container's root, owned by root at mode 0700 with
+    exactly one mount entry and carrying the run's cleanup label — each role's archive lands on that volume
+    at mode 0600, and the run's artifact tree holds no gzip stream, no file named or suffixed as an archive,
+    and no line carrying a private key or secret-bearing variable, so the volume's removal by label during
+    cleanup leaves nothing behind.
+  assertion_sha256: 45b6c1c7e8101b8ccb36fe14a9d399cf280c066ba1a080b21531ed66be4640db
   runs_in:
   - podman
   state: incubating

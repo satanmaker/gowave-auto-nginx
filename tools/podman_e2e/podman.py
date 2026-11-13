@@ -182,6 +182,17 @@ class Podman:
         self._run(["volume", "create", *self._ownership_labels(), name])
         return name
 
+    def volume_mountpoint(self, name: str) -> Path:
+        """Where the run's own volume lives on the host, so its mode can be fixed."""
+        inspected = self._run(["volume", "inspect", "--format", "{{.Mountpoint}}", name])
+        return Path((inspected.stdout or "").strip())
+
+    def labelled_volumes(self) -> List[str]:
+        """The volumes this run owns; the same label the cleanup removes them by."""
+        label = f"gowave.e2e.run={self.context.run_id}"
+        listed = self._run(["volume", "ls", "-q", "--filter", f"label={label}"], check=False)
+        return [line.strip() for line in (listed.stdout or "").splitlines() if line.strip()]
+
     def ensure_image(self, alias: str) -> str:
         """Pull an alias at its locked digest and return the immutable reference."""
         if alias in self._built_images:
