@@ -1988,6 +1988,15 @@ _DECOY_ROUTE_MASTER_MAP = (
     "map $ssl_preread_server_name $sni_backend {",
     "    panel.testbed.internal 127.0.0.1:7443;",
     "    reality.testbed.internal 127.0.0.1:8443;",
+    "    testbed.internal 127.0.0.1:9443;",
+    "    www.testbed.internal 127.0.0.1:9443;",
+    "    default 127.0.0.1:8443;",
+    "}",
+)
+_DECOY_ROUTE_VISION_MAP = (
+    "map $ssl_preread_server_name $sni_backend {",
+    "    panel.testbed.internal 127.0.0.1:7443;",
+    "    reality.testbed.internal 127.0.0.1:8443;",
     "    vision.testbed.internal 127.0.0.1:8444;",
     "    testbed.internal 127.0.0.1:9443;",
     "    www.testbed.internal 127.0.0.1:9443;",
@@ -2036,6 +2045,15 @@ def _decoy_decision_output(domain, apex, reason=""):
     return f"decision\t{domain}\t{apex}\t{reason}\n"
 
 
+def _shell_attempts(script):
+    """The attempts the shell probe was handed, as the case built them."""
+    body = script.split("<<'PATHS'\n", 1)[1].split("\nPATHS\n", 1)[0]
+    rows = [row.split("\t") for row in body.splitlines() if row]
+    return [
+        {"label": row[0], "address": row[1], "port": int(row[2])} for row in rows
+    ]
+
+
 class _DecoyRoutePodman:
     """Both roles' own scripts, plus the client's TCP attempts."""
 
@@ -2063,6 +2081,8 @@ class _DecoyRoutePodman:
         self.attempts = []
 
     def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        if container in self.CLIENT:
+            return self._attempt(container, script)
         role = self.ROLES[container]
         if "ssl_preread" in script:
             self.scripts.setdefault(role, {})["route"] = script
@@ -2073,30 +2093,33 @@ class _DecoyRoutePodman:
         self.scripts.setdefault(role, {})["site"] = script
         return subprocess.CompletedProcess(["bash", "-lc"], 0, self.site_output, "")
 
-    def exec(self, container, argv, check=True, input_text=None, timeout=120):
-        attempts = json.loads(argv[-1])
+    def _attempt(self, container, script):
+        attempts = _shell_attempts(script)
         self.attempts.append((self.CLIENT[container], attempts))
-        entries = []
+        lines = []
         for attempt in attempts:
             outcome = self.outcomes.get(
                 attempt["label"],
                 "CONNECTED" if attempt["port"] == 443 else "REFUSED",
             )
-            entries.append({
-                "label": attempt["label"],
-                "address": attempt["address"],
-                "port": attempt["port"],
-                "outcome": outcome,
-                "elapsed_ms": 1,
-                "detail": "",
-            })
-        return subprocess.CompletedProcess(argv, 0, json.dumps(entries), "")
+            lines.append("\t".join([
+                "path", attempt["label"], attempt["address"], str(attempt["port"]),
+                outcome, "1", "",
+            ]))
+        return subprocess.CompletedProcess(["bash", "-lc"], 0,
+                                           "\n".join(lines) + "\n", "")
+
+    def exec(self, container, argv, check=True, input_text=None, timeout=120):
+        raise AssertionError(f"unexpected python probe in {container}: {argv}")
 
 
 class _DecoyRouteHost:
     """The client role and the two hosts' addresses, as the case reads them."""
 
     target_name = "aio-master"
+    panel_domain = topology.PANEL_DOMAIN
+    reality_domain = topology.REALITY_DOMAIN
+    vision_domain = None
     worker_name = "worker-01"
     worker_domain = "worker.testbed.internal"
     worker_reality_domain = "worker-reality.testbed.internal"
@@ -2253,6 +2276,34 @@ class TestDecoyRouteCase(unittest.TestCase):
                 "worker": _decoy_route_output(_DECOY_ROUTE_WORKER_MAP,
                                               lineages=_DECOY_ROUTE_WORKER_LINEAGES),
             }))
+        self.assertIn("does not keep its own route", str(caught.exception))
+
+    def test_a_run_without_vision_does_not_demand_a_vision_route(self):
+        # A default run installs no Vision inbound, so its map carries no Vision
+        # name; demanding one would fail a healthy host.
+        evidence = self.run_case()
+        self.assertNotIn("vision.testbed.internal",
+                         evidence["roles"]["master"]["routes"])
+        self.assertEqual(evidence["roles"]["master"]["routes"]["default"], "127.0.0.1:8443")
+
+    def test_a_run_with_vision_routes_the_vision_name(self):
+        host = _DecoyRouteHost()
+        host.vision_domain = "vision.testbed.internal"
+        podman = _DecoyRoutePodman(routes={
+            "master": _decoy_route_output(_DECOY_ROUTE_VISION_MAP),
+            "worker": _decoy_route_output(_DECOY_ROUTE_WORKER_MAP,
+                                          lineages=_DECOY_ROUTE_WORKER_LINEAGES),
+        })
+        evidence = self.run_case(podman=podman, host=host)
+        self.assertEqual(evidence["roles"]["master"]["routes"]["vision.testbed.internal"],
+                         "127.0.0.1:8444")
+
+    def test_a_run_with_vision_must_route_the_vision_name(self):
+        host = _DecoyRouteHost()
+        host.vision_domain = "vision.testbed.internal"
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("vision.testbed.internal", str(caught.exception))
         self.assertIn("does not keep its own route", str(caught.exception))
 
     def test_a_decoy_bound_beyond_the_loopback_is_rejected(self):

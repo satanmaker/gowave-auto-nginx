@@ -4503,7 +4503,7 @@ def require_decoy_routes(case_id: str, label: str, facts: Dict[str, Any],
             case_id,
             routes.get(name) == expected,
             f"{label} routes {name} to {routes.get(name)!r} instead of {expected}, so that "
-            "name does not keep its own route",
+            f"name does not keep its own route (observed: {sorted(routes.items())})",
         )
     return dict(routes)
 
@@ -4572,7 +4572,7 @@ def decoy_route_paths(case_id: str, podman: Any, container: str, origin: str,
             "port": 443,
             "timeout": DECOY_ROUTE_PATH_TIMEOUT_SECONDS,
         })
-    observed = denial.tcp_paths(podman, container, attempts)
+    observed = denial.tcp_paths_shell(podman, container, attempts)
     require(
         case_id,
         observed.get("returncode") == 0,
@@ -4617,8 +4617,8 @@ def case_decoy_route(product: MultiNodeProduct) -> Dict[str, Any]:
     host = product.require_worker()
     apex = topology.COVER_APEX
     roles = (
-        ("master", "the Master", host.target_name, topology.PANEL_DOMAIN,
-         topology.REALITY_DOMAIN, topology.VISION_DOMAIN,
+        ("master", "the Master", host.target_name, host.panel_domain,
+         host.reality_domain, getattr(host, "vision_domain", "") or "",
          "/etc/nginx/conf.d/gowave-decoy.conf", host.plan.target_ip),
         ("worker", "the Worker", host.worker_name, host.worker_domain,
          host.worker_reality_domain, host.worker_vision_domain,
@@ -4689,14 +4689,14 @@ def case_decoy_route(product: MultiNodeProduct) -> Dict[str, Any]:
         "apex": require_decoy_page(case_id, host, apex, index_sha256, wanted),
         "www": require_decoy_page(case_id, host, f"www.{apex}", index_sha256, wanted),
         "reality": require_decoy_page(
-            case_id, host, topology.REALITY_DOMAIN, index_sha256, wanted,
+            case_id, host, host.reality_domain, index_sha256, wanted,
         ),
     }
-    panel = cover_site_fetch(case_id, host, topology.PANEL_DOMAIN, "/")
+    panel = cover_site_fetch(case_id, host, host.panel_domain, "/")
     require(
         case_id,
         panel.get("body_sha256") != index_sha256,
-        f"https://{topology.PANEL_DOMAIN}/ served the camouflage page, so the panel name "
+        f"https://{host.panel_domain}/ served the camouflage page, so the panel name "
         "does not keep its own route",
     )
     evidence["client"]["panel"] = {

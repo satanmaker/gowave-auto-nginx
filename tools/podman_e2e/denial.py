@@ -940,3 +940,88 @@ def host_firewall(
     facts["returncode"] = result.returncode
     facts["detail"] = (result.stderr or "").strip()[-400:]
     return facts
+
+
+# The untrusted vantage is a clean image with a shell and no Python, so a probe
+# that has to run from *there* cannot be a Python program. Bash's own /dev/tcp
+# redirection is already this suite's reachability primitive, and the outcome is
+# still a real connection attempt: the labels travel with the attempt, so the
+# report can never be read against the wrong path.
+_TCP_PATHS_SHELL = r"""set -u
+while IFS=$'\t' read -r label address port limit; do
+    [ -n "${label:-}" ] || continue
+    started=$(date +%s%N)
+    err=$(timeout "$limit" bash -c "exec 3<>/dev/tcp/$address/$port" 2>&1)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        outcome=CONNECTED
+    elif [ "$rc" -eq 124 ]; then
+        outcome=TIMEOUT
+    else
+        case "$err" in
+            *refused*) outcome=REFUSED ;;
+            *"route to host"*|*"Network is unreachable"*) outcome=UNREACHABLE ;;
+            *) outcome=UNREACHABLE ;;
+        esac
+    fi
+    elapsed=$(( ($(date +%s%N) - started) / 1000000 ))
+    printf 'path\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$label" "$address" "$port" "$outcome" "$elapsed" "$err"
+done <<'PATHS'
+__ATTEMPTS__
+PATHS
+"""
+
+
+def tcp_paths_shell_script(attempts: Sequence[Dict[str, Any]]) -> str:
+    """The shell probe's source, with each attempt on its own line.
+
+    Every value is one the caller built (a label, an address, a port and a
+    timeout), so the attempts are written as data rather than re-quoted by a
+    shell; a value carrying a tab or a newline would corrupt the report, so it
+    is refused here instead.
+    """
+    rows = []
+    for attempt in attempts:
+        values = [
+            str(attempt["label"]), str(attempt["address"]), str(attempt["port"]),
+            str(attempt.get("timeout") or PROBE_TIMEOUT_SECONDS),
+        ]
+        if any("\t" in value or "\n" in value for value in values):
+            raise ValueError(f"TCP attempt carries a separator: {values!r}")
+        rows.append("\t".join(values))
+    return _TCP_PATHS_SHELL.replace("__ATTEMPTS__", "\n".join(rows))
+
+
+def parse_shell_tcp_paths(output: str) -> Dict[str, Dict[str, Any]]:
+    """Each shell attempt's outcome, keyed by the label it carried."""
+    observed: Dict[str, Dict[str, Any]] = {}
+    for line in (output or "").splitlines():
+        fields = line.split("\t")
+        if len(fields) < 7 or fields[0] != "path":
+            continue
+        label, address, port, outcome, elapsed, detail = fields[1:7]
+        observed[label] = {
+            "address": address,
+            "port": int(port) if port.isdigit() else port,
+            "outcome": outcome,
+            "elapsed_ms": int(elapsed) if elapsed.isdigit() else None,
+            "banner": None,
+            "detail": detail.strip(),
+        }
+    return observed
+
+
+def tcp_paths_shell(
+    podman: Any, container: str, attempts: Sequence[Dict[str, Any]],
+    timeout: int = PROBE_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Attempt every path from one origin with nothing but the image's own shell."""
+    prepared = [dict(attempt) for attempt in attempts]
+    result = podman.exec_bash(
+        container, tcp_paths_shell_script(prepared), check=False, timeout=timeout,
+    )
+    observed = parse_shell_tcp_paths(result.stdout or "")
+    observed["returncode"] = result.returncode
+    observed["detail"] = (result.stderr or "").strip()[-600:]
+    return observed
