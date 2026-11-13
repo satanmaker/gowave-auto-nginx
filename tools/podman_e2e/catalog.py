@@ -254,6 +254,27 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Backup and Restore Format v1",
     },
     {
+        "id": "AIO-FAULT-PANEL",
+        "requirement": "Failure injection and recovery",
+        "assertion": "With gowave.service stopped, NGINX keeps answering on 443 for the Panel's own name and its routes return the gateway error rather than a Panel or subscription response, the data plane the node already configured still carries a payload through every served outbound, no operator-owned file or database row moves while the unit is down, and starting it again restores the health route and serves the same client inventory and byte-identical representations.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "AIO-FAULT-XRAY",
+        "requirement": "Failure injection and recovery",
+        "assertion": "Killing the core the node runs with SIGKILL is answered by gowave-node itself: a replacement core appears inside gowave-node.service's own cgroup within the deadline, the node's MainPID, ActiveEnterTimestamp and restart counter are unchanged, no unit of its own supervises a core, the operator-owned tree is untouched, and every served outbound carries a payload again afterwards.",
+        "topology": ["aio"],
+        "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
+    },
+    {
+        "id": "AIO-FAULT-LATENCY",
+        "requirement": "Failure injection and recovery",
+        "assertion": "Adding a netem delay to every interface of the installed host degrades but does not break it: the Control Machine's own request time rises by at least the injected delay while the Panel still answers 200 and every served outbound still carries a payload, removing the delay returns the request time to its baseline, and the operator-owned files, database integrity and units are unchanged throughout.",
+        "topology": ["aio"],
+        "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
+    },
+    {
         "id": "NGX-05",
         "requirement": "NGINX SNI Routing and REALITY Decoy Verification",
         "assertion": "On every role the product installs, the generated NGINX tree passes `nginx -t`, its dump carries that role's own server name and its ssl_preread SNI routing, the product's managed ACME deploy hook does not reload NGINX when an invalid snippet makes `nginx -t` fail — leaving the master, its workers and the 443 listener untouched — and the same hook does reload it, without replacing the master, once the snippet is removed.",
