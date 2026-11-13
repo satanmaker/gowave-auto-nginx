@@ -18,8 +18,10 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import unittest
 import unittest.mock
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -27,7 +29,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TESTS_DIR))
 
-from tools.podman_e2e import aio, matrix, mtls, multi_node, topology  # noqa: E402
+from tools.podman_e2e import aio, matrix, mtls, multi_node, panel_surface, topology  # noqa: E402
 from tools.podman_e2e.runner import Case, CaseBlocked  # noqa: E402
 from test_podman_aio import BROKEN_TAIL, nginx_probe  # noqa: E402
 
@@ -4992,6 +4994,646 @@ class TestBackupArchiveParsing(unittest.TestCase):
             "Panel backup created successfully: gowave-backup-panel-1.tar.gz"), "")
         self.assertEqual(multi_node.parse_backup_archive("Done.\n"), "")
         self.assertEqual(multi_node.parse_backup_archive(""), "")
+
+
+_RESTORE_REPRESENTATIONS = ("base64", "xray-json", "mihomo", "clash", "singbox")
+_RESTORE_SUFFIXES = {
+    "": "base64",
+    "/v2ray-json": "xray-json",
+    "/mihomo": "mihomo",
+    "/clash": "clash",
+    "/singbox": "singbox",
+}
+
+
+class _RestorePanelStub:
+    """A Panel with a client list, a representation per client, and a delete verb.
+
+    The served body is a function of the client row, so handing the same row back
+    is what makes the bytes reappear — which is exactly what the restore has to
+    reproduce, and what a rotated row must fail to reproduce.
+    """
+
+    def __init__(self):
+        self.users = {}
+        self.next_id = 100
+        self.salt = "captured"
+        self.password = "restore-password-do-not-print"
+        self.token = "restore-token-do-not-print"
+
+    def add(self, user_id=7, username="podman-e2e-restore-aaaa",
+            short_uuid="11111111-2222-3333-4444-555555555555"):
+        self.users[str(user_id)] = {
+            "id": user_id, "username": username, "shortUuid": short_uuid,
+            "status": "ACTIVE",
+        }
+        return self.users[str(user_id)]
+
+    def by_short_uuid(self, short_uuid):
+        return next((user for user in self.users.values()
+                     if user["shortUuid"] == short_uuid), None)
+
+    def body(self, name, user):
+        return f"{name} {user['shortUuid']} {user['username']} {self.salt}".encode()
+
+
+class TestRestoreScope(unittest.TestCase):
+    """The probe's restore steps, driven through the HTTP the Panel really serves."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.payloads = Path(self.tmp.name) / "payloads"
+        self.payloads.mkdir(mode=0o700)
+        self.stub = _RestorePanelStub()
+        self.credentials = Path(self.tmp.name) / "credentials"
+        self.credentials.write_text(
+            f"ADMIN_USERNAME=admin\nADMIN_PASSWORD={self.stub.password}\n", encoding="utf-8"
+        )
+        self.credentials.chmod(0o600)
+        self.server = self._serve()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.port = self.server.server_address[1]
+
+    def _serve(self):
+        stub = self.stub
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _authorised(self):
+                return self.headers.get("Authorization") == f"Bearer {stub.token}"
+
+            def _send(self, status, body=None, raw=None,
+                      content_type="application/json; charset=utf-8"):
+                self.send_response(status)
+                payload_bytes = raw if raw is not None else (
+                    json.dumps(body).encode() if body is not None else b"")
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload_bytes)))
+                self.end_headers()
+                self.wfile.write(payload_bytes)
+
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                # The subscription routes are what a client dials, so the Panel
+                # serves them without a bearer token.
+                if path.startswith("/api/sub/"):
+                    remainder = path[len("/api/sub/"):]
+                    short_uuid, _, suffix = remainder.partition("/")
+                    name = _RESTORE_SUFFIXES.get(f"/{suffix}" if suffix else "")
+                    user = stub.by_short_uuid(short_uuid)
+                    if name is None or user is None:
+                        return self._send(404, {"message": "Subscription not found"})
+                    return self._send(200, raw=stub.body(name, user),
+                                      content_type="text/plain; charset=utf-8")
+                if not self._authorised():
+                    return self._send(401, {"error": "Unauthorized"})
+                if path == "/api/users":
+                    users = list(stub.users.values())
+                    return self._send(200, {"response": {"users": users,
+                                                         "total": len(users)}})
+                if path.startswith("/api/users/"):
+                    user = stub.users.get(path.rsplit("/", 1)[-1])
+                    if user is None:
+                        return self._send(404, {"message": "User not found"})
+                    return self._send(200, {"response": user})
+                if path == "/api/internal-squads":
+                    return self._send(200, {"response": {"internalSquads": [
+                        {"uuid": "squad-uuid", "name": "Default MVP Squad"},
+                    ]}})
+                return self._send(404, {"message": "not found"})
+
+            def do_POST(self):
+                if self.path == "/api/auth/login":
+                    body = json.loads(self.rfile.read(
+                        int(self.headers.get("Content-Length") or 0)) or b"{}")
+                    if body.get("password") != stub.password:
+                        return self._send(401, {"error": "Unauthorized"})
+                    return self._send(200, {"response": {"accessToken": stub.token}})
+                if self.path == "/api/users" and self._authorised():
+                    body = json.loads(self.rfile.read(
+                        int(self.headers.get("Content-Length") or 0)) or b"{}")
+                    stub.next_id += 1
+                    user = stub.add(
+                        user_id=stub.next_id,
+                        username=str(body.get("username") or "unnamed"),
+                        short_uuid=f"{stub.next_id:08d}-0000-4000-8000-000000000000",
+                    )
+                    return self._send(201, {"response": user})
+                return self._send(404, {"message": "not found"})
+
+            def do_DELETE(self):
+                if not self._authorised():
+                    return self._send(401, {"error": "Unauthorized"})
+                path = self.path.split("?", 1)[0]
+                user = stub.users.pop(path.rsplit("/", 1)[-1], None)
+                if user is None:
+                    return self._send(404, {"message": "User not found"})
+                return self._send(204)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server
+
+    def _run(self, step, *extra):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = panel_surface.main([
+                "--scope", "restore",
+                "--step", step,
+                "--panel-url", f"http://127.0.0.1:{self.port}",
+                "--credentials", str(self.credentials),
+                "--payload-dir", str(self.payloads),
+                *extra,
+            ])
+        self.assertEqual(code, 0)
+        output = stdout.getvalue()
+        self.assertNotIn(self.stub.password, output)
+        self.assertNotIn(self.stub.token, output)
+        return json.loads(output)["restore"]
+
+    def _state(self):
+        return self.payloads / "backup-restore" / "state.json"
+
+    def test_capture_records_the_inventory_and_every_served_representation(self):
+        facts = self._run("capture")
+
+        self.assertEqual(facts["users_in_archive"], 1)
+        self.assertEqual(facts["create_status"], 201)
+        self.assertGreater(facts["created_short_uuid_length"], 0)
+        self.assertIs(facts["readback_username_matches"], True)
+        self.assertEqual(sorted(facts["representations"]), sorted(_RESTORE_REPRESENTATIONS))
+        self.assertTrue(all(entry["status"] == 200
+                            for entry in facts["representations"].values()))
+
+        state = json.loads(self._state().read_text(encoding="utf-8"))
+        self.assertEqual(os.stat(self._state()).st_mode & 0o777, 0o600)
+        self.assertTrue(state["username"].startswith("podman-e2e-restore-"))
+        self.assertEqual(state["users_in_archive"], 1)
+        self.assertEqual(sorted(state["representations"]), sorted(_RESTORE_REPRESENTATIONS))
+        self.assertTrue(all(len(entry["sha256"]) == 64
+                            for entry in state["representations"].values()))
+        for name in _RESTORE_REPRESENTATIONS:
+            payload = self.payloads / "backup-restore" / f"{name}.payload"
+            self.assertTrue(payload.is_file(), name)
+            self.assertEqual(os.stat(payload).st_mode & 0o777, 0o600, name)
+
+    def test_mutate_deletes_the_captured_client_and_its_route(self):
+        self._run("capture")
+        facts = self._run("mutate")
+
+        self.assertEqual(facts["delete_status"], 204)
+        self.assertEqual(facts["after_delete_readback_status"], 404)
+        self.assertIs(facts["user_present_after_delete"], False)
+        self.assertEqual(facts["users_after_delete"], 0)
+        self.assertNotEqual(facts["subscription_after_delete_status"], 200)
+
+    def test_verify_accepts_only_the_client_and_the_bytes_the_archive_brought_back(self):
+        captured = self._run("capture")
+        self._run("mutate")
+        state = json.loads(self._state().read_text(encoding="utf-8"))
+        self.stub.add(user_id=state["user_id"], username=state["username"],
+                      short_uuid=state["short_uuid"])
+
+        facts = self._run("verify")
+
+        self.assertEqual(facts["readback_status"], 200)
+        self.assertIs(facts["username_restored"], True)
+        self.assertIs(facts["short_uuid_restored"], True)
+        self.assertIs(facts["inventory_restored"], True)
+        self.assertEqual(facts["users_restored"], captured["users_in_archive"])
+        self.assertEqual(sorted(facts["representations_identical"]),
+                         sorted(_RESTORE_REPRESENTATIONS))
+        self.assertTrue(all(facts["representations_identical"].values()))
+
+    def test_verify_reports_a_client_that_did_not_come_back(self):
+        self._run("capture")
+        self._run("mutate")
+
+        facts = self._run("verify")
+
+        self.assertEqual(facts["readback_status"], 404)
+        self.assertIs(facts["username_restored"], False)
+        self.assertIs(facts["short_uuid_restored"], False)
+        self.assertIs(facts["inventory_restored"], False)
+        self.assertFalse(any(facts["representations_identical"].values()))
+
+    def test_verify_reports_a_client_served_different_bytes(self):
+        self._run("capture")
+        self._run("mutate")
+        state = json.loads(self._state().read_text(encoding="utf-8"))
+        self.stub.add(user_id=state["user_id"], username=state["username"],
+                      short_uuid=state["short_uuid"])
+        self.stub.salt = "restored-from-another-archive"
+
+        facts = self._run("verify")
+
+        self.assertEqual(facts["readback_status"], 200)
+        self.assertIs(facts["username_restored"], True)
+        self.assertEqual(sorted(facts["representations_identical"]),
+                         sorted(_RESTORE_REPRESENTATIONS))
+        self.assertFalse(any(facts["representations_identical"].values()))
+
+    def test_a_step_without_the_capture_state_names_the_step_to_run_first(self):
+        with self.assertRaises(SystemExit) as caught:
+            self._run("mutate")
+        self.assertIn("--step capture", str(caught.exception))
+
+    def test_the_scope_refuses_to_run_without_a_payload_directory(self):
+        with self.assertRaises(SystemExit) as caught:
+            panel_surface.main([
+                "--scope", "restore", "--step", "capture",
+                "--panel-url", f"http://127.0.0.1:{self.port}",
+                "--credentials", str(self.credentials),
+            ])
+        self.assertIn("needs --payload-dir", str(caught.exception))
+
+    def test_a_state_file_without_a_client_id_is_refused(self):
+        self._run("capture")
+        self._state().write_text(json.dumps({"username": "orphan"}), encoding="utf-8")
+        with self.assertRaises(SystemExit) as caught:
+            panel_surface.read_state(self._state(), "capture")
+        self.assertIn("holds no client id", str(caught.exception))
+
+
+_RESTORE_PANEL_ARCHIVE = "/var/backups/gowave/gowave-backup-panel-1763078500.tar.gz"
+_RESTORE_NODE_ARCHIVE = "/var/backups/gowave/gowave-backup-node-1763078501.tar.gz"
+
+
+def _restore_served(status=200, served=48):
+    return {name: {"status": status, "bytes": served} for name in _RESTORE_REPRESENTATIONS}
+
+
+def _restore_capture_facts(**overrides):
+    facts = {
+        "users_in_archive": 3,
+        "create_status": 201,
+        "created_short_uuid_length": 36,
+        "readback_status": 200,
+        "readback_username_matches": True,
+        "representations": _restore_served(),
+    }
+    facts.update(overrides)
+    return facts
+
+
+def _restore_mutate_facts(**overrides):
+    facts = {
+        "delete_status": 204,
+        "after_delete_readback_status": 404,
+        "users_after_delete": 3,
+        "user_present_after_delete": False,
+        "subscription_after_delete_status": 404,
+    }
+    facts.update(overrides)
+    return facts
+
+
+def _restore_verify_facts(**overrides):
+    facts = {
+        "readback_status": 200,
+        "username_restored": True,
+        "short_uuid_restored": True,
+        "users_restored": 4,
+        "user_present_after_restore": True,
+        "inventory_restored": True,
+        "representations": _restore_served(),
+        "representations_identical": {name: True for name in _RESTORE_REPRESENTATIONS},
+    }
+    facts.update(overrides)
+    return facts
+
+
+class _RestorePodman:
+    """Both roles' backups and restores, the Panel steps, and a Worker environment.
+
+    The Worker's environment file is modelled rather than scripted: the marker
+    append changes its digest, and a successful node restore puts the captured
+    bytes back, so a case that never restarted the Worker cannot pass.
+    """
+
+    ENV_DIGEST = "a" * 64
+    MARKED_DIGEST = "e" * 64
+    SUCCESS = "Restore completed and verified successfully.\n"
+
+    def __init__(self, capture=None, mutate=None, verify=None,
+                 backup_returncode=None, restore_returncode=None, restore_stdout=None,
+                 silent_archives=False, marker_returncode=0, marker_changes=True,
+                 env_digest_restored=True, env_marker_cleared=True, unit="active"):
+        self.capture = _restore_capture_facts() if capture is None else capture
+        self.mutate = _restore_mutate_facts() if mutate is None else mutate
+        self.verify = _restore_verify_facts() if verify is None else verify
+        self.backup_returncode = backup_returncode or {}
+        self.restore_returncode = restore_returncode or {}
+        self.restore_stdout = restore_stdout or {}
+        self.silent_archives = silent_archives
+        self.marker_returncode = marker_returncode
+        self.marker_changes = marker_changes
+        self.env_digest_restored = env_digest_restored
+        self.env_marker_cleared = env_marker_cleared
+        self.unit = unit
+        self.scripts = []
+        self.env_digest = self.ENV_DIGEST
+        self.env_sentinel = "0"
+        self.captured_digest = self.ENV_DIGEST
+
+    @staticmethod
+    def archive_path(type_name):
+        return _RESTORE_PANEL_ARCHIVE if type_name == "panel" else _RESTORE_NODE_ARCHIVE
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        self.scripts.append((container, script))
+        if "--scope restore" in script:
+            step = next(name for name in ("capture", "mutate", "verify")
+                        if f"--step {name}" in script)
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0,
+                json.dumps({"restore": getattr(self, step)}) + "\n", "")
+        if f"sha256sum {multi_node.RESTORE_NODE_ENV}" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0,
+                f"digest={self.env_digest} sentinel={self.env_sentinel} active={self.unit}\n", "")
+        if ">> " in script and multi_node.RESTORE_SENTINEL_KEY in script:
+            if self.marker_returncode == 0 and self.marker_changes:
+                self.env_sentinel = "1"
+                self.env_digest = self.MARKED_DIGEST
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], self.marker_returncode, "",
+                "" if self.marker_returncode == 0 else "ERROR: read-only file system\n")
+        if "gowave-auto.sh backup" in script:
+            type_name = "panel" if "--type panel" in script else "node"
+            rc = self.backup_returncode.get(type_name, 0)
+            label = "Panel" if type_name == "panel" else "Node"
+            stdout = "" if rc != 0 or self.silent_archives else (
+                f"{label} backup created successfully: {self.archive_path(type_name)} "
+                "(mode 0600).\n")
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], rc, stdout,
+                "" if rc == 0 else f"ERROR: {label} backup root is missing\n")
+        if "gowave-auto.sh restore" in script:
+            type_name = "panel" if "--type panel" in script else "node"
+            rc = self.restore_returncode.get(type_name, 0)
+            if rc == 0 and type_name == "node":
+                self.env_digest = (self.captured_digest if self.env_digest_restored
+                                   else self.MARKED_DIGEST)
+                self.env_sentinel = "0" if self.env_marker_cleared else "1"
+            stdout = self.restore_stdout.get(type_name, self.SUCCESS)
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], rc,
+                stdout if rc == 0 else "",
+                "" if rc == 0 else "ERROR: archive validation failed\n")
+        raise AssertionError(f"unexpected script in {container}: {script}")
+
+
+class _RestoreMaster:
+    def __init__(self, delivered=None):
+        self.delivered = delivered or {"base64": 1, "xray-json": 2}
+        self.tunnel_calls = []
+        self.payload_calls = []
+
+    def subscription_payloads(self, case_id):
+        self.payload_calls.append(case_id)
+        return {"representations": {}}
+
+    def wait_tunnel_ready(self, case_id, payload_dir=None):
+        self.tunnel_calls.append((case_id, payload_dir))
+        return {"delivered": dict(self.delivered)}
+
+
+class _RestoreHost:
+    target_name = "aio-master"
+    worker_name = "worker-01"
+
+
+class _RestoreProduct:
+    def __init__(self, podman, host=None, master=None):
+        self.podman = podman
+        self.host = host if host is not None else _RestoreHost()
+        self.master = master if master is not None else _RestoreMaster()
+        self.waits = []
+
+    def require_worker(self):
+        return self.host
+
+    def wait_for_nodes(self, case_id, expected):
+        self.waits.append((case_id, expected))
+        return {"count": expected, "connected_count": expected}
+
+
+class TestRestoreCase(unittest.TestCase):
+    """MN-RESTORE: the product restores what its own archive captured, on both roles."""
+
+    def run_case(self, **kwargs):
+        podman = _RestorePodman(**kwargs)
+        product = _RestoreProduct(podman)
+        return multi_node.case_backup_restore(product), podman, product
+
+    def fail(self, **kwargs):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(**kwargs)
+        return str(caught.exception)
+
+    def test_it_records_both_roles_and_the_restored_panel_state(self):
+        evidence, podman, product = self.run_case()
+
+        master = evidence["roles"]["master"]
+        self.assertEqual(master["users_in_archive"], 3)
+        self.assertEqual(master["create_status"], 201)
+        self.assertEqual(sorted(master["representations"]), sorted(_RESTORE_REPRESENTATIONS))
+        worker = evidence["roles"]["worker"]
+        self.assertEqual(worker["environment_sha256"], _RestorePodman.ENV_DIGEST)
+        self.assertIs(worker["environment_restored"], True)
+        self.assertEqual(worker["unit"], "active")
+        self.assertEqual(sorted(evidence["restore"]), ["master", "worker"])
+        self.assertEqual(evidence["restore"]["master"]["type"], "panel")
+        self.assertEqual(evidence["restore"]["master"]["archive"], _RESTORE_PANEL_ARCHIVE)
+        self.assertEqual(evidence["restore"]["worker"]["type"], "node")
+        self.assertIn("Restore completed and verified successfully.",
+                      evidence["restore"]["worker"]["tail"][-1])
+        self.assertIs(evidence["panel"]["identity_restored"], True)
+        self.assertEqual(evidence["panel"]["users_restored"], 4)
+        self.assertTrue(all(evidence["panel"]["representations_identical"].values()))
+        self.assertEqual(evidence["nodes"], {"count": 2, "connected_count": 2})
+        self.assertEqual(evidence["data_plane"], {"base64": 1, "xray-json": 2})
+        self.assertEqual(product.waits, [(multi_node.RESTORE_CASE_ID, 2)])
+        self.assertEqual(product.master.payload_calls, [multi_node.RESTORE_CASE_ID])
+        self.assertEqual(product.master.tunnel_calls, [(multi_node.RESTORE_CASE_ID, None)])
+        self.assertEqual(podman.env_sentinel, "0")
+
+    def test_it_captures_before_the_archive_and_verifies_after_the_restore(self):
+        _, podman, _ = self.run_case()
+        kinds = []
+        for _, script in podman.scripts:
+            for marker in ("--step capture", "--step mutate", "--step verify",
+                           "gowave-auto.sh backup", "gowave-auto.sh restore",
+                           ">> ", "sha256sum"):
+                if marker in script:
+                    kinds.append({
+                        "--step capture": "capture", "--step mutate": "mutate",
+                        "--step verify": "verify",
+                        "gowave-auto.sh backup": "backup",
+                        "gowave-auto.sh restore": "restore",
+                        ">> ": "mark", "sha256sum": "probe",
+                    }[marker])
+                    break
+        self.assertEqual(kinds, ["capture", "probe", "backup", "backup", "mutate",
+                                 "mark", "probe", "restore", "restore", "verify", "probe"])
+
+    def test_each_role_runs_the_archive_and_the_restore_type_it_owns(self):
+        _, podman, _ = self.run_case()
+        created = [(container, script) for container, script in podman.scripts
+                   if "gowave-auto.sh backup" in script]
+        self.assertEqual([container for container, _ in created], ["aio-master", "worker-01"])
+        self.assertIn("backup --type panel", created[0][1])
+        self.assertIn("backup --type node", created[1][1])
+        restored = [(container, script) for container, script in podman.scripts
+                    if "gowave-auto.sh restore" in script]
+        self.assertEqual([container for container, _ in restored], ["aio-master", "worker-01"])
+        self.assertIn(f"restore {_RESTORE_PANEL_ARCHIVE} --type panel", restored[0][1])
+        self.assertIn(f"restore {_RESTORE_NODE_ARCHIVE} --type node", restored[1][1])
+
+    def test_the_panel_steps_run_where_the_loopback_api_lives(self):
+        script = multi_node.restore_step_script("verify")
+        self.assertIn(aio.PANEL_SURFACE_SCRIPT, script)
+        self.assertIn("--scope restore", script)
+        self.assertIn("--step verify", script)
+        self.assertIn(f"--payload-dir {topology.PAYLOAD_MOUNT}", script)
+
+    def test_the_worker_probe_reports_a_fingerprint_rather_than_the_file(self):
+        script = multi_node.node_env_probe_script()
+        self.assertIn(f"sha256sum {multi_node.RESTORE_NODE_ENV}", script)
+        self.assertIn(f"grep -c '^{multi_node.RESTORE_SENTINEL_KEY}='", script)
+        self.assertIn("systemctl is-active gowave-node.service", script)
+        self.assertIn("printf 'digest=%s sentinel=%s active=%s", script)
+        self.assertNotIn("cat ", script)
+
+    def test_a_capture_that_did_not_create_the_client_fails_the_case(self):
+        message = self.fail(capture=_restore_capture_facts(create_status=400))
+        self.assertIn("instead of 201", message)
+
+    def test_a_capture_the_panel_did_not_read_back_fails_the_case(self):
+        message = self.fail(capture=_restore_capture_facts(readback_username_matches=False))
+        self.assertIn("did not read back the client", message)
+
+    def test_a_client_served_no_representation_fails_the_case(self):
+        message = self.fail(capture=_restore_capture_facts(
+            representations=_restore_served(status=404)))
+        self.assertIn("not served every representation", message)
+
+    def test_a_delete_that_was_not_a_success_fails_the_case(self):
+        message = self.fail(mutate=_restore_mutate_facts(delete_status=500))
+        self.assertIn("instead of 204", message)
+
+    def test_a_client_the_panel_still_lists_after_the_delete_fails_the_case(self):
+        message = self.fail(mutate=_restore_mutate_facts(user_present_after_delete=True))
+        self.assertIn("still lists the client", message)
+
+    def test_a_subscription_that_survives_the_delete_fails_the_case(self):
+        message = self.fail(mutate=_restore_mutate_facts(
+            subscription_after_delete_status=200))
+        self.assertIn("still answered 200", message)
+
+    def test_a_marker_that_could_not_be_written_fails_the_case(self):
+        message = self.fail(marker_returncode=1)
+        self.assertIn("could not mark the Worker environment", message)
+
+    def test_a_marker_that_did_not_change_the_environment_fails_the_case(self):
+        message = self.fail(marker_changes=False)
+        self.assertIn("did not change after the injected marker", message)
+
+    def test_a_backup_that_failed_fails_the_case_before_anything_is_destroyed(self):
+        message = self.fail(backup_returncode={"panel": 1})
+        self.assertIn("backup root is missing", message)
+
+    def test_a_backup_that_named_no_archive_fails_the_case(self):
+        message = self.fail(silent_archives=True)
+        self.assertIn("did not name the archive", message)
+
+    def test_a_restore_that_exited_unsuccessfully_fails_the_case(self):
+        message = self.fail(restore_returncode={"node": 1})
+        self.assertIn("archive validation failed", message)
+
+    def test_a_restore_that_did_not_report_its_own_success_fails_the_case(self):
+        message = self.fail(restore_stdout={"panel": "Restoring...\n"})
+        self.assertIn("did not report its own success", message)
+
+    def test_a_client_that_did_not_come_back_fails_the_case(self):
+        message = self.fail(verify=_restore_verify_facts(readback_status=404))
+        self.assertIn("did not come back", message)
+
+    def test_a_restored_client_with_another_identity_fails_the_case(self):
+        message = self.fail(verify=_restore_verify_facts(short_uuid_restored=False))
+        self.assertIn("rather than the captured identity", message)
+
+    def test_an_inventory_that_was_not_restored_fails_the_case(self):
+        message = self.fail(verify=_restore_verify_facts(
+            inventory_restored=False, users_restored=2))
+        self.assertIn("instead of the inventory the archive captured", message)
+
+    def test_bytes_that_differ_after_the_restore_fail_the_case(self):
+        message = self.fail(verify=_restore_verify_facts(
+            representations_identical={"base64": True, "xray-json": False,
+                                       "mihomo": True, "clash": True, "singbox": True}))
+        self.assertIn("not served the bytes it was served before", message)
+
+    def test_a_worker_environment_that_was_not_restored_fails_the_case(self):
+        message = self.fail(env_digest_restored=False)
+        self.assertIn("did not restore its credentials", message)
+
+    def test_a_worker_environment_still_carrying_the_marker_fails_the_case(self):
+        message = self.fail(env_marker_cleared=False)
+        self.assertIn("still carries the injected", message)
+
+    def test_a_worker_that_is_not_active_after_the_restore_fails_the_case(self):
+        message = self.fail(unit="failed")
+        self.assertIn("gowave-node.service is 'failed'", message)
+
+    def test_the_case_is_registered_after_the_backup_it_depends_on(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite = multi_node.cases(_StubPodman(Path(directory)))
+        ids = [case.id for case in suite]
+        case = suite[ids.index(multi_node.RESTORE_CASE_ID)]
+        self.assertEqual(case.topology, "multi-node")
+        self.assertEqual(case.timeout_seconds, multi_node.RESTORE_CASE_TIMEOUT_SECONDS)
+        self.assertLess(ids.index(multi_node.BACKUP_CASE_ID),
+                        ids.index(multi_node.RESTORE_CASE_ID))
+
+
+class TestNodeEnvProbe(unittest.TestCase):
+    """The Worker fingerprint is one line of key=value facts, and nothing else."""
+
+    def test_it_reads_the_three_fields_the_probe_prints(self):
+        facts = multi_node.parse_node_env_probe("digest=abc sentinel=0 active=active\n")
+        self.assertEqual(facts, {"digest": "abc", "sentinel": "0", "active": "active"})
+
+    def test_an_empty_or_noisy_report_is_read_field_by_field(self):
+        self.assertEqual(multi_node.parse_node_env_probe(""), {})
+        facts = multi_node.parse_node_env_probe(
+            "warning: something\n\ndigest=abc sentinel=1 active=failed\n")
+        self.assertEqual(facts, {"digest": "abc", "sentinel": "1", "active": "failed"})
+
+    def test_a_restored_environment_that_matches_is_accepted(self):
+        multi_node.require_node_env(
+            "MN-RESTORE", "after the restore",
+            {"digest": "a" * 64, "sentinel": "0", "active": "active"}, "a" * 64)
+
+    def test_a_missing_or_different_fingerprint_is_refused(self):
+        for facts, message in (
+            ({"digest": "", "sentinel": "0", "active": "active"}, "did not restore its credentials"),
+            ({"digest": "b" * 64, "sentinel": "0", "active": "active"},
+             "did not restore its credentials"),
+            ({"digest": "a" * 64, "sentinel": "1", "active": "active"},
+             "still carries the injected"),
+            ({"digest": "a" * 64, "sentinel": "0", "active": "unknown"},
+             "gowave-node.service is 'unknown'"),
+        ):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.require_node_env("MN-RESTORE", "after the restore", facts, "a" * 64)
+            self.assertIn(message, str(caught.exception))
 
 
 if __name__ == "__main__":

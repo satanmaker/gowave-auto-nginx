@@ -640,12 +640,12 @@ def write_state(path: Path, state: Dict[str, Any]) -> None:
     os.chmod(path, 0o600)
 
 
-def read_state(path: Path) -> Dict[str, Any]:
+def read_state(path: Path, hint: str = "issue") -> Dict[str, Any]:
     if not path.is_file():
-        raise SystemExit(f"the revocation state file {path} is missing: run --step issue first")
+        raise SystemExit(f"the state file {path} is missing: run --step {hint} first")
     state = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(state, dict) or not state.get("user_id"):
-        raise SystemExit(f"the revocation state file {path} holds no client id")
+        raise SystemExit(f"the state file {path} holds no client id")
     return state
 
 
@@ -768,13 +768,178 @@ def revoke_cleanup(panel: Panel, directory: Path) -> Dict[str, Any]:
     return facts
 
 
+# ------------------------------------------------------------------- restore
+RESTORE_DIRECTORY = "backup-restore"
+RESTORE_STATE_NAME = "state.json"
+
+
+def _restore_dir(payload_dir: Optional[Path]) -> Path:
+    if payload_dir is None:
+        raise SystemExit("the restore scope needs --payload-dir: the state carries a client identity")
+    directory = payload_dir / RESTORE_DIRECTORY
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return directory
+
+
+def user_inventory(users: Sequence[Dict[str, Any]]) -> str:
+    """One digest of the whole client list, so a restore is compared against it by value."""
+    return digest(
+        f"{user.get('id')}|{user.get('username')}|{user.get('shortUuid')}" for user in users
+    )
+
+
+def representation_digests(
+    panel: Panel, short_uuid: str, directory: Optional[Path] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch every representation the clients consume and digest its body.
+
+    A restore has to hand a client back exactly the payload it held, so the
+    comparison is over the served bytes rather than over a count: the digest is
+    kept, the payload is written 0600 where the probes expect it, and no value is
+    printed.
+    """
+    facts: Dict[str, Dict[str, Any]] = {}
+    for name, template, user_agent in REPRESENTATIONS:
+        response = fetch(panel.base_url, template.format(short_uuid=short_uuid), user_agent)
+        body = response["body"]
+        facts[name] = {
+            "status": response["status"],
+            "content_type": media_type(response["content_type"]),
+            "bytes": len(body),
+            "sha256": hashlib.sha256(body).hexdigest() if body else "",
+        }
+        if directory is not None and response["status"] == 200 and body:
+            write_payload(directory / f"{name}.payload", body)
+    return facts
+
+
+def restore_capture(panel: Panel, directory: Path) -> Dict[str, Any]:
+    """Create a client, capture the Panel's inventory and every representation it is served."""
+    facts: Dict[str, Any] = {}
+    status, body = panel.call("GET", "/api/internal-squads")
+    squads = [squad for squad in items(body, "internalSquads") if isinstance(squad, dict)]
+    mvp = next((squad for squad in squads if squad.get("name") == MVP_SQUAD), None)
+    squad_uuid = str((mvp or {}).get("uuid") or "")
+
+    username = f"{CLIENT_PREFIX}restore-{secrets.token_hex(4)}"
+    request: Dict[str, Any] = {
+        "username": username,
+        "status": "ACTIVE",
+        "trafficLimitStrategy": "NO_RESET",
+        "expireAt": "2099-01-01T00:00:00Z",
+    }
+    if squad_uuid:
+        request["activeInternalSquads"] = [squad_uuid]
+    status, body = panel.call("POST", "/api/users", request)
+    created = payload(body)
+    created = created if isinstance(created, dict) else {}
+    user_id = str(created.get("id") or created.get("uuid") or "")
+    short_uuid = str(created.get("shortUuid") or "")
+    facts["create_status"] = status
+    facts["created_short_uuid_length"] = len(short_uuid)
+    if not user_id or not short_uuid:
+        return facts
+
+    status, body = panel.call("GET", f"/api/users/{user_id}")
+    readback = payload(body)
+    readback = readback if isinstance(readback, dict) else {}
+    facts["readback_status"] = status
+    facts["readback_username_matches"] = readback.get("username") == username
+
+    # The inventory is the one the archive is about to capture, so it is read with
+    # the client in place: a digest taken before the client existed could never be
+    # reproduced by a restore of an archive that contains it.
+    status, body = panel.call("GET", "/api/users")
+    users = [user for user in items(body, "users") if isinstance(user, dict)]
+    inventory = user_inventory(users)
+    facts["inventory_status"] = status
+    facts["users_in_archive"] = len(users)
+
+    representations = representation_digests(panel, short_uuid, directory)
+    facts["representations"] = {
+        name: {"status": entry["status"], "bytes": entry["bytes"]}
+        for name, entry in representations.items()
+    }
+    write_state(directory / RESTORE_STATE_NAME, {
+        "user_id": user_id,
+        "username": username,
+        "short_uuid": short_uuid,
+        "squad_uuid": squad_uuid,
+        "inventory": inventory,
+        "users_in_archive": len(users),
+        "representations": representations,
+    })
+    return facts
+
+
+def restore_mutate(panel: Panel, directory: Path) -> Dict[str, Any]:
+    """Delete the captured client through the API so a restore has something to undo."""
+    state = read_state(directory / RESTORE_STATE_NAME, "capture")
+    user_id = state["user_id"]
+    facts: Dict[str, Any] = {}
+
+    status, _ = panel.call("DELETE", f"/api/users/{user_id}")
+    facts["delete_status"] = status
+    status, _ = panel.call("GET", f"/api/users/{user_id}")
+    facts["after_delete_readback_status"] = status
+
+    status, body = panel.call("GET", "/api/users")
+    users = [user for user in items(body, "users") if isinstance(user, dict)]
+    facts["users_after_delete"] = len(users)
+    facts["user_present_after_delete"] = any(
+        str(user.get("id") or "") == user_id for user in users
+    )
+
+    short_uuid = str(state.get("short_uuid") or "")
+    response = fetch(panel.base_url, f"/api/sub/{short_uuid}", MOBILE_USER_AGENT)
+    facts["subscription_after_delete_status"] = response["status"]
+    return facts
+
+
+def restore_verify(panel: Panel, directory: Path) -> Dict[str, Any]:
+    """After the restore, the client and the bytes it was served have to be back."""
+    state = read_state(directory / RESTORE_STATE_NAME, "capture")
+    user_id = state["user_id"]
+    facts: Dict[str, Any] = {}
+
+    status, body = panel.call("GET", f"/api/users/{user_id}")
+    user = payload(body)
+    user = user if isinstance(user, dict) else {}
+    facts["readback_status"] = status
+    facts["username_restored"] = user.get("username") == state["username"]
+    facts["short_uuid_restored"] = str(user.get("shortUuid") or "") == str(state["short_uuid"])
+
+    status, body = panel.call("GET", "/api/users")
+    users = [user for user in items(body, "users") if isinstance(user, dict)]
+    facts["users_restored"] = len(users)
+    facts["inventory_restored"] = user_inventory(users) == state.get("inventory")
+    facts["user_present_after_restore"] = any(
+        str(user.get("id") or "") == user_id for user in users
+    )
+
+    short_uuid = str(state.get("short_uuid") or "")
+    captured = state.get("representations") or {}
+    representations = representation_digests(panel, short_uuid, None)
+    facts["representations"] = {
+        name: {"status": entry["status"], "bytes": entry["bytes"]}
+        for name, entry in representations.items()
+    }
+    facts["representations_identical"] = {
+        name: bool(captured.get(name))
+        and entry["status"] == captured[name]["status"]
+        and entry["sha256"] == captured[name]["sha256"]
+        for name, entry in representations.items()
+    }
+    return facts
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Collect Panel API facts without leaking secrets")
     parser.add_argument(
         "--scope",
         choices=(
             "surface", "cluster", "lifecycle", "subscriptions",
-            "ua-absent", "ua-blank", "revoke", "all",
+            "ua-absent", "ua-blank", "revoke", "restore", "all",
         ),
         default="all",
     )
@@ -782,8 +947,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--credentials", default=CREDENTIALS_FILE)
     parser.add_argument(
         "--step",
-        choices=("issue", "apply", "cleanup"),
-        help="Which revocation step to run; each step hands its state to the next one",
+        choices=("issue", "apply", "cleanup", "capture", "mutate", "verify"),
+        help="Which revocation or restore step to run; each step hands its state to the next one",
     )
     parser.add_argument(
         "--payload-dir",
@@ -818,6 +983,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.step not in steps:
             raise SystemExit("the revoke scope needs --step issue, --step apply, or --step cleanup")
         facts["revocation"] = steps[args.step](panel, directory)
+    if args.scope == "restore":
+        directory = _restore_dir(Path(args.payload_dir) if args.payload_dir else None)
+        steps = {
+            "capture": restore_capture,
+            "mutate": restore_mutate,
+            "verify": restore_verify,
+        }
+        if args.step not in steps:
+            raise SystemExit(
+                "the restore scope needs --step capture, --step mutate, or --step verify"
+            )
+        facts["restore"] = steps[args.step](panel, directory)
     print(json.dumps(facts, sort_keys=True))
     return 0
 
