@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 69
-  total: 194
+  podman_first: 70
+  total: 195
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3487,6 +3487,25 @@ cases:
     client, and a forced renewal performs an HTTP-01 challenge and yields a new serial whose leaf the
     independent client receives after the product's deploy hook reloads NGINX without replacing the master.
   assertion_sha256: 73faa97a9d89b56ea9796614425d204c699b73ec24bbee0dab13bdb25f6c138f
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Global Certbot Deploy Hook Ownership
+- id: ACME-02
+  requirement: Real ACME issuance and renewal through the pinned directory
+  live_scenario: null
+  assertion: With the port 80 challenge webroot closed to the validator, and again with the pinned directory
+    unreachable from the host, a forced renewal exits non-zero, quotes its own cause, leaves the installed
+    serial, notBefore and archive count unchanged, and keeps serving the working leaf to an independent
+    client; once each outage is removed the same forced renewal issues a new serial whose leaf the client
+    then receives.
+  assertion_sha256: a802cb587328bf03d81a53bfd3b2c7c6f1e6a45e4445714dbc1fb79f91a978e7
   runs_in:
   - podman
   state: incubating

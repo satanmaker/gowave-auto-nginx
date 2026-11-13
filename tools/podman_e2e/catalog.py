@@ -247,6 +247,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Global Certbot Deploy Hook Ownership",
     },
     {
+        "id": "ACME-02",
+        "requirement": "Real ACME issuance and renewal through the pinned directory",
+        "assertion": "With the port 80 challenge webroot closed to the validator, and again with the pinned directory unreachable from the host, a forced renewal exits non-zero, quotes its own cause, leaves the installed serial, notBefore and archive count unchanged, and keeps serving the working leaf to an independent client; once each outage is removed the same forced renewal issues a new serial whose leaf the client then receives.",
+        "topology": ["aio"],
+        "promotion_target": "Global Certbot Deploy Hook Ownership",
+    },
+    {
         "id": "NGX-COVER-DERIVE",
         "requirement": "Camouflage decoy and certificate lineage",
         "assertion": "The cover apex is the last two labels of panel_domain and a domain with fewer than three labels produces no cover lineage and is handled explicitly.",
