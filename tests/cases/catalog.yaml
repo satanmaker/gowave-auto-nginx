@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 85
-  total: 210
+  podman_first: 86
+  total: 211
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -4070,6 +4070,25 @@ cases:
   driver: null
   driver_status: planned
   promotion_target: Preflight SSH Trust and DNS Verification
+- id: MN-SSH-DOWN
+  requirement: Failure injection and recovery
+  live_scenario: null
+  assertion: With `ssh.service` stopped on the Worker, the controller's remote-finalize operation is refused
+    by the transport before the remote command runs, naming the connection failure rather than host-key
+    verification, while the Worker's node unit stays active and the same captured subscription still carries
+    a payload from the Worker's own data address; starting the daemon again lets the very operation that
+    was refused run and remove the planted snapshot.
+  assertion_sha256: e561205084c31f6c28482066f12c9ffbdd33e37f6bcbb19cca02763952486acf
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Negative Scenario and Fault Injection Tests
 - id: MN-VISION
   requirement: Independent Optional Vision Domains
   live_scenario: null

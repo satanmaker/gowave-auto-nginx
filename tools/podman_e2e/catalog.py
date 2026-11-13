@@ -464,6 +464,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Preflight SSH Trust and DNS Verification",
     },
     {
+        "id": "MN-SSH-DOWN",
+        "requirement": "Failure injection and recovery",
+        "assertion": "With `ssh.service` stopped on the Worker, the controller's remote-finalize operation is refused by the transport before the remote command runs, naming the connection failure rather than host-key verification, while the Worker's node unit stays active and the same captured subscription still carries a payload from the Worker's own data address; starting the daemon again lets the very operation that was refused run and remove the planted snapshot.",
+        "topology": ["multi-node"],
+        "promotion_target": "Negative Scenario and Fault Injection Tests",
+    },
+    {
         "id": "MN-VISION",
         "requirement": "Independent Optional Vision Domains",
         "assertion": "In each of the four per-node Vision combinations, every node is checked against its own Vision domain alone: a configured node declares exactly one Vision inbound and one disabled-free Panel host bound to it under its own name, holds a certificate covering that name that renews from this run's ACME directory, routes the name to its Vision inbound and runs that inbound in its applied config; an unconfigured node has none of those under its own name, so swapping the two nodes' Vision configuration fails.",
