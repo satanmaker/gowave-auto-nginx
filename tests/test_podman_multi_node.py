@@ -1315,29 +1315,41 @@ class TestMultiNodeSuite(unittest.TestCase):
         ids = [case.id for case in multi_node.cases(self.podman)]
         self.assertEqual(ids[12:14], ["FW-01", "FW-02"])
 
+    def test_the_master_access_case_follows_the_denial_pair(self):
+        # 6.6: FW-03 asks the same question of the Master's own rules that the
+        # pair above asked of the Worker's, so it reads them while the cluster
+        # is healthy and before the cases that only observe the Panel.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertEqual(ids[14], multi_node.MASTER_ACCESS_CASE_ID)
+        self.assertLess(ids.index(multi_node.MASTER_ACCESS_CASE_ID), ids.index("CLUS-01"))
+        suite = {case.id: case for case in multi_node.cases(self.podman)}
+        self.assertEqual(suite[multi_node.MASTER_ACCESS_CASE_ID].timeout_seconds,
+                         multi_node.FIREWALL_TIMEOUT_SECONDS)
+        self.assertEqual(suite[multi_node.MASTER_ACCESS_CASE_ID].topology, "multi-node")
+
     def test_the_cluster_audit_follows_the_control_plane_proof(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[14:17], ["CLUS-01", "CLUS-02", "CLUS-03"])
+        self.assertEqual(ids[15:18], ["CLUS-01", "CLUS-02", "CLUS-03"])
 
     def test_the_worker_state_audit_follows_the_cluster_audit(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[17:19], ["WRK-05", "WRK-06"])
+        self.assertEqual(ids[18:20], ["WRK-05", "WRK-06"])
 
     def test_the_vision_independence_case_follows_the_worker_config(self):
         # 5.10: the per-node Vision proof reads the config WRK-06 has just
         # compared, so it runs once that assignment is established and before any
         # data plane traffic.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[17:20], ["WRK-05", "WRK-06", multi_node.VISION_CASE_ID])
+        self.assertEqual(ids[18:21], ["WRK-05", "WRK-06", multi_node.VISION_CASE_ID])
 
     def test_the_data_plane_cases_follow_the_worker_audit(self):
         # 5.7: a payload has to traverse the Worker too, so the matrix tuples of
         # both nodes run once the Worker's own config is applied.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[20], "MN-DP-master-REALITY-xray")
-        self.assertEqual(ids[27], "MN-DP-master-TROJAN-GRPC-mihomo")
-        self.assertEqual(ids[28], "MN-DP-worker-REALITY-xray")
-        self.assertEqual(ids[35], "MN-DP-worker-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[21], "MN-DP-master-REALITY-xray")
+        self.assertEqual(ids[28], "MN-DP-master-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[29], "MN-DP-worker-REALITY-xray")
+        self.assertEqual(ids[36], "MN-DP-worker-TROJAN-GRPC-mihomo")
 
     def test_every_node_contributes_its_own_matrix_tuples(self):
         data = matrix.load()
@@ -1396,8 +1408,8 @@ class TestMultiNodeSuite(unittest.TestCase):
         # 5.12: attribution reads the same run and the endpoint, so it follows the
         # count and still precedes revocation, which would revoke a client.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[35], "MN-DP-worker-TROJAN-GRPC-mihomo")
-        self.assertEqual(ids[36:40], [multi_node.MATRIX_CASE_ID, multi_node.EGRESS_CASE_ID,
+        self.assertEqual(ids[36], "MN-DP-worker-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[37:41], [multi_node.MATRIX_CASE_ID, multi_node.EGRESS_CASE_ID,
                                       "SUB-SERVED", "SUB-B64"])
         suite = {case.id: case for case in multi_node.cases(self.podman)}
         self.assertEqual(suite[multi_node.MATRIX_CASE_ID].timeout_seconds,
@@ -1420,7 +1432,7 @@ class TestMultiNodeSuite(unittest.TestCase):
         # 6.1: both roles' trees are validated and reloaded while the cluster is
         # healthy, so a later revocation cannot be read as a reload effect.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[40], multi_node.NGINX_CONFIG_CASE_ID)
+        self.assertEqual(ids[41], multi_node.NGINX_CONFIG_CASE_ID)
         self.assertLess(ids.index(multi_node.NGINX_CONFIG_CASE_ID),
                         ids.index(multi_node.REVOCATION_CASE_ID))
         self.assertLess(ids.index("SUB-B64"), ids.index(multi_node.NGINX_CONFIG_CASE_ID))
@@ -1432,8 +1444,8 @@ class TestMultiNodeSuite(unittest.TestCase):
         # 6.2: both roles' certificates are read from a healthy cluster, so a
         # later Worker shutdown cannot be blamed for what the client saw here.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[41], aio.TLS_CASE_ID)
-        self.assertEqual(ids[40], multi_node.NGINX_CONFIG_CASE_ID)
+        self.assertEqual(ids[42], aio.TLS_CASE_ID)
+        self.assertEqual(ids[41], multi_node.NGINX_CONFIG_CASE_ID)
         self.assertLess(ids.index(aio.TLS_CASE_ID), ids.index(multi_node.REVOCATION_CASE_ID))
         suite = {case.id: case for case in multi_node.cases(self.podman)}
         self.assertEqual(suite[aio.TLS_CASE_ID].timeout_seconds,
@@ -2396,6 +2408,190 @@ class TestTlsSurfaceCase(unittest.TestCase):
         with self.assertRaises(CaseBlocked) as caught:
             multi_node.case_tls_surface(product)
         self.assertIn(multi_node.NODE_ADD_CASE_ID, str(caught.exception))
+
+
+class TestMasterAccessCase(unittest.TestCase):
+    """FW-03 is only a firewall verdict when the denials are attributable.
+
+    The Master's rule set is read once here and the three origins report what
+    they observed; every failure below is a way a green-looking case could in
+    fact have proven nothing — a firewall that is off, a service that is down, a
+    port nobody filtered, or a rule that never saw the packet.
+    """
+
+    PACKETS = {22: 5, 80: 3, 443: 9, 3002: 2, 7443: 0}
+
+    def path(self, outcome, address="10.89.0.11", port=3002, **extra):
+        observed = {
+            "address": address,
+            "port": port,
+            "outcome": outcome,
+            "elapsed_ms": 12,
+            "banner": None,
+            "detail": "",
+        }
+        observed.update(extra)
+        return observed
+
+    def rule_set(self, packets=None, policy_packets=7):
+        counts = dict(self.PACKETS)
+        counts.update(packets or {})
+
+        def allow(port):
+            return [{"target": "ACCEPT", "source": "",
+                     "line": f"-A ufw-user-input -p tcp -m tcp --dport {port} -j ACCEPT"}]
+
+        return {
+            "active": True,
+            "default_incoming": "deny",
+            "input_policy": "DROP",
+            "input_policy_packets": policy_packets,
+            "input_policy_bytes": 420,
+            "ports": list(multi_node.FIREWALL_PORTS),
+            "allows": {22: allow(22), 80: allow(80), 443: allow(443), 3002: [], 7443: []},
+            "blocks": {
+                22: [], 80: [], 443: [],
+                3002: [{"target": "DROP", "source": "",
+                        "line": "-A ufw-user-input -p tcp -m tcp --dport 3002 -j DROP"}],
+                7443: [],
+            },
+            "counters": {
+                port: [{"packets": counts[port], "bytes": None,
+                        "target": "ACCEPT", "source": ""}]
+                for port in multi_node.FIREWALL_PORTS
+            },
+            # The local node is bound on loopback only, the panel API too; the
+            # published ports answer on every address.
+            "listeners": {
+                22: ["0.0.0.0"], 80: ["0.0.0.0"], 443: ["0.0.0.0"],
+                3002: ["127.0.0.1"], 7443: ["127.0.0.1"],
+            },
+            "ufw": ["Status: active"],
+        }
+
+    def facts(self):
+        # The counters moved for every rule the case dialled, and the INPUT
+        # policy dropped the silent panel API probe.
+        after_packets = {
+            port: count + 2 for port, count in self.PACKETS.items() if port != 7443
+        }
+        return {
+            "before": self.rule_set(),
+            "after": self.rule_set(packets=after_packets, policy_packets=9),
+            "origins": {
+                multi_node.ORIGIN_CONTROL_MACHINE: {
+                    "operator-ssh": self.path("CONNECTED", port=22,
+                                              banner="SSH-2.0-OpenSSH_9.6"),
+                    "node": self.path("REFUSED"),
+                    "panel-api": self.path("TIMEOUT", port=7443),
+                },
+                multi_node.ORIGIN_PUBLISHED: {
+                    "https": self.path("CONNECTED", port=443, address="203.0.114.11"),
+                    "node": self.path("TIMEOUT", address="203.0.114.11"),
+                },
+                multi_node.ORIGIN_LOCAL: {
+                    "https": self.path("CONNECTED", port=443, address="127.0.0.1"),
+                    "node": self.path("CONNECTED", address="127.0.0.1"),
+                    "panel-api": self.path("CONNECTED", port=7443, address="127.0.0.1"),
+                },
+            },
+            "https": {"returncode": 0, "probe": {
+                "status": 200, "peer": {"tls_version": "TLSv1.3"},
+            }},
+            "http": {"returncode": 0, "probe": {
+                "status": 301, "headers": {"location": f"https://{topology.COVER_APEX}/"},
+            }},
+            "cover": topology.COVER_APEX,
+            "addresses": {
+                multi_node.ORIGIN_CONTROL_MACHINE: "10.89.0.11",
+                multi_node.ORIGIN_PUBLISHED: "203.0.114.11",
+                multi_node.ORIGIN_LOCAL: "127.0.0.1",
+            },
+        }
+
+    def contract(self, facts=None):
+        return multi_node.master_access_contract(facts or self.facts(), "FW-03")
+
+    def test_the_four_origins_and_their_counters_are_evidence(self):
+        evidence = self.contract()
+        self.assertEqual(sorted(evidence["origins"]), sorted([
+            multi_node.ORIGIN_CONTROL_MACHINE, multi_node.ORIGIN_PUBLISHED,
+            multi_node.ORIGIN_LOCAL,
+        ]))
+        self.assertEqual(evidence["input_policy"], "DROP")
+        self.assertEqual(evidence["default_incoming"], "deny")
+        self.assertEqual(evidence["packets_moved"], {"22": 2, "80": 2, "443": 2, "3002": 2})
+        self.assertEqual(evidence["input_policy_packets_moved"], 2)
+        self.assertEqual(evidence["https_tls_version"], "TLSv1.3")
+        self.assertTrue(evidence["http_location"].startswith("https://"))
+        self.assertEqual(
+            evidence["origins"][multi_node.ORIGIN_LOCAL]["node"]["outcome"], "CONNECTED",
+        )
+
+    def test_an_inactive_firewall_is_not_a_pass(self):
+        facts = self.facts()
+        facts["before"]["active"] = False
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("UFW is not active", str(caught.exception))
+
+    def test_an_answered_panel_api_port_publishes_the_management_interface(self):
+        facts = self.facts()
+        facts["origins"][multi_node.ORIGIN_CONTROL_MACHINE]["panel-api"] = self.path(
+            "CONNECTED", port=7443,
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("panel API", str(caught.exception))
+
+    def test_a_reachable_node_port_from_the_published_address_is_a_finding(self):
+        facts = self.facts()
+        facts["origins"][multi_node.ORIGIN_PUBLISHED]["node"] = self.path(
+            "CONNECTED", address="203.0.114.11",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("widened the rule set", str(caught.exception))
+
+    def test_a_rule_that_counted_nothing_proves_the_attempts_missed_it(self):
+        facts = self.facts()
+        facts["after"]["counters"][3002] = [{"packets": 2, "bytes": None,
+                                             "target": "DROP", "source": ""}]
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("counted no packet", str(caught.exception))
+
+    def test_a_dead_loopback_service_invalidates_every_refusal(self):
+        facts = self.facts()
+        facts["origins"][multi_node.ORIGIN_LOCAL]["panel-api"] = self.path(
+            "REFUSED", port=7443, address="127.0.0.1",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("service is down", str(caught.exception))
+
+    def test_a_wildcard_panel_listener_is_not_loopback_only(self):
+        facts = self.facts()
+        facts["before"]["listeners"][7443] = ["0.0.0.0"]
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("not loopback only", str(caught.exception))
+
+    def test_an_unblocked_node_port_is_a_decision_the_install_never_made(self):
+        facts = self.facts()
+        facts["before"]["blocks"][3002] = []
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("carves out no block rule", str(caught.exception))
+
+    def test_a_missing_attempt_names_what_the_probe_did_report(self):
+        facts = self.facts()
+        del facts["origins"][multi_node.ORIGIN_CONTROL_MACHINE]["panel-api"]
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        message = str(caught.exception)
+        self.assertIn("reported nothing for 'panel-api'", message)
+        self.assertIn("'operator-ssh'", message)
 
 
 if __name__ == "__main__":

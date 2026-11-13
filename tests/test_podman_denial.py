@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Suite nonroot: FW-01/FW-02 denial evidence, parsing, and fail-closed cases."""
+"""Suite nonroot: FW-01/FW-02 denial evidence, FW-03's host reading, and fail-closed cases."""
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -369,6 +370,155 @@ class TestDenialFactsVantage(unittest.TestCase):
         self.assertEqual(facts["master_address"], MASTER)
         self.assertEqual(facts["worker_address"], WORKER)
         self.assertEqual(facts["journal_tail"], [f"Connection closed by {UNTRUSTED} port 40000"])
+
+
+class TestHostFirewallParsers(unittest.TestCase):
+    """FW-03 reads the Master's own rules, counters, and binds from one report."""
+
+    Rules = [
+        "-P INPUT DROP",
+        "-A INPUT -i lo -j ACCEPT",
+        "-A INPUT -p tcp -m tcp --dport 22 -j ufw-user-input",
+        f"-A ufw-user-input -p tcp -m tcp --dport {denial.SSH_PORT} -j ACCEPT",
+        f"-A ufw-user-input -p tcp -m tcp --dport {denial.HTTP_PORT} -j ACCEPT",
+        f"-A ufw-user-input -p tcp -m tcp --dport {denial.HTTPS_PORT} -j ACCEPT",
+        f"-A ufw-user-input -p tcp -m tcp --dport {denial.NODE_PORT} -j DROP",
+    ]
+
+    Chain = [
+        "Chain ufw-user-input (1 references)",
+        "target     prot opt source               destination         ",
+        "ACCEPT     tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:22",
+        "ACCEPT     tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:80",
+        "ACCEPT     tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:443",
+        "DROP       tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:3002",
+    ]
+
+    Policy = [
+        "Chain INPUT (policy DROP 7 packets, 420 bytes)",
+        "target     prot opt source               destination         ",
+        "ACCEPT     all  --  0.0.0.0/0            0.0.0.0/0           ",
+    ]
+
+    Ufw = [
+        "Status: active",
+        "Logging: on (low)",
+        "Default: deny (incoming), allow (outgoing), disabled (routed)",
+        "New profiles: skip",
+    ]
+
+    Listeners = [
+        "LISTEN 0      4096         0.0.0.0:22         0.0.0.0:*",
+        "LISTEN 0      511          0.0.0.0:80         0.0.0.0:*",
+        "LISTEN 0      4096         0.0.0.0:443        0.0.0.0:*",
+        f"LISTEN 0      4096       127.0.0.1:{denial.PANEL_API_PORT}      0.0.0.0:*",
+        "ESTAB  0      0        10.89.0.11:7443      10.89.0.44:51000",
+    ]
+
+    def report(self):
+        return {
+            "ports": [denial.SSH_PORT, denial.HTTP_PORT, denial.HTTPS_PORT,
+                      denial.NODE_PORT, denial.PANEL_API_PORT],
+            "ufw_returncode": 0,
+            "ufw": list(self.Ufw),
+            "rules_returncode": 0,
+            "rules": list(self.Rules),
+            "policy_returncode": 0,
+            "policy": list(self.Policy),
+            "chain_returncode": 0,
+            "chain": list(self.Chain),
+            "listeners_returncode": 0,
+            "listeners": list(self.Listeners),
+        }
+
+    def test_the_path_probe_is_keyed_by_label_and_keeps_its_banner(self):
+        # The probe prints one JSON document on its last line, so anything the
+        # container wrote before it has to be tolerated.
+        observed = denial.parse_tcp_paths(
+            "noise from the container\n" + json.dumps([
+                {"label": "ssh", "address": "10.89.0.11", "port": 22,
+                 "outcome": "CONNECTED", "elapsed_ms": 12, "banner": "SSH-2.0-OpenSSH_9.6"},
+                {"label": "panel-api", "address": "10.89.0.11", "port": 7443,
+                 "outcome": "TIMEOUT", "elapsed_ms": 5003, "detail": "no answer within 5s"},
+                {"label": "node", "address": "10.89.0.11", "port": 3002,
+                 "outcome": "CONNECTED", "banner": "", "banner_error": "timed out"},
+                {"address": "10.89.0.11", "port": 22, "outcome": "CONNECTED"},
+            ]) + "\n"
+        )
+        self.assertEqual(sorted(observed), ["node", "panel-api", "ssh"])
+        self.assertEqual(observed["ssh"]["banner"], "SSH-2.0-OpenSSH_9.6")
+        self.assertEqual(observed["panel-api"]["outcome"], "TIMEOUT")
+        # A reader that got no banner still has to say why, or a silent service
+        # and a filtered port would look the same.
+        self.assertEqual(observed["node"]["detail"], "timed out")
+
+    def test_a_probe_without_a_report_is_empty(self):
+        self.assertEqual(denial.parse_tcp_paths("bash: python3: not found\n"), {})
+
+    def test_the_listeners_are_read_per_port_and_only_for_declared_ports(self):
+        bound = denial.parse_listeners(
+            self.Listeners + ["LISTEN 0      4096       [::]:3000          [::]:*"],
+            [denial.SSH_PORT, denial.HTTP_PORT, denial.HTTPS_PORT,
+             denial.NODE_PORT, denial.PANEL_API_PORT],
+        )
+        self.assertEqual(bound[denial.SSH_PORT], ["0.0.0.0"])
+        self.assertEqual(bound[denial.PANEL_API_PORT], ["127.0.0.1"])
+        self.assertEqual(bound[denial.NODE_PORT], [])
+        self.assertNotIn(3000, bound)
+
+    def test_the_input_policy_carries_the_dropped_packet_count(self):
+        policy = denial.parse_input_policy(self.Policy)
+        self.assertEqual(policy["policy"], "DROP")
+        self.assertEqual(policy["packets"], 7)
+        self.assertEqual(denial.parse_input_policy(["Chain INPUT (policy DROP)"])["packets"], None)
+        self.assertEqual(denial.parse_input_policy([])["policy"], "")
+
+    def test_the_default_incoming_verdict_is_read_from_verbose_ufw(self):
+        self.assertEqual(denial.parse_default_incoming(self.Ufw), "deny")
+        self.assertEqual(denial.parse_default_incoming(["Status: inactive"]), "")
+
+    def test_the_rule_set_splits_into_decisions_per_port(self):
+        facts = denial.parse_host_firewall(self.report(), [
+            denial.SSH_PORT, denial.HTTP_PORT, denial.HTTPS_PORT,
+            denial.NODE_PORT, denial.PANEL_API_PORT,
+        ])
+        self.assertTrue(facts["active"])
+        self.assertEqual(facts["default_incoming"], "deny")
+        self.assertEqual(facts["input_policy"], "DROP")
+        self.assertEqual(facts["input_policy_packets"], 7)
+        for port in (denial.SSH_PORT, denial.HTTP_PORT, denial.HTTPS_PORT):
+            self.assertTrue(denial.open_to_every_source(facts, port))
+        self.assertFalse(denial.open_to_every_source(facts, denial.NODE_PORT))
+        self.assertEqual(facts["blocks"][denial.NODE_PORT][0]["target"], "DROP")
+        self.assertEqual(facts["allows"][denial.PANEL_API_PORT], [])
+        self.assertEqual(facts["blocks"][denial.PANEL_API_PORT], [])
+        self.assertEqual(facts["listeners"][denial.PANEL_API_PORT], ["127.0.0.1"])
+
+    def test_the_counters_come_from_the_users_chain_not_the_policy(self):
+        facts = denial.parse_host_firewall(self.report(), [denial.NODE_PORT])
+        self.assertEqual(denial.packets_for(facts, denial.NODE_PORT), 0)
+        counted = denial.parse_host_firewall(
+            {
+                **self.report(),
+                "chain": self.Chain[:-1] + [
+                    "    4      240 DROP       tcp  --  0.0.0.0/0            0.0.0.0/0"
+                    "            tcp dpt:3002",
+                ],
+            },
+            [denial.NODE_PORT],
+        )
+        self.assertEqual(denial.packets_for(counted, denial.NODE_PORT), 4)
+
+    def test_rules_read_from_the_input_chain_alone_would_miss_every_decision(self):
+        # UFW keeps its allow and deny rules in ufw-user-input, which INPUT only
+        # jumps to: a report that collected only "iptables -S INPUT" cannot name
+        # a single decision, and the case must not read that silence as a pass.
+        partial = dict(self.report())
+        partial["rules"] = [line for line in self.Rules
+                            if not line.startswith("-A ufw-user-input")]
+        facts = denial.parse_host_firewall(partial, [denial.SSH_PORT, denial.NODE_PORT])
+        self.assertFalse(denial.open_to_every_source(facts, denial.SSH_PORT))
+        self.assertEqual(facts["blocks"][denial.NODE_PORT], [])
 
 
 if __name__ == "__main__":

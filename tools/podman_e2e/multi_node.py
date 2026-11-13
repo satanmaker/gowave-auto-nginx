@@ -35,6 +35,9 @@ WORKER_CONFIG_CASE_ID = "WRK-06"
 MASTER_ADDRESS_CASE_ID = "PODNET-MASTER-ADDR"
 MANAGEMENT_DENIAL_CASE_ID = "FW-01"
 DENIAL_CLASSIFICATION_CASE_ID = "FW-02"
+# FW-03 asks the same question of the Master's own rule set that FW-01 asks of
+# the Worker's: which origin reaches which port, proven by real connections.
+MASTER_ACCESS_CASE_ID = "FW-03"
 REVOCATION_CASE_ID = "MN-REVOKE"
 OUTAGE_CASE_ID = "MN-OUTAGE"
 RESTART_CASE_ID = "MN-RESTART"
@@ -49,6 +52,21 @@ MTLS_TIMEOUT_SECONDS = 300
 MATRIX_TIMEOUT_SECONDS = 120
 EGRESS_TIMEOUT_SECONDS = 300
 DENIAL_TIMEOUT_SECONDS = 300
+# Every port the Master install's own rule set names, plus the panel vhost it
+# never publishes: the operator's SSH port, the ACME/web pair, the local node
+# port the All-in-One install isolates, and the loopback-only panel API.
+FIREWALL_PORTS: Sequence[int] = (
+    denial.SSH_PORT,
+    denial.HTTP_PORT,
+    denial.HTTPS_PORT,
+    denial.NODE_PORT,
+    denial.PANEL_API_PORT,
+)
+# A dropped packet has to be waited out and a refused one answers at once, so
+# the attempt ceiling is what separates the two; the case ceiling covers every
+# origin plus both readings of the rule set.
+FIREWALL_ATTEMPT_TIMEOUT_SECONDS = 5
+FIREWALL_TIMEOUT_SECONDS = 300
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 VISION_PROBE_TIMEOUT_SECONDS = 120
@@ -2009,6 +2027,384 @@ def case_denial_classification(product: MultiNodeProduct) -> Dict[str, Any]:
     }
 
 
+# The three vantages the Master can be reached from, named once because the
+# contract, the failure messages and the evidence all quote them.
+ORIGIN_CONTROL_MACHINE = "the Control Machine"
+ORIGIN_PUBLISHED = "the published address"
+ORIGIN_LOCAL = "the host itself"
+
+
+def firewall_origins(plan: Any) -> List[Dict[str, Any]]:
+    """Every origin the Master can be reached from, and what each one tries.
+
+    Three vantages, none of them invented: the Control Machine on the run
+    network (what the operator's own machine sees), the published address block
+    the data plane leaves from (an address the product publishes, which must not
+    widen its rule set), and the host itself, whose loopback is the only place
+    the management ports listen.
+
+    The external vantages try the isolated node port as well as the published
+    ones, because that port is the one the install decides about. The denial
+    suite's untrusted role is not one of them: it runs the clean target image,
+    which has no Python, so it cannot report a multi-path probe — its vantage is
+    the Worker's control plane, which FW-01 and FW-02 measure.
+    """
+    return [
+        {
+            "name": ORIGIN_CONTROL_MACHINE,
+            "container": "client",
+            "address": plan.target_ip,
+            "attempts": (
+                {"label": "operator-ssh", "port": denial.SSH_PORT, "banner": True},
+                {"label": "node", "port": denial.NODE_PORT},
+                {"label": "panel-api", "port": denial.PANEL_API_PORT},
+            ),
+        },
+        {
+            "name": ORIGIN_PUBLISHED,
+            "container": "echo",
+            "address": plan.data_target_ip,
+            "attempts": (
+                {"label": "https", "port": denial.HTTPS_PORT},
+                {"label": "node", "port": denial.NODE_PORT},
+            ),
+        },
+        {
+            "name": ORIGIN_LOCAL,
+            "container": "target",
+            "address": "127.0.0.1",
+            "attempts": (
+                {"label": "https", "port": denial.HTTPS_PORT},
+                {"label": "node", "port": denial.NODE_PORT},
+                {"label": "panel-api", "port": denial.PANEL_API_PORT},
+            ),
+        },
+    ]
+
+
+def master_access_facts(product: MultiNodeProduct, case_id: str) -> Dict[str, Any]:
+    """The Master's rule set read twice around real connections from every origin."""
+    host = product.require_installed()
+    containers = {
+        "client": host.client_name,
+        "echo": host.echo_name,
+        "target": host.target_name,
+    }
+    origins = firewall_origins(host.plan)
+    before = denial.host_firewall(product.podman, host.target_name, FIREWALL_PORTS)
+    require(
+        case_id,
+        before.get("chain_returncode") == 0,
+        f"the Master's rules could not be read (exit {before.get('chain_returncode')}): "
+        f"{before.get('error') or before.get('detail') or 'no output'}",
+    )
+
+    observed: Dict[str, Any] = {}
+    for origin in origins:
+        attempts = [
+            dict(
+                attempt,
+                address=origin["address"],
+                timeout=FIREWALL_ATTEMPT_TIMEOUT_SECONDS,
+            )
+            for attempt in origin["attempts"]
+        ]
+        report = denial.tcp_paths(product.podman, containers[origin["container"]], attempts)
+        require(
+            case_id,
+            any(key not in ("returncode", "detail") for key in report),
+            f"the probe from {origin['name']} produced no report (exit "
+            f"{report.get('returncode')}): {report.get('detail') or 'no output'}",
+        )
+        observed[origin["name"]] = report
+
+    cover = topology.COVER_APEX
+    https = host.client_http(
+        f"https://{cover}/", expect_status=200,
+        timeout=FIREWALL_ATTEMPT_TIMEOUT_SECONDS + 10,
+    )
+    http = host.client_http(
+        f"http://{cover}/", expect_status=301,
+        timeout=FIREWALL_ATTEMPT_TIMEOUT_SECONDS + 10,
+    )
+    after = denial.host_firewall(product.podman, host.target_name, FIREWALL_PORTS)
+    return {
+        "before": before,
+        "after": after,
+        "origins": observed,
+        "https": https,
+        "http": http,
+        "cover": cover,
+        "addresses": {origin["name"]: origin["address"] for origin in origins},
+    }
+
+
+def _master_access_path(
+    origin: str, label: str, report: Dict[str, Any], case_id: str,
+) -> Dict[str, Any]:
+    """One origin's attempt, named when the probe never reported it."""
+    entry = report.get(label)
+    require(
+        case_id,
+        isinstance(entry, dict),
+        f"the {origin} probe reported nothing for {label!r}; it observed "
+        f"{sorted(key for key in report if key not in ('returncode', 'detail'))}",
+    )
+    return entry
+
+
+def master_access_contract(facts: Dict[str, Any], case_id: str) -> Dict[str, Any]:
+    """The Master's rule set, its counters, and what each origin actually got.
+
+    The refusals are never read alone. A refused connection says the packet was
+    answered with a reset, a silent one says it was dropped, and only the rule
+    that counted the packet says the host's own policy did it — so every denial
+    is paired with the loopback path to the same port (the service is up), the
+    rule the install wrote for it, and the packet counter that moved while this
+    case ran. Nothing here reads the Worker: its rules say nothing about the
+    Master's.
+    """
+    before, after = facts["before"], facts["after"]
+    require(
+        case_id,
+        before["active"],
+        "the Master's UFW is not active, so nothing filters the ports the install publishes",
+    )
+    require(
+        case_id,
+        before["default_incoming"] == "deny",
+        f"the Master's UFW default incoming policy is "
+        f"{before['default_incoming'] or 'unset'!r} instead of deny",
+    )
+    require(
+        case_id,
+        before["input_policy"] == "DROP",
+        f"the Master's INPUT policy is {before['input_policy'] or 'unset'!r} instead of DROP",
+    )
+
+    for port in (denial.SSH_PORT, denial.HTTP_PORT, denial.HTTPS_PORT):
+        require(
+            case_id,
+            denial.open_to_every_source(before, port),
+            f"port {port} is not open to every source, so the Master does not serve the internet "
+            f"on it: {[entry['line'] for entry in before['allows'][port]]}",
+        )
+    require(
+        case_id,
+        not before["allows"][denial.NODE_PORT],
+        f"the local node port {denial.NODE_PORT} carries an ACCEPT rule, so it is published: "
+        f"{[entry['line'] for entry in before['allows'][denial.NODE_PORT]]}",
+    )
+    require(
+        case_id,
+        before["blocks"][denial.NODE_PORT],
+        f"the local node port {denial.NODE_PORT} carves out no block rule, so its isolation is "
+        "the default policy alone rather than a decision about that port",
+    )
+    require(
+        case_id,
+        not before["allows"][denial.PANEL_API_PORT],
+        f"the panel API port {denial.PANEL_API_PORT} carries an ACCEPT rule, so it is published: "
+        f"{[entry['line'] for entry in before['allows'][denial.PANEL_API_PORT]]}",
+    )
+    require(
+        case_id,
+        not before["blocks"][denial.PANEL_API_PORT],
+        f"the panel API port {denial.PANEL_API_PORT} is blocked by its own rule, which would hide "
+        "whether the default policy reaches it: "
+        f"{[entry['line'] for entry in before['blocks'][denial.PANEL_API_PORT]]}",
+    )
+    panel_listeners = before["listeners"][denial.PANEL_API_PORT]
+    require(
+        case_id,
+        panel_listeners,
+        f"nothing listens on {denial.PANEL_API_PORT} on the Master, so the loopback control below "
+        "has no socket behind it",
+    )
+    require(
+        case_id,
+        not [address for address in panel_listeners if address in denial.WILDCARD_ADDRESSES],
+        f"the panel API listens on {panel_listeners}, which is not loopback only",
+    )
+
+    control = facts["origins"][ORIGIN_CONTROL_MACHINE]
+    ssh = _master_access_path("Control Machine", "operator-ssh", control, case_id)
+    require(
+        case_id,
+        ssh["outcome"] == "CONNECTED",
+        f"SSH from the Control Machine ended {ssh['outcome'] or 'without a verdict'} "
+        f"({ssh['detail'] or 'no detail'}), so the Master is not administrable from outside",
+    )
+    require(
+        case_id,
+        str(ssh.get("banner") or "").startswith("SSH-2.0-"),
+        f"the SSH port answered {ssh.get('banner')!r} instead of an SSH identification",
+    )
+
+    https = facts["https"]
+    https_probe = https.get("probe") or {}
+    require(
+        case_id,
+        https.get("returncode") == 0,
+        f"https://{facts['cover']}/ from the Control Machine did not answer 200: "
+        f"{https_probe.get('error') or https.get('stderr') or 'the probe printed no report'}",
+    )
+    require(
+        case_id,
+        str((https_probe.get("peer") or {}).get("tls_version", "")).startswith("TLSv1.3"),
+        f"https://{facts['cover']}/ negotiated "
+        f"{(https_probe.get('peer') or {}).get('tls_version')!r} instead of TLSv1.3",
+    )
+
+    http = facts["http"]
+    http_probe = http.get("probe") or {}
+    require(
+        case_id,
+        http.get("returncode") == 0,
+        f"http://{facts['cover']}/ from the Control Machine did not answer 301: "
+        f"{http_probe.get('error') or http.get('stderr') or 'the probe printed no report'}",
+    )
+    location = str((http_probe.get("headers") or {}).get("location") or "")
+    require(
+        case_id,
+        location.startswith("https://"),
+        f"the plaintext vhost answered 301 without an https Location: {location!r}",
+    )
+
+    node = _master_access_path("Control Machine", "node", control, case_id)
+    require(
+        case_id,
+        node["outcome"] != "CONNECTED",
+        f"the Control Machine reached the local node port {denial.NODE_PORT} at "
+        f"{node['address']}, so the port the All-in-One install isolates is published",
+    )
+    require(
+        case_id,
+        node["outcome"] in ("REFUSED", "TIMEOUT"),
+        f"the Control Machine's attempt on the node port ended "
+        f"{node['outcome'] or 'without a verdict'} ({node['detail'] or 'no detail'}), which is "
+        "neither a rule nor a dropped packet",
+    )
+
+    panel = _master_access_path("Control Machine", "panel-api", control, case_id)
+    require(
+        case_id,
+        panel["outcome"] == "TIMEOUT",
+        f"the Control Machine's attempt on the panel API port {denial.PANEL_API_PORT} ended "
+        f"{panel['outcome'] or 'without a verdict'}: an answered port publishes the management "
+        "interface, and a refusal would mean the port has no socket on that address rather than "
+        "the default policy dropping the packet",
+    )
+
+    published = facts["origins"][ORIGIN_PUBLISHED]
+    served = _master_access_path("the published address", "https", published, case_id)
+    require(
+        case_id,
+        served["outcome"] == "CONNECTED",
+        f"the published address {served['address']} could not reach the HTTPS port "
+        f"({served['outcome'] or 'without a verdict'}): {served['detail'] or 'no detail'}",
+    )
+    withheld = _master_access_path("the published address", "node", published, case_id)
+    require(
+        case_id,
+        withheld["outcome"] != "CONNECTED",
+        f"the published address {withheld['address']} reached the local node port "
+        f"{denial.NODE_PORT}, so publishing the address widened the rule set",
+    )
+
+    local = facts["origins"][ORIGIN_LOCAL]
+    for label, port in (
+        ("https", denial.HTTPS_PORT),
+        ("node", denial.NODE_PORT),
+        ("panel-api", denial.PANEL_API_PORT),
+    ):
+        entry = _master_access_path("host", label, local, case_id)
+        require(
+            case_id,
+            entry["outcome"] == "CONNECTED",
+            f"the Master could not reach {label} on {port} over loopback "
+            f"({entry['outcome'] or 'without a verdict'}): {entry['detail'] or 'no detail'}; the "
+            "refusals above would then say the service is down, not that the source was denied",
+        )
+
+    moved: Dict[int, int] = {}
+    for port in (denial.SSH_PORT, denial.HTTP_PORT, denial.HTTPS_PORT, denial.NODE_PORT):
+        before_packets = denial.packets_for(before, port)
+        after_packets = denial.packets_for(after, port)
+        moved[port] = after_packets - before_packets
+        require(
+            case_id,
+            after_packets > before_packets,
+            f"the Master's rule for port {port} counted no packet while this case ran "
+            f"({before_packets} -> {after_packets}), so the attempts above did not traverse the "
+            "rule set the install wrote",
+        )
+    policy_moved: Optional[int] = None
+    before_policy = before.get("input_policy_packets")
+    after_policy = after.get("input_policy_packets")
+    if isinstance(before_policy, int) and isinstance(after_policy, int):
+        policy_moved = after_policy - before_policy
+        require(
+            case_id,
+            after_policy > before_policy,
+            f"the INPUT policy counted no dropped packet while the panel API port was probed from "
+            f"the Control Machine ({before_policy} -> {after_policy})",
+        )
+
+    return {
+        "input_policy": before["input_policy"],
+        "default_incoming": before["default_incoming"],
+        "allows": {
+            str(port): [entry["line"] for entry in before["allows"][port]]
+            for port in FIREWALL_PORTS
+        },
+        "blocks": {
+            str(port): [entry["line"] for entry in before["blocks"][port]]
+            for port in FIREWALL_PORTS
+        },
+        "listeners": {str(port): before["listeners"][port] for port in FIREWALL_PORTS},
+        "addresses": facts["addresses"],
+        "origins": {
+            name: {
+                label: {
+                    "address": entry.get("address"),
+                    "port": entry.get("port"),
+                    "outcome": entry.get("outcome"),
+                    "elapsed_ms": entry.get("elapsed_ms"),
+                    "banner": entry.get("banner"),
+                }
+                for label, entry in report.items()
+                if isinstance(entry, dict)
+            }
+            for name, report in facts["origins"].items()
+        },
+        "https_status": https_probe.get("status"),
+        "https_tls_version": (https_probe.get("peer") or {}).get("tls_version"),
+        "http_status": http_probe.get("status"),
+        "http_location": location,
+        "packets_moved": {str(port): count for port, count in moved.items()},
+        "input_policy_packets_moved": policy_moved,
+    }
+
+
+def case_master_access(product: MultiNodeProduct) -> Dict[str, Any]:
+    """FW-03: the Master allows and denies the declared paths, from every origin.
+
+    The Master's own install writes one rule set for the whole host: the
+    operator's SSH port, the ACME and HTTPS pair and the default incoming
+    policy, plus a block rule for the local node port, which only the Panel
+    reaches over loopback. A refusal seen from one place proves nothing about
+    that policy — a stopped service, a port that was never bound, and a dropped
+    packet all look refused from far away — so the case attempts every path with
+    a real TCP connection from the Control Machine, from the run's published
+    address, and from the host itself, and requires the Master's rule counters
+    to have counted those attempts.
+    """
+    return master_access_contract(
+        master_access_facts(product, MASTER_ACCESS_CASE_ID), MASTER_ACCESS_CASE_ID,
+    )
+
+
 def case_cluster_hosts(product: MultiNodeProduct) -> Dict[str, Any]:
     """CLUS-01: every Host names one node, one of its inbounds, and the pinned fingerprint.
 
@@ -3447,6 +3843,12 @@ def cases(
         Case(DENIAL_CLASSIFICATION_CASE_ID, "multi-node",
              lambda context: case_denial_classification(product),
              timeout_seconds=DENIAL_TIMEOUT_SECONDS),
+        # The Master's rule set is read twice around this case's own connections,
+        # so it runs while nothing else is dialling the host and its counters only
+        # move for the attempts below.
+        Case(MASTER_ACCESS_CASE_ID, "multi-node",
+             lambda context: case_master_access(product),
+             timeout_seconds=FIREWALL_TIMEOUT_SECONDS),
         Case("CLUS-01", "multi-node", lambda context: case_cluster_hosts(product),
              timeout_seconds=CLUSTER_TIMEOUT_SECONDS),
         Case("CLUS-02", "multi-node", lambda context: case_cluster_squad(product),

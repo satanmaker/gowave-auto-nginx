@@ -16,6 +16,11 @@ connection to the control port; the evidence is what those attempts made the
 Worker record. SSH is deliberately attempted with host-key verification
 disabled and only a public-key method offered: the question is authentication,
 so making the host key the reason a login failed would answer a different one.
+
+FW-03 asks the same question of a single host's own rule set, from every origin
+that host can be reached from: real connections from the internet role, from the
+run's published address block, and from the host itself, each one paired with the
+rule counters that moved while it ran.
 """
 from __future__ import annotations
 
@@ -25,6 +30,11 @@ from typing import Any, Dict, List, Optional, Sequence
 
 NODE_PORT = 3002
 SSH_PORT = 22
+HTTPS_PORT = 443
+HTTP_PORT = 80
+# The panel vhost listens here on loopback only; the stream map sends the panel
+# SNI to it, so it is the one management port a scan would want to reach.
+PANEL_API_PORT = 7443
 
 # Markers are what separates "the command ran" from "the connection ended".
 TRUSTED_MARKER = "GOWAVE_TRUSTED_SSH_OK"
@@ -533,3 +543,287 @@ def sshd_observation(
     report["returncode"] = result.returncode
     report["detail"] = (result.stderr or "").strip()[-400:]
     return report
+
+
+# --------------------------------------------------------------------------- #
+# FW-03: one host's rule set, measured from every origin it can be reached from
+# --------------------------------------------------------------------------- #
+
+# A bind on any of these addresses answers every interface; one on 127.0.0.1
+# answers only the host itself. Which of the two a port has decides whether an
+# external refusal was the rule set or the socket.
+WILDCARD_ADDRESSES = ("0.0.0.0", "*", "::", "[::]")
+
+# Every attempt is a real TCP connection from the container the origin names.
+# The attempts arrive as one JSON document so no value is ever re-quoted by a
+# shell, and every label is reported back with its own outcome.
+_TCP_PATHS = r'''
+import json, socket, sys, time
+
+ATTEMPTS = json.loads(sys.argv[1])
+report = []
+for attempt in ATTEMPTS:
+    entry = {
+        "label": attempt["label"],
+        "address": attempt["address"],
+        "port": attempt["port"],
+    }
+    started = time.monotonic()
+    try:
+        connection = socket.create_connection(
+            (attempt["address"], attempt["port"]), timeout=attempt["timeout"],
+        )
+    except ConnectionRefusedError as exc:
+        entry["outcome"] = "REFUSED"
+        entry["detail"] = str(exc)
+    except TimeoutError:
+        entry["outcome"] = "TIMEOUT"
+        entry["detail"] = "no answer within %ss" % attempt["timeout"]
+    except OSError as exc:
+        entry["outcome"] = "UNREACHABLE"
+        entry["detail"] = str(exc)
+    else:
+        entry["outcome"] = "CONNECTED"
+        if attempt.get("banner"):
+            connection.settimeout(attempt["timeout"])
+            try:
+                entry["banner"] = connection.recv(256).decode("latin-1", "replace").strip()
+            except OSError as exc:
+                entry["banner"] = ""
+                entry["banner_error"] = str(exc)
+        connection.close()
+    entry["elapsed_ms"] = int((time.monotonic() - started) * 1000)
+    report.append(entry)
+print(json.dumps(report))
+'''
+
+# Three views of one rule set: what UFW says it is, what the kernel is actually
+# enforcing (with the packet counters that prove our attempts traversed it), and
+# which address each declared port is bound to. The bind addresses separate
+# "nothing listens there" from "the packet was filtered".
+_HOST_FIREWALL = r'''
+import json, subprocess
+
+PORTS = __PORTS__
+
+
+def run(*argv):
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=45)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, "", str(exc)
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+report = {"ports": PORTS}
+
+code, out, err = run("ufw", "status", "verbose")
+report["ufw_returncode"] = code
+report["ufw"] = [line.rstrip() for line in out.splitlines() if line.strip()]
+report["ufw_error"] = (err or "").strip()[-400:]
+
+code, out, err = run("iptables", "-S")
+report["rules_returncode"] = code
+report["rules"] = [line.rstrip() for line in out.splitlines() if line.strip()]
+report["rules_error"] = (err or out).strip()[-400:]
+
+code, out, err = run("iptables", "-L", "INPUT", "-v", "-n", "-x")
+report["policy_returncode"] = code
+report["policy"] = [line.rstrip() for line in out.splitlines() if line.strip()]
+
+code, out, err = run("iptables", "-L", "ufw-user-input", "-v", "-n", "-x")
+report["chain_returncode"] = code
+report["chain"] = [line.rstrip() for line in out.splitlines() if line.strip()]
+report["chain_error"] = (err or out).strip()[-400:]
+
+code, out, err = run("ss", "-ltn")
+report["listeners_returncode"] = code
+report["listeners"] = [line.rstrip() for line in out.splitlines() if line.strip()]
+
+print(json.dumps(report))
+'''
+
+
+def tcp_paths_script(attempts: Sequence[Dict[str, Any]]) -> str:
+    """The argv the path probe runs with: one JSON document, no shell quoting."""
+    return json.dumps([dict(attempt) for attempt in attempts], sort_keys=True)
+
+
+def host_firewall_script(ports: Sequence[int]) -> str:
+    """What the host's own firewall says about the ports under test."""
+    return _HOST_FIREWALL.replace("__PORTS__", json.dumps(sorted({int(port) for port in ports})))
+
+
+def _json_list(output: str) -> List[Any]:
+    for line in reversed((output or "").splitlines()):
+        stripped = line.strip()
+        if not (stripped.startswith("[") and stripped.endswith("]")):
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, list):
+            return parsed
+    return []
+
+
+def parse_tcp_paths(output: str) -> Dict[str, Dict[str, Any]]:
+    """Each attempt's outcome, keyed by the label it was given."""
+    observed: Dict[str, Dict[str, Any]] = {}
+    for entry in _json_list(output):
+        if not isinstance(entry, dict):
+            continue
+        label = str(entry.get("label") or "")
+        if not label:
+            continue
+        observed[label] = {
+            "address": entry.get("address"),
+            "port": entry.get("port"),
+            "outcome": str(entry.get("outcome") or ""),
+            "elapsed_ms": entry.get("elapsed_ms"),
+            "banner": entry.get("banner"),
+            "detail": entry.get("detail") or entry.get("banner_error") or "",
+        }
+    return observed
+
+
+def parse_listeners(lines: Sequence[str], ports: Sequence[int]) -> Dict[int, List[str]]:
+    """The addresses each port is bound to, from ``ss -ltn``."""
+    bound: Dict[int, List[str]] = {int(port): [] for port in ports}
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 4 or fields[0] != "LISTEN":
+            continue
+        address, _, port_text = fields[3].rpartition(":")
+        if not port_text.isdigit():
+            continue
+        port = int(port_text)
+        if port in bound:
+            bound[port].append(address or "*")
+    return bound
+
+
+def parse_input_policy(lines: Sequence[str]) -> Dict[str, Any]:
+    """The INPUT chain's own policy and the packets it has dropped itself.
+
+    A port with no rule of its own is answered by this policy, so its counters
+    are what make a silent timeout attributable to the rule set rather than to a
+    socket that was never there.
+    """
+    for line in lines:
+        match = re.match(
+            r"^Chain INPUT \(policy (\w+)(?: (\d+) packets, (\d+) bytes)?\)",
+            line.strip(),
+        )
+        if match:
+            return {
+                "policy": match.group(1),
+                "packets": int(match.group(2)) if match.group(2) else None,
+                "bytes": int(match.group(3)) if match.group(3) else None,
+            }
+    return {"policy": "", "packets": None, "bytes": None}
+
+
+def parse_default_incoming(ufw_lines: Sequence[str]) -> str:
+    """The default incoming verdict, as ``ufw status verbose`` states it."""
+    for line in ufw_lines:
+        stripped = line.strip()
+        if not stripped.startswith("Default:"):
+            continue
+        match = re.match(r"^Default:\s*(\w+)\s*\(incoming\)", stripped)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def parse_host_firewall(report: Dict[str, Any], ports: Sequence[int]) -> Dict[str, Any]:
+    """One host's effective policy, split per port by what it does to a packet."""
+    declared = [int(port) for port in ports]
+    # UFW writes its allow and deny rules into ``ufw-user-input``, which INPUT
+    # only jumps to, so the decisions are read from ``iptables -S`` (every chain,
+    # in its ``-j`` form) and the counters from the same chain's verbose listing.
+    rules = [str(line) for line in report.get("rules") or []]
+    chain = [str(line) for line in report.get("chain") or []]
+    ufw = [str(line) for line in report.get("ufw") or []]
+    allows: Dict[int, List[Dict[str, Any]]] = {port: [] for port in declared}
+    blocks: Dict[int, List[Dict[str, Any]]] = {port: [] for port in declared}
+    for line in rules:
+        fields = line.split()
+        if "--dport" not in fields:
+            continue
+        index = fields.index("--dport")
+        if index + 1 >= len(fields) or not fields[index + 1].isdigit():
+            continue
+        port = int(fields[index + 1])
+        if port not in allows:
+            continue
+        target = fields[fields.index("-j") + 1] if "-j" in fields else ""
+        source = fields[fields.index("-s") + 1].split("/")[0] if "-s" in fields else ""
+        entry = {"target": target, "source": source, "line": line.strip()}
+        if target in ("ACCEPT", "RETURN"):
+            allows[port].append(entry)
+        elif target in ("REJECT", "DROP"):
+            blocks[port].append(entry)
+    policy = parse_input_policy([str(line) for line in report.get("policy") or []])
+    return {
+        "active": any(line.strip() == "Status: active" for line in ufw),
+        "default_incoming": parse_default_incoming(ufw),
+        "input_policy": policy["policy"],
+        "input_policy_packets": policy["packets"],
+        "input_policy_bytes": policy["bytes"],
+        "ports": declared,
+        "allows": allows,
+        "blocks": blocks,
+        "counters": {port: parse_counters(chain, port) for port in declared},
+        "listeners": parse_listeners(
+            [str(line) for line in report.get("listeners") or []], declared,
+        ),
+        "rules_returncode": report.get("rules_returncode"),
+        "chain_returncode": report.get("chain_returncode"),
+        "error": report.get("chain_error") or report.get("rules_error") or "",
+        "ufw": ufw,
+    }
+
+
+def open_to_every_source(facts: Dict[str, Any], port: int) -> bool:
+    """Whether the port has an ACCEPT rule that names no source."""
+    return any(not entry["source"] for entry in facts["allows"].get(port, []))
+
+
+def packets_for(facts: Dict[str, Any], port: int) -> int:
+    """How many packets the port's rules have counted so far."""
+    return sum(int(entry.get("packets") or 0) for entry in facts["counters"].get(port, []))
+
+
+def tcp_paths(
+    podman: Any, container: str, attempts: Sequence[Dict[str, Any]],
+    timeout: int = PROBE_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Attempt every path from one origin and report what the attempt observed."""
+    prepared = [dict(attempt) for attempt in attempts]
+    result = podman.exec(
+        container, ["python3", "-c", _TCP_PATHS, tcp_paths_script(prepared)],
+        check=False, timeout=timeout,
+    )
+    observed = parse_tcp_paths(result.stdout or "")
+    observed["returncode"] = result.returncode
+    observed["detail"] = (result.stderr or "").strip()[-600:]
+    return observed
+
+
+def host_firewall(
+    podman: Any, container: str, ports: Sequence[int],
+    timeout: int = WORKER_REPORT_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """One host's rule set, its counters, and where each port is bound."""
+    declared = sorted({int(port) for port in ports})
+    result = podman.exec(
+        container, ["python3", "-c", host_firewall_script(declared)],
+        check=False, timeout=timeout,
+    )
+    report = _json_object(result.stdout or "")
+    facts = parse_host_firewall(report, declared)
+    facts["returncode"] = result.returncode
+    facts["detail"] = (result.stderr or "").strip()[-400:]
+    return facts
