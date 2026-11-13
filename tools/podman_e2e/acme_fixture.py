@@ -52,7 +52,16 @@ CONTAINER_FIXTURE_DIR = "/fixtures/acme"
 # own test suite, not of the product under test: here it would turn one install
 # in twenty into a failure that says nothing about GoWave. The knob is set to
 # zero so a certificate request either works or does not, deterministically.
-FIXTURE_ENVIRONMENT = {"PEBBLE_WFE_NONCEREJECT": "0"}
+#
+# Pebble likewise hands back an already-valid authorization half the time
+# (``PEBBLE_AUTHZREUSE`` defaults to 50%), and a reusing order performs no
+# challenge at all: a renewal then succeeds with an untouched webroot, which is
+# indistinguishable from the product never serving its challenge route. Both
+# ACME cases measure that route, so reuse is off. Pebble compares
+# ``rand.Intn(100) > percent``, so zero still reuses once in a hundred orders —
+# a reused renewal shows up as exit status 0 with no "http-01 challenge for"
+# line in its Certbot log.
+FIXTURE_ENVIRONMENT = {"PEBBLE_WFE_NONCEREJECT": "0", "PEBBLE_AUTHZREUSE": "0"}
 
 # Must stay byte-identical to GOWAVE_ACME_TEST_ENDPOINT in modules/nginx.sh and
 # gowave-node-auto.sh; a divergence would make test mode unreachable rather than
