@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 68
-  total: 193
+  podman_first: 69
+  total: 194
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3478,6 +3478,25 @@ cases:
   driver: null
   driver_status: planned
   promotion_target: NGINX SNI Routing and REALITY Decoy Verification
+- id: ACME-01
+  requirement: Real ACME issuance and renewal through the pinned directory
+  live_scenario: null
+  assertion: On the installed host the certificate serving the Panel domain was issued during this run
+    by the pinned ACME directory, Certbot's own renewal record names the webroot method and that webroot,
+    a token written into the webroot is fetched through the product's port 80 vhost from an independent
+    client, and a forced renewal performs an HTTP-01 challenge and yields a new serial whose leaf the
+    independent client receives after the product's deploy hook reloads NGINX without replacing the master.
+  assertion_sha256: 73faa97a9d89b56ea9796614425d204c699b73ec24bbee0dab13bdb25f6c138f
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Global Certbot Deploy Hook Ownership
 - id: NGX-COVER-DERIVE
   requirement: Camouflage decoy and certificate lineage
   live_scenario: null

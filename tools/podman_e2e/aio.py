@@ -16,11 +16,12 @@ from __future__ import annotations
 import json
 import shlex
 import time
+import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from . import client_trust, matrix, panel_surface, topology
+from . import acme_fixture, client_trust, matrix, panel_surface, topology
 from .podman import wait_until
 from .runner import Case, CaseBlocked, require
 
@@ -464,6 +465,289 @@ def ngx_config_script(mode: str, primary_domain: str) -> str:
         .replace("DIRECTIVE_PLACEHOLDER", NGX_CONFIG_DIRECTIVE)
         .replace("HOOK_PLACEHOLDER", NGX_CONFIG_HOOK)
         .replace("RELOAD_WAIT_PLACEHOLDER", str(int(NGX_CONFIG_RELOAD_WAIT_SECONDS)))
+    )
+
+
+ACME_CASE_ID = "ACME-01"
+# The directory the product hands Certbot on every role it provisions; the port
+# 80 vhost serves exactly this path, so a token written here is what an HTTP-01
+# validator has to fetch over the network.
+ACME_WEBROOT = "/var/www/gowave-acme"
+ACME_RENEWAL_DIR = "/etc/letsencrypt/renewal"
+ACME_ARCHIVE_DIR = "/etc/letsencrypt/archive"
+ACME_LINEAGE_DIR = "/etc/letsencrypt/live"
+# Certbot rotates no log per invocation, so the renewal writes into a directory
+# of its own: the challenge type it chose and the certificate it received are
+# then this invocation's own words instead of a line the install left behind.
+ACME_RENEWAL_LOG_DIR = "/tmp/gowave-e2e-acme-logs"
+# One phase costs a full Certbot renewal against the local directory plus the
+# master replacing its workers; the ceilings are hang guards, not expectations.
+ACME_PROBE_TIMEOUT_SECONDS = 180
+ACME_RENEWAL_TIMEOUT_SECONDS = 300
+ACME_RENEWAL_WAIT_SECONDS = 30
+ACME_ROUTE_TIMEOUT_SECONDS = 30
+ACME_TIMEOUT_SECONDS = 600
+# A lineage older than this predates the run that claims to have obtained it,
+# which is what a pre-seeded certificate looks like from the outside. The window
+# is wide because a slow install still has to fit inside it.
+ACME_ISSUANCE_WINDOW_SECONDS = 7200
+
+ACME_RENEWAL_SCRIPT = r"""python3 - MODE_PLACEHOLDER DOMAIN_PLACEHOLDER CA_PLACEHOLDER <<'PY'
+import calendar
+import json
+import os
+import subprocess
+import sys
+import time
+
+MODE = sys.argv[1]
+DOMAIN = sys.argv[2]
+CA_FILE = sys.argv[3]
+WEBROOT = "WEBROOT_PLACEHOLDER"
+LOG_DIR = "LOG_DIR_PLACEHOLDER"
+RENEWAL_DIR = "RENEWAL_DIR_PLACEHOLDER"
+ARCHIVE_DIR = "ARCHIVE_DIR_PLACEHOLDER"
+LINEAGE_DIR = "LINEAGE_DIR_PLACEHOLDER"
+RELOAD_WAIT_SECONDS = RELOAD_WAIT_PLACEHOLDER
+RENEWAL_TIMEOUT_SECONDS = RENEWAL_TIMEOUT_PLACEHOLDER
+
+
+def run(argv, timeout=90, env=None):
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout, env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return {
+            "returncode": 127,
+            "stdout": "",
+            "stderr": "%s: %s" % (type(error).__name__, error),
+        }
+    return {
+        "returncode": completed.returncode,
+        "stdout": completed.stdout or "",
+        "stderr": completed.stderr or "",
+    }
+
+
+def tail(result, limit=1500):
+    text = (result["stderr"] or result["stdout"] or "").strip()
+    return text[-limit:]
+
+
+def stamp(value):
+    # OpenSSL and the TLS client print the same UTC second; an epoch is what lets
+    # a certificate file on the host be compared with a certificate a client
+    # received over the wire as the one certificate they are.
+    try:
+        return calendar.timegm(time.strptime(value, "%b %d %H:%M:%S %Y %Z"))
+    except (TypeError, ValueError):
+        return None
+
+
+def certificate(path):
+    if not os.path.isfile(path):
+        return {"path": path, "present": False}
+    result = run((
+        "openssl", "x509", "-in", path, "-noout", "-serial", "-subject",
+        "-issuer", "-dates", "-ext", "subjectAltName",
+    ))
+    facts = {"path": path, "present": True, "returncode": result["returncode"]}
+    san = []
+    collecting = False
+    for raw in (result["stdout"] or "").splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("X509v3 Subject Alternative Name"):
+            collecting = True
+            continue
+        if collecting:
+            if not stripped:
+                collecting = False
+                continue
+            for token in stripped.split(","):
+                token = token.strip()
+                if token.startswith("DNS:"):
+                    san.append(token[len("DNS:"):])
+                elif token.startswith("IP Address:"):
+                    san.append(token[len("IP Address:"):].strip())
+            continue
+        key, separator, value = stripped.partition("=")
+        if not separator:
+            continue
+        key = key.replace(" ", "").lower()
+        value = value.strip()
+        if key == "serial":
+            facts["serial"] = value
+        elif key == "subject":
+            facts["subject"] = value
+        elif key == "issuer":
+            facts["issuer"] = value
+        elif key == "notbefore":
+            facts["not_before"] = value
+            facts["not_before_epoch"] = stamp(value)
+        elif key == "notafter":
+            facts["not_after"] = value
+            facts["not_after_epoch"] = stamp(value)
+    if san:
+        facts["san"] = san
+    return facts
+
+
+def lineage():
+    path = os.path.join(RENEWAL_DIR, DOMAIN + ".conf")
+    facts = {"path": path, "present": os.path.isfile(path), "values": {}}
+    if not facts["present"]:
+        return facts
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError as error:
+        facts["error"] = "%s: %s" % (type(error).__name__, error)
+        return facts
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if separator:
+            facts["values"][key.strip()] = value.strip()
+    return facts
+
+
+def sequence(name):
+    digits = "".join(character for character in name if character.isdigit())
+    return int(digits or 0)
+
+
+def archive():
+    directory = os.path.join(ARCHIVE_DIR, DOMAIN)
+    try:
+        names = sorted(
+            (name for name in os.listdir(directory)
+             if name.startswith("cert") and name.endswith(".pem")),
+            key=sequence,
+        )
+    except OSError:
+        return []
+    return [certificate(os.path.join(directory, name)) for name in names]
+
+
+def live():
+    return certificate(os.path.join(LINEAGE_DIR, DOMAIN, "fullchain.pem"))
+
+
+def child_pids(pid):
+    try:
+        with open("/proc/%s/task/%s/children" % (pid, pid), encoding="utf-8") as handle:
+            return sorted(entry for entry in handle.read().split() if entry.isdigit())
+    except OSError:
+        return []
+
+
+def service():
+    active = run(("systemctl", "is-active", "nginx"))
+    show = run(("systemctl", "show", "-p", "MainPID", "--value", "nginx"))
+    main = (show["stdout"] or "").strip()
+    workers = []
+    if main.isdigit() and int(main) > 0:
+        workers = child_pids(main)
+        if not workers:
+            children = run(("pgrep", "-P", main))
+            workers = sorted(pid for pid in (children["stdout"] or "").split() if pid.isdigit())
+    return {
+        "active": (active["stdout"] or "").strip(),
+        "main_pid": main,
+        "worker_pids": workers,
+        "listeners_443": len([
+            line for line in (run(("ss", "-H", "-ltn", "sport = :443"))["stdout"] or "").splitlines()
+            if line.strip()
+        ]),
+    }
+
+
+def configuration_test():
+    result = run(("nginx", "-t"))
+    return {"returncode": result["returncode"], "tail": tail(result, 600)}
+
+
+def wait_for_new_workers(before_pids):
+    # Poll until the master replaced a worker, or the deadline expires.
+    started = time.monotonic()
+    deadline = started + RELOAD_WAIT_SECONDS
+    state = service()
+    while set(state["worker_pids"]) <= set(before_pids) and time.monotonic() < deadline:
+        time.sleep(0.5)
+        state = service()
+    return state, round(time.monotonic() - started, 2)
+
+
+def renewal_log():
+    try:
+        with open(os.path.join(LOG_DIR, "letsencrypt.log"), encoding="utf-8",
+                  errors="replace") as handle:
+            return handle.read()[-20000:]
+    except OSError:
+        return ""
+
+
+report = {
+    "mode": MODE,
+    "domain": DOMAIN,
+    "webroot": WEBROOT,
+    "challenge_dir": os.path.join(WEBROOT, ".well-known", "acme-challenge"),
+    "lineage": lineage(),
+    "live": live(),
+    "archive": archive(),
+    "service": service(),
+    "test": configuration_test(),
+}
+if MODE == "renew":
+    environment = dict(os.environ)
+    if CA_FILE:
+        # The same scoped anchor run_certbot uses in test mode: the fixture CA
+        # signs the ACME endpoint and nothing installs it system-wide, so the
+        # renewal has to be handed the anchor the install was handed.
+        environment["REQUESTS_CA_BUNDLE"] = CA_FILE
+        environment["SSL_CERT_FILE"] = CA_FILE
+    started = time.monotonic()
+    renewal = run(
+        ("certbot", "renew", "--cert-name", DOMAIN, "--force-renewal",
+         "--non-interactive", "--no-random-sleep-on-renew", "--logs-dir", LOG_DIR),
+        timeout=RENEWAL_TIMEOUT_SECONDS, env=environment,
+    )
+    elapsed = round(time.monotonic() - started, 2)
+    after_hook, waited = wait_for_new_workers(report["service"]["worker_pids"])
+    report.update({
+        "renewal": {
+            "returncode": renewal["returncode"],
+            "stdout": (renewal["stdout"] or "").strip()[-3000:],
+            "stderr": (renewal["stderr"] or "").strip()[-3000:],
+            "tail": tail(renewal, 3000),
+            "duration_seconds": elapsed,
+        },
+        "certbot_log": renewal_log(),
+        "live_after": live(),
+        "archive_after": archive(),
+        "service_after": after_hook,
+        "test_after": configuration_test(),
+        "reload_waited_seconds": waited,
+    })
+print(json.dumps(report, sort_keys=True))
+PY
+"""
+
+
+def acme_renewal_script(mode: str, domain: str, ca_file: str) -> str:
+    """The ACME probe for one phase: read the lineage, or renew and read it again."""
+    return (
+        ACME_RENEWAL_SCRIPT
+        .replace("MODE_PLACEHOLDER", shlex.quote(mode))
+        .replace("DOMAIN_PLACEHOLDER", shlex.quote(domain))
+        .replace("CA_PLACEHOLDER", shlex.quote(ca_file))
+        .replace("WEBROOT_PLACEHOLDER", ACME_WEBROOT)
+        .replace("LOG_DIR_PLACEHOLDER", ACME_RENEWAL_LOG_DIR)
+        .replace("RENEWAL_DIR_PLACEHOLDER", ACME_RENEWAL_DIR)
+        .replace("ARCHIVE_DIR_PLACEHOLDER", ACME_ARCHIVE_DIR)
+        .replace("LINEAGE_DIR_PLACEHOLDER", ACME_LINEAGE_DIR)
+        .replace("RELOAD_WAIT_PLACEHOLDER", str(int(ACME_RENEWAL_WAIT_SECONDS)))
+        .replace("RENEWAL_TIMEOUT_PLACEHOLDER", str(int(ACME_RENEWAL_TIMEOUT_SECONDS)))
     )
 
 
@@ -2190,6 +2474,301 @@ def case_nginx_config(product: AioProduct) -> Dict[str, Any]:
     )
 
 
+def acme_renewal_facts(
+    podman: Any, container: str, case_id: str, mode: str, domain: str, ca_file: str,
+    timeout: int = ACME_PROBE_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """One phase of the ACME contract: the lineage as it is, or renewed and read again."""
+    result = podman.exec_bash(
+        container, acme_renewal_script(mode, domain, ca_file), check=False, timeout=timeout,
+    )
+    return probe_json(case_id, f"the ACME {mode} probe on {container}", result)
+
+
+def require_webroot_lineage(case_id: str, role: str, domain: str, facts: Dict[str, Any]) -> None:
+    """Certbot's own renewal record describes the webroot lineage the install used.
+
+    The record is what an unattended renewal reads, so an ``authenticator`` or
+    ``webroot_path`` that differs from the install's would make the renewal
+    validate through a route this case never observes — or fail outright.
+    """
+    lineage = facts.get("lineage") or {}
+    values = lineage.get("values") or {}
+    require(case_id, lineage.get("present"),
+            f"{role}: Certbot keeps no renewal lineage at {lineage.get('path')!r} for {domain}, "
+            "so the installed certificate would never be renewed")
+    require(case_id, values.get("authenticator") == "webroot",
+            f"{role}: the renewal lineage for {domain} authenticates as "
+            f"{values.get('authenticator')!r} instead of the webroot method the install used")
+    require(case_id, values.get("webroot_path") == ACME_WEBROOT,
+            f"{role}: the renewal lineage for {domain} writes its challenge under "
+            f"{values.get('webroot_path')!r} instead of {ACME_WEBROOT}, which is the path "
+            "the port 80 vhost serves")
+    require(case_id, values.get("server") == acme_fixture.ACME_DIRECTORY_URL,
+            f"{role}: the renewal lineage for {domain} points at {values.get('server')!r} "
+            f"instead of this run's ACME directory {acme_fixture.ACME_DIRECTORY_URL!r}")
+
+
+def require_certificate_was_issued_in_this_run(
+    case_id: str, role: str, domain: str, facts: Dict[str, Any], now: float,
+) -> Dict[str, Any]:
+    """The installed leaf is fresh, so it came from this run and not from an image.
+
+    A certificate baked into an image or copied in by the harness would still be
+    served, still chain to the fixture CA, and still pass a TLS case — its
+    ``notBefore`` is the one fact that puts its issuance inside this run.
+    """
+    live = facts.get("live") or {}
+    require(case_id, live.get("present"),
+            f"{role}: no certificate is installed at {live.get('path')!r} for {domain}")
+    require(case_id, live.get("returncode") == 0 and live.get("subject"),
+            f"{role}: the installed certificate for {domain} could not be read: "
+            f"{live.get('path')!r}")
+    issued = live.get("not_before_epoch")
+    require(case_id, isinstance(issued, int),
+            f"{role}: the installed certificate reports no parseable notBefore "
+            f"({live.get('not_before')!r})")
+    require(case_id, issued >= int(now) - ACME_ISSUANCE_WINDOW_SECONDS,
+            f"{role}: the certificate installed for {domain} was issued at "
+            f"{live.get('not_before')!r}, more than {ACME_ISSUANCE_WINDOW_SECONDS}s before this "
+            "case ran, so it was seeded rather than obtained through the operator's ACME path")
+    return {
+        "serial": live.get("serial"),
+        "not_before": live.get("not_before"),
+        "not_after": live.get("not_after"),
+        "san": live.get("san"),
+        "issuer": live.get("issuer"),
+        "installed_certificates": len(facts.get("archive") or []),
+    }
+
+
+def require_webroot_route(case_id: str, role: str, domain: str, probe: Dict[str, Any]) -> Dict[str, Any]:
+    """The product's own port 80 vhost serves the token a validator has to fetch.
+
+    The token is fetched from the Control Machine, not from the host: what an ACME
+    validator sees is a request over the network to the challenge URL, so a file
+    read from the host would prove the wrong thing.
+    """
+    report = probe.get("probe") or {}
+    require(case_id, probe.get("returncode") == 0,
+            f"{role}: an independent client could not fetch "
+            f"http://{domain}/.well-known/acme-challenge/ through the product's port 80 vhost: "
+            f"{report.get('error') or (probe.get('stderr') or '').strip()[-600:]}")
+    require(case_id, report.get("status") == 200,
+            f"{role}: the product's port 80 vhost answered {report.get('status')!r} for "
+            f"http://{domain}/.well-known/acme-challenge/ instead of serving the token")
+    return {
+        "url": report.get("url"),
+        "status": report.get("status"),
+        "body_length": report.get("body_length"),
+        "body_sha256": report.get("body_sha256"),
+    }
+
+
+def require_renewal_issued(case_id: str, role: str, domain: str, facts: Dict[str, Any]) -> Dict[str, Any]:
+    """A forced renewal performs a real HTTP-01 challenge and yields a new certificate.
+
+    Issuance is the validator's own verdict: the fixture directory is not
+    configured to accept challenges without fetching them, so a new certificate
+    with a new serial and a later ``notBefore`` can only exist after a successful
+    HTTP-01 fetch from the challenge URL. The challenge type is read from
+    Certbot's log for this invocation, which is what rules out a DNS-01 or
+    TLS-ALPN-01 path that the route probe could never have observed.
+    """
+    renewal = facts.get("renewal") or {}
+    require(case_id, facts.get("mode") == "renew",
+            f"{role}: the renewal probe answered for {facts.get('mode')!r}")
+    require(case_id, renewal.get("returncode") == 0,
+            f"{role}: `certbot renew --force-renewal` for {domain} exited "
+            f"{renewal.get('returncode')!r}: {renewal.get('tail')}")
+    transcript = "\n".join([
+        str(facts.get("certbot_log") or ""),
+        str(renewal.get("stdout") or ""),
+        str(renewal.get("stderr") or ""),
+    ])
+    require(case_id, f"http-01 challenge for {domain}" in transcript,
+            f"{role}: the renewal for {domain} did not perform an HTTP-01 challenge, so the "
+            f"challenge route this case validates is not the one that was used: "
+            f"{renewal.get('tail')}")
+    require(case_id, "Successfully received certificate" in transcript,
+            f"{role}: Certbot never reported receiving a renewed certificate for {domain}: "
+            f"{renewal.get('tail')}")
+    before = facts.get("archive") or []
+    after = facts.get("archive_after") or []
+    require(case_id, len(after) > len(before),
+            f"{role}: the archive for {domain} holds {len(after)} certificate(s) after a forced "
+            f"renewal, the same count it held before it ({[item.get('path') for item in after]})")
+    old = facts.get("live") or {}
+    new = facts.get("live_after") or {}
+    require(case_id, old.get("serial") and new.get("serial") and old.get("serial") != new.get("serial"),
+            f"{role}: the renewed lineage for {domain} still reports certificate serial "
+            f"{new.get('serial')!r}")
+    issued, renewed = old.get("not_before_epoch"), new.get("not_before_epoch")
+    require(case_id, isinstance(renewed, int) and isinstance(issued, int) and renewed > issued,
+            f"{role}: the renewed certificate for {domain} is not newer than the one it replaced "
+            f"({old.get('not_before')!r} -> {new.get('not_before')!r})")
+    return {
+        "returncode": renewal.get("returncode"),
+        "duration_seconds": renewal.get("duration_seconds"),
+        "challenge": f"http-01 for {domain}",
+        "installed_certificates_before": len(before),
+        "installed_certificates_after": len(after),
+        "serial_before": old.get("serial"),
+        "serial_after": new.get("serial"),
+        "not_before_before": old.get("not_before"),
+        "not_before_after": new.get("not_before"),
+        "certbot_tail": str(renewal.get("tail") or "")[-600:],
+    }
+
+
+def require_renewed_certificate_is_served(
+    case_id: str, role: str, domain: str, facts: Dict[str, Any], report: Dict[str, Any],
+    expected_status: int,
+) -> Dict[str, Any]:
+    """The handshake a client gets now carries the certificate the renewal issued.
+
+    Reloading NGINX onto a new lineage is the only way the served leaf can change,
+    so matching the client's ``notBefore`` to the renewed file is what proves the
+    renewal reached the public surface rather than only the disk.
+    """
+    verified = require_client_certificate(case_id, role, domain, report, expected_status)
+    renewed = (facts.get("live_after") or {}).get("not_before_epoch")
+    require(case_id, isinstance(renewed, int),
+            f"{role}: the renewed certificate for {domain} reports no parseable notBefore")
+    served = verified.get("not_before")
+    expected = datetime.fromtimestamp(renewed, timezone.utc).isoformat()
+    require(case_id, served == expected,
+            f"{role}: the certificate served for {domain} starts at {served!r}, not at the "
+            f"{expected!r} the renewal issued, so NGINX is still serving the replaced lineage")
+    return verified
+
+
+def require_renewal_reloaded_nginx(
+    case_id: str, role: str, facts: Dict[str, Any],
+) -> Dict[str, Any]:
+    """The product's deploy hook reloaded the master onto the renewed lineage.
+
+    A renewal that never reloads leaves NGINX serving the expired certificate
+    until the next restart, which is the exact failure the managed hook exists to
+    prevent; replacing the master instead of reloading it would drop the
+    listeners the hook is supposed to leave alone.
+    """
+    baseline = facts.get("service") or {}
+    refreshed = facts.get("service_after") or {}
+    require(case_id, baseline.get("worker_pids"),
+            f"{role}: the renewal probe read no worker before the renewal "
+            f"({baseline.get('worker_pids')!r}), so no reload could be observed")
+    require(case_id, refreshed.get("active") == "active",
+            f"{role}: NGINX is {refreshed.get('active')!r} after the renewal")
+    require(case_id, refreshed.get("main_pid") == baseline.get("main_pid"),
+            f"{role}: the renewal replaced the NGINX master "
+            f"({baseline.get('main_pid')} -> {refreshed.get('main_pid')}) instead of reloading it")
+    appeared = sorted(set(refreshed.get("worker_pids") or []) - set(baseline.get("worker_pids") or []))
+    require(case_id, appeared,
+            f"{role}: the product's deploy hook did not reload NGINX after the renewal "
+            f"(workers stayed {baseline.get('worker_pids')} for "
+            f"{facts.get('reload_waited_seconds')}s)")
+    require(case_id, int(refreshed.get("listeners_443") or 0) >= 1,
+            f"{role}: nothing listens on 443 after the renewal reloaded NGINX")
+    test = facts.get("test_after") or {}
+    require(case_id, test.get("returncode") == 0,
+            f"{role}: the configuration fails `nginx -t` after the renewal:\n{test.get('tail', '')}")
+    return {
+        "master_pid": refreshed.get("main_pid"),
+        "worker_pids_before": baseline.get("worker_pids"),
+        "worker_pids_after": refreshed.get("worker_pids"),
+        "listener_443": refreshed.get("listeners_443"),
+        "nginx_test_returncode": test.get("returncode"),
+        "reload_waited_seconds": facts.get("reload_waited_seconds"),
+    }
+
+
+def _acme_route_probe(
+    product: AioProduct, case_id: str, role: str, domain: str,
+) -> Dict[str, Any]:
+    """Place a token in the product's webroot and fetch it as a validator would.
+
+    The token is removed in a ``finally`` block: a case that fails must not leave
+    a challenge file behind for the next renewal or for a later case to read.
+    """
+    token = uuid.uuid4().hex
+    body = f"gowave-e2e-acme-{token}"
+    directory = f"{ACME_WEBROOT}/.well-known/acme-challenge"
+    challenge = f"{directory}/{token}"
+    write = product.host_script(
+        f"install -d -m 0755 {shlex.quote(directory)} && "
+        f"printf '%s' {shlex.quote(body)} > {shlex.quote(challenge)}",
+        timeout=60,
+    )
+    try:
+        require(case_id, write.returncode == 0,
+                f"{role}: the case could not write a challenge token into the product's ACME "
+                f"webroot: {(write.stderr or write.stdout or '').strip()[-600:]}")
+        return product.host.client_http(
+            f"http://{domain}/.well-known/acme-challenge/{token}",
+            expect_status=200, expect_body=body, timeout=ACME_ROUTE_TIMEOUT_SECONDS,
+        )
+    finally:
+        product.host_script(f"rm -f {shlex.quote(challenge)}", timeout=60)
+
+
+def acme_renewal_contract(
+    product: AioProduct, case_id: str, role: str, domain: str,
+    container: str = "", expected_status: int = 200,
+) -> Dict[str, Any]:
+    """Prove issuance and renewal run through the target's own webroot route.
+
+    Four observations make one conclusion, and none of them substitutes for
+    another: Certbot's renewal record names the webroot method, the product's
+    port 80 vhost serves a token written into that webroot to an independent
+    client, a forced renewal performs an HTTP-01 challenge and yields a new
+    serial, and the certificate the client now receives is that renewed leaf
+    behind a reloaded — not restarted — NGINX.
+    """
+    host = product.require_installed()
+    target = container or host.target_name
+    ca_file = str(host.install_environment().get("GOWAVE_ACME_TEST_CA_FILE", ""))
+    now = time.time()
+    before = acme_renewal_facts(product.podman, target, case_id, "before", domain, ca_file)
+    require_webroot_lineage(case_id, role, domain, before)
+    installed = require_certificate_was_issued_in_this_run(case_id, role, domain, before, now)
+    route = require_webroot_route(
+        case_id, role, domain, _acme_route_probe(product, case_id, role, domain),
+    )
+    renewed = acme_renewal_facts(product.podman, target, case_id, "renew", domain, ca_file)
+    issuance = require_renewal_issued(case_id, role, domain, renewed)
+    served = require_renewed_certificate_is_served(
+        case_id, role, domain, renewed,
+        host.client_http(f"https://{domain}/", expect_status=expected_status,
+                         expect_san=[domain], timeout=30),
+        expected_status,
+    )
+    reload_facts = require_renewal_reloaded_nginx(case_id, role, renewed)
+    return {
+        "role": role,
+        "domain": domain,
+        "webroot": ACME_WEBROOT,
+        "lineage": (before.get("lineage") or {}).get("values"),
+        "installed_certificate": installed,
+        "challenge_route": route,
+        "renewal": issuance,
+        "served_after_renewal": served,
+        "reload": reload_facts,
+    }
+
+
+def case_acme_renewal(product: AioProduct) -> Dict[str, Any]:
+    """ACME-01: the certificate serving the Panel is issued and renewed for real.
+
+    The product does not ship a certificate: it asks the pinned ACME directory
+    for one through Certbot's webroot method, and the port 80 vhost it generated
+    is what the validator fetches. The case never writes a certificate and never
+    answers a challenge itself — it plants one token to prove the route, then lets
+    Certbot renew the lineage and checks that the leaf a client receives changed.
+    """
+    return acme_renewal_contract(product, ACME_CASE_ID, "the All-in-One host", PANEL_DOMAIN)
+
+
 def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
     """SUB-SERVED: every served representation is fetched and loaded by its real client.
 
@@ -2618,6 +3197,11 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # traffic so a reload it caused can never be read as a data-plane fault.
         Case(NGX_CONFIG_CASE_ID, "aio", lambda context: case_nginx_config(product),
              timeout_seconds=NGX_CONFIG_TIMEOUT_SECONDS),
+        # The renewal runs before any traffic for the same reason: it reloads
+        # NGINX onto a fresh lineage, and a data-plane case must not be measured
+        # across a reload this one caused.
+        Case(ACME_CASE_ID, "aio", lambda context: case_acme_renewal(product),
+             timeout_seconds=ACME_TIMEOUT_SECONDS),
         Case("AIO-AUTH", "aio", lambda context: case_panel_auth(product), timeout_seconds=300),
         Case("AIO-CLIENT", "aio", lambda context: case_client_lifecycle(product), timeout_seconds=300),
         Case("SUB-SERVED", "aio", lambda context: case_subscriptions(product), timeout_seconds=600),
