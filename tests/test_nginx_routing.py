@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import hashlib
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -761,9 +762,10 @@ class TestNginxRouting(unittest.TestCase):
             first = f'source "{NGINX_SH}" && install_managed_deploy_hook "install_1" "{hook_file}" "{rec_dir}"'
             res_first = subprocess.run(["bash", "-c", first], capture_output=True, text=True)
             self.assertEqual(res_first.returncode, 0, res_first.stderr)
-            # Commit keeps the manifest: it is the only host-local proof that the
-            # hook at this path was written by this product.
+            # Commit keeps the transaction manifest, and the ownership record next
+            # to the snapshots proves the hook at this path is this product's file.
             self.assertTrue((rec_dir / "install_1" / "deploy-hook-manifest.json").is_file())
+            self.assertTrue((rec_dir / "deploy-hook-ownership.json").is_file())
 
             # Every repeat install runs under a new transaction id, so its own
             # manifest does not exist yet; the hook a prior transaction recorded is
@@ -779,6 +781,33 @@ class TestNginxRouting(unittest.TestCase):
             res_fourth = subprocess.run(["bash", "-c", fourth], capture_output=True, text=True)
             self.assertNotEqual(res_fourth.returncode, 0)
             self.assertIn("Pre-existing unowned Certbot deploy hook found", res_fourth.stderr)
+
+    def test_deploy_hook_ownership_survives_the_transaction_snapshot(self):
+        """Pruning the snapshot must not turn this product's own hook into a foreign file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            hook_file = tmp / "renewal-hooks" / "deploy" / "gowave-nginx.sh"
+            rec_dir = tmp / "recovery"
+
+            install = f'source "{NGINX_SH}" && install_managed_deploy_hook "install_1" "{hook_file}" "{rec_dir}"'
+            res_install = subprocess.run(["bash", "-c", install], capture_output=True, text=True)
+            self.assertEqual(res_install.returncode, 0, res_install.stderr)
+            record = rec_dir / "deploy-hook-ownership.json"
+            self.assertTrue(record.is_file())
+            self.assertEqual(record.stat().st_mode & 0o777, 0o600)
+
+            shutil.rmtree(rec_dir / "install_1")
+            repeat = f'source "{NGINX_SH}" && install_managed_deploy_hook "install_2" "{hook_file}" "{rec_dir}"'
+            res_repeat = subprocess.run(["bash", "-c", repeat], capture_output=True, text=True)
+            self.assertEqual(res_repeat.returncode, 0, res_repeat.stderr)
+
+            # The retained record names the exact file it wrote, so an operator edit
+            # voids ownership instead of silently licensing the overwrite.
+            hook_file.write_text("#!/bin/sh\necho hijacked\n")
+            preflight = f'source "{NGINX_SH}" && verify_deploy_hook_preflight "{hook_file}" "install_3" "{rec_dir}"'
+            res_preflight = subprocess.run(["bash", "-c", preflight], capture_output=True, text=True)
+            self.assertNotEqual(res_preflight.returncode, 0)
+            self.assertIn("Pre-existing unowned Certbot deploy hook found", res_preflight.stderr)
 
     def test_deploy_hook_ownership_create_and_rollback(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -800,6 +829,8 @@ class TestNginxRouting(unittest.TestCase):
             res_rollback = subprocess.run(["bash", "-c", cmd_rollback], capture_output=True, text=True)
             self.assertEqual(res_rollback.returncode, 0, res_rollback.stderr)
             self.assertFalse(hook_file.exists())
+            # Ownership is cleared with the hook, so nothing claims the path next time.
+            self.assertFalse((rec_dir / "deploy-hook-ownership.json").exists())
 
     def test_deploy_hook_ownership_rollback_preserves_modified_replacement(self):
         with tempfile.TemporaryDirectory() as tmpdir:

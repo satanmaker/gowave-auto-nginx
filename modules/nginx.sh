@@ -577,6 +577,37 @@ EOF
     echo "Generated $out_file."
 }
 
+deploy_hook_ownership_record() {
+    printf '%s\n' "${1:-/var/lib/gowave-auto-nginx/recovery}/deploy-hook-ownership.json"
+}
+
+deploy_hook_record_matches() {
+    local record="$1"
+    local hook_file="$2"
+    local digest="$3"
+
+    if [[ ! -f "$record" || -L "$record" ]]; then
+        return 1
+    fi
+    python3 - "$record" "$hook_file" "$digest" <<'PY'
+import json
+import sys
+
+record_path, hook_path, digest = sys.argv[1:4]
+try:
+    with open(record_path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if (
+    isinstance(data, dict)
+    and data.get("created_by_tx") is True
+    and data.get("path") == hook_path
+    and data.get("sha256") == digest
+) else 1)
+PY
+}
+
 deploy_hook_owned_by_prior_transaction() {
     local hook_file="$1"
     local recovery_root="$2"
@@ -592,29 +623,14 @@ deploy_hook_owned_by_prior_transaction() {
     if [[ -z "$digest" ]]; then
         return 1
     fi
+    # The record outside the transaction directories outlives snapshot purges and
+    # deletions, so a repeated install still recognises the hook it installed.
+    if deploy_hook_record_matches "$(deploy_hook_ownership_record "$recovery_root")" "$hook_file" "$digest"; then
+        return 0
+    fi
     local manifest
     for manifest in "${recovery_root}"/*/deploy-hook-manifest.json; do
-        if [[ ! -f "$manifest" || -L "$manifest" ]]; then
-            continue
-        fi
-        if python3 - "$manifest" "$hook_file" "$digest" <<'PY'
-import json
-import sys
-
-manifest_path, hook_path, digest = sys.argv[1:4]
-try:
-    with open(manifest_path, "r", encoding="utf-8") as stream:
-        data = json.load(stream)
-except Exception:
-    raise SystemExit(1)
-raise SystemExit(0 if (
-    isinstance(data, dict)
-    and data.get("created_by_tx") is True
-    and data.get("path") == hook_path
-    and data.get("sha256") == digest
-) else 1)
-PY
-        then
+        if deploy_hook_record_matches "$manifest" "$hook_file" "$digest"; then
             return 0
         fi
     done
@@ -803,6 +819,20 @@ EOF
         echo "Error: Could not sync Certbot deploy-hook directory after installation." >&2
         return 1
     }
+    local ownership_record ownership_tmp
+    ownership_record=$(deploy_hook_ownership_record "$recovery_root")
+    ownership_tmp="${ownership_record}.tmp.$$"
+    python3 -c 'import json, os, sys; record, tx_id, path, digest = sys.argv[1:5]; flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0); fd = os.open(record, flags, 0o600); stream = os.fdopen(fd, "w", encoding="utf-8"); json.dump({"transaction_id": tx_id, "path": path, "created_by_tx": True, "sha256": digest}, stream, indent=2); stream.flush(); os.fsync(stream.fileno()); stream.close()' "$ownership_tmp" "$transaction_id" "$hook_file" "$digest" || {
+        rm -f -- "$ownership_tmp" || true
+        echo "Error: Could not record deploy-hook ownership for later transactions." >&2
+        return 1
+    }
+    if ! chmod 0600 -- "$ownership_tmp" || ! sync "$ownership_tmp" ||
+        ! mv -f -- "$ownership_tmp" "$ownership_record" || ! sync "$recovery_root"; then
+        rm -f -- "$ownership_tmp" || true
+        echo "Error: Could not publish the deploy-hook ownership record." >&2
+        return 1
+    fi
     echo "Configured managed ACME renewal hook in $hook_file."
 }
 rollback_managed_deploy_hook() {
@@ -896,6 +926,10 @@ PY
     }
     sync "$(dirname "$hook_file")" || {
         echo "Error: Could not sync deploy-hook directory after rollback." >&2
+        return 1
+    }
+    rm -f -- "$(deploy_hook_ownership_record "$recovery_root")" || {
+        echo "Error: Could not clear the deploy-hook ownership record after rollback." >&2
         return 1
     }
     return 0
