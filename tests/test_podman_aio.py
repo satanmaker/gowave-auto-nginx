@@ -3406,7 +3406,10 @@ class TestFaultCases(unittest.TestCase):
 
     # -------------------------------------------------------------- the cases
     def test_the_panel_outage_case_fails_when_https_still_answers_with_the_unit_down(self):
-        product, _ = installed_product(self.context, [("inactive\n", 0)])
+        product, _ = installed_product(self.context, [
+            ("inactive\n", 0),
+            ("active\n", 0),
+        ])
         down = json.loads(json.dumps(self.PANEL_STATE))
         down["unit"] = {"ActiveState": "inactive", "SubState": "dead"}
         down["health"] = "ConnectionRefusedError: [Errno 111] Connection refused"
@@ -3424,6 +3427,9 @@ class TestFaultCases(unittest.TestCase):
                 aio.case_panel_service_down(product)
         self.assertIn("expected NGINX's 502", str(caught.exception))
         self.assertIn(f"systemctl stop {aio.PANEL_SERVICE}", product.podman.scripts[0])
+        # A fault case that fails half-way must still hand the host back with its
+        # control plane running, or every case after it reads a dead Panel.
+        self.assertIn(f"systemctl start {aio.PANEL_SERVICE}", product.podman.scripts[-1])
 
     def test_the_fault_cases_are_registered_before_the_idempotent_case_and_catalogued(self):
         suite = aio.cases(ScriptedPodman(self.context, []))
