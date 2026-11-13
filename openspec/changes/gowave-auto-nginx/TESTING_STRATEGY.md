@@ -1,7 +1,7 @@
 # Testing Strategy & CI Architecture: GoWave Auto NGINX
 
 **Document Status**: Authoritative Specification  
-**Source Baseline**: `community-baseline/tests/run_ci.py` (`community-baseline`) and `gowave-node/tests/`  
+**Source Baseline**: community-baseline `run_ci.py` runner patterns and `gowave-node/tests/`  
 **Purpose**: Define the 5-suite testing architecture, runner contract, EUID privilege separation, test matrix, and acceptance gates for GoWave Auto NGINX.
 
 ---

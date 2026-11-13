@@ -2,7 +2,7 @@
 
 ## Context
 
-See `proposal.md` for background and motivation. GoWave is an AGPL-3.0 licensed system consisting of a Go backend, React frontend, SQLite storage, and Go-based worker nodes (`gowave-node`). The infrastructure community baseline project, `community-baseline` (GPL-3.0), provides battle-tested implementations of NGINX Stream multiplexing, transactional security hardening, and Backup/Restore mechanisms.
+See `proposal.md` for background and motivation. GoWave is an AGPL-3.0 licensed system consisting of a Go backend, React frontend, SQLite storage, and Go-based worker nodes (`gowave-node`). Battle-tested NGINX Stream multiplexing, transactional security hardening, and Backup/Restore patterns were adopted from reviewed community installer baselines (GPL-3.0); upstream attribution is retained in `THIRD_PARTY_NOTICES.md`.
 
 This design specifies the modular implementation of a standalone installer and lifecycle manager for GoWave, detailing the network architecture, deterministic subscription delivery, host provisioning, update lifecycle, edge node hardening, backup system, and testing pipeline.
 
@@ -252,7 +252,7 @@ To prevent conflation between camouflage sites, management panels, and public VP
 4. **Camouflage Architecture (Scope Constraint)**:
    - **Mode A: Owned Camouflage Domain with Local Decoy (Exclusive MVP Scope)**: Operator configures an owned secondary domain (`reality_domain`, e.g. `cdn.example.com`). Certbot issues an authentic Let's Encrypt certificate for it. NGINX on loopback port 9443 terminates TLS presenting this authentic certificate and serves `cover-reality`. Xray REALITY uses `serverNames: ["cdn.example.com"]` and `dest: "127.0.0.1:9443", xver: 1`. Active probes receive valid certificates matching the SNI.
    - **Mode B: Third-Party SNI Stealing (Deferred Post-MVP Non-Goal)**: Third-party SNI proxying (`dest: external:443`, `xver: 0`) requires dynamic upstream SNI matching, external network reachability without loopback proxy protocol, and external certificate dependency. To ensure deterministic local validation and eliminate external blocking risks, Mode B is formally deferred to post-MVP Non-Goals.
-5. **Decoy Web Site (`cover-reality`)**: An authentic multi-asset website (retained from `community-baseline` `cover-reality` under `/var/www/gowave-auto-nginx/cover-reality` including complete HTML, stylesheets, scripts, and media assets) served on loopback port `9443` by NGINX. Minimal single-file HTML stubs are explicitly rejected to provide realistic camouflage against active probing and DPI scanners.
+5. **Decoy Web Site (`cover-reality`)**: An authentic multi-asset website (community-baseline `cover-reality` assets (attributed in `THIRD_PARTY_NOTICES.md`) under `/var/www/gowave-auto-nginx/cover-reality` including complete HTML, stylesheets, scripts, and media assets) served on loopback port `9443` by NGINX. Minimal single-file HTML stubs are explicitly rejected to provide realistic camouflage against active probing and DPI scanners.
 
 #### 3-Stage Dual-Lineage Let's Encrypt TLS Bootstrapping
 To resolve the classic chicken-and-egg bootstrap deadlock while guaranteeing permanent, non-deadlocking automated renewals via `certbot.timer`:
