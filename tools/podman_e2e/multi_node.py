@@ -155,6 +155,17 @@ COVER_SITE_LEAKS: Sequence[str] = (
     "server-status", "/metrics",
 )
 COVER_VHOST_DIRS: Sequence[str] = ("/etc/nginx/sites-enabled", "/etc/nginx/conf.d")
+# The decoy is only reachable through a loopback listener, so the route case
+# reads the stream map and that socket's bindings instead of the public surface.
+DECOY_ROUTE_CASE_ID = "NGX-DECOY-ROUTE"
+DECOY_ROUTE_TIMEOUT_SECONDS = 300
+DECOY_LISTENER_PORT = 9443
+# The product's own local ports, in the stream map's own numbering: the panel
+# vhost, the REALITY and Vision inbounds, and the camouflage decoy.
+DECOY_ROUTE_BACKENDS: Dict[str, int] = {"panel": 7443, "reality": 8443, "vision": 8444}
+# A refused connection answers at once and a filtered one has to be waited out,
+# so each attempt from a client network is bounded by its own short timeout.
+DECOY_ROUTE_PATH_TIMEOUT_SECONDS = 5
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 VISION_PROBE_TIMEOUT_SECONDS = 120
@@ -4352,6 +4363,360 @@ def case_cover_site(product: MultiNodeProduct) -> Dict[str, Any]:
     }
 
 
+def decoy_cover_decision_script(role: str, domain: str, server_ip: str) -> str:
+    """The role's own cover decision for its deployment domain, and nothing else.
+
+    The route case only needs to know whether this role owes a cover route, so it
+    asks the shipped decision instead of assuming both roles render an apex.
+    """
+    return f"""set -u
+{cover_decision_loader(role)}
+apex=$(cover_domain_for {shlex.quote(domain)} {shlex.quote(server_ip)} 2>/dev/null || true)
+reason=$(cover_domain_for {shlex.quote(domain)} {shlex.quote(server_ip)} 2>&1 >/dev/null || true)
+printf 'decision\\t%s\\t%s\\t%s\\n' {shlex.quote(domain)} "$apex" "$reason"
+"""
+
+
+def decoy_route_script(vhost: str) -> str:
+    """The stream map, the decoy vhost's listens, the sockets, and the SANs.
+
+    ``nginx -T`` prints the configuration verbatim, so the map block is read from
+    the running tree rather than from the file the product would have written;
+    ``ss`` reports where the decoy is actually bound, which is what decides
+    whether a client network can reach it.
+    """
+    return f"""set -u
+nginx -T 2>/dev/null | sed -n '/^map \\$ssl_preread_server_name /,/^}}/p' | sed 's/^/mapraw\\t/'
+grep -nE '^[[:space:]]*listen[[:space:]]' {shlex.quote(vhost)} 2>/dev/null | sed 's/^/decoy\\t/' || true
+ss -ltnH 'sport = :443' 2>/dev/null | awk '{{print "bound\\t443\\t" $4}}' || true
+ss -ltnH 'sport = :{DECOY_LISTENER_PORT}' 2>/dev/null | awk '{{print "bound\\t{DECOY_LISTENER_PORT}\\t" $4}}' || true
+for cert in /etc/letsencrypt/live/*/cert.pem; do
+    [ -f "$cert" ] || continue
+    printf 'lineage\\t%s\\t%s\\n' "$cert" "$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | tr '\\n' ' ' || true)"
+done
+"""
+
+
+def parse_decoy_route(output: str) -> Dict[str, Any]:
+    """The map, the decoy's listens, the bound sockets, and every lineage's SANs."""
+    facts: Dict[str, Any] = {"map": {}, "decoy": [], "bound": {}, "lineages": {}}
+    for line in output.splitlines():
+        fields = line.split("\t")
+        kind = fields[0] if fields else ""
+        if kind == "mapraw" and len(fields) == 2:
+            # The dump keeps the directive's semicolon; the map block's own
+            # braces are not entries.
+            entry = re.match(
+                r"^([A-Za-z0-9_.*-]+)\s+([0-9.]+:[0-9]+)$",
+                fields[1].strip().rstrip(";").strip(),
+            )
+            if entry:
+                facts["map"][entry.group(1)] = entry.group(2)
+        elif kind == "decoy" and len(fields) == 2:
+            facts["decoy"].append(fields[1])
+        elif kind == "bound" and len(fields) == 3:
+            address, _, port = fields[2].rpartition(":")
+            facts["bound"].setdefault(port, []).append(address)
+        elif kind == "lineage" and len(fields) == 3:
+            facts["lineages"][fields[1]] = cover_lineage_sans(fields[2])
+    return facts
+
+
+def require_decoy_loopback(case_id: str, label: str, facts: Dict[str, Any]) -> Dict[str, Any]:
+    """The decoy listens on 127.0.0.1 only, and 443 is the public listener."""
+    bound = facts["bound"]
+    listeners = bound.get(str(DECOY_LISTENER_PORT)) or []
+    require(
+        case_id,
+        listeners,
+        f"{label} has no {DECOY_LISTENER_PORT} listener at all, so the camouflage page "
+        "would have to be served by the public 443 vhost",
+    )
+    foreign = sorted(address for address in listeners if address != "127.0.0.1")
+    require(
+        case_id,
+        not foreign,
+        f"{label} binds its decoy to {foreign} as well as 127.0.0.1, so the camouflage "
+        "listener is reachable from the network instead of only through NGINX's own "
+        "loopback proxy",
+    )
+    public = bound.get("443") or []
+    require(
+        case_id,
+        any(address in denial.WILDCARD_ADDRESSES for address in public),
+        f"{label} does not accept 443 on a wildcard address: {public}",
+    )
+    require(
+        case_id,
+        facts["decoy"],
+        f"{label}'s decoy vhost declares no listen directive",
+    )
+    stray = [line for line in facts["decoy"] if f"127.0.0.1:{DECOY_LISTENER_PORT}" not in line]
+    require(
+        case_id,
+        not stray,
+        f"{label}'s decoy vhost listens outside the loopback listener: {stray}",
+    )
+    return {"bound_9443": listeners, "bound_443": public, "decoy_listen": facts["decoy"]}
+
+
+def require_decoy_routes(case_id: str, label: str, facts: Dict[str, Any],
+                         cover_names: Sequence[str], names: Dict[str, str]) -> Dict[str, str]:
+    """Only the camouflage names reach the decoy, and every VPN name keeps its port."""
+    routes = facts["map"]
+    require(
+        case_id,
+        routes,
+        f"{label}'s running configuration carries no ssl_preread server-name map, so no "
+        "SNI has a route of its own",
+    )
+    decoy = f"127.0.0.1:{DECOY_LISTENER_PORT}"
+    for name in cover_names:
+        require(
+            case_id,
+            routes.get(name) == decoy,
+            f"{label} routes {name} to {routes.get(name)!r} instead of the loopback decoy "
+            f"{decoy}, so that name does not terminate on {decoy}",
+        )
+    stray = sorted(
+        name for name, backend in routes.items()
+        if backend == decoy and name not in set(cover_names) and name != "default"
+    )
+    require(
+        case_id,
+        not stray,
+        f"{label} sends {stray} to the camouflage listener, so a name that is not a cover "
+        "name would land on the decoy instead of keeping its own route",
+    )
+    reality = f"127.0.0.1:{DECOY_ROUTE_BACKENDS['reality']}"
+    require(
+        case_id,
+        routes.get("default") == reality,
+        f"{label}'s stream map defaults to {routes.get('default')!r} instead of its own "
+        f"REALITY listener {reality}, so an unmatched SNI would not fall back to the node",
+    )
+    for kind, name in names.items():
+        if not name:
+            continue
+        expected = f"127.0.0.1:{DECOY_ROUTE_BACKENDS[kind]}"
+        require(
+            case_id,
+            routes.get(name) == expected,
+            f"{label} routes {name} to {routes.get(name)!r} instead of {expected}, so that "
+            "name does not keep its own route",
+        )
+    return dict(routes)
+
+
+def require_cover_lineage(case_id: str, label: str, facts: Dict[str, Any],
+                          wanted: Sequence[str]) -> Dict[str, List[str]]:
+    """The installed lineage that names every cover name, or a failure naming it."""
+    covering = {
+        path: sans for path, sans in facts["lineages"].items()
+        if all(name in sans for name in wanted)
+    }
+    require(
+        case_id,
+        covering,
+        f"{label} holds no certificate lineage naming {list(wanted)}, so the decoy would "
+        f"serve a lineage that does not cover the camouflage names: {facts['lineages']}",
+    )
+    return covering
+
+
+def require_decoy_page(case_id: str, host: topology.MultiNodeTopology, name: str,
+                       index_sha256: str, wanted: Sequence[str]) -> Dict[str, Any]:
+    """One name answers with the rendered cover page over a lineage naming the pair."""
+    probe = cover_site_fetch(case_id, host, name, "/")
+    require(
+        case_id,
+        probe.get("status") == 200,
+        f"https://{name}/ answered {probe.get('status')} instead of the camouflage page, so "
+        "that name does not terminate on the decoy",
+    )
+    require(
+        case_id,
+        probe.get("body_sha256") == index_sha256,
+        f"https://{name}/ served {probe.get('body_sha256')} instead of the rendered cover "
+        f"page {index_sha256}, so the decoy it reached is not the site the product rendered",
+    )
+    sans = list((probe.get("peer") or {}).get("san") or [])
+    for cover_name in wanted:
+        require(
+            case_id,
+            cover_name in sans,
+            f"the certificate https://{name}/ presented does not name {cover_name}: {sans}",
+        )
+    return {
+        "status": probe.get("status"),
+        "body_sha256": probe.get("body_sha256"),
+        "san": sans,
+        "tls_version": (probe.get("peer") or {}).get("tls_version", ""),
+    }
+
+
+def decoy_route_paths(case_id: str, podman: Any, container: str, origin: str,
+                      addresses: Dict[str, str]) -> Dict[str, Any]:
+    """Real TCP attempts from one client network: 443 answers, the decoy does not."""
+    attempts = []
+    for key, address in addresses.items():
+        attempts.append({
+            "label": f"{origin}-{key}-{DECOY_LISTENER_PORT}",
+            "address": address,
+            "port": DECOY_LISTENER_PORT,
+            "timeout": DECOY_ROUTE_PATH_TIMEOUT_SECONDS,
+        })
+        attempts.append({
+            "label": f"{origin}-{key}-443",
+            "address": address,
+            "port": 443,
+            "timeout": DECOY_ROUTE_PATH_TIMEOUT_SECONDS,
+        })
+    observed = denial.tcp_paths(podman, container, attempts)
+    require(
+        case_id,
+        observed.get("returncode") == 0,
+        f"the {origin} role could not attempt a connection: {observed.get('detail') or ''}",
+    )
+    for key in addresses:
+        opened = observed.get(f"{origin}-{key}-443", {})
+        require(
+            case_id,
+            opened.get("outcome") == "CONNECTED",
+            f"{origin} could not reach {addresses[key]}:443 ({opened.get('outcome')}, "
+            f"{opened.get('detail') or 'no detail'}), so a refused decoy port would prove "
+            "nothing about that network",
+        )
+        closed = observed.get(f"{origin}-{key}-{DECOY_LISTENER_PORT}", {})
+        require(
+            case_id,
+            closed.get("outcome") in ("REFUSED", "TIMEOUT", "UNREACHABLE"),
+            f"{origin} reached {addresses[key]}:{DECOY_LISTENER_PORT} "
+            f"({closed.get('outcome')}), so the camouflage listener is exposed to a client "
+            "network instead of staying on the node's own loopback",
+        )
+    return observed
+
+
+def case_decoy_route(product: MultiNodeProduct) -> Dict[str, Any]:
+    """NGX-DECOY-ROUTE: the decoy is a loopback target, never a public surface.
+
+    Three claims make the camouflage listener an internal detail. The running
+    stream map sends the cover pair to `127.0.0.1:9443` and every other name to
+    its own local port; the socket itself is bound to the loopback address and
+    refuses connections from both client networks while 443 answers them; and
+    the certificate a client receives for the apex, its www and the REALITY name
+    is the installed lineage that names the pair, so the camouflage is what a
+    scanning client sees rather than an Xray fingerprint.
+
+    The role that decides no apex (its own resolution puts the pair elsewhere)
+    owes no cover route at all, so the case reads each role's own decision
+    instead of assuming both render one.
+    """
+    case_id = DECOY_ROUTE_CASE_ID
+    host = product.require_worker()
+    apex = topology.COVER_APEX
+    roles = (
+        ("master", "the Master", host.target_name, topology.PANEL_DOMAIN,
+         topology.REALITY_DOMAIN, topology.VISION_DOMAIN,
+         "/etc/nginx/conf.d/gowave-decoy.conf", host.plan.target_ip),
+        ("worker", "the Worker", host.worker_name, host.worker_domain,
+         host.worker_reality_domain, host.worker_vision_domain,
+         "/etc/nginx/conf.d/gowave-worker-decoy.conf", host.plan.worker_ip),
+    )
+    evidence: Dict[str, Any] = {"apex": apex, "roles": {}}
+    for key, label, container, domain, reality, vision, vhost, address in roles:
+        decided = product.podman.exec_bash(
+            container, decoy_cover_decision_script(key, domain, address),
+            check=False, timeout=120,
+        )
+        require(
+            case_id,
+            decided.returncode == 0,
+            f"{label} could not run its own cover-domain decision: "
+            f"{(decided.stderr or '').strip()[-500:]}",
+        )
+        rendered_apex = cover_decision_for(
+            case_id, label, domain, parse_cover_state(decided.stdout or ""),
+        ).get("apex", "")
+        cover_names = [rendered_apex, f"www.{rendered_apex}"] if rendered_apex else []
+
+        read = product.podman.exec_bash(
+            container, decoy_route_script(vhost), check=False, timeout=120,
+        )
+        require(
+            case_id,
+            read.returncode == 0,
+            f"{label} could not read its stream map and decoy listener: "
+            f"{(read.stderr or '').strip()[-500:]}",
+        )
+        facts = parse_decoy_route(read.stdout or "")
+        evidence["roles"][key] = {
+            "cover_names": cover_names,
+            "bindings": require_decoy_loopback(case_id, label, facts),
+            "routes": require_decoy_routes(
+                case_id, label, facts, cover_names,
+                {"panel": domain, "reality": reality, "vision": vision},
+            ),
+            "lineage": require_cover_lineage(
+                case_id, label, facts, cover_names or [reality],
+            ),
+            "address": address,
+        }
+
+    # The page and the lineage are observed from the client, which trusts only
+    # the fixture CA: a name that does not terminate on the decoy cannot answer
+    # with the rendered page and the camouflage lineage.
+    rendered = product.podman.exec_bash(
+        host.target_name, cover_site_script(apex), check=False, timeout=120,
+    )
+    require(
+        case_id,
+        rendered.returncode == 0,
+        "the Master could not read its rendered cover site: "
+        f"{(rendered.stderr or '').strip()[-500:]}",
+    )
+    index_sha256 = (parse_cover_site(rendered.stdout or "")["files"].get("index.html") or {}).get(
+        "sha256", "")
+    require(
+        case_id,
+        index_sha256,
+        f"the Master rendered no index.html for {apex}, so there is no page the decoy "
+        "could be serving",
+    )
+    wanted = [apex, f"www.{apex}"]
+    evidence["client"] = {
+        "apex": require_decoy_page(case_id, host, apex, index_sha256, wanted),
+        "www": require_decoy_page(case_id, host, f"www.{apex}", index_sha256, wanted),
+        "reality": require_decoy_page(
+            case_id, host, topology.REALITY_DOMAIN, index_sha256, wanted,
+        ),
+    }
+    panel = cover_site_fetch(case_id, host, topology.PANEL_DOMAIN, "/")
+    require(
+        case_id,
+        panel.get("body_sha256") != index_sha256,
+        f"https://{topology.PANEL_DOMAIN}/ served the camouflage page, so the panel name "
+        "does not keep its own route",
+    )
+    evidence["client"]["panel"] = {
+        "status": panel.get("status"),
+        "body_sha256": panel.get("body_sha256"),
+    }
+
+    # Both client networks attempt the real TCP path: 443 has to answer from each
+    # of them, because a decoy that is unreachable only where nothing is
+    # reachable would prove nothing.
+    addresses = {"master": host.plan.target_ip, "worker": host.plan.worker_ip}
+    evidence["paths"] = {
+        origin: decoy_route_paths(case_id, product.podman, container, origin, addresses)
+        for origin, container in (
+            ("client", host.client_name), ("untrusted", host.untrusted_name),
+        )
+    }
+    return evidence
+
+
 def cover_probe_matrix(server_ip: str, other_ip: str) -> Sequence[Dict[str, Any]]:
     """Every way the installed apex pair can fail to resolve to one role.
 
@@ -5242,6 +5607,12 @@ def cases(
         Case(COVER_SITE_CASE_ID, "multi-node",
              lambda context: case_cover_site(product),
              timeout_seconds=COVER_SITE_TIMEOUT_SECONDS),
+        # The decoy's route is install-time state on both roles, so it is read in
+        # the same healthy window: the socket bindings, the stream map and the
+        # lineage cannot change behind a case that faulted a role later.
+        Case(DECOY_ROUTE_CASE_ID, "multi-node",
+             lambda context: case_decoy_route(product),
+             timeout_seconds=DECOY_ROUTE_TIMEOUT_SECONDS),
         # The refusal case steers the fixture zone and puts it back before it
         # returns, so it runs beside the other reads of a healthy cluster.
         Case(COVER_UNRESOLVED_CASE_ID, "multi-node",
