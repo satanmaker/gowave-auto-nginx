@@ -413,6 +413,15 @@ class TestWorkerProvisioningCommand(unittest.TestCase):
         script = host.node_add_script()
         self.assertIn(f"--vision-domain '{topology.WORKER_VISION_DOMAIN}'", script)
 
+    def test_the_registered_node_name_is_not_the_container_name(self):
+        # The Panel knows the Worker as worker-1 while the container that runs
+        # its image carries the run's own name, so a command that addresses the
+        # registered node has to be handed the former.
+        host = topology.MultiNodeTopology(self.podman, egress_resolvers=["192.0.2.53"])
+        self.assertEqual(host.worker_node_name, topology.WORKER_NODE_NAME)
+        self.assertNotEqual(host.worker_node_name, host.worker_name)
+        self.assertIn(f"'{host.worker_node_name}'", host.node_add_script())
+
     def test_the_command_carries_no_secret(self):
         host = topology.MultiNodeTopology(self.podman, egress_resolvers=["192.0.2.53"])
         script = host.node_add_script()
@@ -4354,6 +4363,7 @@ class _Acme80Host:
     panel_domain = topology.PANEL_DOMAIN
     reality_domain = topology.REALITY_DOMAIN
     worker_name = "worker-01"
+    worker_node_name = topology.WORKER_NODE_NAME
     worker_domain = "worker.testbed.internal"
     worker_reality_domain = "worker-reality.testbed.internal"
 
@@ -4476,6 +4486,15 @@ class TestAcme80Case(unittest.TestCase):
             self.run_case(podman=_Acme80Podman(reapply_returncode=1))
         self.assertIn("node reapply` exited 1", str(caught.exception))
         self.assertIn("is missing address", str(caught.exception))
+
+    def test_it_re_applies_the_registered_node_rather_than_the_container(self):
+        podman = _Acme80Podman()
+        host = _Acme80Host()
+        self.run_case(podman=podman, host=host)
+        reapply = [script for container, script in podman.scripts if "node reapply" in script]
+        self.assertEqual(len(reapply), 1)
+        self.assertIn(f"node reapply {host.worker_node_name}", reapply[0])
+        self.assertNotIn(host.worker_name, reapply[0])
 
     def test_a_re_provision_that_moves_the_workers_routes_is_rejected(self):
         class MovingPodman(_Acme80Podman):

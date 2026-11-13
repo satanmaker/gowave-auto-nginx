@@ -4970,7 +4970,7 @@ def case_acme80(product: MultiNodeProduct) -> Dict[str, Any]:
 
     before = worker_route()
     changed = product.podman.exec_bash(
-        host.target_name, node_reapply_script(host.worker_name),
+        host.target_name, node_reapply_script(host.worker_node_name),
         check=False, timeout=ACME80_REAPPLY_TIMEOUT_SECONDS,
     )
     require(
@@ -4980,7 +4980,7 @@ def case_acme80(product: MultiNodeProduct) -> Dict[str, Any]:
         f"{(changed.stderr or changed.stdout or '').strip()[-600:]}",
     )
     evidence["reapply"] = {
-        "command": node_reapply_script(host.worker_name).strip(),
+        "command": node_reapply_script(host.worker_node_name).strip(),
         "returncode": changed.returncode,
     }
     after = worker_route()

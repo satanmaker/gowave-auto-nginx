@@ -1395,6 +1395,11 @@ class MultiNodeTopology(AioTopology):
         return fields[1] if len(fields) > 1 else ""
 
     # --------------------------------------------------------------- node add
+    # The Panel registers the Worker under this name; the container that runs
+    # the Worker image is named separately, so a later command that addresses
+    # the registered node must not be handed the container's name.
+    worker_node_name = WORKER_NODE_NAME
+
     def node_add_script(self, name: str = WORKER_NODE_NAME) -> str:
         arguments = [
             f"'{name}'",
