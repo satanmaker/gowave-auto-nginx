@@ -2255,6 +2255,246 @@ def case_idempotent(product: AioProduct) -> Dict[str, Any]:
     }
 
 
+BACKUP_FAULT_CASE_ID = "AIO-FAULT-DISK"
+# The product's own store, the tmpfs size that stands in for a full filesystem,
+# and the filler that leaves it that way. 512k holds the filler and nothing else:
+# the panel archive this host produces is ~76k, so the write cannot complete.
+BACKUP_FAULT_STORE = "/var/backups/gowave"
+BACKUP_FAULT_TMPFS_SIZE = "512k"
+BACKUP_FAULT_FILLER_KB = 500
+BACKUP_FAULT_TIMEOUT_SECONDS = 600
+
+BACKUP_FAULT_SCRIPT = r"""
+store=BACKUP_STORE_PLACEHOLDER
+size=BACKUP_TMPFS_SIZE_PLACEHOLDER
+filler=BACKUP_FILLER_PLACEHOLDER
+
+created=no
+if [[ ! -d "$store" ]]; then
+    mkdir -p "$store"
+    created=yes
+fi
+
+# The fault is the case's own to remove, whatever the run of the command below
+# does: a full store left behind would be read by every case that follows as a
+# product failure of its own.
+cleanup() {
+    set +e
+    rm -f -- "$store"/filler "$store"/gowave-backup-*.tar.gz "$store"/*.partial 2>/dev/null
+    if mountpoint -q "$store" 2>/dev/null; then
+        umount "$store"
+    fi
+    if [[ "$created" == "no" ]]; then
+        rmdir "$store" 2>/dev/null
+    fi
+    return 0
+}
+trap cleanup EXIT
+
+mount -t tmpfs -o "size=$size,mode=0700" tmpfs "$store"
+dd if=/dev/zero of="$store/filler" bs=1k "count=$filler" status=none
+free_kb=$(df -k --output=avail "$store" | tail -1 | tr -d ' ')
+
+rc=0
+bash "$repo/gowave-auto.sh" backup --type panel \
+    >/tmp/gowave-e2e-fault-backup.out 2>/tmp/gowave-e2e-fault-backup.err || rc=$?
+files_during=$(ls -1A "$store" | tr '\n' ' ')
+
+# The fault is removed and the operator's own command is run again: an archive
+# that appears and validates is what separates a store that refused the write
+# from a backup that no longer works at all.
+umount "$store"
+rc_after=0
+bash "$repo/gowave-auto.sh" backup --type panel \
+    >/tmp/gowave-e2e-fault-backup2.out 2>/tmp/gowave-e2e-fault-backup2.err || rc_after=$?
+archive=$(ls -1 "$store"/gowave-backup-panel-*.tar.gz 2>/dev/null | tail -1)
+archive_mode=""
+archive_bytes=""
+verify=127
+if [[ -n "$archive" ]]; then
+    archive_mode=$(stat -c '%a' "$archive")
+    archive_bytes=$(stat -c '%s' "$archive")
+    verify=0
+    bash "$repo/assets/backup/gowave-backup.sh" verify "$archive" panel \
+        >/tmp/gowave-e2e-fault-verify.out 2>&1 || verify=$?
+fi
+
+RC="$rc" RC_AFTER="$rc_after" VERIFY="$verify" FREE="$free_kb" FILES="$files_during" \
+ARCHIVE="$archive" ARCHIVE_MODE="$archive_mode" ARCHIVE_BYTES="$archive_bytes" python3 - <<'PY'
+import json, os, subprocess, urllib.request
+
+
+def read(path, tail=1200):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()[-tail:]
+    except OSError:
+        return ""
+
+
+unit = {}
+show = subprocess.run(
+    ["systemctl", "show", "gowave.service", "nginx", "-p", "Id", "-p", "ActiveState"],
+    capture_output=True, text=True,
+)
+for block in (show.stdout or "").split("\n\n"):
+    fields = dict(
+        line.partition("=")[::2] for line in block.splitlines() if "=" in line
+    )
+    if fields.get("Id"):
+        unit[fields["Id"]] = fields.get("ActiveState")
+
+health = None
+try:
+    with urllib.request.urlopen("http://127.0.0.1:3000/api/system/health", timeout=5) as response:
+        health = response.status
+except Exception as error:  # noqa: BLE001 - the probe reports, the case decides
+    health = type(error).__name__ + ": " + str(error)
+
+print(json.dumps({
+    "free_kb": os.environ.get("FREE", ""),
+    "returncode": int(os.environ.get("RC") or 0),
+    "stdout": read("/tmp/gowave-e2e-fault-backup.out"),
+    "stderr": read("/tmp/gowave-e2e-fault-backup.err"),
+    "files_during": os.environ.get("FILES", "").split(),
+    "returncode_after": int(os.environ.get("RC_AFTER") or 0),
+    "stderr_after": read("/tmp/gowave-e2e-fault-backup2.err"),
+    "archive": os.path.basename(os.environ.get("ARCHIVE", "")),
+    "archive_mode": os.environ.get("ARCHIVE_MODE", ""),
+    "archive_bytes": os.environ.get("ARCHIVE_BYTES", ""),
+    "verify_returncode": int(os.environ.get("VERIFY") or 0),
+    "verify_output": read("/tmp/gowave-e2e-fault-verify.out"),
+    "unit": unit,
+    "health": health,
+}, sort_keys=True))
+PY
+"""
+
+
+def backup_fault_script() -> str:
+    """Fill the backup store with a tmpfs and run the operator's own backup twice."""
+    return (
+        "set -Eeuo pipefail\n"
+        "umask 077\n"
+        f"repo={shlex.quote(topology.REPO_IN_CONTAINER)}\n"
+        + BACKUP_FAULT_SCRIPT
+        .replace("BACKUP_STORE_PLACEHOLDER", shlex.quote(BACKUP_FAULT_STORE))
+        .replace("BACKUP_TMPFS_SIZE_PLACEHOLDER", shlex.quote(BACKUP_FAULT_TMPFS_SIZE))
+        .replace("BACKUP_FILLER_PLACEHOLDER", str(BACKUP_FAULT_FILLER_KB))
+        .strip()
+        + "\n"
+    )
+
+
+def case_backup_store_full(product: AioProduct) -> Dict[str, Any]:
+    """AIO-FAULT-DISK: a store that cannot hold the archive fails without publishing one.
+
+    The injected fault is a filesystem that runs out of space while the archive is
+    being written. What the operator must be able to rely on is the name: an
+    archive that appears in the store is complete, so a write that cannot finish
+    leaves no file a later restore would offer and reject as truncated. The live
+    tree is read around the fault because a backup that damaged the Panel while
+    failing would be the worse defect, and the same command is run again after
+    the fault is removed so "the store refused" is separated from "backup is
+    broken".
+    """
+    product.require_installed()
+    before = channel_state(product, BACKUP_FAULT_CASE_ID)
+    require(
+        BACKUP_FAULT_CASE_ID,
+        before.get("database", {}).get("integrity") == "ok"
+        and before.get("unit", {}).get("ActiveState") == "active",
+        f"the host was not healthy before the fault: database "
+        f"{before.get('database', {}).get('integrity')!r}, unit "
+        f"{before.get('unit', {}).get('ActiveState')!r}",
+    )
+
+    facts = probe_json(
+        BACKUP_FAULT_CASE_ID, "the backup store fault",
+        product.host_script(backup_fault_script(), timeout=BACKUP_FAULT_TIMEOUT_SECONDS),
+    )
+    require(
+        BACKUP_FAULT_CASE_ID, int(facts.get("free_kb") or 0) < 64,
+        f"the injected store still had {facts.get('free_kb')!r} KiB free, so the write was not "
+        "the one that could fail",
+    )
+    require(
+        BACKUP_FAULT_CASE_ID, facts.get("returncode") not in (None, 0),
+        "the backup reported success on a store with no room left for the archive: "
+        f"{(facts.get('stdout') or '').strip()[-600:]!r}",
+    )
+    require(
+        BACKUP_FAULT_CASE_ID, "nothing was published" in (facts.get("stderr") or ""),
+        f"the failed backup did not report that nothing was published: "
+        f"{(facts.get('stderr') or '').strip()[-800:]!r}",
+    )
+    published = [
+        name for name in (facts.get("files_during") or [])
+        if name.endswith(".tar.gz") or name.endswith(".partial")
+    ]
+    require(
+        BACKUP_FAULT_CASE_ID, not published,
+        f"the failed backup left {published!r} in the store, so a later restore would be "
+        "offered an archive that cannot be complete",
+    )
+
+    after = channel_state(product, BACKUP_FAULT_CASE_ID)
+    for field, label in (
+        ("env_digest", "the environment file"),
+        ("database", "the database"),
+        ("frontend", "the frontend tree"),
+        ("state", "state.json"),
+        ("nginx", "the NGINX tree"),
+        ("letsencrypt", "the ACME tree"),
+    ):
+        require(
+            BACKUP_FAULT_CASE_ID, after.get(field) == before.get(field),
+            f"the failed backup changed {label}: {after.get(field)!r} vs {before.get(field)!r}",
+        )
+    require(
+        BACKUP_FAULT_CASE_ID, after.get("unit", {}).get("ActiveState") == "active",
+        f"gowave.service is {after.get('unit', {}).get('ActiveState')!r} after the failed backup",
+    )
+    require(
+        BACKUP_FAULT_CASE_ID, facts.get("health") == 200,
+        f"the Panel's health route answered {facts.get('health')!r} after the failed backup",
+    )
+
+    # The fault is gone by the time the probe returns; the same command has to
+    # publish an archive that the product's own validator accepts.
+    require(
+        BACKUP_FAULT_CASE_ID, facts.get("returncode_after") == 0,
+        f"the backup still failed once the store had room again: "
+        f"{(facts.get('stderr_after') or '').strip()[-800:]!r}",
+    )
+    require(
+        BACKUP_FAULT_CASE_ID, bool(facts.get("archive")),
+        "the backup after the fault published no archive in the store",
+    )
+    require(
+        BACKUP_FAULT_CASE_ID, facts.get("archive_mode") == "600",
+        f"the published archive has mode {facts.get('archive_mode')!r}",
+    )
+    require(
+        BACKUP_FAULT_CASE_ID, facts.get("verify_returncode") == 0
+        and "15-point preflight archive validation PASSED" in (facts.get("verify_output") or ""),
+        f"the product's own validator rejected the published archive: "
+        f"{facts.get('verify_output')!r}",
+    )
+    return {
+        "free_kb_with_fault": facts.get("free_kb"),
+        "returncode_with_fault": facts.get("returncode"),
+        "files_with_fault": ",".join(facts.get("files_during") or []),
+        "returncode_after": facts.get("returncode_after"),
+        "archive": facts.get("archive"),
+        "archive_bytes": facts.get("archive_bytes"),
+        "archive_mode": facts.get("archive_mode"),
+        "verify_returncode": facts.get("verify_returncode"),
+        "unit_state": after.get("unit", {}).get("ActiveState"),
+        "health": facts.get("health"),
+    }
+
+
 def case_negative_destination(product: AioProduct) -> Dict[str, Any]:
     """AIO-NEG-DEST: a destination the product's egress policy excludes is denied.
 
@@ -5375,6 +5615,11 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case("AIO-RESTART", "aio", lambda context: case_restart(product),
              timeout_seconds=RESTART_TIMEOUT_SECONDS + TUNNEL_READY_TIMEOUT_SECONDS
              + TRAFFIC_TIMEOUT_SECONDS),
+        # The fault cases come after the restart case and before the repeated
+        # install: each one removes its own fault, and a host left in the state
+        # a fault produced must never be the one the idempotency case measures.
+        Case(BACKUP_FAULT_CASE_ID, "aio", lambda context: case_backup_store_full(product),
+             timeout_seconds=BACKUP_FAULT_TIMEOUT_SECONDS),
         Case("AIO-IDEMPOTENT", "aio", lambda context: case_idempotent(product),
              timeout_seconds=INSTALL_TIMEOUT_SECONDS + TRAFFIC_TIMEOUT_SECONDS),
         Case("AIO-NEG-DEST", "aio", lambda context: case_negative_destination(product),

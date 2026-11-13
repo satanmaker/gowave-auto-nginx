@@ -247,6 +247,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "All-in-One Master VPS Installation Verification",
     },
     {
+        "id": "AIO-FAULT-DISK",
+        "requirement": "Failure injection and recovery",
+        "assertion": "A backup store that cannot hold the archive fails loudly and publishes nothing: no archive-shaped or partial file appears in the store, the Panel, its database, the frontend, state.json, the NGINX and ACME trees and the health route are unchanged by the failed write, and after the fault is removed the same operator command publishes a mode-0600 archive that the product's own preflight validator accepts.",
+        "topology": ["aio"],
+        "promotion_target": "Backup and Restore Format v1",
+    },
+    {
         "id": "NGX-05",
         "requirement": "NGINX SNI Routing and REALITY Decoy Verification",
         "assertion": "On every role the product installs, the generated NGINX tree passes `nginx -t`, its dump carries that role's own server name and its ssl_preread SNI routing, the product's managed ACME deploy hook does not reload NGINX when an invalid snippet makes `nginx -t` fail — leaving the master, its workers and the 443 listener untouched — and the same hook does reload it, without replacing the master, once the snippet is removed.",
