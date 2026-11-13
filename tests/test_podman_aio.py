@@ -217,11 +217,13 @@ class StubHost:
         self.panel_domain = panel_domain
         self.reality_domain = aio.REALITY_DOMAIN
         self.client_reports = []
+        self.client_calls = []
 
     def install_environment(self):
         return {"GOWAVE_ACME_TEST_CA_FILE": "/fixtures/ca/acme-trust.pem"}
 
     def client_http(self, url, **kwargs):
+        self.client_calls.append({"url": url, **kwargs})
         report = self.client_reports.pop(0)
         return report
 
@@ -2514,6 +2516,241 @@ server {
         self.assertEqual(panel.returncode, 0, panel.stderr)
         panel_names = json.loads(panel.stdout)["blocks"][0]["server_names"]
         self.assertNotIn("testbed.internal", panel_names)
+
+
+DECOY_INDEX_SHA = "a" * 64
+DECOY_404_SHA = "b" * 64
+DECOY_PANEL_SHA = "c" * 64
+
+
+def decoy_report(
+    url, status, sha, san=(), version="TLSv1.3", length=1024, peer=True,
+    returncode=0, error="", snippet="",
+):
+    """One independent-client fetch, in the shape the probe prints it.
+
+    A handshake read without a name pin reports no peer facts at all — Python
+    returns an empty certificate dict once verification is off — so ``peer``
+    decides whether the report carries any.
+    """
+    reported = {"san": list(san), "tls_version": version, "issuer": "CN=Pebble Intermediate CA"}
+    probe = {
+        "url": url,
+        "status": status,
+        "body_length": length,
+        "body_sha256": sha,
+        "body_snippet": snippet,
+        "peer": reported if peer else {},
+    }
+    if error:
+        probe["error"] = error
+    return {"returncode": returncode, "probe": probe, "stdout": json.dumps(probe), "stderr": ""}
+
+
+class TestDecoyCase(unittest.TestCase):
+    """DECOY-01: the camouflage listener never answers as a management interface."""
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def route_reports(self, name, san=(), site_sha=DECOY_INDEX_SHA, not_found_sha=DECOY_404_SHA):
+        base = f"https://{name}"
+        entries = [
+            (f"{base}/", 200, site_sha),
+            (f"{base}/index.html", 200, site_sha),
+            (f"{base}{aio.DECOY_MISSING_PATH}", 404, not_found_sha),
+            (f"{base}/404.html", 200, not_found_sha),
+        ]
+        entries += [(f"{base}{path}", 404, not_found_sha) for path in aio.DECOY_MANAGEMENT_PATHS]
+        return [
+            decoy_report(url, status, sha, san, peer=bool(san))
+            for url, status, sha in entries
+        ]
+
+    def reports(self, replace=None):
+        """The fetches the case makes, in order, with single answers replaceable."""
+        cover = topology.COVER_APEX
+        reports = []
+        reports += self.route_reports(cover, san=[cover])
+        reports += self.route_reports(f"www.{cover}", san=[f"www.{cover}"])
+        reports += self.route_reports(aio.REALITY_DOMAIN, san=[aio.REALITY_DOMAIN])
+        reports += self.route_reports(aio.DECOY_UNMAPPED_SNI)
+        reports.append(decoy_report(
+            f"{aio.PUBLIC_PANEL}/api/nodes", 401, DECOY_PANEL_SHA, [aio.PANEL_DOMAIN],
+            snippet='{"message":"Unauthorized"}',
+        ))
+        for url, report in (replace or {}).items():
+            for index, existing in enumerate(reports):
+                if existing["probe"]["url"] == url:
+                    reports[index] = report
+                    break
+            else:
+                raise AssertionError(f"the case never asks for {url}")
+        return reports
+
+    def product(self, reports=None, loopback="login=200 api=200 token_length=64\n"):
+        product, _podman = installed_product(self.context, [(loopback, 0)])
+        product.host.client_reports = list(self.reports() if reports is None else reports)
+        return product
+
+    def reject(self, expected, reports=None, loopback="login=200 api=200 token_length=64\n"):
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_decoy(self.product(reports, loopback))
+        self.assertIn(expected, str(caught.exception))
+        return caught
+
+    def test_every_route_serves_the_site_and_refuses_every_management_path(self):
+        evidence = aio.case_decoy(self.product())
+        self.assertEqual(
+            [route["sni"] for route in evidence["routes"].values()],
+            [topology.COVER_APEX, f"www.{topology.COVER_APEX}",
+             aio.REALITY_DOMAIN, aio.DECOY_UNMAPPED_SNI],
+        )
+        for route in evidence["routes"].values():
+            self.assertEqual(route["status"], 200)
+            self.assertEqual(route["site_sha256"], DECOY_INDEX_SHA)
+            self.assertEqual(route["not_found_sha256"], DECOY_404_SHA)
+            self.assertEqual(sorted(route["management"]), sorted(aio.DECOY_MANAGEMENT_PATHS))
+            for observed in route["management"].values():
+                self.assertEqual(observed, {"status": 404, "sha256": DECOY_404_SHA})
+        self.assertEqual(evidence["management_paths"], list(aio.DECOY_MANAGEMENT_PATHS))
+        self.assertEqual(evidence["missing_path"], aio.DECOY_MISSING_PATH)
+        self.assertEqual(evidence["management"]["loopback_login"], "200")
+        self.assertEqual(evidence["management"]["loopback_api"], "200")
+        self.assertEqual(evidence["management"]["anonymous_api_status"], 401)
+
+    def test_only_the_unmapped_route_is_read_without_verification(self):
+        product = self.product()
+        aio.case_decoy(product)
+        calls = {call["url"]: call for call in product.host.client_calls}
+        for name in (topology.COVER_APEX, f"www.{topology.COVER_APEX}", aio.REALITY_DOMAIN):
+            self.assertFalse(calls[f"https://{name}/"].get("insecure", False))
+        self.assertTrue(calls[f"https://{aio.DECOY_UNMAPPED_SNI}/"]["insecure"])
+        self.assertFalse(calls[f"{aio.PUBLIC_PANEL}/api/nodes"].get("insecure", False))
+        self.assertEqual(calls[f"https://{topology.COVER_APEX}/"]["expect_status"], 200)
+        self.assertEqual(
+            calls[f"https://{topology.COVER_APEX}/api/nodes"]["expect_status"], 404,
+        )
+
+    def test_a_management_path_that_answers_is_refused(self):
+        url = f"https://{topology.COVER_APEX}/api/nodes"
+        self.reject(
+            "published a management interface",
+            self.reports({url: decoy_report(
+                url, 200, DECOY_PANEL_SHA, [topology.COVER_APEX],
+                returncode=1, error="status 200 != 404", snippet='{"message":"Forbidden"}',
+            )}),
+        )
+
+    def test_a_refusal_that_is_not_the_sites_own_page_is_refused(self):
+        url = f"https://{topology.COVER_APEX}/api/"
+        report = decoy_report(url, 404, "d" * 64, [topology.COVER_APEX],
+                              snippet="<html><center>nginx</center></html>")
+        self.reject("came from another listener", self.reports({url: report}))
+
+    def test_a_route_serving_another_document_is_refused(self):
+        cover = topology.COVER_APEX
+        other = "e" * 64
+        urls = [f"https://www.{cover}/", f"https://www.{cover}/index.html"]
+        self.reject(
+            "does not terminate on the camouflage site",
+            self.reports({
+                url: decoy_report(url, 200, other, [f"www.{cover}"]) for url in urls
+            }),
+        )
+
+    def test_a_route_whose_certificate_does_not_name_it_is_refused(self):
+        cover = topology.COVER_APEX
+        report = decoy_report(f"https://www.{cover}/", 200, DECOY_INDEX_SHA, [cover])
+        self.reject("which does not name", self.reports({f"https://www.{cover}/": report}))
+
+    def test_a_route_that_negotiated_another_tls_version_is_refused(self):
+        cover = topology.COVER_APEX
+        report = decoy_report(f"https://{cover}/", 200, DECOY_INDEX_SHA, [cover], version="TLSv1.2")
+        self.reject("instead of TLSv1.3", self.reports({f"https://{cover}/": report}))
+
+    def test_a_route_that_cannot_be_reached_is_refused(self):
+        cover = topology.COVER_APEX
+        url = f"https://{cover}/"
+        report = {"returncode": 1, "probe": {"url": url, "error": "ConnectionResetError: reset"},
+                  "stdout": "", "stderr": ""}
+        self.reject("did not answer as the camouflage site does", self.reports({url: report}))
+
+    def test_a_404_page_that_is_the_front_page_is_refused(self):
+        cover = topology.COVER_APEX
+        url = f"https://{cover}/404.html"
+        self.reject(
+            "are the same document",
+            self.reports({url: decoy_report(url, 200, DECOY_INDEX_SHA, [cover])}),
+        )
+
+    def test_an_unknown_path_answered_with_the_front_page_is_refused(self):
+        cover = topology.COVER_APEX
+        url = f"https://{cover}{aio.DECOY_MISSING_PATH}"
+        report = decoy_report(url, 200, DECOY_INDEX_SHA, [cover], returncode=1,
+                              error="status 200 != 404")
+        self.reject("did not answer as the camouflage site does", self.reports({url: report}))
+
+    def test_a_management_surface_that_stops_authenticating_fails_the_case(self):
+        self.reject("the Panel login answered", loopback="login=502 api=502 token_length=0\n")
+
+    def test_an_anonymous_management_read_that_is_answered_fails_the_case(self):
+        url = f"{aio.PUBLIC_PANEL}/api/nodes"
+        self.reject(
+            "instead of being refused",
+            self.reports({url: decoy_report(url, 200, DECOY_PANEL_SHA, [aio.PANEL_DOMAIN])}),
+        )
+
+    def test_a_panel_name_answered_by_the_decoy_fails_the_case(self):
+        url = f"{aio.PUBLIC_PANEL}/api/nodes"
+        self.reject(
+            "the panel name is answered by the decoy",
+            self.reports({url: decoy_report(url, 403, DECOY_404_SHA, [aio.PANEL_DOMAIN])}),
+        )
+
+    def test_the_measured_paths_are_the_ones_the_panel_vhost_serves(self):
+        nginx = (REPO_ROOT / "modules" / "nginx.sh").read_text(encoding="utf-8")
+        vhost = nginx.split("generate_panel_https_vhost() {", 1)[1].split("\n}\n", 1)[0]
+        served = set()
+        for line in vhost.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("location "):
+                continue
+            parts = stripped.split(None, 1)[1].rstrip("{").split()
+            while parts and parts[0] in ("^~", "=", "~", "~*"):
+                parts.pop(0)
+            path = " ".join(parts)
+            if path == "/":
+                # The cover site's own front page is served there, and the case
+                # measures that separately from the paths it must refuse.
+                continue
+            served.add(path)
+        self.assertTrue(served)
+        self.assertEqual(served - set(aio.DECOY_MANAGEMENT_PATHS), set())
+
+    def test_the_unmapped_sni_is_resolved_by_the_run_zone(self):
+        plan = topology.NetworkPlan("203.0.114.0/24")
+        records = topology.zone(plan)["records"]
+        self.assertEqual(records[aio.DECOY_UNMAPPED_SNI]["A"], [plan.target_ip])
+        self.assertNotIn(aio.DECOY_UNMAPPED_SNI, {
+            topology.PANEL_DOMAIN, topology.REALITY_DOMAIN, topology.VISION_DOMAIN,
+            topology.COVER_APEX, f"www.{topology.COVER_APEX}",
+        })
+
+    def test_the_case_is_registered_before_any_traffic_and_catalogued(self):
+        suite = aio.cases(ScriptedPodman(self.context, []))
+        cases = {case.id: case for case in suite}
+        self.assertIn(aio.DECOY_CASE_ID, cases)
+        self.assertEqual(cases[aio.DECOY_CASE_ID].topology, "aio")
+        self.assertEqual(cases[aio.DECOY_CASE_ID].timeout_seconds, aio.DECOY_TIMEOUT_SECONDS)
+        ids = [case.id for case in suite]
+        self.assertLess(ids.index(aio.DECOY_CASE_ID), ids.index("SUB-SERVED"))
+        record = {case["id"]: case for case in catalog.load_catalog()["cases"]}[aio.DECOY_CASE_ID]
+        self.assertEqual(record["state"], "incubating")
+        self.assertEqual(record["runs_in"], ["podman"])
+        self.assertEqual(record["topology"], ["aio"])
 
 
 if __name__ == "__main__":

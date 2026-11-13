@@ -240,6 +240,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "NGINX SNI Routing and REALITY Decoy Verification",
     },
     {
+        "id": "DECOY-01",
+        "requirement": "NGINX SNI Routing and REALITY Decoy Verification",
+        "assertion": "From an independent Control Machine, the camouflage listener answers the cover apex, its www, the REALITY name without REALITY authentication, and an SNI the stream map does not list with the same rendered cover site, and refuses every path the panel vhost serves — /api/, /api/sub/, /api/nodes, /api/auth/login, /xhttp-down/, /ws, /trojan-grpc and the scanned /metrics and /server-status — with that site's own 404 document rather than any management response, while the Panel's management surface still authenticates over loopback and refuses an anonymous /api/nodes call on its own name.",
+        "topology": ["aio"],
+        "promotion_target": "NGINX SNI Routing and REALITY Decoy Verification",
+    },
+    {
         "id": "ACME-01",
         "requirement": "Real ACME issuance and renewal through the pinned directory",
         "assertion": "On the installed host the certificate serving the Panel domain was issued during this run by the pinned ACME directory, Certbot's own renewal record names the webroot method and that webroot, a token written into the webroot is fetched through the product's port 80 vhost from an independent client, and a forced renewal performs an HTTP-01 challenge and yields a new serial whose leaf the independent client receives after the product's deploy hook reloads NGINX without replacing the master.",

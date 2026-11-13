@@ -104,6 +104,11 @@ PANEL_DOMAIN = "panel.testbed.internal"
 REALITY_DOMAIN = "reality.testbed.internal"
 VISION_DOMAIN = "vision.testbed.internal"
 COVER_APEX = "testbed.internal"
+# A name the run resolves into the host but the product was never configured
+# with. Probing it is what a scan of the address looks like: the stream map has
+# no entry for it, so it is answered by the REALITY fallback rather than by any
+# vhost the operator asked for.
+PROBE_UNMAPPED_SNI = "probe.testbed.internal"
 ECHO_HOST = "echo.testbed.internal"
 CLIENT_HOST = "client.testbed.internal"
 # The Worker owns its names as well: the operator is asked for a Worker domain
@@ -277,6 +282,7 @@ def zone(plan: NetworkPlan) -> Dict[str, Any]:
             VISION_DOMAIN: {"A": [plan.target_ip]},
             COVER_APEX: {"A": [plan.target_ip]},
             f"www.{COVER_APEX}": {"A": [plan.target_ip]},
+            PROBE_UNMAPPED_SNI: {"A": [plan.target_ip]},
             acme_fixture.FIXTURE_HOST: {"A": [plan.pebble_ip]},
             ECHO_HOST: {"A": [plan.echo_ip]},
             CLIENT_HOST: {"A": [plan.client_ip]},

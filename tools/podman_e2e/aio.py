@@ -4078,6 +4078,270 @@ def case_json_shapes(product: AioProduct) -> Dict[str, Any]:
     }
 
 
+DECOY_CASE_ID = "DECOY-01"
+# Every path the panel vhost is generated with, plus the two a scanner tries
+# first. Each one is answered by a management process on the panel's own name,
+# so a camouflage listener that answers any of them has published what the
+# deployment really is. ``/`` is deliberately absent: the cover site's own front
+# page is served there, and the case measures that separately.
+DECOY_MANAGEMENT_PATHS: Sequence[str] = (
+    "/api/",
+    "/api/sub/",
+    "/api/nodes",
+    "/api/auth/login",
+    "/xhttp-down/",
+    "/ws",
+    "/trojan-grpc",
+    "/metrics",
+    "/server-status",
+)
+# A path no cover site ships, so the answer to it is the site's own 404 page.
+DECOY_MISSING_PATH = "/e2e-no-such-cover-page"
+DECOY_UNMAPPED_SNI = topology.PROBE_UNMAPPED_SNI
+# Four routes times thirteen fetches, each one a process in the client container;
+# the ceiling is a hang guard, not an expectation.
+DECOY_PROBE_TIMEOUT_SECONDS = 30
+DECOY_TIMEOUT_SECONDS = 300
+
+
+def decoy_routes() -> List[Dict[str, Any]]:
+    """The four ways a prober reaches the camouflage listener.
+
+    Every route is dialled by name because the stream map keys on the SNI rather
+    than on the address, and the two REALITY routes are dialled without REALITY
+    authentication: that is what a scan looks like, and it is the path the product
+    documents as its fallback for a client the inbound does not recognise. Only
+    the two cover names are served by the decoy listener directly.
+    """
+    cover = topology.COVER_APEX
+    return [
+        {"name": "the cover apex", "sni": cover, "url": f"https://{cover}",
+         "verified": True, "expect_san": [cover]},
+        {"name": f"www.{cover}", "sni": f"www.{cover}", "url": f"https://www.{cover}",
+         "verified": True, "expect_san": [f"www.{cover}"]},
+        {"name": "the REALITY name without REALITY authentication",
+         "sni": REALITY_DOMAIN, "url": f"https://{REALITY_DOMAIN}",
+         "verified": True, "expect_san": [REALITY_DOMAIN]},
+        # The fallback certificate is the REALITY lineage, which cannot name a
+        # hostname the product was never configured with; what this route proves
+        # is where the request lands, so the handshake is read without a name pin.
+        {"name": "an SNI the stream map does not list",
+         "sni": DECOY_UNMAPPED_SNI, "url": f"https://{DECOY_UNMAPPED_SNI}",
+         "verified": False, "expect_san": []},
+    ]
+
+
+def decoy_route_facts(product: AioProduct, route: Dict[str, Any]) -> Dict[str, Any]:
+    """Everything one route can be asked: the site, its 404 page, and the probes."""
+    host = product.require_installed()
+
+    def fetch(path: str, **expectations: Any) -> Dict[str, Any]:
+        return host.client_http(
+            f"{route['url']}{path}",
+            insecure=not route["verified"],
+            timeout=DECOY_PROBE_TIMEOUT_SECONDS,
+            **expectations,
+        )
+
+    return {
+        "site": fetch("/", expect_status=200),
+        "index": fetch("/index.html", expect_status=200),
+        "missing": fetch(DECOY_MISSING_PATH, expect_status=404),
+        "not_found": fetch("/404.html", expect_status=200),
+        "management": {path: fetch(path, expect_status=404) for path in DECOY_MANAGEMENT_PATHS},
+    }
+
+
+def _decoy_probe(
+    case_id: str, route: Dict[str, Any], label: str, report: Dict[str, Any],
+) -> Dict[str, Any]:
+    """A fetch whose expectation did not hold names the route, the request and the cause."""
+    probe = report.get("probe") or {}
+    require(
+        case_id,
+        report.get("returncode") == 0,
+        f"{route['name']}: {label} did not answer as the camouflage site does: "
+        f"{probe.get('error') or report.get('stderr') or 'the probe printed no report'}",
+    )
+    return probe
+
+
+def require_cover_site_served(
+    case_id: str, route: Dict[str, Any], facts: Dict[str, Any],
+) -> Dict[str, Any]:
+    """The listener hands out the site the product rendered, and 404s the rest.
+
+    Three facts make that one conclusion: the front page is byte for byte the
+    site's own ``index.html``, an unknown path is refused with the site's own
+    ``404.html``, and those two documents are not the same one — a missing
+    ``404.html`` would otherwise let every refusal below be satisfied by the
+    front page.
+    """
+    site = _decoy_probe(case_id, route, f"GET {route['url']}/", facts["site"])
+    index = _decoy_probe(case_id, route, f"GET {route['url']}/index.html", facts["index"])
+    not_found = _decoy_probe(case_id, route, f"GET {route['url']}/404.html", facts["not_found"])
+    missing = _decoy_probe(
+        case_id, route, f"GET {route['url']}{DECOY_MISSING_PATH}", facts["missing"],
+    )
+    require(case_id, int(site.get("body_length") or 0) > 0,
+            f"{route['name']}: the front page is empty, so the listener serves no site at all")
+    require(case_id, site.get("body_sha256") == index.get("body_sha256"),
+            f"{route['name']}: GET / served a document that is not the cover site's index.html "
+            f"({site.get('body_sha256')} vs {index.get('body_sha256')})")
+    require(case_id, not_found.get("body_sha256") != index.get("body_sha256"),
+            f"{route['name']}: the cover site's 404.html and its index.html are the same document, "
+            "so its refusals could not be told apart from its front page")
+    require(case_id, missing.get("body_sha256") == not_found.get("body_sha256"),
+            f"{route['name']}: an unknown path was refused with a body that is not the cover site's "
+            f"404.html ({missing.get('body_sha256')} vs {not_found.get('body_sha256')}), so the "
+            f"refusal is a server default rather than the site: "
+            f"{(missing.get('body_snippet') or '')[:200]}")
+    if route["expect_san"]:
+        peer = site.get("peer") or {}
+        san = sorted(str(name) for name in peer.get("san") or [])
+        unnamed = [name for name in route["expect_san"] if name not in san]
+        require(case_id, not unnamed,
+                f"{route['name']}: the camouflage listener presented a certificate covering {san}, "
+                f"which does not name {unnamed}")
+        require(case_id, str(peer.get("tls_version", "")).startswith("TLSv1.3"),
+                f"{route['name']}: the camouflage listener negotiated "
+                f"{peer.get('tls_version')!r} instead of TLSv1.3")
+    return {
+        "url": route["url"],
+        "sni": route["sni"],
+        "verified_certificate": bool(route["expect_san"]),
+        "status": site.get("status"),
+        "site_sha256": site.get("body_sha256"),
+        "site_bytes": site.get("body_length"),
+        "not_found_sha256": not_found.get("body_sha256"),
+        "tls_version": (site.get("peer") or {}).get("tls_version"),
+        "san": sorted(str(name) for name in (site.get("peer") or {}).get("san") or []),
+    }
+
+
+def require_decoy_denies_management(
+    case_id: str, route: Dict[str, Any], facts: Dict[str, Any], not_found_sha: str,
+) -> Dict[str, Any]:
+    """Every management path on this route is refused with the site's own 404 page.
+
+    A status alone would pass a bare NGINX error page, which is a fingerprint of
+    its own, and a matching body alone would pass any path that served nothing:
+    the refusal and the document have to be the camouflage site's together.
+    """
+    observed: Dict[str, Any] = {}
+    for path, report in facts["management"].items():
+        probe = report.get("probe") or {}
+        status = probe.get("status")
+        observed[path] = {"status": status, "sha256": probe.get("body_sha256")}
+        require(case_id, status == 404,
+                f"{route['name']}: {path} answered {status!r} instead of being refused, so this "
+                f"route published a management interface "
+                f"({probe.get('error') or 'the probe reported no failure'})")
+        require(case_id, probe.get("body_sha256") == not_found_sha,
+                f"{route['name']}: {path} was refused with a body that is not the cover site's own "
+                f"404.html ({probe.get('body_sha256')} vs {not_found_sha}), so the answer came from "
+                f"another listener: {(probe.get('body_snippet') or '')[:200]}")
+    return observed
+
+
+def management_control_facts(
+    product: AioProduct, case_id: str, decoy_404_sha: str,
+) -> Dict[str, Any]:
+    """The management surface works, and only on its own name.
+
+    Without this pair every refusal above would be vacuous: the loopback call is
+    the operator's own path, and the anonymous call on the panel's name is the
+    same route a prober would try, answered by the Panel instead of the decoy.
+    """
+    host = product.require_installed()
+    loopback = product.host_script(panel_probe_script())
+    require(case_id, loopback.returncode == 0,
+            f"the loopback management probe failed: {(loopback.stderr or loopback.stdout).strip()[-800:]}")
+    values = _parse_key_values(loopback.stdout or "")
+    require(case_id, values.get("login") == "200",
+            f"the Panel login answered {values.get('login')!r}")
+    require(case_id, values.get("api") == "200",
+            f"an authenticated /api/nodes call answered {values.get('api')!r}")
+    require(case_id, int(values.get("token_length") or 0) > 0,
+            "the Panel login returned an empty access token")
+
+    anonymous = host.client_http(f"{PUBLIC_PANEL}/api/nodes", timeout=DECOY_PROBE_TIMEOUT_SECONDS)
+    probe = anonymous.get("probe") or {}
+    require(case_id, anonymous.get("returncode") == 0,
+            f"https://{PANEL_DOMAIN}/api/nodes could not be asked from the client: "
+            f"{probe.get('error') or anonymous.get('stderr')}")
+    require(case_id, probe.get("status") in (401, 403),
+            f"an anonymous /api/nodes call through the panel name answered "
+            f"{probe.get('status')!r} instead of being refused")
+    require(case_id, probe.get("body_sha256") != decoy_404_sha,
+            "the anonymous management read on the panel name returned the camouflage site's 404 "
+            "page, so the panel name is answered by the decoy rather than by the Panel")
+    return {
+        "loopback_login": values.get("login"),
+        "loopback_api": values.get("api"),
+        "token_length": values.get("token_length"),
+        "anonymous_api_status": probe.get("status"),
+        "anonymous_api_sha256": probe.get("body_sha256"),
+    }
+
+
+def decoy_isolation_contract(product: AioProduct, case_id: str) -> Dict[str, Any]:
+    """Every route serves one site, and none of them serves a management path.
+
+    The documents are compared across routes as well as within one: one decoy
+    vhost on one root is what makes them identical, so a route that answers with
+    something else is a second surface standing in for the fallback.
+    """
+    observed: Dict[str, Any] = {}
+    site_sha = not_found_sha = ""
+    first_route = ""
+    for route in decoy_routes():
+        facts = decoy_route_facts(product, route)
+        served = require_cover_site_served(case_id, route, facts)
+        if not site_sha:
+            site_sha, not_found_sha, first_route = (
+                served["site_sha256"], served["not_found_sha256"], route["name"],
+            )
+        else:
+            require(case_id, served["site_sha256"] == site_sha,
+                    f"{route['name']}: GET {route['url']}/ served a different document than "
+                    f"{first_route} did ({served['site_sha256']} vs {site_sha}), so this route does "
+                    "not terminate on the camouflage site the product rendered")
+            require(case_id, served["not_found_sha256"] == not_found_sha,
+                    f"{route['name']}: the 404 page differs from the one {first_route} serves "
+                    f"({served['not_found_sha256']} vs {not_found_sha}), so the two routes do not "
+                    "share the cover site's root")
+        observed[route["name"]] = {
+            **served,
+            "management": require_decoy_denies_management(case_id, route, facts, not_found_sha),
+        }
+    control = management_control_facts(product, case_id, not_found_sha)
+    return {
+        "routes": observed,
+        "management_paths": list(DECOY_MANAGEMENT_PATHS),
+        "missing_path": DECOY_MISSING_PATH,
+        "management": control,
+    }
+
+
+def case_decoy(product: AioProduct) -> Dict[str, Any]:
+    """DECOY-01: the camouflage listener hands out a site, never a management interface.
+
+    A REALITY deployment is found by scanning its address: the probe asks for a
+    name, gets a certificate and then asks it for ``/api/``. The product answers
+    that scan with a static cover site and, for everything the site does not have,
+    with the site's own 404 page — the panel, the subscription API and the
+    transport paths only exist behind the panel's own name.
+
+    The case reads every one of those paths on the cover apex, on its ``www``, on
+    the REALITY name without REALITY authentication, and on a name the stream map
+    does not list, from the Control Machine; and it proves the paths are real
+    management routes by calling them on the host and on the panel's name, where
+    they do answer.
+    """
+    return decoy_isolation_contract(product, DECOY_CASE_ID)
+
+
 def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False) -> List[Case]:
     """The AIO suite: the install case plus every case that reuses its host.
 
@@ -4112,6 +4376,10 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # traffic so a reload it caused can never be read as a data-plane fault.
         Case(NGX_CONFIG_CASE_ID, "aio", lambda context: case_nginx_config(product),
              timeout_seconds=NGX_CONFIG_TIMEOUT_SECONDS),
+        # The decoy only reads the public surface and reloads nothing, so it is
+        # measured here, while no case has changed the tree or the lineage yet.
+        Case(DECOY_CASE_ID, "aio", lambda context: case_decoy(product),
+             timeout_seconds=DECOY_TIMEOUT_SECONDS),
         # The renewal runs before any traffic for the same reason: it reloads
         # NGINX onto a fresh lineage, and a data-plane case must not be measured
         # across a reload this one caused.
