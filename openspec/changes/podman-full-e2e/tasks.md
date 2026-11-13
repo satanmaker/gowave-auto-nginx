@@ -67,8 +67,8 @@
 
 ## 6. TLS, DNS, ACME, and network policy
 
-- [ ] 6.1 Validate generated NGINX configuration and safe reload behavior.
-- [ ] 6.2 Verify TLS version, certificate SAN, validity, and chain from independent clients.
+- [x] 6.1 Validate generated NGINX configuration and safe reload behavior.
+- [x] 6.2 Verify TLS version, certificate SAN, validity, and chain from independent clients.
 - [ ] 6.3 Exercise ACME issuance and renewal through Pebble using the real Certbot webroot HTTP-01 path and the target's actual NGINX challenge route; do not pre-seed certificates or mock successful challenges.
 - [ ] 6.4 Exercise challenge and ACME outage failures and recovery.
 - [ ] 6.4a Separately verify A/AAAA selection, TTL/cache expiry, NXDOMAIN, and stale/wrong DNS answers from target and independent-client vantage points.
