@@ -104,8 +104,26 @@ COVER_APEX_ANSWERS = {
 # from gowave-node-auto.sh and is never written to its disk, so the file the
 # payload was cut from is where that role's deployed text can be read.
 COVER_DECISION_FUNCTIONS: Sequence[str] = (
-    "derive_cover_domain", "cover_domains_resolve_here", "cover_domain_for",
+    "derive_cover_domain", "cover_domains_not_resolving", "cover_domains_resolve_here",
+    "cover_domain_for",
 )
+# One requirement, one case id: a cluster that refuses the apex has to leave no
+# certificate, vhost or site claiming it, on either role.
+COVER_UNRESOLVED_CASE_ID = "NGX-COVER-UNRESOLVED"
+# The refusal case rewrites the fixture zone, reads one role's files, and runs
+# the decision matrix on both roles, so its ceiling is a hang guard for those
+# calls rather than a budget.
+COVER_UNRESOLVED_TIMEOUT_SECONDS = 300
+# Each probe deployment domain steers one half of the apex pair, which the
+# installed zone cannot do: it answers the real apex for the Master, so the run
+# could never show what a single missing record refuses.
+COVER_PROBE_NAMES = {
+    "apex_only": f"onlyapex.{topology.DNS_ZONE_SUFFIX}",
+    "www_only": f"onlywww.{topology.DNS_ZONE_SUFFIX}",
+    "elsewhere": f"elsewhere.{topology.DNS_ZONE_SUFFIX}",
+}
+COVER_SITE_INDEX = "/var/www/gowave-auto-nginx/cover-reality/index.html"
+COVER_VHOST_DIRS: Sequence[str] = ("/etc/nginx/sites-enabled", "/etc/nginx/conf.d")
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 VISION_PROBE_TIMEOUT_SECONDS = 120
@@ -4047,6 +4065,409 @@ def case_cover_derive(product: MultiNodeProduct) -> Dict[str, Any]:
     return evidence
 
 
+def cover_probe_matrix(master_ip: str, other_ip: str) -> Sequence[Dict[str, Any]]:
+    """One steered deployment domain per way the apex pair can be wrong.
+
+    The address the decision is told is its own is the one the steered records
+    answer, so the matrix reads the same on both roles: whether that address is
+    really the role's is what the installed apex decides, and that is measured
+    separately against the installed zone.
+    """
+    apex_only = COVER_PROBE_NAMES["apex_only"]
+    www_only = COVER_PROBE_NAMES["www_only"]
+    elsewhere = COVER_PROBE_NAMES["elsewhere"]
+    return (
+        {
+            "domain": f"panel.{apex_only}", "apex": apex_only, "server_ip": master_ip,
+            "answers": {apex_only: master_ip, f"www.{apex_only}": ""},
+        },
+        {
+            "domain": f"panel.{www_only}", "apex": www_only, "server_ip": master_ip,
+            "answers": {www_only: "", f"www.{www_only}": master_ip},
+        },
+        {
+            "domain": f"panel.{elsewhere}", "apex": elsewhere, "server_ip": master_ip,
+            "answers": {elsewhere: other_ip, f"www.{elsewhere}": other_ip},
+        },
+    )
+
+
+def cover_probe_zone(host: topology.MultiNodeTopology, answer_ip: str,
+                     other_ip: str) -> Dict[str, Any]:
+    """The installed zone plus one record per half of each probe apex.
+
+    Only probe names are added, so steering this case cannot change what a later
+    case resolves for a name the install published.
+    """
+    data = json.loads(json.dumps(host.zone()))
+    records = data["records"]
+    apex_only = COVER_PROBE_NAMES["apex_only"]
+    www_only = COVER_PROBE_NAMES["www_only"]
+    elsewhere = COVER_PROBE_NAMES["elsewhere"]
+    records[apex_only] = {"A": [answer_ip]}
+    records[f"www.{www_only}"] = {"A": [answer_ip]}
+    records[elsewhere] = {"A": [other_ip]}
+    records[f"www.{elsewhere}"] = {"A": [other_ip]}
+    return data
+
+
+def cover_probe_script(role: str, probes: Sequence[Dict[str, Any]]) -> str:
+    """The steered matrix run through this role's own copy of the decision.
+
+    Each probe reports twice: what the role's own resolver answered for both
+    halves of the apex, and the outcome of the decision those answers feed.
+    """
+    names: List[str] = []
+    for probe in probes:
+        names.extend([probe["apex"], f"www.{probe['apex']}"])
+    lookups = "\n".join(
+        f"printf 'resolved\\t%s\\t%s\\n' {shlex.quote(name)} "
+        f"\"$(getent ahostsv4 {shlex.quote(name)} 2>/dev/null | awk 'NR==1 {{print $1}}' || true)\""
+        for name in names
+    )
+    decisions = "\n".join(
+        f"apex=$(cover_domain_for {shlex.quote(probe['domain'])} "
+        f"{shlex.quote(probe['server_ip'])} 2>/dev/null || true)\n"
+        f"reason=$(cover_domain_for {shlex.quote(probe['domain'])} "
+        f"{shlex.quote(probe['server_ip'])} 2>&1 >/dev/null || true)\n"
+        f"printf 'decision\\t%s\\t%s\\t%s\\n' {shlex.quote(probe['domain'])} "
+        "\"$apex\" \"$reason\""
+        for probe in probes
+    )
+    return f"""set -eu
+{cover_decision_loader(role)}
+{lookups}
+{decisions}
+"""
+
+
+def cover_state_script(role: str, domain: str, server_ip: str) -> str:
+    """This role's real decision plus every file a rendered apex would leave.
+
+    The vhost claims are read from both directories NGINX loads, and the lineage
+    is read from the certificate files themselves, so "no partial decoy" and "no
+    lineage issued" are facts about the deployable state rather than about the
+    decision's wording.
+    """
+    apex = ".".join(domain.rstrip(".").split(".")[-2:])
+    dirs = " ".join(shlex.quote(path) for path in COVER_VHOST_DIRS)
+    return f"""set -u
+{cover_decision_loader(role)}
+server_ip={shlex.quote(server_ip)}
+apex={shlex.quote(apex)}
+for name in "$apex" "www.$apex"; do
+    printf 'resolved\\t%s\\t%s\\n' "$name" "$(getent ahostsv4 "$name" 2>/dev/null | awk 'NR==1 {{print $1}}' || true)"
+done
+hostname -I 2>/dev/null | tr ' ' '\\n' | sed '/^$/d; s/^/self\\t/' || true
+decision_apex=$(cover_domain_for {shlex.quote(domain)} "$server_ip" 2>/dev/null || true)
+decision_reason=$(cover_domain_for {shlex.quote(domain)} "$server_ip" 2>&1 >/dev/null || true)
+printf 'decision\\t%s\\t%s\\t%s\\n' {shlex.quote(domain)} "$decision_apex" "$decision_reason"
+printf 'site\\t%s\\t%s\\n' {shlex.quote(COVER_SITE_INDEX)} "$(stat -c '%s' {shlex.quote(COVER_SITE_INDEX)} 2>/dev/null || true)"
+for dir in {dirs}; do
+    [ -d "$dir" ] || continue
+    grep -rHnE '^[[:space:]]*server_name[[:space:]]' "$dir" 2>/dev/null | sed 's/^/claim\\t/' || true
+done
+for cert in /etc/letsencrypt/live/*/cert.pem; do
+    [ -f "$cert" ] || continue
+    printf 'lineage\\t%s\\t%s\\n' "$cert" "$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | tr '\\n' ' ' || true)"
+done
+"""
+
+
+def parse_cover_state(output: str) -> Dict[str, Any]:
+    """Every line the probe and state scripts print, keyed by what it measures.
+
+    A probe script reports one decision per steered domain and the state script
+    reports one for the installed domain, so decisions are keyed by the domain
+    they were asked about instead of by the order they arrived in.
+    """
+    facts: Dict[str, Any] = {
+        "resolved": {}, "self": [], "decisions": {}, "site_size": "",
+        "claims": [], "lineages": {},
+    }
+    for line in output.splitlines():
+        fields = line.split("\t")
+        kind = fields[0] if fields else ""
+        if kind == "resolved" and len(fields) == 3:
+            facts["resolved"][fields[1]] = fields[2]
+        elif kind == "decision" and len(fields) == 4:
+            facts["decisions"][fields[1]] = {"apex": fields[2], "reason": fields[3]}
+        elif kind == "self" and len(fields) == 2:
+            facts["self"].append(fields[1])
+        elif kind == "site" and len(fields) == 3:
+            facts["site_size"] = fields[2]
+        elif kind == "claim" and len(fields) == 2:
+            facts["claims"].append(fields[1])
+        elif kind == "lineage" and len(fields) == 3:
+            facts["lineages"][fields[1]] = fields[2]
+    return facts
+
+
+def cover_decision_for(case_id: str, role: str, domain: str, facts: Dict[str, Any]) -> Dict[str, Any]:
+    """The decision a role printed for one domain, or a failure naming the gap."""
+    decision = facts["decisions"].get(domain)
+    require(
+        case_id,
+        decision is not None,
+        f"{role} printed no cover decision for {domain}: {sorted(facts['decisions'])}",
+    )
+    return decision or {}
+
+
+def cover_refusal_message(names: Sequence[str], server_ip: str) -> str:
+    """The operator-facing refusal, worded the way the product words it."""
+    verb = "do not resolve" if len(names) > 1 else "does not resolve"
+    return (
+        f"Camouflage apex disabled — {' / '.join(names)} {verb} to {server_ip}, "
+        "so HTTP-01 would fail."
+    )
+
+
+def cover_claim_names(claim: str) -> List[str]:
+    """The names one `server_name` line claims, read as NGINX reads them."""
+    match = re.search(r"server_name[ \t]+([^;]+);", claim)
+    return match.group(1).split() if match else []
+
+
+def cover_lineage_sans(text: str) -> List[str]:
+    """The DNS entries of one certificate's subjectAltName extension."""
+    return [token for token in re.findall(r"DNS:([^,\s]+)", text)]
+
+
+def require_cover_probe(case_id: str, role: str, probe: Dict[str, Any],
+                        facts: Dict[str, Any]) -> Dict[str, Any]:
+    """A steered probe: the records the fixture withheld are the records named."""
+    apex, server_ip = probe["apex"], probe["server_ip"]
+    for name, expected in probe["answers"].items():
+        require(
+            case_id,
+            facts["resolved"].get(name, "") == expected,
+            f"{role}: the fixture answered {name} with "
+            f"{facts['resolved'].get(name, '')!r} instead of {expected!r}, so this probe "
+            "cannot stand for the half of the pair it was steered to withhold",
+        )
+    failing = [name for name, expected in probe["answers"].items() if expected != server_ip]
+    require(
+        case_id,
+        failing,
+        f"{role}: the {apex} probe resolves every record to {server_ip}, so it shows no "
+        "refusal at all",
+    )
+    decision = cover_decision_for(case_id, role, probe["domain"], facts)
+    require(
+        case_id,
+        decision.get("apex") == "",
+        f"{role} rendered the apex {decision.get('apex')!r} for {probe['domain']} although "
+        f"only {failing} resolve to {server_ip}, so a lineage ACME cannot validate would be "
+        "requested",
+    )
+    expected = cover_refusal_message(failing, server_ip)
+    require(
+        case_id,
+        decision.get("reason") == expected,
+        f"{role} refuses {probe['domain']} with {decision.get('reason')!r} instead of "
+        f"naming the records that did not resolve, {expected!r}",
+    )
+    return {
+        "domain": probe["domain"],
+        "cover_domain": apex,
+        "answers": probe["answers"],
+        "apex_rendered": decision.get("apex", ""),
+        "refusal": decision.get("reason", ""),
+    }
+
+
+def require_cover_rendered(case_id: str, role: str, domain: str, apex: str,
+                           server_ip: str, facts: Dict[str, Any]) -> Dict[str, Any]:
+    """Both halves resolve here, so the decoy, the page and the lineage exist."""
+    require(
+        case_id,
+        server_ip in facts["self"],
+        f"{role} does not hold {server_ip} among its own addresses {facts['self']}, so the "
+        "apex cannot resolve to it",
+    )
+    for name in (apex, f"www.{apex}"):
+        require(
+            case_id,
+            facts["resolved"].get(name) == server_ip,
+            f"{role}: {name} resolves to {facts['resolved'].get(name)!r} instead of the "
+            f"host's own {server_ip}, so this run cannot show the rendering precondition",
+        )
+    decision = cover_decision_for(case_id, role, domain, facts)
+    require(
+        case_id,
+        decision.get("apex") == apex and decision.get("reason") == "",
+        f"{role} decided {decision.get('apex')!r} with {decision.get('reason')!r} although "
+        f"{apex} and www.{apex} both resolve to {server_ip}",
+    )
+    require(
+        case_id,
+        facts["site_size"].isdigit() and int(facts["site_size"]) > 0,
+        f"{role} accepted the apex but left no rendered cover page at {COVER_SITE_INDEX}",
+    )
+    claimed = [name for claim in facts["claims"] for name in cover_claim_names(claim)]
+    for name in (apex, f"www.{apex}"):
+        require(
+            case_id,
+            name in claimed,
+            f"{role} rendered no vhost claiming {name}: {claimed}",
+        )
+    sans = {path: cover_lineage_sans(text) for path, text in facts["lineages"].items()}
+    covering = [
+        path for path, names in sans.items()
+        if apex in names and f"www.{apex}" in names
+    ]
+    require(
+        case_id,
+        covering,
+        f"{role} holds no certificate covering both {apex} and www.{apex}, so the decoy "
+        f"would serve a lineage ACME cannot validate: {sans}",
+    )
+    return {
+        "server_ip": server_ip,
+        "own_addresses": facts["self"],
+        "apex_rendered": decision.get("apex", ""),
+        "cover_page_bytes": int(facts["site_size"]),
+        "covered_by": covering,
+    }
+
+
+def require_cover_withheld(case_id: str, role: str, domain: str, apex: str,
+                           server_ip: str, answers: Dict[str, str],
+                           facts: Dict[str, Any]) -> Dict[str, Any]:
+    """The apex resolves elsewhere, so nothing may claim it and nothing may be issued."""
+    for name, expected in answers.items():
+        require(
+            case_id,
+            facts["resolved"].get(name, "") == expected,
+            f"{role}: {name} resolves to {facts['resolved'].get(name, '')!r} instead of "
+            f"{expected!r}, so this run cannot show the refusal it claims",
+        )
+    failing = [name for name, expected in answers.items() if expected != server_ip]
+    decision = cover_decision_for(case_id, role, domain, facts)
+    require(
+        case_id,
+        decision.get("apex") == "",
+        f"{role} rendered the apex {decision.get('apex')!r} although {failing} do not "
+        f"resolve to its own {server_ip}",
+    )
+    expected_reason = cover_refusal_message(failing, server_ip)
+    require(
+        case_id,
+        decision.get("reason") == expected_reason,
+        f"{role} refuses its apex with {decision.get('reason')!r} instead of "
+        f"{expected_reason!r}",
+    )
+    claimed = [name for claim in facts["claims"] for name in cover_claim_names(claim)]
+    for name in (apex, f"www.{apex}"):
+        require(
+            case_id,
+            name not in claimed,
+            f"{role} refused the apex but a vhost still claims {name}, leaving a partial "
+            f"decoy or a stale sites-enabled entry: {claimed}",
+        )
+    sans = {path: cover_lineage_sans(text) for path, text in facts["lineages"].items()}
+    covering = [path for path, names in sans.items() if apex in names]
+    require(
+        case_id,
+        not covering,
+        f"{role} refused the apex but already holds a lineage naming it ({covering}), so "
+        f"the refusal came after issuance: {sans}",
+    )
+    return {
+        "server_ip": server_ip,
+        "apex_rendered": decision.get("apex", ""),
+        "refusal": decision.get("reason", ""),
+        "claimed_names": claimed,
+        "lineages": sans,
+    }
+
+
+def case_cover_unresolved(product: MultiNodeProduct) -> Dict[str, Any]:
+    """NGX-COVER-UNRESOLVED: resolution, not intent, decides whether the apex is rendered.
+
+    The install publishes one apex for the Master, so a single run cannot show
+    what a half-missing pair refuses unless the fixture zone is steered. Three
+    probe deployment domains therefore withhold one record each — and both
+    records at once — while the deployed decision is run on both roles with the
+    address the steered records answer: each probe must refuse, name exactly the
+    records that did not resolve, and render nothing.
+
+    The installed apex stays as the run built it and is read on both roles: the
+    role that holds the address gets a rendered page, a claiming vhost and a
+    lineage covering the pair, and the role that does not gets a refusal with no
+    claim and no lineage. The zone is restored before the case returns, because
+    the cases after it resolve the installed names.
+    """
+    case_id = COVER_UNRESOLVED_CASE_ID
+    host = product.require_worker()
+    master_ip = str(host.plan.target_ip)
+    worker_ip = str(host.plan.worker_ip)
+    other_ip = str(host.plan.echo_ip)
+    base_zone = host.zone()
+    probes = cover_probe_matrix(master_ip, other_ip)
+    evidence: Dict[str, Any] = {"installed_cover_domain": topology.COVER_APEX}
+    host.write_dns_zone(cover_probe_zone(host, master_ip, other_ip))
+    try:
+        probe_evidence: Dict[str, Any] = {}
+        for key, label, container in (
+            ("master", "the Master", host.target_name),
+            ("worker", "the Worker", host.worker_name),
+        ):
+            steered = product.podman.exec_bash(
+                container, cover_probe_script(key, probes), check=False, timeout=120,
+            )
+            require(
+                case_id,
+                steered.returncode == 0,
+                f"{label} could not run the steered cover matrix: "
+                f"{(steered.stderr or '').strip()[-500:]}",
+            )
+            facts = parse_cover_state(steered.stdout or "")
+            probe_evidence[key] = [
+                require_cover_probe(case_id, label, probe, facts) for probe in probes
+            ]
+        evidence["probes"] = probe_evidence
+
+        for key, label, container, domain, server_ip, answers, rendered in (
+            ("master", "the Master", host.target_name, topology.PANEL_DOMAIN, master_ip,
+             {topology.COVER_APEX: master_ip,
+              f"www.{topology.COVER_APEX}": master_ip}, True),
+            ("worker", "the Worker", host.worker_name, host.worker_domain, worker_ip,
+             {topology.COVER_APEX: master_ip,
+              f"www.{topology.COVER_APEX}": master_ip}, False),
+        ):
+            state = product.podman.exec_bash(
+                container, cover_state_script(key, domain, server_ip),
+                check=False, timeout=120,
+            )
+            require(
+                case_id,
+                state.returncode == 0,
+                f"{label} could not report its cover state: "
+                f"{(state.stderr or '').strip()[-500:]}",
+            )
+            facts = parse_cover_state(state.stdout or "")
+            if rendered:
+                evidence[key] = require_cover_rendered(
+                    case_id, label, domain, topology.COVER_APEX, server_ip, facts,
+                )
+            else:
+                evidence[key] = require_cover_withheld(
+                    case_id, label, domain, topology.COVER_APEX, server_ip, answers, facts,
+                )
+    finally:
+        # A restore failure must not replace the error the case is reporting, and
+        # the zone is the fixture's own state: later cases resolve the installed
+        # names, so it is put back even when a check above failed.
+        try:
+            host.write_dns_zone(base_zone)
+        except OSError:
+            pass
+    evidence["zone_restored"] = True
+    return evidence
+
+
 def case_worker_outage(product: MultiNodeProduct) -> Dict[str, Any]:
     """MN-OUTAGE: stopping the Worker degrades the cluster, and removing the fault restores it.
 
@@ -4484,6 +4905,11 @@ def cases(
         Case(COVER_DERIVE_CASE_ID, "multi-node",
              lambda context: case_cover_derive(product),
              timeout_seconds=COVER_DERIVE_TIMEOUT_SECONDS),
+        # The refusal case steers the fixture zone and puts it back before it
+        # returns, so it runs beside the other reads of a healthy cluster.
+        Case(COVER_UNRESOLVED_CASE_ID, "multi-node",
+             lambda context: case_cover_unresolved(product),
+             timeout_seconds=COVER_UNRESOLVED_TIMEOUT_SECONDS),
         # The lifecycle cases run last: they revoke a client and fault the
         # Worker's own unit, so nothing that observes a healthy cluster may run
         # after them and no earlier case may be blamed for their state.
