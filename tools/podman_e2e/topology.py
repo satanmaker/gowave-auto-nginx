@@ -23,6 +23,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import os
 import socket
 import time
 from dataclasses import dataclass, field
@@ -82,6 +83,8 @@ HOST_RESOLV_CONF = Path("/etc/resolv.conf")
 FIXTURE_IMAGE = "fixture-echo"
 DNS_FIXTURE_SCRIPT = "/repo/tests/fixtures/dns_server.py"
 ECHO_FIXTURE_SCRIPT = "/repo/tests/fixtures/echo_server.py"
+DNS_QUERY_LOG_NAME = "queries.jsonl"
+DNS_ZONE_NAME = "zone.json"
 REPO_IN_CONTAINER = "/repo"
 CA_MOUNT = "/fixtures/ca"
 CA_FILE_NAME = "fixture-ca.crt"
@@ -122,6 +125,10 @@ SUBSCRIPTION_PROBE_SCRIPT = f"{REPO_IN_CONTAINER}/tools/podman_e2e/subscription_
 # The probe that sends payloads through the served outbounds with the same
 # binaries, from the same role.
 TRAFFIC_PROBE_SCRIPT = f"{REPO_IN_CONTAINER}/tools/podman_e2e/traffic_probe.py"
+# The probe that reads DNS answers either from the fixture itself or through the
+# role's own resolution path, so both vantages are measured with the same code.
+DNS_PROBE_SCRIPT = f"{REPO_IN_CONTAINER}/tools/podman_e2e/dns_probe.py"
+DNS_PROBE_TIMEOUT_SECONDS = 60
 # Payloads are fetched on the host (the subscription routes are loopback-only)
 # and mounted into the engine container; they are never printed or copied into
 # the artifact directory.
@@ -325,6 +332,7 @@ class AioTopology:
     _issued_root: str = ""
     _clean_facts: Dict[str, Any] = field(default_factory=dict)
     echo_dir: Optional[Path] = None
+    dns_dir: Optional[Path] = None
 
     def __post_init__(self) -> None:
         target_image.distribution(self.distribution)
@@ -368,7 +376,8 @@ class AioTopology:
     def _start_dns(self) -> None:
         directory = self.context.secret_dir / "dns"
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        zone_path = directory / "zone.json"
+        self.dns_dir = directory
+        zone_path = directory / DNS_ZONE_NAME
         zone_path.write_text(json.dumps(self.zone(), sort_keys=True), encoding="utf-8")
         self.podman.run(
             name=self.dns_name,
@@ -379,12 +388,76 @@ class AioTopology:
             # Writable: cases rewrite the zone to steer answers and the fixture
             # appends its query log there.
             volumes=(f"{directory}:/fixtures/dns:Z",),
-            command=dns_command("/fixtures/dns/zone.json", "/fixtures/dns/queries.jsonl"),
+            command=dns_command(f"/fixtures/dns/{DNS_ZONE_NAME}", f"/fixtures/dns/{DNS_QUERY_LOG_NAME}"),
             systemd="false",
             extra_args=("--ip", self.plan.dns_ip),
         )
         self.started.append(self.dns_name)
         self.podman.wait_tcp(self.dns_name, "127.0.0.1", DNS_PORT, timeout_seconds=60)
+
+    def dns_zone_file(self) -> Path:
+        """The zone the fixture serves; rewriting it steers the next answer."""
+        if self.dns_dir is None:
+            raise TopologyError("the resolver fixture has not been started")
+        return self.dns_dir / DNS_ZONE_NAME
+
+    def dns_query_log(self) -> Path:
+        """The fixture's own query log, which names the vantage each answer went to."""
+        if self.dns_dir is None:
+            raise TopologyError("the resolver fixture has not been started")
+        return self.dns_dir / DNS_QUERY_LOG_NAME
+
+    def write_dns_zone(self, data: Dict[str, Any]) -> None:
+        """Replace the zone atomically; a query never reads a half-written file.
+
+        The fixture reloads when the zone's mtime changes, so the replacement is
+        given a fresh timestamp: a rewrite of the same size inside one clock tick
+        would otherwise be served from the fixture's previous copy.
+        """
+        path = self.dns_zone_file()
+        temporary = path.with_name(path.name + ".tmp")
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(data, sort_keys=True))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        stamp = time.time_ns()
+        os.utime(path, ns=(stamp, stamp))
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    def dns_queries(self) -> List[Dict[str, Any]]:
+        """Every query the fixture has recorded, newest last."""
+        try:
+            text = self.dns_query_log().read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return []
+        events: List[Dict[str, Any]] = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return events
+
+    def dns_probe(
+        self, container: str, scope: str, queries: Sequence[str] = (), names: Sequence[str] = (),
+        timeout: int = DNS_PROBE_TIMEOUT_SECONDS,
+    ) -> Any:
+        """Run the DNS probe inside one role and return the completed process."""
+        argv = ["python3", DNS_PROBE_SCRIPT, "--scope", scope]
+        if scope == "direct":
+            argv += ["--server", str(self.plan.dns_ip), "--port", str(DNS_PORT)]
+        for query in queries:
+            argv += ["--query", query]
+        for name in names:
+            argv += ["--name", name]
+        return self.podman.exec(container, argv, check=False, timeout=timeout)
 
     def _start_acme(self) -> None:
         self.acme = acme_fixture.AcmeFixture(
