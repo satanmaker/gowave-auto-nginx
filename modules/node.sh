@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # modules/node.sh - GoWave Node installation, configuration, and mTLS verification
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GOWAVE_NODE_INSTALL_DIR="/opt/gowave-node"

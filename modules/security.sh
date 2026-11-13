@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # modules/security.sh - Host security, firewall, swap, BBR, and log rotation
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANAGED_SECURITY_PY="${SCRIPT_DIR}/assets/security/managed.py"

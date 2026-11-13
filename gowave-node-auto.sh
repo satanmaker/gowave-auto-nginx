@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # gowave-node-auto.sh - Distributed Edge Worker Deployment and Hardening Orchestrator
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECOMMENDED_NODE_PORT=3002
@@ -8,6 +8,20 @@ RECOMMENDED_NODE_PORT=3002
 log_info() { printf '[INFO] %s\n' "$*"; }
 log_warn() { printf '[WARN] %s\n' "$*" >&2; }
 log_err()  { printf '[ERROR] %s\n' "$*" >&2; }
+
+# Refuse to delete a tree that is not strictly below a directory this script
+# owns: ${var:?} rejects only unset and empty values, while "/", "..", or a
+# domain that resolves elsewhere all pass it.
+require_tree_under() {
+    local path="$1" parent="$2"
+    local resolved_path resolved_parent
+    [[ -n "$path" && -n "$parent" ]] || return 1
+    resolved_path=$(realpath -m -- "$path") || return 1
+    resolved_parent=$(realpath -m -- "$parent") || return 1
+    [[ "$resolved_parent" != "/" ]] || return 1
+    [[ "$resolved_path" == "$resolved_parent"/* ]] || return 1
+    [[ "$resolved_path" != "$resolved_parent" ]]
+}
 
 # Modules source if local
 if [[ -f "$SCRIPT_DIR/modules/os.sh" ]]; then
@@ -328,6 +342,11 @@ fi
     if [[ "$existed" == "0" ]]; then
         echo "Removing transaction-created ACME lineage for $domain..." >&2
         rm -f "$renewal_conf" || { echo "Error: Could not remove transaction-created renewal config for $domain" >&2; return 1; }
+        if ! require_tree_under "$live_dir" "$letsencrypt_root" ||
+            ! require_tree_under "$archive_dir" "$letsencrypt_root"; then
+            echo "Error: Refusing to remove ACME lineage for $domain outside $letsencrypt_root." >&2
+            return 1
+        fi
         rm -rf "$live_dir" "$archive_dir" || { echo "Error: Could not remove transaction-created lineage for $domain" >&2; return 1; }
         return 0
     fi
@@ -427,6 +446,10 @@ cleanup_acme_snapshot() {
 
     local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
     if [[ -d "$snap_dir" ]]; then
+        if ! require_tree_under "$snap_dir" "$recovery_root"; then
+            echo "Error: Refusing to remove ACME snapshot outside $recovery_root (transaction $transaction_id)." >&2
+            return 1
+        fi
         rm -rf "$snap_dir"
     fi
 }
@@ -1057,6 +1080,20 @@ log_info() { printf '[INFO] %s\n' "$*"; }
 log_warn() { printf '[WARN] %s\n' "$*" >&2; }
 log_err()  { printf '[ERROR] %s\n' "$*" >&2; }
 
+# Refuse to delete a tree that is not strictly below a directory this script
+# owns: ${var:?} rejects only unset and empty values, while "/", "..", or a
+# domain that resolves elsewhere all pass it.
+require_tree_under() {
+    local path="$1" parent="$2"
+    local resolved_path resolved_parent
+    [[ -n "$path" && -n "$parent" ]] || return 1
+    resolved_path=$(realpath -m -- "$path") || return 1
+    resolved_parent=$(realpath -m -- "$parent") || return 1
+    [[ "$resolved_parent" != "/" ]] || return 1
+    [[ "$resolved_path" == "$resolved_parent"/* ]] || return 1
+    [[ "$resolved_path" != "$resolved_parent" ]]
+}
+
 # The local ACME fixture is a test-only trust anchor. Its endpoint is pinned so
 # enabling test mode never turns GOWAVE_ACME_SERVER into an arbitrary-URL option.
 GOWAVE_ACME_TEST_ENDPOINT="https://pebble.testbed.internal:14000/dir"
@@ -1368,6 +1405,11 @@ fi
     if [[ "$existed" == "0" ]]; then
         echo "Removing transaction-created ACME lineage for $domain..." >&2
         rm -f "$renewal_conf" || { echo "Error: Could not remove transaction-created renewal config for $domain" >&2; return 1; }
+        if ! require_tree_under "$live_dir" "$letsencrypt_root" ||
+            ! require_tree_under "$archive_dir" "$letsencrypt_root"; then
+            echo "Error: Refusing to remove ACME lineage for $domain outside $letsencrypt_root." >&2
+            return 1
+        fi
         rm -rf "$live_dir" "$archive_dir" || { echo "Error: Could not remove transaction-created lineage for $domain" >&2; return 1; }
         return 0
     fi
@@ -1467,6 +1509,10 @@ cleanup_acme_snapshot() {
 
     local snap_dir="${recovery_root}/${transaction_id}/acme/${domain}"
     if [[ -d "$snap_dir" ]]; then
+        if ! require_tree_under "$snap_dir" "$recovery_root"; then
+            echo "Error: Refusing to remove ACME snapshot outside $recovery_root (transaction $transaction_id)." >&2
+            return 1
+        fi
         rm -rf "$snap_dir"
     fi
 }
@@ -2876,7 +2922,7 @@ RUNNER_FUNCS
 
         # 3. Main entrypoint executed remotely
         cat <<'REMOTE_EOF'
-set -euo pipefail
+set -Eeuo pipefail
 main() {
     umask 077
     _ROLLBACK_IN_PROGRESS=0
@@ -3018,7 +3064,7 @@ remote_rollback() {
         printf 'export ACME_TX_ID=%q\n' "${ACME_TX_ID:-}"
 
         cat <<'ROLLBACK_REMOTE_SCRIPT'
-set -euo pipefail
+set -Eeuo pipefail
 
 if [[ -n "${ACME_TX_ID:-}" && ! "$ACME_TX_ID" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
     echo "Error: Invalid Worker ACME transaction ID." >&2
@@ -3464,7 +3510,7 @@ remote_finalize() {
     {
         printf 'export ACME_TX_ID=%q\n' "$acme_tx_id"
         cat <<'FINALIZE_REMOTE_SCRIPT'
-set -euo pipefail
+set -Eeuo pipefail
 if [[ "$(id -u)" -ne 0 ]]; then
     echo "Error: Worker snapshot finalization requires root." >&2
     exit 1

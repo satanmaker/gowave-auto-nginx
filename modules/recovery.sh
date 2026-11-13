@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # modules/recovery.sh - Transaction-safe updates, channel switching, and crash recovery
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${SCRIPT_DIR}/modules/lock.sh"

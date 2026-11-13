@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # modules/preflight.sh - Preflight port availability and NGINX conflict verification
-set -euo pipefail
+set -Eeuo pipefail
 
 PREFLIGHT_REQUIRED_PORTS=(80 443 3000 3001 3002 7443 8443 8444 9443 9444 10001 10002 10003)
 

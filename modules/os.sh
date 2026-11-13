@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # modules/os.sh - Base OS, package inventory, and environment detection
-set -euo pipefail
+set -Eeuo pipefail
 
 detect_os() {
     local os_release="${1:-/etc/os-release}"
