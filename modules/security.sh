@@ -66,11 +66,15 @@ configure_ufw() {
 
     # 4. Handle IPv6 configuration in /etc/default/ufw
     if [[ -f "$ufw_default" ]]; then
-        if [[ ! -f "$if_inet6" ]] || [[ ! -s "$if_inet6" ]]; then
+        # Same decision the listener generator makes, taken through the same
+        # helper: one host must never get ``[::]`` listeners without the v6
+        # rules that filter them, or the reverse.
+        if check_kernel_ipv6 "$if_inet6" 2>/dev/null; then
+            echo "UFW: IPv6 active in kernel; setting IPV6=yes in $ufw_default..."
+            sed -i 's/^IPV6=.*/IPV6=yes/' "$ufw_default" || true
+        else
             echo "UFW: IPv6 disabled in kernel; setting IPV6=no in $ufw_default..."
             sed -i 's/^IPV6=.*/IPV6=no/' "$ufw_default" || true
-        else
-            sed -i 's/^IPV6=.*/IPV6=yes/' "$ufw_default" || true
         fi
     fi
 
