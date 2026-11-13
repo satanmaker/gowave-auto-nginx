@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Suite nonroot: the All-in-One suite installs once with the real operator."""
+import hashlib
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -554,6 +556,346 @@ class TestNegativeCases(unittest.TestCase):
             result = subprocess.run(["bash", "-n"], input=script, text=True,
                                     capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class TestChannelCases(unittest.TestCase):
+    """AIO-CHANNEL-NOOP / -DEV / -ROLLBACK: what each case accepts as proof.
+
+    The channel cases read the product's snapshot, journal and unit rather than
+    the command's exit status alone, so what each one refuses matters as much as
+    what it accepts. The probe itself is executed here against a real tree: a
+    probe that only compiled would pass while its argv line was broken.
+    """
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def state(self, **overrides):
+        state = {
+            "environment": {"GOWAVE_CHANNEL": "stable"},
+            "env_digest": "e" * 64,
+            "binary": "b" * 64,
+            "database": {"bytes": "d" * 64, "integrity": "ok", "logical": "l" * 64},
+            "frontend": "f" * 64,
+            "frontend_index": "i" * 64,
+            "state": "s" * 64,
+            "nginx": "n" * 64,
+            "nginx_conf": "c" * 64,
+            "letsencrypt": "a" * 64,
+            "lineage_chain": "k" * 64,
+            "journal": {
+                "state": "COMMITTED",
+                "snapshot_dir": f"{aio.CHANNEL_RECOVERY_ROOT}/update-1",
+            },
+            "snapshots": ["update-1"],
+            "unit": {"ActiveState": "active", "MainPID": "42", "ActiveEnterTimestamp": "t"},
+            "health": "200",
+        }
+        state.update(overrides)
+        return state
+
+    def test_the_noop_case_accepts_a_host_the_call_did_not_touch(self):
+        product, _ = installed_product(self.context, [
+            (json.dumps(self.state()), 0),
+            ("GoWave is already on channel 'stable'.\n", 0),
+            (json.dumps(self.state()), 0),
+        ])
+        evidence = aio.case_channel_noop(product)
+        self.assertEqual(evidence["channel"], "stable")
+        self.assertEqual(evidence["snapshots_after"], evidence["snapshots_before"])
+        self.assertIn("already on channel", evidence["message"])
+
+    def test_a_same_channel_call_that_restarted_the_panel_fails_the_noop_case(self):
+        restarted = self.state()
+        restarted["unit"] = dict(restarted["unit"], MainPID="43")
+        product, _ = installed_product(self.context, [
+            (json.dumps(self.state()), 0),
+            ("GoWave is already on channel 'stable'.\n", 0),
+            (json.dumps(restarted), 0),
+        ])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_channel_noop(product)
+        self.assertIn("MainPID", str(caught.exception))
+
+    def test_a_same_channel_call_that_took_a_snapshot_fails_the_noop_case(self):
+        snapshotted = self.state(snapshots=["update-1", "update-2"])
+        product, _ = installed_product(self.context, [
+            (json.dumps(self.state()), 0),
+            ("GoWave is already on channel 'stable'.\n", 0),
+            (json.dumps(snapshotted), 0),
+        ])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_channel_noop(product)
+        self.assertIn("snapshot", str(caught.exception))
+
+    def test_the_dev_case_will_not_measure_a_host_that_is_not_on_stable(self):
+        off_channel = self.state(environment={"GOWAVE_CHANNEL": "dev"})
+        product, _ = installed_product(self.context, [(json.dumps(off_channel), 0)])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_channel_dev(product)
+        self.assertIn("nothing to switch", str(caught.exception))
+
+    def tree(self, directory):
+        directory.mkdir(parents=True, exist_ok=True)
+        database = sqlite3.connect(directory / "gowave.db")
+        try:
+            database.execute("create table users (id integer primary key, name text)")
+            database.execute("insert into users (name) values ('alice')")
+            database.commit()
+        finally:
+            database.close()
+        (directory / ".env").write_text("GOWAVE_CHANNEL=stable\nAPP_SECRET=kept\n", encoding="utf-8")
+        (directory / "gowave-server").write_bytes(b"#!/bin/sh\nexit 0\n")
+        (directory / "frontend").mkdir(exist_ok=True)
+        (directory / "frontend" / "index.html").write_text("<html>panel</html>\n", encoding="utf-8")
+        (directory / "state.json").write_text('{"domain": "panel.test"}\n', encoding="utf-8")
+        (directory / "etc" / "nginx" / "conf.d").mkdir(parents=True, exist_ok=True)
+        (directory / "etc" / "nginx" / "nginx.conf").write_text("events {}\n", encoding="utf-8")
+        lineage = directory / "etc" / "letsencrypt" / "live" / "panel.test"
+        lineage.mkdir(parents=True, exist_ok=True)
+        (lineage / "fullchain.pem").write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
+        (lineage / "privkey.pem").write_text("-----BEGIN PRIVATE KEY-----\n", encoding="utf-8")
+        return directory
+
+    def probe(self, paths):
+        result = subprocess.run(
+            ["python3", "-", json.dumps(paths)], input=aio.CHANNEL_STATE_PROBE,
+            text=True, capture_output=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_the_state_probe_digests_a_snapshot_tree_and_its_database(self):
+        snapshot = self.tree(Path(self.tmp.name) / "recovery" / "update-1")
+        facts = self.probe(aio.channel_state_paths(str(snapshot)))
+        self.assertEqual(facts["environment"]["GOWAVE_CHANNEL"], "stable")
+        self.assertEqual(facts["database"]["integrity"], "ok")
+        self.assertTrue(facts["database"]["logical"])
+        self.assertEqual(facts["binary"], hashlib.sha256((snapshot / "gowave-server").read_bytes()).hexdigest())
+        self.assertEqual(facts["frontend_index"], hashlib.sha256(b"<html>panel</html>\n").hexdigest())
+        self.assertTrue(facts["nginx"] and facts["nginx_conf"] and facts["letsencrypt"])
+        self.assertTrue(facts["lineage_chain"])
+        # A snapshot names no journal and owns no recovery root, so the probe
+        # must not mistake the live host's journal for part of the snapshot.
+        self.assertEqual(facts["journal"], {})
+        self.assertEqual(facts["snapshots"], [])
+
+    def test_the_state_probe_reports_a_file_that_is_not_a_database(self):
+        snapshot = self.tree(Path(self.tmp.name) / "recovery" / "update-1")
+        (snapshot / "gowave.db").write_bytes(b"this is not a sqlite database\n")
+        facts = self.probe(aio.channel_state_paths(str(snapshot)))
+        self.assertTrue(facts["database"]["integrity"].startswith("error:"))
+        self.assertNotIn("logical", facts["database"])
+
+    def test_the_injected_switch_and_its_cleanup_are_valid_bash(self):
+        for script in (aio.channel_rollback_script(), aio.channel_rollback_cleanup_script()):
+            result = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        body = aio.channel_rollback_script()
+        self.assertIn(aio.CHANNEL_RECOVERY_ROOT, body)
+        # The repo path is baked in: the payload arrives on stdin alone, so a
+        # positional argument would be empty and `set -u` would abort mid-switch.
+        self.assertIn(f"repo={aio.topology.REPO_IN_CONTAINER}", body)
+        self.assertIn('bash "$repo/gowave-auto.sh" channel dev', body)
+
+    def surface(self, **overrides):
+        facts = {
+            "readback_status": 200,
+            "short_uuid_length": 16,
+            "inventory_status": 200,
+            "users": 1,
+            "users_captured": 1,
+            "inventory_identical": True,
+            "user_present": True,
+            "representations": {
+                name: {"status": 200, "bytes": 128} for name in aio.REPRESENTATIONS
+            },
+            "representations_identical": {name: True for name in aio.REPRESENTATIONS},
+        }
+        facts.update(overrides)
+        return facts
+
+    def switched_product(self, results):
+        """A product whose data plane is the stub, so only host scripts are scripted."""
+        podman = ScriptedPodman(self.context, results)
+        product = aio.AioProduct(podman)
+        product.host = TrafficHost(None, podman)
+        product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
+        # The subscription payloads were captured by an earlier case in the suite.
+        product._subscriptions = {}
+        return product, podman
+
+    def dev_results(self, after=None, surface=None):
+        after = after or self.state(
+            environment={"GOWAVE_CHANNEL": "dev"},
+            snapshots=["update-1", "update-2"],
+            journal={
+                "state": "COMMITTED",
+                "snapshot_dir": f"{aio.CHANNEL_RECOVERY_ROOT}/update-2",
+                "target_version": "dev",
+            },
+        )
+        surface = surface or self.surface()
+        return after, [
+            (json.dumps(self.state()), 0),
+            (json.dumps({"channel": self.surface()}), 0),
+            ("Snapshot captured.\nSwitched to channel 'dev' successfully.\n", 0),
+            (json.dumps(after), 0),
+            (json.dumps(self.state(journal={}, snapshots=[])), 0),
+            (json.dumps({"channel": surface}), 0),
+            ("200", 0),
+            (
+                "WARNING: Switching from Dev to Stable may involve irreversible "
+                "database migrations.\nUse --force to confirm channel switch.\n",
+                1,
+            ),
+            (json.dumps(after), 0),
+        ]
+
+    def test_the_dev_case_proves_a_committed_switch_on_the_same_client_surface(self):
+        after, results = self.dev_results()
+        product, podman = self.switched_product(results)
+        with mock.patch.object(aio, "wait_until", lambda predicate, *a, **k: predicate()):
+            evidence = aio.case_channel_dev(product)
+        self.assertEqual(evidence["channel_after"], "dev")
+        self.assertEqual(evidence["journal_state"], "COMMITTED")
+        self.assertEqual(evidence["snapshot_target_version"], "dev")
+        self.assertEqual(evidence["snapshot"], "update-2")
+        self.assertEqual(evidence["clients_served"], 1)
+        self.assertEqual(evidence["transfer_count"], 8)
+        self.assertEqual(evidence["downgrade_refused"], 1)
+        # The command is the product's own, run on the host and nowhere else.
+        self.assertIn("gowave-auto.sh channel dev", podman.scripts[2])
+        self.assertIn("gowave-auto.sh channel stable", podman.scripts[7])
+
+    def test_a_switch_that_left_the_journal_uncommitted_fails_the_dev_case(self):
+        after, results = self.dev_results(after=self.state(
+            environment={"GOWAVE_CHANNEL": "dev"}, snapshots=["update-1", "update-2"],
+        ))
+        product, _ = self.switched_product(results)
+        with mock.patch.object(aio, "wait_until", lambda predicate, *a, **k: predicate()):
+            with self.assertRaises(AssertionError) as caught:
+                aio.case_channel_dev(product)
+        self.assertIn("instead of a COMMITTED dev transition", str(caught.exception))
+
+    def test_a_switch_that_lost_the_client_fails_the_dev_case(self):
+        _after, results = self.dev_results(surface=self.surface(
+            inventory_identical=False, user_present=False, users=0,
+        ))
+        product, _ = self.switched_product(results)
+        with mock.patch.object(aio, "wait_until", lambda predicate, *a, **k: predicate()):
+            with self.assertRaises(AssertionError) as caught:
+                aio.case_channel_dev(product)
+        self.assertIn("changed the client inventory", str(caught.exception))
+
+    def test_a_snapshot_that_kept_the_new_channel_fails_the_switch_case(self):
+        product, _ = installed_product(self.context, [])
+        before = self.state()
+        snapshot = self.state(environment={"GOWAVE_CHANNEL": "dev"})
+        with self.assertRaises(AssertionError) as caught:
+            aio.require_channel_snapshot("AIO-CHANNEL-DEV", before, snapshot, "/recovery/update-2")
+        self.assertIn("instead of the stable channel", str(caught.exception))
+
+    def test_the_rollback_case_proves_every_area_came_back_from_the_snapshot(self):
+        before = self.state()
+        sabotage = {
+            "snapshot": f"{aio.CHANNEL_RECOVERY_ROOT}/update-3",
+            "targets": {
+                "binary": "1" * 64, "database": "2" * 64, "frontend_index": "3" * 64,
+                "environment": "4" * 64, "state": "5" * 64, "nginx_conf": "6" * 64,
+                "lineage_chain": "7" * 64,
+            },
+        }
+        switch = {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "Channel switch failed: gowave.service did not become active\n"
+                      "File rollback completed and services verified.\n"
+                      "Channel switch rolled back to the pre-switch state.\n",
+            "sabotage": sabotage,
+            "journal": {
+                "state": "ROLLED_BACK",
+                "snapshot_dir": f"{aio.CHANNEL_RECOVERY_ROOT}/update-3",
+                "target_version": "dev",
+            },
+            "unit": {"ActiveState": "active"},
+            "health": 200,
+        }
+        product, podman = self.switched_product([
+            (json.dumps(before), 0),
+            (json.dumps({"channel": self.surface()}), 0),
+            (json.dumps(switch), 0),
+            (json.dumps(before), 0),
+            (json.dumps(self.state(journal={}, snapshots=[])), 0),
+            (json.dumps({"channel": self.surface()}), 0),
+            ("200", 0),
+            ("active\n", 0),
+            (json.dumps(before), 0),
+        ])
+        with mock.patch.object(aio, "wait_until", lambda predicate, *a, **k: predicate()):
+            evidence = aio.case_channel_rollback(product)
+        self.assertEqual(evidence["journal_state"], "ROLLED_BACK")
+        self.assertEqual(evidence["channel_after"], "stable")
+        self.assertEqual(evidence["sabotaged_targets"],
+                         "binary,database,environment,frontend_index,lineage_chain,nginx_conf,state")
+        self.assertEqual(evidence["clients_served"], 1)
+        self.assertEqual(evidence["representations_identical"], len(aio.REPRESENTATIONS))
+        self.assertEqual(evidence["transfer_count"], 8)
+        # The injected hook runs inside the switch, and the cleanup is the
+        # product's own recovery command rather than a harness restore.
+        self.assertIn("gowave-e2e-once-fail", podman.scripts[2])
+        self.assertIn("gowave-auto.sh recover --boot-files", podman.scripts[7])
+
+    def test_the_rollback_case_fails_when_the_injected_fault_never_fired(self):
+        before = self.state()
+        switch = {
+            "returncode": 1, "stdout": "", "stderr": "boom",
+            "sabotage": {}, "journal": {"state": "ROLLED_BACK"},
+            "unit": {"ActiveState": "failed"}, "health": "URLError: refused",
+        }
+        product, _ = self.switched_product([
+            (json.dumps(before), 0),
+            (json.dumps({"channel": self.surface()}), 0),
+            (json.dumps(switch), 0),
+            ("active\n", 0),
+            (json.dumps(before), 0),
+        ])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_channel_rollback(product)
+        self.assertIn("the injected start hook never ran", str(caught.exception))
+
+    def test_the_rollback_case_fails_when_an_area_the_hook_hit_stayed_damaged(self):
+        before = self.state()
+        sabotage = {
+            "snapshot": f"{aio.CHANNEL_RECOVERY_ROOT}/update-3",
+            "targets": {
+                "binary": "1" * 64, "database": "2" * 64, "frontend_index": "3" * 64,
+                "environment": "4" * 64, "state": "5" * 64, "nginx_conf": "6" * 64,
+                "lineage_chain": "7" * 64,
+            },
+        }
+        switch = {
+            "returncode": 1, "stdout": "",
+            "stderr": "File rollback completed and services verified.\n",
+            "sabotage": sabotage,
+            "journal": {"state": "ROLLED_BACK",
+                        "snapshot_dir": f"{aio.CHANNEL_RECOVERY_ROOT}/update-3"},
+            "unit": {"ActiveState": "active"}, "health": 200,
+        }
+        damaged = self.state(nginx_conf="0" * 64)
+        product, _ = self.switched_product([
+            (json.dumps(before), 0),
+            (json.dumps({"channel": self.surface()}), 0),
+            (json.dumps(switch), 0),
+            (json.dumps(damaged), 0),
+            ("active\n", 0),
+            (json.dumps(damaged), 0),
+        ])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_channel_rollback(product)
+        self.assertIn("did not restore the NGINX configuration", str(caught.exception))
 
 
 class TestPanelApiCases(unittest.TestCase):

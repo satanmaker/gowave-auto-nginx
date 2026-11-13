@@ -31,22 +31,27 @@ The installation module SHALL configure `GOWAVE_PROXY=external` in `/opt/gowave/
 - **THEN** `GOWAVE_PROXY=external` is present in `/opt/gowave/.env`, base unit `/etc/systemd/system/gowave.service` is registered with systemd, and the native service unit drop-in `90-unprivileged.conf` applies unprivileged user sandboxing without missing unit errors.
 
 ### Requirement: Safe Channel Switching Between Stable and Dev Releases
-The manager SHALL provide a dedicated command `gowave-auto.sh channel [stable|dev]` supporting transitions between Stable and Dev release channels with automated pre-switch snapshotting, schema migration guardrails, health checks, and rollback on failure.
+The manager SHALL provide a dedicated command `gowave-auto.sh channel [stable|dev]` supporting transitions between Stable and Dev release channels with automated pre-switch snapshotting, schema migration guardrails, health checks, and rollback on failure. The command SHALL NOT fetch or replace release assets: it records the channel the Panel reads at startup and restarts it, and installing a different release remains the job of `gowave-auto.sh update`.
 
 #### Scenario: Switch from Stable to Dev channel
 - **GIVEN** an active GoWave installation currently tracking the `stable` channel
 - **WHEN** `gowave-auto.sh channel dev` is executed
-- **THEN** the manager creates an automated SQLite Online Backup snapshot in `/var/lib/gowave-auto-nginx/recovery/`, updates `GOWAVE_CHANNEL=dev` in `/opt/gowave/.env`, fetches and verifies the latest dev release assets, restarts `gowave.service`, and confirms health via `GET http://127.0.0.1:3000/api/system/health`.
+- **THEN** the manager captures a recovery snapshot in `/var/lib/gowave-auto-nginx/recovery/update-<timestamp>/` (SQLite Online Backup of the database plus the Panel binary, the frontend tree, `.env`, `state.json`, and the `/etc/nginx` and `/etc/letsencrypt` trees), writes the `APPLYING` journal, updates `GOWAVE_CHANNEL=dev` in `/opt/gowave/.env`, restarts `gowave.service`, confirms health via `GET http://127.0.0.1:3000/api/system/health` within 30 seconds, marks the journal `COMMITTED`, prunes old snapshots, and exits with code 0.
+
+#### Scenario: Repeating the command for the current channel is a no-op
+- **GIVEN** an active GoWave installation already tracking the requested channel
+- **WHEN** `gowave-auto.sh channel <current channel>` is executed
+- **THEN** the manager reports `GoWave is already on channel '<channel>'.` and exits with code 0 without taking a snapshot, rewriting `.env`, or restarting the service.
 
 #### Scenario: Switch from Dev to Stable channel with snapshot and confirmation
 - **GIVEN** an active GoWave installation currently tracking the `dev` channel
-- **WHEN** `gowave-auto.sh channel stable` is executed
-- **THEN** the manager displays an explicit warning that Dev database migrations cannot be automatically rolled back to an older Stable release, requires explicit confirmation or `--force` flag, creates an automated SQLite Online Backup snapshot, applies the stable release, and verifies service health.
+- **WHEN** `gowave-auto.sh channel stable` is executed without `--force`
+- **THEN** the manager displays an explicit warning that Dev database migrations cannot be automatically rolled back to an older Stable release, exits with code 1 without snapshotting, rewriting `.env`, or restarting the service, and only a repeated invocation with `--force` captures the recovery snapshot, applies the stable channel label, restarts the service, and verifies service health.
 
 #### Scenario: Channel switch failure and automatic rollback
-- **GIVEN** a channel switch operation where the new release binary fails to start or healthcheck fails
-- **WHEN** healthcheck times out after 30 seconds
-- **THEN** the manager immediately stops the failed binary, restores the previous binary and SQLite database from the pre-switch snapshot, restores the previous `GOWAVE_CHANNEL` in `.env`, restarts the service, and exits with code 1.
+- **GIVEN** a channel switch operation where the restarted Panel does not become active or its healthcheck fails
+- **WHEN** `systemctl restart gowave.service` fails or the healthcheck times out after 30 seconds
+- **THEN** the manager restores the previous binary, SQLite database, frontend tree, `.env`, `state.json`, and the NGINX and ACME state from the pre-switch snapshot, restarts the service, marks the journal `ROLLED_BACK`, and exits with code 1, leaving the journal `ROLLBACK_REQUIRED` when the rollback itself cannot complete so that the boot recovery unit retries it.
 
 ### Requirement: Transaction-Safe Updates with Crash Recovery Journal
 The update module SHALL execute SQLite Online Backup, capture a persistent snapshot in `/var/lib/gowave-auto-nginx/recovery/update-<timestamp>/`, maintain atomic state in `journal.json`, and roll back automatically upon healthcheck failure or power loss.

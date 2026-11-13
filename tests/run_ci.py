@@ -51,11 +51,13 @@ SUITES = {
         "test_podman_aio.TestAcmeRenewalProbe",
         "test_podman_aio.TestAcmeOutageCase",
         "test_podman_aio.TestAcmeOutageProbe",
+        "test_podman_aio.TestChannelCases",
         "test_podman_dns.TestDnsProbe",
         "test_podman_dns.TestDnsZoneStore",
         "test_podman_dns.TestDnsCase",
         "test_podman_dns.TestDnsCaseWiring",
         "test_podman_subscriptions.TestPanelSubscriptionProbe",
+        "test_podman_subscriptions.TestChannelClientSurface",
         "test_podman_subscriptions.TestSubscriptionClientProbe",
         "test_podman_subscriptions.TestSubscriptionCases",
         "test_podman_subscriptions.TestSubscriptionTopology",
@@ -161,6 +163,7 @@ SUITES = {
     ),
     "root": (
         "test_root.TestRoot",
+        "test_root.TestChannelSwitchRollback",
     ),
     "systemd": (
         "test_systemd_runner.TestSystemdRunner",

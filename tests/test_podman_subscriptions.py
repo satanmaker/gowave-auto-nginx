@@ -304,7 +304,9 @@ class StubPanel:
     def __init__(self):
         self.password = "pw-do-not-print"
         self.token = "token-do-not-print"
-        self.user = {"username": "default-user", "shortUuid": SHORT_UUID}
+        self.user = {"id": CLIENT_UUID, "username": "default-user", "shortUuid": SHORT_UUID}
+        self.users = [{"id": CLIENT_UUID, "username": "default-user", "shortUuid": SHORT_UUID}]
+        self.bodies = dict(BODIES)
         self.statuses = {}
         self.requests = []
         self.enforce_user_agent = False
@@ -336,13 +338,15 @@ class StubPanel:
                 panel.requests.append((self.path, agent))
                 if self.path == "/api/users/by-username/default-user":
                     return self._send(200, json.dumps({"response": panel.user}))
+                if self.path == "/api/users":
+                    return self._send(200, json.dumps({"response": {"users": panel.users}}))
                 name = panel.representation(self.path)
                 if name is None:
                     return self._send(404, json.dumps({"message": "not found"}))
                 if panel.enforce_user_agent and (agent is None or not agent.strip()):
                     return self._send(403, "forbidden", "text/plain")
                 status = panel.statuses.get(name, 200)
-                body, content_type = BODIES[name]
+                body, content_type = panel.bodies[name]
                 return self._send(status, body if status == 200 else "", content_type)
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -369,7 +373,7 @@ class StubPanel:
         return f"http://127.0.0.1:{self.server.server_address[1]}"
 
 
-def probe_output(panel, scope, payload_dir=""):
+def probe_output(panel, scope, payload_dir="", step=""):
     stdout = io.StringIO()
     argv = [
         "--scope", scope,
@@ -378,6 +382,8 @@ def probe_output(panel, scope, payload_dir=""):
     ]
     if payload_dir:
         argv.extend(["--payload-dir", payload_dir])
+    if step:
+        argv.extend(["--step", step])
     with redirect_stdout(stdout):
         code = panel_surface.main(argv)
     if code != 0:
@@ -481,6 +487,84 @@ class TestPanelSubscriptionProbe(unittest.TestCase):
             self.assertEqual(
                 matrix["representations"][name].replace("{shortUuid}", "{short_uuid}"), template
             )
+
+
+class TestChannelClientSurface(unittest.TestCase):
+    """The channel scope states what a switch or a rollback left the client with.
+
+    A channel switch restarts the Panel and a rollback restores its database, and
+    the Panel writes to SQLite while it runs. The scope therefore compares the
+    client list and the bytes each representation serves, and it keeps the
+    captured payload digests in a 0600 state file rather than printing them.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.payload_dir = Path(self.tmp.name) / "payloads"
+        self.payload_dir.mkdir(mode=0o700)
+        self.panel = StubPanel()
+        self.addCleanup(self.panel.server.shutdown)
+        self.addCleanup(self.panel.server.server_close)
+
+    def capture(self):
+        facts, _output = probe_output(
+            self.panel, "channel", str(self.payload_dir), step="capture",
+        )
+        return facts["channel"]
+
+    def verify(self):
+        facts, output = probe_output(
+            self.panel, "channel", str(self.payload_dir), step="verify",
+        )
+        return facts["channel"], output
+
+    def test_an_unchanged_panel_verifies_as_identical(self):
+        captured = self.capture()
+        self.assertEqual(captured["readback_status"], 200)
+        self.assertEqual(captured["short_uuid_length"], len(SHORT_UUID))
+        self.assertEqual(captured["users"], len(self.panel.users))
+
+        state = self.payload_dir / "channel" / "state.json"
+        self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+
+        verified, output = self.verify()
+        self.assertTrue(verified["inventory_identical"])
+        self.assertTrue(verified["user_present"])
+        self.assertTrue(all(verified["representations_identical"].values()))
+        self.assertEqual(
+            sorted(verified["representations_identical"]),
+            sorted(name for name, _template, _agent in panel_surface.REPRESENTATIONS),
+        )
+        for secret in (SHORT_UUID, CLIENT_UUID, TROJAN_PASSWORD, REALITY_PUBLIC_KEY):
+            self.assertNotIn(secret, output)
+
+    def test_a_client_the_switch_lost_is_not_an_identical_inventory(self):
+        self.capture()
+        self.panel.users = []
+        verified, _output = self.verify()
+        self.assertFalse(verified["inventory_identical"])
+        self.assertFalse(verified["user_present"])
+        self.assertEqual(verified["users"], 0)
+        self.assertEqual(verified["users_captured"], 1)
+
+    def test_a_representation_that_serves_different_bytes_is_reported(self):
+        self.capture()
+        self.panel.bodies["mihomo"] = ("changed: {}\n", "text/yaml")
+        verified, _output = self.verify()
+        self.assertFalse(verified["representations_identical"]["mihomo"])
+        self.assertTrue(verified["representations_identical"]["base64"])
+        self.assertEqual(verified["representations"]["mihomo"]["status"], 200)
+
+    def test_a_scope_call_without_a_capture_asks_for_one(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.verify()
+        self.assertIn("run --step capture first", str(caught.exception))
+
+    def test_the_scope_refuses_to_run_without_a_payload_directory(self):
+        with self.assertRaises(SystemExit) as caught:
+            probe_output(self.panel, "channel", step="capture")
+        self.assertIn("--payload-dir", str(caught.exception))
 
 
 class RecordingEngines:

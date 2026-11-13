@@ -226,6 +226,27 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "All-in-One Master VPS Installation Verification",
     },
     {
+        "id": "AIO-CHANNEL-NOOP",
+        "requirement": "All-in-One Master VPS Installation Verification",
+        "assertion": "The channel command invoked for the channel the host is already on reports that nothing changed, exits successfully, and takes no snapshot, rewrites no environment file or journal, and leaves the Panel process in place, so a repeated lifecycle call is a no-op rather than a restart.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "AIO-CHANNEL-ROLLBACK",
+        "requirement": "Signal-Safe and Verifiable Transaction Compensation",
+        "assertion": "A channel switch whose restarted Panel cannot start is undone from the snapshot taken before it: the binary, database, frontend, environment, state.json, NGINX tree and ACME lineage come back identical to the pre-switch state after each was overwritten, the journal ends ROLLED_BACK rather than staying at APPLYING, and the restored installation answers its authenticated API and carries a payload through every served outbound of both pinned clients.",
+        "topology": ["aio"],
+        "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
+    },
+    {
+        "id": "AIO-CHANNEL-DEV",
+        "requirement": "All-in-One Master VPS Installation Verification",
+        "assertion": "The documented stable-to-dev transition is a snapshot, an environment rewrite and a restart: the journal ends COMMITTED with the target channel recorded, exactly one snapshot holds the pre-switch tree, the Panel answers its health route and serves every representation, both pinned clients transfer a payload through every served outbound, and the guarded dev-to-stable direction is still refused without --force and changes nothing.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
         "id": "NGX-05",
         "requirement": "NGINX SNI Routing and REALITY Decoy Verification",
         "assertion": "On every role the product installs, the generated NGINX tree passes `nginx -t`, its dump carries that role's own server name and its ssl_preread SNI routing, the product's managed ACME deploy hook does not reload NGINX when an invalid snippet makes `nginx -t` fail — leaving the master, its workers and the 443 listener untouched — and the same hook does reload it, without replacing the master, once the snippet is removed.",
