@@ -2726,8 +2726,9 @@ def require_renewal_issued(case_id: str, role: str, domain: str, facts: Dict[str
     ])
     require(case_id, f"http-01 challenge for {domain}" in transcript,
             f"{role}: the renewal for {domain} did not perform an HTTP-01 challenge, so the "
-            f"challenge route this case validates is not the one that was used: "
-            f"{renewal.get('tail')}")
+            f"challenge route this case validates is not the one that was used (a CA that "
+            f"reuses a valid authorization asks for no challenge at all): "
+            f"{transcript.strip()[-800:]}")
     require(case_id, "Successfully received certificate" in transcript,
             f"{role}: Certbot never reported receiving a renewed certificate for {domain}: "
             f"{renewal.get('tail')}")
@@ -2986,29 +2987,31 @@ def require_renewal_failed(
     the directory's own connection error.
     """
     renewal = facts.get("renewal") or {}
-    require(case_id, facts.get("mode") == "renew",
-            f"{role}: the failed-attempt probe answered for {facts.get('mode')!r}")
-    require(case_id, renewal.get("returncode") not in (0, None),
-            f"{role}: `certbot renew --force-renewal` for {domain} exited "
-            f"{renewal.get('returncode')!r} although the {kind} was down, so the outage never "
-            f"reached the renewal this case is about: {renewal.get('tail')}")
     transcript = "\n".join([
         str(facts.get("certbot_log") or ""),
         str(renewal.get("stdout") or ""),
         str(renewal.get("stderr") or ""),
     ])
+    require(case_id, facts.get("mode") == "renew",
+            f"{role}: the failed-attempt probe answered for {facts.get('mode')!r}")
+    require(case_id, renewal.get("returncode") not in (0, None),
+            f"{role}: `certbot renew --force-renewal` for {domain} exited "
+            f"{renewal.get('returncode')!r} although the {kind} was down, so the outage never "
+            f"reached the renewal this case is about (a CA that reuses a valid authorization "
+            f"asks for no challenge at all): {transcript.strip()[-800:]}")
     if kind == "challenge":
         require(case_id, f"http-01 challenge for {domain}" in transcript,
                 f"{role}: the renewal for {domain} never attempted an HTTP-01 challenge, so the "
-                f"challenge route that failed is not the one it used: {renewal.get('tail')}")
+                f"challenge route that failed is not the one it used: "
+                f"{transcript.strip()[-800:]}")
     markers = FAILED_RENEWAL_MARKERS[kind]
     matched = [marker for marker in markers if marker in transcript]
     require(case_id, matched,
             f"{role}: the renewal for {domain} failed without naming the {kind} it was denied: "
-            f"{renewal.get('tail')}")
+            f"{transcript.strip()[-800:]}")
     require(case_id, "Successfully received certificate" not in transcript,
             f"{role}: the renewal for {domain} reported receiving a certificate while the "
-            f"{kind} was down: {renewal.get('tail')}")
+            f"{kind} was down: {transcript.strip()[-800:]}")
     return {
         "returncode": renewal.get("returncode"),
         "reported": matched,

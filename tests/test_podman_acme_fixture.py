@@ -195,8 +195,14 @@ class TestPodmanAcmeFixture(unittest.TestCase):
         self.assertEqual(run["systemd"], "false")
         self.assertEqual(run["command"], ("-config", "/fixtures/acme/pebble-config.json"))
         # Pebble's own badNonce injection would fail one install in twenty for a
-        # reason that has nothing to do with the product, so the fixture disables it.
-        self.assertEqual(run["environment"], {"PEBBLE_WFE_NONCEREJECT": "0"})
+        # reason that has nothing to do with the product, so the fixture disables
+        # it. Its authorization reuse is disabled for the same reason: a reusing
+        # order performs no challenge, so a renewal would succeed with the
+        # challenge route down and prove nothing about the webroot.
+        self.assertEqual(
+            run["environment"],
+            {"PEBBLE_WFE_NONCEREJECT": "0", "PEBBLE_AUTHZREUSE": "0"},
+        )
         self.assertEqual(
             run["volumes"],
             (f"{context.secret_dir / 'acme'}:{acme_fixture.CONTAINER_FIXTURE_DIR}:ro,Z",),

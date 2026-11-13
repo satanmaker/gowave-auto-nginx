@@ -1686,6 +1686,17 @@ class TestAcmeRenewalCase(unittest.TestCase):
                     after=acme_probe("renew", transcript="dns-01 challenge for "
                                      f"{aio.PANEL_DOMAIN}\nSuccessfully received certificate"))
 
+    def test_a_renewal_the_ca_answered_without_a_challenge_names_the_reuse(self):
+        # Pebble answers with an already-valid authorization half the time, and
+        # such an order performs no challenge: the log says so and is quoted.
+        reused = acme_probe("renew", transcript=(
+            f"Renewing an existing certificate for {aio.PANEL_DOMAIN}\n"
+            "Successfully received certificate"
+        ))
+        caught = self.reject("reuses a valid authorization", after=reused)
+        self.assertIn(f"Renewing an existing certificate for {aio.PANEL_DOMAIN}",
+                      str(caught.exception))
+
     def test_a_renewal_that_receives_no_certificate_fails_the_case(self):
         self.reject("exited 1", after=acme_probe("renew", renewal_exit=1))
 
@@ -2108,6 +2119,14 @@ class TestAcmeOutageCase(unittest.TestCase):
     def test_a_renewal_that_succeeds_during_the_challenge_outage_fails_the_case(self):
         self.reject("although the challenge was down",
                     challenge_attempt=acme_probe("renew", issued_epoch=self.installed))
+
+    def test_a_reused_authorization_during_the_outage_quotes_the_log(self):
+        reused = acme_probe("renew", issued_epoch=self.installed, transcript=(
+            f"Renewing an existing certificate for {aio.PANEL_DOMAIN}\n"
+            "Successfully received certificate"
+        ))
+        caught = self.reject("reuses a valid authorization", challenge_attempt=reused)
+        self.assertIn("Renewing an existing certificate", str(caught.exception))
 
     def test_a_failure_that_never_attempted_http01_fails_the_case(self):
         self.reject("never attempted an HTTP-01 challenge",
