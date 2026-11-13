@@ -2439,9 +2439,26 @@ def case_backup_store_full(product: AioProduct) -> Dict[str, Any]:
     )
 
     after = channel_state(product, BACKUP_FAULT_CASE_ID)
+    # The database is read by its integrity and by its rows, never by its file
+    # digest: the product checkpoints the WAL before it stages a copy, so even a
+    # backup that publishes nothing moves the pages of the live file while the
+    # content the Panel stores stays the same. Everything else is written by the
+    # operator's configuration and must not move at all.
+    require(
+        BACKUP_FAULT_CASE_ID, after.get("database", {}).get("integrity") == "ok",
+        f"the database does not pass integrity_check after the failed backup: "
+        f"{after.get('database', {}).get('integrity')!r}",
+    )
+    require(
+        BACKUP_FAULT_CASE_ID,
+        bool(before.get("database", {}).get("logical"))
+        and after.get("database", {}).get("logical") == before.get("database", {}).get("logical"),
+        f"the failed backup changed the rows the Panel stores: "
+        f"{after.get('database', {}).get('logical')!r} vs "
+        f"{before.get('database', {}).get('logical')!r}",
+    )
     for field, label in (
         ("env_digest", "the environment file"),
-        ("database", "the database"),
         ("frontend", "the frontend tree"),
         ("state", "state.json"),
         ("nginx", "the NGINX tree"),
@@ -2490,6 +2507,10 @@ def case_backup_store_full(product: AioProduct) -> Dict[str, Any]:
         "archive_bytes": facts.get("archive_bytes"),
         "archive_mode": facts.get("archive_mode"),
         "verify_returncode": facts.get("verify_returncode"),
+        "database_integrity": after.get("database", {}).get("integrity"),
+        "database_rows_unchanged": str(
+            after.get("database", {}).get("logical") == before.get("database", {}).get("logical")
+        ).lower(),
         "unit_state": after.get("unit", {}).get("ActiveState"),
         "health": facts.get("health"),
     }
