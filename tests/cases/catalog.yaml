@@ -3336,10 +3336,10 @@ cases:
   requirement: All-in-One Master VPS Installation Verification
   live_scenario: null
   assertion: Restarting the product's own systemd units leaves every declared unit active, the Panel answering
-    the documented authenticated call again inside one bounded deadline, one served outbound carrying
+    the documented authenticated call again inside one bounded deadline, every served outbound carrying
     a payload to the endpoint before the matrix runs, and both pinned clients transferring a unique payload
     through every core transport with the installed host as the source.
-  assertion_sha256: 4cb39517118e96bb9e06259338bccf38b34e2f7e6f15e0523425e251d8074266
+  assertion_sha256: 893fadb10a22224054e9a7ba6350357d6ba24b5d29b2960bccfdc6e86a9d16dc
   runs_in:
   - podman
   state: incubating

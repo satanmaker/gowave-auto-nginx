@@ -2,6 +2,7 @@
 """Suite nonroot: the All-in-One suite installs once with the real operator."""
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -843,7 +844,7 @@ def transfer_facts():
 
 
 def readiness_facts(delivered=True):
-    """What the single-tunnel readiness scope reports about the data plane."""
+    """What the all-outbound readiness scope reports about the data plane."""
     return {
         "delivered": delivered,
         "engine": "xray",
@@ -851,6 +852,8 @@ def readiness_facts(delivered=True):
         "status": 200 if delivered else None,
         "reason": "" if delivered else "HTTP 503 without an endpoint report",
         "recorded": delivered,
+        "attempt_count": 1 if delivered else 2,
+        "pending": [] if delivered else ["xray:xhttp/tls"],
     }
 
 
@@ -966,8 +969,22 @@ class TestRestartCase(unittest.TestCase):
             with self.assertRaises(AssertionError) as caught:
                 aio.case_restart(product)
         message = str(caught.exception)
-        self.assertIn("no served outbound carried a payload", message)
+        self.assertIn("not every served outbound carried a payload", message)
         self.assertIn("HTTP 503 without an endpoint report", message)
+
+    def test_the_deadline_names_the_outbound_that_never_carried(self):
+        # One warm transport is not the data plane: the case asserts the whole
+        # matrix, so a transport that never carried has to be named before the
+        # matrix runs rather than surfacing as a mid-matrix failure.
+        product, _ = self.restart_product([
+            ("", 0),
+            ("login=200 api=200 token_length=64 upstreams=2\n", 0),
+            ("active\nactive\nactive\nactive\n", 0),
+        ], readiness=readiness_facts(delivered=False))
+        with mock.patch.object(aio, "wait_until", self.poll_until_the_tunnel()):
+            with self.assertRaises(AssertionError) as caught:
+                aio.case_restart(product)
+        self.assertIn("xray:xhttp/tls", str(caught.exception))
 
     def test_a_failed_restart_fails_the_case(self):
         product, _ = self.restart_product([("not permitted", 1)])
@@ -1189,18 +1206,116 @@ class TestNginxConfigCase(unittest.TestCase):
         self.assertEqual(evidence["role"], "the All-in-One host")
         self.assertEqual(evidence["generated_config_files"], 1)
         self.assertEqual(evidence["invalid_configuration"]["nginx_test_returncode"], 1)
+        self.assertIn(aio.NGX_CONFIG_DIRECTIVE, evidence["invalid_configuration"]["nginx_test_tail"])
         self.assertEqual(evidence["invalid_configuration"]["hook_returncode"], 0)
+        self.assertEqual(evidence["invalid_configuration"]["worker_pids_before_hook"],
+                         ["4243", "4244"])
         self.assertEqual(evidence["invalid_configuration"]["worker_pids"], ["4243", "4244"])
         self.assertEqual(evidence["restored_configuration"]["worker_pids_before"], ["4243", "4244"])
         self.assertEqual(evidence["restored_configuration"]["worker_pids_after"], ["5100", "5101"])
 
-    def test_every_phase_drives_the_products_own_hook_against_the_planted_snippet(self):
+    def test_every_phase_carries_the_planted_snippet_and_the_guard_path(self):
         _evidence, podman = self.contract(*self.healthy_phases())
         for phase, script in zip(("before", "break", "restore"), podman.scripts):
             self.assertIn(phase, script)
             self.assertIn(aio.NGX_CONFIG_SNIPPET, script)
             self.assertIn(aio.NGX_CONFIG_HOOK, script)
             self.assertIn(aio.PANEL_DOMAIN, script)
+
+    def run_probe(self, mode, *, nginx_test=0, hook_exit=0):
+        """Run the real host probe body against stubbed binaries and a stub guard."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            bindir = root / "bin"
+            bindir.mkdir()
+            snippet = root / "zz-gowave-e2e-broken.conf"
+            hook = root / "gowave-nginx.sh"
+            marker = root / "hook-ran"
+            hook.write_text(
+                "#!/bin/sh\n" f"touch '{marker}'\n" f"exit {hook_exit}\n", encoding="utf-8",
+            )
+            hook.chmod(0o755)
+            (bindir / "nginx").write_text(
+                "#!/bin/sh\n"
+                "case \"$1\" in\n"
+                "  -t) printf '%s\\n' "
+                f"'{aio.NGX_CONFIG_DIRECTIVE} is not allowed here' >&2; exit {nginx_test} ;;\n"
+                "  -T) printf 'server_name %s;\\nssl_preread on;\\n' "
+                f"'{aio.PANEL_DOMAIN}' ; exit 0 ;;\n"
+                "esac\nexit 0\n",
+                encoding="utf-8",
+            )
+            (bindir / "systemctl").write_text(
+                "#!/bin/sh\n"
+                "case \"$1 $2\" in\n"
+                "  'is-active nginx') echo active ;;\n"
+                "  'show -p') echo 4242 ;;\n"
+                "esac\nexit 0\n",
+                encoding="utf-8",
+            )
+            (bindir / "pgrep").write_text(
+                "#!/bin/sh\necho 4243\necho 4244\n", encoding="utf-8",
+            )
+            (bindir / "ss").write_text(
+                "#!/bin/sh\necho 'LISTEN 0 511 0.0.0.0:443 0.0.0.0:*'\n", encoding="utf-8",
+            )
+            for name in ("nginx", "systemctl", "pgrep", "ss"):
+                (bindir / name).chmod(0o755)
+            script = (
+                aio.ngx_config_script(mode, aio.PANEL_DOMAIN)
+                .replace(aio.NGX_CONFIG_SNIPPET, str(snippet))
+                .replace(aio.NGX_CONFIG_HOOK, str(hook))
+            )
+            _, _, body = script.partition("<<'PY'\n")
+            self.assertIn("import hashlib", body, "the probe script must carry a heredoc body")
+            body = body.rsplit("\nPY\n", 1)[0]
+            result = subprocess.run(
+                [sys.executable, "-c", body, mode, aio.PANEL_DOMAIN],
+                capture_output=True, text=True, check=False,
+                env={**os.environ, "PATH": f"{bindir}:{os.environ.get('PATH', '')}"},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout), marker.exists()
+
+    def test_the_baseline_phase_reports_the_guard_without_running_it(self):
+        # Driving the guard on the untouched tree would reload the master, and the
+        # workers that reload creates would then look like workers the break phase
+        # gained.
+        facts, ran = self.run_probe("before")
+        self.assertTrue(facts["hook"]["present"])
+        self.assertTrue(facts["hook"]["executable"])
+        self.assertFalse(facts["hook"]["executed"])
+        self.assertFalse(ran, "the baseline phase must not drive the deploy hook")
+
+    def test_the_break_phase_drives_the_guard_and_reports_what_it_did(self):
+        facts, ran = self.run_probe("break", nginx_test=1)
+        self.assertTrue(facts["hook"]["executed"])
+        self.assertTrue(ran, "the break phase has to drive the product's own guard")
+        self.assertEqual(facts["hook"]["returncode"], 0)
+        self.assertEqual(facts["before_hook"]["worker_pids"], ["4243", "4244"])
+        self.assertEqual(facts["after_hook"]["worker_pids"], ["4243", "4244"])
+
+    def test_a_reload_the_baseline_phase_saw_is_not_blamed_on_the_break_phase(self):
+        # The break phase carries its own pre-guard reading, so a worker set that
+        # differs from the earlier baseline phase is not evidence of anything.
+        evidence, _podman = self.contract(
+            nginx_probe("before", after_workers=("4300", "4301")),
+            nginx_probe("break", test=1, tail=BROKEN_TAIL, present=True,
+                        before_workers=("4300", "4301"), after_workers=("4300", "4301")),
+            nginx_probe("restore", after_workers=("5100", "5101")),
+        )
+        self.assertEqual(evidence["invalid_configuration"]["worker_pids_before_hook"],
+                         ["4300", "4301"])
+        self.assertEqual(evidence["invalid_configuration"]["worker_pids"], ["4300", "4301"])
+
+    def test_a_break_phase_that_read_no_worker_before_the_guard_fails_the_case(self):
+        self.reject(
+            "read no worker before driving the guard",
+            nginx_probe("before"),
+            nginx_probe("break", test=1, tail=BROKEN_TAIL, present=True,
+                        before_workers=(), after_workers=("4300",)),
+            nginx_probe("restore", after_workers=("5100",)),
+        )
 
     def test_a_generated_tree_that_fails_nginx_t_fails_the_case(self):
         product, podman = installed_product(

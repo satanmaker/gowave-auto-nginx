@@ -640,7 +640,6 @@ def mihomo_transfers(
 
 
 # ----------------------------------------------------------------------- scopes
-WARMUP_PROFILES = 1
 REVOCATION_ROUNDS = 6
 REVOCATION_ROUND_PAUSE_SECONDS = 5
 REVOCATION_TIMEOUT_SECONDS = 10
@@ -652,7 +651,7 @@ def wait_revocation_propagation(seconds: int = REVOCATION_ROUND_PAUSE_SECONDS) -
 
 
 def warmup(payload_dir: str, ca_file: str, destination: str, workdir: Path) -> Dict[str, Any]:
-    """Send one payload through the first served outbound and say whether it arrived.
+    """Send one payload through every served outbound and say whether each arrived.
 
     This is a readiness scope, not an acceptance one: the Panel hands a new user
     to the node and the node applies it asynchronously, so the first transfer of a
@@ -660,30 +659,60 @@ def warmup(payload_dir: str, ca_file: str, destination: str, workdir: Path) -> D
     reported result the caller waits on rather than an error, and the verdict
     comes from the endpoint's own log, because a proxy that answers without
     carrying the payload must not look ready.
+
+    Every served outbound of both engines is exercised, per transport and per
+    client: the cases that follow assert the whole matrix, so one warm tunnel
+    says nothing about the transport that goes through NGINX's HTTP location or
+    about the other client engine.
     """
     if not destination:
         raise SystemExit("a destination address is required: the payload needs somewhere to go")
 
     attempts = xray_transfers(
         payload_dir, ca_file, destination, workdir,
-        expect_refusal=True, timeout=REVOCATION_TIMEOUT_SECONDS, limit=WARMUP_PROFILES,
+        expect_refusal=True, timeout=REVOCATION_TIMEOUT_SECONDS,
+    )
+    attempts += mihomo_transfers(
+        payload_dir, ca_file, destination, workdir,
+        expect_refusal=True, timeout=REVOCATION_TIMEOUT_SECONDS,
     )
     if not attempts:
-        raise SystemExit("the served Xray payload declares no outbound to warm up")
-    attempt = attempts[0]
+        raise SystemExit("the served payload declares no outbound to warm up")
     diagnostics = echo_diagnostics(destination)
     recorded = {
         str(event.get("request_id") or "")
         for event in diagnostics.get("requests") or []
         if isinstance(event, dict)
     }
+    tuples = [
+        {
+            "engine": str(item["engine"]),
+            "network": str(item.get("network") or ""),
+            "security": str(item.get("security") or ""),
+            "tag": str(item.get("tag") or ""),
+            "status": item.get("status"),
+            "recorded": item["request_id"] in recorded,
+            "delivered": bool(item.get("delivered")) and item["request_id"] in recorded,
+            "reason": str(item.get("reason") or ""),
+        }
+        for item in attempts
+    ]
+    pending = [
+        f"{item['engine']}:{item['network']}/{item['security']}"
+        for item in tuples if not item["delivered"]
+    ]
+    first = tuples[0]
+    unsatisfied = [item for item in tuples if not item["delivered"]]
     return {
-        "delivered": bool(attempt.get("delivered")) and attempt["request_id"] in recorded,
-        "engine": attempt.get("engine"),
-        "network": attempt.get("network"),
-        "status": attempt.get("status"),
-        "reason": attempt.get("reason", ""),
-        "recorded": attempt["request_id"] in recorded,
+        "delivered": not pending,
+        "engine": first["engine"],
+        "network": first["network"],
+        "status": first["status"],
+        "reason": unsatisfied[0]["reason"] if unsatisfied else first["reason"],
+        "recorded": first["recorded"],
+        "attempt_count": len(tuples),
+        "pending": pending,
+        "tuples": tuples,
     }
 
 

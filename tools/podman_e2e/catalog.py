@@ -186,7 +186,7 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
     {
         "id": "AIO-RESTART",
         "requirement": "All-in-One Master VPS Installation Verification",
-        "assertion": "Restarting the product's own systemd units leaves every declared unit active, the Panel answering the documented authenticated call again inside one bounded deadline, one served outbound carrying a payload to the endpoint before the matrix runs, and both pinned clients transferring a unique payload through every core transport with the installed host as the source.",
+        "assertion": "Restarting the product's own systemd units leaves every declared unit active, the Panel answering the documented authenticated call again inside one bounded deadline, every served outbound carrying a payload to the endpoint before the matrix runs, and both pinned clients transferring a unique payload through every core transport with the installed host as the source.",
         "topology": ["aio"],
         "promotion_target": "All-in-One Master VPS Installation Verification",
     },

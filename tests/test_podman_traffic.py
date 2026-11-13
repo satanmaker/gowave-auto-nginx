@@ -825,17 +825,23 @@ class TestTrafficProbeProhibited(unittest.TestCase):
 
 
 class TestTrafficProbeReadiness(unittest.TestCase):
-    """The readiness scope: one tunnel, judged by what the endpoint recorded."""
+    """The readiness scope: every served outbound, judged by what the endpoint recorded."""
 
-    def run_scope(self, attempt, diagnostics=None, destination="203.0.114.30:18080"):
+    def run_scope(self, attempts, mihomo_attempts=None, diagnostics=None,
+                  destination="203.0.114.30:18080"):
         calls = []
 
-        def transfers(*_args, **kwargs):
-            calls.append(kwargs.get("limit"))
-            return [attempt]
+        def xray(*_args, **kwargs):
+            calls.append(("xray", kwargs.get("limit"), kwargs.get("expect_refusal")))
+            return list(attempts)
+
+        def mihomo(*_args, **kwargs):
+            calls.append(("mihomo", kwargs.get("limit"), kwargs.get("expect_refusal")))
+            return list(mihomo_attempts or [])
 
         with tempfile.TemporaryDirectory() as workdir:
-            with mock.patch.object(traffic_probe, "xray_transfers", transfers), \
+            with mock.patch.object(traffic_probe, "xray_transfers", xray), \
+                    mock.patch.object(traffic_probe, "mihomo_transfers", mihomo), \
                     mock.patch.object(traffic_probe, "echo_diagnostics",
                                       lambda *a, **k: diagnostics or {"requests": []}):
                 facts = traffic_probe.warmup(
@@ -850,16 +856,43 @@ class TestTrafficProbeReadiness(unittest.TestCase):
             "request_id_match": True, "body_match": True, "source_ip": PLAN.target_ip,
         }
 
-    def test_one_profile_is_probed_and_the_endpoint_must_record_it(self):
+    def delivered_mihomo(self, request_id="mihomo-req"):
+        return {
+            "engine": "mihomo", "tag": "mihomo-xhttp", "network": "xhttp",
+            "security": "tls", "request_id": request_id, "delivered": True,
+            "status": 200, "request_id_match": True, "body_match": True,
+            "source_ip": PLAN.target_ip,
+        }
+
+    def test_every_served_outbound_is_warmed_up_and_the_endpoint_must_record_it(self):
         facts, calls = self.run_scope(
-            self.delivered(), diagnostics={"requests": [{"request_id": "xray-req"}]},
+            [self.delivered()], [self.delivered_mihomo()],
+            diagnostics={"requests": [{"request_id": "xray-req"},
+                                      {"request_id": "mihomo-req"}]},
         )
         self.assertTrue(facts["delivered"])
         self.assertEqual(facts["network"], "tcp")
-        self.assertEqual(calls, [traffic_probe.WARMUP_PROFILES])
+        self.assertEqual(facts["attempt_count"], 2)
+        self.assertEqual(facts["pending"], [])
+        # Both engines, and no profile limit: the cases that follow assert the
+        # whole matrix, so the gate has to wait for the whole matrix.
+        self.assertEqual(calls, [("xray", None, True), ("mihomo", None, True)])
+
+    def test_one_outbound_that_never_carried_keeps_the_scope_not_ready(self):
+        refused = traffic_probe.refusal(
+            "mihomo", {"tag": "mihomo-xhttp", "network": "xhttp", "security": "tls"},
+            "mihomo-req", 503, "HTTP 503 without an endpoint report",
+        )
+        facts, _ = self.run_scope(
+            [self.delivered()], [refused],
+            diagnostics={"requests": [{"request_id": "xray-req"}]},
+        )
+        self.assertFalse(facts["delivered"])
+        self.assertEqual(facts["pending"], ["mihomo:xhttp/tls"])
+        self.assertIn("HTTP 503", facts["reason"])
 
     def test_a_proxy_that_answers_without_carrying_the_payload_is_not_ready(self):
-        facts, _ = self.run_scope(self.delivered(), diagnostics={"requests": []})
+        facts, _ = self.run_scope([self.delivered()], diagnostics={"requests": []})
         self.assertFalse(facts["delivered"])
         self.assertFalse(facts["recorded"])
 
@@ -868,7 +901,7 @@ class TestTrafficProbeReadiness(unittest.TestCase):
             "xray", {"tag": "xray-tcp", "network": "tcp"}, "xray-req", None,
             "HTTP 503 without an endpoint report",
         )
-        facts, _ = self.run_scope(refused)
+        facts, _ = self.run_scope([refused])
         self.assertFalse(facts["delivered"])
         self.assertIn("HTTP 503", facts["reason"])
 
@@ -1360,7 +1393,7 @@ class TestRevocationCase(unittest.TestCase):
             with self.assertRaises(AssertionError) as caught:
                 self.run_case(readiness=readiness)
         message = str(caught.exception)
-        self.assertIn("no served outbound carried a payload", message)
+        self.assertIn("not every served outbound carried a payload", message)
         self.assertIn("HTTP 503 without an endpoint report", message)
 
     def test_the_case_fails_when_the_client_could_not_be_created(self):
