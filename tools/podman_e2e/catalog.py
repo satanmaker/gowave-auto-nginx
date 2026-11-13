@@ -254,6 +254,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Global Certbot Deploy Hook Ownership",
     },
     {
+        "id": "DNS-01",
+        "requirement": "Preflight SSH Trust and DNS Verification",
+        "assertion": "From the installed host's own resolution path and from an independent Control Machine, a name that publishes only an A record is answered with exactly that address and never with an AAAA, and a name that publishes only an AAAA is answered with exactly that address and never with an A, with the fixture publishing the TTL the zone declares; the fixture's own query log names each vantage's source address asking that question, an unknown name inside the zone is refused with NXDOMAIN and resolves to nothing, a record changed under a short TTL is answered with the new address within that record's lifetime instead of being served from a stale cache, and a wrong or about-to-expire answer is served exactly as published rather than repaired — after which the installed zone is restored and serves the installed names again.",
+        "topology": ["aio"],
+        "promotion_target": "Preflight SSH Trust and DNS Verification",
+    },
+    {
         "id": "NGX-COVER-DERIVE",
         "requirement": "Camouflage decoy and certificate lineage",
         "assertion": "The cover apex is the last two labels of panel_domain and a domain with fewer than three labels produces no cover lineage and is handled explicitly.",

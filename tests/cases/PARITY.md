@@ -77,6 +77,7 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **TLS-01** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **ACME-01** — promotion target: Global Certbot Deploy Hook Ownership
 - **ACME-02** — promotion target: Global Certbot Deploy Hook Ownership
+- **DNS-01** — promotion target: Preflight SSH Trust and DNS Verification
 - **NGX-COVER-DERIVE** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **NGX-COVER-UNRESOLVED** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **NGX-WORKER-ACME80** — promotion target: Distributed Worker VPS Deployment Verification

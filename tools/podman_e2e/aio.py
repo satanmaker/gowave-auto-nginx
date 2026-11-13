@@ -3203,6 +3203,446 @@ def case_acme_outage(product: AioProduct) -> Dict[str, Any]:
     return acme_outage_contract(product, ACME_OUTAGE_CASE_ID, "the All-in-One host", PANEL_DOMAIN)
 
 
+DNS_CASE_ID = "DNS-01"
+DNS_SUFFIX = topology.DNS_ZONE_SUFFIX
+DNS_A_NAME = f"dns-a.{DNS_SUFFIX}"
+DNS_AAAA_NAME = f"dns-aaaa.{DNS_SUFFIX}"
+DNS_BOTH_NAME = f"dns-both.{DNS_SUFFIX}"
+DNS_TTL_NAME = f"dns-ttl.{DNS_SUFFIX}"
+DNS_ABSENT_NAME = f"dns-absent.{DNS_SUFFIX}"
+DNS_WRONG_NAME = f"dns-wrong.{DNS_SUFFIX}"
+DNS_STALE_NAME = f"dns-stale.{DNS_SUFFIX}"
+# An address in a family the run does not otherwise carry, so a published AAAA
+# can be told from an A answer by value alone.
+DNS_AAAA_ANSWER = "2001:db8::53"
+# The record lifetime the case publishes: long enough that a resolver which
+# caches at all will cache it, short enough that one which ignores expiry is
+# caught by the deadline instead of being believed for the rest of the run.
+DNS_CASE_TTL = 5
+DNS_EXPIRY_DEADLINE_SECONDS = 60
+DNS_EXPIRY_INTERVAL_SECONDS = 3
+DNS_CASE_TIMEOUT_SECONDS = 600
+RCODE_NOERROR = 0
+RCODE_NXDOMAIN = 3
+
+
+def dns_vantages(host: topology.AioTopology) -> List[Dict[str, str]]:
+    """The two places answers are read from: the host under test and a client.
+
+    The host's own resolution path is what a product step gets; the Control
+    Machine shares nothing with the product, so an answer it receives can only
+    have come from the resolver both of them were given.
+    """
+    return [
+        {"role": "target", "container": host.target_name, "source": str(host.plan.target_ip)},
+        {"role": "client", "container": host.client_name, "source": str(host.plan.client_ip)},
+    ]
+
+
+def dns_case_zone(
+    host: topology.AioTopology, ttl_address: str = "",
+    behavior: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """The install's own zone plus the names this case steers.
+
+    The probe names are added to the base zone rather than replacing it, so a
+    rewrite cannot make a later case resolve differently. The zone's TTL is
+    shortened for the expiry half, and restored with the zone at the end.
+    """
+    data = json.loads(json.dumps(host.zone()))
+    data["ttl"] = DNS_CASE_TTL
+    records = data["records"]
+    records[DNS_A_NAME] = {"A": [str(host.plan.target_ip)]}
+    records[DNS_AAAA_NAME] = {"AAAA": [DNS_AAAA_ANSWER]}
+    records[DNS_BOTH_NAME] = {
+        "A": [str(host.plan.target_ip)], "AAAA": [DNS_AAAA_ANSWER],
+    }
+    records[DNS_TTL_NAME] = {"A": [ttl_address or str(host.plan.target_ip)]}
+    data["behavior"] = behavior or {"mode": "answer", "delay_ms": 0}
+    return data
+
+
+def _dns_report(
+    product: AioProduct, case_id: str, vantage: Dict[str, str], scope: str,
+    queries: Sequence[str] = (), names: Sequence[str] = (),
+) -> Dict[str, Any]:
+    host = product.require_installed()
+    result = host.dns_probe(vantage["container"], scope, queries=queries, names=names)
+    return probe_json(case_id, f"the DNS {scope} probe on {vantage['role']}", result)
+
+
+def _direct_entry(report: Dict[str, Any], name: str, qtype: str) -> Dict[str, Any]:
+    for entry in report.get("queries") or []:
+        if entry.get("name") == name and entry.get("type") == qtype:
+            return entry
+    return {}
+
+
+def _system_entry(report: Dict[str, Any], name: str) -> Dict[str, Any]:
+    for entry in report.get("names") or []:
+        if entry.get("name") == name:
+            return entry
+    return {}
+
+
+def require_direct_answer(
+    case_id: str, role: str, report: Dict[str, Any], name: str, qtype: str,
+    expected: Sequence[str], rcode: int = RCODE_NOERROR,
+) -> Dict[str, Any]:
+    """One authoritative answer, read without a resolver library in between."""
+    entry = _direct_entry(report, name, qtype)
+    require(case_id, entry,
+            f"{role}: the direct probe reported no {qtype} query for {name!r} "
+            f"({[(item.get('name'), item.get('type')) for item in report.get('queries') or []]})")
+    require(case_id, not entry.get("error"),
+            f"{role}: a direct {qtype} query for {name} never reached the resolver: {entry.get('error')}")
+    require(case_id, entry.get("rcode") == rcode,
+            f"{role}: a direct {qtype} query for {name} answered "
+            f"{entry.get('rcode')} ({entry.get('rcode_name')}) instead of {rcode} from "
+            f"{report.get('server')}")
+    answers = list(entry.get("answers") or [])
+    require(case_id, answers == list(expected),
+            f"{role}: a direct {qtype} query for {name} answered {answers} instead of "
+            f"{list(expected)}, so the resolver published a different record set than the zone")
+    return entry
+
+
+def require_system_family(
+    case_id: str, role: str, report: Dict[str, Any], name: str, family: str,
+    expected: Sequence[str],
+) -> Dict[str, Any]:
+    """One family's addresses, resolved through the role's own path."""
+    entry = _system_entry(report, name)
+    require(case_id, entry,
+            f"{role}: the system probe reported no resolution for {name!r} "
+            f"({[item.get('name') for item in report.get('names') or []]})")
+    addresses = list(entry.get(family) or [])
+    require(case_id, addresses == list(expected),
+            f"{role}: {name} resolved to {addresses} for {family} instead of {list(expected)}, "
+            f"through the resolver configuration {report.get('resolver')}")
+    return entry
+
+
+def require_fixture_attribution(
+    case_id: str, role: str, source: str, events: Sequence[Dict[str, Any]], name: str,
+    qtype: str, expected: Sequence[str], rcode: int = RCODE_NOERROR,
+    mode: str = "answer",
+) -> Dict[str, Any]:
+    """The resolver's own log names this vantage and this answer.
+
+    A name that resolves says nothing about where the answer came from: a hosts
+    entry or a cache left by an earlier phase would look identical. Only the
+    fixture recording this source address asking this question lets the answer be
+    attributed to the zone the case published.
+    """
+    matches = [
+        event for event in events
+        if event.get("qname") == name and event.get("qtype") == qtype
+        and str(event.get("client", "")).startswith(f"{source}:")
+    ]
+    require(case_id, matches,
+            f"{role}: the resolver recorded no {qtype} query for {name!r} from {source}, "
+            "so the answer did not come from the fixture zone")
+    event = matches[-1]
+    require(case_id, event.get("rcode") == rcode,
+            f"{role}: the resolver recorded rcode {event.get('rcode')} for the {qtype} query "
+            f"for {name} from {source} instead of {rcode}")
+    require(case_id, event.get("mode") == mode,
+            f"{role}: the resolver recorded mode {event.get('mode')!r} for {name!r} instead of "
+            f"{mode!r}, so the answer was not the one this phase published")
+    if rcode == RCODE_NOERROR:
+        answers = list(event.get("answers") or [])
+        require(case_id, answers == list(expected),
+                f"{role}: the resolver recorded {answers} for {name} from {source} instead of "
+                f"{list(expected)}")
+    return event
+
+
+def require_address_selection(
+    case_id: str, role: str, direct: Dict[str, Any], system: Dict[str, Any], target_address: str,
+) -> Dict[str, Any]:
+    """Each family answers with its own records and never with the other's.
+
+    A resolver that substituted one family for the other would still resolve
+    every name here, so the empty side is as much an assertion as the filled one.
+    """
+    a_only = require_direct_answer(case_id, role, direct, DNS_A_NAME, "A", [target_address])
+    a_empty = require_direct_answer(case_id, role, direct, DNS_A_NAME, "AAAA", [])
+    aaaa_only = require_direct_answer(case_id, role, direct, DNS_AAAA_NAME, "AAAA", [DNS_AAAA_ANSWER])
+    aaaa_empty = require_direct_answer(case_id, role, direct, DNS_AAAA_NAME, "A", [])
+    both_a = require_direct_answer(case_id, role, direct, DNS_BOTH_NAME, "A", [target_address])
+    both_aaaa = require_direct_answer(case_id, role, direct, DNS_BOTH_NAME, "AAAA", [DNS_AAAA_ANSWER])
+
+    system_a = require_system_family(case_id, role, system, DNS_A_NAME, "inet", [target_address])
+    require(case_id, not system_a.get("inet6"),
+            f"{role}: {DNS_A_NAME} carries only an A record, yet the system path resolved "
+            f"{system_a.get('inet6')} for inet6")
+    system_aaaa = require_system_family(case_id, role, system, DNS_AAAA_NAME, "inet6", [DNS_AAAA_ANSWER])
+    require(case_id, not system_aaaa.get("inet"),
+            f"{role}: {DNS_AAAA_NAME} carries only an AAAA record, yet the system path resolved "
+            f"{system_aaaa.get('inet')} for inet")
+    system_both = require_system_family(case_id, role, system, DNS_BOTH_NAME, "inet", [target_address])
+    require(case_id, list(system_both.get("inet6") or []) == [DNS_AAAA_ANSWER],
+            f"{role}: {DNS_BOTH_NAME} resolved to {system_both.get('inet6')} for inet6 instead of "
+            f"[{DNS_AAAA_ANSWER!r}]")
+
+    require(case_id, a_only.get("ttl") == DNS_CASE_TTL and aaaa_only.get("ttl") == DNS_CASE_TTL,
+            f"{role}: the fixture published TTL {a_only.get('ttl')}/{aaaa_only.get('ttl')} for the "
+            f"A/AAAA records instead of the zone's {DNS_CASE_TTL}s, so a downstream cache would keep "
+            "an answer past the change this case makes")
+    require(case_id, a_empty.get("answers") == [] and aaaa_empty.get("answers") == [],
+            f"{role}: the fixture answered the empty family instead of publishing no record for it")
+    return {
+        "a": {"answers": a_only.get("answers"), "ttl": a_only.get("ttl")},
+        "a_aaaa": {"rcode": a_empty.get("rcode")},
+        "aaaa": {"answers": aaaa_only.get("answers"), "ttl": aaaa_only.get("ttl")},
+        "aaaa_a": {"rcode": aaaa_empty.get("rcode")},
+        "both": {"a": both_a.get("answers"), "aaaa": both_aaaa.get("answers")},
+        "system": {
+            "a": {"inet": system_a.get("inet"), "inet6": system_a.get("inet6")},
+            "aaaa": {"inet": system_aaaa.get("inet"), "inet6": system_aaaa.get("inet6")},
+            "both": {"inet": system_both.get("inet"), "inet6": system_both.get("inet6")},
+        },
+    }
+
+
+def require_nxdomain(
+    case_id: str, role: str, direct: Dict[str, Any], system: Dict[str, Any],
+) -> Dict[str, Any]:
+    """A name the zone does not carry is refused by the zone, not by a fallback."""
+    entry = require_direct_answer(
+        case_id, role, direct, DNS_ABSENT_NAME, "A", [], rcode=RCODE_NXDOMAIN,
+    )
+    missing = require_system_family(case_id, role, system, DNS_ABSENT_NAME, "inet", [])
+    require(case_id, not missing.get("inet6"),
+            f"{role}: {DNS_ABSENT_NAME} does not exist in the zone, yet the system path resolved "
+            f"{missing.get('inet6')} for inet6")
+    return {"rcode": entry.get("rcode"), "answers": entry.get("answers"),
+            "system_error": missing.get("inet_error")}
+
+
+def require_ttl_expiry(
+    case_id: str, role: str, earlier: Dict[str, Any], later: Dict[str, Any],
+    previous: Sequence[str], expected: Sequence[str], polls: int,
+) -> Dict[str, Any]:
+    """The answer a record changes to is visible by the time its TTL has passed.
+
+    Both ends are asserted: the old answer really was what the role resolved
+    before the zone changed, and the new one replaced it inside the deadline. A
+    resolver that never caches passes the second half immediately, which is the
+    correct outcome for it — what must not happen is an old answer surviving
+    beyond the TTL the record published.
+    """
+    observed = list(earlier.get("inet") or [])
+    require(case_id, observed == list(previous),
+            f"{role}: {DNS_TTL_NAME} resolved to {observed} instead of {list(previous)} before the "
+            "zone changed, so the change had nothing observable to replace")
+    addresses = list(later.get("inet") or [])
+    require(case_id, addresses == list(expected),
+            f"{role}: {DNS_TTL_NAME} still resolved to {addresses} instead of {list(expected)} "
+            f"after {polls} polls inside {DNS_EXPIRY_DEADLINE_SECONDS}s, so the answer the previous "
+            f"zone published ({list(previous)}) outlived the {DNS_CASE_TTL}s record TTL")
+    return {"before": observed, "after": addresses, "polls": polls}
+
+
+def require_wrong_answer(
+    case_id: str, role: str, direct: Dict[str, Any], wrong_address: str,
+) -> Dict[str, Any]:
+    """A steered wrong answer is served as published instead of being repaired.
+
+    Making the resolver lie is the precondition for proving the product refuses a
+    wrong address later, so the wrong address has to arrive intact.
+    """
+    entry = require_direct_answer(case_id, role, direct, DNS_WRONG_NAME, "A", [wrong_address])
+    require(case_id, entry.get("ttl") == DNS_CASE_TTL,
+            f"{role}: the wrong answer for {DNS_WRONG_NAME} carried TTL {entry.get('ttl')} instead "
+            f"of {DNS_CASE_TTL}s")
+    return {"answers": entry.get("answers"), "ttl": entry.get("ttl")}
+
+
+def require_stale_answer(
+    case_id: str, role: str, direct: Dict[str, Any], stale_address: str,
+) -> Dict[str, Any]:
+    """An answer about to expire is served with the short TTL that says so."""
+    entry = require_direct_answer(case_id, role, direct, DNS_STALE_NAME, "A", [stale_address])
+    require(case_id, entry.get("ttl") == DNS_CASE_TTL,
+            f"{role}: the stale answer for {DNS_STALE_NAME} carried TTL {entry.get('ttl')} instead "
+            f"of {DNS_CASE_TTL}s, so it was not published as an answer about to expire")
+    return {"answers": entry.get("answers"), "ttl": entry.get("ttl")}
+
+
+def _restore_dns_zone(host: topology.AioTopology, data: Dict[str, Any]) -> None:
+    """Put the install's own zone back; a cleanup failure must not replace the real error."""
+    try:
+        host.write_dns_zone(data)
+    except OSError:
+        pass
+
+
+def case_dns(product: AioProduct) -> Dict[str, Any]:
+    """DNS-01: the fixture's answers are measured from both vantages, twice.
+
+    The product trusts this resolver at install time and at renewal time, so the
+    resolver's behaviour is part of what an acceptance run rests on: a name that
+    answers the wrong family, an expired record that keeps being served, a
+    missing name that resolves anyway, or an injected wrong address that is
+    silently repaired would each make a later case pass or fail for a reason
+    nobody attributed. Every answer is read twice — through the host's own
+    resolution path and from the Control Machine — and matched against the
+    resolver's own query log, which is the only thing that can say the answer
+    came from the zone rather than from a cache or a hosts file.
+    """
+    host = product.require_installed()
+    case_id = DNS_CASE_ID
+    target_address = str(host.plan.target_ip)
+    changed_address = str(host.plan.client_ip)
+    wrong_address = str(host.plan.echo_ip)
+    base_zone = host.zone()
+    resolution = str(host.plan.dns_ip)
+
+    host.write_dns_zone(dns_case_zone(host))
+    answers: Dict[str, Dict[str, Any]] = {}
+    attribution: Dict[str, Any] = {}
+    selection: Dict[str, Any] = {}
+    expiry: Dict[str, Any] = {}
+    steered: Dict[str, Any] = {}
+    try:
+        for vantage in dns_vantages(host):
+            role = vantage["role"]
+            direct = _dns_report(product, case_id, vantage, "direct", queries=[
+                f"{DNS_A_NAME}:A", f"{DNS_A_NAME}:AAAA",
+                f"{DNS_AAAA_NAME}:AAAA", f"{DNS_AAAA_NAME}:A",
+                f"{DNS_BOTH_NAME}:A", f"{DNS_BOTH_NAME}:AAAA",
+                f"{DNS_ABSENT_NAME}:A", f"{DNS_TTL_NAME}:A",
+            ])
+            system = _dns_report(product, case_id, vantage, "system", names=[
+                DNS_A_NAME, DNS_AAAA_NAME, DNS_BOTH_NAME, DNS_ABSENT_NAME, DNS_TTL_NAME,
+            ])
+            selection[role] = require_address_selection(
+                case_id, role, direct, system, target_address,
+            )
+            selection[role]["nxdomain"] = require_nxdomain(case_id, role, direct, system)
+            # The expiry half compares this resolution with the same name's later
+            # one, so what is kept is the name's own entry, not the whole report.
+            answers[role] = require_system_family(
+                case_id, role, system, DNS_TTL_NAME, "inet", [target_address],
+            )
+            events = host.dns_queries()
+            attribution[role] = {
+                "source": vantage["source"],
+                "resolver": resolution,
+                "resolv_conf": (system.get("resolver") or {}).get("nameservers"),
+                "a": require_fixture_attribution(
+                    case_id, role, vantage["source"], events, DNS_A_NAME, "A", [target_address],
+                ),
+                "absent": require_fixture_attribution(
+                    case_id, role, vantage["source"], events, DNS_ABSENT_NAME, "A", [],
+                    rcode=RCODE_NXDOMAIN,
+                ),
+            }
+
+        host.write_dns_zone(dns_case_zone(host, ttl_address=changed_address))
+        for vantage in dns_vantages(host):
+            role = vantage["role"]
+            published = require_direct_answer(
+                case_id, role,
+                _dns_report(product, case_id, vantage, "direct", queries=[f"{DNS_TTL_NAME}:A"]),
+                DNS_TTL_NAME, "A", [changed_address],
+            )
+            observed: Dict[str, Any] = {}
+
+            def expired() -> bool:
+                observed.clear()
+                observed.update(_dns_report(
+                    product, case_id, vantage, "system", names=[DNS_TTL_NAME],
+                ))
+                return list(_system_entry(observed, DNS_TTL_NAME).get("inet") or []) == [changed_address]
+
+            expired_in_time = wait_until(
+                expired, DNS_EXPIRY_DEADLINE_SECONDS,
+                f"{case_id} {role} resolution of {DNS_TTL_NAME}",
+                interval_seconds=DNS_EXPIRY_INTERVAL_SECONDS,
+            )
+            require(case_id, expired_in_time,
+                    f"{role}: {DNS_TTL_NAME} never resolved to {changed_address} within "
+                    f"{DNS_EXPIRY_DEADLINE_SECONDS}s after the zone changed")
+            require(case_id, published.get("answers") == [changed_address],
+                    f"{role}: the resolver published {published.get('answers')} for {DNS_TTL_NAME} "
+                    f"instead of the changed record {[changed_address]}")
+            expiry[role] = require_ttl_expiry(
+                case_id, role, answers[role], _system_entry(observed, DNS_TTL_NAME),
+                [target_address], [changed_address],
+                DNS_EXPIRY_DEADLINE_SECONDS // DNS_EXPIRY_INTERVAL_SECONDS,
+            )
+            attribution[role]["ttl_after_change"] = require_fixture_attribution(
+                case_id, role, vantage["source"], host.dns_queries(), DNS_TTL_NAME, "A",
+                [changed_address],
+            )
+
+        host.write_dns_zone(dns_case_zone(
+            host,
+            behavior={"mode": "wrong", "overrides": {DNS_WRONG_NAME: {"A": [wrong_address]}}},
+        ))
+        for vantage in dns_vantages(host):
+            role = vantage["role"]
+            direct = _dns_report(
+                product, case_id, vantage, "direct", queries=[f"{DNS_WRONG_NAME}:A"],
+            )
+            steered[role] = {"wrong": require_wrong_answer(case_id, role, direct, wrong_address)}
+            steered[role]["wrong"]["attribution"] = require_fixture_attribution(
+                case_id, role, vantage["source"], host.dns_queries(), DNS_WRONG_NAME, "A",
+                [wrong_address], mode="wrong",
+            )
+
+        host.write_dns_zone(dns_case_zone(
+            host,
+            behavior={
+                "mode": "stale", "ttl": DNS_CASE_TTL,
+                "overrides": {DNS_STALE_NAME: {"A": [wrong_address]}},
+            },
+        ))
+        for vantage in dns_vantages(host):
+            role = vantage["role"]
+            direct = _dns_report(
+                product, case_id, vantage, "direct", queries=[f"{DNS_STALE_NAME}:A"],
+            )
+            steered[role]["stale"] = require_stale_answer(case_id, role, direct, wrong_address)
+            steered[role]["stale"]["attribution"] = require_fixture_attribution(
+                case_id, role, vantage["source"], host.dns_queries(), DNS_STALE_NAME, "A",
+                [wrong_address], mode="stale",
+            )
+    except BaseException:
+        _restore_dns_zone(host, base_zone)
+        raise
+
+    host.write_dns_zone(base_zone)
+    restored: Dict[str, Any] = {}
+    for vantage in dns_vantages(host):
+        role = vantage["role"]
+        direct = _dns_report(
+            product, case_id, vantage, "direct",
+            queries=[f"{topology.PANEL_DOMAIN}:A", f"{DNS_A_NAME}:A"],
+        )
+        restored[role] = {
+            "panel_domain": require_direct_answer(
+                case_id, role, direct, topology.PANEL_DOMAIN, "A", [target_address],
+            ).get("answers"),
+            "probe_name": require_direct_answer(
+                case_id, role, direct, DNS_A_NAME, "A", [], rcode=RCODE_NXDOMAIN,
+            ).get("rcode"),
+        }
+
+    return {
+        "case": case_id,
+        "zone": {"ttl": DNS_CASE_TTL, "suffix": DNS_SUFFIX, "resolver": resolution},
+        "selection": selection,
+        "expiry": expiry,
+        "steered": steered,
+        "restored": restored,
+        "attribution": attribution,
+    }
+
+
 def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
     """SUB-SERVED: every served representation is fetched and loaded by its real client.
 
@@ -3627,6 +4067,11 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # case's reload cannot be mistaken for a defect in what this one measured.
         Case(TLS_CASE_ID, "aio", lambda context: case_tls_surface(product),
              timeout_seconds=TLS_TIMEOUT_SECONDS),
+        # The fixture resolver answers for every name the install and the renewal
+        # trust, so what it publishes is measured before anything is asked to
+        # rely on it; the case puts the installed zone back before it returns.
+        Case(DNS_CASE_ID, "aio", lambda context: case_dns(product),
+             timeout_seconds=DNS_CASE_TIMEOUT_SECONDS),
         # The configuration case only observes and reloads: it runs before any
         # traffic so a reload it caused can never be read as a data-plane fault.
         Case(NGX_CONFIG_CASE_ID, "aio", lambda context: case_nginx_config(product),
