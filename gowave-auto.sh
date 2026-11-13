@@ -39,8 +39,25 @@ verify_public_tls_sni() {
         fi
         ca_opts=(-CAfile "$GOWAVE_TLS_CA_FILE")
     fi
-    timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$domain" \
-        -verify_return_error -verify_hostname "$domain" "${ca_opts[@]}" -brief </dev/null
+    if timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$domain" \
+        -verify_return_error -verify_hostname "$domain" "${ca_opts[@]}" -brief </dev/null; then
+        return 0
+    fi
+    # "hostname mismatch" alone leaves an operator guessing whether the wrong
+    # certificate or the wrong SNI route answered, so name both on failure.
+    local served routed certificate
+    served=$(timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$domain" </dev/null 2>/dev/null \
+        | openssl x509 -noout -subject -issuer -ext subjectAltName 2>/dev/null || true)
+    routed=$(grep -F "$domain " /etc/nginx/stream-enabled/gowave-stream.conf 2>/dev/null \
+        | head -n 1 || true)
+    certificate=$(grep -E '^[[:space:]]*ssl_certificate[[:space:]]' /etc/nginx/conf.d/gowave-panel.conf 2>/dev/null \
+        | head -n 1 || true)
+    echo "Error: The port 443 listener did not prove TLS for $domain." >&2
+    echo "  SNI map entry: ${routed:-none}" >&2
+    echo "  Panel listener certificate: ${certificate:-none}" >&2
+    echo "  Served certificate:" >&2
+    printf '%s\n' "${served:-  unreadable}" >&2
+    return 1
 }
 
 acquire_lock() {
