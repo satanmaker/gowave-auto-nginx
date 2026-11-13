@@ -611,6 +611,13 @@ def certificate(path):
     return facts
 
 
+def certbot_list(value):
+    # Certbot keeps the webroot as a list and serialises it comma-separated, so a
+    # lineage with one webroot reads '/var/www/gowave-acme,' — the same path the
+    # install passed with -w, plus the separator configobj appends.
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def lineage():
     path = os.path.join(RENEWAL_DIR, DOMAIN + ".conf")
     facts = {"path": path, "present": os.path.isfile(path), "values": {}}
@@ -624,8 +631,12 @@ def lineage():
         return facts
     for line in lines:
         key, separator, value = line.partition("=")
-        if separator:
-            facts["values"][key.strip()] = value.strip()
+        if not separator:
+            continue
+        key = key.strip()
+        facts["values"][key] = value.strip()
+        if key == "webroot_path":
+            facts["values"]["webroot_paths"] = certbot_list(value)
     return facts
 
 
@@ -2618,10 +2629,11 @@ def require_webroot_lineage(case_id: str, role: str, domain: str, facts: Dict[st
     require(case_id, values.get("authenticator") == "webroot",
             f"{role}: the renewal lineage for {domain} authenticates as "
             f"{values.get('authenticator')!r} instead of the webroot method the install used")
-    require(case_id, values.get("webroot_path") == ACME_WEBROOT,
+    webroots = values.get("webroot_paths") or []
+    require(case_id, webroots == [ACME_WEBROOT],
             f"{role}: the renewal lineage for {domain} writes its challenge under "
-            f"{values.get('webroot_path')!r} instead of {ACME_WEBROOT}, which is the path "
-            "the port 80 vhost serves")
+            f"{webroots!r} (certbot recorded {values.get('webroot_path')!r}) instead of "
+            f"[{ACME_WEBROOT!r}], which is the path the port 80 vhost serves")
     require(case_id, values.get("server") == acme_fixture.ACME_DIRECTORY_URL,
             f"{role}: the renewal lineage for {domain} points at {values.get('server')!r} "
             f"instead of this run's ACME directory {acme_fixture.ACME_DIRECTORY_URL!r}")
