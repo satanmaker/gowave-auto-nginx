@@ -4354,6 +4354,10 @@ CHANNEL_RECOVERY_ROOT = "/var/lib/gowave-auto-nginx/recovery"
 CHANNEL_ONCE_FAIL_UNIT = "/etc/systemd/system/gowave.service.d/99-e2e-once-fail.conf"
 CHANNEL_ONCE_FAIL_EXEC = "/usr/local/sbin/gowave-e2e-once-fail"
 CHANNEL_ONCE_FAIL_MARKER = "/root/gowave-e2e-once.marker"
+# systemd gives a unit's ExecStartPre /dev/null on standard input, so the damage
+# is done by a file the hook executes rather than by a program streamed into
+# `python3 -` from the hook's own body.
+CHANNEL_SABOTAGE_EXEC = "/usr/local/sbin/gowave-e2e-sabotage.py"
 
 
 def channel_state_paths(base: str = "") -> Dict[str, str]:
@@ -4716,15 +4720,7 @@ CHANNEL_ROLLBACK_BODY = r"""
 recovery=/var/lib/gowave-auto-nginx/recovery
 rm -f /root/gowave-e2e-once.marker /tmp/gowave-e2e-sabotage.json
 install -d -m 0755 /usr/local/sbin
-cat > /usr/local/sbin/gowave-e2e-once-fail <<'ONCE'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-marker=/root/gowave-e2e-once.marker
-if [[ -e "$marker" ]]; then
-    exit 0
-fi
-touch "$marker"
-python3 - <<'PY'
+cat > /usr/local/sbin/gowave-e2e-sabotage.py <<'PY'
 import hashlib, json, os
 
 root = "/var/lib/gowave-auto-nginx/recovery"
@@ -4786,6 +4782,18 @@ record = {
 with open("/tmp/gowave-e2e-sabotage.json", "w", encoding="utf-8") as handle:
     json.dump(record, handle, sort_keys=True)
 PY
+chmod 0755 /usr/local/sbin/gowave-e2e-sabotage.py
+cat > /usr/local/sbin/gowave-e2e-once-fail <<'ONCE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+marker=/root/gowave-e2e-once.marker
+if [[ -e "$marker" ]]; then
+    exit 0
+fi
+touch "$marker"
+# The harness starts this hook from systemd, which hands it /dev/null instead of
+# the script text, so the sabotage has to be an executable of its own.
+python3 /usr/local/sbin/gowave-e2e-sabotage.py
 exit 1
 ONCE
 chmod 0755 /usr/local/sbin/gowave-e2e-once-fail
@@ -4891,7 +4899,7 @@ def channel_rollback_cleanup_script() -> str:
     """
     return f"""set -Eeuo pipefail
 rm -f {shlex.quote(CHANNEL_ONCE_FAIL_UNIT)} {shlex.quote(CHANNEL_ONCE_FAIL_EXEC)} \
-{shlex.quote(CHANNEL_ONCE_FAIL_MARKER)}
+{shlex.quote(CHANNEL_SABOTAGE_EXEC)} {shlex.quote(CHANNEL_ONCE_FAIL_MARKER)}
 systemctl daemon-reload
 state=$(python3 - <<'PY' || true
 import json
@@ -5055,12 +5063,13 @@ def case_channel_rollback(product: AioProduct) -> Dict[str, Any]:
     """AIO-CHANNEL-ROLLBACK: a release that cannot start is undone from the snapshot.
 
     Every area ``prepare_update_snapshot`` captures is overwritten by the injected
-    start hook and has to come back byte for byte, with the database compared by
-    its logical dump: the Panel binary, the database, the frontend, the
-    environment, state.json, the NGINX tree and the ACME lineage. The sabotage
-    digests prove the rollback had something to restore rather than finding the
-    tree already intact; the API and both client engines prove the restored tree
-    is a working Panel and not only a matching hash.
+    start hook and has to come back byte for byte: the Panel binary, the database,
+    the frontend, the environment, state.json, the NGINX tree and the ACME
+    lineage. The database is read by its integrity and by the inventory the Panel
+    serves from it, because a running Panel writes to the file between two reads.
+    The sabotage digests prove the rollback had something to restore rather than
+    finding the tree already intact; the API and both client engines prove the
+    restored tree is a working Panel and not only a matching hash.
     """
     host = product.require_installed()
     product.subscription_payloads(CHANNEL_ROLLBACK_CASE_ID)
