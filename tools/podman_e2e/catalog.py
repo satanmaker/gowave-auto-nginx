@@ -310,6 +310,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
     },
     {
+        "id": "MN-BACKUP",
+        "requirement": "Backup and Restore Format v1",
+        "assertion": "Both archive types are produced through the operator's own interface — --type panel on Master and --type node on Worker — as mode-0600 Format v1 archives whose actual contents match their documented allowlists: the Panel archive carries the database, environment, NGINX vhosts, the complete certificate lineage and run state with every declared checksum present and no binary, while the Worker archive carries exactly its environment file, and the product's own validator accepts both.",
+        "topology": ["multi-node"],
+        "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
+    },
+    {
         "id": "PODNET-MASTER-ADDR",
         "requirement": "Podman-only Master address selection for Worker provisioning",
         "assertion": "The real node add path uses the validated private Master address on the run-scoped network, Worker observes that source, and the override is rejected without the explicit opt-in or when the address is not assigned to Master.",

@@ -186,6 +186,34 @@ ACME_CHALLENGE_TOKEN = "gowave-e2e-http01-token"
 # product's resolution precondition and certbot's HTTP-01 both still hold.
 ACME_NEW_PANEL_DOMAIN = "panel2.testbed.internal"
 ACME_NEW_REALITY_DOMAIN = "reality2.testbed.internal"
+# Both archive types are separate contracts and both are unencrypted and
+# secret-bearing, so this case records what each archive carries -- member paths,
+# declared checksums, environment key names and where private keys sit -- and
+# never reads out a value the archive protects.
+BACKUP_CASE_ID = "MN-BACKUP"
+BACKUP_TIMEOUT_SECONDS = 600
+BACKUP_READ_TIMEOUT_SECONDS = 180
+# One archive type per role, because that is the role each one restores.
+BACKUP_TYPES: Dict[str, str] = {"master": "panel", "worker": "node"}
+# A Panel archive is the Panel, not the host: the database, the environment, the
+# installation state, the managed NGINX tree and the lineages it renews.
+BACKUP_PANEL_REQUIRED_PATHS = (
+    "opt/gowave/gowave.db",
+    "opt/gowave/.env",
+    "var/lib/gowave-auto-nginx/state.json",
+)
+BACKUP_PANEL_REQUIRED_PREFIXES = (
+    "etc/nginx/conf.d/gowave-",
+    "etc/nginx/stream-enabled/gowave-",
+    "etc/letsencrypt/live/",
+    "etc/letsencrypt/archive/",
+    "etc/letsencrypt/renewal/",
+)
+# The Worker archive is its `.env` credentials only; it is not a system image and
+# it does not carry the Panel's database.
+BACKUP_NODE_PATHS = ("opt/gowave-node/.env",)
+# The key whose presence makes each archive secret-bearing. Only the name is read.
+BACKUP_SECRET_KEYS: Dict[str, str] = {"panel": "APP_SECRET", "node": "SECRET_KEY"}
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 VISION_PROBE_TIMEOUT_SECONDS = 120
@@ -5098,6 +5126,273 @@ def case_acme80(product: MultiNodeProduct) -> Dict[str, Any]:
     return evidence
 
 
+def backup_script(type_name: str) -> str:
+    """The operator's own backup command for one archive type."""
+    return (
+        f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh backup "
+        f"--type {shlex.quote(type_name)}\n"
+    )
+
+
+def backup_verify_script(archive: str, type_name: str) -> str:
+    """The product's own validator, run against the archive it just wrote."""
+    return (
+        f"bash {topology.REPO_IN_CONTAINER}/assets/backup/gowave-backup.sh verify "
+        f"{shlex.quote(archive)} {shlex.quote(type_name)}\n"
+    )
+
+
+def backup_probe_script(archive: str) -> str:
+    """Read an archive back without printing a single value it protects."""
+    return (
+        "set -u\n"
+        f"python3 - {shlex.quote(archive)} <<'PY'\n"
+        "import hashlib\n"
+        "import json\n"
+        "import os\n"
+        "import tarfile\n"
+        "import sys\n"
+        "\n"
+        "archive = sys.argv[1]\n"
+        "facts = {'path': archive}\n"
+        "stat = os.stat(archive)\n"
+        "facts['mode'] = oct(stat.st_mode & 0o777)\n"
+        "facts['size'] = stat.st_size\n"
+        "digest = hashlib.sha256()\n"
+        "with open(archive, 'rb') as handle:\n"
+        "    for block in iter(lambda: handle.read(65536), b''):\n"
+        "        digest.update(block)\n"
+        "facts['sha256'] = digest.hexdigest()\n"
+        "facts['paths'] = []\n"
+        "facts['declared'] = []\n"
+        "facts['env_keys'] = {}\n"
+        "facts['private_key_members'] = []\n"
+        "facts['sqlite_header'] = False\n"
+        "with tarfile.open(archive, 'r:gz') as tar:\n"
+        "    members = tar.getmembers()\n"
+        "    meta_name = next(\n"
+        "        m.name for m in members if m.name in ('meta.json', './meta.json')\n"
+        "    )\n"
+        "    meta = json.load(tar.extractfile(meta_name))\n"
+        "    facts['format_version'] = meta.get('format_version')\n"
+        "    facts['type'] = meta.get('backup_type')\n"
+        "    facts['declared'] = sorted(\n"
+        "        entry.get('path', '') for entry in meta.get('files', []) if isinstance(entry, dict)\n"
+        "    )\n"
+        "    for member in members:\n"
+        "        name = member.name\n"
+        "        if member.isdir() or name in ('meta.json', './meta.json'):\n"
+        "            continue\n"
+        "        rel = name[6:] if name.startswith('files/') else name\n"
+        "        facts['paths'].append(rel)\n"
+        "        # The live/ members are symlinks into archive/; a link is counted\n"
+        "        # where it sits and is never resolved, so a dangling one cannot\n"
+        "        # turn a readable archive into a probe failure.\n"
+        "        if member.issym() or member.islnk():\n"
+        "            continue\n"
+        "        payload = tar.extractfile(member)\n"
+        "        if payload is None:\n"
+        "            continue\n"
+        "        if rel.endswith('/.env'):\n"
+        "            text = payload.read().decode('utf-8', 'replace')\n"
+        "            facts['env_keys'][rel] = sorted(\n"
+        "                line.split('=', 1)[0].strip() for line in text.splitlines()\n"
+        "                if '=' in line and not line.lstrip().startswith('#')\n"
+        "            )\n"
+        "        elif rel.endswith('gowave.db'):\n"
+        "            facts['sqlite_header'] = payload.read(16).startswith(b'SQLite format 3')\n"
+        "        elif rel.startswith('etc/letsencrypt/archive/') and rel.endswith('.pem'):\n"
+        "            if b'PRIVATE KEY' in payload.read():\n"
+        "                facts['private_key_members'].append(rel)\n"
+        "facts['paths'] = sorted(facts['paths'])\n"
+        "print(json.dumps(facts))\n"
+        "PY\n"
+    )
+
+
+def parse_backup_archive(stdout: str) -> str:
+    """The path the product reports for the archive it just wrote.
+
+    Both archive types end with `... backup created successfully: <path>
+    (mode 0600).`, and nothing else on stdout carries an absolute path, so the
+    last such line names the archive that has to be read back.
+    """
+    for line in reversed(stdout.splitlines()):
+        if "created successfully:" not in line:
+            continue
+        _, _, rest = line.partition("created successfully:")
+        candidate = rest.strip().split(" ")[0]
+        return candidate if candidate.startswith("/") else ""
+    return ""
+
+
+def require_backup_archive(case_id: str, role: str, facts: Dict[str, Any],
+                           type_name: str) -> None:
+    """One archive type carries exactly what its restore contract promises."""
+    require(
+        case_id,
+        facts.get("format_version") == 1,
+        f"{role}'s archive declares format version {facts.get('format_version')!r}, "
+        "so it is not the Backup & Restore Format v1 the product documents",
+    )
+    require(
+        case_id,
+        facts.get("type") == type_name,
+        f"{role}'s archive declares backup_type {facts.get('type')!r} instead of "
+        f"{type_name!r}, so a restore would apply the wrong contract",
+    )
+    require(
+        case_id,
+        facts.get("mode") == "0o600",
+        f"{role}'s archive is mode {facts.get('mode')} instead of 0600, so the "
+        "credentials it carries are not root-only",
+    )
+    paths = set(facts.get("paths") or ())
+    declared = set(facts.get("declared") or ())
+    require(
+        case_id,
+        paths and declared,
+        f"{role}'s archive lists its members as {sorted(paths)} and declares "
+        f"{sorted(declared)}, so there is nothing to compare",
+    )
+    require(
+        case_id,
+        declared <= paths,
+        f"{role}'s meta.json declares checksums for members the archive does not "
+        f"carry: {sorted(declared - paths)}",
+    )
+    if type_name == "panel":
+        missing = [path for path in BACKUP_PANEL_REQUIRED_PATHS if path not in paths]
+        require(
+            case_id,
+            not missing,
+            f"{role}'s Panel archive is missing {missing}, so a restore would not "
+            "bring back that part of the installation",
+        )
+        for prefix in BACKUP_PANEL_REQUIRED_PREFIXES:
+            require(
+                case_id,
+                any(path.startswith(prefix) for path in paths),
+                f"{role}'s Panel archive carries no {prefix}* member, so a restore "
+                "would lose that part of the installation",
+            )
+        require(
+            case_id,
+            facts.get("sqlite_header") is True,
+            f"{role}'s opt/gowave/gowave.db is not a SQLite database, so the Panel "
+            "archive holds no usable database",
+        )
+        require(
+            case_id,
+            facts.get("private_key_members"),
+            f"{role}'s Panel archive carries no TLS private key, so it could not "
+            "restore a lineage",
+        )
+        require(
+            case_id,
+            "opt/gowave/gowave-server" not in paths,
+            "the Panel archive carries the Panel binary, which the archive format "
+            "forbids and a restore would overwrite",
+        )
+        require(
+            case_id,
+            not any(path.startswith("opt/gowave-node/") for path in paths),
+            "the Panel archive carries the Worker's credentials, so the two role "
+            "archives are mixed",
+        )
+    else:
+        require(
+            case_id,
+            paths == set(BACKUP_NODE_PATHS),
+            f"{role}'s Worker archive carries {sorted(paths)} instead of exactly "
+            f"{list(BACKUP_NODE_PATHS)}, so it is not the documented "
+            "credentials-only archive",
+        )
+    secret_keys = facts.get("env_keys") or {}
+    required_key = BACKUP_SECRET_KEYS[type_name]
+    require(
+        case_id,
+        any(required_key in names for names in secret_keys.values()),
+        f"{role}'s archive carries no {required_key} in any environment file "
+        f"({sorted(secret_keys)}), so it does not hold the credential its own "
+        "restore contract promises",
+    )
+
+
+def case_backup_types(product: MultiNodeProduct) -> Dict[str, Any]:
+    """MN-BACKUP: both archive types come out of the operator's own interface.
+
+    The archives are unencrypted and secret-bearing, so the evidence keeps the
+    inventory -- member paths, declared checksums, environment key names, where
+    private keys sit -- and the archive's own digest, and never a value.
+    """
+    case_id = BACKUP_CASE_ID
+    host = product.require_worker()
+    evidence: Dict[str, Any] = {"roles": {}}
+    for role, container, label in (
+        ("master", host.target_name, "the Master"),
+        ("worker", host.worker_name, "the Worker"),
+    ):
+        type_name = BACKUP_TYPES[role]
+        created = product.podman.exec_bash(
+            container, backup_script(type_name), check=False, timeout=BACKUP_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            created.returncode == 0,
+            f"{label} could not create a {type_name} archive: "
+            f"{(created.stderr or created.stdout or '').strip()[-400:]}",
+        )
+        archive = parse_backup_archive(created.stdout or "")
+        require(
+            case_id,
+            bool(archive),
+            f"{label}'s {type_name} backup did not name the archive it wrote: "
+            f"{(created.stdout or '').strip()[-400:]}",
+        )
+        read = product.podman.exec_bash(
+            container, backup_probe_script(archive), check=False,
+            timeout=BACKUP_READ_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            read.returncode == 0,
+            f"{label} could not read its own {type_name} archive {archive}: "
+            f"{(read.stderr or '').strip()[-400:]}",
+        )
+        try:
+            facts = json.loads(read.stdout or "")
+        except json.JSONDecodeError:
+            raise AssertionError(
+                f"{case_id}: {label} did not describe its {type_name} archive: "
+                f"{(read.stdout or '').strip()[-400:]}"
+            )
+        require_backup_archive(case_id, label, facts, type_name)
+        verified = product.podman.exec_bash(
+            container, backup_verify_script(archive, type_name), check=False,
+            timeout=BACKUP_READ_TIMEOUT_SECONDS,
+        )
+        require(
+            case_id,
+            verified.returncode == 0 and "PASSED" in (verified.stdout or ""),
+            f"{label}'s own validator refused its {type_name} archive "
+            f"{(verified.stderr or verified.stdout or '').strip()[-400:]}",
+        )
+        evidence["roles"][role] = {
+            "type": type_name,
+            "path": archive,
+            "mode": facts["mode"],
+            "size": facts["size"],
+            "sha256": facts["sha256"],
+            "members": facts["paths"],
+            "declared": facts["declared"],
+            "secret_keys": facts["env_keys"],
+            "private_key_members": facts["private_key_members"],
+            "validation": (verified.stdout or "").strip().splitlines()[-1:],
+        }
+    return evidence
+
+
 def cover_probe_matrix(server_ip: str, other_ip: str) -> Sequence[Dict[str, Any]]:
     """Every way the installed apex pair can fail to resolve to one role.
 
@@ -5999,6 +6294,11 @@ def cases(
         Case(COVER_UNRESOLVED_CASE_ID, "multi-node",
              lambda context: case_cover_unresolved(product),
              timeout_seconds=COVER_UNRESOLVED_TIMEOUT_SECONDS),
+        # Both archive types are read while the cluster is healthy and before the
+        # lifecycle cases revoke a client or fault a role: the credentials and the
+        # lineages they carry are install-time state of exactly those roles.
+        Case(BACKUP_CASE_ID, "multi-node", lambda context: case_backup_types(product),
+             timeout_seconds=BACKUP_TIMEOUT_SECONDS),
         # The lifecycle cases run last: they revoke a client and fault the
         # Worker's own unit, so nothing that observes a healthy cluster may run
         # after them and no earlier case may be blamed for their state.
