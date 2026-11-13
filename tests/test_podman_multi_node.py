@@ -1688,24 +1688,31 @@ _COVER_OTHER_IP = "10.89.0.2"
 _COVER_LINEAGE = "/etc/letsencrypt/live/reality.testbed.internal/cert.pem"
 
 
-def _cover_probe_output(probes, answers=None, rendered=None, reasons=None):
-    """The steered matrix as the deployed decision would print it."""
-    lines = []
-    for probe in probes:
-        answers_for = (answers or {}).get(probe["domain"], probe["answers"])
-        for name, expected in answers_for.items():
-            lines.append(f"resolved\t{name}\t{expected}")
-        failing = [name for name, expected in answers_for.items()
+def _cover_probe_output(probe, answers=None, apex_rendered="", reason=None):
+    """One steered probe as the deployed decision would print it."""
+    answers = probe["answers"] if answers is None else answers
+    lines = [f"resolved\t{name}\t{value}" for name, value in answers.items()]
+    if reason is None and not apex_rendered:
+        failing = [name for name, expected in answers.items()
                    if expected != probe["server_ip"]]
-        if rendered and probe["domain"] in rendered:
-            lines.append(f"decision\t{probe['domain']}\t{probe['apex']}\t")
-            continue
-        reason = (reasons or {}).get(
-            probe["domain"],
-            multi_node.cover_refusal_message(failing, probe["server_ip"]),
-        )
-        lines.append(f"decision\t{probe['domain']}\t\t{reason}")
+        reason = multi_node.cover_refusal_message(failing, probe["server_ip"])
+    lines.append(f"decision\t{probe['domain']}\t{apex_rendered}\t{reason or ''}")
     return "\n".join(lines) + "\n"
+
+
+_COVER_PROBE_IPS = {"master": _COVER_MASTER_IP, "worker": _COVER_WORKER_IP}
+
+
+def _cover_probe_outputs(override=None):
+    """Every role's probe outputs, in the order the case runs them."""
+    override = override or {}
+    return {
+        role: [
+            _cover_probe_output(probe, **override.get(probe["label"], {}))
+            for probe in multi_node.cover_probe_matrix(server_ip, _COVER_OTHER_IP)
+        ]
+        for role, server_ip in _COVER_PROBE_IPS.items()
+    }
 
 
 def _cover_state_output(domain, apex, answers, own, apex_rendered, reason,
@@ -1724,7 +1731,7 @@ def _cover_state_output(domain, apex, answers, own, apex_rendered, reason,
     return "\n".join(lines) + "\n"
 
 
-def _cover_default_states(probes):
+def _cover_default_states():
     """One rendered role and one refusing role, both as a healthy run leaves them."""
     apex = topology.COVER_APEX
     both = {apex: _COVER_MASTER_IP, f"www.{apex}": _COVER_MASTER_IP}
@@ -1778,22 +1785,18 @@ class _CoverHost:
 
 
 class _CoverUnresolvedPodman:
-    """Answers the steered matrix and the role state from per-role facts."""
+    """Answers the steered probes in order and the role state from per-role facts."""
 
     ROLES = {"aio-master": "master", "worker-01": "worker"}
 
-    def __init__(self, probes=None, probe_outputs=None, states=None,
+    def __init__(self, probe_outputs=None, states=None,
                  probe_returncode=0, state_returncode=0):
-        self.probes = probes or multi_node.cover_probe_matrix(
-            _COVER_MASTER_IP, _COVER_OTHER_IP)
-        self.probe_outputs = probe_outputs or {
-            role: _cover_probe_output(self.probes)
-            for role in ("master", "worker")
-        }
-        self.states = states or _cover_default_states(self.probes)
+        self.probe_outputs = probe_outputs or _cover_probe_outputs()
+        self.states = states or _cover_default_states()
         self.probe_returncode = probe_returncode
         self.state_returncode = state_returncode
         self.scripts = {}
+        self.probes_run = {"master": 0, "worker": 0}
 
     def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
         role = self.ROLES[container]
@@ -1801,7 +1804,11 @@ class _CoverUnresolvedPodman:
         if "grep -rHnE" in script:
             code, output = self.state_returncode, self.states[role]
         else:
-            code, output = self.probe_returncode, self.probe_outputs[role]
+            # The three probes of one role differ only in the zone they were
+            # steered with, so the stub answers them in the order they run.
+            index = self.probes_run[role]
+            self.probes_run[role] += 1
+            code, output = self.probe_returncode, self.probe_outputs[role][index]
         if code:
             return subprocess.CompletedProcess(["bash", "-lc"], code, "", "boom")
         return subprocess.CompletedProcess(["bash", "-lc"], 0, output, "")
@@ -1825,25 +1832,30 @@ class TestCoverUnresolvedCase(unittest.TestCase):
 
     def test_every_probe_refuses_and_names_the_records_it_withheld(self):
         evidence, _ = self._run(_CoverUnresolvedPodman())
+        apex = topology.COVER_APEX
+        www = f"www.{apex}"
         for role in ("master", "worker"):
             with self.subTest(role=role):
                 probes = evidence["probes"][role]
-                self.assertEqual([probe["apex_rendered"] for probe in probes],
+                self.assertEqual(sorted(probes),
+                                 ["apex_missing", "both_elsewhere", "www_missing"])
+                self.assertEqual([probe["apex_rendered"] for probe in probes.values()],
                                  ["", "", ""])
-                answers = {probe["domain"]: probe["answers"] for probe in probes}
-                reasons = {probe["domain"]: probe["refusal"] for probe in probes}
-                apex_only = multi_node.COVER_PROBE_NAMES["apex_only"]
-                www_only = multi_node.COVER_PROBE_NAMES["www_only"]
-                elsewhere = multi_node.COVER_PROBE_NAMES["elsewhere"]
-                self.assertEqual(answers[f"panel.{apex_only}"],
-                                 {apex_only: _COVER_MASTER_IP,
-                                  f"www.{apex_only}": ""})
-                self.assertIn(f"www.{apex_only} does not resolve",
-                              reasons[f"panel.{apex_only}"])
-                self.assertIn(f"{www_only} does not resolve",
-                              reasons[f"panel.{www_only}"])
-                self.assertIn(f"{elsewhere} / www.{elsewhere} do not resolve",
-                              reasons[f"panel.{elsewhere}"])
+                self.assertEqual(probes["www_missing"]["steered"],
+                                 {apex: _COVER_PROBE_IPS[role], www: ""})
+                self.assertEqual(probes["apex_missing"]["steered"],
+                                 {apex: "", www: _COVER_PROBE_IPS[role]})
+                self.assertEqual(probes["both_elsewhere"]["steered"],
+                                 {apex: _COVER_OTHER_IP, www: _COVER_OTHER_IP})
+                self.assertIn(f"{www} does not resolve to {_COVER_PROBE_IPS[role]}",
+                              probes["www_missing"]["refusal"])
+                self.assertIn(f"— {apex} does not resolve",
+                              probes["apex_missing"]["refusal"])
+                self.assertNotIn(f"www.{apex}", probes["apex_missing"]["refusal"],
+                                 "the apex-only refusal named a record that did resolve")
+                self.assertIn(f"{apex} / {www} do not resolve to "
+                              f"{_COVER_PROBE_IPS[role]}",
+                              probes["both_elsewhere"]["refusal"])
 
     def test_the_role_that_holds_the_apex_shows_it_rendered(self):
         evidence, _ = self._run(_CoverUnresolvedPodman())
@@ -1861,19 +1873,30 @@ class TestCoverUnresolvedCase(unittest.TestCase):
         self.assertNotIn(topology.COVER_APEX, worker["claimed_names"])
         self.assertNotIn(f"www.{topology.COVER_APEX}", worker["claimed_names"])
 
-    def test_the_zone_is_steered_and_then_restored(self):
+    def test_the_zone_is_steered_per_probe_and_then_restored(self):
         evidence, product = self._run(_CoverUnresolvedPodman())
         self.assertTrue(evidence["zone_restored"])
-        self.assertEqual(len(product.host.zones), 2)
-        steered = product.host.zones[0]["records"]
-        self.assertEqual(steered[multi_node.COVER_PROBE_NAMES["apex_only"]],
-                         {"A": [_COVER_MASTER_IP]})
-        self.assertNotIn(f"www.{multi_node.COVER_PROBE_NAMES['apex_only']}", steered)
-        self.assertEqual(steered[multi_node.COVER_PROBE_NAMES["elsewhere"]],
-                         {"A": [_COVER_OTHER_IP]})
-        # The installed names keep their answers, so a later case cannot inherit
-        # a steered zone.
-        self.assertEqual(product.host.zones[-1], product.host.zone())
+        apex = topology.COVER_APEX
+        www = f"www.{apex}"
+        zones = product.host.zones
+        # Six steered writes — one per role and probe — then the restore that the
+        # state read needs and the restore the case guarantees.
+        self.assertEqual(len(zones), 8)
+        www_missing, apex_missing, both_elsewhere, worker_first = zones[:4]
+        self.assertNotIn(www, www_missing["records"])
+        self.assertEqual(www_missing["records"][apex], {"A": [_COVER_MASTER_IP]})
+        self.assertNotIn(apex, apex_missing["records"])
+        self.assertEqual(apex_missing["records"][www], {"A": [_COVER_MASTER_IP]})
+        self.assertEqual(both_elsewhere["records"][apex], {"A": [_COVER_OTHER_IP]})
+        self.assertEqual(both_elsewhere["records"][www], {"A": [_COVER_OTHER_IP]})
+        self.assertEqual(worker_first["records"][apex], {"A": [_COVER_WORKER_IP]},
+                         "the probe must be steered towards the role that runs it")
+        # The deployment domain keeps the answer the install published, and the
+        # installed pair comes back, so a later case cannot inherit a steered zone.
+        for zone in zones:
+            self.assertEqual(zone["records"][topology.PANEL_DOMAIN],
+                             {"A": [_COVER_MASTER_IP]})
+        self.assertEqual(zones[-1], product.host.zone())
 
     def test_the_zone_is_restored_when_a_check_fails(self):
         podman = _CoverUnresolvedPodman(probe_returncode=127)
@@ -1884,36 +1907,32 @@ class TestCoverUnresolvedCase(unittest.TestCase):
         self.assertEqual(product.host.zones[-1], product.host.zone())
 
     def test_a_probe_the_fixture_answered_differently_is_rejected(self):
-        probes = multi_node.cover_probe_matrix(_COVER_MASTER_IP, _COVER_OTHER_IP)
-        answers = {probes[0]["domain"]: probes[0]["answers"]}
-        answers[probes[0]["domain"]] = {probes[0]["apex"]: _COVER_MASTER_IP,
-                                        f"www.{probes[0]['apex']}": _COVER_MASTER_IP}
-        podman = _CoverUnresolvedPodman(
-            probe_outputs={"master": _cover_probe_output(probes, answers=answers),
-                           "worker": _cover_probe_output(probes)})
+        apex = topology.COVER_APEX
+        podman = _CoverUnresolvedPodman(probe_outputs=_cover_probe_outputs({
+            "www_missing": {"answers": {apex: _COVER_MASTER_IP,
+                                        f"www.{apex}": _COVER_MASTER_IP}},
+        }))
         with self.assertRaises(AssertionError) as caught:
             self._run(podman)
-        self.assertIn("cannot stand for the half of the pair", str(caught.exception))
+        self.assertIn("cannot stand for the pair it was steered to withhold",
+                      str(caught.exception))
 
     def test_a_probe_that_renders_the_apex_is_rejected(self):
-        probes = multi_node.cover_probe_matrix(_COVER_MASTER_IP, _COVER_OTHER_IP)
-        rendered = {probes[0]["domain"]: probes[0]["apex"]}
-        podman = _CoverUnresolvedPodman(
-            probe_outputs={"master": _cover_probe_output(probes, rendered=rendered),
-                           "worker": _cover_probe_output(probes)})
+        podman = _CoverUnresolvedPodman(probe_outputs=_cover_probe_outputs({
+            "www_missing": {"apex_rendered": topology.COVER_APEX},
+        }))
         with self.assertRaises(AssertionError) as caught:
             self._run(podman)
         self.assertIn("so a lineage ACME cannot validate would be requested",
                       str(caught.exception))
 
     def test_a_refusal_that_blames_the_wrong_record_is_rejected(self):
-        probes = multi_node.cover_probe_matrix(_COVER_MASTER_IP, _COVER_OTHER_IP)
-        reasons = {probes[0]["domain"]:
-                   f"Camouflage apex disabled — {probes[0]['apex']} does not resolve "
-                   f"to {probes[0]['server_ip']}, so HTTP-01 would fail."}
-        podman = _CoverUnresolvedPodman(
-            probe_outputs={"master": _cover_probe_output(probes, reasons=reasons),
-                           "worker": _cover_probe_output(probes)})
+        apex = topology.COVER_APEX
+        podman = _CoverUnresolvedPodman(probe_outputs=_cover_probe_outputs({
+            "www_missing": {"reason":
+                            f"Camouflage apex disabled — {apex} does not resolve "
+                            f"to {_COVER_MASTER_IP}, so HTTP-01 would fail."},
+        }))
         with self.assertRaises(AssertionError) as caught:
             self._run(podman)
         self.assertIn("instead of naming the records that did not resolve",
@@ -2001,28 +2020,58 @@ class TestCoverUnresolvedCase(unittest.TestCase):
             self._run(podman)
         self.assertIn("could not report its cover state", str(caught.exception))
 
-    def test_the_rendered_scripts_run_the_shipped_decisions(self):
+    def test_the_probe_scripts_run_the_shipped_decisions(self):
         # The extracted payload is the fragile half, so both roles' scripts are
         # executed against the files this checkout ships.
-        probes = multi_node.cover_probe_matrix(_COVER_MASTER_IP, _COVER_OTHER_IP)
-        for role in ("master", "worker"):
-            with self.subTest(role=role):
-                script = multi_node.cover_probe_script(role, probes).replace(
-                    topology.REPO_IN_CONTAINER, str(REPO_ROOT))
-                res = subprocess.run(["bash", "-c", script],
-                                     capture_output=True, text=True)
-                self.assertEqual(res.returncode, 0, res.stderr)
-                facts = multi_node.parse_cover_state(res.stdout)
-                self.assertEqual(len(facts["decisions"]), len(probes))
-                self.assertEqual(
-                    set(facts["resolved"]),
-                    {name for probe in probes
-                     for name in (probe["apex"], f"www.{probe['apex']}")},
-                )
+        apex = topology.COVER_APEX
+        for role, server_ip in _COVER_PROBE_IPS.items():
+            for probe in multi_node.cover_probe_matrix(server_ip, _COVER_OTHER_IP):
+                with self.subTest(role=role, probe=probe["label"]):
+                    # One settle attempt: this host has no resolver, so a probe
+                    # that waited would spin for the whole retry budget.
+                    script = multi_node.cover_probe_script(
+                        role, probe, attempts=1, settle="0").replace(
+                        topology.REPO_IN_CONTAINER, str(REPO_ROOT))
+                    res = subprocess.run(["bash", "-c", script],
+                                         capture_output=True, text=True)
+                    self.assertEqual(res.returncode, 0, res.stderr)
+                    facts = multi_node.parse_cover_state(res.stdout)
+                    self.assertEqual(set(facts["resolved"]), {apex, f"www.{apex}"})
+                    self.assertEqual(list(facts["decisions"]), [probe["domain"]])
+                    decision = facts["decisions"][probe["domain"]]
+                    self.assertEqual(decision["apex"], "")
+                    self.assertIn("Camouflage apex disabled", decision["reason"])
+
+    def test_the_probe_waits_for_the_steered_pair_and_flushes_before_reading(self):
+        # The install already resolved these names through the same resolver, and
+        # the fixture reloads its zone on a poll, so a probe that read once would
+        # decide on the previous zone's answers.
+        probe = multi_node.cover_probe_matrix(_COVER_MASTER_IP, _COVER_OTHER_IP)[0]
+        script = multi_node.cover_probe_script("master", probe)
+        self.assertIn(f"{{1..{multi_node.COVER_PROBE_SETTLE_ATTEMPTS}}}", script)
+        self.assertIn(f"sleep {multi_node.COVER_PROBE_SETTLE_SECONDS}", script)
+        self.assertIn("flush-caches", script)
+        self.assertLess(script.index("flush-caches"), script.index("apex_ip=$(read_half"))
+        self.assertIn(f"want_apex={_COVER_MASTER_IP}", script)
+        self.assertIn("want_www=''", script)
+        state = multi_node.cover_state_script(
+            "master", topology.PANEL_DOMAIN, _COVER_MASTER_IP,
+            {topology.COVER_APEX: _COVER_MASTER_IP,
+             f"www.{topology.COVER_APEX}": _COVER_MASTER_IP})
+        self.assertLess(state.index("flush-caches"), state.index('apex_ip=$(read_half'))
+
+    def test_the_installed_pair_is_read_from_the_published_zone(self):
+        zone = _CoverHost().zone()
+        apex = topology.COVER_APEX
+        zone["records"][apex] = {"A": [_COVER_MASTER_IP]}
+        self.assertEqual(multi_node.cover_published_answers(zone),
+                         {apex: _COVER_MASTER_IP, f"www.{apex}": ""},
+                         "an absent half must be read as unanswered, not as unknown")
 
     def test_the_state_script_reads_the_files_a_rendered_apex_leaves(self):
         script = multi_node.cover_state_script(
-            "master", topology.PANEL_DOMAIN, _COVER_MASTER_IP)
+            "master", topology.PANEL_DOMAIN, _COVER_MASTER_IP,
+            multi_node.cover_published_answers(_CoverHost().zone()))
         for fragment in (multi_node.COVER_SITE_INDEX, "server_name", "subjectAltName",
                          "hostname -I", "getent ahostsv4"):
             self.assertIn(fragment, script)
