@@ -982,27 +982,32 @@ node = matches[0]
 for field in ("address", "port", "workerDomain", "realityDomain"):
     if not node.get(field):
         raise SystemExit(f"state.json node '{name}' is missing {field}.")
-print(node["address"])
-print(node["port"])
-print(node["workerDomain"])
-print(node["realityDomain"])
-print(node.get("visionDomain") or "")
+print(f"address={node['address']}")
+print(f"port={node['port']}")
+print(f"worker_domain={node['workerDomain']}")
+print(f"reality_domain={node['realityDomain']}")
+print(f"vision_domain={node.get('visionDomain') or ''}")
 PY
             ); then
                 echo "Error: cannot re-apply Worker '$name': $identity_text" >&2
                 return 1
             fi
-            local -a identity=()
-            mapfile -t identity <<< "$identity_text"
-            if (( ${#identity[@]} != 5 )); then
+            # Read by label: a name may legitimately be empty (a Worker without
+            # Vision), and command substitution drops trailing empty lines.
+            local ip="" node_port="" worker_domain="" reality_domain="" vision_domain=""
+            while IFS='=' read -r key value; do
+                case "$key" in
+                    address) ip="$value" ;;
+                    port) node_port="$value" ;;
+                    worker_domain) worker_domain="$value" ;;
+                    reality_domain) reality_domain="$value" ;;
+                    vision_domain) vision_domain="$value" ;;
+                esac
+            done <<< "$identity_text"
+            if [[ -z "$ip" || -z "$node_port" || -z "$worker_domain" || -z "$reality_domain" ]]; then
                 echo "Error: state.json node '$name' did not yield its identity." >&2
                 return 1
             fi
-            local ip="${identity[0]}"
-            local node_port="${identity[1]}"
-            local worker_domain="${identity[2]}"
-            local reality_domain="${identity[3]}"
-            local vision_domain="${identity[4]}"
             if [[ ! "$node_port" =~ ^[0-9]+$ ]] || (( node_port < 1 || node_port > 65535 )); then
                 echo "Error: state.json node '$name' carries an invalid port: $node_port" >&2
                 return 1
