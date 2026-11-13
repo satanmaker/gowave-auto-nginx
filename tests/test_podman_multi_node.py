@@ -10,6 +10,7 @@ defect into a harness failure — or worse, a wrong node into a passing case.
 """
 import base64
 import contextlib
+import hashlib
 import io
 import json
 import subprocess
@@ -1682,6 +1683,303 @@ class TestCoverDeriveCase(unittest.TestCase):
         self.assertEqual(suite[multi_node.COVER_DERIVE_CASE_ID].timeout_seconds,
                          multi_node.COVER_DERIVE_TIMEOUT_SECONDS)
         self.assertEqual(suite[multi_node.COVER_DERIVE_CASE_ID].topology, "multi-node")
+
+
+# The assets the template's pages point at, so the site case must fetch each one
+# and get it back with the type NGINX's own mime table assigns.
+_COVER_SITE_ASSETS = (
+    "/favicon.svg",
+    "/static/ico/evergreen.ico",
+    "/static/art/hero-1.svg",
+    "/static/demo.js",
+    "/static/site.css",
+)
+
+
+class _CoverSiteHost:
+    """The Control Machine's answer: one rendered tree, served by path."""
+
+    target_name = "aio-master"
+
+    def __init__(self, files, overrides=None, types=None, unreachable=None):
+        self.files = files
+        self.overrides = overrides or {}
+        self.types = types if types is not None else dict(multi_node.COVER_SITE_ASSET_TYPES)
+        self.unreachable = unreachable or {}
+        self.requests = []
+        self.timeouts = []
+
+    def client_http(self, url, timeout=30, **kwargs):
+        self.requests.append(url)
+        self.timeouts.append(timeout)
+        rest = url.split("://", 1)[1]
+        path = rest[rest.index("/"):] if "/" in rest else "/"
+        if path in self.unreachable:
+            return {"url": url, "returncode": 1, "stdout": "",
+                    "stderr": self.unreachable[path]}
+        document = multi_node.cover_site_path(path)
+        payload = self.overrides.get(path, self.files.get(document))
+        if payload is None:
+            probe = {"url": url, "method": "GET", "status": 404, "headers": {},
+                     "body_length": 0, "body_sha256": "", "body_snippet": ""}
+            return {"url": url, "returncode": 0, "stdout": json.dumps(probe),
+                    "stderr": "", "probe": probe}
+        leaf = document.rsplit("/", 1)[-1]
+        suffix = f".{leaf.rsplit('.', 1)[-1].lower()}" if "." in leaf else ""
+        content_type = self.types.get(suffix, "text/html")
+        probe = {
+            "url": url,
+            "method": "GET",
+            "status": 200,
+            "headers": {"content-type": content_type},
+            "body_length": len(payload),
+            "body_sha256": hashlib.sha256(payload).hexdigest(),
+            "body_snippet": payload[:300].decode("utf-8", "replace"),
+            "peer": {},
+        }
+        return {"url": url, "returncode": 0, "stdout": json.dumps(probe),
+                "stderr": "", "probe": probe}
+
+
+class _CoverSitePodman:
+    """The Master's role: answer with the script's own output, nothing else."""
+
+    def __init__(self, output, returncode=0, stderr=""):
+        self.output = output
+        self.returncode = returncode
+        self.stderr = stderr
+        self.scripts = []
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        self.scripts.append({"container": container, "script": script, "timeout": timeout})
+        return subprocess.CompletedProcess(
+            ["bash", "-lc"], self.returncode,
+            self.output if not self.returncode else "", self.stderr,
+        )
+
+
+class _CoverSiteProduct:
+    def __init__(self, podman, host):
+        self.podman = podman
+        self.host = host
+
+    def require_worker(self):
+        return self.host
+
+
+class TestCoverSiteCase(unittest.TestCase):
+    """NGX-COVER-SITE: the apex serves one complete, plausibly branded site.
+
+    The rendered tree is produced by the *shipped* render function into a
+    temporary root, so the assertions run against the template and the brand
+    rule as they are deployed rather than against a fixture that repeats them.
+    """
+
+    apex = topology.COVER_APEX
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "cover-reality"
+        self.render()
+
+    def render(self, brand=""):
+        """Render the shipped template into this test's own root."""
+        prefix = f"GOWAVE_COVER_BRAND={brand} " if brand else ""
+        script = (
+            "set -eu\n"
+            f"source \"{REPO_ROOT}/modules/nginx.sh\"\n"
+            f"{prefix}render_cover_site \"{self.root}\" \"{self.apex}\"\n"
+        )
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def tree(self):
+        return {
+            str(path.relative_to(self.root)): path.read_bytes()
+            for path in sorted(self.root.rglob("*")) if path.is_file()
+        }
+
+    def output(self):
+        """What the Master's own script prints for this tree."""
+        script = multi_node.cover_site_script(self.apex)
+        script = script.replace(multi_node.COVER_SITE_ROOT, str(self.root))
+        script = script.replace(topology.REPO_IN_CONTAINER, str(REPO_ROOT))
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def run_case(self, host=None, output=None, podman=None):
+        files = self.tree()
+        host = host if host is not None else _CoverSiteHost(files)
+        podman = podman if podman is not None else _CoverSitePodman(
+            self.output() if output is None else output)
+        return multi_node.case_cover_site(_CoverSiteProduct(podman, host)), host
+
+    def test_the_shipped_site_passes_every_assertion(self):
+        evidence, host = self.run_case()
+        self.assertEqual(evidence["apex"], self.apex)
+        self.assertEqual(evidence["brand"], "Testbed")
+        self.assertEqual(sorted(evidence["documents"]), sorted(multi_node.COVER_SITE_DOCUMENTS))
+        self.assertEqual(evidence["placeholders"], [])
+        self.assertEqual(evidence["leaks"], {})
+        self.assertGreaterEqual(evidence["files"], len(multi_node.COVER_SITE_DOCUMENTS))
+        for path in multi_node.COVER_SITE_PAGES:
+            self.assertEqual(evidence["pages"][path]["status"], 200)
+            self.assertEqual(evidence["pages"][path]["content_type"], "text/html")
+        self.assertTrue(host.requests)
+        for url in host.requests:
+            self.assertTrue(url.startswith(f"https://{self.apex}/"), url)
+
+    def test_every_asset_the_pages_reference_is_fetched_with_its_type(self):
+        evidence, _ = self.run_case()
+        self.assertEqual(sorted(evidence["assets"]), sorted(_COVER_SITE_ASSETS))
+        self.assertEqual(evidence["assets"]["/static/site.css"]["content_type"], "text/css")
+        self.assertEqual(evidence["assets"]["/static/art/hero-1.svg"]["content_type"],
+                         "image/svg+xml")
+        self.assertEqual(evidence["assets"]["/static/demo.js"]["content_type"],
+                         "application/javascript")
+        self.assertEqual(evidence["assets"]["/static/ico/evergreen.ico"]["content_type"],
+                         "image/x-icon")
+        self.assertEqual(evidence["assets"]["/favicon.svg"]["content_type"],
+                         "image/svg+xml")
+
+    def test_each_fetch_is_bounded_by_its_own_timeout(self):
+        _, host = self.run_case()
+        self.assertEqual(set(host.timeouts), {multi_node.COVER_SITE_PROBE_TIMEOUT_SECONDS})
+        self.assertLess(multi_node.COVER_SITE_PROBE_TIMEOUT_SECONDS,
+                        multi_node.COVER_SITE_TIMEOUT_SECONDS)
+
+    def test_the_script_reads_the_root_the_product_renders(self):
+        script = multi_node.cover_site_script(self.apex)
+        self.assertIn(f"root={multi_node.COVER_SITE_ROOT}", script)
+        self.assertIn(f"source {topology.REPO_IN_CONTAINER}/modules/nginx.sh", script)
+        self.assertIn("cover_brand_from_domain", script)
+        shipped = subprocess.run(
+            ["bash", "-c",
+             f"source \"{REPO_ROOT}/modules/nginx.sh\"; printf '%s' \"$COVER_REALITY_ROOT\""],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(shipped.returncode, 0, shipped.stderr)
+        self.assertEqual(shipped.stdout, multi_node.COVER_SITE_ROOT)
+
+    def test_the_brand_mirror_matches_the_shipped_function(self):
+        apexes = ("testbed.internal", "vision.testbed.internal",
+                  "my-cool.brand.example", "example.com")
+        script = (
+            "set -eu\n"
+            f"source \"{REPO_ROOT}/modules/nginx.sh\"\n"
+            + "".join(f"cover_brand_from_domain {apex}\n" for apex in apexes)
+        )
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        shipped = result.stdout.splitlines()
+        self.assertEqual(shipped, [multi_node.cover_brand_from_apex(apex) for apex in apexes])
+        # The second-to-last label is the brand, not the whole apex.
+        self.assertEqual(multi_node.cover_brand_from_apex("testbed.internal"), "Testbed")
+        self.assertEqual(multi_node.cover_brand_from_apex("my-cool.brand.example"),
+                         "Brand")
+
+    def test_a_site_branded_for_another_name_is_rejected(self):
+        # GOWAVE_COVER_BRAND lets an operator override the brand, and the site
+        # then no longer says the name the apex derives; the pages show it.
+        self.render(brand="Copperline")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case()
+        self.assertIn("not titled with the brand 'Testbed'", str(caught.exception))
+        self.assertIn("Copperline", str(caught.exception))
+
+    def test_a_derivation_that_disagrees_with_the_apex_is_rejected(self):
+        output = self.output().replace(
+            f"brand\t{self.apex}\tTestbed", f"brand\t{self.apex}\tTestbed Internal")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(output=output)
+        self.assertIn("second-to-last label", str(caught.exception))
+
+    def test_a_surviving_placeholder_is_rejected(self):
+        page = self.root / "product" / "index.html"
+        page.write_text(page.read_text(encoding="utf-8") + "{{BRAND}}\n", encoding="utf-8")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case()
+        self.assertIn("template placeholder", str(caught.exception))
+        self.assertIn("product/index.html", str(caught.exception))
+
+    def test_a_page_that_names_the_management_surface_is_rejected(self):
+        page = self.root / "index.html"
+        page.write_text(
+            page.read_text(encoding="utf-8").replace(
+                "</body>", "<p>status at 127.0.0.1:9443/server-status</p></body>"),
+            encoding="utf-8",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case()
+        self.assertIn("management surface", str(caught.exception))
+        self.assertIn("index.html", str(caught.exception))
+
+    def test_a_front_page_without_the_brand_in_its_title_is_rejected(self):
+        page = self.root / "index.html"
+        text = page.read_text(encoding="utf-8")
+        start, end = text.index("<title>"), text.index("</title>") + len("</title>")
+        page.write_text(text[:start] + "<title>Welcome</title>" + text[end:],
+                        encoding="utf-8")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case()
+        self.assertIn("is not titled with the brand", str(caught.exception))
+
+    def test_a_missing_document_is_rejected(self):
+        (self.root / "guides" / "index.html").unlink()
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case()
+        self.assertIn("missing ['guides/index.html']", str(caught.exception))
+
+    def test_a_served_page_that_differs_from_the_rendered_file_is_rejected(self):
+        host = _CoverSiteHost(self.tree(), overrides={"/demo/": b"<html>elsewhere</html>"})
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("not serving the site the product rendered", str(caught.exception))
+
+    def test_an_asset_served_with_the_wrong_type_is_rejected(self):
+        types = dict(multi_node.COVER_SITE_ASSET_TYPES, **{".css": "text/plain"})
+        host = _CoverSiteHost(self.tree(), types=types)
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("'text/plain' instead of 'text/css'", str(caught.exception))
+
+    def test_an_asset_the_listener_does_not_serve_is_rejected(self):
+        files = self.tree()
+        del files["static/ico/evergreen.ico"]
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=_CoverSiteHost(files))
+        self.assertIn("answered 404 instead of serving static/ico/evergreen.ico",
+                      str(caught.exception))
+
+    def test_a_client_that_returns_no_report_is_rejected(self):
+        host = _CoverSiteHost(self.tree(), unreachable={"/": "Connection refused"})
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("produced no report", str(caught.exception))
+        self.assertIn("Connection refused", str(caught.exception))
+
+    def test_a_master_that_cannot_read_its_tree_is_rejected(self):
+        podman = _CoverSitePodman("", returncode=1, stderr="cd: no such file")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=podman)
+        self.assertIn("could not read its rendered cover site", str(caught.exception))
+
+    def test_the_case_runs_between_the_derive_case_and_the_refusal_case(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        suite = multi_node.cases(_StubPodman(Path(tmp.name)))
+        ids = [case.id for case in suite]
+        self.assertEqual(ids.count(multi_node.COVER_SITE_CASE_ID), 1)
+        self.assertLess(ids.index(multi_node.COVER_DERIVE_CASE_ID),
+                        ids.index(multi_node.COVER_SITE_CASE_ID))
+        self.assertLess(ids.index(multi_node.COVER_SITE_CASE_ID),
+                        ids.index(multi_node.COVER_UNRESOLVED_CASE_ID))
+        case = {case.id: case for case in suite}[multi_node.COVER_SITE_CASE_ID]
+        self.assertEqual(case.timeout_seconds, multi_node.COVER_SITE_TIMEOUT_SECONDS)
+        self.assertEqual(case.topology, "multi-node")
 
 
 _COVER_OTHER_IP = "10.89.0.2"

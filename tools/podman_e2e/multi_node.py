@@ -14,6 +14,7 @@ operator ships.
 """
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
 import os
@@ -124,6 +125,35 @@ COVER_FLUSH_SCRIPT = (
 COVER_PROBE_SETTLE_ATTEMPTS = 50
 COVER_PROBE_SETTLE_SECONDS = "0.2"
 COVER_SITE_INDEX = "/var/www/gowave-auto-nginx/cover-reality/index.html"
+# The site the apex serves is measured as one tree: these are the documents the
+# template ships, and the paths NGINX resolves each one from.
+COVER_SITE_CASE_ID = "NGX-COVER-SITE"
+# The site case reads one rendered tree and fetches each page and asset once, so
+# its budget covers those fetches; a single fetch is only bounded against a hang.
+COVER_SITE_TIMEOUT_SECONDS = 300
+COVER_SITE_PROBE_TIMEOUT_SECONDS = 30
+COVER_SITE_ROOT = "/var/www/gowave-auto-nginx/cover-reality"
+COVER_SITE_DOCUMENTS: Sequence[str] = (
+    "index.html", "404.html", "product/index.html", "demo/index.html",
+    "guides/index.html", "principles/index.html",
+)
+COVER_SITE_PAGES: Sequence[str] = (
+    "/", "/index.html", "/product/", "/demo/", "/guides/", "/principles/", "/404.html",
+)
+# What NGINX's own mime table answers for each asset kind the template ships.
+COVER_SITE_ASSET_TYPES: Dict[str, str] = {
+    ".html": "text/html",
+    ".css": "text/css",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".js": "application/javascript",
+}
+# A camouflage page may say the word "API" in prose, but it must never carry the
+# panel's routes or the management addresses a scanner tries next.
+COVER_SITE_LEAKS: Sequence[str] = (
+    "/api", "127.0.0.1", "9443", "9444", "panel", "gowave", "xhttp", "trojan",
+    "server-status", "/metrics",
+)
 COVER_VHOST_DIRS: Sequence[str] = ("/etc/nginx/sites-enabled", "/etc/nginx/conf.d")
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
@@ -4066,6 +4096,262 @@ def case_cover_derive(product: MultiNodeProduct) -> Dict[str, Any]:
     return evidence
 
 
+def cover_site_script(apex: str) -> str:
+    """The Master's own rendering: the brand it derives and every file it ships.
+
+    The public listener is measured separately, from the Control Machine; this
+    reads the deployable tree that listener is configured with, so a page served
+    from anywhere else cannot be mistaken for the site the product rendered.
+    """
+    documents = " ".join(shlex.quote(name) for name in COVER_SITE_DOCUMENTS)
+    return f"""set -u
+{cover_decision_loader("master")}
+root={shlex.quote(COVER_SITE_ROOT)}
+printf 'brand\\t%s\\t%s\\n' {shlex.quote(apex)} "$(cover_brand_from_domain {shlex.quote(apex)})"
+cd "$root" || exit 1
+find . -type f | LC_ALL=C sort | while IFS= read -r file; do
+    printf 'file\\t%s\\t%s\\t%s\\n' "${{file#./}}" "$(sha256sum "$file" | cut -d' ' -f1)" "$(stat -c '%s' "$file")"
+done
+for doc in {documents}; do
+    [ -f "$doc" ] || continue
+    printf 'body\\t%s\\t%s\\n' "$doc" "$(base64 -w0 "$doc")"
+done
+"""
+
+
+def parse_cover_site(output: str) -> Dict[str, Any]:
+    """The rendered tree one line at a time: brand, files, and document text."""
+    facts: Dict[str, Any] = {"brand": "", "files": {}, "bodies": {}}
+    for line in output.splitlines():
+        fields = line.split("\t")
+        kind = fields[0] if fields else ""
+        if kind == "brand" and len(fields) == 3:
+            facts["brand"] = fields[2]
+        elif kind == "file" and len(fields) == 4:
+            facts["files"][fields[1]] = {"sha256": fields[2], "size": int(fields[3] or 0)}
+        elif kind == "body" and len(fields) == 3:
+            facts["bodies"][fields[1]] = base64.b64decode(fields[2]).decode("utf-8", "replace")
+    return facts
+
+
+def cover_brand_from_apex(apex: str) -> str:
+    """The brand the site must carry: the apex's second-to-last label, title-cased.
+
+    Read from the apex rather than from the deployment domain, because the apex
+    is the name a visitor sees; a label with hyphens becomes separate words.
+    """
+    labels = [label for label in apex.rstrip(".").split(".") if label]
+    if not labels:
+        return ""
+    label = labels[-2] if len(labels) >= 3 else labels[0]
+    return " ".join(
+        word[:1].upper() + word[1:] for word in label.replace("-", " ").split()
+    )
+
+
+def cover_site_path(path: str) -> str:
+    """The file NGINX serves for one path under the cover root."""
+    rel = path.lstrip("/").split("#", 1)[0].split("?", 1)[0]
+    if rel == "" or path.endswith("/"):
+        return f"{rel}index.html"
+    if "." not in rel.rsplit("/", 1)[-1]:
+        return f"{rel}/index.html"
+    return rel
+
+
+def cover_site_links(text: str) -> List[str]:
+    """Every same-site path one HTML document points at, in first-seen order."""
+    links: List[str] = []
+    for match in re.finditer(r'(?:href|src)="([^"]+)"', text):
+        target = match.group(1).split("#", 1)[0].split("?", 1)[0]
+        if not target.startswith("/") or target == "/" or target in links:
+            continue
+        links.append(target)
+    return links
+
+
+def cover_site_fetch(case_id: str, host: topology.MultiNodeTopology, apex: str,
+                     path: str) -> Dict[str, Any]:
+    """One fetch of the apex from the independent client, or a failure naming it."""
+    report = host.client_http(f"https://{apex}{path}", timeout=COVER_SITE_PROBE_TIMEOUT_SECONDS)
+    probe = report.get("probe") or {}
+    require(
+        case_id,
+        report.get("returncode") == 0 and probe,
+        f"GET https://{apex}{path} produced no report (exit {report.get('returncode')}): "
+        f"{report.get('stderr') or probe.get('error') or 'the probe printed nothing'}",
+    )
+    return probe
+
+
+def require_cover_site_served(case_id: str, host: topology.MultiNodeTopology, apex: str,
+                              path: str, document: str, files: Dict[str, Any],
+                              expect_type: str = "") -> Dict[str, Any]:
+    """One path serves exactly the file the Master rendered, with its own type."""
+    require(
+        case_id,
+        document in files,
+        f"{path} resolves to {document}, which the rendered site does not ship: "
+        f"{sorted(files)}",
+    )
+    probe = cover_site_fetch(case_id, host, apex, path)
+    require(
+        case_id,
+        probe.get("status") == 200,
+        f"GET {path} on {apex} answered {probe.get('status')} instead of serving {document}",
+    )
+    require(
+        case_id,
+        probe.get("body_sha256") == files[document]["sha256"],
+        f"GET {path} served a document the Master's {COVER_SITE_ROOT}/{document} does not "
+        f"hold ({probe.get('body_sha256')} vs {files[document]['sha256']}), so the public "
+        "listener is not serving the site the product rendered",
+    )
+    content_type = (probe.get("headers") or {}).get("content-type", "")
+    if expect_type:
+        require(
+            case_id,
+            content_type.startswith(expect_type),
+            f"GET {path} was served as {content_type!r} instead of {expect_type!r}, so it "
+            "would not be loaded as the page asks for it",
+        )
+    return {
+        "path": path,
+        "document": document,
+        "status": probe.get("status"),
+        "content_type": content_type,
+        "body_sha256": probe.get("body_sha256"),
+    }
+
+
+def case_cover_site(product: MultiNodeProduct) -> Dict[str, Any]:
+    """NGX-COVER-SITE: the apex serves one complete, plausibly branded site.
+
+    A REALITY deployment is looked at before it is talked to, so the page the
+    fallback hands out is part of the product surface: it has to be a whole site
+    — documents, stylesheet, icons and artwork — branded for the apex rather than
+    for whatever the installation happens to be called, with no unsubstituted
+    template left in it and nothing that names the panel, its routes or the
+    loopback listeners.
+
+    Two halves make that one claim. The Master's own rendered tree is read where
+    it sits, and the apex is fetched from the Control Machine over the real
+    listener; every served document must be byte for byte the file the Master
+    rendered, and every asset the pages point at must be served with the type
+    NGINX's mime table gives it. The content is then judged against the rule the
+    task states — the brand comes from the apex's second-to-last label — and
+    against the shipped derivation, so a page branded by anything else fails.
+    """
+    case_id = COVER_SITE_CASE_ID
+    host = product.require_worker()
+    apex = topology.COVER_APEX
+    rendered = product.podman.exec_bash(
+        host.target_name, cover_site_script(apex), check=False, timeout=120,
+    )
+    require(
+        case_id,
+        rendered.returncode == 0,
+        "the Master could not read its rendered cover site: "
+        f"{(rendered.stderr or '').strip()[-500:]}",
+    )
+    facts = parse_cover_site(rendered.stdout or "")
+    files, bodies = facts["files"], facts["bodies"]
+
+    brand = cover_brand_from_apex(apex)
+    require(
+        case_id,
+        facts["brand"] == brand,
+        f"the Master's own derivation for {apex} is {facts['brand']!r} instead of {brand!r}, "
+        "so the site is branded from something other than the apex's second-to-last label",
+    )
+    for suffix in (".html", ".css", ".svg"):
+        require(
+            case_id,
+            any(name.endswith(suffix) for name in files),
+            f"the rendered site ships no {suffix} asset: {sorted(files)}",
+        )
+    absent = [name for name in COVER_SITE_DOCUMENTS if name not in bodies]
+    require(
+        case_id,
+        not absent,
+        f"the rendered site is missing {absent} of the template's documents: {sorted(files)}",
+    )
+
+    placeholders = sorted(name for name, text in bodies.items() if "{{" in text)
+    require(
+        case_id,
+        not placeholders,
+        f"these rendered documents still carry a template placeholder: {placeholders}",
+    )
+    leaks = {
+        name: sorted(token for token in COVER_SITE_LEAKS if token in text.lower())
+        for name, text in bodies.items()
+    }
+    leaks = {name: tokens for name, tokens in leaks.items() if tokens}
+    require(
+        case_id,
+        not leaks,
+        f"the cover site names the deployment's own management surface: {leaks}",
+    )
+
+    index = bodies["index.html"]
+    require(
+        case_id,
+        f"| {brand}</title>" in index,
+        f"the front page is not titled with the brand {brand!r}: "
+        f"{index[index.find('<title>'):index.find('</title>') + 8]}",
+    )
+    require(
+        case_id,
+        index.count(brand) >= 2,
+        f"the brand {brand!r} appears {index.count(brand)} time(s) on the front page, so "
+        "the header or footer was not branded",
+    )
+
+    served: Dict[str, Any] = {}
+    for path in COVER_SITE_PAGES:
+        served[path] = require_cover_site_served(
+            case_id, host, apex, path, cover_site_path(path), files,
+            expect_type="text/html",
+        )
+
+    assets: Dict[str, Any] = {}
+    links: List[str] = []
+    for text in bodies.values():
+        links.extend(link for link in cover_site_links(text) if link not in links)
+    for link in links:
+        document = cover_site_path(link)
+        if document in bodies:
+            # A page the site ships was already measured with the pages above.
+            continue
+        assets[link] = require_cover_site_served(
+            case_id, host, apex, link, document, files,
+            expect_type=COVER_SITE_ASSET_TYPES.get(
+                os.path.splitext(document)[1].lower(), "",
+            ),
+        )
+    require(
+        case_id,
+        any(asset.get("content_type", "").startswith("text/css") for asset in assets.values()),
+        f"the site's stylesheet is not served as CSS: {sorted(assets)}",
+    )
+    require(
+        case_id,
+        any(asset.get("content_type", "").startswith("image/svg") for asset in assets.values()),
+        f"the site's artwork is not served as SVG: {sorted(assets)}",
+    )
+    return {
+        "apex": apex,
+        "brand": brand,
+        "files": len(files),
+        "documents": sorted(bodies),
+        "pages": served,
+        "assets": assets,
+        "placeholders": placeholders,
+        "leaks": leaks,
+    }
+
+
 def cover_probe_matrix(server_ip: str, other_ip: str) -> Sequence[Dict[str, Any]]:
     """Every way the installed apex pair can fail to resolve to one role.
 
@@ -4950,6 +5236,12 @@ def cases(
         Case(COVER_DERIVE_CASE_ID, "multi-node",
              lambda context: case_cover_derive(product),
              timeout_seconds=COVER_DERIVE_TIMEOUT_SECONDS),
+        # The site the apex serves is read in the same healthy window: it is the
+        # page the fallback hands out, so it is measured before any case can
+        # change the tree or the listener it is served from.
+        Case(COVER_SITE_CASE_ID, "multi-node",
+             lambda context: case_cover_site(product),
+             timeout_seconds=COVER_SITE_TIMEOUT_SECONDS),
         # The refusal case steers the fixture zone and puts it back before it
         # returns, so it runs beside the other reads of a healthy cluster.
         Case(COVER_UNRESOLVED_CASE_ID, "multi-node",

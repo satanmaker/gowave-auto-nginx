@@ -275,6 +275,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "NGINX SNI Routing and REALITY Decoy Verification",
     },
     {
+        "id": "NGX-COVER-SITE",
+        "requirement": "Camouflage decoy and certificate lineage",
+        "assertion": "The rendered cover site is a complete branded site: every template document is present, the brand is derived from the apex's second-to-last label and appears in the front page's title, header and footer, no document keeps a template placeholder, no document names the panel, its API routes or the loopback decoy listeners, and an independent client fetching every page and every asset the pages reference from the apex receives byte-identical copies of the files the host rendered with the MIME type NGINX assigns each asset kind.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "NGINX SNI Routing and REALITY Decoy Verification",
+    },
+    {
         "id": "NGX-COVER-UNRESOLVED",
         "requirement": "Camouflage decoy and certificate lineage",
         "assertion": "When the apex or www.<apex> does not resolve to the host IPv4, the operator refuses before issuing the lineage and leaves no partial decoy or stale sites-enabled entry.",
