@@ -866,6 +866,20 @@ class TestChannelCases(unittest.TestCase):
             aio.case_channel_rollback(product)
         self.assertIn("the injected start hook never ran", str(caught.exception))
 
+    def test_the_start_hook_does_not_read_its_own_text_from_stdin(self):
+        # systemd starts the injected hook with /dev/null on standard input, so a
+        # `python3 -` heredoc inside the hook would run an empty program, damage
+        # nothing, and still fail the start — the sabotage has to be a file.
+        script = aio.channel_rollback_script()
+        self.assertIn(f"cat > {aio.CHANNEL_SABOTAGE_EXEC} <<'PY'", script)
+        hook = script.split(f"cat > {aio.CHANNEL_ONCE_FAIL_EXEC} <<'ONCE'", 1)[1]
+        hook = hook.split("\nONCE\n", 1)[0]
+        self.assertNotIn("<<'PY'", hook)
+        self.assertNotIn("python3 -", hook)
+        self.assertIn(f"python3 {aio.CHANNEL_SABOTAGE_EXEC}", hook)
+        self.assertLess(hook.index("python3 "), hook.index("exit 1"))
+        self.assertIn(aio.CHANNEL_SABOTAGE_EXEC, aio.channel_rollback_cleanup_script())
+
     def test_the_rollback_case_fails_when_an_area_the_hook_hit_stayed_damaged(self):
         before = self.state()
         sabotage = {
