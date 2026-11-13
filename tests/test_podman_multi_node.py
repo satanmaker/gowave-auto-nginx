@@ -1982,6 +1982,408 @@ class TestCoverSiteCase(unittest.TestCase):
         self.assertEqual(case.topology, "multi-node")
 
 
+_DECOY_ROUTE_INDEX = b"<html><title>A home for considered work | Testbed</title></html>"
+_DECOY_ROUTE_INDEX_SHA = hashlib.sha256(_DECOY_ROUTE_INDEX).hexdigest()
+_DECOY_ROUTE_MASTER_MAP = (
+    "map $ssl_preread_server_name $sni_backend {",
+    "    panel.testbed.internal 127.0.0.1:7443;",
+    "    reality.testbed.internal 127.0.0.1:8443;",
+    "    vision.testbed.internal 127.0.0.1:8444;",
+    "    testbed.internal 127.0.0.1:9443;",
+    "    www.testbed.internal 127.0.0.1:9443;",
+    "    default 127.0.0.1:8443;",
+    "}",
+)
+_DECOY_ROUTE_WORKER_MAP = (
+    "map $ssl_preread_server_name $worker_dest {",
+    "    worker.testbed.internal 127.0.0.1:7443;",
+    "    worker-reality.testbed.internal 127.0.0.1:8443;",
+    "    default 127.0.0.1:8443;",
+    "}",
+)
+_DECOY_ROUTE_MASTER_LINEAGES = {
+    "/etc/letsencrypt/live/reality.testbed.internal/cert.pem": [
+        "reality.testbed.internal", "testbed.internal", "www.testbed.internal",
+    ],
+}
+_DECOY_ROUTE_WORKER_LINEAGES = {
+    "/etc/letsencrypt/live/worker-reality.testbed.internal/cert.pem": [
+        "worker.testbed.internal", "worker-reality.testbed.internal",
+    ],
+}
+_DECOY_ROUTE_WORKER_REFUSAL = (
+    "Camouflage apex disabled — testbed.internal / www.testbed.internal do not resolve "
+    "to 10.89.0.11, so HTTP-01 would fail."
+)
+
+
+def _decoy_route_output(map_lines=None, listens=None, bound=None, lineages=None):
+    """One role's route script output, in the shape the parser reads."""
+    map_lines = _DECOY_ROUTE_MASTER_MAP if map_lines is None else map_lines
+    listens = ["7:    listen 127.0.0.1:9443 ssl proxy_protocol;"] if listens is None else listens
+    bound = bound if bound is not None else {"443": ["0.0.0.0", "[::]"], "9443": ["127.0.0.1"]}
+    lineages = _DECOY_ROUTE_MASTER_LINEAGES if lineages is None else lineages
+    lines = [f"mapraw\t{line}" for line in map_lines]
+    lines += [f"decoy\t{line}" for line in listens]
+    for port, addresses in bound.items():
+        lines += [f"bound\t{port}\t{address}:{port}" for address in addresses]
+    for path, sans in lineages.items():
+        lines.append(f"lineage\t{path}\tDNS:{', DNS:'.join(sans)}, ")
+    return "\n".join(lines) + "\n"
+
+
+def _decoy_decision_output(domain, apex, reason=""):
+    return f"decision\t{domain}\t{apex}\t{reason}\n"
+
+
+class _DecoyRoutePodman:
+    """Both roles' own scripts, plus the client's TCP attempts."""
+
+    ROLES = {"aio-master": "master", "worker-01": "worker"}
+    CLIENT = {"client-01": "client", "untrusted-01": "untrusted"}
+
+    def __init__(self, routes=None, decisions=None, site_output=None, outcomes=None,
+                 scripts=None):
+        self.routes = routes if routes is not None else {
+            "master": _decoy_route_output(),
+            "worker": _decoy_route_output(
+                _DECOY_ROUTE_WORKER_MAP, lineages=_DECOY_ROUTE_WORKER_LINEAGES,
+            ),
+        }
+        self.decisions = decisions if decisions is not None else {
+            "master": _decoy_decision_output("panel.testbed.internal", "testbed.internal"),
+            "worker": _decoy_decision_output(
+                "worker.testbed.internal", "", _DECOY_ROUTE_WORKER_REFUSAL),
+        }
+        self.site_output = site_output if site_output is not None else (
+            f"file\tindex.html\t{_DECOY_ROUTE_INDEX_SHA}\t{len(_DECOY_ROUTE_INDEX)}\n"
+        )
+        self.outcomes = outcomes or {}
+        self.scripts = {} if scripts is None else scripts
+        self.attempts = []
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        role = self.ROLES[container]
+        if "ssl_preread" in script:
+            self.scripts.setdefault(role, {})["route"] = script
+            return subprocess.CompletedProcess(["bash", "-lc"], 0, self.routes[role], "")
+        if "cover_domain_for" in script:
+            self.scripts.setdefault(role, {})["decision"] = script
+            return subprocess.CompletedProcess(["bash", "-lc"], 0, self.decisions[role], "")
+        self.scripts.setdefault(role, {})["site"] = script
+        return subprocess.CompletedProcess(["bash", "-lc"], 0, self.site_output, "")
+
+    def exec(self, container, argv, check=True, input_text=None, timeout=120):
+        attempts = json.loads(argv[-1])
+        self.attempts.append((self.CLIENT[container], attempts))
+        entries = []
+        for attempt in attempts:
+            outcome = self.outcomes.get(
+                attempt["label"],
+                "CONNECTED" if attempt["port"] == 443 else "REFUSED",
+            )
+            entries.append({
+                "label": attempt["label"],
+                "address": attempt["address"],
+                "port": attempt["port"],
+                "outcome": outcome,
+                "elapsed_ms": 1,
+                "detail": "",
+            })
+        return subprocess.CompletedProcess(argv, 0, json.dumps(entries), "")
+
+
+class _DecoyRouteHost:
+    """The client role and the two hosts' addresses, as the case reads them."""
+
+    target_name = "aio-master"
+    worker_name = "worker-01"
+    worker_domain = "worker.testbed.internal"
+    worker_reality_domain = "worker-reality.testbed.internal"
+    worker_vision_domain = ""
+    client_name = "client-01"
+    untrusted_name = "untrusted-01"
+
+    def __init__(self, pages=None, status=None, sans=None):
+        self.pages = pages if pages is not None else {
+            "testbed.internal": _DECOY_ROUTE_INDEX,
+            "www.testbed.internal": _DECOY_ROUTE_INDEX,
+            "reality.testbed.internal": _DECOY_ROUTE_INDEX,
+            "panel.testbed.internal": b"<html>panel login</html>",
+        }
+        self.status = status or {}
+        self.sans = sans if sans is not None else list(
+            _DECOY_ROUTE_MASTER_LINEAGES[
+                "/etc/letsencrypt/live/reality.testbed.internal/cert.pem"])
+        self.plan = type("Plan", (), {"target_ip": "10.89.0.10", "worker_ip": "10.89.0.11"})()
+
+    def client_http(self, url, timeout=30, **kwargs):
+        name = url.split("://", 1)[1].split("/", 1)[0]
+        payload = self.pages.get(name, b"")
+        probe = {
+            "url": url,
+            "method": "GET",
+            "status": self.status.get(name, 200),
+            "headers": {"content-type": "text/html"},
+            "body_length": len(payload),
+            "body_sha256": hashlib.sha256(payload).hexdigest(),
+            "body_snippet": payload[:300].decode("utf-8", "replace"),
+            "peer": {"san": list(self.sans), "tls_version": "TLSv1.3"},
+        }
+        return {"url": url, "returncode": 0, "stdout": json.dumps(probe),
+                "stderr": "", "probe": probe}
+
+
+class _DecoyRouteProduct:
+    def __init__(self, podman, host):
+        self.podman = podman
+        self.host = host
+
+    def require_worker(self):
+        return self.host
+
+
+class TestDecoyRouteCase(unittest.TestCase):
+    """NGX-DECOY-ROUTE: the decoy is a loopback target, never a network surface."""
+
+    def run_case(self, podman=None, host=None):
+        podman = podman if podman is not None else _DecoyRoutePodman()
+        host = host if host is not None else _DecoyRouteHost()
+        return multi_node.case_decoy_route(_DecoyRouteProduct(podman, host))
+
+    def test_both_roles_keep_the_decoy_on_the_loopback_and_route_every_name(self):
+        evidence = self.run_case()
+        self.assertEqual(evidence["apex"], "testbed.internal")
+        master = evidence["roles"]["master"]
+        self.assertEqual(master["cover_names"],
+                         ["testbed.internal", "www.testbed.internal"])
+        self.assertEqual(master["routes"]["testbed.internal"], "127.0.0.1:9443")
+        self.assertEqual(master["routes"]["www.testbed.internal"], "127.0.0.1:9443")
+        self.assertEqual(master["routes"]["default"], "127.0.0.1:8443")
+        self.assertEqual(master["bindings"]["bound_9443"], ["127.0.0.1"])
+        self.assertTrue(master["lineage"])
+        worker = evidence["roles"]["worker"]
+        self.assertEqual(worker["cover_names"], [])
+        self.assertNotIn("127.0.0.1:9443", worker["routes"].values())
+        self.assertEqual(worker["lineage"][
+            "/etc/letsencrypt/live/worker-reality.testbed.internal/cert.pem"],
+            ["worker.testbed.internal", "worker-reality.testbed.internal"])
+
+    def test_the_client_sees_the_rendered_page_on_all_three_names(self):
+        evidence = self.run_case()
+        for key in ("apex", "www", "reality"):
+            with self.subTest(name=key):
+                self.assertEqual(evidence["client"][key]["status"], 200)
+                self.assertEqual(evidence["client"][key]["body_sha256"], _DECOY_ROUTE_INDEX_SHA)
+                self.assertIn("testbed.internal", evidence["client"][key]["san"])
+                self.assertIn("www.testbed.internal", evidence["client"][key]["san"])
+        self.assertNotEqual(evidence["client"]["panel"]["body_sha256"], _DECOY_ROUTE_INDEX_SHA)
+
+    def test_both_client_networks_reach_443_and_neither_reaches_the_decoy(self):
+        podman = _DecoyRoutePodman()
+        evidence = self.run_case(podman=podman)
+        self.assertEqual(sorted(evidence["paths"]), ["client", "untrusted"])
+        for origin, attempts in podman.attempts:
+            with self.subTest(origin=origin):
+                self.assertEqual({attempt["port"] for attempt in attempts}, {443, 9443})
+        for entry in evidence["paths"]["client"].values():
+            if isinstance(entry, dict) and entry.get("port") == 9443:
+                self.assertEqual(entry["outcome"], "REFUSED")
+
+    def test_a_role_that_decides_an_apex_must_route_it_to_the_decoy(self):
+        routes = _decoy_route_output(tuple(
+            line for line in _DECOY_ROUTE_MASTER_MAP
+            if line.strip().split(" ", 1)[0]
+            not in ("testbed.internal", "www.testbed.internal")
+        ))
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(_DecoyRoutePodman(routes={"master": routes,
+                                                    "worker": _decoy_route_output(
+                                                        _DECOY_ROUTE_WORKER_MAP,
+                                                        lineages=_DECOY_ROUTE_WORKER_LINEAGES)}))
+        self.assertIn("instead of the loopback decoy 127.0.0.1:9443", str(caught.exception))
+
+    def test_a_role_that_decides_no_apex_owes_no_cover_route(self):
+        decisions = {
+            "master": _decoy_decision_output("panel.testbed.internal", "testbed.internal"),
+            "worker": _decoy_decision_output("worker.testbed.internal",
+                                            "testbed.internal"),
+        }
+        podman = _DecoyRoutePodman(decisions=decisions)
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman)
+        self.assertIn("routes testbed.internal to None", str(caught.exception))
+
+    def test_a_vpn_name_sent_to_the_decoy_is_rejected(self):
+        routes = _decoy_route_output(tuple(
+            "    reality.testbed.internal 127.0.0.1:9443;" if line.strip().startswith(
+                "reality.testbed.internal") else line
+            for line in _DECOY_ROUTE_MASTER_MAP
+        ))
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(_DecoyRoutePodman(routes={
+                "master": routes,
+                "worker": _decoy_route_output(_DECOY_ROUTE_WORKER_MAP,
+                                              lineages=_DECOY_ROUTE_WORKER_LINEAGES),
+            }))
+        self.assertIn("to the camouflage listener", str(caught.exception))
+
+    def test_a_default_that_is_not_the_nodes_own_reality_is_rejected(self):
+        routes = _decoy_route_output(tuple(
+            "    default 127.0.0.1:9443;" if line.strip().startswith("default") else line
+            for line in _DECOY_ROUTE_MASTER_MAP
+        ))
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(_DecoyRoutePodman(routes={
+                "master": routes,
+                "worker": _decoy_route_output(_DECOY_ROUTE_WORKER_MAP,
+                                              lineages=_DECOY_ROUTE_WORKER_LINEAGES),
+            }))
+        self.assertIn("defaults to '127.0.0.1:9443'", str(caught.exception))
+
+    def test_a_vpn_name_on_another_port_is_rejected(self):
+        routes = _decoy_route_output(tuple(
+            "    reality.testbed.internal 127.0.0.1:7443;" if line.strip().startswith(
+                "reality.testbed.internal") else line
+            for line in _DECOY_ROUTE_MASTER_MAP
+        ))
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(_DecoyRoutePodman(routes={
+                "master": routes,
+                "worker": _decoy_route_output(_DECOY_ROUTE_WORKER_MAP,
+                                              lineages=_DECOY_ROUTE_WORKER_LINEAGES),
+            }))
+        self.assertIn("does not keep its own route", str(caught.exception))
+
+    def test_a_decoy_bound_beyond_the_loopback_is_rejected(self):
+        routes = _decoy_route_output(bound={"443": ["0.0.0.0"], "9443": ["0.0.0.0"]})
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(_DecoyRoutePodman(routes={
+                "master": routes,
+                "worker": _decoy_route_output(_DECOY_ROUTE_WORKER_MAP,
+                                              lineages=_DECOY_ROUTE_WORKER_LINEAGES),
+            }))
+        self.assertIn("binds its decoy to ['0.0.0.0']", str(caught.exception))
+
+    def test_a_role_without_a_decoy_listener_is_rejected(self):
+        routes = _decoy_route_output(bound={"443": ["0.0.0.0"], "9443": []})
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(_DecoyRoutePodman(routes={
+                "master": routes,
+                "worker": _decoy_route_output(_DECOY_ROUTE_WORKER_MAP,
+                                              lineages=_DECOY_ROUTE_WORKER_LINEAGES),
+            }))
+        self.assertIn("has no 9443 listener", str(caught.exception))
+
+    def test_a_decoy_vhost_listening_in_the_clear_is_rejected(self):
+        routes = _decoy_route_output(listens=["7:    listen 9443 ssl proxy_protocol;"])
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(_DecoyRoutePodman(routes={
+                "master": routes,
+                "worker": _decoy_route_output(_DECOY_ROUTE_WORKER_MAP,
+                                              lineages=_DECOY_ROUTE_WORKER_LINEAGES),
+            }))
+        self.assertIn("listens outside the loopback listener", str(caught.exception))
+
+    def test_a_host_whose_443_is_not_public_is_rejected(self):
+        routes = _decoy_route_output(bound={"443": ["127.0.0.1"], "9443": ["127.0.0.1"]})
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(_DecoyRoutePodman(routes={
+                "master": routes,
+                "worker": _decoy_route_output(_DECOY_ROUTE_WORKER_MAP,
+                                              lineages=_DECOY_ROUTE_WORKER_LINEAGES),
+            }))
+        self.assertIn("does not accept 443 on a wildcard address", str(caught.exception))
+
+    def test_a_lineage_that_does_not_cover_the_pair_is_rejected(self):
+        routes = _decoy_route_output(lineages={
+            "/etc/letsencrypt/live/reality.testbed.internal/cert.pem": [
+                "reality.testbed.internal", "testbed.internal",
+            ],
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(_DecoyRoutePodman(routes={
+                "master": routes,
+                "worker": _decoy_route_output(_DECOY_ROUTE_WORKER_MAP,
+                                              lineages=_DECOY_ROUTE_WORKER_LINEAGES),
+            }))
+        self.assertIn("certificate lineage naming ['testbed.internal', "
+                      "'www.testbed.internal']", str(caught.exception))
+
+    def test_a_name_that_serves_another_page_is_rejected(self):
+        host = _DecoyRouteHost(pages={
+            "testbed.internal": _DECOY_ROUTE_INDEX,
+            "www.testbed.internal": b"<html>other site</html>",
+            "reality.testbed.internal": _DECOY_ROUTE_INDEX,
+            "panel.testbed.internal": b"<html>panel login</html>",
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("instead of the rendered cover page", str(caught.exception))
+        self.assertIn("www.testbed.internal", str(caught.exception))
+
+    def test_a_certificate_that_does_not_name_www_is_rejected(self):
+        host = _DecoyRouteHost(sans=["reality.testbed.internal", "testbed.internal"])
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("does not name www.testbed.internal", str(caught.exception))
+
+    def test_a_panel_name_serving_the_decoy_page_is_rejected(self):
+        host = _DecoyRouteHost(pages={
+            "testbed.internal": _DECOY_ROUTE_INDEX,
+            "www.testbed.internal": _DECOY_ROUTE_INDEX,
+            "reality.testbed.internal": _DECOY_ROUTE_INDEX,
+            "panel.testbed.internal": _DECOY_ROUTE_INDEX,
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("does not keep its own route", str(caught.exception))
+
+    def test_a_decoy_reachable_from_a_client_network_is_rejected(self):
+        podman = _DecoyRoutePodman(outcomes={"untrusted-master-9443": "CONNECTED"})
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=podman)
+        self.assertIn("reached 10.89.0.10:9443", str(caught.exception))
+        self.assertIn("exposed to a client network", str(caught.exception))
+
+    def test_a_network_that_cannot_reach_443_proves_nothing(self):
+        podman = _DecoyRoutePodman(outcomes={"client-worker-443": "TIMEOUT"})
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=podman)
+        self.assertIn("could not reach 10.89.0.11:443", str(caught.exception))
+
+    def test_the_scripts_run_the_shipped_decisions_and_read_the_running_tree(self):
+        podman = _DecoyRoutePodman()
+        self.run_case(podman=podman)
+        for role in ("master", "worker"):
+            with self.subTest(role=role):
+                route = podman.scripts[role]["route"]
+                self.assertIn("nginx -T", route)
+                self.assertIn("sport = :9443", route)
+                self.assertIn("openssl x509", route)
+                self.assertNotIn("zone", route)
+        self.assertIn("gowave-decoy.conf", podman.scripts["master"]["route"])
+        self.assertIn("gowave-worker-decoy.conf", podman.scripts["worker"]["route"])
+        self.assertIn("source", podman.scripts["master"]["decision"])
+        self.assertIn("gowave-node-auto.sh", podman.scripts["worker"]["decision"])
+        self.assertIn(f"cover_domain_for {topology.PANEL_DOMAIN} 10.89.0.10",
+                      podman.scripts["master"]["decision"])
+
+    def test_the_case_runs_after_the_cover_site_and_before_the_refusal_case(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        suite = multi_node.cases(_StubPodman(Path(tmp.name)))
+        ids = [case.id for case in suite]
+        self.assertEqual(ids.count(multi_node.DECOY_ROUTE_CASE_ID), 1)
+        self.assertLess(ids.index(multi_node.COVER_SITE_CASE_ID),
+                        ids.index(multi_node.DECOY_ROUTE_CASE_ID))
+        self.assertLess(ids.index(multi_node.DECOY_ROUTE_CASE_ID),
+                        ids.index(multi_node.COVER_UNRESOLVED_CASE_ID))
+        case = {case.id: case for case in suite}[multi_node.DECOY_ROUTE_CASE_ID]
+        self.assertEqual(case.timeout_seconds, multi_node.DECOY_ROUTE_TIMEOUT_SECONDS)
+        self.assertEqual(case.topology, "multi-node")
+
+
 _COVER_OTHER_IP = "10.89.0.2"
 _COVER_LINEAGE = "/etc/letsencrypt/live/reality.testbed.internal/cert.pem"
 

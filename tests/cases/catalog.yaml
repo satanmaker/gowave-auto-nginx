@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 73
-  total: 198
+  podman_first: 74
+  total: 199
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3592,6 +3592,27 @@ cases:
   environment: container
   topology:
   - aio
+  - multi-node
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: NGINX SNI Routing and REALITY Decoy Verification
+- id: NGX-DECOY-ROUTE
+  requirement: Camouflage decoy and certificate lineage
+  live_scenario: null
+  assertion: On both roles the running stream map sends the cover apex and www.<apex> to the loopback
+    listener 127.0.0.1:9443 — and no other name to it — while every VPN and panel name keeps its own local
+    port and an unmatched SNI falls back to the node's own REALITY listener; the camouflage socket is
+    bound to 127.0.0.1 only and refuses a real TCP connection from both client networks that reach 443
+    on the same host, and an independent client fetching the apex, its www and the REALITY name without
+    REALITY authentication receives the rendered cover page over the installed lineage whose SAN list
+    names both cover names.
+  assertion_sha256: fcb1bbb8a5ec70cdb88532a32e52b32a343933bcd2d228bf6594c29d02640284
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
   - multi-node
   gate: pre-push
   driver: null

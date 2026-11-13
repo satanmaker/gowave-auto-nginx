@@ -94,6 +94,7 @@ SUITES = {
         "test_podman_multi_node.TestTlsSurfaceCase",
         "test_podman_multi_node.TestCoverDeriveCase",
         "test_podman_multi_node.TestCoverSiteCase",
+        "test_podman_multi_node.TestDecoyRouteCase",
         "test_podman_multi_node.TestCoverUnresolvedCase",
         "test_podman_multi_node.TestWorkerOutageCase",
         "test_podman_multi_node.TestWorkerPeerWait",

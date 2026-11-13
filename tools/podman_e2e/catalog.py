@@ -282,6 +282,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "NGINX SNI Routing and REALITY Decoy Verification",
     },
     {
+        "id": "NGX-DECOY-ROUTE",
+        "requirement": "Camouflage decoy and certificate lineage",
+        "assertion": "On both roles the running stream map sends the cover apex and www.<apex> to the loopback listener 127.0.0.1:9443 — and no other name to it — while every VPN and panel name keeps its own local port and an unmatched SNI falls back to the node's own REALITY listener; the camouflage socket is bound to 127.0.0.1 only and refuses a real TCP connection from both client networks that reach 443 on the same host, and an independent client fetching the apex, its www and the REALITY name without REALITY authentication receives the rendered cover page over the installed lineage whose SAN list names both cover names.",
+        "topology": ["multi-node"],
+        "promotion_target": "NGINX SNI Routing and REALITY Decoy Verification",
+    },
+    {
         "id": "NGX-COVER-UNRESOLVED",
         "requirement": "Camouflage decoy and certificate lineage",
         "assertion": "When the apex or www.<apex> does not resolve to the host IPv4, the operator refuses before issuing the lineage and leaves no partial decoy or stale sites-enabled entry.",
