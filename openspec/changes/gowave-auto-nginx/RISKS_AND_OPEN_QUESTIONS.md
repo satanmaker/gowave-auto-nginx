@@ -66,7 +66,7 @@
 - **Likelihood**: Low | **Impact**: High (Installer or update fails).
 - **Mitigation**:
   1. Pin exact release versions in production installer manifests (`v1.2.4`).
-  2. Implement asset name fallback matching in `install_release()` similar to `community-baseline/internal/updater/artifacts.go`.
+  2. Implement asset name fallback matching in `install_release()` similar to `gowave-node/internal/updater/artifacts.go`.
 
 ### Risk 2: Let's Encrypt Rate Limits on Domain Reconfiguration
 - **Description**: Rapid domain changes or test runs may hit Let's Encrypt duplicate certificate rate limits (5 certs per week for exact domain set).
