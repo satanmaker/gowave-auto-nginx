@@ -2498,7 +2498,10 @@ def ipv6_facts(product: MultiNodeProduct, case_id: str) -> Dict[str, Any]:
             "status": "NOT_APPLICABLE",
             "reason": (
                 "the run network carries IPv4 only, so no IPv6 origin and no AAAA routing exist "
-                "for the Control Machine probe; a real external IPv6 source is live-only"
+                "for the Control Machine probe; a real external IPv6 source is live-only. The "
+                "remaining v6 attempts are self-connects from the Master itself, which "
+                "ufw-before-input accepts on `-i lo` before any user rule runs: they can show "
+                "that a socket exists, never that other peers could reach it"
             ),
         },
     }
@@ -2615,23 +2618,32 @@ def ipv6_contract(facts: Dict[str, Any], case_id: str) -> Dict[str, Any]:
         f"{http['outcome'] or 'without a verdict'} ({http['detail'] or 'no detail'}), so the ACME "
         "path the product publishes on IPv4 is unreachable over IPv6",
     )
-    for label, port in (("node", denial.NODE_PORT), ("panel-api", denial.PANEL_API_PORT)):
-        entry = _master_access_path("Master", label, facts["master_paths"], case_id)
-        require(
-            case_id,
-            entry["outcome"] != "CONNECTED",
-            f"the internal {label} port {port} answered over IPv6 at [{facts['address']}], so "
-            "enabling IPv6 published a management port that IPv4 keeps off the network",
-        )
-        require(
-            case_id,
-            entry["outcome"] in ("REFUSED", "UNREACHABLE"),
-            f"the {label} port {port} over IPv6 ended "
-            f"{entry['outcome'] or 'without a verdict'} ({entry['detail'] or 'no detail'}): a "
-            "timeout would mean the v6 rule set dropped a packet, while the port simply having no "
-            "v6 socket is what keeps it unpublished",
-        )
-
+    # The panel API is bound to loopback on IPv4 and must not gain a v6 socket:
+    # nothing else on the host answers that port, so a refused attempt is a real
+    # absence rather than a filtered packet, and a timeout is not the same
+    # observation.
+    panel_api = _master_access_path("Master", "panel-api", facts["master_paths"], case_id)
+    require(
+        case_id,
+        panel_api["outcome"] in ("REFUSED", "UNREACHABLE"),
+        f"the panel API port {denial.PANEL_API_PORT} over IPv6 ended "
+        f"{panel_api['outcome'] or 'without a verdict'} ({panel_api['detail'] or 'no detail'}): a "
+        "timeout would mean the v6 rule set dropped a packet, while the port simply having no v6 "
+        "socket is what keeps it unpublished",
+    )
+    # The node port is a local service and stays one on both families: on IPv4 it
+    # listens on a wildcard address too and only UFW keeps it private. The v6
+    # half therefore has to be proven by the rule set, never by a self-connect —
+    # ufw-before-input accepts `-i lo` before any user rule runs, so dialling
+    # ::1 from the host itself always succeeds whenever a socket exists.
+    _master_access_path("Master", "node", facts["master_paths"], case_id)
+    require(
+        case_id,
+        any(entry["source"] == "" for entry in master_v6["blocks"][denial.NODE_PORT]),
+        f"the Master's v6 block for the node port {denial.NODE_PORT} only covers a named source, "
+        "so it does not keep the port off the network: "
+        f"{[entry['line'] for entry in master_v6['blocks'][denial.NODE_PORT]]}",
+    )
     require(
         case_id,
         worker_v6["kernel_disabled"],

@@ -2735,7 +2735,10 @@ class TestIpv6PolicyCase(unittest.TestCase):
             "master_paths": {
                 "https": self.path("CONNECTED", port=443),
                 "http": self.path("CONNECTED", port=80),
-                "node": self.path("REFUSED", port=3002),
+                # The node binds a wildcard on both families, so a probe from the
+                # host itself reaches it: ufw-before-input accepts `-i lo` before
+                # any user rule runs. Only the port's absence looks like REFUSED.
+                "node": self.path("CONNECTED", port=3002),
                 "panel-api": self.path("REFUSED", port=7443),
             },
             "worker_paths": {
@@ -2754,7 +2757,7 @@ class TestIpv6PolicyCase(unittest.TestCase):
         self.assertEqual(evidence["master"]["declared"], "yes")
         self.assertEqual(sorted(evidence["master"]["v6_listens"]),
                          ["[::]:443", "[::]:80"])
-        self.assertEqual(evidence["master"]["paths"]["node"]["outcome"], "REFUSED")
+        self.assertEqual(evidence["master"]["paths"]["node"]["outcome"], "CONNECTED")
         self.assertTrue(evidence["worker"]["kernel_disabled"])
         self.assertEqual(evidence["worker"]["declared"], "no")
         self.assertEqual(evidence["worker"]["v6_rules"]["allows"]["3002"], [])
@@ -2813,12 +2816,25 @@ class TestIpv6PolicyCase(unittest.TestCase):
             self.contract(facts)
         self.assertIn("binds no wildcard IPv6 socket", str(caught.exception))
 
-    def test_a_node_port_answered_over_v6_is_published(self):
+    def test_a_node_block_scoped_to_one_source_does_not_keep_the_port_off_network(self):
+        # A block aimed at a single address leaves every other v6 peer with only
+        # the default policy between it and the node port, which is not the
+        # decision the IPv4 rules make.
         facts = self.facts()
-        facts["master_paths"]["node"] = self.path("CONNECTED", port=3002)
+        facts["master"]["ipv6"]["blocks"][3002] = [
+            {"target": "DROP", "source": "::1",
+             "line": "-A ufw6-user-input -s ::1/128 -p tcp -m tcp --dport 3002 -j DROP"},
+        ]
         with self.assertRaises(AssertionError) as caught:
             self.contract(facts)
-        self.assertIn("answered over IPv6", str(caught.exception))
+        self.assertIn("only covers a named source", str(caught.exception))
+
+    def test_a_panel_api_answered_over_v6_is_published(self):
+        facts = self.facts()
+        facts["master_paths"]["panel-api"] = self.path("CONNECTED", port=7443)
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(facts)
+        self.assertIn("keeps it unpublished", str(caught.exception))
 
     def test_a_v6_timeout_is_not_the_same_observation_as_no_socket(self):
         facts = self.facts()
