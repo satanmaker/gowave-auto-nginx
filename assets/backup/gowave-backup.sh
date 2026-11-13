@@ -270,6 +270,25 @@ print("15-point preflight archive validation PASSED.")
 PY
 }
 
+publish_archive() {
+    # The archive name is what an operator or a restore trusts, so it appears
+    # only once the bytes behind it are complete: tar writes a `.partial`
+    # sibling, that sibling is synced, and the rename publishes it. A store
+    # that fills up halfway through therefore fails loudly and leaves no file
+    # a later restore could pick up as a backup.
+    local output_file="$1" staging_dir="$2" partial="$1.partial"
+
+    rm -f -- "$partial"
+    if ! tar -czf "$partial" -C "$staging_dir" meta.json files; then
+        rm -f -- "$partial"
+        die "The archive could not be written to $output_file; nothing was published."
+    fi
+    chmod 0600 "$partial"
+    sync -- "$partial" 2>/dev/null || sync
+    mv -f -- "$partial" "$output_file"
+    sync -- "$(dirname "$output_file")" 2>/dev/null || true
+}
+
 create_panel_backup() {
     local output_file="$1"
     local gowave_dir="${2:-$DEFAULT_GOWAVE_DIR}"
@@ -372,8 +391,7 @@ sqlite_online_backup('$gowave_dir/gowave.db', '$tmp_staging/files/opt/gowave/gow
 EOF
 
     mkdir -p "$(dirname "$output_file")"
-    tar -czf "$output_file" -C "$tmp_staging" meta.json files
-    chmod 0600 "$output_file"
+    publish_archive "$output_file" "$tmp_staging"
     echo "Panel backup created successfully: $output_file (mode 0600)."
 }
 
@@ -415,8 +433,7 @@ create_node_backup() {
 EOF
 
     mkdir -p "$(dirname "$output_file")"
-    tar -czf "$output_file" -C "$tmp_staging" meta.json files
-    chmod 0600 "$output_file"
+    publish_archive "$output_file" "$tmp_staging"
     echo "Node backup created successfully: $output_file (mode 0600)."
 }
 

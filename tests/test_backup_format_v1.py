@@ -50,6 +50,43 @@ class TestBackupFormatV1(unittest.TestCase):
             self.assertEqual(res_verify.returncode, 0, res_verify.stderr)
             self.assertIn("15-point preflight archive validation PASSED", res_verify.stdout)
 
+    def test_a_store_that_cannot_hold_the_archive_publishes_nothing(self):
+        # A store that fills up mid-write must not leave a file whose name says
+        # "backup": the next restore would offer it, and the operator would learn
+        # about the truncation only after a preflight refusal. tar is failed here
+        # rather than the disk being filled, so the fault is deterministic.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            gowave_dir = tmp / "opt_gowave"
+            gowave_dir.mkdir()
+            conn = sqlite3.connect(str(gowave_dir / "gowave.db"))
+            conn.execute("CREATE TABLE test (id INT);")
+            conn.commit()
+            conn.close()
+            (gowave_dir / ".env").write_text("APP_PORT=3000\n")
+
+            shim = tmp / "shim"
+            shim.mkdir()
+            (shim / "tar").write_text(
+                "#!/usr/bin/env bash\n"
+                "echo 'tar: write error: No space left on device' >&2\n"
+                "exit 2\n"
+            )
+            (shim / "tar").chmod(0o755)
+
+            store = tmp / "store"
+            out_archive = store / "backup-panel.tar.gz"
+            res = subprocess.run(
+                ["bash", "-c",
+                 f'"{BACKUP_SH}" backup --type panel "{out_archive}" "{gowave_dir}"'],
+                capture_output=True, text=True,
+                env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}"},
+            )
+            self.assertNotEqual(res.returncode, 0, res.stdout)
+            self.assertIn("nothing was published", res.stderr)
+            self.assertEqual(sorted(store.iterdir()) if store.exists() else [], [],
+                             "the failed backup left a file a restore could pick up")
+
     def test_rejection_of_malicious_archives(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
