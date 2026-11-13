@@ -2,13 +2,12 @@
 
 ## Pinned Upstream Repositories & Commit SHAs
 
-The implementation of `gowave-auto-nginx` is anchored to verified upstream and community baseline repository states. All specifications, integration contracts, and test scenarios are directly validated against the following commit SHAs:
+The implementation of `gowave-auto-nginx` is anchored to verified upstream repository states. All specifications, integration contracts, and test scenarios are directly validated against the following commit SHAs:
 
 | Project | Role | Pinned Commit SHA | Full Commit SHA | Pinned Repository / Tree |
 |---|---|---|---|---|
 | **GoWave** | Panel Backend, Frontend & Database | `6d2c357` | `6d2c35788b3b038627b5e86e6c6486caff0851c8` | `sources/gowave` (`aaaSaZaN/gowave`) |
 | **GoWave Node** | Node Daemon & Xray Process Manager | `7b3514d` | `7b3514d1ab8c674050597820d52d55525d4bece7` | `sources/gowave-node` (`aaaSaZaN/gowave-node`) |
-| **community-baseline** | community baseline & Security Hardening | `community-baseline` | `community-baseline` | `sources/community-baseline` (`community-baseline/community-baseline`) |
 
 ---
 

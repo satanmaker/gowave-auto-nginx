@@ -43,7 +43,6 @@ GoWave Auto NGINX interacts with separately obtained and deployed upstream compo
 - **Upstream Project**: [community-baseline](https://github.com/community-baseline/community-baseline)
 - **License**: GNU General Public License v3.0 (GNU GPL-3.0-only)
 - **Attribution**: Copyright (C) 2026 community-baseline contributors.
-- **Notice**: Infrastructure architecture, NGINX Stream multiplexing models, transactional security hardening drop-ins, and backup/restore verification methodologies are adapted from `community-baseline`.
 
 ### mozaroc
 - **Upstream Reference**: [mozaroc/3x-ui-pro](https://github.com/mozaroc/3x-ui-pro)

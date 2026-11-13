@@ -1,7 +1,7 @@
 # Testing Strategy & CI Architecture: GoWave Auto NGINX
 
 **Document Status**: Authoritative Specification  
-**Source Baseline**: `community-baseline/tests/run_ci.py` (`community-baseline`) and `gowave-node/tests/`  
+**Source Baseline**: community installer `run_ci.py` runner patterns and `gowave-node/tests/`  
 **Purpose**: Define the 5-suite testing architecture, runner contract, EUID privilege separation, test matrix, and acceptance gates for GoWave Auto NGINX.
 
 ---
@@ -22,7 +22,7 @@ The workflow names and local scripts reflect the automated testbed architecture:
 
 ## 1. Test Runner Contract & Privilege Separation
 
-GoWave Auto NGINX adopts the exact test runner architecture of `community-baseline/tests/run_ci.py`. The runner verifies test completeness dynamically and enforces strict process EUID privileges before running any suite:
+GoWave Auto NGINX adopts the community-inherited `run_ci.py` test runner architecture, with upstream attribution retained in `THIRD_PARTY_NOTICES.md`. The runner verifies test completeness dynamically and enforces strict process EUID privileges before running any suite:
 
 ```bash
 # Verify test inventory and completeness (zero unassigned or stale TestCase classes)

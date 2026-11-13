@@ -3,7 +3,7 @@
 **Document Status**: Authoritative Engineering Baseline  
 **Audit Date**: November 7, 2026  
 **Auditor**: Senior DevOps / Linux Infrastructure Engineer / Security Architect  
-**Scope**: Codebases of `gowave`, `gowave-node`, and `community-baseline`
+**Scope**: Codebases of `gowave` and `gowave-node`
 
 ---
 
@@ -13,7 +13,6 @@
 |---|---|---|---|---|---|
 | **GoWave** | `https://github.com/aaaSaZaN/gowave` | `v1.2.4` (tag `dev`, `main`) | `6d2c35788b3b038627b5e86e6c6486caff0851c8` | 2026-11-07 04:42:31 +0700 | `backend-go/config/`, `cmd/server/`, `internal/server/`, `internal/subscription/`, `internal/subtpl/`, `internal/configprofiles/`, `internal/nodes/`, `internal/serviceunit/`, `internal/database/`, `install.sh` |
 | **GoWave Node** | `https://github.com/aaaSaZaN/gowave-node` | `v1.1.3-3-g7b3514d` | `7b3514d1ab8c674050597820d52d55525d4bece7` | 2026-11-07 04:18:09 +0700 | `cmd/gowave-node/`, `internal/config/`, `internal/tlsutil/`, `internal/auth/`, `internal/xray/`, `internal/handler/`, `internal/stats/`, `internal/updater/`, `install.sh`, `AGENTS.md` |
-| **community-baseline** | `https://github.com/community-baseline/community-baseline` | `v2.4.0-1-gcommunity-baseline` | `community-baseline` | 2026-11-07 13:21:15 +0300 | `tests/run_ci.py`, `tests/systemd/`, `assets/security/`, `assets/xhttp-cdn/`, `assets/vision/`, `assets/backup/`, `x-ui-latest.sh`, `THIRD_PARTY_NOTICES.md`, `LICENSE` |
 
 ---
 
@@ -77,17 +76,18 @@
 5. **Xray-Core Supervision & Process Lifecycle**:
    - `gowave-node/internal/xray/process.go#L51-L132`: Supervised execution with ring buffer logging. Direct process management handles auto-restart on unexpected exit. **No external watchdog timer.**
 
-### 2.3 community-baseline (community baseline)
+### 2.3 Baseline community installer patterns
+
 1. **NGINX Stream SNI Demultiplexing**:
-   - `community-baseline/x-ui-latest.sh#L797-L825`: Public port 443 bound by NGINX Stream (`ssl_preread on; proxy_protocol on;`). SNI map routes `reality_domain` to 8443, `panel_domain` to 7443, and default/unknown to 8443.
+   - Community installer `x-ui-latest.sh#L797-L825`: Public port 443 bound by NGINX Stream (`ssl_preread on; proxy_protocol on;`). SNI map routes `reality_domain` to 8443, `panel_domain` to 7443, and default/unknown to 8443.
 2. **REALITY Fallback & Decoy Site**:
-   - `community-baseline/assets/vision/managed.py#L73-L100`: Xray fallback sends PROXY protocol v1 (`dest: 127.0.0.1:9443, xver: 1`) to NGINX listener at 9443 (`listen 127.0.0.1:9443 ssl proxy_protocol;`) serving static camouflage HTML.
+   - Community `assets/vision/managed.py#L73-L100`: Xray fallback sends PROXY protocol v1 (`dest: 127.0.0.1:9443, xver: 1`) to NGINX listener at 9443 (`listen 127.0.0.1:9443 ssl proxy_protocol;`) serving static camouflage HTML.
 3. **Backup Preflight Validation & Security Checks**:
-   - `community-baseline/assets/backup/x-ui-backup.sh#L400-L452`: Python validator inspects tar members, rejects `..`, leading `/`, symlinks pointing outside managed roots, hardlinks to non-files, device nodes, and FIFOs.
+   - Community `assets/backup/x-ui-backup.sh#L400-L452`: Python validator inspects tar members, rejects `..`, leading `/`, symlinks pointing outside managed roots, hardlinks to non-files, device nodes, and FIFOs.
 4. **CI Runner & Privilege Separation**:
-   - `community-baseline/tests/run_ci.py#L12-L41,L94-L116`: Uses `--suite` with choices `nonroot`, `root`, `integration`, `services`, `systemd`, or `--check-completeness`. Enforces EUID checks before execution.
+   - Community `tests/run_ci.py#L12-L41,L94-L116`: Uses `--suite` with choices `nonroot`, `root`, `integration`, `services`, `systemd`, or `--check-completeness`. Enforces EUID checks before execution.
 5. **Authentic Multi-Asset Decoy Camouflage**:
-   - `community-baseline/assets/vision/managed.py#L73-L100`: Retains authentic multi-asset static website (`cover-reality` under `/var/www/gowave-auto-nginx/cover-reality`), providing realistic HTML, CSS, JavaScript, and image assets on loopback port 9443 rather than minimal single-file HTML stubs.
+   - Community `assets/vision/managed.py#L73-L100`: Retains authentic multi-asset static website (`cover-reality` under `/var/www/gowave-auto-nginx/cover-reality`), providing realistic HTML, CSS, JavaScript, and image assets on loopback port 9443 rather than minimal single-file HTML stubs.
 
 ---
 
@@ -130,11 +130,11 @@
 |    (P1-6)              | without full contract   | migrations; downgrade      | gowave-auto.sh channel   | uncontrolled switching   | operators wanting bleeding-  |
 |                        | in tasks/specs.         | cannot auto-reverse.       | with snapshot & guard.   | without backup.          | edge or stable releases.     |
 +------------------------+-------------------------+----------------------------+--------------------------+--------------------------+------------------------------+
-| 9. Compatibility Status| Debian 12 marked as     | Upstream GoWave/community baseline lack | Refine matrix taxonomy;  | Overstating official     | Rigorous engineering claims; |
+| 9. Compatibility Status| Debian 12 marked as     | Upstream GoWave lacks a    | Refine matrix taxonomy;  | Overstating official     | Rigorous engineering claims; |
 |    (P1-7)              | UPSTREAM_SUPPORTED.     | dedicated Debian 12 CI     | classify Panel/Node on   | upstream verification.   | adaptations verified via L5  |
 |                        |                         | test workflows.            | Debian 12 as SOURCE_COMP.|                          | QEMU tests.                  |
 +------------------------+-------------------------+----------------------------+--------------------------+--------------------------+------------------------------+
-| 10. Container User     | Integration tests ran   | tests/run_ci.py rejects    | Run integration container| Running integration as   | Strict compliance with community baseline |
+| 10. Container User     | Integration tests ran   | tests/run_ci.py rejects    | Run integration container| Running integration as   | Strict compliance with runner |
 |     (P1-9)             | as root in container.   | EUID 0 for integration     | with --user 1001:1001    | root; disabling EUID     | runner privilege separation  |
 |                        |                         | and services suites.       | enforcing EUID != 0.     | checks in runner.        | contract.                    |
 +------------------------+-------------------------+----------------------------+--------------------------+--------------------------+------------------------------+
@@ -185,7 +185,7 @@
 +------------------------+-------------------------+----------------------------+--------------------------+--------------------------+------------------------------+
 | 22. Decoy Camouflage   | Minimal single-file HTML| Scanners easily detect     | Retain multi-asset       | Adopting minimal 1-line  | High-fidelity camouflage     |
 |     (Item 2)           | stub used as decoy.     | simplistic static stubs.   | cover-reality template   | HTML stub from third-    | against DPI and scanners;    |
-|                        |                         |                            | from community-baseline.   | party scripts.           | verified in test suite.      |
+|                        |                         |                            | from community baseline. | party scripts.           | verified in test suite.      |
 +------------------------+-------------------------+----------------------------+--------------------------+--------------------------+------------------------------+
 | 23. Contractual Auth   | Implicit auth flow      | GoWave requires POST       | Codify exact auth DTO,   | Uncontracted API calls;  | Deterministic login and      |
 |     (AUD-01)           | without path/headers.   | /api/auth/login, Bearer    | 12h TTL, and 401 re-login| hardcoded tokens.        | token lifecycle handling;    |
