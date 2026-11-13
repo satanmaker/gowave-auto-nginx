@@ -2599,45 +2599,59 @@ def case_panel_service_down(product: AioProduct) -> Dict[str, Any]:
         f"{PANEL_SERVICE} did not stop: {(stop.stdout or stop.stderr or '').strip()[-600:]!r}",
     )
 
-    down = channel_state(product, case)
-    require(
-        case, down.get("unit", {}).get("ActiveState") == "inactive",
-        f"{PANEL_SERVICE} is {down.get('unit', {}).get('ActiveState')!r} after the stop",
-    )
-    require(
-        case, down.get("health") != 200,
-        f"the Panel health route still answered {down.get('health')!r} with the unit stopped",
-    )
-    require_configuration_unchanged(case, before, down, "while the Panel was stopped")
-    require(
-        case, down.get("database", {}).get("logical") == before.get("database", {}).get("logical"),
-        "the stopped Panel changed the rows it had stored: "
-        f"{down.get('database', {}).get('logical')!r} vs "
-        f"{before.get('database', {}).get('logical')!r}",
-    )
+    down: Dict[str, Any] = {}
+    page: Dict[str, Any] = {}
+    subscription: Dict[str, Any] = {}
+    during: Dict[str, Any] = {}
+    try:
+        down = channel_state(product, case)
+        require(
+            case, down.get("unit", {}).get("ActiveState") == "inactive",
+            f"{PANEL_SERVICE} is {down.get('unit', {}).get('ActiveState')!r} after the stop",
+        )
+        require(
+            case, down.get("health") != 200,
+            f"the Panel health route still answered {down.get('health')!r} with the unit stopped",
+        )
+        require_configuration_unchanged(case, before, down, "while the Panel was stopped")
 
-    page = host.client_http(f"{PUBLIC_PANEL}/", timeout=30)
-    require(
-        case, page["probe"].get("status") == PANEL_FAULT_UNAVAILABLE_STATUS,
-        f"the public Panel surface answered {page['probe'].get('status')!r} with the unit "
-        f"stopped, expected NGINX's {PANEL_FAULT_UNAVAILABLE_STATUS}: "
-        f"{(page.get('stderr') or page.get('stdout') or '').strip()[-600:]!r}",
-    )
-    # The route a client fetches its configuration from is the Panel's too, so it
-    # has to fail with the same gateway error rather than with a subscription.
-    subscription = host.client_http(f"{PUBLIC_PANEL}/api/sub/000000000000", timeout=30)
-    require(
-        case, subscription["probe"].get("status") == PANEL_FAULT_UNAVAILABLE_STATUS,
-        f"the subscription route answered {subscription['probe'].get('status')!r} with the "
-        f"Panel stopped, expected {PANEL_FAULT_UNAVAILABLE_STATUS}: "
-        f"{(subscription.get('stderr') or subscription.get('stdout') or '').strip()[-600:]!r}",
-    )
+        page = host.client_http(f"{PUBLIC_PANEL}/", timeout=30)
+        require(
+            case, page["probe"].get("status") == PANEL_FAULT_UNAVAILABLE_STATUS,
+            f"the public Panel surface answered {page['probe'].get('status')!r} with the unit "
+            f"stopped, expected NGINX's {PANEL_FAULT_UNAVAILABLE_STATUS}: "
+            f"{(page.get('stderr') or page.get('stdout') or '').strip()[-600:]!r}",
+        )
+        # The route a client fetches its configuration from is the Panel's too, so it
+        # has to fail with the same gateway error rather than with a subscription.
+        subscription = host.client_http(f"{PUBLIC_PANEL}/api/sub/000000000000", timeout=30)
+        require(
+            case, subscription["probe"].get("status") == PANEL_FAULT_UNAVAILABLE_STATUS,
+            f"the subscription route answered {subscription['probe'].get('status')!r} with the "
+            f"Panel stopped, expected {PANEL_FAULT_UNAVAILABLE_STATUS}: "
+            f"{(subscription.get('stderr') or subscription.get('stdout') or '').strip()[-600:]!r}",
+        )
 
-    # The data plane is the node's, not the Panel's: the tunnels that were already
-    # configured must keep carrying payload while the control plane is down.
-    during = require_channel_traffic(product, case, host)
+        # The data plane is the node's, not the Panel's: the tunnels that were already
+        # configured must keep carrying payload while the control plane is down.
+        during = require_channel_traffic(product, case, host)
 
-    start = product.host_script(f"systemctl start {PANEL_SERVICE}", timeout=120)
+        # Nothing read above reached the Panel — the two requests stopped at NGINX and
+        # the transfers went to the node — so a stopped control plane cannot have
+        # written a row since the state read after the stop. That is what separates a
+        # Panel that is down from a database that is damaged.
+        idle = channel_state(product, case)
+        require(
+            case, idle.get("database", {}).get("logical") == down.get("database", {}).get("logical"),
+            "the stopped Panel changed the rows it had stored: "
+            f"{idle.get('database', {}).get('logical')!r} vs "
+            f"{down.get('database', {}).get('logical')!r}",
+        )
+
+    finally:
+        # A case that failed above must not leave the host without its control
+        # plane: every case after this one reads the Panel.
+        start = product.host_script(f"systemctl start {PANEL_SERVICE}", timeout=120)
     require(
         case, start.returncode == 0,
         f"{PANEL_SERVICE} did not start: {(start.stderr or start.stdout or '').strip()[-600:]!r}",
@@ -2674,6 +2688,9 @@ def case_panel_service_down(product: AioProduct) -> Dict[str, Any]:
         "subscription_status_with_panel_down": subscription["probe"].get("status"),
         "health_with_panel_down": str(down.get("health"))[:120],
         "unit_sub_state_with_panel_down": down.get("unit", {}).get("SubState"),
+        "rows_stable_with_panel_down": str(
+            idle.get("database", {}).get("logical") == down.get("database", {}).get("logical")
+        ).lower(),
         "transfers_with_panel_down": during.get("transfer_count"),
         "health_after": str(after.get("health")),
         "inventory_identical": str(surface.get("inventory_identical")).lower(),
@@ -2813,13 +2830,17 @@ def case_core_process_killed(product: AioProduct) -> Dict[str, Any]:
     host = product.require_installed()
     case = CORE_FAULT_CASE_ID
     before = channel_state(product, case)
-    require(
-        case, before.get("unit", {}).get("ActiveState") == "active",
-        f"{PANEL_SERVICE} is {before.get('unit', {}).get('ActiveState')!r} before the fault",
-    )
     product.wait_tunnel_ready(case)
 
     scan = probe_json(case, "the core scan", product.host_script(core_fault_script("scan", 0)))
+    # The unit that has to survive the kill is the node's, read from the same
+    # probe that finds the core: the Panel may already be down for its own
+    # reasons, and the core this case kills does not depend on it.
+    require(
+        case, (scan.get("unit_before") or {}).get("ActiveState") == "active",
+        f"{CORE_FAULT_UNIT} is {(scan.get('unit_before') or {}).get('ActiveState')!r} before "
+        "the fault",
+    )
     cores = scan.get("cores_before") or []
     require(
         case, len(cores) == 1 and cores[0].get("in_unit"),
