@@ -75,6 +75,7 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **AIO-NEG-DEP** — promotion target: All-in-One Master VPS Installation Verification
 - **NGX-05** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **TLS-01** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
+- **ACME-01** — promotion target: Global Certbot Deploy Hook Ownership
 - **NGX-COVER-DERIVE** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **NGX-COVER-UNRESOLVED** — promotion target: NGINX SNI Routing and REALITY Decoy Verification
 - **NGX-WORKER-ACME80** — promotion target: Distributed Worker VPS Deployment Verification

@@ -21,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from tools.podman_e2e import (  # noqa: E402
+    acme_fixture,
     aio,
     catalog,
     matrix,
@@ -216,6 +217,9 @@ class StubHost:
         self.panel_domain = panel_domain
         self.reality_domain = aio.REALITY_DOMAIN
         self.client_reports = []
+
+    def install_environment(self):
+        return {"GOWAVE_ACME_TEST_CA_FILE": "/fixtures/ca/acme-trust.pem"}
 
     def client_http(self, url, **kwargs):
         report = self.client_reports.pop(0)
@@ -1465,6 +1469,440 @@ def tls_policy(domain=aio.PANEL_DOMAIN, **overrides):
     if block.pop("omit", False):
         return json.dumps({"domain": domain, "blocks": []})
     return json.dumps({"domain": domain, "blocks": [block]})
+
+
+def acme_moment(seconds_ago: int = 0) -> int:
+    return int(datetime.now(timezone.utc).timestamp()) - seconds_ago
+
+
+def acme_certificate(
+    path: str, serial: str, not_before_epoch: int, days: int = 90,
+    domain: str = aio.PANEL_DOMAIN,
+) -> dict:
+    """One certificate as the host probe prints it, from the epoch it starts at."""
+    starts = datetime.fromtimestamp(not_before_epoch, timezone.utc)
+    return {
+        "path": path,
+        "present": True,
+        "returncode": 0,
+        "serial": serial,
+        "subject": f"CN = {domain}",
+        "issuer": "CN = Pebble Intermediate CA 123af5",
+        "not_before": format_datetime(starts),
+        "not_before_epoch": not_before_epoch,
+        "not_after": format_datetime(starts + timedelta(days=days)),
+        "not_after_epoch": not_before_epoch + days * 86400,
+        "san": [domain],
+    }
+
+
+def acme_probe(
+    mode: str, *, domain: str = aio.PANEL_DOMAIN,
+    authenticator: str = "webroot", webroot_path: str = aio.ACME_WEBROOT,
+    server: str = acme_fixture.ACME_DIRECTORY_URL,
+    issued_epoch: Optional[int] = None, renewed_epoch: Optional[int] = None,
+    installed_serial: str = "0A1B", renewed_serial: str = "0C2D",
+    renewal_exit: int = 0, transcript: Optional[str] = None,
+    workers_before: Sequence[str] = ("4243", "4244"),
+    workers_after: Optional[Sequence[str]] = None,
+    main_pid: str = "4242", listeners: int = 1, nginx_test: int = 0,
+    lineage_present: bool = True,
+) -> dict:
+    """One phase's report, shaped exactly as the host probe prints it."""
+    first = acme_moment(600) if issued_epoch is None else issued_epoch
+    second = acme_moment(60) if renewed_epoch is None else renewed_epoch
+    served = tuple(workers_before) if mode != "renew" else ("5100", "5101")
+    after = served if workers_after is None else tuple(workers_after)
+    live_path = f"{aio.ACME_LINEAGE_DIR}/{domain}/fullchain.pem"
+    archive_path = f"{aio.ACME_ARCHIVE_DIR}/{domain}/cert1.pem"
+    facts = {
+        "mode": mode,
+        "domain": domain,
+        "webroot": webroot_path,
+        "challenge_dir": f"{webroot_path}/.well-known/acme-challenge",
+        "lineage": {
+            "path": f"{aio.ACME_RENEWAL_DIR}/{domain}.conf",
+            "present": lineage_present,
+            "values": {
+                "authenticator": authenticator,
+                "webroot_path": webroot_path,
+                "server": server,
+            },
+        },
+        "live": acme_certificate(live_path, installed_serial, first),
+        "archive": [acme_certificate(archive_path, installed_serial, first)],
+        "service": {"active": "active", "main_pid": main_pid,
+                    "worker_pids": list(workers_before), "listeners_443": listeners},
+        "test": {"returncode": nginx_test, "tail": ""},
+    }
+    if mode != "renew":
+        return facts
+    text = transcript if transcript is not None else (
+        f"http-01 challenge for {domain}\nSuccessfully received certificate"
+    )
+    facts.update({
+        "renewal": {"returncode": renewal_exit, "stdout": text, "stderr": "",
+                    "tail": text, "duration_seconds": 6.5},
+        "certbot_log": text,
+        "live_after": acme_certificate(live_path, renewed_serial, second),
+        "archive_after": [
+            acme_certificate(archive_path, installed_serial, first),
+            acme_certificate(f"{aio.ACME_ARCHIVE_DIR}/{domain}/cert2.pem", renewed_serial, second),
+        ],
+        "service_after": {"active": "active", "main_pid": main_pid,
+                          "worker_pids": list(after), "listeners_443": listeners},
+        "test_after": {"returncode": nginx_test, "tail": ""},
+        "reload_waited_seconds": 0.5,
+    })
+    return facts
+
+
+def acme_route_report(status: int = 200, returncode: int = 0, body_length: int = 48) -> dict:
+    """The independent client's fetch of a token from the product's port 80 vhost."""
+    probe = {
+        "url": f"http://{aio.PANEL_DOMAIN}/.well-known/acme-challenge/token",
+        "status": status,
+        "body_length": body_length,
+        "body_sha256": "b" * 64,
+    }
+    return {"returncode": returncode, "probe": probe, "stdout": json.dumps(probe), "stderr": ""}
+
+
+def acme_served_report(after: dict, **overrides) -> dict:
+    """The handshake a client gets once the renewal reloaded NGINX."""
+    renewed = (after.get("live_after") or {}).get("not_before_epoch")
+    not_before = (
+        format_datetime(datetime.fromtimestamp(renewed, timezone.utc))
+        if isinstance(renewed, int) else certificate_day(-1)
+    )
+    return tls_report(not_before=not_before, not_after=certificate_day(60), **overrides)
+
+
+class TestAcmeRenewalCase(unittest.TestCase):
+    """ACME-01: the certificate is issued and renewed through the webroot route."""
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def contract(self, before=None, after=None, route=None, served=None):
+        before = acme_probe("before") if before is None else before
+        after = acme_probe("renew") if after is None else after
+        product, podman = installed_product(self.context, [
+            (json.dumps(before), 0),
+            ("", 0),
+            ("", 0),
+            (json.dumps(after), 0),
+        ])
+        product.host.client_reports = [
+            acme_route_report() if route is None else route,
+            acme_served_report(after) if served is None else served,
+        ]
+        return aio.case_acme_renewal(product), podman
+
+    def reject(self, expected: str, **kwargs):
+        with self.assertRaises(AssertionError) as caught:
+            self.contract(**kwargs)
+        self.assertIn(expected, str(caught.exception))
+        return caught
+
+    def test_the_case_walks_the_lineage_from_issuance_to_a_served_renewal(self):
+        evidence, podman = self.contract()
+        self.assertEqual(evidence["role"], "the All-in-One host")
+        self.assertEqual(evidence["webroot"], aio.ACME_WEBROOT)
+        self.assertEqual(evidence["lineage"]["authenticator"], "webroot")
+        self.assertEqual(evidence["installed_certificate"]["serial"], "0A1B")
+        self.assertEqual(evidence["challenge_route"]["status"], 200)
+        self.assertEqual(evidence["renewal"]["serial_before"], "0A1B")
+        self.assertEqual(evidence["renewal"]["serial_after"], "0C2D")
+        self.assertEqual(evidence["renewal"]["installed_certificates_after"], 2)
+        self.assertEqual(evidence["reload"]["worker_pids_after"], ["5100", "5101"])
+        self.assertEqual(evidence["reload"]["master_pid"], "4242")
+        self.assertEqual(len(podman.scripts), 4)
+        self.assertTrue(podman.scripts[0].startswith("python3 - before "),
+                        "the first phase only reads the lineage")
+        self.assertIn(aio.ACME_WEBROOT, podman.scripts[0])
+        self.assertTrue(podman.scripts[3].startswith("python3 - renew "))
+        self.assertIn(aio.PANEL_DOMAIN, podman.scripts[3])
+
+    def test_the_token_is_planted_in_the_products_own_webroot_and_removed_again(self):
+        _evidence, podman = self.contract()
+        self.assertIn(f"{aio.ACME_WEBROOT}/.well-known/acme-challenge/", podman.scripts[1])
+        self.assertTrue(podman.scripts[2].startswith("rm -f "))
+
+    def test_a_lineage_through_another_authenticator_fails_the_case(self):
+        self.reject("authenticates as 'dns-01'",
+                    before=acme_probe("before", authenticator="dns-01"))
+
+    def test_a_renewal_that_writes_its_challenge_elsewhere_fails_the_case(self):
+        self.reject("instead of /var/www/gowave-acme",
+                    before=acme_probe("before", webroot_path="/var/www/elsewhere"))
+
+    def test_a_lineage_against_another_acme_directory_fails_the_case(self):
+        self.reject("instead of this run's ACME directory",
+                    before=acme_probe("before", server="https://acme-v02.api.letsencrypt.org/directory"))
+
+    def test_a_missing_renewal_lineage_fails_the_case(self):
+        self.reject("keeps no renewal lineage",
+                    before=acme_probe("before", lineage_present=False))
+
+    def test_a_certificate_that_predates_the_run_is_refused_as_seeded(self):
+        self.reject("it was seeded rather than obtained",
+                    before=acme_probe("before", issued_epoch=acme_moment(3 * 86400)))
+
+    def test_a_port_80_vhost_that_does_not_serve_the_token_fails_the_case(self):
+        self.reject("instead of serving the token", route=acme_route_report(status=444))
+
+    def test_a_route_the_client_cannot_reach_fails_the_case(self):
+        self.reject("could not fetch http://",
+                    route={"returncode": 1, "probe": {"url": "http://x/"},
+                           "stdout": "", "stderr": "connection refused"})
+
+    def test_a_renewal_that_never_performs_http01_fails_the_case(self):
+        self.reject("did not perform an HTTP-01 challenge",
+                    after=acme_probe("renew", transcript="dns-01 challenge for "
+                                     f"{aio.PANEL_DOMAIN}\nSuccessfully received certificate"))
+
+    def test_a_renewal_that_receives_no_certificate_fails_the_case(self):
+        self.reject("exited 1", after=acme_probe("renew", renewal_exit=1))
+
+    def test_a_renewal_that_reuses_the_serial_fails_the_case(self):
+        self.reject("still reports certificate serial '0A1B'",
+                    after=acme_probe("renew", renewed_serial="0A1B"))
+
+    def test_a_renewal_that_keeps_the_same_archive_entry_fails_the_case(self):
+        expired = acme_probe("renew")
+        expired["archive_after"] = expired["archive"]
+        self.reject("holds 1 certificate(s) after a forced renewal", after=expired)
+
+    def test_a_renewal_that_never_reloads_nginx_fails_the_case(self):
+        self.reject("did not reload NGINX after the renewal",
+                    after=acme_probe("renew", workers_after=("4243", "4244")))
+
+    def test_a_renewal_that_replaces_the_master_fails_the_case(self):
+        replaced = acme_probe("renew")
+        replaced["service_after"]["main_pid"] = "9001"
+        self.reject("instead of reloading it", after=replaced)
+
+    def test_a_leaf_the_client_still_receives_from_the_old_lineage_fails_the_case(self):
+        self.reject("so NGINX is still serving the replaced lineage",
+                    served=tls_report(not_before=certificate_day(-1)))
+
+    def test_the_planted_token_is_removed_even_when_the_route_is_refused(self):
+        product, podman = installed_product(self.context, [
+            (json.dumps(acme_probe("before")), 0),
+            ("", 0),
+            ("", 0),
+        ])
+        product.host.client_reports = [acme_route_report(status=444)]
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_acme_renewal(product)
+        self.assertIn("instead of serving the token", str(caught.exception))
+        self.assertEqual(len(podman.scripts), 3, "the token has to be removed from the finally block")
+        self.assertTrue(podman.scripts[2].startswith("rm -f "))
+
+    def test_a_host_that_refuses_the_token_write_fails_the_case_and_writes_nothing(self):
+        product, podman = installed_product(self.context, [
+            (json.dumps(acme_probe("before")), 0),
+            ("", 1),
+            ("", 0),
+        ])
+        product.host.client_reports = []
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_acme_renewal(product)
+        self.assertIn("could not write a challenge token", str(caught.exception))
+        self.assertTrue(podman.scripts[2].startswith("rm -f "))
+
+    def test_the_case_is_registered_before_any_traffic_and_carries_a_bounded_budget(self):
+        cases = {case.id: case for case in aio.cases(ScriptedPodman(self.context, []))}
+        self.assertIn(aio.ACME_CASE_ID, cases)
+        self.assertEqual(cases[aio.ACME_CASE_ID].timeout_seconds, aio.ACME_TIMEOUT_SECONDS)
+        self.assertEqual(cases[aio.ACME_CASE_ID].topology, "aio")
+        ids = [case.id for case in aio.cases(ScriptedPodman(self.context, []))]
+        self.assertLess(ids.index(aio.NGX_CONFIG_CASE_ID), ids.index(aio.ACME_CASE_ID))
+        self.assertLess(ids.index(aio.ACME_CASE_ID), ids.index("SUB-SERVED"))
+        self.assertLess(ids.index(aio.ACME_CASE_ID), ids.index("AIO-RESTART"))
+
+    def test_the_case_is_catalogued_as_an_incubating_podman_first_case(self):
+        entry = {case["id"]: case for case in catalog.load_catalog()["cases"]}
+        self.assertIn(aio.ACME_CASE_ID, entry)
+        record = entry[aio.ACME_CASE_ID]
+        self.assertEqual(record["state"], "incubating")
+        self.assertEqual(record["runs_in"], ["podman"])
+        self.assertEqual(record["topology"], ["aio"])
+        self.assertEqual(record["promotion_target"], "Global Certbot Deploy Hook Ownership")
+
+
+class TestAcmeRenewalProbe(unittest.TestCase):
+    """ACME-01's host probe: what it reads, and what it runs, on a real tree."""
+
+    def build_target(self, tmpdir: Path, main_pid: str, domain: str = aio.PANEL_DOMAIN) -> dict:
+        root = tmpdir
+        renewal = root / "renewal"
+        archive = root / "archive" / domain
+        live_root = root / "live"
+        live = live_root / domain
+        webroot = root / "webroot"
+        logs = root / "logs"
+        for directory in (renewal, archive, live, webroot, logs):
+            directory.mkdir(parents=True, exist_ok=True)
+        (renewal / f"{domain}.conf").write_text(
+            "# renew_before_expiry = 30 days\n"
+            "version = 4.1.1\n"
+            "archive_dir = /etc/letsencrypt/archive/" + domain + "\n"
+            "cert = /etc/letsencrypt/live/" + domain + "/cert.pem\n"
+            "privkey = /etc/letsencrypt/live/" + domain + "/privkey.pem\n"
+            f"server = {acme_fixture.ACME_DIRECTORY_URL}\n"
+            "authenticator = webroot\n"
+            f"webroot_path = {aio.ACME_WEBROOT}\n"
+            "[[webroot_map]]\n",
+            encoding="utf-8",
+        )
+        (archive / "cert1.pem").write_text("old", encoding="utf-8")
+        (live / "fullchain.pem").write_text("old", encoding="utf-8")
+
+        bindir = root / "bin"
+        bindir.mkdir()
+        marker = root / "renewed"
+        anchor = root / "anchor"
+
+        def write(name: str, body: str) -> None:
+            path = bindir / name
+            path.write_text(body, encoding="utf-8")
+            path.chmod(0o755)
+
+        write("openssl", (
+            "#!/bin/sh\n"
+            'path=""\n'
+            'while [ $# -gt 0 ]; do\n'
+            '  if [ "$1" = "-in" ]; then shift; path="$1"; fi\n'
+            "  shift\n"
+            "done\n"
+            'if [ -f "$path" ] && [ "$(cat "$path")" = "new" ]; then\n'
+            f"  printf '%s' 'serial=0C2D\n"
+            f"subject=CN = {domain}\n"
+            "issuer=CN = Pebble Intermediate CA 123af5\n"
+            "notBefore=Nov 13 10:30:00 2026 GMT\n"
+            "notAfter=Feb 11 10:30:00 2027 GMT\n"
+            "X509v3 Subject Alternative Name: \n"
+            f"    DNS:{domain}\n'\n"
+            "else\n"
+            f"  printf '%s' 'serial=0A1B\n"
+            f"subject=CN = {domain}\n"
+            "issuer=CN = Pebble Intermediate CA 123af5\n"
+            "notBefore=Nov 13 09:59:52 2026 GMT\n"
+            "notAfter=Feb 11 09:59:51 2027 GMT\n"
+            "X509v3 Subject Alternative Name: \n"
+            f"    DNS:{domain}\n'\n"
+            "fi\n"
+            "exit 0\n"
+        ))
+        write("certbot", (
+            "#!/bin/sh\n"
+            'log_dir=""\n'
+            'while [ $# -gt 0 ]; do\n'
+            '  if [ "$1" = "--logs-dir" ]; then shift; log_dir="$1"; fi\n'
+            "  shift\n"
+            "done\n"
+            'mkdir -p "$log_dir"\n'
+            f"printf '%s\\n' 'http-01 challenge for {domain}' >> \"$log_dir/letsencrypt.log\"\n"
+            "printf '%s\\n' 'Successfully received certificate' >> \"$log_dir/letsencrypt.log\"\n"
+            'printf %s "$REQUESTS_CA_BUNDLE" > ' + str(anchor) + "\n"
+            f"printf 'new' > {archive}/cert2.pem\n"
+            f"printf 'new' > {live}/fullchain.pem\n"
+            f"touch {marker}\n"
+            f"printf '%s\\n' 'http-01 challenge for {domain}'\n"
+            "printf '%s\\n' 'Successfully received certificate'\n"
+            "exit 0\n"
+        ))
+        write("systemctl", (
+            "#!/bin/sh\n"
+            'case "$1 $2" in\n'
+            '  "is-active nginx") echo active ;;\n'
+            f'  "show -p") echo {main_pid} ;;\n'
+            "esac\n"
+            "exit 0\n"
+        ))
+        write("pgrep", (
+            "#!/bin/sh\n"
+            f'if [ -f {marker} ]; then echo 5100; echo 5101; else echo 4243; echo 4244; fi\n'
+        ))
+        write("ss", "#!/bin/sh\necho 'LISTEN 0 511 0.0.0.0:443 0.0.0.0:*'\n")
+        write("nginx", "#!/bin/sh\nexit 0\n")
+        return {
+            "root": root, "bindir": bindir, "marker": marker, "anchor": anchor,
+            "renewal": renewal, "archive_root": archive.parent, "archive": archive,
+            "live_root": live_root, "live": live, "webroot": webroot, "logs": logs,
+        }
+
+    def run_probe(self, mode: str, layout: dict, main_pid: str) -> dict:
+        domain = aio.PANEL_DOMAIN
+        ca_file = "/fixtures/ca/acme-trust.pem"
+        script = (
+            aio.acme_renewal_script(mode, domain, ca_file)
+            .replace(aio.ACME_RENEWAL_LOG_DIR, str(layout["logs"]))
+            .replace(aio.ACME_RENEWAL_DIR, str(layout["renewal"]))
+            .replace(aio.ACME_ARCHIVE_DIR, str(layout["archive_root"]))
+            .replace(aio.ACME_LINEAGE_DIR, str(layout["live_root"]))
+            .replace(aio.ACME_WEBROOT, str(layout["webroot"]))
+        )
+        _, _, body = script.partition("<<'PY'\n")
+        self.assertIn("import calendar", body, "the probe script must carry a heredoc body")
+        body = body.rsplit("\nPY\n", 1)[0]
+        result = subprocess.run(
+            [sys.executable, "-c", body, mode, domain, ca_file],
+            capture_output=True, text=True, check=False,
+            env={**os.environ, "PATH": f"{layout['bindir']}:{os.environ.get('PATH', '')}"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def spare_pid(self) -> str:
+        """A PID no process holds, so the probe reads its workers from pgrep."""
+        for candidate in range(30000, 40000):
+            if not Path(f"/proc/{candidate}").exists():
+                return str(candidate)
+        self.skipTest("no free PID to stub the NGINX master with")
+
+    def test_the_baseline_phase_reads_the_lineage_and_never_renews(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main_pid = self.spare_pid()
+            layout = self.build_target(Path(tmpdir), main_pid)
+            facts = self.run_probe("before", layout, main_pid)
+        self.assertEqual(facts["mode"], "before")
+        self.assertEqual(facts["lineage"]["values"]["authenticator"], "webroot")
+        self.assertEqual(facts["lineage"]["values"]["webroot_path"], aio.ACME_WEBROOT)
+        self.assertEqual(facts["live"]["serial"], "0A1B")
+        self.assertEqual(len(facts["archive"]), 1)
+        self.assertEqual(facts["service"]["worker_pids"], ["4243", "4244"])
+        self.assertNotIn("renewal", facts)
+
+    def test_the_renew_phase_renews_with_a_scoped_anchor_and_reads_the_new_leaf(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main_pid = self.spare_pid()
+            layout = self.build_target(Path(tmpdir), main_pid)
+            facts = self.run_probe("renew", layout, main_pid)
+            anchor = layout["anchor"].read_text(encoding="utf-8")
+        self.assertEqual(facts["renewal"]["returncode"], 0)
+        self.assertIn(f"http-01 challenge for {aio.PANEL_DOMAIN}", facts["certbot_log"])
+        self.assertIn("Successfully received certificate", facts["certbot_log"])
+        self.assertEqual(facts["live_after"]["serial"], "0C2D")
+        self.assertEqual(len(facts["archive_after"]), 2)
+        self.assertEqual([item["serial"] for item in facts["archive_after"]], ["0A1B", "0C2D"])
+        self.assertGreater(facts["live_after"]["not_before_epoch"], facts["live"]["not_before_epoch"])
+        self.assertEqual(facts["service"]["main_pid"], facts["service_after"]["main_pid"])
+        self.assertEqual(facts["service_after"]["worker_pids"], ["5100", "5101"])
+        self.assertEqual(anchor, "/fixtures/ca/acme-trust.pem",
+                         "the renewal has to be handed the fixture CA the install used")
+
+    def test_the_renewal_uses_the_lineages_own_name_and_a_forced_reissue(self):
+        script = aio.acme_renewal_script("renew", aio.PANEL_DOMAIN, "/ca.pem")
+        self.assertIn('"certbot", "renew", "--cert-name"', script)
+        self.assertIn("--force-renewal", script)
+        self.assertIn("--non-interactive", script)
+        self.assertIn("webroot", script)
+        self.assertIn(aio.ACME_WEBROOT, script)
 
 
 def certificate_day(days: float = 0) -> str:

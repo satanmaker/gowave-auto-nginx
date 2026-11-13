@@ -42,6 +42,8 @@ SUITES = {
         "test_podman_aio.TestNginxConfigCase",
         "test_podman_aio.TestTlsSurfaceCase",
         "test_podman_aio.TestTlsPolicyParse",
+        "test_podman_aio.TestAcmeRenewalCase",
+        "test_podman_aio.TestAcmeRenewalProbe",
         "test_podman_subscriptions.TestPanelSubscriptionProbe",
         "test_podman_subscriptions.TestSubscriptionClientProbe",
         "test_podman_subscriptions.TestSubscriptionCases",
