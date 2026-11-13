@@ -20,6 +20,7 @@ SUITES = {
         "test_node_integration.TestWorkerPayloadBootstrap",
         "test_node_integration.TestLocalNodeIdempotency",
         "test_node_integration.TestPinnedNodeInstaller",
+        "test_node_integration.TestWorkerReapply",
         "test_nginx_routing.TestNginxRouting",
         "test_nonroot_lint.TestNonrootLint",
         "test_backup_format_v1.TestBackupFormatV1",

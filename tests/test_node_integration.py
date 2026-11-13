@@ -1678,5 +1678,47 @@ class TestWorkerPayloadBootstrap(unittest.TestCase):
             self.assertNotIn("python3", only_openssl)
 
 
+class TestWorkerReapply(unittest.TestCase):
+    """`node reapply` reconverges a registered Worker without re-registering it.
+
+    The Worker keeps no copy of the payload it was installed with, so the only
+    way an operator can reconfigure an existing host is to stream that payload
+    again. The branch therefore takes the identity from state.json, leaves the
+    Panel's registration untouched, and keeps the secret out of argv.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = (REPO_ROOT / "gowave-auto.sh").read_text(encoding="utf-8")
+        cls.branch = cls.text.split("        reapply)", 1)[1].split("        *)", 1)[0]
+
+    def test_it_reads_the_registered_identity_instead_of_taking_it_as_arguments(self):
+        self.assertIn("$STATE_FILE", self.branch)
+        for field in ("address", "port", "workerDomain", "realityDomain"):
+            self.assertIn(field, self.branch)
+        self.assertNotIn("associate_node", self.branch)
+        self.assertNotIn("provision_config_profile", self.branch)
+
+    def test_it_streams_the_shipped_payload_with_only_the_registered_identity(self):
+        self.assertIn('"$SCRIPT_DIR/gowave-node-auto.sh" remote_payload', self.branch)
+        call = [line for line in self.branch.splitlines() if "remote_payload" in line]
+        self.assertEqual(len(call), 1, self.branch)
+        self.assertIn('"$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"', call[0])
+        self.assertNotIn("$secret_key", call[0])
+        self.assertNotIn("$acme_test_ca_b64", call[0])
+
+    def test_the_secret_and_the_test_ca_travel_only_in_the_environment(self):
+        self.assertIn('SECRET_KEY="$secret_key"', self.branch)
+        self.assertIn('GOWAVE_ACME_TEST_CA_B64="$acme_test_ca_b64"', self.branch)
+
+    def test_it_refuses_a_host_key_that_was_never_pinned(self):
+        self.assertIn("ssh-keygen -F", self.branch)
+        self.assertLess(self.branch.index("ssh-keygen -F"),
+                        self.branch.index("remote_payload"))
+
+    def test_the_cli_advertises_the_subcommand(self):
+        self.assertIn("node {add|list|reapply|rollback}", self.text)
+
+
 if __name__ == "__main__":
     unittest.main()

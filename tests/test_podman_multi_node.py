@@ -4289,7 +4289,7 @@ class _Acme80Podman:
     """Both roles' port 80 trees, the client's probes, and the domain change."""
 
     def __init__(self, master=None, master_after=None, worker=None, decoy=None,
-                 change_returncode=0):
+                 change_returncode=0, reapply_returncode=0):
         self.master = master if master is not None else _acme_vhost_output(_ACME_MASTER_VHOST_LINES)
         self.master_after = master_after if master_after is not None else (
             _acme_vhost_output(_ACME_POST_CHANGE_MASTER_VHOST_LINES)
@@ -4302,6 +4302,7 @@ class _Acme80Podman:
             "fullchain.pem;\n"
         )
         self.change_returncode = change_returncode
+        self.reapply_returncode = reapply_returncode
         self.changed = False
         self.scripts = []
 
@@ -4310,6 +4311,11 @@ class _Acme80Podman:
 
     def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
         self.scripts.append((container, script))
+        if "node reapply" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], self.reapply_returncode,
+                "", "state.json node 'worker-1' is missing address.\n"
+                if self.reapply_returncode else "")
         if "domain-change" in script:
             if self.change_returncode == 0:
                 self.changed = True
@@ -4351,10 +4357,8 @@ class _Acme80Host:
     worker_domain = "worker.testbed.internal"
     worker_reality_domain = "worker-reality.testbed.internal"
 
-    def __init__(self, status=None, node_add_returncode=0):
+    def __init__(self, status=None):
         self.status = status or {}
-        self.node_add_returncode = node_add_returncode
-        self.node_add_calls = 0
         self.zone_writes = []
         self.plan = type("Plan", (), {"target_ip": "10.89.0.10", "worker_ip": "10.89.0.11"})()
         self._zone = {"ttl": 60, "records": {}, "behavior": {"mode": "answer"}}
@@ -4381,12 +4385,6 @@ class _Acme80Host:
 
     def write_dns_zone(self, data):
         self.zone_writes.append(data)
-
-    def node_add(self, name=None):
-        self.node_add_calls += 1
-        return type("Outcome", (), {
-            "returncode": self.node_add_returncode, "stdout": "", "stderr": "",
-        })()
 
 
 class _Acme80Product:
@@ -4459,7 +4457,11 @@ class TestAcme80Case(unittest.TestCase):
         podman = _Acme80Podman()
         host = _Acme80Host()
         evidence = self.run_case(podman=podman, host=host)
-        self.assertEqual(host.node_add_calls, 1)
+        reapply = [script for container, script in podman.scripts
+                   if container == "aio-master" and "node reapply" in script]
+        self.assertEqual(len(reapply), 1)
+        self.assertIn("gowave-auto.sh node reapply", reapply[0])
+        self.assertEqual(evidence["reapply"]["returncode"], 0)
         for role in ("master", "worker"):
             with self.subTest(role=role):
                 self.assertEqual(evidence["roles"][role]["challenge"]["status"], 200)
@@ -4468,6 +4470,12 @@ class TestAcme80Case(unittest.TestCase):
                 self.assertEqual(
                     evidence["roles"][role]["after_reconfigure"]["challenge"]["status"], 200)
         self.assertTrue(evidence["roles"]["worker"]["routes_unchanged"])
+
+    def test_a_re_apply_that_fails_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=_Acme80Podman(reapply_returncode=1))
+        self.assertIn("node reapply` exited 1", str(caught.exception))
+        self.assertIn("is missing address", str(caught.exception))
 
     def test_a_re_provision_that_moves_the_workers_routes_is_rejected(self):
         class MovingPodman(_Acme80Podman):
