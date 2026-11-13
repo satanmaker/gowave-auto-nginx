@@ -1490,29 +1490,36 @@ class TestMultiNodeSuite(unittest.TestCase):
         self.assertEqual(suite[aio.TLS_CASE_ID].topology, "multi-node")
 
 
+_COVER_MASTER_IP = "10.89.0.10"
+_COVER_WORKER_IP = "10.89.0.11"
+
+
 class _CoverPodman:
     """A stub that answers with a role's decision output and its rendered vhost."""
 
     ROLES = {"aio-master": "master", "worker-01": "worker"}
 
-    def __init__(self, decision=None, configs=None, decision_returncode=0):
-        self.decision = decision
+    def __init__(self, decisions=None, configs=None, decision_returncode=0):
+        self.decisions = decisions if decisions is not None else {
+            "master": _cover_decision_output(
+                resolved=_COVER_MASTER_IP, own=(_COVER_MASTER_IP, "172.16.0.5")),
+            "worker": _cover_decision_output(
+                resolved=_COVER_MASTER_IP, own=(_COVER_WORKER_IP,)),
+        }
         self.decision_returncode = decision_returncode
         self.configs = configs if configs is not None else {
             "master": _cover_vhost("reality.testbed.internal"),
-            "worker": _cover_vhost("worker-reality.testbed.internal"),
+            "worker": _cover_vhost("worker-reality.testbed.internal", ""),
         }
         self.scripts = {}
 
     def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
-        self.scripts[self.ROLES[container]] = script
+        role = self.ROLES[container]
+        self.scripts[role] = script
         if self.decision_returncode:
             return subprocess.CompletedProcess(
                 ["bash", "-lc"], self.decision_returncode, "", "no such function")
-        stdout = self.decision
-        if stdout is None:
-            stdout = _cover_decision_output()
-        return subprocess.CompletedProcess(["bash", "-lc"], 0, stdout, "")
+        return subprocess.CompletedProcess(["bash", "-lc"], 0, self.decisions[role], "")
 
     def exec(self, container, argv, check=True, input_text=None, timeout=120):
         text = self.configs.get(self.ROLES[container])
@@ -1544,7 +1551,8 @@ def _cover_vhost(reality_domain, names="testbed.internal www.testbed.internal"):
     )
 
 
-def _cover_decision_output(answers=None, refusals=None):
+def _cover_decision_output(resolved="10.89.0.10", own=("10.89.0.10",),
+                           answers=None, refusals=None):
     answers = multi_node.COVER_APEX_ANSWERS if answers is None else answers
     if refusals is None:
         refusals = {
@@ -1552,7 +1560,8 @@ def _cover_decision_output(answers=None, refusals=None):
                     "so no cover apex exists."
             for domain in ("example.com", "localhost")
         }
-    lines = [f"derived\t{domain}\t{apex}" for domain, apex in answers.items()]
+    lines = [f"apex\t{resolved}"] + [f"self\t{address}" for address in own]
+    lines += [f"derived\t{domain}\t{apex}" for domain, apex in answers.items()]
     lines += [f"refusals\t{domain}\t{message}" for domain, message in refusals.items()]
     return "\n".join(lines) + "\n"
 
@@ -1563,12 +1572,19 @@ class TestCoverDeriveCase(unittest.TestCase):
     def _run(self, podman):
         return multi_node.case_cover_derive(_CoverProduct(podman))
 
-    def test_both_roles_report_the_derived_apex_and_its_two_names(self):
+    def test_both_roles_report_the_derived_apex_and_their_binding(self):
         evidence = self._run(_CoverPodman())
-        self.assertEqual(evidence["master"]["cover_domain"], "testbed.internal")
-        self.assertEqual(evidence["worker"]["cover_domain"], "testbed.internal")
         self.assertEqual(evidence["master"]["derived"], multi_node.COVER_APEX_ANSWERS)
-        self.assertIn("www.testbed.internal", evidence["worker"]["server_names"])
+        self.assertEqual(evidence["master"]["cover_domain"], "testbed.internal")
+        self.assertTrue(evidence["master"]["cover_names_bound"])
+        self.assertIn("www.testbed.internal", evidence["master"]["server_names"])
+        # The apex belongs to the Master here, so the Worker keeps a nameless
+        # decoy instead of a lineage its own port 80 could never validate.
+        self.assertEqual(evidence["worker"]["apex_resolved_to"], _COVER_MASTER_IP)
+        self.assertEqual(evidence["worker"]["own_addresses"], [_COVER_WORKER_IP])
+        self.assertFalse(evidence["worker"]["cover_names_bound"])
+        self.assertEqual(evidence["worker"]["server_names"],
+                         ["worker-reality.testbed.internal"])
         self.assertEqual(evidence["master"]["vhost"],
                          "/etc/nginx/conf.d/gowave-decoy.conf")
         self.assertEqual(evidence["worker"]["vhost"],
@@ -1589,8 +1605,9 @@ class TestCoverDeriveCase(unittest.TestCase):
         # roles' scripts are executed against the files this checkout ships.
         for role in ("master", "worker"):
             with self.subTest(role=role):
-                script = multi_node.cover_decision_script(role).replace(
-                    topology.REPO_IN_CONTAINER, str(REPO_ROOT))
+                script = multi_node.cover_decision_script(
+                    role, topology.PANEL_DOMAIN).replace(
+                        topology.REPO_IN_CONTAINER, str(REPO_ROOT))
                 res = subprocess.run(["bash", "-c", script],
                                      capture_output=True, text=True)
                 self.assertEqual(res.returncode, 0, res.stderr)
@@ -1601,10 +1618,13 @@ class TestCoverDeriveCase(unittest.TestCase):
 
     def test_an_unknown_role_is_refused(self):
         with self.assertRaises(ValueError):
-            multi_node.cover_decision_script("denial")
+            multi_node.cover_decision_script("denial", topology.PANEL_DOMAIN)
 
     def test_a_silent_refusal_is_rejected(self):
-        podman = _CoverPodman(decision=_cover_decision_output(refusals={}))
+        podman = _CoverPodman(decisions={
+            "master": _cover_decision_output(own=(_COVER_MASTER_IP,), refusals={}),
+            "worker": _cover_decision_output(own=(_COVER_WORKER_IP,)),
+        })
         with self.assertRaises(AssertionError) as caught:
             self._run(podman)
         self.assertIn("without saying why", str(caught.exception))
@@ -1613,20 +1633,30 @@ class TestCoverDeriveCase(unittest.TestCase):
         podman = _CoverPodman(configs={
             "master": _cover_vhost("reality.testbed.internal",
                                    "panel.testbed www.panel.testbed"),
-            "worker": _cover_vhost("worker-reality.testbed.internal"),
+            "worker": _cover_vhost("worker-reality.testbed.internal", ""),
         })
         with self.assertRaises(AssertionError) as caught:
             self._run(podman)
         self.assertIn("first-two-label derivation", str(caught.exception))
 
-    def test_a_decoy_bound_to_no_derived_apex_is_rejected(self):
+    def test_a_role_that_resolves_the_apex_must_name_it(self):
         podman = _CoverPodman(configs={
             "master": _cover_vhost("reality.testbed.internal", ""),
-            "worker": _cover_vhost("worker-reality.testbed.internal"),
+            "worker": _cover_vhost("worker-reality.testbed.internal", ""),
         })
         with self.assertRaises(AssertionError) as caught:
             self._run(podman)
-        self.assertIn("is not bound to the derived apex", str(caught.exception))
+        self.assertIn("so its decoy has to carry", str(caught.exception))
+
+    def test_a_role_that_does_not_resolve_the_apex_must_not_name_it(self):
+        podman = _CoverPodman(configs={
+            "master": _cover_vhost("reality.testbed.internal"),
+            "worker": _cover_vhost("worker-reality.testbed.internal",
+                                   "testbed.internal www.testbed.internal"),
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self._run(podman)
+        self.assertIn("must not name names it cannot validate", str(caught.exception))
 
     def test_a_decision_that_cannot_run_is_rejected(self):
         podman = _CoverPodman(decision_returncode=127)

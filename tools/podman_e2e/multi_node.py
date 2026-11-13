@@ -3886,35 +3886,45 @@ def cover_decision_loader(role: str) -> str:
     )
 
 
-def cover_decision_script(role: str) -> str:
-    """The apex table run through the copy of the decision the role ships."""
-    domains = " ".join(shlex.quote(domain) for domain in COVER_APEX_TABLE)
-    refusals = " ".join(shlex.quote(domain) for domain in ("example.com", "localhost"))
+def cover_decision_script(role: str, domain: str) -> str:
+    """The apex table run through the copy of the decision the role ships.
+
+    The same run also reports what the role's own resolver says about its derived
+    apex and which addresses the role holds, because the product only binds the
+    decoy to names that resolve here: a role whose apex points at another host is
+    supposed to keep a nameless decoy instead of a certificate that cannot issue.
+    """
+    domains = " ".join(shlex.quote(candidate) for candidate in COVER_APEX_TABLE)
+    refusals = " ".join(shlex.quote(candidate) for candidate in ("example.com", "localhost"))
     return f"""set -eu
 {cover_decision_loader(role)}
+apex=$(derive_cover_domain {shlex.quote(domain)})
+printf 'apex\\t%s\\n' "$(getent ahostsv4 "$apex" 2>/dev/null | awk 'NR==1 {{print $1}}' || true)"
+hostname -I 2>/dev/null | tr ' ' '\\n' | sed '/^$/d; s/^/self\\t/' || true
 for domain in {domains}; do
-    printf 'derived\t%s\t%s\n' "$domain" "$(derive_cover_domain "$domain")"
+    printf 'derived\\t%s\\t%s\\n' "$domain" "$(derive_cover_domain "$domain")"
 done
 for domain in {refusals}; do
-    printf 'refusals\t%s\t%s\n' "$domain" "$(cover_domain_for "$domain" "" 2>&1 >/dev/null)"
+    printf 'refusals\\t%s\\t%s\\n' "$domain" "$(cover_domain_for "$domain" "" 2>&1 >/dev/null)"
 done
 """
 
 
-def parse_cover_decision(output: str) -> Dict[str, Dict[str, str]]:
-    facts: Dict[str, Dict[str, str]] = {"derived": {}, "refusals": {}}
+def parse_cover_decision(output: str) -> Dict[str, Any]:
+    facts: Dict[str, Any] = {"derived": {}, "refusals": {}, "apex": "", "self": []}
     for line in output.splitlines():
         fields = line.split("\t")
-        if len(fields) != 3:
-            continue
-        kind, domain, value = fields
-        if kind in facts:
-            facts[kind][domain] = value
+        kind = fields[0] if fields else ""
+        if kind in ("derived", "refusals") and len(fields) == 3:
+            facts[kind][fields[1]] = fields[2]
+        elif kind == "apex" and len(fields) >= 2:
+            facts["apex"] = fields[1]
+        elif kind == "self" and len(fields) >= 2:
+            facts["self"].append(fields[1])
     return facts
 
 
-def require_cover_decision(case_id: str, role: str,
-                           facts: Dict[str, Dict[str, str]]) -> None:
+def require_cover_decision(case_id: str, role: str, facts: Dict[str, Any]) -> None:
     derived = facts["derived"]
     require(
         case_id,
@@ -3938,10 +3948,12 @@ def cover_vhost_names(case_id: str, role: str, path: str, text: str) -> List[str
     return match.group(1).split()
 
 
-def require_cover_vhost_names(case_id: str, role: str, names: Sequence[str],
-                              apex: str, domain: str) -> None:
+def require_cover_binding(case_id: str, role: str, names: Sequence[str],
+                          apex: str, domain: str, resolved: str,
+                          own_addresses: Sequence[str]) -> None:
+    """The decoy names the apex exactly when this role's own resolver points there."""
     # A first-two-label derivation would name the deployment's own subdomain, so
-    # it is checked first: its presence explains the wrong apex better than the
+    # it is checked first: its presence explains the wrong apex better than a
     # missing one does.
     first_two = ".".join(domain.rstrip(".").split(".")[:2])
     for wrong in (first_two, f"www.{first_two}"):
@@ -3951,11 +3963,22 @@ def require_cover_vhost_names(case_id: str, role: str, names: Sequence[str],
             f"{role}'s cover vhost carries {wrong!r}, the first-two-label derivation, "
             f"instead of the apex {apex!r}: {list(names)}",
         )
-    require(
-        case_id,
-        apex in names and f"www.{apex}" in names,
-        f"{role}'s cover vhost is not bound to the derived apex {apex!r}: {list(names)}",
-    )
+    binds_here = bool(resolved) and resolved in own_addresses
+    if binds_here:
+        require(
+            case_id,
+            apex in names and f"www.{apex}" in names,
+            f"{role} resolves {apex} to its own {resolved}, so its decoy has to carry "
+            f"{apex} and www.{apex}: {list(names)}",
+        )
+    else:
+        require(
+            case_id,
+            apex not in names and f"www.{apex}" not in names,
+            f"{role} does not resolve {apex} to itself ({resolved!r} against "
+            f"{list(own_addresses)}), so its decoy must not name names it cannot "
+            f"validate over HTTP-01: {list(names)}",
+        )
 
 
 def case_cover_derive(product: MultiNodeProduct) -> Dict[str, Any]:
@@ -3965,8 +3988,10 @@ def case_cover_derive(product: MultiNodeProduct) -> Dict[str, Any]:
     derivation is proven on each role's own copy of the decision. The table is run
     in the container because the refusal for a domain without a subdomain cannot
     be observed on an install whose domain has one. Each role's real decoy vhost
-    then has to be bound to the derived apex and its www name, and must not carry
-    the first-two-label derivation a wrong implementation would have produced.
+    then has to follow that role's own resolution of the derived apex: the names
+    are bound where the apex points here, and withheld where it points at another
+    host, because ACME validates the lineage over port 80 on this machine. Neither
+    role may carry the first-two-label derivation a wrong implementation produces.
     """
     host = product.require_worker()
     roles = (
@@ -3987,7 +4012,7 @@ def case_cover_derive(product: MultiNodeProduct) -> Dict[str, Any]:
         apex = ".".join(labels[-2:])
 
         decided = product.podman.exec_bash(
-            container, cover_decision_script(key), check=False, timeout=120,
+            container, cover_decision_script(key, domain), check=False, timeout=120,
         )
         require(
             COVER_DERIVE_CASE_ID,
@@ -4006,14 +4031,18 @@ def case_cover_derive(product: MultiNodeProduct) -> Dict[str, Any]:
             f"{(rendered.stderr or '').strip()[-500:]}",
         )
         names = cover_vhost_names(COVER_DERIVE_CASE_ID, label, path, rendered.stdout)
-        require_cover_vhost_names(COVER_DERIVE_CASE_ID, label, names, apex, domain)
+        require_cover_binding(COVER_DERIVE_CASE_ID, label, names, apex, domain,
+                              facts["apex"], facts["self"])
         evidence[key] = {
             "deployment_domain": domain,
             "cover_domain": apex,
+            "apex_resolved_to": facts["apex"],
+            "own_addresses": facts["self"],
             "derived": facts["derived"],
             "refusals": facts["refusals"],
             "vhost": path,
             "server_names": names,
+            "cover_names_bound": apex in names,
         }
     return evidence
 
