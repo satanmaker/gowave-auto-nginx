@@ -2,8 +2,8 @@
 
 ## 1. Repository Scaffolding, Audits, and Licensing Compliance
 
-- [x] 1.1 Document pinned upstream commit SHAs (`gowave` `6d2c357`, `gowave-node` `7b3514d`, `community-baseline` `community-baseline`), link implementation tasks directly to authoritative architectural blueprints in `design.md` (Stage 1-5, Section 2-4) to prevent specification duplication, and create project directory structure (`assets/`, `modules/`, `config/`, `tests/`, `tools/`, `.github/workflows/`)
-- [x] 1.2 Add `LICENSE` (GNU GPL-3.0) with upstream compatibility notices and complete `THIRD_PARTY_NOTICES.md` retaining upstream copyright attribution for `community-baseline`, `mozaroc`, `MHSanaei`, and `LibreSpeed`
+- [x] 1.1 Document pinned upstream commit SHAs (`gowave` `6d2c357`, `gowave-node` `7b3514d`), link implementation tasks directly to authoritative architectural blueprints in `design.md` (Stage 1-5, Section 2-4) to prevent specification duplication, and create project directory structure (`assets/`, `modules/`, `config/`, `tests/`, `tools/`, `.github/workflows/`)
+- [x] 1.2 Add `LICENSE` (GNU GPL-3.0) with upstream compatibility notices and complete `THIRD_PARTY_NOTICES.md` retaining upstream copyright attribution for reviewed community components
 - [x] 1.3 Implement `AGENTS.md` and `CONTRIBUTING.md` establishing modular code standards, shell formatting rules, and zero-leak credential requirements
 
 ## 2. Base OS, Package Inventory, and Environment Detection

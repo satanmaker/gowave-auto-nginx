@@ -70,4 +70,4 @@ The test suite enforces strict EUID privilege separation:
 
 - Original code is licensed under **GNU GPL-3.0-only**.
 - Interactions with upstream GoWave components (licensed under AGPL-3.0) occur exclusively across external network and REST APIs.
-- Retain upstream attribution for `community-baseline`, `mozaroc`, `MHSanaei`, and `LibreSpeed` in `THIRD_PARTY_NOTICES.md`.
+- Retain upstream attribution for `mozaroc`, `MHSanaei`, and `LibreSpeed` in `THIRD_PARTY_NOTICES.md`.
