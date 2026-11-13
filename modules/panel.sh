@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # modules/panel.sh - GoWave Panel native deployment, environment, and service lifecycle
-set -euo pipefail
+set -Eeuo pipefail
+
+# Sourced here as well as by the entrypoint so the download path can be tested
+# by sourcing this module alone; tempdir.sh tolerates a second sourcing.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tempdir.sh"
 
 GOWAVE_INSTALL_DIR="/opt/gowave"
 GOWAVE_DEFAULT_VERSION="latest"
@@ -68,7 +72,7 @@ download_panel_release() {
     mkdir -p "$target_dir"
     local tmp_dir
     tmp_dir=$(mktemp -d "/tmp/gowave-download-XXXXXX")
-    trap '[[ -n "${tmp_dir:-}" ]] && rm -rf "$tmp_dir"' RETURN
+    track_temp_dir "$tmp_dir"
 
     local base_url="https://github.com/${GOWAVE_REPO}/releases"
     local tag_url="$base_url/latest/download"
@@ -207,7 +211,7 @@ except Exception:
     fi
     chmod 1770 "$target_dir" 2>/dev/null || chmod 0770 "$target_dir" || true
     echo "GoWave Panel binaries installed successfully in $target_dir."
-    rm -rf "$tmp_dir"
+    release_temp_dir "$tmp_dir"
 }
 
 retain_panel_data_ownership() {

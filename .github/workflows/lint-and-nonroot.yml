@@ -43,6 +43,25 @@ jobs:
         run: |
           shellcheck --severity=error gowave-auto.sh gowave-node-auto.sh assets/backup/gowave-backup.sh modules/*.sh tests/*.sh
 
+      # `--severity=error` structurally hides the warning class that covers
+      # suppressed errexit (SC2310) and combined declare-and-assign (SC2155), and
+      # those optional checks only exist in newer ShellCheck than the runner
+      # ships. Report them without failing the build yet.
+      - name: ShellCheck advisory checks
+        continue-on-error: true
+        run: |
+          opts=()
+          for opt in check-set-e-suppressed check-extra-masked-returns deprecate-which; do
+            printf '#!/bin/sh\n' > /tmp/shellcheck-probe.sh
+            if shellcheck -o "$opt" /tmp/shellcheck-probe.sh >/dev/null 2>&1; then
+              opts+=(-o "$opt")
+            fi
+          done
+          if ((${#opts[@]})); then
+            shellcheck "${opts[@]}" gowave-auto.sh gowave-node-auto.sh \
+              assets/backup/gowave-backup.sh modules/*.sh tests/*.sh
+          fi
+
       - name: OpenSpec validation
         run: |
           command -v openspec

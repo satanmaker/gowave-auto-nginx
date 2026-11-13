@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tests/podman_testbed.sh - 4-Distribution Systemd Container Testbed & Multi-Node E2E
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

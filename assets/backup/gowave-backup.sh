@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # assets/backup/gowave-backup.sh - Hardened Backup & Restore Format v1
 # Usage: gowave-backup.sh {backup [--type panel|node] [output]|restore <archive>|inspect <archive>|verify <archive>}
-set -euo pipefail
+set -Eeuo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [[ -f "$SCRIPT_DIR/modules/lock.sh" ]] && source "$SCRIPT_DIR/modules/lock.sh"
+[[ -f "$SCRIPT_DIR/modules/tempdir.sh" ]] && source "$SCRIPT_DIR/modules/tempdir.sh"
 BACKUP_STORE="${BACKUP_STORE:-/var/backups/gowave}"
 RECOVERY_STORE="${RECOVERY_STORE:-/var/lib/gowave-auto-nginx/recovery}"
 JOURNAL_FILE="${JOURNAL_FILE:-${RECOVERY_STORE}/journal.json}"
@@ -280,7 +281,7 @@ create_panel_backup() {
 
     local tmp_staging
     tmp_staging=$(mktemp -d "/tmp/gowave-backup-XXXXXX")
-    trap 'rm -rf "$tmp_staging"' RETURN
+    track_temp_dir "$tmp_staging"
 
     mkdir -p "$tmp_staging/files/opt/gowave" \
              "$tmp_staging/files/etc/nginx/conf.d" \
@@ -385,7 +386,7 @@ create_node_backup() {
 
     local tmp_staging
     tmp_staging=$(mktemp -d "/tmp/gowave-node-backup-XXXXXX")
-    trap 'rm -rf "$tmp_staging"' RETURN
+    track_temp_dir "$tmp_staging"
 
     mkdir -p "$tmp_staging/files/opt/gowave-node"
     local files_meta=()
@@ -432,7 +433,7 @@ cmd_restore() {
 
     local staging_dir
     staging_dir=$(mktemp -d "/tmp/gowave-restore-staging-XXXXXX")
-    trap 'rm -rf "$staging_dir"' RETURN
+    track_temp_dir "$staging_dir"
 
     echo "Running 15-point preflight archive security validation..."
     validate_archive_py "$archive" "$expected_type" "$staging_dir"

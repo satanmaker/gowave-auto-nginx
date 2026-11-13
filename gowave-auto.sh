@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # gowave-auto.sh - Main GoWave Auto NGINX Lifecycle Manager and CLI Entrypoint
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCK_FILE="/run/lock/gowave-auto.lock"
@@ -10,6 +10,7 @@ CREDENTIALS_FILE="/root/gowave-credentials.txt"
 
 # Source submodules
 source "$SCRIPT_DIR/modules/lock.sh"
+source "$SCRIPT_DIR/modules/tempdir.sh"
 source "$SCRIPT_DIR/modules/address.sh"
 source "$SCRIPT_DIR/modules/os.sh"
 source "$SCRIPT_DIR/modules/preflight.sh"
@@ -46,6 +47,7 @@ verify_public_tls_sni() {
         echo "Fatal: Could not create a temporary directory for TLS verification." >&2
         return 1
     }
+    track_temp_dir "$workdir"
     # `systemctl reload nginx` only hands the new configuration to the master:
     # the previous worker generation keeps its own certificates until it drains,
     # so the first handshake after a reload can still be answered with what the
@@ -86,7 +88,7 @@ verify_public_tls_sni() {
                     trust_check=$(openssl verify "${ca_opts[@]}" "$workdir/leaf.pem" 2>&1 || true)
                 fi
                 if [[ "$trust_check" == *": OK" ]]; then
-                    rm -rf -- "$workdir"
+                    release_temp_dir "$workdir"
                     return 0
                 fi
                 served=$(printf '%s' "$trust_check" | tr -s '[:space:]' ' ' | cut -c1-300)
@@ -118,7 +120,7 @@ verify_public_tls_sni() {
         echo "  Handshake log:" >&2
         tail -n 5 "$workdir/handshake.log" >&2 || true
     fi
-    rm -rf -- "$workdir"
+    release_temp_dir "$workdir"
     return 1
 }
 

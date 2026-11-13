@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # modules/nginx.sh - NGINX Stream SNI demultiplexing, TLS termination, and camouflage fallback
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -f "$SCRIPT_DIR/modules/os.sh" ]]; then

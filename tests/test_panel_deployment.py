@@ -28,7 +28,13 @@ def verify_probe_script(directory: Path) -> Path:
     text = (REPO_ROOT / "gowave-auto.sh").read_text(encoding="utf-8")
     body = text[text.index("verify_public_tls_sni() {"):text.index("acquire_lock() {")]
     script = Path(directory) / "verify_public_tls_sni.sh"
-    script.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body, encoding="utf-8")
+    # The probe registers its scratch directory with the temp-dir module, so the
+    # slice has to carry that dependency to run as it does in the entrypoint.
+    script.write_text(
+        "#!/usr/bin/env bash\nset -Eeuo pipefail\n"
+        f'source {shlex.quote(str(REPO_ROOT / "modules" / "tempdir.sh"))}\n' + body,
+        encoding="utf-8",
+    )
     return script
 
 

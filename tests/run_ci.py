@@ -24,6 +24,7 @@ SUITES = {
         "test_node_integration.TestWorkerDeployHookOwnership",
         "test_nginx_routing.TestNginxRouting",
         "test_nonroot_lint.TestNonrootLint",
+        "test_nonroot_lint.TestShellFailurePaths",
         "test_backup_format_v1.TestBackupFormatV1",
         "test_backup_format_v1.TestIncompleteArchiveRejection",
         "test_user_links.TestUserLinks",
