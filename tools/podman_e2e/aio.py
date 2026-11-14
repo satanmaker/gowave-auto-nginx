@@ -21,7 +21,15 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from . import acme_fixture, budget, client_trust, matrix, panel_surface, topology
+from . import (
+    acme_fixture,
+    budget,
+    client_trust,
+    matrix,
+    panel_surface,
+    topology,
+    traffic_probe,
+)
 from .podman import wait_until
 from .runner import Case, CaseBlocked, require
 
@@ -5013,6 +5021,36 @@ def case_data_plane(
     require(case_id, facts.get("sni") == expectations["sni"],
             f"the served {client} outbound carries SNI {facts.get('sni')!r} instead of the "
             f"{expectations['sni']!r} the {inbound['id']} inbound was issued for")
+    # Two budgets, not one: the handshake may spend half the request's allowance
+    # and never less than the floor, so one slow resolver answer costs the
+    # handshake rather than the exchange.
+    connect_budget = int(facts.get("connect_budget_seconds") or 0)
+    transfer_budget = int(facts.get("transfer_budget_seconds") or 0)
+    require(case_id, connect_budget >= traffic_probe.MIN_CONNECT_BUDGET_SECONDS,
+            f"the {inbound['id']} request gave its handshake {connect_budget}s, below the "
+            f"{traffic_probe.MIN_CONNECT_BUDGET_SECONDS}s a resolver stall needs")
+    require(case_id, 2 * connect_budget >= transfer_budget,
+            f"the {inbound['id']} request gave its handshake {connect_budget}s of a "
+            f"{transfer_budget}s transfer budget, less than half of it")
+    if client == "mihomo":
+        # The config Mihomo was launched with is read back from the file it
+        # loaded, so this states what the engine bound rather than what the
+        # preparation meant to bind.
+        require(case_id, facts.get("mihomo_allow_lan") is True,
+                f"the Mihomo config that carried the {inbound['id']} payload declares "
+                f"allow-lan {facts.get('mihomo_allow_lan')!r} instead of false")
+        require(case_id, str(facts.get("mihomo_controller") or "").startswith("127.0.0.1:"),
+                f"the Mihomo controller that served the {inbound['id']} payload is bound to "
+                f"{facts.get('mihomo_controller')!r} instead of 127.0.0.1")
+        require(case_id, facts.get("mihomo_preserved") is True,
+                "the launched Mihomo config does not preserve every served proxy, group and rule")
+        listeners = {
+            key: facts.get(f"mihomo_{key}_port")
+            for key in ("mixed", "socks", "redir")
+            if facts.get(f"mihomo_{key}_port") is not None
+        }
+        require(case_id, len(set(listeners.values())) == len(listeners),
+                f"the Mihomo listeners share a port: {listeners}")
 
     evidence = {
         "inbound": inbound["id"],
@@ -5024,7 +5062,17 @@ def case_data_plane(
         "status": facts.get("status"),
         "source_ip": facts.get("source_ip"),
         "outbounds": facts.get("outbounds"),
+        "connect_budget_seconds": facts.get("connect_budget_seconds"),
+        "transfer_budget_seconds": facts.get("transfer_budget_seconds"),
     }
+    if client == "mihomo":
+        evidence["mihomo_allow_lan"] = facts.get("mihomo_allow_lan")
+        evidence["mihomo_controller"] = facts.get("mihomo_controller")
+        evidence["mihomo_mixed_port"] = facts.get("mihomo_mixed_port")
+        evidence["mihomo_socks_port"] = facts.get("mihomo_socks_port")
+        evidence["mihomo_redir_port"] = facts.get("mihomo_redir_port")
+        evidence["mihomo_proxies"] = facts.get("mihomo_proxies")
+        evidence["mihomo_rules"] = facts.get("mihomo_rules")
     if node:
         evidence["node"] = node
     return evidence

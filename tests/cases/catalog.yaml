@@ -1843,8 +1843,54 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: AIO-DP-REALITY-xray
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: MN-DP-master-REALITY-xray
   promotion_target: null
 - id: DP-03
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -1915,8 +1961,54 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: AIO-DP-REALITY-mihomo
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: MN-DP-master-REALITY-mihomo
   promotion_target: null
 - id: DP-06
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -4983,7 +5075,26 @@ cases:
   drivers:
     aio:
       driver: aio:_data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-REALITY-mihomo
   requirement: Real client data-plane verification
@@ -5004,7 +5115,26 @@ cases:
   drivers:
     aio:
       driver: aio:_data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-XHTTP-xray
   requirement: Real client data-plane verification
@@ -5025,7 +5155,26 @@ cases:
   drivers:
     aio:
       driver: aio:_data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-XHTTP-mihomo
   requirement: Real client data-plane verification
@@ -5046,7 +5195,26 @@ cases:
   drivers:
     aio:
       driver: aio:_data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-WS-xray
   requirement: Real client data-plane verification
@@ -5067,7 +5235,26 @@ cases:
   drivers:
     aio:
       driver: aio:_data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-WS-mihomo
   requirement: Real client data-plane verification
@@ -5088,7 +5275,26 @@ cases:
   drivers:
     aio:
       driver: aio:_data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-TROJAN-GRPC-xray
   requirement: Real client data-plane verification
@@ -5109,7 +5315,26 @@ cases:
   drivers:
     aio:
       driver: aio:_data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-TROJAN-GRPC-mihomo
   requirement: Real client data-plane verification
@@ -5130,7 +5355,26 @@ cases:
   drivers:
     aio:
       driver: aio:_data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-VISION-xray
   requirement: Real client data-plane verification
@@ -5151,7 +5395,26 @@ cases:
   drivers:
     aio:
       driver: aio:_data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-VISION-mihomo
   requirement: Real client data-plane verification
@@ -5172,7 +5435,26 @@ cases:
   drivers:
     aio:
       driver: aio:_data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-MATRIX
   requirement: Real client data-plane verification
@@ -5222,7 +5504,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-REALITY-mihomo
   requirement: Real client data-plane verification
@@ -5244,7 +5545,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-XHTTP-xray
   requirement: Real client data-plane verification
@@ -5266,7 +5586,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-XHTTP-mihomo
   requirement: Real client data-plane verification
@@ -5288,7 +5627,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-WS-xray
   requirement: Real client data-plane verification
@@ -5310,7 +5668,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-WS-mihomo
   requirement: Real client data-plane verification
@@ -5332,7 +5709,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-TROJAN-GRPC-xray
   requirement: Real client data-plane verification
@@ -5354,7 +5750,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-TROJAN-GRPC-mihomo
   requirement: Real client data-plane verification
@@ -5376,7 +5791,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-VISION-xray
   requirement: Real client data-plane verification
@@ -5398,7 +5832,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-VISION-mihomo
   requirement: Real client data-plane verification
@@ -5420,7 +5873,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-REALITY-xray
   requirement: Real client data-plane verification
@@ -5442,7 +5914,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-REALITY-mihomo
   requirement: Real client data-plane verification
@@ -5464,7 +5955,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-XHTTP-xray
   requirement: Real client data-plane verification
@@ -5486,7 +5996,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-XHTTP-mihomo
   requirement: Real client data-plane verification
@@ -5508,7 +6037,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-WS-xray
   requirement: Real client data-plane verification
@@ -5530,7 +6078,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-WS-mihomo
   requirement: Real client data-plane verification
@@ -5552,7 +6119,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-TROJAN-GRPC-xray
   requirement: Real client data-plane verification
@@ -5574,7 +6160,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-TROJAN-GRPC-mihomo
   requirement: Real client data-plane verification
@@ -5596,7 +6201,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-VISION-xray
   requirement: Real client data-plane verification
@@ -5618,7 +6242,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-VISION-mihomo
   requirement: Real client data-plane verification
@@ -5640,7 +6283,26 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:data_plane_case
-      evidence: []
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-MATRIX
   requirement: Real client data-plane verification

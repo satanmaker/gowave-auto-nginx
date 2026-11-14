@@ -25,7 +25,7 @@ from tests.test_podman_subscriptions import (  # noqa: E402
     engine_share_links, installed_product, panel_result, served_facts,
 )
 from tests.test_podman_topology import FakePodman  # noqa: E402
-from tools.podman_e2e import aio, matrix, multi_node, topology  # noqa: E402
+from tools.podman_e2e import aio, matrix, multi_node, topology, traffic_probe  # noqa: E402
 
 
 class TestSubscriptionDomains(unittest.TestCase):
@@ -424,6 +424,8 @@ class TestWorkerDataPlaneCase(unittest.TestCase):
             "request_id_match": True,
             "body_match": True,
             "source_ip": str(DATA_PLAN.data_worker_ip),
+            "connect_budget_seconds": traffic_probe.connect_budget_seconds(),
+            "transfer_budget_seconds": traffic_probe.REQUEST_TIMEOUT_SECONDS,
             "reason": "",
         }
         facts.update(overrides)

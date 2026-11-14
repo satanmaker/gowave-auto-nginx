@@ -122,6 +122,8 @@ def traffic_transfers():
                 "request_id_match": True,
                 "body_match": True,
                 "source_ip": PLAN.target_ip,
+                "connect_budget_seconds": traffic_probe.connect_budget_seconds(),
+                "transfer_budget_seconds": traffic_probe.REQUEST_TIMEOUT_SECONDS,
             })
     return transfers
 
@@ -205,18 +207,112 @@ class TestTrafficProbeHelpers(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="gowave-traffic-ca-") as directory:
             ca_file = Path(directory) / "issued-root.pem"
             ca_file.write_text(PEM, encoding="utf-8")
-            config = traffic_probe.mihomo_config(SERVED_MIHOMO, str(ca_file))
-            self.assertTrue(config.startswith(SERVED_MIHOMO.rstrip("\n") + "\n"))
+            config, planned = traffic_probe.mihomo_config(SERVED_MIHOMO, str(ca_file))
+            body = SERVED_MIHOMO[SERVED_MIHOMO.index("proxies:"):].rstrip("\n")
+            self.assertIn(body, config, "the served proxies, groups and rules are copied through")
             anchor = yaml.safe_load(config)["tls"][client_trust.MIHOMO_CA_KEY]
             self.assertEqual(len(anchor), 1)
             self.assertIn("BEGIN CERTIFICATE", anchor[0])
             self.assertEqual(anchor[0].strip(), PEM.strip())
             self.assertNotIn(str(ca_file), config, "the key takes PEM documents, not paths")
+            served = subscription_probe.scan_mihomo(SERVED_MIHOMO)
+            self.assertEqual(planned["proxies"], served["proxies"])
+            self.assertEqual(planned["rules"], served["rules"])
+            self.assertEqual(planned["groups"], served["groups"])
 
     def test_a_served_yaml_that_already_declares_tls_is_rejected_not_rewritten(self):
         with self.assertRaises(SystemExit) as caught:
             traffic_probe.mihomo_config("tls:\n  insecure: true\n", "/fixtures/ca/issued-root.pem")
         self.assertIn("already declares 'tls'", str(caught.exception))
+
+    def test_the_request_budget_is_split_into_a_handshake_and_a_transfer(self):
+        self.assertEqual(traffic_probe.connect_budget_seconds(30), 15)
+        self.assertEqual(traffic_probe.connect_budget_seconds(900), 450)
+        self.assertEqual(traffic_probe.connect_budget_seconds(10), 10)
+        self.assertEqual(
+            traffic_probe.connect_budget_seconds(4), traffic_probe.MIN_CONNECT_BUDGET_SECONDS,
+            "a transfer budget under the floor still leaves the handshake the floor",
+        )
+
+    def test_the_dial_spends_the_connect_budget_then_the_transfer_budget(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            connection = traffic_probe.dial("127.0.0.1", listener.getsockname()[1], timeout=900)
+            try:
+                self.assertEqual(
+                    connection.sock.gettimeout(), 900,
+                    "an established connection carries the transfer budget, not the handshake one",
+                )
+            finally:
+                connection.close()
+
+    def test_the_launched_config_binds_collision_free_loopback_listeners(self):
+        served = "\n".join([
+            "mixed-port: 7890",
+            "socks-port: 7891",
+            "redir-port: 7892",
+            "allow-lan: true",
+            "external-controller: 0.0.0.0:9090",
+            "proxies:",
+            "  - name: vless-reality",
+            "    type: vless",
+            "rules:",
+            "  - MATCH,DIRECT",
+            "",
+        ])
+        with tempfile.TemporaryDirectory(prefix="gowave-traffic-ca-") as directory:
+            ca_file = Path(directory) / "issued-root.pem"
+            ca_file.write_text(PEM, encoding="utf-8")
+            config, planned = traffic_probe.mihomo_config(served, str(ca_file))
+            path = Path(directory) / "prepared.yaml"
+            path.write_text(config, encoding="utf-8")
+            bound = traffic_probe.read_mihomo_config(path, subscription_probe.scan_mihomo(served))
+        self.assertNotEqual(planned["mixed_port"], 7890, "the port the Panel names is not reused")
+        self.assertNotEqual(planned["socks_port"], 7891)
+        self.assertNotEqual(planned["redir_port"], 7892)
+        self.assertIsNone(planned["tproxy_port"],
+                          "a listener the served document does not declare is not invented")
+        self.assertEqual(
+            len({planned["mixed_port"], planned["socks_port"], planned["redir_port"],
+                 planned["controller_port"]}), 4,
+            "no two listeners share a port",
+        )
+        self.assertEqual(bound["mixed_port"], planned["mixed_port"])
+        self.assertEqual(bound["allow_lan"], "false")
+        self.assertEqual(bound["bind_address"], "127.0.0.1")
+        self.assertEqual(bound["controller"], f"127.0.0.1:{planned['controller_port']}")
+        self.assertTrue(bound["preserved"])
+
+    def test_a_control_endpoint_outside_loopback_stops_the_run(self):
+        served = "proxies:\n  - name: vless-reality\n    type: vless\n"
+        text = served + "external-controller: 0.0.0.0:9090\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "served.yaml"
+            path.write_text(text, encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                traffic_probe.read_mihomo_config(path, subscription_probe.scan_mihomo(served))
+        self.assertIn("would bind outside loopback", str(caught.exception))
+        self.assertIn("external-controller=0.0.0.0:9090", str(caught.exception))
+
+    def test_one_port_for_two_listeners_stops_the_run(self):
+        served = "proxies:\n  - name: vless-reality\n    type: vless\n"
+        text = served + "mixed-port: 9000\nsocks-port: 9000\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "served.yaml"
+            path.write_text(text, encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                traffic_probe.read_mihomo_config(path, subscription_probe.scan_mihomo(served))
+        self.assertIn("assigns one port to two listeners", str(caught.exception))
+        self.assertIn("mixed-port=9000", str(caught.exception))
+
+    def test_a_document_the_preparation_rewrote_is_not_what_preservation_means(self):
+        served = "proxies:\n  - name: vless-reality\n    type: vless\nrules:\n  - MATCH,DIRECT\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "served.yaml"
+            path.write_text(served + "mixed-port: 7890\nrules:\n  - MATCH,PROXY\n", encoding="utf-8")
+            bound = traffic_probe.read_mihomo_config(path, subscription_probe.scan_mihomo(served))
+        self.assertFalse(bound["preserved"], "a rule the Panel never issued is not a preserved rule")
 
     def test_the_matrix_reports_the_tuples_the_transfers_covered(self):
         transfers = traffic_transfers()
@@ -470,6 +566,11 @@ class TestTrafficProbeTransfer(unittest.TestCase):
         second = traffic_probe.transfer(None, self.destination, self.label, "xray")
         self.assertNotEqual(first["request_id"], second["request_id"])
 
+    def test_a_delivered_transfer_states_the_budget_each_phase_had(self):
+        report = traffic_probe.transfer(None, self.destination, self.label, "xray", timeout=900)
+        self.assertEqual(report["connect_budget_seconds"], 450)
+        self.assertEqual(report["transfer_budget_seconds"], 900)
+
     def test_a_body_the_endpoint_did_not_receive_is_reported_as_a_mismatch(self):
         EchoStub.response = {"match": True, "body_sha256": "0" * 64}
         report = traffic_probe.transfer(None, self.destination, self.label, "xray")
@@ -506,6 +607,16 @@ class TestTrafficProbeTransfer(unittest.TestCase):
         self.assertEqual(report["engine"], "xray")
         self.assertTrue(report["reason"])
         self.assertEqual(EchoStub.received, [])
+
+    def test_a_refusal_states_the_budget_the_handshake_had(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed = probe.getsockname()[1]
+        report = traffic_probe.transfer(
+            None, f"127.0.0.1:{closed}", self.label, "xray", expect_refusal=True, timeout=900,
+        )
+        self.assertEqual(report["connect_budget_seconds"], 450)
+        self.assertEqual(report["transfer_budget_seconds"], 900)
 
     def test_a_transfer_the_endpoint_answered_is_delivered_even_when_refusal_is_expected(self):
         report = traffic_probe.transfer(
@@ -574,11 +685,13 @@ class TestTrafficProbeTransferOne(unittest.TestCase):
             {"engine": "xray", "tag": "proxy", "network": "tcp", "security": "reality",
              "server": topology.PANEL_DOMAIN,
              "sni": topology.REALITY_DOMAIN, "status": 200, "delivered": True,
-             "request_id_match": True, "body_match": True, "source_ip": PLAN.data_target_ip},
+             "request_id_match": True, "body_match": True, "source_ip": PLAN.data_target_ip,
+             "connect_budget_seconds": 15, "transfer_budget_seconds": 30},
             {"engine": "xray", "tag": "proxy", "network": "ws", "security": "tls",
              "server": topology.PANEL_DOMAIN,
              "sni": topology.PANEL_DOMAIN, "status": 200, "delivered": True,
-             "request_id_match": True, "body_match": True, "source_ip": PLAN.data_target_ip},
+             "request_id_match": True, "body_match": True, "source_ip": PLAN.data_target_ip,
+             "connect_budget_seconds": 15, "transfer_budget_seconds": 30},
         ]
 
     def fake(self, labels, calls=None):
@@ -610,6 +723,9 @@ class TestTrafficProbeTransferOne(unittest.TestCase):
         self.assertTrue(facts["delivered"])
         self.assertEqual(facts["source_ip"], PLAN.data_target_ip)
         self.assertEqual(facts["reason"], "")
+        self.assertEqual(facts["connect_budget_seconds"], 15,
+                         "the scope reports the budget the transfer ran under")
+        self.assertEqual(facts["transfer_budget_seconds"], 30)
 
     def test_a_tuple_no_outbound_matches_is_a_missing_case_not_a_free_pass(self):
         with self.assertRaises(SystemExit) as caught:
@@ -934,6 +1050,80 @@ class TestTrafficProbeReadiness(unittest.TestCase):
         self.assertIn("destination address is required", str(caught.exception))
 
 
+class LaunchedEngine:
+    """The Mihomo process, stood in for by the facts the launch would produce."""
+
+    commands = []
+
+    def __init__(self, command, log_path, pid_path, port, label):
+        LaunchedEngine.commands.append((command, port, label))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exception):
+        return False
+
+
+class TestMihomoLaunch(unittest.TestCase):
+    """The config Mihomo is started with is the one the preparation wrote."""
+
+    def launched(self, served=SERVED_MIHOMO, destination="203.0.114.30:18080"):
+        with tempfile.TemporaryDirectory() as directory:
+            workdir = Path(directory)
+            ca_file = workdir / "issued-root.pem"
+            ca_file.write_text(PEM, encoding="utf-8")
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    traffic_probe.subscription_probe, "read_payload",
+                    lambda _payload_dir, _name: served,
+                ))
+                stack.enter_context(mock.patch.object(traffic_probe, "Engine", LaunchedEngine))
+                stack.enter_context(mock.patch.object(
+                    traffic_probe, "wait_port", lambda *args, **kwargs: None))
+                stack.enter_context(mock.patch.object(
+                    traffic_probe, "select_mihomo_proxy", lambda *args, **kwargs: None))
+                stack.enter_context(mock.patch.object(
+                    traffic_probe, "transfer",
+                    lambda port, target, label, engine, *args, **kwargs: {
+                        "engine": engine, **label, "request_id": "req-1",
+                        "delivered": True, "status": 200,
+                        "request_id_match": True, "body_match": True,
+                        "source_ip": PLAN.target_ip,
+                    },
+                ))
+                return traffic_probe.mihomo_transfers(
+                    "/payload", str(ca_file), destination, workdir,
+                )
+
+    def test_the_launched_document_is_read_back_not_trusted_from_the_plan(self):
+        transfers = self.launched()
+        self.assertEqual(len(transfers), 2, "one transfer per served proxy")
+        facts = transfers[0]
+        self.assertTrue(facts["mihomo_allow_lan"])
+        self.assertTrue(str(facts["mihomo_controller"]).startswith("127.0.0.1:"))
+        self.assertEqual(facts["mihomo_proxies"], 2)
+        self.assertEqual(facts["mihomo_rules"], 1)
+        self.assertTrue(facts["mihomo_preserved"])
+        listeners = [
+            facts[f"mihomo_{name}_port"] for name in ("mixed", "socks", "redir")
+            if facts.get(f"mihomo_{name}_port") is not None
+        ]
+        self.assertEqual(len(set(listeners)), len(listeners))
+        self.assertNotIn(7890, listeners, "the Panel's mixed-port is not reused")
+        command, port, label = LaunchedEngine.commands[-1]
+        self.assertEqual(label, "mihomo")
+        self.assertEqual(port, facts["mihomo_mixed_port"],
+                         "the engine is waited for on the port it actually bound")
+        self.assertEqual(command[0], traffic_probe.MIHOMO_BINARY)
+        self.assertIn("-f", command, "the engine is started on the prepared file")
+
+    def test_a_served_document_with_no_proxy_is_refused_before_anything_starts(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.launched(served="rules:\n  - MATCH,DIRECT\n")
+        self.assertIn("declares no proxy", str(caught.exception))
+
+
 class ScriptedPodman:
     """Podman stub that answers only the host-side subscription fetch."""
 
@@ -1015,9 +1205,23 @@ def data_plane_facts(**overrides):
         "request_id_match": True,
         "body_match": True,
         "source_ip": PLAN.data_target_ip,
+        "connect_budget_seconds": traffic_probe.connect_budget_seconds(),
+        "transfer_budget_seconds": traffic_probe.REQUEST_TIMEOUT_SECONDS,
         "reason": "",
     }
     facts.update(overrides)
+    if facts["engine"] == "mihomo":
+        for key, value in {
+            "mihomo_allow_lan": True,
+            "mihomo_controller": "127.0.0.1:39090",
+            "mihomo_mixed_port": 7890,
+            "mihomo_socks_port": 7891,
+            "mihomo_redir_port": 7892,
+            "mihomo_proxies": 2,
+            "mihomo_rules": 1,
+            "mihomo_preserved": True,
+        }.items():
+            facts.setdefault(key, value)
     return facts
 
 
@@ -1052,6 +1256,7 @@ class TestDataPlaneCase(unittest.TestCase):
         inbound = self.inbound(inbound_id)
         if facts is None:
             facts = data_plane_facts(
+                engine=client,
                 network=str(inbound["transport"]),
                 security=str(inbound["security"]),
                 sni=served_sni(inbound),
@@ -1061,7 +1266,15 @@ class TestDataPlaneCase(unittest.TestCase):
         return evidence, product, podman
 
     def reject(self, expected, inbound_id="REALITY", client="xray", facts=None, **kwargs):
-        data = data_plane_facts(**kwargs)
+        inbound = self.inbound(inbound_id)
+        defaults = {
+            "engine": client,
+            "network": str(inbound["transport"]),
+            "security": str(inbound["security"]),
+            "sni": served_sni(inbound),
+        }
+        defaults.update(kwargs)
+        data = data_plane_facts(**defaults)
         if facts is not None:
             data = facts
         product, _ = installed_product(self.context, facts=data)
@@ -1141,6 +1354,43 @@ class TestDataPlaneCase(unittest.TestCase):
             f"dials {topology.WORKER_DOMAIN!r} instead of {topology.PANEL_DOMAIN!r}",
             server=topology.WORKER_DOMAIN,
         )
+
+    def test_the_case_records_the_budgets_it_ran_under(self):
+        evidence, _product, _podman = self.run_case()
+        self.assertEqual(evidence["connect_budget_seconds"], 15)
+        self.assertEqual(evidence["transfer_budget_seconds"], 30)
+        self.assertNotIn("mihomo_allow_lan", evidence,
+                         "an xray tuple has no Mihomo config to report")
+
+    def test_the_case_fails_when_the_handshake_budget_is_below_the_resolver_floor(self):
+        self.reject("below the 10s a resolver stall needs", connect_budget_seconds=5)
+
+    def test_the_case_fails_when_the_handshake_gets_less_than_half_the_request(self):
+        self.reject("less than half of it", connect_budget_seconds=15, transfer_budget_seconds=60)
+
+    def test_the_mihomo_case_records_the_listeners_it_launched(self):
+        evidence, _product, _podman = self.run_case(inbound_id="XHTTP", client="mihomo")
+        self.assertEqual(evidence["mihomo_allow_lan"], True)
+        self.assertEqual(evidence["mihomo_controller"], "127.0.0.1:39090")
+        self.assertEqual(evidence["mihomo_mixed_port"], 7890)
+        self.assertEqual(evidence["mihomo_proxies"], 2)
+        self.assertEqual(evidence["mihomo_rules"], 1)
+
+    def test_the_mihomo_case_fails_when_the_launched_config_allows_lan(self):
+        self.reject("declares allow-lan False", inbound_id="XHTTP", client="mihomo",
+                    engine="mihomo", mihomo_allow_lan=False)
+
+    def test_the_mihomo_case_fails_when_the_controller_is_not_on_loopback(self):
+        self.reject("instead of 127.0.0.1", inbound_id="XHTTP", client="mihomo",
+                    engine="mihomo", mihomo_controller="0.0.0.0:9090")
+
+    def test_the_mihomo_case_fails_when_the_served_rules_were_not_preserved(self):
+        self.reject("does not preserve every served proxy, group and rule",
+                    inbound_id="XHTTP", client="mihomo", engine="mihomo", mihomo_preserved=False)
+
+    def test_the_mihomo_case_fails_when_two_listeners_share_a_port(self):
+        self.reject("share a port", inbound_id="XHTTP", client="mihomo",
+                    engine="mihomo", mihomo_socks_port=7890)
 
     def test_the_case_fails_when_it_names_a_node_the_topology_does_not_have(self):
         product, _ = installed_product(self.context, facts=data_plane_facts())

@@ -817,16 +817,36 @@ def _dict_literal_keys(node: ast.Dict) -> Set[str]:
     return {key.value for key in node.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)}
 
 
-def evidence_keys(function: ast.FunctionDef) -> List[str]:
+def evidence_keys(
+    function: ast.FunctionDef,
+    module_tree: Optional[ast.Module] = None,
+    _followed: Tuple[str, ...] = (),
+) -> List[str]:
     """The evidence keys a driver's own source records.
 
-    Three shapes count, because they are the three the runner turns into a
+    Four shapes count, because they are the four the runner turns into a
     ``CaseResult.evidence`` entry: ``evidence["key"] = ...``, a dict literal
-    assigned to ``evidence``, and a dict literal the driver returns. A key the
-    driver stopped recording disappears from here, which is what lets the
-    catalog statement be checked rather than believed.
+    assigned to ``evidence``, a dict literal the driver returns, and a driver
+    that assigns the verdict of one helper to ``evidence`` and returns it. That
+    last shape is a delegation, not a record of its own: read literally it would
+    report a builder such as ``_data_plane_case`` as carrying no evidence at all,
+    which is how a tuple case loses the facts its helper does write. The helper
+    is followed inside the same module only, and one name once, so a cycle or a
+    helper that lives elsewhere stops the walk instead of looping on it.
     """
     keys: Set[str] = set()
+    delegated: Optional[ast.FunctionDef] = None
+    target_tree: Optional[ast.Module] = None
+    assignments = [
+        node for node in ast.walk(function)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "evidence"
+    ]
+    returns_evidence = any(
+        isinstance(node, ast.Return) and isinstance(node.value, ast.Name)
+        and node.value.id == "evidence"
+        for node in ast.walk(function)
+    )
     for node in ast.walk(function):
         if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) \
                 and node.value.id == "evidence":
@@ -837,6 +857,24 @@ def evidence_keys(function: ast.FunctionDef) -> List[str]:
                 keys |= _dict_literal_keys(node.value)
         elif isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
             keys |= _dict_literal_keys(node.value)
+    if module_tree is not None and len(assignments) == 1 and returns_evidence \
+            and isinstance(assignments[0].value, ast.Call):
+        name = _dotted_name(assignments[0].value.func)
+        target_tree, target_name = module_tree, name
+        if name.count(".") == 1:
+            # `aio._data_plane_case`: a helper of another module of this package,
+            # named through the alias this module imported it under.
+            head, _, tail = name.partition(".")
+            sibling_module = _imported_modules(module_tree).get(head)
+            sibling = REPO_ROOT / "tools" / "podman_e2e" / f"{sibling_module}.py" if sibling_module else None
+            target_tree = ast.parse(sibling.read_text(encoding="utf-8")) if sibling and sibling.is_file() else None
+            target_name = tail
+        elif name.count(".") > 1:
+            target_tree = None
+        if target_tree is not None and target_name != function.name and target_name not in _followed:
+            delegated = _function_node(target_tree, target_name)
+    if delegated is not None:
+        keys |= set(evidence_keys(delegated, target_tree, (*_followed, function.name)))
     return sorted(keys)
 
 
@@ -1002,15 +1040,15 @@ def driver_registry() -> Dict[str, Dict[str, Dict[str, Any]]]:
                     f"{topology}: Case({case_id!r}) names {dotted!r}, which this package does not define"
                 )
             module, name = resolved
-            function = _function_node(tree, name) if module == path.stem else _function_node(
-                ast.parse((REPO_ROOT / "tools" / "podman_e2e" / f"{module}.py").read_text(encoding="utf-8")),
-                name,
+            function_tree = tree if module == path.stem else ast.parse(
+                (REPO_ROOT / "tools" / "podman_e2e" / f"{module}.py").read_text(encoding="utf-8")
             )
+            function = _function_node(function_tree, name)
             if function is None:
                 raise CatalogError(f"{topology}: {module}:{name} has no function body to read")
             registry.setdefault(case_id, {})[topology] = {
                 "driver": f"{module}:{name}",
-                "evidence": evidence_keys(function),
+                "evidence": evidence_keys(function, function_tree),
             }
 
         for node in _case_nodes(tree):
@@ -1044,7 +1082,7 @@ def driver_registry() -> Dict[str, Dict[str, Dict[str, Any]]]:
             for case_id in sorted(matrix_driven_ids(topology)):
                 registry.setdefault(case_id, {})[topology] = {
                     "driver": f"{path.stem}:{builder}",
-                    "evidence": evidence_keys(function),
+                    "evidence": evidence_keys(function, tree),
                 }
     return registry
 
@@ -1058,6 +1096,20 @@ def driver_registry() -> Dict[str, Dict[str, Dict[str, Any]]]:
 # catalog entry is read out of that case rather than typed by hand.
 LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     "DP-01": {"aio": "AIO-MATRIX", "multi-node": "MN-MATRIX"},
+    # The live sentence is about the budget a single request's handshake gets
+    # when the resolver stalls: at least half of the request's allowance and
+    # never below ten seconds. The probe that carries the payload splits its
+    # budget that way, and `case_data_plane` requires both halves on every tuple,
+    # so the REALITY tuple of either contour is the case that reads the numbers
+    # back. What it states is the container's analogue — one request's budget —
+    # and docs/PODMAN_E2E_DISCOVERY.md records that difference.
+    "DP-02": {"aio": "AIO-DP-REALITY-xray", "multi-node": "MN-DP-master-REALITY-xray"},
+    # The Mihomo YAML the probe launches is read back from the file Mihomo loads:
+    # every served proxy, group and rule preserved, each listener on a free
+    # loopback port, and the controller pinned to 127.0.0.1 with `allow-lan`
+    # false. Any Mihomo tuple reports the same document, because the document is
+    # the served profile rather than the tuple; the REALITY one is named.
+    "DP-05": {"aio": "AIO-DP-REALITY-mihomo", "multi-node": "MN-DP-master-REALITY-mihomo"},
     # The live contract asks for the status an absent User-Agent produces. The
     # container case asks every served path rather than `/v2ray-json` alone and
     # pins the code the pinned Panel answers, which is the same product rule read
