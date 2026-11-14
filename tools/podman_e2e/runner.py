@@ -435,21 +435,88 @@ class Runner:
         return threading.current_thread() is threading.main_thread()
 
     def report(self) -> int:
-        data = {
-            "schema": "gowave-podman-e2e-result/v1",
-            "run_id": self.context.run_id,
-            "topology": self.context.topology,
-            "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - self.context.elapsed())),
-            "duration": round(self.context.elapsed(), 3),
-            "budget_seconds": self.context.budget_seconds,
-            "environment": {**self.context.environment, "repository": repository_state()},
-            "cases": [result.to_dict() for result in self.results],
-        }
-        overall = overall_status(self.results)
-        data["overall"] = overall
+        def payload() -> Dict[str, Any]:
+            return {
+                "schema": "gowave-podman-e2e-result/v1",
+                "run_id": self.context.run_id,
+                "topology": self.context.topology,
+                "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - self.context.elapsed())),
+                "duration": round(self.context.elapsed(), 3),
+                "budget_seconds": self.context.budget_seconds,
+                "environment": {**self.context.environment, "repository": repository_state()},
+                "cases": [result.to_dict() for result in self.results],
+            }
+
+        data = payload()
+        data["overall"] = overall_status(self.results)
         write_result(self.context.artifact_dir, data)
+
+        audit = redaction_audit(self.context.artifact_dir)
+        self.context.environment["redaction_audit"] = audit
+        if audit["offences"]:
+            # A file that changes when redacted is holding something the policy
+            # forbids in a retained artifact. Scrub it, then fail the run rather
+            # than ship a credential behind a green verdict.
+            scrubbed: List[str] = []
+            unscrubbable: List[str] = []
+            for name in audit["offences"]:
+                done, error = scrub_artifact(self.context.artifact_dir, name)
+                (scrubbed if done else unscrubbable).append(done or error)
+            message = "retained artifacts held secrets and were scrubbed: " + ", ".join(scrubbed)
+            if unscrubbable:
+                message += "; could not scrub: " + "; ".join(unscrubbable)
+            self.results.append(
+                CaseResult("REDACTION", self.context.topology, FAIL, message=message)
+            )
+
+        # The second write is what puts the audit itself into the artifact: a green
+        # run then carries the file count it read, so "no offences" can be told
+        # apart from "nothing was audited".
+        data = payload()
+        data["overall"] = overall_status(self.results)
+        write_result(self.context.artifact_dir, data)
+
         hand_back_artifacts(self.context.artifact_dir, self.context.operator)
-        return 0 if overall == PASS else 1
+        return 0 if data["overall"] == PASS else 1
+
+
+def redaction_audit(artifact_dir: Path) -> Dict[str, Any]:
+    """Read the artifact tree back and find files that are not a fixed point of ``redact``.
+
+    Every writer in the suite passes its text through ``redact()`` before it
+    reaches a retained artifact, and this is what makes that promise checkable
+    instead of assumed: a writer that forgets the filter, or a secret registered
+    after a file was already written, shows up as content that changes when it is
+    redacted. Files that are not UTF-8 text cannot be audited this way and are
+    named rather than silently passed.
+    """
+    offences: List[str] = []
+    skipped: List[str] = []
+    files = 0
+    for path in sorted(artifact_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        files += 1
+        relative = str(path.relative_to(artifact_dir))
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            skipped.append(relative)
+            continue
+        if redact(text) != text:
+            offences.append(relative)
+    return {"files": files, "offences": offences, "skipped_non_utf8": skipped}
+
+
+def scrub_artifact(artifact_dir: Path, relative: str) -> tuple[str, str]:
+    """Redact one offending artifact in place, keeping its mode."""
+    path = artifact_dir / relative
+    try:
+        text = path.read_text(encoding="utf-8")
+        path.write_text(redact(text), encoding="utf-8")
+    except (UnicodeDecodeError, OSError) as exc:
+        return "", f"{relative}: {type(exc).__name__}: {exc}"
+    return relative, ""
 
 
 def overall_status(results: Iterable[CaseResult]) -> str:

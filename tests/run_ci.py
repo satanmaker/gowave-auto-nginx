@@ -159,6 +159,9 @@ SUITES = {
         "test_podman_runner.TestFailureDiagnosticsHook",
         "test_podman_runner.TestPodmanDiagnosticsBundle",
         "test_podman_runner.TestPodmanContainerDiscovery",
+        "test_podman_redaction.TestRedactionFilter",
+        "test_podman_redaction.TestArtifactTreeHoldsNoSentinel",
+        "test_podman_redaction.TestDiagnosticsNeverPrintValues",
     ),
     "integration": (
         "test_api_client.TestAPIClient",
