@@ -1,0 +1,119 @@
+name: Podman Product Acceptance
+
+# The full acceptance suites run real operator installs inside disposable
+# systemd containers: minutes, not seconds, and a failure is worth reading.
+# They get their own workflow so a red acceptance run cannot hide behind the
+# fast lint contour, and so the two topologies report as two distinct checks
+# rather than one aggregate the other could mask.
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+    branches: [main, "feature/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  aio-podman-acceptance:
+    name: All-in-One Podman Acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # Rootful Podman is what gives the suite a real systemd PID 1 plus the
+      # network and mount namespaces it drives; netavark supplies the run
+      # networks and nftables the rules the firewall cases read back.
+      - name: Install rootful Podman and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman iproute2 nftables iputils-ping
+          python3 -m pip install --disable-pip-version-check PyYAML
+
+      # A cgroup v1 host silently changes what a systemd container can do, and
+      # `network create --disable-dns` is a netavark option: with CNI the run
+      # network would answer from its own resolver and the fixture zone would
+      # stop being authoritative. Both are read from `podman info` as JSON
+      # because the Go-template field names differ between Podman majors.
+      - name: Verify the runtime the suite depends on
+        run: |
+          sudo podman version
+          sudo podman info --format json | tee "${RUNNER_TEMP}/podman-info.json" >/dev/null
+          python3 - "${RUNNER_TEMP}/podman-info.json" <<'PY'
+          import json
+          import sys
+
+          host = json.load(open(sys.argv[1]))["host"]
+          print(f"podman host: cgroup={host['cgroupVersion']} network={host['networkBackend']}")
+          assert host["cgroupVersion"] == "v2", "the suite needs a cgroup v2 host"
+          assert host["networkBackend"] == "netavark", "the suite needs the netavark network backend"
+          PY
+
+      - name: Execute the full All-in-One acceptance suite
+        run: sudo python3 -m tools.run_podman_e2e --topology aio
+
+      # result.json, junit.xml and the evidence files are the debugging surface
+      # of a failed case, so they are kept even when the step above exited 1.
+      - name: Upload the run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: podman-aio-${{ github.run_id }}
+          path: artifacts/podman-e2e/
+          if-no-files-found: warn
+          retention-days: 14
+
+  multi-node-podman-acceptance:
+    name: Multi-Node Podman Acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install rootful Podman and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman iproute2 nftables iputils-ping
+          python3 -m pip install --disable-pip-version-check PyYAML
+
+      - name: Verify the runtime the suite depends on
+        run: |
+          sudo podman version
+          sudo podman info --format json | tee "${RUNNER_TEMP}/podman-info.json" >/dev/null
+          python3 - "${RUNNER_TEMP}/podman-info.json" <<'PY'
+          import json
+          import sys
+
+          host = json.load(open(sys.argv[1]))["host"]
+          print(f"podman host: cgroup={host['cgroupVersion']} network={host['networkBackend']}")
+          assert host["cgroupVersion"] == "v2", "the suite needs a cgroup v2 host"
+          assert host["networkBackend"] == "netavark", "the suite needs the netavark network backend"
+          PY
+
+      - name: Execute the full Multi-Node acceptance suite
+        run: sudo python3 -m tools.run_podman_e2e --topology multi-node
+
+      - name: Upload the run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: podman-multi-node-${{ github.run_id }}
+          path: artifacts/podman-e2e/
+          if-no-files-found: warn
+          retention-days: 14
