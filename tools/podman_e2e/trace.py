@@ -31,6 +31,17 @@ four Vision combinations.
 open the YAML. It is generated (``--markdown``) and it is a fixed point: the
 audit re-renders the table and refuses a report that is not that text, so the
 published page cannot describe a mapping the table no longer holds.
+
+``shared_contracts`` maps this capability to the other one:
+`openspec/specs/live-vps-e2e/spec.md` states the contracts both suites assert —
+subscription policy, case counts, Vision independence, firewall evidence,
+redaction, result semantics — and each entry quotes the sentences it rests on,
+names the catalog cases that hold it here, and resolves every count against the
+manifest. ``validate_contracts`` refuses a requirement the live spec does not
+state, a quote it has dropped or reworded, a case that is not ``live-parity`` in
+a container, and a count whose numbers disagree, so a divergence is reported
+against this capability rather than accepted as a container-only variant.
+
 ``--verify-run`` reads a finished run back the other way: ``overall: PASS`` is
 an aggregate, so the command counts the data-plane cases that run wrote and
 refuses one that executed fewer than the manifest owes, or one whose positive
@@ -57,6 +68,37 @@ WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 TESTS_DIR = REPO_ROOT / "tests"
 REPORT_PATH = REPO_ROOT / "docs" / "PODMAN_E2E_TRACEABILITY.md"
 MATRIX_PATH = REPO_ROOT / "tests" / "cases" / "matrix.yaml"
+LIVE_SPEC_PATH = REPO_ROOT / "openspec" / "specs" / "live-vps-e2e" / "spec.md"
+
+# The contracts this capability shares with the live acceptance capability, in
+# the ledger's own order. The table has to record every one of them and nothing
+# else: a contract nobody mapped is the divergence the audit exists to find,
+# and one invented here would be a claim the live spec never makes.
+SHARED_CONTRACTS: Tuple[str, ...] = (
+    "subscription-policy",
+    "case-counts",
+    "vision-independence",
+    "firewall-evidence",
+    "redaction",
+    "result-semantics",
+)
+
+# The numbers the live spec states as words ("sixteen, eighteen, or twenty"),
+# so a count can be compared with the manifest's digits rather than with a
+# second paraphrase of the same claim.
+NUMBER_WORDS: Dict[str, int] = {
+    word: value
+    for value, word in enumerate(
+        (
+            "zero", "one", "two", "three", "four", "five", "six", "seven",
+            "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen",
+            "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty",
+        )
+    )
+}
+NUMBER_RE = re.compile(
+    r"\b(\d+|" + "|".join(sorted(NUMBER_WORDS, key=len, reverse=True)) + r")\b"
+)
 
 TOPOLOGIES: Tuple[str, ...] = ("aio", "multi-node")
 
@@ -492,6 +534,187 @@ def validate_behaviours(
     return problems
 
 
+def parse_live_spec(path: Path = LIVE_SPEC_PATH) -> Dict[str, str]:
+    """The live capability's requirements by title, whitespace-normalised.
+
+    The live spec is the other acceptance capability's own statement of the
+    contracts this one shares with it. Comparing against the shipped file
+    rather than a copy is the point: a sentence the live spec drops or rewords
+    is a divergence the audit has to report, not a stale quote to excuse.
+    """
+    text = Path(path).read_text(encoding="utf-8")
+    parts = re.split(r"^### Requirement:\s*(.+?)\s*$", text, flags=re.M)
+    return {
+        name: _squash(body) for name, body in zip(parts[1::2], parts[2::2])
+    }
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def numbers_in(text: str) -> List[int]:
+    """The numbers a sentence states, in the order it states them."""
+    found: List[int] = []
+    for match in NUMBER_RE.finditer(_squash(text)):
+        token = match.group(1)
+        value = int(token) if token.isdigit() else NUMBER_WORDS[token]
+        if value not in found:
+            found.append(value)
+    return found
+
+
+def numbers_text(values: Iterable[int]) -> str:
+    ordered = list(values)
+    return "/".join(str(value) for value in ordered) if ordered else "—"
+
+
+def resolve_count(
+    token: str, catalogue: Dict[str, Any], matrix: Dict[str, Any]
+) -> List[int]:
+    """The numbers a count source resolves to.
+
+    A free-text "and the same here" would be a claim nothing reads back, so the
+    podman side of a count is a token naming where the number lives: the
+    manifest's own positive-case counts, or the assertion a catalog case
+    carries.
+    """
+    kind, _, rest = token.partition(":")
+    if kind == "matrix":
+        section, _, field = rest.partition(":")
+        if section == "product":
+            value = (matrix.get("product") or {}).get(field)
+            if not isinstance(value, int):
+                raise ValueError(f"unknown count source {token!r}")
+            return [value]
+        entry = (matrix.get("topologies") or {}).get(section)
+        counts = (entry or {}).get("positive_case_counts")
+        if field != "positive-cases" or not isinstance(counts, dict) or not counts:
+            raise ValueError(f"unknown count source {token!r}")
+        return sorted({int(value) for value in counts.values()})
+    if kind == "case":
+        case_id, _, field = rest.partition(":")
+        case = next(
+            (entry for entry in catalogue.get("cases", []) if entry.get("id") == case_id),
+            None,
+        )
+        if field != "assertion" or case is None:
+            raise ValueError(f"unknown count source {token!r}")
+        return numbers_in(str(case.get("assertion") or ""))
+    raise ValueError(f"unknown count source {token!r}")
+
+
+def contracts(table: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The shared contracts with the live acceptance capability."""
+    return [
+        entry for entry in table.get("shared_contracts") or [] if isinstance(entry, dict)
+    ]
+
+
+def validate_contracts(
+    table: Dict[str, Any],
+    live_spec: Optional[Dict[str, str]] = None,
+    catalogue: Optional[Dict[str, Any]] = None,
+    matrix: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Every shared contract is mapped to the sentence the live suite asserts.
+
+    A contract is shared when both capabilities observe the same thing, so the
+    mapping only earns its place if it is read back: the requirement has to
+    exist in the live spec, the quoted sentences have to still be in it, the
+    cases have to be catalog cases the live suite also runs in a container, and
+    a count has to resolve to the numbers the live sentence states. A sentence
+    the live spec reworded is a divergence to fix here, not a container-only
+    variant to accept.
+    """
+    if live_spec is None:
+        live_spec = parse_live_spec()
+    if catalogue is None:
+        from tools.podman_e2e.catalog import load_catalog
+
+        catalogue = load_catalog()
+    if matrix is None:
+        matrix = load_matrix()
+    by_id = {str(case.get("id")): case for case in catalogue.get("cases", [])}
+    entries = contracts(table)
+    if not entries:
+        return ["the table records no shared contract with the live capability"]
+
+    problems: List[str] = []
+    seen: Set[str] = set()
+    for index, entry in enumerate(entries):
+        contract_id = entry.get("id")
+        label = str(contract_id or f"<unnamed #{index + 1}>")
+        if contract_id not in SHARED_CONTRACTS:
+            problems.append(f"shared contract {label}: not one of the contracts the ledger names")
+        elif contract_id in seen:
+            problems.append(f"shared contract {label}: recorded more than once")
+        seen.add(contract_id)
+
+        requirement = entry.get("live_requirement")
+        body = live_spec.get(requirement)
+        if body is None:
+            problems.append(f"shared contract {label}: no live requirement {requirement!r}")
+            body = ""
+        for quote in entry.get("live_asserts") or []:
+            if _squash(quote) not in body:
+                problems.append(
+                    f"shared contract {label}: the live requirement no longer states {quote!r}"
+                )
+        if not str(entry.get("agreement") or "").strip():
+            problems.append(f"shared contract {label}: states no shared observable")
+
+        cases = entry.get("cases") or []
+        if not cases:
+            problems.append(f"shared contract {label}: names no case")
+        for case_id in cases:
+            case = by_id.get(str(case_id))
+            if case is None:
+                problems.append(f"shared contract {label}: references unknown case {case_id}")
+                continue
+            if case.get("state") != "live-parity":
+                problems.append(
+                    f"shared contract {label}: case {case_id} is {case.get('state')}, "
+                    "not live-parity"
+                )
+            if case.get("environment") != "container":
+                problems.append(
+                    f"shared contract {label}: case {case_id} runs in "
+                    f"{case.get('environment')}, so the container half does not assert it"
+                )
+            if requirement and case.get("requirement") != requirement:
+                problems.append(
+                    f"shared contract {label}: case {case_id} serves "
+                    f"{case.get('requirement')!r}, not the mapped requirement"
+                )
+
+        for count in entry.get("counts") or []:
+            observable = count.get("observable") or "<unnamed observable>"
+            live_quote = str(count.get("live") or "")
+            if _squash(live_quote) not in body:
+                problems.append(
+                    f"shared contract {label}: the live requirement no longer states "
+                    f"the count {live_quote!r}"
+                )
+            try:
+                podman = resolve_count(str(count.get("podman") or ""), catalogue, matrix)
+            except ValueError as error:
+                problems.append(f"shared contract {label}: {error}")
+                continue
+            live_numbers = numbers_in(live_quote)
+            if sorted(set(live_numbers)) != sorted(set(podman)):
+                problems.append(
+                    f"shared contract {label}: {observable} is "
+                    f"{numbers_text(live_numbers)} on the live capability and "
+                    f"{numbers_text(podman)} here"
+                )
+
+    for contract_id in SHARED_CONTRACTS:
+        if contract_id not in seen:
+            problems.append(f"shared contract {contract_id}: not recorded")
+    return problems
+
+
 def gaps(table: Dict[str, Any]) -> List[Tuple[str, str, str]]:
     """The (requirement, scenario, gap) rows whose work is still open."""
     return [
@@ -581,6 +804,33 @@ def render(table: Dict[str, Any]) -> str:
                 f"| {declaration_text(entry, matrix)} | {cases} | {tests} | {jobs} |"
             )
     lines += ["", f"Open gaps: {len(gaps(table))}.", ""]
+    shared_contracts = contracts(table)
+    if shared_contracts:
+        lines += [
+            "## Shared contracts with the live capability",
+            "",
+            "The contracts both acceptance suites assert, with the requirement of",
+            "`openspec/specs/live-vps-e2e/spec.md` each one maps to, the observable",
+            "they agree on and the catalog cases that hold it here. The audit refuses",
+            "a requirement the live spec no longer states, a quoted sentence that has",
+            "drifted, a case that is not `live-parity` in a container, and a count",
+            "whose numbers disagree with `tests/cases/matrix.yaml`.",
+            "",
+            "| Contract | Live requirement | Shared observable | Cases | Counts |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        for entry in shared_contracts:
+            cases = ", ".join(f"`{case}`" for case in entry.get("cases") or []) or "—"
+            counts = "; ".join(
+                f"{count.get('observable')} "
+                f"{numbers_text(numbers_in(str(count.get('live') or '')))}"
+                for count in entry.get("counts") or []
+            ) or "—"
+            lines.append(
+                f"| {entry.get('id')} | {entry.get('live_requirement')} "
+                f"| {_squash(entry.get('agreement'))} | {cases} | {counts} |"
+            )
+        lines.append("")
     named = named_matrix_rows(table, declared)
     required = required_matrix_rows()
     lines.append(
@@ -890,6 +1140,7 @@ def audited(include_report: bool = True) -> Tuple[Dict[str, Any], List[str]]:
     tests = test_index()
     problems = validate(table, spec, declared, jobs, task_boxes(), tests)
     problems.extend(validate_behaviours(table, spec, declared, jobs, tests, load_matrix()))
+    problems.extend(validate_contracts(table))
     problems.extend(positive_counts())
     problems.extend(matrix_problems(table, declared))
     if include_report:

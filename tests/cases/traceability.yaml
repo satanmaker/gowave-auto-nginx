@@ -346,7 +346,9 @@ requirements:
           - tests.test_podman_traceability.TestTraceabilityRules
         jobs: ["Lint, Completeness, and Suite Nonroot"]
       - scenario: Shared contract diverges from live acceptance
-        gap: 8.17 — the audit against openspec/specs/live-vps-e2e/spec.md has not been performed
+        tests:
+          - tests.test_podman_contracts.TestSharedContracts
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
 
   - requirement: Case incubation and promotion path
     scenarios:
@@ -656,3 +658,108 @@ behaviours:
       - tests.test_podman_dns.TestDnsCase.test_a_wrong_answer_that_is_repaired_fails_the_case
       - tests.test_fixture_dns.TestDnsFixture.test_wrong_answer_mode_returns_the_steered_address
     jobs: [All-in-One Podman Acceptance]
+
+# The contracts this capability shares with the live acceptance capability
+# (`openspec/specs/live-vps-e2e/spec.md`). `live_asserts` are sentences of the
+# mapped requirement, whitespace-normalised, and the audit refuses one the live
+# spec no longer holds; `cases` are catalog cases the live suite also runs, so a
+# contract may only rest on `live-parity` cases the container reproduces
+# (`environment: container`). `counts.live` is the sentence that states the
+# number and `counts.podman` names where this suite's number lives — the
+# manifest's own `positive_case_counts`, or a catalog case's assertion — so the
+# audit compares two readings rather than accepting a paraphrase. A divergence
+# is fixed here, not recorded as a container-only variant.
+shared_contracts:
+  - id: subscription-policy
+    contract: Subscription delivery and User-Agent policy
+    live_requirement: Real Subscription Delivery and User-Agent Policy
+    live_asserts:
+      - "No mock server responses are permitted."
+      - "User-Agent policy SHALL be verified against the real Panel"
+      - "actual HTTP response codes SHALL be used (not mock assumptions)"
+      - "if that is 403, the runner records a pass"
+    cases: [SUB-01, SUB-02, SUB-03, SUB-04]
+    agreement: >-
+      Both suites fetch the payload from the real Panel and judge the status the
+      installed User-Agent policy returns, so a missing or blank header is an
+      outcome rather than a canned 403.
+    counts:
+      - observable: proxy-capable outbounds per subscription
+        live: "exactly eight, nine, or ten according to the number of configured Vision domains"
+        podman: "case:SUB-02:assertion"
+
+  - id: case-counts
+    contract: Data-plane case counts
+    live_requirement: Data Plane E2E Traffic Through All VPN Endpoints
+    live_asserts:
+      - "yielding sixteen, eighteen, or twenty mandatory runtime cases"
+      - "All tests SHALL use actual subscription data and verify client-observed egress plus target-VPS ingress evidence"
+    cases: [DP-15]
+    agreement: >-
+      Both suites require every active endpoint to be exercised by a real Xray
+      and a real Mihomo process, so the pair owes sixteen, eighteen or twenty
+      runtime cases and the Vision combinations add two each.
+    counts:
+      - observable: mandatory Data Plane runtime cases
+        live: "yielding sixteen, eighteen, or twenty mandatory runtime cases"
+        podman: "matrix:multi-node:positive-cases"
+
+  - id: vision-independence
+    contract: Independent optional Vision domains
+    live_requirement: Independent Optional Vision Domains
+    live_asserts:
+      - "Each configured domain SHALL be provisioned and verified only on its corresponding VPS"
+      - "When a host's Vision domain is absent, its default four-inbound topology remains unchanged"
+    cases: [VIS-01, VIS-07]
+    agreement: >-
+      Enabling Vision on one node leaves the other node's four-inbound topology,
+      certificate and route untouched in both suites, and a Vision failure fails
+      the host that owns it.
+
+  - id: firewall-evidence
+    contract: Firewall isolation evidence
+    live_requirement: UFW Firewall Isolation Verification
+    live_asserts:
+      - "A timeout alone is not sufficient evidence of UFW DROP"
+      - "Each negative probe MUST be paired with a known-good positive probe"
+      - "ambiguous evidence is `INCOMPLETE`"
+    cases: [FW-01, FW-02, FW-04]
+    agreement: >-
+      A refused control-plane connection counts only beside a successful probe
+      from the allowed vantage and firewall evidence read on the target, and
+      ambiguous evidence is INCOMPLETE rather than a firewall PASS.
+    counts:
+      - observable: control-plane port under test
+        live: "The runner SHALL verify isolation of TCP/3002 on Master and Worker"
+        podman: "matrix:product:node_api_port"
+
+  - id: redaction
+    contract: Redacted diagnostic artifacts
+    live_requirement: Redacted Diagnostic Artifact Collection
+    live_asserts:
+      - "The following data SHALL NOT appear in any artifact"
+      - "only field names"
+      - "actual values are replaced with `[REDACTED]`"
+      - "no plaintext secret appears in any artifact"
+    cases: [RED-01, RED-02]
+    agreement: >-
+      Secrets are recorded by field name only in both suites, every artifact
+      byte passes the redactor, and a file that changes when redacted fails the
+      run instead of being published.
+
+  - id: result-semantics
+    contract: Result status semantics
+    live_requirement: Result Status Semantics
+    live_asserts:
+      - "Overall `PASS` requires all mandatory phases completed"
+      - "`SKIP` and `NOT_RUN` are non-passing"
+      - "all sixteen, eighteen, or twenty Data Plane runtime cases verified"
+    cases: [RES-01, RES-02, RES-03]
+    agreement: >-
+      Overall PASS requires every expected data-plane case, a skip never reads
+      as a pass, an unexecuted case is reported rather than dropped, and each
+      failing case is named individually in the machine-readable result.
+    counts:
+      - observable: Data Plane runtime cases an overall PASS requires
+        live: "all sixteen, eighteen, or twenty Data Plane runtime cases verified"
+        podman: "matrix:multi-node:positive-cases"

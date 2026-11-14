@@ -193,23 +193,27 @@ class TestTraceabilityRules(unittest.TestCase):
             problems,
         )
 
-    def test_strict_refuses_the_gaps_the_table_still_has(self):
+    def test_no_gap_remains_in_the_table(self):
         gaps = trace.gaps(self.table)
         self.assertEqual(
-            {gap.split()[0] for _requirement, _scenario, gap in gaps},
-            {"8.17"},
-            "each open gap must name the ledger task that owns it",
+            gaps, [],
+            "every scenario must be proved by a case or a test, so --strict is green",
         )
 
-    def test_a_closed_gap_is_cited_by_the_test_that_closed_it(self):
+    def test_each_closed_gap_is_cited_by_the_test_that_closed_it(self):
         rows = {
             row["scenario"]: row
             for group in self.table.get("requirements") or []
             for row in group.get("scenarios") or []
         }
-        row = rows["Unmapped behavior or orphan case fails the audit"]
-        self.assertIn("tests.test_podman_behaviors.TestBehaviorInventory", row["tests"])
-        self.assertNotIn("gap", row)
+        for scenario, test_id in (
+            ("Unmapped behavior or orphan case fails the audit", "tests.test_podman_behaviors.TestBehaviorInventory"),
+            ("Shared contract diverges from live acceptance", "tests.test_podman_contracts.TestSharedContracts"),
+        ):
+            with self.subTest(scenario=scenario):
+                row = rows[scenario]
+                self.assertIn(test_id, row["tests"])
+                self.assertNotIn("gap", row)
 
     def test_the_published_report_is_the_table_rendered(self):
         self.assertEqual(
@@ -410,8 +414,8 @@ class TestTraceabilityRules(unittest.TestCase):
             self.assertEqual(trace.main(["--check"]), 0)
         self.assertIn("45 scenarios, 45 rows", printed.getvalue())
         with contextlib.redirect_stdout(io.StringIO()) as printed:
-            self.assertEqual(trace.main(["--strict"]), 1)
-        self.assertIn("--strict refuses", printed.getvalue())
+            self.assertEqual(trace.main(["--strict"]), 0)
+        self.assertIn("45 scenarios, 45 rows, 0 gaps", printed.getvalue())
 
     def test_the_audit_entrypoint_refuses_a_drifted_report(self):
         with tempfile.TemporaryDirectory() as directory:
