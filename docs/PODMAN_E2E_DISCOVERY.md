@@ -230,6 +230,34 @@ and different bytes would mean the header selects the representation and the
 family headers were carrying the assertion. Neither is true of the pinned Panel,
 and the suite would be inventing an allowlist if it assumed either.
 
+### Which client family consumes which representation
+
+The manifest's `clients` block says which pinned binary imports which
+representation; this table says what the case that fetches it actually does with
+the body. The order is the order the probe fetches them in
+(`tools/podman_e2e/panel_surface.py:63`-`67`), and
+`TestSubscriptionFamilyInventory` reads every cell back against
+`tests/cases/matrix.yaml`, that tuple and `tests/cases/catalog.yaml`, so a
+representation added to the manifest without a row — or a row naming an engine
+the manifest does not pin — fails the nonroot suite.
+
+| Representation | Path | Header the probe sends | Consuming engine | Case | What consumption proves |
+| --- | --- | --- | --- | --- | --- |
+| `base64` | `/api/sub/{shortUuid}` | `v2rayNG/1.8.5` | `xray` 26.11.9 | `SUB-B64` | The body is decoded as a share-link list, every link becomes the outbound a client would build from it, and the result is validated with `xray run -test`. The same importer is then offered the `/v2ray-json` body and decodes nothing, so the two representations cannot be substituted for each other. |
+| `xray-json` | `/api/sub/{shortUuid}/v2ray-json` | `Xray/26.11.9` | `xray` 26.11.9 | `SUB-SERVED` | Every served profile is already a complete config and is validated as one with `xray run -test`; a profile that needed the runtime wrapper would be a bare outbound, which the Panel does not serve. |
+| `mihomo` | `/api/sub/{shortUuid}/mihomo` | `mihomo/1.19.34` | `mihomo` 1.19.34 | `SUB-SERVED` | The YAML is loaded by `mihomo -t -f`, and the proxies it declares are counted against the inbounds this cluster serves. |
+| `clash` | `/api/sub/{shortUuid}/clash` | `clash.meta/1.19.34` | `mihomo` 1.19.34 | `SUB-SERVED` | The same engine loads it; the count is the trojan subset the shipped Clash generator keeps, which is why one node serves one Clash proxy rather than one per inbound. |
+| `singbox` | `/api/sub/{shortUuid}/singbox` | `sing-box/1.10.0` | none pinned | `SUB-SERVED` | The body is parsed as JSON and its outbounds counted, and nothing executes it: no sing-box binary is pinned in the manifest, so this row records a representation the Panel serves without claiming that a client consumed it. |
+
+Two rows share an engine because one binary really is the client: Mihomo loads
+both the `mihomo` YAML and the `clash` YAML, and the Clash representation is
+that engine fed the subset the Panel's Clash generator keeps. `singbox` is the
+one representation in the manifest that no pinned client consumes, which is why
+`tests/cases/matrix.yaml` lists exactly two clients — `xray`, consuming `base64`
+and `xray-json`, and `mihomo`, consuming `mihomo` and `clash` — and the table
+says "none pinned" instead of leaving a reader to infer that a parsed body was
+an imported one.
+
 ### What is declared but not driven
 
 `PATCH /api/users` and `PATCH /api/users/{userId}` update an existing client,

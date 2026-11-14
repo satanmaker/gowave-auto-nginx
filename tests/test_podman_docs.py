@@ -384,6 +384,133 @@ class TestPanelApiContract(unittest.TestCase):
                       "the unconditional fallback rule is what serves a header that names no client family")
 
 
+FAMILY_HEADING = "### Which client family consumes which representation"
+
+
+def family_section() -> str:
+    text = discovered()
+    start = text.index(FAMILY_HEADING)
+    end = text.find("\n### ", start + 1)
+    return text[start:end if end != -1 else len(text)]
+
+
+def family_rows() -> "list[dict]":
+    """The representation inventory, one dict per row, in documented order."""
+    rows = []
+    for line in family_section().splitlines():
+        if not line.startswith("| `"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        rows.append({
+            "representation": cells[0].strip("`"),
+            "path": cells[1].strip("`"),
+            "header": cells[2].strip("`"),
+            "engine": cells[3],
+            "case": cells[4],
+            "proves": cells[5],
+        })
+    return rows
+
+
+class TestSubscriptionFamilyInventory(unittest.TestCase):
+    """The representation inventory is read back against the manifest and the probe.
+
+    The page says which client family consumes each representation; the manifest
+    says which binary is pinned and which representations it consumes; the probe
+    says which header it sends. None of the three may drift from the other two,
+    because a row claiming a family the harness never sent would describe a
+    client the run did not use.
+    """
+
+    def setUp(self):
+        self.rows = family_rows()
+        self.manifest = yaml.safe_load(MATRIX.read_text(encoding="utf-8"))
+        self.by_name = {row["representation"]: row for row in self.rows}
+
+    def test_every_manifest_representation_has_exactly_one_row(self):
+        self.assertEqual(len(self.rows), len(self.by_name), "a representation is listed twice")
+        self.assertEqual(sorted(self.by_name), sorted(self.manifest["representations"]))
+
+    def test_the_inventory_lists_representations_in_the_order_the_probe_fetches_them(self):
+        from tools.podman_e2e import panel_surface
+
+        self.assertEqual(
+            [row["representation"] for row in self.rows],
+            [name for name, _template, _agent in panel_surface.REPRESENTATIONS],
+            "the page and tools/podman_e2e/panel_surface.py disagree on the order the inventory is read in",
+        )
+
+    def test_each_row_declares_the_path_the_manifest_uses(self):
+        for name, path in self.manifest["representations"].items():
+            with self.subTest(representation=name):
+                self.assertEqual(self.by_name[name]["path"], path,
+                                 "the row names a path the manifest does not fetch")
+
+    def test_each_row_names_the_header_the_probe_really_sends(self):
+        from tools.podman_e2e import panel_surface
+
+        for name, _template, agent in panel_surface.REPRESENTATIONS:
+            with self.subTest(representation=name):
+                self.assertEqual(
+                    self.by_name[name]["header"], agent,
+                    "the inventory must name the header the probe sends, not another member of the family",
+                )
+
+    def test_each_row_names_the_engine_the_manifest_pins(self):
+        product = self.manifest["product"]
+        consumers = {
+            representation: client
+            for client in self.manifest["clients"]
+            for representation in client["consumes"]
+        }
+        for name, client in consumers.items():
+            with self.subTest(representation=name):
+                row = self.by_name[name]
+                self.assertIn(f"`{client['binary']}`", row["engine"])
+                self.assertIn(
+                    str(product[client["version_key"]]), row["engine"],
+                    f"the inventory names an engine version the manifest does not pin for {name}",
+                )
+
+    def test_a_representation_no_manifest_client_consumes_says_so(self):
+        consumers = {
+            representation
+            for client in self.manifest["clients"]
+            for representation in client["consumes"]
+        }
+        for name, row in self.by_name.items():
+            with self.subTest(representation=name):
+                if name in consumers:
+                    self.assertNotIn("none pinned", row["engine"])
+                else:
+                    self.assertIn("none pinned", row["engine"])
+                    self.assertIn("nothing executes", row["proves"],
+                                  "a representation no pinned client consumes must not claim execution")
+
+    def test_each_row_cites_a_case_the_catalogue_holds(self):
+        ids = catalog_ids()
+        for row in self.rows:
+            with self.subTest(representation=row["representation"]):
+                cited = set(CASE_ID.findall(row["case"]))
+                self.assertTrue(cited, "the row cites no case, so nothing would notice it going stale")
+                self.assertEqual(cited - ids, set())
+
+    def test_the_link_importer_is_offered_the_json_body_too(self):
+        probe = (REPO_ROOT / "tools" / "podman_e2e" / "subscription_probe.py").read_text(encoding="utf-8")
+        start = probe.index("def share_link_facts")
+        body = probe[start:probe.index("\ndef ", start + 1)]
+        self.assertIn('read_payload(payload_dir, "xray-json")', body,
+                      "the base64 case proves an import only if the JSON body is offered to the same importer")
+        self.assertIn('"json_body_links"', body)
+        aio_text = (REPO_ROOT / "tools" / "podman_e2e" / "aio.py").read_text(encoding="utf-8")
+        start = aio_text.index("def case_share_links")
+        body = aio_text[start:aio_text.index("\ndef ", start + 1)]
+        self.assertIn('facts.get("json_body_links") == 0', body)
+        self.assertIn('facts.get("xray_outbounds")', body,
+                      "importing the list has to be executed by the Xray binary, not only parsed")
+        self.assertEqual(self.by_name["base64"]["case"].strip("`"), "SUB-B64")
+
+
 class TestPodmanE2EDocumentation(unittest.TestCase):
     def test_every_flag_in_a_documented_command_exists(self):
         unknown = sorted(documented_flags() - parser_flags())
