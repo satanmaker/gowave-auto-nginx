@@ -163,6 +163,25 @@ state, and refuses the table when a declaration the report is supposed to cover
 is named by no behaviour, so the page cannot keep describing a policy the
 matrix has moved away from.
 
+Coverage is audited from the other side as well. `tests/cases/behaviors.yaml`
+maps every catalog case to exactly one behaviour — installation, provisioning,
+subscription representations, data plane, decoy, TLS/DNS/ACME, network policy,
+lifecycle, failure injection — and names the cases that exercise each
+behaviour's error paths, the topologies it is proven in and the gate tier that
+blocks on it. The rendered view is
+[`docs/PODMAN_E2E_BEHAVIORS.md`](PODMAN_E2E_BEHAVIORS.md):
+
+```bash
+python3 -m tools.podman_e2e.catalog behaviors --write   # regenerate the report
+python3 -m tools.podman_e2e.catalog check               # audit the inventory
+```
+
+`check` fails on a behaviour with no case, a behaviour covered only on its happy
+path, a case no behaviour names, a case two behaviours claim, an area the
+requirement lists but no entry covers, a gate the named cases are not gated by,
+and a topology none of the behaviour's cases reaches. The report is a fixed
+point: editing the YAML without regenerating it fails the same check.
+
 States are never collapsed: `PASS`, `FAIL`, `BLOCKED`, `SKIP`,
 `NOT_APPLICABLE`, `INCOMPLETE`. Any `SKIP` fails the run, `BLOCKED` and
 `INCOMPLETE` never read as `PASS`, and a run in which nothing applied is

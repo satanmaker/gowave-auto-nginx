@@ -9,6 +9,14 @@ Run this module as a script to regenerate the catalog from the live spec:
 
     python3 -m tools.podman_e2e.catalog generate
     python3 -m tools.podman_e2e.catalog check
+
+``tests/cases/behaviors.yaml`` is the behaviour inventory beside the catalog:
+every case belongs to exactly one behaviour, and each behaviour names the cases
+that establish it, the cases that exercise its error paths, the topologies it
+is proven in and the gate that blocks on it. ``check`` audits that inventory
+and refuses a rendered report that is not the text the inventory renders to:
+
+    python3 -m tools.podman_e2e.catalog behaviors --write
 """
 from __future__ import annotations
 
@@ -30,7 +38,24 @@ LIVE_SPEC = REPO_ROOT / "openspec" / "specs" / "live-vps-e2e" / "spec.md"
 CATALOG_PATH = REPO_ROOT / "tests" / "cases" / "catalog.yaml"
 PARITY_PATH = REPO_ROOT / "tests" / "cases" / "PARITY.md"
 BEHAVIORS_PATH = REPO_ROOT / "tests" / "cases" / "behaviors.yaml"
+BEHAVIOR_REPORT_PATH = REPO_ROOT / "docs" / "PODMAN_E2E_BEHAVIORS.md"
 MATRIX_PATH = REPO_ROOT / "tests" / "cases" / "matrix.yaml"
+
+# The nine areas the delta spec's coverage requirement names, in its own order.
+# The inventory declares them and every one of them has to carry a behaviour:
+# an area the requirement names but no entry covers is a failure, not a gap.
+BEHAVIOR_SCHEMA = "gowave-podman-behaviors/v1"
+BEHAVIOR_AREAS: Tuple[str, ...] = (
+    "installation",
+    "provisioning",
+    "subscription-representations",
+    "data-plane",
+    "decoy",
+    "tls-dns-acme",
+    "network-policy",
+    "lifecycle",
+    "failure-injection",
+)
 
 PODMAN_CASES: Sequence[str] = ("aio", "multi-node")
 ALL_CASES: Sequence[str] = ("podman", "live")
@@ -815,29 +840,275 @@ def executable_gaps(catalog: Dict[str, Any], suite: str = "podman") -> List[str]
     return gaps
 
 
-def coverage_audit(catalog: Dict[str, Any], behaviors_path: Path = BEHAVIORS_PATH) -> List[str]:
-    errors: List[str] = []
+def _display(path: Path) -> str:
+    """A path as the repository names it, or as it stands when it is outside."""
+    try:
+        return str(Path(path).resolve().relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def load_behaviors(path: Path = BEHAVIORS_PATH) -> Dict[str, Any]:
+    with Path(path).open(encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
+def coverage_audit(
+    catalog: Dict[str, Any],
+    behaviors_path: Path = BEHAVIORS_PATH,
+    matrix_path: Path = MATRIX_PATH,
+) -> List[str]:
+    """Judge the behaviour inventory against the catalog it claims to cover.
+
+    The inventory is a partition, not a summary: every catalog case is named by
+    exactly one behaviour, and every behaviour states where its cases run and
+    which tier blocks on them. A behaviour with no case is an empty promise; a
+    behaviour whose only cases establish its happy path has no measured failure
+    behaviour; a case no behaviour names is a guarantee nobody wrote down.
+    """
+    behaviors_path = Path(behaviors_path)
     if not behaviors_path.exists():
-        return [f"Behavior inventory is missing: {behaviors_path.relative_to(REPO_ROOT)}"]
-    inventory = yaml.safe_load(behaviors_path.read_text(encoding="utf-8")) or {}
-    behaviors = inventory.get("behaviors", [])
-    case_ids = {case["id"] for case in catalog.get("cases", [])}
-    mapped_cases = set()
-    for behavior in behaviors:
-        name = behavior.get("name", "<unnamed>")
-        cases = behavior.get("cases") or []
-        error_paths = behavior.get("error_paths") or []
-        if not cases:
+        return [f"Behavior inventory is missing: {_display(behaviors_path)}"]
+    try:
+        inventory = load_behaviors(behaviors_path)
+    except yaml.YAMLError as exc:
+        return [f"Behavior inventory is not valid YAML: {_display(behaviors_path)}: {exc}"]
+    if not isinstance(inventory, dict):
+        return [f"Behavior inventory must be a mapping: {_display(behaviors_path)}"]
+
+    errors: List[str] = []
+    topology_manifest = (yaml.safe_load(Path(matrix_path).read_text(encoding="utf-8")) or {}).get(
+        "topologies"
+    ) or {}
+    gated_by = {
+        str(name): {str(tier) for tier in (entry or {}).get("gate") or []}
+        for name, entry in topology_manifest.items()
+    }
+
+    schema = inventory.get("schema")
+    if schema != BEHAVIOR_SCHEMA:
+        errors.append(
+            f"Behavior inventory schema is {schema!r}, expected {BEHAVIOR_SCHEMA!r}"
+        )
+    declared_areas = inventory.get("areas")
+    if not isinstance(declared_areas, list):
+        errors.append("Behavior inventory declares no areas")
+        declared_areas = []
+    for area in declared_areas:
+        if area not in BEHAVIOR_AREAS:
+            errors.append(f"Behavior inventory declares unknown area {area!r}")
+    for area in BEHAVIOR_AREAS:
+        if area not in declared_areas:
+            errors.append(f"Behavior inventory does not declare area {area}")
+
+    cases = inventory.get("behaviors")
+    if not isinstance(cases, list) or not cases:
+        return errors + ["Behavior inventory names no behavior"]
+
+    by_id: Dict[str, Dict[str, Any]] = {
+        str(case.get("id")): case for case in catalog.get("cases", []) if case.get("id")
+    }
+    owners: Dict[str, List[str]] = {}
+    covered_areas: Set[str] = set()
+    seen_names: Set[str] = set()
+
+    def reachable(case_ids: Iterable[str]) -> Set[str]:
+        found: Set[str] = set()
+        for case_id in case_ids:
+            found |= set((by_id.get(case_id) or {}).get("topology") or [])
+        return found
+
+    for index, behavior in enumerate(cases):
+        if not isinstance(behavior, dict):
+            errors.append(f"Behavior #{index + 1} is not a mapping")
+            continue
+        name = behavior.get("name")
+        if not isinstance(name, str) or not name.strip():
+            name = f"<unnamed #{index + 1}>"
+        elif name in seen_names:
+            errors.append(f"Duplicate behavior name: {name}")
+        seen_names.add(name)
+
+        area = behavior.get("area")
+        if area not in BEHAVIOR_AREAS:
+            errors.append(f"Behavior {name} declares unknown area {area!r}")
+        else:
+            covered_areas.add(area)
+
+        gate = behavior.get("gate")
+        if not isinstance(gate, str) or not gate.strip():
+            errors.append(f"Behavior {name} declares no gate")
+            gate = None
+
+        declared = behavior.get("topology")
+        if not isinstance(declared, list) or not declared:
+            errors.append(f"Behavior {name} declares no topology")
+            declared = []
+        elif len({str(item) for item in declared}) != len(declared):
+            errors.append(f"Behavior {name} declares a topology more than once")
+        declared_topologies = {str(item) for item in declared}
+        for topology in sorted(declared_topologies):
+            if topology not in gated_by:
+                errors.append(
+                    f"Behavior {name} declares unknown topology {topology}"
+                )
+
+        happy = behavior.get("cases")
+        failure = behavior.get("error_paths")
+        if not isinstance(happy, list):
+            errors.append(f"Behavior {name} names no cases")
+            happy = []
+        if not isinstance(failure, list):
+            errors.append(f"Behavior {name} names no error paths")
+            failure = []
+        if not happy:
             errors.append(f"Behavior has no case: {name}")
-        if not error_paths:
+        if not failure:
             errors.append(f"Behavior has no error-path case: {name}")
-        for case_id in cases + error_paths:
-            mapped_cases.add(case_id)
-            if case_id not in case_ids:
+
+        named_here: Set[str] = set()
+        establishing: List[str] = []
+        for case_id in list(happy) + list(failure):
+            if not isinstance(case_id, str):
+                errors.append(f"Behavior {name} names a case that is not an id: {case_id!r}")
+                continue
+            if case_id in named_here:
+                errors.append(f"Behavior {name} names case {case_id} more than once")
+                continue
+            named_here.add(case_id)
+            case = by_id.get(case_id)
+            if case is None:
                 errors.append(f"Behavior {name} references unknown case {case_id}")
-    for case_id in sorted(case_ids - mapped_cases):
-        errors.append(f"Case is mapped to no behavior: {case_id}")
+                continue
+            owners.setdefault(case_id, []).append(name)
+            if gate and case.get("gate") != gate:
+                errors.append(
+                    f"Behavior {name} declares gate {gate} but case {case_id} "
+                    f"is gated {case.get('gate')}"
+                )
+        establishing = [item for item in happy if isinstance(item, str) and item in by_id]
+
+        reached = reachable(named_here)
+        for topology in sorted(declared_topologies - reached):
+            errors.append(
+                f"Behavior {name} declares topology {topology} that none of its cases runs in"
+            )
+        for topology in sorted(reachable(establishing) - declared_topologies):
+            errors.append(
+                f"Behavior {name} does not declare topology {topology} where its cases are established"
+            )
+        if gate:
+            for topology in sorted(declared_topologies & set(gated_by)):
+                if gate not in gated_by[topology]:
+                    errors.append(
+                        f"Behavior {name} declares gate {gate} for {topology}, which "
+                        f"{_display(matrix_path)} does not gate that way"
+                    )
+
+    for case_id in sorted(by_id):
+        claimants = owners.get(case_id) or []
+        if not claimants:
+            errors.append(f"Case is mapped to no behavior: {case_id}")
+        elif len(claimants) > 1:
+            errors.append(
+                f"Case is mapped by more than one behavior: {case_id} "
+                f"({', '.join(sorted(claimants))})"
+            )
+
+    for area in BEHAVIOR_AREAS:
+        if area not in covered_areas:
+            errors.append(f"Area has no behavior: {area}")
     return errors
+
+
+def render_behaviors(catalog: Dict[str, Any], inventory: Dict[str, Any]) -> str:
+    """The inventory for a reader who will not open the YAML."""
+    behaviors = [entry for entry in inventory.get("behaviors") or [] if isinstance(entry, dict)]
+    named = {
+        case_id
+        for entry in behaviors
+        for case_id in (entry.get("cases") or []) + (entry.get("error_paths") or [])
+    }
+    lines = [
+        "<!-- Generated by `python3 -m tools.podman_e2e.catalog behaviors --write`. -->",
+        "",
+        "# Podman acceptance behaviour inventory",
+        "",
+        "Rendered from `tests/cases/behaviors.yaml`; do not edit by hand. Every row",
+        "names the cases that establish the behaviour and the cases that exercise",
+        "its error paths, the topologies it is proven in and the gate tier that",
+        "blocks on it. The topology column lists every topology the row's cases",
+        "apply to, so which case runs where is `tests/cases/catalog.yaml`'s own",
+        "per-case `topology`, not this column.",
+        "`python3 -m tools.podman_e2e.catalog check` fails on a",
+        "behaviour with no case, a behaviour covered only on its happy path, an",
+        "area the delta spec names but no entry covers, and a case no behaviour",
+        "names (an orphan) or two behaviours claim.",
+        "",
+        f"Behaviours: {len(behaviors)} across {len(BEHAVIOR_AREAS)} areas, naming "
+        f"{len(named)} of {len(catalog.get('cases') or [])} catalog cases.",
+        "",
+        "| Area | Behaviours | Cases | Error-path cases |",
+        "|---|---:|---:|---:|",
+    ]
+    for area in BEHAVIOR_AREAS:
+        entries = [entry for entry in behaviors if entry.get("area") == area]
+        happy = sum(len(entry.get("cases") or []) for entry in entries)
+        failure = sum(len(entry.get("error_paths") or []) for entry in entries)
+        lines.append(f"| {area} | {len(entries)} | {happy} | {failure} |")
+    for area in BEHAVIOR_AREAS:
+        entries = [entry for entry in behaviors if entry.get("area") == area]
+        if not entries:
+            continue
+        lines.extend(
+            [
+                "",
+                f"## {area}",
+                "",
+                "| Behaviour | Topologies | Gate | Cases | Error paths |",
+                "|---|---|---|---|---|",
+            ]
+        )
+        for entry in entries:
+            topologies = ", ".join(str(item) for item in entry.get("topology") or [])
+            cases = ", ".join(f"`{case_id}`" for case_id in entry.get("cases") or [])
+            failure = ", ".join(f"`{case_id}`" for case_id in entry.get("error_paths") or [])
+            lines.append(
+                f"| {entry.get('name')} | {topologies} | {entry.get('gate')} "
+                f"| {cases} | {failure} |"
+            )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def report_problems(
+    catalog: Dict[str, Any],
+    behaviors_path: Path = BEHAVIORS_PATH,
+    report_path: Optional[Path] = None,
+) -> List[str]:
+    """The rendered inventory must be the text the YAML renders to."""
+    behaviors_path = Path(behaviors_path)
+    path = Path(BEHAVIOR_REPORT_PATH if report_path is None else report_path)
+    if not behaviors_path.exists():
+        return []
+    try:
+        inventory = load_behaviors(behaviors_path)
+    except yaml.YAMLError:
+        return []
+    if not isinstance(inventory, dict):
+        return []
+    expected = render_behaviors(catalog, inventory)
+    if not path.exists():
+        return [
+            f"{_display(path)} is missing: run "
+            f"`python3 -m tools.podman_e2e.catalog behaviors --write`"
+        ]
+    if path.read_text(encoding="utf-8") != expected:
+        return [
+            f"{_display(path)} is not what the behaviour inventory renders to: run "
+            f"`python3 -m tools.podman_e2e.catalog behaviors --write` and commit the result"
+        ]
+    return []
 
 
 def executed_ids_from_results(paths: Iterable[Path]) -> set:
@@ -938,8 +1209,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("generate", help="Regenerate catalog.yaml and PARITY.md from the live spec")
-    sub.add_parser("check", help="Validate catalog parity, counts, and coverage")
+    sub.add_parser("check", help="Validate catalog parity, counts, coverage, and the rendered inventory")
     sub.add_parser("gaps", help="List cases without an implemented driver")
+    behaviors = sub.add_parser("behaviors", help="Render the checked-in behaviour inventory")
+    behaviors.add_argument(
+        "--write", action="store_true",
+        help=f"write {_display(BEHAVIOR_REPORT_PATH)} instead of printing it",
+    )
     args = parser.parse_args(argv)
 
     if args.command == "generate":
@@ -953,11 +1229,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         catalog = load_catalog()
         errors = validate_catalog(catalog)
         errors.extend(coverage_audit(catalog))
+        errors.extend(report_problems(catalog))
         if errors:
             for error in errors:
                 print(f"ERROR: {error}", file=sys.stderr)
             return 1
         print("CATALOG: PASS")
+        return 0
+
+    if args.command == "behaviors":
+        catalog = load_catalog()
+        inventory = load_behaviors()
+        if not args.write:
+            print(render_behaviors(catalog, inventory), end="")
+            return 0
+        BEHAVIOR_REPORT_PATH.write_text(render_behaviors(catalog, inventory), encoding="utf-8")
+        print(f"Wrote {_display(BEHAVIOR_REPORT_PATH)}")
         return 0
 
     if args.command == "gaps":
