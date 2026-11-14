@@ -182,6 +182,17 @@ requirement lists but no entry covers, a gate the named cases are not gated by,
 and a topology none of the behaviour's cases reaches. The report is a fixed
 point: editing the YAML without regenerating it fails the same check.
 
+The same audit maps the contracts this suite shares with the live capability in
+`openspec/specs/live-vps-e2e/spec.md` — subscription policy, case counts, Vision
+independence, firewall evidence, redaction and result semantics — and publishes
+them in the traceability report. Each contract quotes the live sentences it
+rests on, names the `live-parity` catalog cases a container reproduces, and
+resolves every count against `tests/cases/matrix.yaml` (`16/18/20` runtime cases
+for Multi-Node, `8/9/10` outbounds per subscription, port `3002`). A live
+sentence that was dropped or reworded, a case that is only partly reproducible,
+and a count whose numbers disagree are refusals: a divergence is a defect here,
+not a container-only variant.
+
 States are never collapsed: `PASS`, `FAIL`, `BLOCKED`, `SKIP`,
 `NOT_APPLICABLE`, `INCOMPLETE`. Any `SKIP` fails the run, `BLOCKED` and
 `INCOMPLETE` never read as `PASS`, and a run in which nothing applied is

@@ -172,6 +172,7 @@ SUITES = {
         "test_podman_budget.TestBudgetCase",
         "test_podman_budget.TestEntrypointBudget",
         "test_podman_behaviors.TestBehaviorInventory",
+        "test_podman_contracts.TestSharedContracts",
         "test_ci_workflows.TestIndependentAcceptanceWorkflows",
         "test_podman_redaction.TestRedactionFilter",
         "test_podman_redaction.TestArtifactTreeHoldsNoSentinel",

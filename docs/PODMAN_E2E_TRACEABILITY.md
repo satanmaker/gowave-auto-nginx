@@ -50,7 +50,7 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Pre-push and pull-request acceptance gate | Pre-push run blocks a regressed change | — | — | `test_podman_pre_push.TestPrePushGate` | Lint, Completeness, and Suite Nonroot | — |
 | Pre-push and pull-request acceptance gate | Budget overrun is not a truncated pass | — | `GATE-BUDGET` | `test_podman_budget.TestBudgetCase`, `test_podman_budget.TestEntrypointBudget`, `test_podman_budget.TestDeclaredBudget`, `test_podman_gate.TestPodmanGateContract` | All-in-One Podman Acceptance, Multi-Node Podman Acceptance, All-in-One Lifecycle and Recovery Acceptance, Multi-Node Lifecycle and Recovery Acceptance, Lint, Completeness, and Suite Nonroot | — |
 | Coverage completeness and error paths | Unmapped behavior or orphan case fails the audit | — | — | `test_podman_behaviors.TestBehaviorInventory`, `test_podman_traceability.TestTraceabilityRules` | Lint, Completeness, and Suite Nonroot | — |
-| Coverage completeness and error paths | Shared contract diverges from live acceptance | — | — | — | — | 8.17 — the audit against openspec/specs/live-vps-e2e/spec.md has not been performed |
+| Coverage completeness and error paths | Shared contract diverges from live acceptance | — | — | `test_podman_contracts.TestSharedContracts` | Lint, Completeness, and Suite Nonroot | — |
 | Case incubation and promotion path | New case starts in Podman | — | — | `test_podman_aio.TestNginxConfigCase.test_the_case_is_catalogued_as_an_incubating_podman_first_case` | Lint, Completeness, and Suite Nonroot | — |
 | Case incubation and promotion path | Promotion keeps one definition | — | — | `test_podman_matrix.TestMatrixCatalog` | Lint, Completeness, and Suite Nonroot | — |
 | Case incubation and promotion path | Live-only case states its reason | — | — | `test_podman_matrix.TestMatrixCatalog` | Lint, Completeness, and Suite Nonroot | — |
@@ -100,6 +100,24 @@ answers what one promise rests on, not which scenario owns it.
 | A stale answer expires within the record TTL instead of outliving it | Deterministic DNS and ACME fixtures | — | `DNS-01` | `test_podman_dns.TestDnsCase.test_a_resolver_that_keeps_the_old_answer_past_the_ttl_fails_the_case`, `test_fixture_dns.TestDnsFixture.test_zone_change_applies_without_a_restart` | All-in-One Podman Acceptance |
 | A steered wrong answer is served as published instead of being repaired | Deterministic DNS and ACME fixtures | — | `DNS-01` | `test_podman_dns.TestDnsCase.test_a_wrong_answer_that_is_repaired_fails_the_case`, `test_fixture_dns.TestDnsFixture.test_wrong_answer_mode_returns_the_steered_address` | All-in-One Podman Acceptance |
 
-Open gaps: 1.
+Open gaps: 0.
+
+## Shared contracts with the live capability
+
+The contracts both acceptance suites assert, with the requirement of
+`openspec/specs/live-vps-e2e/spec.md` each one maps to, the observable
+they agree on and the catalog cases that hold it here. The audit refuses
+a requirement the live spec no longer states, a quoted sentence that has
+drifted, a case that is not `live-parity` in a container, and a count
+whose numbers disagree with `tests/cases/matrix.yaml`.
+
+| Contract | Live requirement | Shared observable | Cases | Counts |
+| --- | --- | --- | --- | --- |
+| subscription-policy | Real Subscription Delivery and User-Agent Policy | Both suites fetch the payload from the real Panel and judge the status the installed User-Agent policy returns, so a missing or blank header is an outcome rather than a canned 403. | `SUB-01`, `SUB-02`, `SUB-03`, `SUB-04` | proxy-capable outbounds per subscription 8/9/10 |
+| case-counts | Data Plane E2E Traffic Through All VPN Endpoints | Both suites require every active endpoint to be exercised by a real Xray and a real Mihomo process, so the pair owes sixteen, eighteen or twenty runtime cases and the Vision combinations add two each. | `DP-15` | mandatory Data Plane runtime cases 16/18/20 |
+| vision-independence | Independent Optional Vision Domains | Enabling Vision on one node leaves the other node's four-inbound topology, certificate and route untouched in both suites, and a Vision failure fails the host that owns it. | `VIS-01`, `VIS-07` | — |
+| firewall-evidence | UFW Firewall Isolation Verification | A refused control-plane connection counts only beside a successful probe from the allowed vantage and firewall evidence read on the target, and ambiguous evidence is INCOMPLETE rather than a firewall PASS. | `FW-01`, `FW-02`, `FW-04` | control-plane port under test 3002 |
+| redaction | Redacted Diagnostic Artifact Collection | Secrets are recorded by field name only in both suites, every artifact byte passes the redactor, and a file that changes when redacted fails the run instead of being published. | `RED-01`, `RED-02` | — |
+| result-semantics | Result Status Semantics | Overall PASS requires every expected data-plane case, a skip never reads as a pass, an unexecuted case is reported rather than dropped, and each failing case is named individually in the machine-readable result. | `RES-01`, `RES-02`, `RES-03` | Data Plane runtime cases an overall PASS requires 16/18/20 |
 
 Matrix rows named: 8 of 8 aio rows, 16 of 16 multi-node rows.
