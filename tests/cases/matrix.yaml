@@ -1,8 +1,10 @@
 # Versioned protocol/client acceptance matrix for the Podman product E2E.
 # The matrix is consumed by the Podman runner and validated by catalog.py.
 # It is not a second source of truth: every field is derived from the shipped
-# inbound templates, the Panel subscription contracts, and the pinned client
-# versions recorded in tools/live_vps_config.env.example.
+# inbound templates, the Panel subscription contracts, and the client releases
+# pinned by digest below. The live runner follows the release instead
+# (tools/live_vps_config.env.example records `latest` for both clients), so a
+# version here is a statement about this harness, not about the live one.
 version: 1
 schema: gowave-podman-matrix/v1
 

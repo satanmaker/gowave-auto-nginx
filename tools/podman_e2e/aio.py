@@ -4549,6 +4549,12 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
                 f"the {name} representation is empty")
         require("SUB-SERVED", bool(record.get("content_type")),
                 f"the {name} representation came back without a media type")
+        # The vhost disables caching on /api/sub/, because a cached list would
+        # keep working after the client it describes was revoked.
+        require("SUB-SERVED", "no-store" in str(record.get("cache_control") or "").lower(),
+                f"the {name} representation answered with Cache-Control "
+                f"{record.get('cache_control')!r}, which lets a cache serve a subscription the "
+                f"Panel no longer stands behind")
         # The pinned policy is "a non-empty header", not "a header naming this
         # format". Sending a header that names no client family is the only way
         # to keep the suite from turning client identification into a server
@@ -4631,6 +4637,7 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
         record = served.get(name) or {}
         evidence[f"{name}_status"] = record.get("status")
         evidence[f"{name}_content_type"] = record.get("content_type")
+        evidence[f"{name}_cache_control"] = record.get("cache_control")
         evidence[f"{name}_bytes"] = record.get("bytes")
         evidence[f"{name}_foreign_status"] = record.get("foreign_status")
         evidence[f"{name}_foreign_identical"] = record.get("foreign_identical")

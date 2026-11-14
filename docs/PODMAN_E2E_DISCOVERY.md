@@ -285,6 +285,48 @@ exactly that, and `TestJsonShapeContract` holds this paragraph against
 `case_json_shapes` and `prepare_config`, so the page cannot keep describing a
 rule the probe stopped enforcing.
 
+### The live contract, capability by capability
+
+`openspec/specs/live-vps-e2e/spec.md` §Real Subscription Delivery and
+User-Agent Policy accepts the same product surface on two real VPS instead of
+one disposable host. The two suites have to assert the same product contract;
+where their numbers differ the topology explains the number, and where the live
+text names something the pinned Panel does not ship, this page says so instead
+of quietly asserting the weaker half.
+
+| Live scenario | Container case | Where the two differ |
+| --- | --- | --- |
+| `Subscription rejected with absent User-Agent` | `SUB-UA-ABSENT`, `SUB-UA-BLANK` | The live contract passes on whatever status the installed Panel returns and fails only if it differs from the upstream policy; the container suite pins `403` because the pinned Panel answers `403`, and asks every served path rather than `/v2ray-json` alone. |
+| `Proxy-capable outbounds in Xray JSON` | `SUB-SERVED`, `SUB-B64` | The live contract counts 8, 9 or 10 outbounds because it always runs a Master and a Worker; an All-in-One subscription carries 4 (5 with Vision) and a Multi-Node one carries 8, 9 or 10. The count is per subscription, so the topology explains the smaller number and the product does not change. |
+| `Xray JSON subscription headers and content verified` | `SUB-SERVED`, `SUB-B64` | Both require HTTP 200, the representation's media type, `Cache-Control: no-store`, Panel-issued addresses and SNI, and validation by the real `xray run -test`. |
+| `Mihomo YAML subscription verified` | `SUB-SERVED` | Both require HTTP 200, a media type, one proxy per served inbound and `mihomo -t`. The live text also names the rule `GEOIP,private,DIRECT,no-resolve`; see below. |
+
+**The one divergence that is prose, not behaviour.** The pinned Panel does not
+emit `GEOIP,private,DIRECT,no-resolve`. Its Mihomo template carries
+`GEOIP,LAN,DIRECT` followed by `MATCH,→ GoWave`
+(`internal/database/default_data.go:108`), which is the same intent — keep
+private destinations off the proxy — under the rule name that template uses.
+The live runner accepts either family, a GEOIP rule or a MATCH rule
+(`tools/live_vps/subscriptions.py:371`), and the container case asserts that a
+`MATCH` rule exists so a client would route something at all, because a
+representation the engine loads but never routes through is not a working
+subscription. Restating the live sentence's literal line would fail against the
+Panel this repository pins, so the divergence is recorded here rather than
+turned into an assertion either suite would have to weaken later.
+
+**The engines are the same binaries, pinned differently.** Both suites validate
+with the real Xray and Mihomo, and neither substitutes a parser for the engine:
+`mihomo -t` and `xray run -test` are what accept a representation, and the
+Python readers only count what the engines accepted. The container matrix pins
+`xray` 26.11.9 and `mihomo` 1.19.34 with the artifact digest and sha256 of each
+(`product.xray_client_version`, `product.mihomo_client_version`), because a
+container image has to be reproducible from the tree; the live runner takes
+`XRAY_CLIENT_VERSION` and `MIHOMO_CLIENT_VERSION` from
+`tools/live_vps_config.env.example`, which reads `latest`, so the live side
+follows the release. The shared contract is therefore "accepted by the real
+engine", not "accepted by this exact build", and the container suite is the
+place where a specific build is named.
+
 ### What is declared but not driven
 
 `PATCH /api/users` and `PATCH /api/users/{userId}` update an existing client,

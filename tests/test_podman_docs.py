@@ -582,6 +582,113 @@ class TestJsonShapeContract(unittest.TestCase):
                       "the shapes case is not in the suite that runs it, so the page describes a case nobody runs")
 
 
+LIVE_HEADING = "### The live contract, capability by capability"
+LIVE_SPEC = REPO_ROOT / "openspec" / "specs" / "live-vps-e2e" / "spec.md"
+LIVE_REQUIREMENT = "### Requirement: Real Subscription Delivery and User-Agent Policy"
+LIVE_CONFIG = REPO_ROOT / "tools" / "live_vps_config.env.example"
+SCENARIO = re.compile(r"^#### Scenario: (.+)$", re.MULTILINE)
+
+
+def live_section() -> str:
+    text = discovered()
+    start = text.index(LIVE_HEADING)
+    end = text.find("\n### ", start + 1)
+    return text[start:end if end != -1 else len(text)]
+
+
+def live_requirement() -> str:
+    text = LIVE_SPEC.read_text(encoding="utf-8")
+    start = text.index(LIVE_REQUIREMENT)
+    end = text.find("\n### Requirement: ", start + 1)
+    return text[start:end if end != -1 else len(text)]
+
+
+class TestLiveContractReconciliation(unittest.TestCase):
+    """The container acceptance and the live acceptance accept one product.
+
+    The page maps each scenario of the live subscription requirement onto the
+    container case that asserts it, and names the places where the two differ.
+    Each divergence is a claim about the pinned product or about the live
+    runner's configuration, so it is read back from both rather than trusted.
+    """
+
+    def setUp(self):
+        self.section = live_section()
+        self.prose = " ".join(self.section.split())
+        self.manifest = yaml.safe_load(MATRIX.read_text(encoding="utf-8"))
+
+    def test_every_live_subscription_scenario_has_a_row(self):
+        scenarios = set(SCENARIO.findall(live_requirement()))
+        self.assertTrue(scenarios, "the live requirement declares no scenario; the page maps nothing")
+        rows = set()
+        for line in self.section.splitlines():
+            if line.startswith("| `"):
+                rows.add(line.strip().strip("|").split("|")[0].strip().strip("`"))
+        self.assertEqual(scenarios - rows, set(), "a live scenario has no container row")
+        self.assertEqual(rows - scenarios, set(), "a row maps a scenario the live spec does not state")
+
+    def test_every_row_names_a_case_the_catalogue_holds(self):
+        ids = catalog_ids()
+        for line in self.section.splitlines():
+            if not line.startswith("| `"):
+                continue
+            cited = set(CASE_ID.findall(line))
+            self.assertTrue(cited, f"the row cites no case: {line[:60]}")
+            self.assertEqual(cited - ids, set())
+
+    def test_the_outbound_count_difference_is_explained_by_the_topology(self):
+        self.assertIn("8, 9 or 10", self.prose)
+        self.assertIn("carries 4 (5 with Vision)", self.prose)
+        self.assertIn("Multi-Node one carries 8, 9 or 10", self.prose)
+        self.assertEqual(sorted(self.manifest["topologies"]), ["aio", "multi-node"],
+                         "the page names two topologies the manifest does not declare")
+
+    def test_the_geoip_divergence_names_the_pinned_template(self):
+        self.assertIn("internal/database/default_data.go:108", self.prose)
+        self.assertIn("tools/live_vps/subscriptions.py:371", self.prose)
+        live = (REPO_ROOT / "tools" / "live_vps" / "subscriptions.py").read_text(encoding="utf-8")
+        rule_check = live.splitlines()[370]
+        self.assertIn('any("GEOIP" in rule', rule_check)
+        self.assertIn('any("MATCH" in rule', rule_check)
+        if not backend_tree():
+            self.skipTest(
+                "sources/gowave is a local checkout (/sources/ is gitignored): "
+                "the pinned Mihomo template was not re-read in this run"
+            )
+        template = (BACKEND / "internal" / "database" / "default_data.go").read_text(encoding="utf-8")
+        self.assertIn("GEOIP,LAN,DIRECT", template,
+                      "the pinned Panel now ships the rule the live spec names; the divergence is gone")
+        self.assertIn("MATCH,\u2192 GoWave", template)
+        self.assertNotIn("GEOIP,private,DIRECT,no-resolve", template)
+
+    def test_the_engine_pinning_difference_is_recorded(self):
+        self.assertIn("pinned differently", self.prose)
+        self.assertIn("reads `latest`", self.prose)
+        product = self.manifest["product"]
+        for name in ("xray_client_version", "mihomo_client_version"):
+            with self.subTest(version=name):
+                self.assertIn(str(product[name]), self.prose)
+        live = LIVE_CONFIG.read_text(encoding="utf-8")
+        self.assertIn("XRAY_CLIENT_VERSION=latest", live)
+        self.assertIn("MIHOMO_CLIENT_VERSION=latest", live)
+        header = MATRIX.read_text(encoding="utf-8").splitlines()
+        self.assertFalse(
+            any("pinned client" in line and "live_vps_config" in line for line in header[:10]),
+            "the manifest still claims its pinned clients are the ones the live runner records",
+        )
+
+    def test_the_cache_control_contract_is_asserted_where_the_page_says(self):
+        self.assertIn("`Cache-Control: no-store`", self.prose)
+        nginx = (REPO_ROOT / "modules" / "nginx.sh").read_text(encoding="utf-8")
+        location = nginx[nginx.index("location ^~ /api/sub/"):]
+        self.assertIn('add_header Cache-Control "no-store', location.split("location ", 1)[-1],
+                      "the vhost no longer disables caching on the subscription location")
+        self.assertIn('"no-store" in str(record.get("cache_control") or "").lower()',
+                      function_body("tools/podman_e2e/aio.py", "case_subscriptions"))
+        self.assertIn('"cache_control": (response.getheader("Cache-Control") or "")',
+                      function_body("tools/podman_e2e/panel_surface.py", "fetch"))
+
+
 class TestPodmanE2EDocumentation(unittest.TestCase):
     def test_every_flag_in_a_documented_command_exists(self):
         unknown = sorted(documented_flags() - parser_flags())

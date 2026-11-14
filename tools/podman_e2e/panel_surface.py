@@ -482,6 +482,10 @@ def fetch(
         return {
             "status": response.status,
             "content_type": (response.getheader("Content-Type") or ""),
+            # The product's own vhost adds this on /api/sub/, and a subscription
+            # a proxy or browser may cache outlives a revocation, so the answer
+            # is read here rather than assumed from the vhost's text.
+            "cache_control": (response.getheader("Cache-Control") or ""),
             "body": body,
         }
     finally:
@@ -520,6 +524,7 @@ def subscriptions(panel: Panel, payload_dir: Optional[Path]) -> Dict[str, Any]:
         facts["representations"][name] = {
             "status": response["status"],
             "content_type": media_type(response["content_type"]),
+            "cache_control": response["cache_control"],
             "bytes": len(body),
             "foreign_status": foreign["status"],
             "foreign_identical": foreign["body"] == body,
@@ -711,6 +716,7 @@ def revoke_issue(panel: Panel, directory: Path) -> Dict[str, Any]:
         facts["representations"][name] = {
             "status": response["status"],
             "content_type": media_type(response["content_type"]),
+            "cache_control": response["cache_control"],
             "bytes": len(body),
         }
         if response["status"] == 200 and body:
