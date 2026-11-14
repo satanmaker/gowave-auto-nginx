@@ -193,6 +193,36 @@ class Podman:
         listed = self._run(["volume", "ls", "-q", "--filter", f"label={label}"], check=False)
         return [line.strip() for line in (listed.stdout or "").splitlines() if line.strip()]
 
+    def run_containers(self) -> List[Dict[str, str]]:
+        """Every container this run owns, with the state Podman reports for it.
+
+        Diagnostics address the run's containers by name, and the names come from
+        the run label rather than from the products: a case can fail before the
+        object that would have named its roles exists.
+        """
+        label = f"gowave.e2e.run={self.context.run_id}"
+        listed = self._run(["ps", "-a", "--format", "json", "--filter", f"label={label}"], check=False)
+        if listed.returncode != 0:
+            return []
+        try:
+            items = json.loads(listed.stdout or "[]")
+        except json.JSONDecodeError:
+            return []
+        containers: List[Dict[str, str]] = []
+        for item in items if isinstance(items, list) else []:
+            name = _get(item, "Names", "Name")
+            if isinstance(name, list):
+                name = name[0] if name else None
+            if not name:
+                continue
+            containers.append({
+                "name": str(name),
+                "state": str(_get(item, "State") or ""),
+                "status": str(_get(item, "Status") or ""),
+            })
+        containers.sort(key=lambda entry: entry["name"])
+        return containers
+
     def ensure_image(self, alias: str) -> str:
         """Pull an alias at its locked digest and return the immutable reference."""
         if alias in self._built_images:

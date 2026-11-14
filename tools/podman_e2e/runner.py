@@ -279,9 +279,19 @@ class Runner:
         self.context = context
         self.cases: List[Case] = []
         self.results: List[CaseResult] = []
+        # Failure collectors are registered by the entrypoint instead of the
+        # runner: collection needs Podman, while the runner stays a result
+        # machine a unit test can drive without one.
+        self.failure_hooks: List[Callable[[CaseResult], None]] = []
+        self._diagnosed = False
+        self._pending_abort = ""
 
     def add(self, case: Case) -> None:
         self.cases.append(case)
+
+    def on_failure(self, hook: Callable[[CaseResult], None]) -> None:
+        """Register a collector that runs for every non-green case, before cleanup."""
+        self.failure_hooks.append(hook)
 
     def execute(self) -> int:
         self.context.install_signal_handlers()
@@ -306,6 +316,9 @@ class Runner:
                     abort_message = str(exc)
                     unexecuted = list(self.cases[index + 1:])
                     result = CaseResult(case.id, case.topology, INCOMPLETE, message=abort_message)
+                    # No diagnostics here: the operator asked the run to stop, so
+                    # probe time is the one thing this path must not spend. The
+                    # containers are removed immediately afterwards anyway.
                     self.results.append(self._finish(result, started, evidence_before))
                     break
                 except CaseTimeout:
@@ -327,7 +340,11 @@ class Runner:
                         FAIL,
                         message=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
                     )
-                self.results.append(self._finish(result, started, evidence_before))
+                self.results.append(self._finish_result(result, started, evidence_before))
+                if self._pending_abort:
+                    abort_message = self._pending_abort
+                    unexecuted = list(self.cases[index + 1:])
+                    break
         finally:
             # Cleanup must survive every exit path, so signal handlers are restored
             # before running it; a second SIGINT then behaves like an operator abort.
@@ -350,6 +367,46 @@ class Runner:
         if declared > remaining:
             return remaining, True
         return declared, False
+
+    def _finish_result(self, result: CaseResult, started: float, evidence_before: int) -> CaseResult:
+        """Stamp the case, collecting the failure bundle while its hosts still exist."""
+        if self._should_diagnose(result.status):
+            self._diagnosed = True
+            self._collect_failure_diagnostics(result)
+        return self._finish(result, started, evidence_before)
+
+    def _should_diagnose(self, status: str) -> bool:
+        """Which non-green outcomes owe a bundle.
+
+        A blocked case is a consequence, not the failure: the case that blocked it
+        already collected the state, and probing again for each of the fifty cases
+        behind one failed install would spend minutes re-recording the same
+        machine. A red run in which no case actually failed still gets one
+        bundle, because then the blocked case is the only account of the run.
+        """
+        return status in (FAIL, INCOMPLETE) or (status == BLOCKED and not self._diagnosed)
+
+    def _collect_failure_diagnostics(self, result: CaseResult) -> None:
+        """Run the registered collectors for a non-green case.
+
+        A collector that breaks must not change the verdict: the case already has
+        one, and losing the bundle is a smaller loss than reporting a different
+        outcome. The breakage is appended to the message so the gap is visible in
+        result.json rather than silently absent.
+        """
+        for hook in self.failure_hooks:
+            try:
+                hook(result)
+            except RunAborted as exc:
+                # The operator interrupted while the bundle was being read. The
+                # case keeps the verdict it earned; the run stops after it rather
+                # than spending the rest of the budget on the next cases.
+                self._pending_abort = str(exc)
+                return
+            except Exception as exc:
+                result.message = (
+                    f"{result.message}\n[failure diagnostics: {type(exc).__name__}: {exc}]"
+                )
 
     def _finish(self, result: CaseResult, started: float, evidence_before: int) -> CaseResult:
         """Stamp the duration and the evidence files this case produced."""

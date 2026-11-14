@@ -156,6 +156,9 @@ SUITES = {
         "test_podman_runner.TestPodmanRunnerContract",
         "test_podman_runner.TestPodmanRunOwnership",
         "test_podman_runner.TestArtifactOwnership",
+        "test_podman_runner.TestFailureDiagnosticsHook",
+        "test_podman_runner.TestPodmanDiagnosticsBundle",
+        "test_podman_runner.TestPodmanContainerDiscovery",
     ),
     "integration": (
         "test_api_client.TestAPIClient",

@@ -692,6 +692,9 @@ class TestRunnerEntrypoint(unittest.TestCase):
             def add(self, case):
                 pass
 
+            def on_failure(self, hook):
+                captured["failure_hook"] = hook
+
             def execute(self):
                 return 0
 
@@ -724,6 +727,13 @@ class TestRunnerEntrypoint(unittest.TestCase):
         captured = self._main(["--topology", "multi-node"])
         self.assertFalse(captured["vision"])
         self.assertFalse(captured["worker_vision"])
+
+    def test_the_failure_bundle_is_wired_before_any_case_runs(self):
+        captured = self._main(["--topology", "multi-node"])
+        self.assertTrue(
+            callable(captured.get("failure_hook")),
+            "a red case must leave the diagnostics the entrypoint is responsible for wiring",
+        )
 
     def test_the_aio_topology_rejects_the_worker_vision_flag(self):
         with self.assertRaises(SystemExit) as caught:
