@@ -8,7 +8,7 @@ issues one lineage per host role (`:372`, `:389`, `:399`; worker equivalent at
 `gowave-node-auto.sh:2456-2481`), so a host spends two or three certificates, never one. The `:443` stream map is
 a fixed literal (`modules/nginx.sh:192-250`): panel → 7443, reality → 8443, vision → 8444, cover → 9443, and
 `default` → 8443. The decoy vhost terminates on 9443 with the camouflage lineage
-(`modules/nginx.sh:501-541`). `modules/api_client.py:651` returns the internal squad identifier, `:697` puts it
+(`modules/nginx.sh:501-541`). `modules/api_client.py:651` returns the internal squad identifier, `:698` puts it
 into every host record, and `gowave-auto.sh:846` ignores that return and reads `squadUuid` from `state.json`.
 
 Two SSH layers exist and must not be conflated: the product onboards a worker with a pre-pinned host key and
@@ -52,12 +52,13 @@ runtime for a script whose whole value is being auditable bash).
 
 ### D2 — Mode is a flag, not a subcommand
 
-The non-interactive contract becomes `install [--panel-only] <panel-or-worker-name> <camouflage-name> <email>`,
-with the positional meaning of the second argument unchanged (it has always been the camouflage name; the code
-calls it `reality_domain`). `--mode all-in-one|panel-only` is accepted as the explicit spelling. The wizard sets
-the same flag. Alternatives rejected: `install-panel` (a second install path to keep in step with every future
-change) and overloading the email position (an argument whose meaning depends on another argument is how the
-current positional contract already confuses operators).
+The non-interactive contract becomes `install [--panel-only] <panel-name> <camouflage-name> <email> [vision]`,
+with the positional meanings unchanged: the first argument is the Panel name (`$1` in `cmd_install`; nothing on
+`install` names a worker), the second has always been the camouflage name (the code calls it `reality_domain`),
+and the optional fourth stays the Vision name. `--mode all-in-one|panel-only` is accepted as the explicit
+spelling. The wizard sets the same flag. Alternatives rejected: `install-panel` (a second install path to keep
+in step with every future change) and overloading the email position (an argument whose meaning depends on
+another argument is how the current positional contract already confuses operators).
 
 ### D3 — Panel-only routing sends the default to the decoy, not to a dead port
 
@@ -125,9 +126,9 @@ on that domain (mail, a website, other tooling).
 Whole-cluster-on-one-domain is technically sound — every host owns its own `:443`, its own certificate, and its
 own SNI map, and client links carry names rather than addresses — but three caveats belong in the design record:
 
-1. The apex and `www` camouflage certificate can only belong to one host. `cover_domain_for`
-   (`modules/nginx.sh:83-107`) disables the cover silently on every other host, so the rest of the cluster has a
-   decoy at its own subdomain and no apex website.
+1. The apex and `www` camouflage certificate can only belong to one host. On every other host the apex does not
+   resolve to that host's IP, so `cover_domain_for` (`modules/nginx.sh:83-107`) prints its disable warning and
+   drops the cover there — the rest of the cluster has a decoy at its own subdomain and no apex website.
 2. The budget is shared globally, as above.
 3. Wildcard certificates are not the escape hatch. Every host would order the identical identifier set
    `[domain, *.domain]`, and the "5 certificates per exact set of identifiers every 7 days" limit has no override,

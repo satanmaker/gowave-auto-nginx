@@ -18,7 +18,8 @@ fails after certificates have already been issued.
 - Support three deployment variants:
   - **2.1 All-in-One** — Panel, local node, Xray/REALITY/Vision on one host (today's behaviour).
   - **2.2 Panel-only** — Panel plus a camouflage domain only: no Xray, no REALITY inbound, no Vision, and no
-    local node. The SNI map serves the Panel and sends everything else to the static decoy.
+    local node. The SNI map serves the Panel and sends everything else to the static decoy. Like 2.3, this
+    variant also onboards N remote nodes from the Panel host, one at a time with `node add`.
   - **2.3 All-in-One plus N remote nodes** — 2.1 on the Panel host, then N workers onboarded from it.
 - Collect per host: Panel subdomain, decoy subdomain, and optionally a Vision subdomain. On worker nodes the
   real-VPN name and the camouflage name are separate subdomains, and Vision is optional per node.
@@ -37,7 +38,7 @@ fails after certificates have already been issued.
 - Fix the panel-only squad defect in the same change: `node add` reads `squadUuid` from `state.json`
   (`gowave-auto.sh:846`) and discards what `provision_internal_squad` returns
   (`modules/api_client.py:651`), so the first worker of a panel-only cluster would send
-  `"squads": [null]` (`modules/api_client.py:697`).
+  `"squads": [null]` (`modules/api_client.py:698`).
 - Extend both acceptance contours for the new topology: the Podman suite gains a panel-only drive and catalog
   cases, and the live runner gains the matching panel-only verification.
 

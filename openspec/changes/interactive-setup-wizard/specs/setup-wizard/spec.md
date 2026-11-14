@@ -61,7 +61,7 @@ chosen variant requires before collecting any of them.
 
 #### Scenario: Multi-node variants ask for a node count and one node at a time
 
-- **GIVEN** the operator chooses All-in-One plus remote nodes
+- **GIVEN** the operator chooses Panel-only with nodes or All-in-One plus remote nodes
 - **WHEN** the wizard continues
 - **THEN** it asks how many remote nodes to onboard, refuses a count below one, and then collects the names of
   each node in turn before any host is modified
@@ -127,10 +127,11 @@ while exceeding the ceiling.
 
 ### Requirement: Remote node onboarding uses temporary access
 
-The wizard SHALL onboard a remote node only after the operator confirms the presented host key fingerprint by
-typing it in full, SHALL read the password without echoing it, SHALL authorise a temporary key that is removed
-by a host timer no later than two hours after it is installed, SHALL run the existing node registration while
-that access exists, and SHALL revoke the key and the timer when the registration ends, succeeds or not.
+The wizard SHALL onboard a remote node only after the operator confirms the presented host-key fingerprint by
+typing it in full, SHALL read the password without echo, SHALL authorise a temporary key that a host timer
+removes within two hours, SHALL run the existing node registration under that access, SHALL revoke the key and
+the timer when the registration ends, succeeds or not, and SHALL abort before any key is authorised when the
+timer cannot be installed or enabled.
 
 #### Scenario: An incompletely typed fingerprint stops onboarding
 
@@ -158,6 +159,13 @@ that access exists, and SHALL revoke the key and the timer when the registration
 - **WHEN** the Panel host's process arguments are inspected while the password is held
 - **THEN** no argument of any spawned process contains the password, and the password is not written to a file
   that outlives the onboarding
+
+#### Scenario: Onboarding aborts when the expiry timer cannot be installed
+
+- **GIVEN** the wizard is onboarding a node whose expiry timer cannot be installed or enabled
+- **WHEN** the wizard reaches the point where the temporary key would be authorised
+- **THEN** it aborts that node before any key is written, leaves no temporary access or timer artefacts, and
+  leaves the other hosts of the plan untouched
 
 ### Requirement: The wizard is the only interactive surface
 
