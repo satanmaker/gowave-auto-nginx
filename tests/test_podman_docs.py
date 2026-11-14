@@ -691,8 +691,9 @@ class TestLiveContractReconciliation(unittest.TestCase):
         collect = function_body("tools/podman_e2e/aio.py", "collect_subscriptions")
         self.assertIn("--edge-base https://{host.panel_domain}", collect,
                       "the probe is no longer pointed at the public edge")
-        self.assertIn("GOWAVE_ACME_TEST_CA_FILE", collect,
+        self.assertIn("topology.ACME_CA_BUNDLE_NAME", collect,
                       "the edge fetch is no longer given the run's CA bundle")
+        self.assertIn("--ca {ca_file}", collect)
         self.assertIn('"cache_control": (response.getheader("Cache-Control") or "")',
                       function_body("tools/podman_e2e/panel_surface.py", "fetch"))
 
