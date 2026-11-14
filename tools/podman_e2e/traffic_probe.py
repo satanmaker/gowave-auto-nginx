@@ -42,6 +42,7 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -118,35 +119,73 @@ def wait_port(port: int, seconds: int, label: str, log_path: Path) -> None:
     raise SystemExit(f"{label} did not listen on 127.0.0.1:{port} within {seconds}s: {engine_log(log_path)}")
 
 
-def process_alive(pid: int) -> bool:
-    """Whether the recorded pid still runs. A zombie has already exited.
+@dataclass(frozen=True)
+class EngineProcess:
+    """A launched engine: its pid together with the start tick that makes it ours.
+
+    A pid is not an identity. Once a process is reaped the kernel hands its
+    number out again, and a full acceptance run forks enough for an unrelated
+    process to own a stopped engine's number before the shutdown wait looks at
+    it: the engine then reads as alive, so the case that expects "exited on its
+    own" waits out the deadline and reports nothing. Field 22 of
+    ``/proc/<pid>/stat`` is fixed for the life of a process, so the pair tells a
+    recycled number from the engine that was actually launched.
+    """
+
+    pid: int
+    started: Optional[str]
+
+
+def process_started(pid: int) -> Optional[str]:
+    """Field 22 of ``/proc/<pid>/stat``: the tick the process started, or None."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            fields = handle.read().rsplit(b")", 1)[-1].split()
+    except (OSError, IndexError):
+        return None
+    if len(fields) <= 19:
+        return None
+    return fields[19].decode("ascii", "replace")
+
+
+def process_alive(process: EngineProcess) -> bool:
+    """Whether the engine this probe launched still runs. A zombie has exited.
 
     The container's PID 1 is not a reaper, so a stopped engine stays visible to
     ``os.kill(pid, 0)`` until the container goes away; the process state is what
-    tells the shutdown wait that it is over.
+    tells the shutdown wait that it is over. A pid whose start tick has moved on
+    is a different process that inherited the number, so the engine it used to
+    name has exited and must not be signalled.
     """
     try:
-        os.kill(pid, 0)
+        os.kill(process.pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
+        # A process this probe may not signal is not the engine it forked.
+        pass
     try:
-        with open(f"/proc/{pid}/stat", "rb") as handle:
-            return handle.read().rsplit(b")", 1)[-1].split()[0] != b"Z"
+        with open(f"/proc/{process.pid}/stat", "rb") as handle:
+            fields = handle.read().rsplit(b")", 1)[-1].split()
     except FileNotFoundError:
         return False
     except (OSError, IndexError):
         return True
+    if not fields or fields[0] == b"Z":
+        return False
+    if process.started is None or len(fields) <= 19:
+        return True
+    return fields[19].decode("ascii", "replace") == process.started
 
 
-def launch_engine(argv: Sequence[str], log_path: Path, pid_path: Path, label: str) -> int:
+def launch_engine(argv: Sequence[str], log_path: Path, pid_path: Path, label: str) -> EngineProcess:
     """Start an engine that outlives this call, and record the pid to signal.
 
     A supervised child handle is a wait this probe would hold without a deadline,
     so the engine is launched detached and its pid is recorded instead: every
     wait the probe then performs is bounded, readiness by ``wait_port`` and
-    shutdown by ``wait_engine_exit``.
+    shutdown by ``wait_engine_exit``. The start tick is read here, while the
+    engine is known to be the process that number names.
     """
     pid_path.unlink(missing_ok=True)
     binary = shlex.quote(str(argv[0]))
@@ -178,31 +217,36 @@ def launch_engine(argv: Sequence[str], log_path: Path, pid_path: Path, label: st
         pid = int(pid_path.read_text(encoding="utf-8").strip())
     except (FileNotFoundError, ValueError):
         raise SystemExit(f"cannot start {label}: the launched process recorded no pid")
-    if not process_alive(pid):
+    process = EngineProcess(pid, process_started(pid))
+    if not process_alive(process):
         raise SystemExit(f"cannot start {label}: {engine_log(log_path)}")
-    return pid
+    return process
 
 
-def stop_engine(pid: int) -> None:
+def stop_engine(process: EngineProcess) -> None:
     """Last resort for a start that never became ready: nothing is left running."""
+    if not process_alive(process):
+        return
     try:
-        os.kill(pid, signal.SIGKILL)
+        os.kill(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
 
 
-def wait_engine_exit(pid: int, seconds: int, label: str, log_path: Path) -> None:
+def wait_engine_exit(process: EngineProcess, seconds: int, label: str, log_path: Path) -> None:
     """Signal the engine and wait, bounded, for its pid to disappear."""
+    if not process_alive(process):
+        raise SystemExit(f"{label} exited on its own while the transfers ran: {engine_log(log_path)}")
     try:
-        os.kill(pid, signal.SIGTERM)
+        os.kill(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         raise SystemExit(f"{label} exited on its own while the transfers ran: {engine_log(log_path)}")
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        if not process_alive(pid):
+        if not process_alive(process):
             return
         time.sleep(0.2)
-    stop_engine(pid)
+    stop_engine(process)
     raise SystemExit(f"{label} ignored SIGTERM for {seconds}s: {engine_log(log_path)}")
 
 
@@ -215,22 +259,22 @@ class Engine:
         self.pid_path = pid_path
         self.port = port
         self.label = label
-        self.pid: Optional[int] = None
+        self.process: Optional[EngineProcess] = None
 
     def __enter__(self) -> "Engine":
-        self.pid = launch_engine(self.argv, self.log_path, self.pid_path, self.label)
+        self.process = launch_engine(self.argv, self.log_path, self.pid_path, self.label)
         try:
             wait_port(self.port, STARTUP_SECONDS, self.label, self.log_path)
         except SystemExit:
-            stop_engine(self.pid)
+            stop_engine(self.process)
             raise
         return self
 
     def __exit__(self, *_exc: Any) -> None:
-        if self.pid is None:
+        if self.process is None:
             return
         try:
-            wait_engine_exit(self.pid, SHUTDOWN_SECONDS, self.label, self.log_path)
+            wait_engine_exit(self.process, SHUTDOWN_SECONDS, self.label, self.log_path)
         finally:
             self.pid_path.unlink(missing_ok=True)
 

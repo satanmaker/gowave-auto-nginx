@@ -273,12 +273,12 @@ class TestTrafficEngine(unittest.TestCase):
         path.rmdir()
 
     def test_a_started_engine_is_recorded_and_stopped(self):
-        pid = traffic_probe.launch_engine(["sleep", "30"], self.log_path, self.pid_path, "sleep")
-        self.assertGreater(pid, 0)
-        self.assertEqual(int(self.pid_path.read_text(encoding="utf-8").strip()), pid)
-        self.assertTrue(traffic_probe.process_alive(pid))
-        traffic_probe.wait_engine_exit(pid, 5, "sleep", self.log_path)
-        self.assertFalse(traffic_probe.process_alive(pid))
+        process = traffic_probe.launch_engine(["sleep", "30"], self.log_path, self.pid_path, "sleep")
+        self.assertGreater(process.pid, 0)
+        self.assertEqual(int(self.pid_path.read_text(encoding="utf-8").strip()), process.pid)
+        self.assertTrue(traffic_probe.process_alive(process))
+        traffic_probe.wait_engine_exit(process, 5, "sleep", self.log_path)
+        self.assertFalse(traffic_probe.process_alive(process))
 
     def test_the_engine_context_manager_cleans_up_its_pid_file(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -294,19 +294,41 @@ class TestTrafficEngine(unittest.TestCase):
         with traffic_probe.Engine(
             [sys.executable, "-c", listener], self.log_path, self.pid_path, port, "the test listener",
         ) as engine:
-            self.assertTrue(traffic_probe.process_alive(engine.pid))
+            self.assertTrue(traffic_probe.process_alive(engine.process))
             self.assertTrue(self.pid_path.exists())
-        self.assertFalse(traffic_probe.process_alive(engine.pid))
+        self.assertFalse(traffic_probe.process_alive(engine.process))
         self.assertFalse(self.pid_path.exists())
 
     def test_an_engine_that_died_on_its_own_fails_the_case(self):
-        pid = traffic_probe.launch_engine(["sleep", "0.05"], self.log_path, self.pid_path, "sleep")
+        process = traffic_probe.launch_engine(["sleep", "0.05"], self.log_path, self.pid_path, "sleep")
         deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and traffic_probe.process_alive(pid):
+        while time.monotonic() < deadline and traffic_probe.process_alive(process):
             time.sleep(0.05)
         with self.assertRaises(SystemExit) as caught:
-            traffic_probe.wait_engine_exit(pid, 1, "sleep", self.log_path)
+            traffic_probe.wait_engine_exit(process, 1, "sleep", self.log_path)
         self.assertIn("exited on its own", str(caught.exception))
+
+    def test_a_recycled_pid_reads_as_the_engine_having_exited(self):
+        """A number the kernel handed out again is not the engine that was launched.
+
+        This is the failure the liveness check exists for: the engine exits, its
+        pid is reaped and reused, and a bare ``kill -0`` would report a live
+        process. The recorded start tick has to tell them apart, and the process
+        that inherited the number must be left alone rather than signalled.
+        """
+        process = traffic_probe.launch_engine(["sleep", "30"], self.log_path, self.pid_path, "sleep")
+        self.assertIsNotNone(process.started)
+        other_owner = traffic_probe.EngineProcess(process.pid, str(int(process.started) + 1))
+        self.assertFalse(traffic_probe.process_alive(other_owner))
+        self.assertTrue(traffic_probe.process_alive(process))
+        with self.assertRaises(SystemExit) as caught:
+            traffic_probe.wait_engine_exit(other_owner, 1, "sleep", self.log_path)
+        self.assertIn("exited on its own", str(caught.exception))
+        self.assertTrue(
+            traffic_probe.process_alive(process),
+            "a pid the kernel handed to another process must not be signalled",
+        )
+        traffic_probe.stop_engine(process)
 
     def test_an_engine_that_never_starts_fails_with_its_log(self):
         with self.assertRaises(SystemExit) as caught:
@@ -317,11 +339,11 @@ class TestTrafficEngine(unittest.TestCase):
         self.assertIn("gowave-no-such-engine-binary", str(caught.exception))
 
     def test_stopping_a_process_that_is_gone_is_not_an_error(self):
-        pid = traffic_probe.launch_engine(["sleep", "0.05"], self.log_path, self.pid_path, "sleep")
+        process = traffic_probe.launch_engine(["sleep", "0.05"], self.log_path, self.pid_path, "sleep")
         deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and traffic_probe.process_alive(pid):
+        while time.monotonic() < deadline and traffic_probe.process_alive(process):
             time.sleep(0.05)
-        traffic_probe.stop_engine(pid)
+        traffic_probe.stop_engine(process)
 
     def test_readiness_is_bounded_when_nothing_listens(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
