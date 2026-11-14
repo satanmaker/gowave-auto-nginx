@@ -890,6 +890,97 @@ def matrix_driven_ids(topology: str) -> Set[str]:
     }
 
 
+def run_starts(path: Path = REPO_ROOT / "tools" / "podman_e2e" / "topology.py") -> List[Dict[str, Any]]:
+    """The start sequence a run performs, read from the topology's own `create()`.
+
+    A per-case fixture list cannot be derived from a driver's source: a case
+    consumes a fixture through an endpoint or a container, not a declared
+    dependency, so `AIO-NEG-DEST` reads the echo endpoint through
+    `endpoint_records` without naming any echo attribute. Nor can the fixtures
+    be told apart from the rest of the contour by a syntactic marker, which is
+    why this records the whole sequence with the markers it does have instead of
+    a guessed classification: the client container is started with
+    `image_alias=FIXTURE_IMAGE`, so that marker does not separate the
+    `dns`/`echo` fixtures from it, and `target`, `untrusted_client` and `worker`
+    carry no marker at all. What the source does prove is which steps
+    `create()` performs, and that is what is recorded.
+    """
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    aliases = _imported_modules(tree)
+    acme_modules = {alias for alias, module in aliases.items() if module == "acme_fixture"}
+    steps: Dict[str, ast.FunctionDef] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_start_"):
+            steps[node.name[len("_start_"):]] = node
+
+    created: Set[str] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name == "create"):
+            continue
+        for call in ast.walk(node):
+            if isinstance(call, ast.Call):
+                name = _dotted_name(call.func)
+                if name.startswith("self._start_"):
+                    created.add(name[len("self._start_"):])
+
+    starts: List[Dict[str, Any]] = []
+    for step in sorted(created):
+        body = steps.get(step)
+        if body is None:
+            raise CatalogError(f"topology starts {step!r}, which has no _start_{step} body to read")
+        starts.append({
+            "step": step,
+            "started_by": _display(path),
+            "scope": "run",
+            "fixture_image": any(
+                keyword.arg == "image_alias"
+                and isinstance(keyword.value, ast.Name) and keyword.value.id == "FIXTURE_IMAGE"
+                for call in ast.walk(body) if isinstance(call, ast.Call)
+                for keyword in call.keywords
+            ),
+            "acme_module": any(
+                isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                and node.value.id in acme_modules
+                for node in ast.walk(body)
+            ),
+        })
+    return starts
+
+
+def _run_start_errors(catalog: Dict[str, Any]) -> List[str]:
+    """The catalog's start inventory is the topology's own `create()` sequence."""
+    errors: List[str] = []
+    recorded = catalog.get("run_starts")
+    if not isinstance(recorded, list) or not recorded:
+        errors.append("the catalog records no run_starts inventory, so a run's start sequence is unstated")
+        return errors
+    derived = {entry["step"]: entry for entry in run_starts()}
+    stated: Dict[str, Dict[str, Any]] = {}
+    for entry in recorded:
+        step = entry.get("step")
+        if step in stated:
+            errors.append(f"start step {step!r} is recorded twice")
+        stated[step] = entry
+        if step not in derived:
+            errors.append(f"start step {step!r} is recorded, but no topology `create()` performs it")
+            continue
+        for field_name in ("started_by", "scope", "fixture_image", "acme_module"):
+            if entry.get(field_name) != derived[step][field_name]:
+                errors.append(
+                    f"start step {step!r}: {field_name} is {entry.get(field_name)!r}, "
+                    f"the topology says {derived[step][field_name]!r}"
+                )
+    for step in sorted(set(derived) - set(stated)):
+        errors.append(f"start step {step!r} is performed by the topology and not recorded")
+    for case in catalog.get("cases", []):
+        if "fixtures" in case:
+            errors.append(
+                f"{case.get('id')}: a per-case fixtures list cannot be derived from the driver, "
+                "so it is refused rather than guessed; the run-level sequence is `run_starts`"
+            )
+    return errors
+
+
 def driver_registry() -> Dict[str, Dict[str, Dict[str, Any]]]:
     """case id -> topology -> {driver, evidence}, read from the code that runs it.
 
@@ -1051,6 +1142,7 @@ def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
         "live_spec": str(spec_path.relative_to(REPO_ROOT)),
         "live_spec_sha256": spec_sha,
         "counts": counts,
+        "run_starts": run_starts(),
         "expected_positive_case_counts": {
             "aio": {"vision_disabled": 8, "vision_enabled": 10},
             "multi-node": {
@@ -1133,6 +1225,7 @@ def validate_catalog(catalog: Dict[str, Any], spec_path: Path = LIVE_SPEC) -> Li
         if not case.get("live_scenario") and not case.get("promotion_target"):
             errors.append(f"{case.get('id')}: Podman-first case requires a promotion target")
     errors.extend(_implementation_errors(catalog))
+    errors.extend(_run_start_errors(catalog))
     return errors
 
 
