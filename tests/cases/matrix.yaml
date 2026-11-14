@@ -5,6 +5,13 @@
 # pinned by digest below. The live runner follows the release instead
 # (tools/live_vps_config.env.example records `latest` for both clients), so a
 # version here is a statement about this harness, not about the live one.
+#
+# `host_record` is the Host record `modules/api_client.py` posts for the
+# inbound (`host_projection`): the address a client dials, the SNI it presents,
+# the ALPN it offers, the transport path and the `securityLayer` the Panel
+# stores. `address_role` / `sni_role` name the domain the value comes from,
+# because REALITY dials the panel's public address while presenting the REALITY
+# domain as SNI.
 version: 1
 schema: gowave-podman-matrix/v1
 
@@ -27,6 +34,14 @@ inbounds:
     optional: false
     listener: 443/tcp
     subscription_protocol: vless
+    host_record:
+      address_role: panel
+      sni_role: reality
+      port: 443
+      path: null
+      host: null
+      alpn: "h2,http/1.1"
+      security_layer: DEFAULT
   - id: XHTTP
     tag: vless-xhttp
     protocol: vless
@@ -37,6 +52,14 @@ inbounds:
     optional: false
     listener: 443/tcp
     subscription_protocol: vless
+    host_record:
+      address_role: panel
+      sni_role: panel
+      port: 443
+      path: /xhttp-down/
+      host: null
+      alpn: "h2,http/1.1"
+      security_layer: TLS
   - id: WS
     tag: vless-ws
     protocol: vless
@@ -47,6 +70,14 @@ inbounds:
     optional: false
     listener: 443/tcp
     subscription_protocol: vless
+    host_record:
+      address_role: panel
+      sni_role: panel
+      port: 443
+      path: /ws
+      host: null
+      alpn: "http/1.1"
+      security_layer: TLS
   - id: TROJAN-GRPC
     tag: trojan-grpc
     protocol: trojan
@@ -57,6 +88,14 @@ inbounds:
     optional: false
     listener: 443/tcp
     subscription_protocol: trojan
+    host_record:
+      address_role: panel
+      sni_role: panel
+      port: 443
+      path: trojan-grpc
+      host: null
+      alpn: "h2"
+      security_layer: TLS
   - id: VISION
     tag: vless-vision
     protocol: vless
@@ -67,6 +106,14 @@ inbounds:
     optional: true
     listener: 8443/tcp
     subscription_protocol: vless
+    host_record:
+      address_role: vision
+      sni_role: vision
+      port: 443
+      path: null
+      host: null
+      alpn: "http/1.1"
+      security_layer: TLS
 
 clients:
   - id: xray
