@@ -4738,6 +4738,30 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
             f"a served Xray {shape} profile needed {xray_json.get('wrapped')!r} runtime wrapper(s) "
             "before Xray accepted it, so it is not a runnable config")
 
+    # The matrix names the protocol/transport/security tuple and the client
+    # fingerprint each inbound is issued for, so the served outbound has to dial
+    # that same tuple: a client that imports the subscription can only reach the
+    # host the pair describes. The expectation is read from the subscription's
+    # own inbound set, so a matrix edit moves it instead of leaving a hand list
+    # behind.
+    inbounds = product.subscription_inbounds()
+    expected_transports = sorted({
+        f"{str(inbound.get('subscription_protocol') or inbound.get('protocol'))}"
+        f"/{inbound.get('transport')}/{inbound.get('security')}"
+        for inbound in inbounds
+    })
+    expected_fingerprints = sorted({str(inbound.get("fingerprint") or "") for inbound in inbounds})
+    require("SUB-SERVED", sorted(xray_json.get("transports") or []) == expected_transports,
+            f"the Xray profiles dial {xray_json.get('transports')!r} instead of the matrix's own "
+            f"transport set {expected_transports!r}, so a served outbound names a transport no "
+            "inbound was issued for")
+    require("SUB-SERVED", sorted(xray_json.get("fingerprints") or []) == expected_fingerprints,
+            f"the Xray profiles carry fingerprints {xray_json.get('fingerprints')!r} instead of "
+            f"the matrix's own {expected_fingerprints!r}")
+    require("SUB-SERVED", xray_json.get("sni_missing") == 0,
+            f"{xray_json.get('sni_missing')!r} served Xray outbound(s) carry no SNI, so the "
+            "certificate the client presents its name to is the wrong one")
+
     # Clash keeps only the trojan subset, and each node issues one, so a cluster
     # serves one Clash proxy per node rather than the single one an All-in-One
     # install serves.
@@ -4756,8 +4780,24 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
         require("SUB-SERVED", sorted(record.get("proxy_types") or []) == list(expected_types),
                 f"the {name} YAML declares proxy types {record.get('proxy_types')!r}, expected "
                 f"{list(expected_types)!r}")
-        require("SUB-SERVED", record.get("match_rule"),
-                f"the {name} YAML has no MATCH rule, so a client would route nothing through it")
+        require("SUB-SERVED", record.get("duplicate_names") == 0,
+                f"the {name} YAML declares {record.get('duplicate_names')!r} duplicate proxy "
+                "name(s), so a client would route to one of two entries by the same name")
+        # A representation the engine loads but never routes through is not a
+        # working subscription, so a routing rule has to exist. Either family is
+        # accepted: the pinned Panel's Mihomo template ships `GEOIP,LAN,DIRECT`
+        # followed by `MATCH`, while the live contract names
+        # `GEOIP,private,DIRECT,no-resolve`, and the live runner accepts either.
+        rule_names = record.get("rule_names") or []
+        require("SUB-SERVED", record.get("match_rule") or "GEOIP" in rule_names,
+                f"the {name} YAML has no MATCH and no GEOIP rule (rules {rule_names!r}), so a "
+                "client would route nothing through it")
+
+    mihomo = loaded.get("mihomo") or {}
+    require("SUB-SERVED", sorted(mihomo.get("client_fingerprints") or []) == expected_fingerprints,
+            f"the Mihomo YAML carries client-fingerprint {mihomo.get('client_fingerprints')!r} "
+            f"instead of the matrix's own {expected_fingerprints!r}, so the uTLS preset a "
+            "REALITY host authenticates is not the one the fleet was configured with")
 
     # A subscription that loads is not yet a subscription for this cluster: the
     # YAML has to address the Worker too, or the client would only ever reach the
@@ -4795,12 +4835,19 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
     evidence["xray_json_entries"] = xray_json.get("entries")
     evidence["xray_json_wrapped"] = xray_json.get("wrapped")
     evidence["xray_json_protocols"] = ",".join(xray_json.get("protocols") or [])
+    evidence["xray_json_transports"] = ",".join(xray_json.get("transports") or [])
+    evidence["xray_json_fingerprints"] = ",".join(xray_json.get("fingerprints") or [])
+    evidence["xray_json_sni_missing"] = xray_json.get("sni_missing")
+    evidence["xray_json_expected_transports"] = ",".join(expected_transports)
     for name in ("mihomo", "clash"):
         record = loaded.get(name) or {}
         evidence[f"{name}_proxies"] = record.get("proxies")
         evidence[f"{name}_proxy_types"] = ",".join(record.get("proxy_types") or [])
         evidence[f"{name}_groups"] = record.get("groups")
         evidence[f"{name}_match_rule"] = record.get("match_rule")
+        evidence[f"{name}_rule_names"] = ",".join(record.get("rule_names") or [])
+        evidence[f"{name}_duplicate_names"] = record.get("duplicate_names")
+        evidence[f"{name}_client_fingerprints"] = ",".join(record.get("client_fingerprints") or [])
     evidence["mihomo_servers"] = ",".join(sorted(mihomo_servers))
     evidence["singbox_outbounds"] = singbox.get("outbounds")
     return evidence

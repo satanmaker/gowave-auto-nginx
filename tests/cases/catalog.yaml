@@ -1359,8 +1359,12 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_user_agent_absent
+      evidence: []
+      case: SUB-UA-ABSENT
   promotion_target: null
 - id: SUB-02
   requirement: Real Subscription Delivery and User-Agent Policy
@@ -1389,8 +1393,42 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_subscriptions
+      evidence:
+      - base64_link_count
+      - base64_schemes
+      - mihomo_servers
+      - singbox_outbounds
+      - ua_foreign
+      - xray_json_entries
+      - xray_json_expected_transports
+      - xray_json_fingerprints
+      - xray_json_protocols
+      - xray_json_shape
+      - xray_json_sni_missing
+      - xray_json_transports
+      - xray_json_wrapped
+      case: SUB-SERVED
+    multi-node:
+      driver: aio:case_subscriptions
+      evidence:
+      - base64_link_count
+      - base64_schemes
+      - mihomo_servers
+      - singbox_outbounds
+      - ua_foreign
+      - xray_json_entries
+      - xray_json_expected_transports
+      - xray_json_fingerprints
+      - xray_json_protocols
+      - xray_json_shape
+      - xray_json_sni_missing
+      - xray_json_transports
+      - xray_json_wrapped
+      case: SUB-SERVED
   promotion_target: null
 - id: SUB-03
   requirement: Real Subscription Delivery and User-Agent Policy
@@ -1449,8 +1487,42 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_subscriptions
+      evidence:
+      - base64_link_count
+      - base64_schemes
+      - mihomo_servers
+      - singbox_outbounds
+      - ua_foreign
+      - xray_json_entries
+      - xray_json_expected_transports
+      - xray_json_fingerprints
+      - xray_json_protocols
+      - xray_json_shape
+      - xray_json_sni_missing
+      - xray_json_transports
+      - xray_json_wrapped
+      case: SUB-SERVED
+    multi-node:
+      driver: aio:case_subscriptions
+      evidence:
+      - base64_link_count
+      - base64_schemes
+      - mihomo_servers
+      - singbox_outbounds
+      - ua_foreign
+      - xray_json_entries
+      - xray_json_expected_transports
+      - xray_json_fingerprints
+      - xray_json_protocols
+      - xray_json_shape
+      - xray_json_sni_missing
+      - xray_json_transports
+      - xray_json_wrapped
+      case: SUB-SERVED
   promotion_target: null
 - id: FW-01
   requirement: UFW Firewall Isolation Verification
@@ -3484,8 +3556,12 @@ cases:
       - singbox_outbounds
       - ua_foreign
       - xray_json_entries
+      - xray_json_expected_transports
+      - xray_json_fingerprints
       - xray_json_protocols
       - xray_json_shape
+      - xray_json_sni_missing
+      - xray_json_transports
       - xray_json_wrapped
     multi-node:
       driver: aio:case_subscriptions
@@ -3496,8 +3572,12 @@ cases:
       - singbox_outbounds
       - ua_foreign
       - xray_json_entries
+      - xray_json_expected_transports
+      - xray_json_fingerprints
       - xray_json_protocols
       - xray_json_shape
+      - xray_json_sni_missing
+      - xray_json_transports
       - xray_json_wrapped
   promotion_target: Real Subscription Delivery and User-Agent Policy
 - id: SUB-B64

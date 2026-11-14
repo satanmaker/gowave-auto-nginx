@@ -283,9 +283,18 @@ def engine_representations(overrides=None):
     engine = {
         "base64": {"decoded": True, "decoded_bytes": 812, "link_count": 4,
                    "schemes": ["trojan", "vless"]},
-        "xray_json": {"shape": "list", "entries": 4, "wrapped": 0, "protocols": ["trojan", "vless"]},
+        # The tuples and the fingerprint are what the probe reads back out of the
+        # four served outbounds above, and what the matrix issues each inbound
+        # for; they are literals here so a matrix edit turns this fixture red
+        # instead of moving with it.
+        "xray_json": {"shape": "list", "entries": 4, "wrapped": 0, "protocols": ["trojan", "vless"],
+                      "transports": ["trojan/grpc/tls", "vless/tcp/reality",
+                                     "vless/ws/tls", "vless/xhttp/tls"],
+                      "fingerprints": ["firefox"], "sni_missing": 0},
         "mihomo": {"proxies": 4, "proxy_types": ["trojan", "vless"], "groups": 1, "rules": 1,
                    "match_rule": True, "exit": 0,
+                   "rule_names": ["MATCH"], "duplicate_names": 0,
+                   "client_fingerprints": ["firefox"],
                    "proxy_details": [
                        {"name": "REALITY", "type": "vless", "server": "panel.testbed.internal",
                         "network": "tcp", "tls": "true",
@@ -298,7 +307,9 @@ def engine_representations(overrides=None):
                         "network": "tcp", "tls": "true"},
                    ]},
         "clash": {"proxies": 1, "proxy_types": ["trojan"], "groups": 1, "rules": 1,
-                  "match_rule": True, "exit": 0},
+                  "match_rule": True, "exit": 0,
+                  "rule_names": ["MATCH"], "duplicate_names": 0,
+                  "client_fingerprints": ["firefox"]},
         "singbox": {"parsed": True, "outbounds": 4},
     }
     return merge(engine, overrides)
@@ -982,11 +993,17 @@ class TestSubscriptionClientProbe(unittest.TestCase):
         self.assertEqual(facts["base64"]["schemes"], ["trojan", "vless"])
         self.assertEqual(facts["xray_json"],
                          {"shape": "list", "entries": 4, "wrapped": 0,
-                          "protocols": ["trojan", "vless"]})
+                          "protocols": ["trojan", "vless"],
+                          "transports": ["trojan/grpc/tls", "vless/tcp/reality",
+                                         "vless/ws/tls", "vless/xhttp/tls"],
+                          "fingerprints": ["firefox"], "sni_missing": 0})
         for name in ("mihomo", "clash"):
             self.assertEqual(facts[name]["exit"], 0)
             self.assertEqual(facts[name]["proxies"], 4)
             self.assertTrue(facts[name]["match_rule"])
+            self.assertEqual(facts[name]["rule_names"], ["MATCH"])
+            self.assertEqual(facts[name]["duplicate_names"], 0)
+            self.assertEqual(facts[name]["client_fingerprints"], ["firefox"])
         self.assertEqual(facts["singbox"], {"parsed": True, "outbounds": 4})
         self.assertEqual([path.name for path in self.workdir.iterdir()
                           if path.suffix in (".json", ".yaml")], [])
@@ -1327,7 +1344,59 @@ class TestSubscriptionCases(unittest.TestCase):
         self.reject("proxy types", engine=engine_representations({"mihomo.proxy_types": ["vless"]}))
 
     def test_subscriptions_case_rejects_a_yaml_without_a_match_rule(self):
-        self.reject("no MATCH rule", engine=engine_representations({"clash.match_rule": False}))
+        self.reject("no MATCH and no GEOIP rule", engine=engine_representations({
+            "clash.match_rule": False, "clash.rule_names": []}))
+
+    def test_subscriptions_case_accepts_a_geoip_rule_family_without_match(self):
+        """The pinned Panel routes by ``GEOIP,LAN,DIRECT`` and the live contract
+        by ``GEOIP,private,DIRECT,no-resolve``; neither family ends in MATCH, so
+        a rule that names GEOIP is enough to prove the client routes at all."""
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"subscriptions": served_facts()})],
+            engine_results=[engine_result(engine_representations({
+                "mihomo.match_rule": False, "mihomo.rule_names": ["GEOIP"]}))],
+        )
+        evidence = aio.case_subscriptions(product)
+        self.assertEqual(evidence["mihomo_rule_names"], "GEOIP")
+
+    def test_subscriptions_case_rejects_a_profile_dialling_a_foreign_transport(self):
+        self.reject("transport", engine=engine_representations({
+            "xray_json.transports": ["trojan/grpc/tls", "vless/tcp/tls",
+                                     "vless/ws/tls", "vless/xhttp/tls"]}))
+
+    def test_subscriptions_case_rejects_a_profile_with_the_wrong_fingerprint(self):
+        self.reject("fingerprints", engine=engine_representations({
+            "xray_json.fingerprints": ["chrome"]}))
+
+    def test_subscriptions_case_rejects_a_profile_without_an_sni(self):
+        self.reject("carry no SNI", engine=engine_representations({
+            "xray_json.sni_missing": 1}))
+
+    def test_subscriptions_case_rejects_a_yaml_with_duplicate_proxy_names(self):
+        self.reject("duplicate proxy name", engine=engine_representations({
+            "mihomo.duplicate_names": 1}))
+
+    def test_subscriptions_case_rejects_a_mihomo_yaml_with_the_wrong_client_fingerprint(self):
+        self.reject("client-fingerprint", engine=engine_representations({
+            "mihomo.client_fingerprints": ["chrome"]}))
+
+    def test_subscriptions_case_names_the_tuple_and_fingerprint_it_read(self):
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"subscriptions": served_facts()})],
+            engine_results=[engine_result(engine_representations())],
+        )
+        evidence = aio.case_subscriptions(product)
+        self.assertEqual(evidence["xray_json_transports"],
+                         "trojan/grpc/tls,vless/tcp/reality,vless/ws/tls,vless/xhttp/tls")
+        self.assertEqual(evidence["xray_json_expected_transports"],
+                         "trojan/grpc/tls,vless/tcp/reality,vless/ws/tls,vless/xhttp/tls")
+        self.assertEqual(evidence["xray_json_fingerprints"], "firefox")
+        self.assertEqual(evidence["xray_json_sni_missing"], 0)
+        self.assertEqual(evidence["mihomo_rule_names"], "MATCH")
+        self.assertEqual(evidence["mihomo_duplicate_names"], 0)
+        self.assertEqual(evidence["mihomo_client_fingerprints"], "firefox")
 
     def test_subscriptions_case_rejects_a_singbox_body_without_outbounds(self):
         self.reject("carries no outbounds", engine=engine_representations({"singbox.outbounds": 0}))
