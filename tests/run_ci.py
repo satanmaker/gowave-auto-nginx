@@ -144,6 +144,8 @@ SUITES = {
         "test_podman_worker_subscriptions.TestMatrixExpectations",
         "test_podman_worker_subscriptions.TestWorkerDataPlaneCase",
         "test_podman_cleanup.TestPodmanStaleRunRecovery",
+        "test_podman_cleanup.TestEntrypointReclaimsStaleRuns",
+        "test_podman_docs.TestPodmanE2EDocumentation",
         "test_fixture_dns.TestDnsFixture",
         "test_fixture_echo.TestEchoFixture",
         "test_fixture_echo.TestEchoFixtureSourceAllowlist",

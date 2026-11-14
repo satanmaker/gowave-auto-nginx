@@ -52,7 +52,8 @@ The behaviour is pinned by OpenSpec specifications in `openspec/specs/`: two spe
 runners rather than only eyeballed in code review:
 
 - **Podman E2E** (`tools/run_podman_e2e.py`) — a rootful 4-distribution container testbed that
-  incubates every new scenario in minutes.
+  incubates every new scenario in minutes. Local invocation, prerequisites, budgets, the failure
+  bundle, artifact retention and cleanup are documented in [`docs/PODMAN_E2E.md`](docs/PODMAN_E2E.md).
 - **Live VPS E2E** (`tools/run_live_vps.py`) — the same acceptance catalog driven against real clean-room
   virtual servers; scenarios graduate here from the container suite.
 
