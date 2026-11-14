@@ -1035,6 +1035,165 @@ class TestReusableFixtureInventory(unittest.TestCase):
         self.assertIn(aio.NGX_CONFIG_DIRECTIVE, section)
 
 
+BOUNDARY_HEADING = "## Where Podman stops, where QEMU starts, and what only a VPS can answer"
+PARITY = REPO_ROOT / "tests" / "cases" / "PARITY.md"
+SYSTEMD_SUITE = REPO_ROOT / "tests" / "test_systemd_runner.py"
+DESIGN = REPO_ROOT / "openspec" / "changes" / "podman-full-e2e" / "design.md"
+LIVE_SPLIT = re.compile(r"Live scenarios: (\d+) — container (\d+), partial (\d+), live-only (\d+)\.")
+
+
+def boundary_section() -> str:
+    text = discovered()
+    start = text.index(BOUNDARY_HEADING)
+    end = text.find("\n## ", start + 1)
+    return text[start:end if end != -1 else len(text)]
+
+
+def environment_row(environment: str):
+    """The boundary table row whose first cell is the quoted environment."""
+    for line in boundary_section().splitlines():
+        if not line.startswith("| `"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if cells[0] == f"`{environment}`":
+            return cells
+    return None
+
+
+def parity_ids(heading: str) -> set:
+    text = PARITY.read_text(encoding="utf-8")
+    start = text.index(heading)
+    end = text.find("\n## ", start + 1)
+    return set(re.findall(r"^- \*\*([A-Z0-9-]+)\*\*", text[start:end], re.MULTILINE))
+
+
+class TestContourBoundary(unittest.TestCase):
+    """Podman, QEMU and Live VPS each answer a different question.
+
+    Every catalog entry carries an `environment`, so the boundary is data, not
+    prose. This class recomputes the counts and the ten non-container ids from
+    the catalog and from the generated `tests/cases/PARITY.md`, and refuses a
+    page or a design note that quotes a different set. The QEMU contour is read
+    from its own script: if it ever gained an installer call or a catalog id,
+    the claim that it checks the units without exercising the product would be
+    false.
+    """
+
+    def test_the_environment_table_counts_are_the_catalog_counts(self):
+        from tools.podman_e2e import catalog as case_catalog
+
+        catalog = case_catalog.load_catalog()
+        environments = {}
+        for case in catalog["cases"]:
+            environments[case["environment"]] = environments.get(case["environment"], 0) + 1
+        self.assertEqual(len(catalog["cases"]), 212, "the catalog changed size; the page quotes its total")
+        self.assertEqual(environments, {"container": 202, "partial": 8, "live-only": 2})
+        rows = [line for line in boundary_section().splitlines() if line.startswith("| `")]
+        self.assertEqual(len(rows), 3, "the environment table gained or lost a row")
+        for environment, expected in environments.items():
+            with self.subTest(environment=environment):
+                row = environment_row(environment)
+                self.assertIsNotNone(row, "the page states no count for this environment")
+                self.assertEqual(row[1], str(expected),
+                                 "the page counts a different number of cases than the catalog")
+
+    def test_the_live_split_is_the_one_parity_reports(self):
+        from tools.podman_e2e import catalog as case_catalog
+
+        counts = case_catalog.load_catalog()["counts"]
+        match = LIVE_SPLIT.search(PARITY.read_text(encoding="utf-8"))
+        self.assertIsNotNone(match, "PARITY.md stopped stating the live split")
+        self.assertEqual(
+            tuple(int(value) for value in match.groups()),
+            (counts["live_total"], counts["container"], counts["partial"], counts["live_only"]),
+            "the generated parity header and the catalog counts disagree",
+        )
+        page = " ".join(boundary_section().split())
+        self.assertIn(
+            f"Of the {counts['live_total']} live scenarios projected into this catalog, "
+            f"{counts['container']} are container, {counts['partial']} are partial and "
+            f"{counts['live_only']} are live-only; the other {counts['podman_first']} entries "
+            "are Podman-first",
+            page,
+            "the page's live split drifted from the catalog",
+        )
+
+    def test_the_ten_entries_that_are_not_fully_container_answerable_are_named(self):
+        from tools.podman_e2e import catalog as case_catalog
+
+        cases = case_catalog.load_catalog()["cases"]
+        expected = {
+            "partial": {case["id"] for case in cases if case["environment"] == "partial"},
+            "live-only": {case["id"] for case in cases if case["environment"] == "live-only"},
+        }
+        self.assertEqual(expected["partial"], parity_ids("## Partial splits"),
+                         "the generated partial split list moved away from the catalog")
+        self.assertEqual(expected["live-only"], parity_ids("## Live-only exclusions"),
+                         "the generated live-only exclusion list moved away from the catalog")
+        page = boundary_section()
+        named = set(re.findall(r"`([A-Z][A-Z0-9-]+)`", page))
+        catalogued = {case["id"] for case in cases}
+        self.assertEqual(named & catalogued, expected["partial"] | expected["live-only"],
+                         "the page names a case id that is not on the boundary, or omits one that is")
+        total = len(expected["partial"]) + len(expected["live-only"])
+        self.assertEqual(total, 10)
+        self.assertIn("The ten entries that are not fully container-answerable",
+                      " ".join(page.split()),
+                      "the page stopped counting the boundary entries")
+
+    def test_the_qemu_contour_installs_nothing_and_carries_no_case_ids(self):
+        from tools.podman_e2e import catalog as case_catalog
+
+        boot = BOOT_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("python3 tests/run_ci.py --suite systemd", boot,
+                      "the QEMU guest stopped running the systemd suite")
+        self.assertNotIn("gowave-auto.sh", boot,
+                         "the QEMU contour began invoking the product installer")
+        catalogued = [case["id"] for case in case_catalog.load_catalog()["cases"]]
+        for path in (BOOT_SCRIPT, SYSTEMD_SUITE):
+            text = path.read_text(encoding="utf-8")
+            found = sorted(
+                case_id for case_id in catalogued
+                if re.search(rf"\b{re.escape(case_id)}\b", text)
+            )
+            self.assertEqual(found, [], f"{path.name} names catalog cases the QEMU contour does not run")
+        page = " ".join(boundary_section().split())
+        for needle in ("python3 tests/run_ci.py --suite systemd", "/proc/1/comm", "no catalog case id"):
+            self.assertIn(needle, page, "the page dropped a fact that keeps the QEMU claim honest")
+
+    def test_the_systemd_suite_checks_the_units_the_page_names(self):
+        page = " ".join(boundary_section().split())
+        for relative in ("modules/panel.sh", "modules/security.sh"):
+            with self.subTest(module=relative):
+                self.assertTrue((REPO_ROOT / relative).is_file())
+                self.assertIn(relative, page, "the page no longer names the unit template the suite reads")
+        panel = (REPO_ROOT / "modules" / "panel.sh").read_text(encoding="utf-8")
+        self.assertIn("Before=gowave.service gowave-node.service", panel)
+        security = (REPO_ROOT / "modules" / "security.sh").read_text(encoding="utf-8")
+        self.assertIn("Before=systemd-sysctl.service", security)
+        suite = SYSTEMD_SUITE.read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r"^    def test_", suite, re.MULTILINE)), 5,
+                         "the systemd suite changed length; the page still says five tests")
+        self.assertIn("five tests", page)
+
+    def test_the_design_scope_names_the_same_three_contours(self):
+        text = DESIGN.read_text(encoding="utf-8")
+        start = text.index("## Scope boundary")
+        scope = " ".join(text[start:].split())
+        for needle in (
+            "docs/PODMAN_E2E_DISCOVERY.md",
+            "tests/systemd/boot.sh",
+            "tests/run_ci.py --suite systemd",
+            "tests/cases/PARITY.md",
+            "212 catalogued cases",
+            "202 are `container`",
+            "8 are `partial`",
+            "2 are `live-only`",
+        ):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, scope, "the design's scope boundary stopped matching the page")
+
+
 class TestPodmanE2EDocumentation(unittest.TestCase):
     def test_every_flag_in_a_documented_command_exists(self):
         unknown = sorted(documented_flags() - parser_flags())
