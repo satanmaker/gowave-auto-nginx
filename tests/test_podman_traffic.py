@@ -1100,7 +1100,8 @@ class TestMihomoLaunch(unittest.TestCase):
         transfers = self.launched()
         self.assertEqual(len(transfers), 2, "one transfer per served proxy")
         facts = transfers[0]
-        self.assertTrue(facts["mihomo_allow_lan"])
+        self.assertEqual(facts["mihomo_allow_lan"], "false",
+                         "the fact is the scalar the document spells, not a verdict")
         self.assertTrue(str(facts["mihomo_controller"]).startswith("127.0.0.1:"))
         self.assertEqual(facts["mihomo_proxies"], 2)
         self.assertEqual(facts["mihomo_rules"], 1)
@@ -1212,7 +1213,7 @@ def data_plane_facts(**overrides):
     facts.update(overrides)
     if facts["engine"] == "mihomo":
         for key, value in {
-            "mihomo_allow_lan": True,
+            "mihomo_allow_lan": "false",
             "mihomo_controller": "127.0.0.1:39090",
             "mihomo_mixed_port": 7890,
             "mihomo_socks_port": 7891,
@@ -1370,15 +1371,15 @@ class TestDataPlaneCase(unittest.TestCase):
 
     def test_the_mihomo_case_records_the_listeners_it_launched(self):
         evidence, _product, _podman = self.run_case(inbound_id="XHTTP", client="mihomo")
-        self.assertEqual(evidence["mihomo_allow_lan"], True)
+        self.assertEqual(evidence["mihomo_allow_lan"], "false")
         self.assertEqual(evidence["mihomo_controller"], "127.0.0.1:39090")
         self.assertEqual(evidence["mihomo_mixed_port"], 7890)
         self.assertEqual(evidence["mihomo_proxies"], 2)
         self.assertEqual(evidence["mihomo_rules"], 1)
 
     def test_the_mihomo_case_fails_when_the_launched_config_allows_lan(self):
-        self.reject("declares allow-lan False", inbound_id="XHTTP", client="mihomo",
-                    engine="mihomo", mihomo_allow_lan=False)
+        self.reject("declares allow-lan 'true'", inbound_id="XHTTP", client="mihomo",
+                    engine="mihomo", mihomo_allow_lan="true")
 
     def test_the_mihomo_case_fails_when_the_controller_is_not_on_loopback(self):
         self.reject("instead of 127.0.0.1", inbound_id="XHTTP", client="mihomo",

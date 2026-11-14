@@ -5035,10 +5035,11 @@ def case_data_plane(
     if client == "mihomo":
         # The config Mihomo was launched with is read back from the file it
         # loaded, so this states what the engine bound rather than what the
-        # preparation meant to bind.
-        require(case_id, facts.get("mihomo_allow_lan") is True,
+        # preparation meant to bind. The scalar is reported as the document
+        # spells it: a verdict under this key read as "allow-lan is on".
+        require(case_id, facts.get("mihomo_allow_lan") == "false",
                 f"the Mihomo config that carried the {inbound['id']} payload declares "
-                f"allow-lan {facts.get('mihomo_allow_lan')!r} instead of false")
+                f"allow-lan {facts.get('mihomo_allow_lan')!r} instead of 'false'")
         require(case_id, str(facts.get("mihomo_controller") or "").startswith("127.0.0.1:"),
                 f"the Mihomo controller that served the {inbound['id']} payload is bound to "
                 f"{facts.get('mihomo_controller')!r} instead of 127.0.0.1")

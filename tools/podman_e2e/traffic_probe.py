@@ -917,7 +917,7 @@ def mihomo_transfers(
         "mihomo_redir_port": bound["redir_port"],
         "mihomo_tproxy_port": bound["tproxy_port"],
         "mihomo_controller": bound["controller"],
-        "mihomo_allow_lan": bound["allow_lan"] == "false",
+        "mihomo_allow_lan": bound["allow_lan"],
         "mihomo_bind_address": bound["bind_address"],
         "mihomo_control_endpoints": bound["control_endpoints"],
         "mihomo_proxies": bound["proxies"],
