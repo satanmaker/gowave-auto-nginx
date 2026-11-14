@@ -1058,6 +1058,22 @@ def driver_registry() -> Dict[str, Dict[str, Dict[str, Any]]]:
 # catalog entry is read out of that case rather than typed by hand.
 LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     "DP-01": {"aio": "AIO-MATRIX", "multi-node": "MN-MATRIX"},
+    # The live contract asks for the status an absent User-Agent produces. The
+    # container case asks every served path rather than `/v2ray-json` alone and
+    # pins the code the pinned Panel answers, which is the same product rule read
+    # more strictly; the divergence is recorded in docs/PODMAN_E2E_DISCOVERY.md.
+    "SUB-01": {"aio": "SUB-UA-ABSENT"},
+    # 8/9/10 is the count a Master and a Worker together serve; an All-in-One
+    # install serves one per inbound as well, 4 or 5, and the page records that
+    # the topology, not the product, explains the number. SUB-SERVED reads the
+    # profiles back from the pinned Xray binary and requires one per inbound,
+    # every transport the matrix declares, and the configured fingerprint.
+    "SUB-02": {"aio": "SUB-SERVED", "multi-node": "SUB-SERVED"},
+    # The Mihomo YAML half of the same case: one proxy per inbound (8/9/10 on a
+    # cluster, 4/5 on one host), `client-fingerprint` equal to the configured
+    # preset, no duplicate names, and a routing-rule family a client would
+    # actually route through.
+    "SUB-04": {"aio": "SUB-SERVED", "multi-node": "SUB-SERVED"},
 }
 
 

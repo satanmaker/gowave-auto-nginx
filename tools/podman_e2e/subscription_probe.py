@@ -312,6 +312,7 @@ def scan_mihomo(text: str) -> Dict[str, Any]:
     groups = 0
     rules = 0
     match_rule = False
+    rule_names: set = set()
     section = ""
     item_prefix: Optional[str] = None
     key_prefix: Optional[str] = None
@@ -342,7 +343,9 @@ def scan_mihomo(text: str) -> Dict[str, Any]:
                     groups += 1
             else:
                 rules += 1
-                match_rule = match_rule or header.partition(",")[0].strip().upper() == "MATCH"
+                head = header.partition(",")[0].strip().upper()
+                rule_names.add(head)
+                match_rule = match_rule or head == "MATCH"
             continue
         if section != "proxies" or not proxies:
             continue
@@ -352,12 +355,18 @@ def scan_mihomo(text: str) -> Dict[str, Any]:
             continue
         key, _, value = stripped.partition(":")
         proxies[-1][key.strip()] = value.strip().strip("'\"")
+    names = [entry.get("name", "") for entry in proxies if entry.get("name")]
     return {
         "proxies": len(proxies),
         "proxy_types": sorted({entry.get("type", "") for entry in proxies if entry.get("type")}),
         "proxy_details": proxies,
+        "duplicate_names": len(names) - len(set(names)),
+        "client_fingerprints": sorted(
+            {entry.get("client-fingerprint", "") for entry in proxies if entry.get("client-fingerprint")}
+        ),
         "groups": groups,
         "rules": rules,
+        "rule_names": sorted(rule_names),
         "match_rule": match_rule,
     }
 
@@ -393,11 +402,21 @@ def representations(payload_dir: str, ca_file: str, workdir: Path) -> Dict[str, 
         if xray_test(entry, ca_file, workdir, f"xray-json-{index}"):
             wrapped += 1
 
+    # The transport a client must dial is the tuple the matrix declares per
+    # inbound, so it is read back from the served outbound rather than trusted
+    # from the protocol name alone.
+    identities = [
+        identity for identity in (outbound_identity(outbound) for outbound in proxy_outbounds(entries))
+        if identity is not None
+    ]
     facts["xray_json"] = {
         "shape": shape,
         "entries": len(entries),
         "wrapped": wrapped,
         "protocols": sorted(protocols),
+        "transports": sorted({f"{i[0]}/{i[6]}/{i[5]}" for i in identities}),
+        "fingerprints": sorted({i[4] for i in identities}),
+        "sni_missing": sum(1 for i in identities if not i[3]),
     }
 
     for name in ("mihomo", "clash"):

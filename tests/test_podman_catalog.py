@@ -94,23 +94,38 @@ class TestImplementationRegistry(unittest.TestCase):
                     "multi_node:data_plane_case",
                 )
 
-    def test_every_implemented_entry_names_the_topologies_the_code_drives(self):
+    def test_every_implemented_entry_names_the_topologies_it_runs_in(self):
+        """The catalog's driver map is what this repository runs, not what the text lists.
+
+        A live scenario's `topology` is read from the spec and names the contours
+        the sentence covers; the drivers say which of them a case actually
+        executes here. The two are not the same field: `SUB-01` describes a
+        subscription fetched from a panel, which both contours serve, but the
+        User-Agent refusal is executed by the All-in-One suite only. Requiring
+        equality would either hide that coverage gap or force the catalog to
+        restate the spec, so the invariant is the one that can be checked: every
+        declared driver belongs to a topology the entry lists, and the case named
+        is one the code builds for that topology.
+        """
         implemented = [case for case in self.catalog["cases"]
                        if case.get("driver_status") == "implemented"]
         self.assertTrue(implemented, "no entry claims an implementation, so nothing is checked")
         for case in implemented:
             observed = {topology: facts.get("case") or case["id"]
                         for topology, facts in case["drivers"].items()}
-            expected = set()
-            for observer in set(observed.values()):
-                expected |= set(self.registry.get(observer, {}))
             with self.subTest(case=case["id"]):
-                self.assertEqual(
-                    sorted(case["drivers"]), sorted(expected),
-                    f"{case['id']}: the catalog names different topologies than the code, "
-                    f"counting the case it runs and the observers it names",
+                self.assertTrue(observed, f"{case['id']}: an implemented entry names no driver")
+                self.assertTrue(
+                    set(observed) <= set(case["topology"]),
+                    f"{case['id']}: driven in {sorted(observed)}, which its topology list "
+                    f"{case['topology']} does not name",
                 )
                 for topology, observer in observed.items():
+                    self.assertIn(
+                        topology, self.registry.get(observer, {}),
+                        f"{case['id']} / {topology}: {observer} is not a case the code builds "
+                        "for that topology",
+                    )
                     self.assertEqual(
                         case["drivers"][topology]["driver"],
                         self.registry[observer][topology]["driver"],
