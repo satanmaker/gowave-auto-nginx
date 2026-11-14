@@ -303,6 +303,7 @@ requirements:
         tests:
           - tests.test_ci_workflows.TestIndependentAcceptanceWorkflows
           - tests.test_podman_groups.TestRequiredGroupRun
+          - tests.test_podman_gate.TestPodmanGateContract
         jobs:
           - All-in-One Podman Acceptance
           - Multi-Node Podman Acceptance

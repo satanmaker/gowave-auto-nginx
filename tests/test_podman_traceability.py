@@ -403,6 +403,15 @@ class TestTraceabilityRules(unittest.TestCase):
             self.assertEqual(trace.main(["--strict"]), 1)
         self.assertIn("--strict refuses", printed.getvalue())
 
+    def test_the_audit_entrypoint_refuses_a_drifted_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            drifted = Path(directory) / "PODMAN_E2E_TRACEABILITY.md"
+            drifted.write_text("| Requirement | Scenario |\n", encoding="utf-8")
+            with mock.patch.object(trace, "REPORT_PATH", drifted):
+                with contextlib.redirect_stdout(io.StringIO()) as printed:
+                    self.assertEqual(trace.main(["--check"]), 1)
+        self.assertIn("is not what the table renders to", printed.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
