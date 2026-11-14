@@ -167,6 +167,7 @@ SUITES = {
         "test_podman_groups.TestUnmet",
         "test_podman_groups.TestRequiredGroupRun",
         "test_podman_gate.TestPodmanGateContract",
+        "test_podman_pre_push.TestPrePushGate",
         "test_ci_workflows.TestIndependentAcceptanceWorkflows",
         "test_podman_redaction.TestRedactionFilter",
         "test_podman_redaction.TestArtifactTreeHoldsNoSentinel",

@@ -64,6 +64,19 @@ The test suite enforces strict EUID privilege separation:
    ```
    All 8 stages must pass across all 4 target operating systems.
 
+4. **Pre-Push Acceptance Gate**:
+   Install the hook once per clone; from then on `git push` runs both full
+   Podman suites (`aio`, then `multi-node`) against the pinned fixtures before
+   anything leaves the machine, and blocks the push on the first failure:
+   ```bash
+   python3 -m tools.pre_push_e2e --install-hook
+   ```
+   The suites provision privileged systemd containers, so the hook runs the gate
+   as root and `sudo` may prompt interactively. `git push --no-verify` bypasses
+   the hook; the required pull-request checks then judge the change. The gate
+   reads which topologies it covers from the `gate:` list in
+   `tests/cases/matrix.yaml` — never edit the list to make a push pass.
+
 ---
 
 ## Licensing & Third-Party Notices
