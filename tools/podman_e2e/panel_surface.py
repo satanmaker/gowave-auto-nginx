@@ -14,11 +14,13 @@ a boolean, a non-secret protocol/port name, or a digest.
 Subscription payloads are secrets — they carry client identifiers, Trojan
 passwords, and REALITY public keys — so they are written to the run's 0600
 payload directory and never printed: the facts only report a status, a media
-type, and a byte count.
+type, a byte count, and the transport header.
 
     python3 /repo/tools/podman_e2e/panel_surface.py --scope surface
     python3 /repo/tools/podman_e2e/panel_surface.py --scope cluster
     python3 /repo/tools/podman_e2e/panel_surface.py --scope subscriptions --payload-dir /payloads
+    python3 /repo/tools/podman_e2e/panel_surface.py --scope subscriptions --payload-dir /payloads \
+        --edge-base https://panel.testbed.internal --ca /fixtures/ca/acme-trust.pem
     python3 /repo/tools/podman_e2e/panel_surface.py --scope channel --step capture --payload-dir /payloads
 """
 from __future__ import annotations
@@ -29,6 +31,7 @@ import http.client
 import json
 import os
 import secrets
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -460,6 +463,7 @@ def fetch(
     path: str,
     user_agent: Optional[str],
     timeout: int = REQUEST_TIMEOUT_SECONDS,
+    ca_file: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Fetch one path with an explicit User-Agent, or with no header at all.
 
@@ -467,9 +471,19 @@ def fetch(
     to be written by hand: it is the only way to observe what the Panel does when
     a client sends no header. A ``user_agent`` of ``""`` sends an explicitly
     blank header, which is a different request from an absent one.
+
+    ``ca_file`` is what lets the same function read the public edge: over HTTPS
+    the certificate the fixture ACME directory issued is the only one that
+    verifies, so a run cannot pass by trusting a store the product never used.
     """
     parsed = urllib.parse.urlsplit(base_url)
-    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+    if parsed.scheme == "https":
+        context = ssl.create_default_context(cafile=ca_file or None)
+        connection: http.client.HTTPConnection = http.client.HTTPSConnection(
+            parsed.hostname, parsed.port or 443, context=context, timeout=timeout,
+        )
+    else:
+        connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
     try:
         connection.putrequest("GET", path, skip_accept_encoding=True)
         connection.putheader("Accept", "*/*")
@@ -482,9 +496,10 @@ def fetch(
         return {
             "status": response.status,
             "content_type": (response.getheader("Content-Type") or ""),
-            # The product's own vhost adds this on /api/sub/, and a subscription
-            # a proxy or browser may cache outlives a revocation, so the answer
-            # is read here rather than assumed from the vhost's text.
+            # What this vantage answered with. Read from both sides on purpose:
+            # the Panel process answers none of it and the shipped vhost adds it,
+            # so a case that only read the loopback URL would be asserting a
+            # header no client ever sees.
             "cache_control": (response.getheader("Cache-Control") or ""),
             "body": body,
         }
@@ -507,8 +522,22 @@ def write_payload(path: Path, body: bytes) -> None:
     os.chmod(path, 0o600)
 
 
-def subscriptions(panel: Panel, payload_dir: Optional[Path]) -> Dict[str, Any]:
-    """Fetch every served representation once and store its payload for the clients."""
+def subscriptions(
+    panel: Panel,
+    payload_dir: Optional[Path],
+    edge_base: str = "",
+    ca_file: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Fetch every served representation once and store its payload for the clients.
+
+    Each representation is read twice. The loopback URL is the Panel process, and
+    it is what the byte and User-Agent facts describe. ``edge_base`` is the public
+    URL the shipped vhost answers on, and the same path is fetched through it with
+    the same header, so the transport headers a real client receives are observed
+    where a client receives them — the vhost adds ``Cache-Control`` and the Panel
+    process does not, so a header read only on loopback would be a claim about a
+    response nobody gets.
+    """
     short_uuid = default_user_short_uuid(panel)
     facts: Dict[str, Any] = {"short_uuid_length": len(short_uuid), "representations": {}}
     for name, template, user_agent in REPRESENTATIONS:
@@ -521,14 +550,27 @@ def subscriptions(panel: Panel, payload_dir: Optional[Path]) -> Dict[str, Any]:
         # representation from the header and the family headers above were
         # carrying the assertion instead of identifying a client.
         foreign = fetch(panel.base_url, path, FOREIGN_USER_AGENT)
-        facts["representations"][name] = {
+        record: Dict[str, Any] = {
             "status": response["status"],
             "content_type": media_type(response["content_type"]),
             "cache_control": response["cache_control"],
+            "sha256": hashlib.sha256(body).hexdigest(),
             "bytes": len(body),
             "foreign_status": foreign["status"],
             "foreign_identical": foreign["body"] == body,
         }
+        if edge_base:
+            edge = fetch(edge_base, path, user_agent, ca_file=ca_file)
+            record.update({
+                "edge_status": edge["status"],
+                "edge_cache_control": edge["cache_control"],
+                "edge_bytes": len(edge["body"]),
+                # The edge has to hand a client the very bytes the Panel issued:
+                # a header attached to a different body would describe a response
+                # the engine-side probe never consumed.
+                "edge_identical": edge["body"] == body,
+            })
+        facts["representations"][name] = record
         if name == "xray-json":
             # The credentials every engine derives from the same user, reduced to
             # a digest: a repeated install must not rotate them.
@@ -1061,6 +1103,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default="",
         help="Directory the subscription payloads are written to (0600); never printed",
     )
+    parser.add_argument(
+        "--edge-base",
+        default="",
+        help=(
+            "Public base URL the shipped vhost answers on, e.g. "
+            "https://panel.testbed.internal. The same paths are fetched through it "
+            "so transport headers are read where a client reads them."
+        ),
+    )
+    parser.add_argument(
+        "--ca",
+        default="",
+        help="CA bundle the edge certificate chains to; over HTTPS no other store is trusted",
+    )
     args = parser.parse_args(argv)
 
     username, password = read_credentials(Path(args.credentials))
@@ -1074,7 +1130,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         facts["lifecycle"] = lifecycle(panel)
     if args.scope in ("subscriptions", "all"):
         payload_dir = Path(args.payload_dir) if args.payload_dir else None
-        facts["subscriptions"] = subscriptions(panel, payload_dir)
+        facts["subscriptions"] = subscriptions(
+            panel, payload_dir, edge_base=args.edge_base, ca_file=args.ca or None,
+        )
     if args.scope == "ua-absent":
         facts["policy"] = user_agent_policy(panel, None, "absent")
     if args.scope == "ua-blank":

@@ -3,6 +3,7 @@
 import base64
 import io
 import json
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -230,24 +231,49 @@ def merge(base, overrides=None):
     return data
 
 
+def issue_edge_certificate(directory):
+    """A self-signed certificate for the edge stub that doubles as its trust anchor."""
+    key = Path(directory) / "edge.key"
+    certificate = Path(directory) / "edge.crt"
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(key), "-out", str(certificate), "-days", "1",
+        "-subj", "/CN=panel.testbed.internal",
+        "-addext", "subjectAltName=DNS:panel.testbed.internal,IP:127.0.0.1",
+    ], check=True, stderr=subprocess.DEVNULL)
+    return certificate
+
+
 def served_facts(overrides=None):
+    """Facts shaped like the real two vantages: the Panel process answers no header.
+
+    ``cache_control`` is the loopback answer — the Panel itself — and
+    ``edge_cache_control`` is the public vhost a client talks to. The product's
+    Panel sends none of it and its vhost adds it, so a fixture that put the
+    header on both would let a case pass while reading the wrong side.
+    """
     return merge({
         "short_uuid_length": len(SHORT_UUID),
         "representations": {
             "base64": {"status": 200, "content_type": "text/plain", "bytes": len(BASE64_BODY),
-                       "cache_control": NO_STORE,
+                       "cache_control": "",
+                       "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
                        "foreign_status": 200, "foreign_identical": True},
             "xray-json": {"status": 200, "content_type": "application/json", "bytes": len(JSON_BODY),
-                          "cache_control": NO_STORE,
+                          "cache_control": "",
+                          "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
                           "foreign_status": 200, "foreign_identical": True},
             "mihomo": {"status": 200, "content_type": "text/yaml", "bytes": len(MIHOMO_YAML),
-                       "cache_control": NO_STORE,
+                       "cache_control": "",
+                       "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
                        "foreign_status": 200, "foreign_identical": True},
             "clash": {"status": 200, "content_type": "text/yaml", "bytes": len(MIHOMO_YAML),
-                      "cache_control": NO_STORE,
+                      "cache_control": "",
+                      "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
                       "foreign_status": 200, "foreign_identical": True},
             "singbox": {"status": 200, "content_type": "application/json", "bytes": len(SINGBOX_BODY),
-                        "cache_control": NO_STORE,
+                        "cache_control": "",
+                        "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
                         "foreign_status": 200, "foreign_identical": True},
         },
     }, overrides)
@@ -313,9 +339,14 @@ def policy_facts(policy, status=403):
 
 
 class StubPanel:
-    """A Panel that answers the default-client lookup and every representation."""
+    """A Panel that answers the default-client lookup and every representation.
 
-    def __init__(self):
+    ``secure`` makes it answer over HTTPS with a certificate that doubles as its
+    own trust anchor, which is what lets a test read the same paths through a
+    second, TLS-terminating vantage the way the public vhost is read.
+    """
+
+    def __init__(self, secure=False):
         self.password = "pw-do-not-print"
         self.token = "token-do-not-print"
         self.user = {"id": CLIENT_UUID, "username": "default-user", "shortUuid": SHORT_UUID}
@@ -326,15 +357,16 @@ class StubPanel:
         self.enforce_user_agent = False
         self.refuse_foreign_user_agent = False
         self.no_cache_control = False
+        self.certificate = None
         directory = Path(tempfile.mkdtemp(prefix="gowave-subscription-panel-"))
         self.credentials = directory / "credentials"
         self.credentials.write_text(
             f"ADMIN_USERNAME=admin\nADMIN_PASSWORD={self.password}\n", encoding="utf-8"
         )
         self.credentials.chmod(0o600)
-        self.server = self._start()
+        self.server = self._start(secure, directory)
 
-    def _start(self):
+    def _start(self, secure=False, directory=None):
         panel = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -370,6 +402,14 @@ class StubPanel:
                 return self._send(status, body if status == 200 else "", content_type)
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        if secure:
+            certificate = issue_edge_certificate(directory)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(
+                certfile=str(certificate), keyfile=str(certificate.with_suffix(".key")),
+            )
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            self.certificate = certificate
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         return server
@@ -392,8 +432,13 @@ class StubPanel:
     def url(self):
         return f"http://127.0.0.1:{self.server.server_address[1]}"
 
+    @property
+    def edge_url(self):
+        scheme = "https" if self.certificate else "http"
+        return f"{scheme}://127.0.0.1:{self.server.server_address[1]}"
 
-def probe_output(panel, scope, payload_dir="", step=""):
+
+def probe_output(panel, scope, payload_dir="", step="", edge_base="", ca=""):
     stdout = io.StringIO()
     argv = [
         "--scope", scope,
@@ -404,6 +449,10 @@ def probe_output(panel, scope, payload_dir="", step=""):
         argv.extend(["--payload-dir", payload_dir])
     if step:
         argv.extend(["--step", step])
+    if edge_base:
+        argv.extend(["--edge-base", edge_base])
+    if ca:
+        argv.extend(["--ca", str(ca)])
     with redirect_stdout(stdout):
         code = panel_surface.main(argv)
     if code != 0:
@@ -467,6 +516,66 @@ class TestPanelSubscriptionProbe(unittest.TestCase):
         for name in ("base64", "xray-json", "mihomo", "clash", "singbox"):
             with self.subTest(representation=name):
                 self.assertEqual(facts["representations"][name]["cache_control"], "")
+
+    def edge_panel(self):
+        edge = StubPanel(secure=True)
+        self.addCleanup(edge.server.shutdown)
+        self.addCleanup(edge.server.server_close)
+        return edge
+
+    def test_the_probe_reads_the_public_edge_beside_the_panel_process(self):
+        """Two vantages, two answers: the Panel sends no header, the edge sends it."""
+        self.panel.no_cache_control = True
+        edge = self.edge_panel()
+        facts, output = probe_output(
+            self.panel, "subscriptions", str(self.payload_dir),
+            edge_base=edge.edge_url, ca=edge.certificate,
+        )
+        served = facts["subscriptions"]["representations"]
+        for name, record in served.items():
+            with self.subTest(representation=name):
+                self.assertEqual(record["cache_control"], "",
+                                 "the Panel process reported a header it does not send")
+                self.assertEqual(record["edge_status"], 200)
+                self.assertIn("no-store", record["edge_cache_control"])
+                self.assertIs(record["edge_identical"], True)
+        self.assertNotIn(SHORT_UUID, output)
+        self.assertNotIn(TROJAN_PASSWORD, output)
+
+    def test_an_edge_that_lets_the_subscription_be_cached_is_visible(self):
+        self.panel.no_cache_control = True
+        edge = self.edge_panel()
+        edge.no_cache_control = True
+        facts, _ = probe_output(
+            self.panel, "subscriptions", str(self.payload_dir),
+            edge_base=edge.edge_url, ca=edge.certificate,
+        )
+        for name, record in facts["subscriptions"]["representations"].items():
+            with self.subTest(representation=name):
+                self.assertEqual(record["edge_cache_control"], "")
+
+    def test_an_edge_that_serves_other_bytes_is_reported_against_the_panel(self):
+        self.panel.no_cache_control = True
+        edge = self.edge_panel()
+        edge.bodies["clash"] = (MIHOMO_YAML + "\n# another body\n", "text/yaml")
+        facts, _ = probe_output(
+            self.panel, "subscriptions", str(self.payload_dir),
+            edge_base=edge.edge_url, ca=edge.certificate,
+        )
+        served = facts["subscriptions"]["representations"]
+        self.assertIs(served["clash"]["edge_identical"], False)
+        self.assertIs(served["mihomo"]["edge_identical"], True)
+
+    def test_the_edge_fetch_trusts_only_the_ca_it_is_given(self):
+        edge = self.edge_panel()
+        path = f"/api/sub/{SHORT_UUID}"
+        with self.assertRaises(ssl.SSLError):
+            panel_surface.fetch(edge.edge_url, path, panel_surface.MOBILE_USER_AGENT)
+        response = panel_surface.fetch(
+            edge.edge_url, path, panel_surface.MOBILE_USER_AGENT, ca_file=str(edge.certificate),
+        )
+        self.assertEqual(response["status"], 200)
+        self.assertIn("no-store", response["cache_control"])
 
     def test_an_absent_user_agent_is_a_request_without_the_header(self):
         response = panel_surface.fetch(self.panel.url, f"/api/sub/{SHORT_UUID}", None)
@@ -1007,6 +1116,9 @@ class StubEngineHost:
         self.timeouts.append(timeout)
         return self.results.pop(0)
 
+    def install_environment(self):
+        return {"GOWAVE_ACME_TEST_CA_FILE": f"{topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}"}
+
     def engine_hosts(self):
         domains = [self.panel_domain, self.reality_domain]
         if self.vision_domain:
@@ -1089,7 +1201,9 @@ class TestSubscriptionCases(unittest.TestCase):
         self.assertEqual(evidence["singbox_outbounds"], 4)
         self.assertEqual(podman.scripts[0],
                          f"python3 {aio.PANEL_SURFACE_SCRIPT} --scope subscriptions "
-                         f"--payload-dir {topology.PAYLOAD_MOUNT}")
+                         f"--payload-dir {topology.PAYLOAD_MOUNT} "
+                         f"--edge-base https://{aio.PANEL_DOMAIN} "
+                         f"--ca {topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}")
         self.assertEqual(product.host.scopes, ["representations"])
         for value in evidence.values():
             self.assertIsInstance(
@@ -1103,11 +1217,36 @@ class TestSubscriptionCases(unittest.TestCase):
     def test_subscriptions_case_rejects_a_cachable_representation(self):
         self.reject("lets a cache serve a subscription",
                     served=served_facts(
-                        {"representations.mihomo.cache_control": "public, max-age=600"}))
+                        {"representations.mihomo.edge_cache_control": "public, max-age=600"}))
 
     def test_subscriptions_case_rejects_a_representation_with_no_cache_control(self):
         self.reject("lets a cache serve a subscription",
-                    served=served_facts({"representations.base64.cache_control": ""}))
+                    served=served_facts({"representations.base64.edge_cache_control": ""}))
+
+    def test_subscriptions_case_does_not_read_the_header_from_the_panel_process(self):
+        """The loopback answer is never the one the case trusts.
+
+        The Panel sends no Cache-Control; the vhost does. A case that asserted
+        the loopback value would have failed against the real product while the
+        header a client receives was present, which is what the first version of
+        this case did.
+        """
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"subscriptions": served_facts()})],
+            engine_results=[engine_result(engine_representations())],
+        )
+        evidence = aio.case_subscriptions(product)
+        self.assertEqual(evidence["base64_backend_cache_control"], "")
+        self.assertEqual(evidence["base64_cache_control"], NO_STORE)
+
+    def test_subscriptions_case_rejects_an_edge_response_from_another_body(self):
+        self.reject("describes a body no engine consumed",
+                    served=served_facts({"representations.clash.edge_identical": False}))
+
+    def test_subscriptions_case_rejects_an_edge_that_refused_the_request(self):
+        self.reject("the public edge answered",
+                    served=served_facts({"representations.singbox.edge_status": 404}))
 
     def test_subscriptions_case_names_the_cache_control_it_received(self):
         product, _ = installed_product(

@@ -191,14 +191,14 @@ to a generator. The five representations are declared once, in
 `tests/cases/matrix.yaml`: `base64` at `/api/sub/{shortUuid}`, `xray-json` at
 `/v2ray-json`, `mihomo` at `/mihomo`, `clash` at `/clash` and `singbox` at
 `/singbox`. The probe carries the client family and User-Agent for each
-(`tools/podman_e2e/panel_surface.py:63`-`67`); `SUB-B64` is the case that checks
+(`tools/podman_e2e/panel_surface.py:66`-`70`); `SUB-B64` is the case that checks
 the base64 list an Xray-family client imports.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| subscription | `GET /api/sub/{shortUuid}` | `internal/server/server.go:522` | `tools/podman_e2e/panel_surface.py:63` `base64` |
+| subscription | `GET /api/sub/{shortUuid}` | `internal/server/server.go:522` | `tools/podman_e2e/panel_surface.py:66` `base64` |
 | subscription | `GET /api/sub/{shortUuid}/info` | `internal/server/server.go:523` | none — coverage gap |
-| subscription | `GET /api/sub/{shortUuid}/{clientType}` | `internal/server/server.go:524` | `tools/podman_e2e/panel_surface.py:64` `xray-json` |
+| subscription | `GET /api/sub/{shortUuid}/{clientType}` | `internal/server/server.go:524` | `tools/podman_e2e/panel_surface.py:67` `xray-json` |
 
 The path segment is not free-form: `handleOverrideClientType`
 (`internal/subscription/srr.go:165`) switches on `stash`, `singbox`, `mihomo`,
@@ -235,7 +235,7 @@ and the suite would be inventing an allowlist if it assumed either.
 The manifest's `clients` block says which pinned binary imports which
 representation; this table says what the case that fetches it actually does with
 the body. The order is the order the probe fetches them in
-(`tools/podman_e2e/panel_surface.py:63`-`67`), and
+(`tools/podman_e2e/panel_surface.py:66`-`70`), and
 `TestSubscriptionFamilyInventory` reads every cell back against
 `tests/cases/matrix.yaml`, that tuple and `tests/cases/catalog.yaml`, so a
 representation added to the manifest without a row — or a row naming an engine
@@ -298,7 +298,7 @@ of quietly asserting the weaker half.
 | --- | --- | --- |
 | `Subscription rejected with absent User-Agent` | `SUB-UA-ABSENT`, `SUB-UA-BLANK` | The live contract passes on whatever status the installed Panel returns and fails only if it differs from the upstream policy; the container suite pins `403` because the pinned Panel answers `403`, and asks every served path rather than `/v2ray-json` alone. |
 | `Proxy-capable outbounds in Xray JSON` | `SUB-SERVED`, `SUB-B64` | The live contract counts 8, 9 or 10 outbounds because it always runs a Master and a Worker; an All-in-One subscription carries 4 (5 with Vision) and a Multi-Node one carries 8, 9 or 10. The count is per subscription, so the topology explains the smaller number and the product does not change. |
-| `Xray JSON subscription headers and content verified` | `SUB-SERVED`, `SUB-B64` | Both require HTTP 200, the representation's media type, `Cache-Control: no-store`, Panel-issued addresses and SNI, and validation by the real `xray run -test`. |
+| `Xray JSON subscription headers and content verified` | `SUB-SERVED`, `SUB-B64` | `SUB-SERVED` requires HTTP 200, the representation's media type and `Cache-Control: no-store`; `SUB-B64` decodes the link list and proves the Xray-family importer consumes it. The header is read through the public edge, because the Panel process itself sends none. |
 | `Mihomo YAML subscription verified` | `SUB-SERVED` | Both require HTTP 200, a media type, one proxy per served inbound and `mihomo -t`. The live text also names the rule `GEOIP,private,DIRECT,no-resolve`; see below. |
 
 **The one divergence that is prose, not behaviour.** The pinned Panel does not
@@ -313,6 +313,20 @@ representation the engine loads but never routes through is not a working
 subscription. Restating the live sentence's literal line would fail against the
 Panel this repository pins, so the divergence is recorded here rather than
 turned into an assertion either suite would have to weaken later.
+
+**The header is read where a client reads it.** `modules/nginx.sh` adds
+`Cache-Control: no-store, no-cache, must-revalidate, max-age=0` inside
+`location ^~ /api/sub/` of the Panel vhost, and the Panel's own handler adds
+none: a probe that fetched `http://127.0.0.1:3000` would report an empty header
+for a product that serves one. `SUB-SERVED` therefore reads every representation
+twice — once on loopback, which is what the byte and User-Agent facts describe,
+and once over `https://<panel_domain>/…` with the run's own CA bundle, which is
+what a client receives — and requires the edge answer to carry `no-store` and to
+be byte-identical to what the Panel issued. The first version of the case read
+only the loopback answer and failed a real run
+(`podman-aio-20261114T192016-4bb11a91`, `SUB-SERVED`, `Cache-Control ''`)
+although the vhost sent the header: the case, not the product, was wrong, and
+the two-vantage read is what closes that gap rather than a wider tolerance.
 
 **The engines are the same binaries, pinned differently.** Both suites validate
 with the real Xray and Mihomo, and neither substitutes a parser for the engine:

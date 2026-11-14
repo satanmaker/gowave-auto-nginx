@@ -1398,17 +1398,28 @@ class AioProduct:
     def collect_subscriptions(self, case_id: str) -> Dict[str, Any]:
         """Fetch every representation once; the payloads stay on the host, 0600.
 
-        The subscription routes are loopback-only, so the host is the only place
-        that can read them. What comes back is a status, a media type, and a byte
+        The admin API is loopback-only, so the host is the only place that can
+        read a client's shortUuid and the bytes it is issued. The public edge is
+        read from the same host for the transport headers: ``/api/sub/`` is
+        proxied by the shipped vhost, and that vhost is what a client talks to,
+        so its ``Cache-Control`` is observable only over HTTPS on the panel
+        domain. What comes back is a status, a media type, a header, and a byte
         count per representation — never the payload itself.
         """
         if self._subscriptions is not None:
             return self._subscriptions
         if self._subscription_error:
             raise CaseBlocked(f"SUB-SERVED: {self._subscription_error}")
+        host = self.require_installed()
+        ca_file = str(host.install_environment().get("GOWAVE_ACME_TEST_CA_FILE", ""))
+        arguments = [
+            f"--payload-dir {topology.PAYLOAD_MOUNT}",
+            f"--edge-base https://{host.panel_domain}",
+        ]
+        if ca_file:
+            arguments.append(f"--ca {ca_file}")
         result = self.host_script(
-            f"python3 {PANEL_SURFACE_SCRIPT} --scope subscriptions "
-            f"--payload-dir {topology.PAYLOAD_MOUNT}"
+            f"python3 {PANEL_SURFACE_SCRIPT} --scope subscriptions " + " ".join(arguments)
         )
         detail = (result.stderr or result.stdout or "").strip()[-2000:]
         if result.returncode != 0:
@@ -4550,11 +4561,23 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
         require("SUB-SERVED", bool(record.get("content_type")),
                 f"the {name} representation came back without a media type")
         # The vhost disables caching on /api/sub/, because a cached list would
-        # keep working after the client it describes was revoked.
-        require("SUB-SERVED", "no-store" in str(record.get("cache_control") or "").lower(),
-                f"the {name} representation answered with Cache-Control "
-                f"{record.get('cache_control')!r}, which lets a cache serve a subscription the "
+        # keep working after the client it describes was revoked. The Panel
+        # process itself sends no Cache-Control, so the header is read through
+        # the public edge — the response a client actually receives — and the
+        # loopback value is recorded beside it to show which side adds it.
+        edge_control = str(record.get("edge_cache_control") or "")
+        require("SUB-SERVED", record.get("edge_status") == 200,
+                f"the public edge answered GET /api/sub/<shortUuid>/{name} with "
+                f"{record.get('edge_status')!r} instead of 200, so the headers a client receives "
+                f"could not be read")
+        require("SUB-SERVED", "no-store" in edge_control.lower(),
+                f"the public edge answered the {name} representation with Cache-Control "
+                f"{edge_control!r} (the Panel process itself answered "
+                f"{record.get('cache_control')!r}), which lets a cache serve a subscription the "
                 f"Panel no longer stands behind")
+        require("SUB-SERVED", record.get("edge_identical") is True,
+                f"the public edge served different bytes for the {name} representation than the "
+                f"Panel issued, so the Cache-Control header describes a body no engine consumed")
         # The pinned policy is "a non-empty header", not "a header naming this
         # format". Sending a header that names no client family is the only way
         # to keep the suite from turning client identification into a server
@@ -4637,7 +4660,10 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
         record = served.get(name) or {}
         evidence[f"{name}_status"] = record.get("status")
         evidence[f"{name}_content_type"] = record.get("content_type")
-        evidence[f"{name}_cache_control"] = record.get("cache_control")
+        evidence[f"{name}_cache_control"] = record.get("edge_cache_control")
+        evidence[f"{name}_backend_cache_control"] = record.get("cache_control")
+        evidence[f"{name}_edge_status"] = record.get("edge_status")
+        evidence[f"{name}_edge_identical"] = record.get("edge_identical")
         evidence[f"{name}_bytes"] = record.get("bytes")
         evidence[f"{name}_foreign_status"] = record.get("foreign_status")
         evidence[f"{name}_foreign_identical"] = record.get("foreign_identical")
