@@ -637,6 +637,16 @@ under test. A Master where `strace` cannot be installed is not a failed
 deployment: `node add` runs untraced, the facts say so, `MN-ARGV-OBSERVER` fails
 and `WRK-04` still judges what the deployment produced.
 
+Dropping the trace of an earlier dispatch belongs to the dispatch, not to the
+directory: the case delivers the probe into that same directory *after* the
+deployment has written its trace, so a preparation step that also cleared "an
+earlier trace" would delete the file the case reads. That is what the first live
+run of this case reported — `the dispatch trace is INCOMPLETE: ['the trace file
+is absent, so nothing was observed']` — while `WRK-04` passed on the same
+deployment, whose dispatch therefore ran under the prefix and opened its trace;
+the delivery that ran between them was the only step removing that path, which
+is why the preparation and the reset are separate functions.
+
 Before the trace is read, acceptance legs have to show that the observer can see
 what it claims to see: a sentinel placed after byte 32 of an argument, once
 through `execve` and once through `execveat` — the latter produced with ctypes,

@@ -323,6 +323,19 @@ class TestObserverWiring(unittest.TestCase):
         self.assertIn("def scan_trace_text", writes[0]["input"], "the file is streamed, not passed as argv")
         self.assertNotIn("def scan_trace_text", writes[0]["script"])
 
+    def test_delivering_the_probe_leaves_the_dispatch_trace_alone(self):
+        """The case places the probe after the deployment wrote the trace."""
+        prepare = argv_probe.probe_directory_script()
+        self.assertIn("mkdir -p -m 0700", prepare)
+        self.assertNotIn("rm", prepare, "delivery must not remove anything from the trace directory")
+        self.assertNotIn(argv_probe.TRACE_PATH, prepare)
+        reset = argv_probe.trace_reset_script()
+        self.assertIn(f"rm -f {argv_probe.TRACE_PATH}", reset,
+                      "a stale trace is dropped by the dispatch, which is the only writer")
+        delivery = Path(argv_probe.__file__).read_text(encoding="utf-8").split("def deliver(")[1].split("\ndef ")[0]
+        self.assertIn("probe_directory_script", delivery)
+        self.assertNotIn("trace_reset_script", delivery)
+
     def test_the_secret_reaches_the_scanner_over_stdin_only(self):
         podman = _FakePodman()
         argv_probe.scan(podman, "master", SECRET, SSH_CLIENT)
@@ -379,6 +392,8 @@ class TestNodeAddIsTraced(unittest.TestCase):
         self.assertEqual(outcome.command, traced[0])
         prepared = [script for script in scripts if script.startswith("mkdir -p -m 0700")]
         self.assertEqual(len(prepared), 1, "the trace directory is prepared before the trace")
+        self.assertIn(f"rm -f {argv_probe.TRACE_PATH}", prepared[0],
+                      "the dispatch drops a stale trace, so the case reads its own run's")
 
     def test_an_unusable_observer_still_runs_the_deployment_untraced(self):
         podman = _FakePodman(strace_present=False, install_fails=True)
