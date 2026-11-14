@@ -4504,9 +4504,11 @@ def cover_site_links(text: str) -> List[str]:
 
 
 def cover_site_fetch(case_id: str, host: topology.MultiNodeTopology, apex: str,
-                     path: str) -> Dict[str, Any]:
+                     path: str, verify: bool = True) -> Dict[str, Any]:
     """One fetch of the apex from the independent client, or a failure naming it."""
-    report = host.client_http(f"https://{apex}{path}", timeout=COVER_SITE_PROBE_TIMEOUT_SECONDS)
+    report = host.client_http(
+        f"https://{apex}{path}", insecure=not verify, timeout=COVER_SITE_PROBE_TIMEOUT_SECONDS,
+    )
     probe = report.get("probe") or {}
     require(
         case_id,
@@ -4847,9 +4849,10 @@ def require_cover_lineage(case_id: str, label: str, facts: Dict[str, Any],
 
 
 def require_decoy_page(case_id: str, host: topology.MultiNodeTopology, name: str,
-                       index_sha256: str, wanted: Sequence[str]) -> Dict[str, Any]:
+                       index_sha256: str, wanted: Sequence[str],
+                       verify: bool = True) -> Dict[str, Any]:
     """One name answers with the rendered cover page over a lineage naming the pair."""
-    probe = cover_site_fetch(case_id, host, name, "/")
+    probe = cover_site_fetch(case_id, host, name, "/", verify=verify)
     require(
         case_id,
         probe.get("status") == 200,
@@ -4874,6 +4877,69 @@ def require_decoy_page(case_id: str, host: topology.MultiNodeTopology, name: str
         "body_sha256": probe.get("body_sha256"),
         "san": sans,
         "tls_version": (probe.get("peer") or {}).get("tls_version", ""),
+    }
+
+
+def require_decoy_management(
+    case_id: str, host: topology.MultiNodeTopology, names: Sequence[Tuple[str, bool]],
+    not_found_sha256: str,
+) -> Dict[str, Any]:
+    """No management path answers through a name the camouflage listener serves.
+
+    A scanning client asks the decoy for ``/api/`` and the transport paths next,
+    so a route that terminates on the decoy has to answer every one of them with
+    the site's own 404 page. A status alone would pass a bare NGINX error page
+    and a matching body alone would pass a route that served nothing, so both are
+    required together, exactly as the All-in-One decoy case requires them.
+
+    The panel's own name is the control: there the same read reaches the Panel
+    and is refused with 401/403, which is what makes the refusals below mean
+    "this route is the decoy" instead of "nothing answers on this host". A name
+    the stream map does not list is dialled without a name pin, because the
+    fallback lineage cannot name a hostname the product was never configured
+    with; what it proves is where the request lands.
+    """
+    observed: Dict[str, Any] = {}
+    for name, verify in names:
+        paths: Dict[str, Any] = {}
+        for path in aio.DECOY_MANAGEMENT_PATHS:
+            probe = cover_site_fetch(case_id, host, name, path, verify=verify)
+            status = probe.get("status")
+            paths[path] = {"status": status, "sha256": probe.get("body_sha256")}
+            require(
+                case_id,
+                status == 404,
+                f"https://{name}{path} answered {status} instead of being refused, so that "
+                f"route published a management interface "
+                f"({probe.get('error') or 'the probe reported no failure'})",
+            )
+            require(
+                case_id,
+                probe.get("body_sha256") == not_found_sha256,
+                f"https://{name}{path} was refused with a body that is not the cover site's "
+                f"own 404.html ({probe.get('body_sha256')} vs {not_found_sha256}), so the "
+                f"answer came from another listener: {(probe.get('body_snippet') or '')[:200]}",
+            )
+        observed[name] = paths
+
+    panel = cover_site_fetch(case_id, host, host.panel_domain, "/api/nodes")
+    status = panel.get("status")
+    require(
+        case_id,
+        status in (401, 403),
+        f"an anonymous /api/nodes read on the panel name {host.panel_domain} answered {status} "
+        "instead of being refused, so the control that tells the Panel from the decoy is gone",
+    )
+    require(
+        case_id,
+        panel.get("body_sha256") != not_found_sha256,
+        f"the panel name answered /api/nodes with the camouflage site's 404 page, so "
+        f"{host.panel_domain} is served by the decoy rather than by the Panel",
+    )
+    return {
+        "names": observed,
+        "panel_anonymous_api_status": status,
+        "panel_anonymous_api_sha256": panel.get("body_sha256"),
     }
 
 
@@ -4929,7 +4995,12 @@ def case_decoy_route(product: MultiNodeProduct) -> Dict[str, Any]:
     refuses connections from both client networks while 443 answers them; and
     the certificate a client receives for the apex, its www and the REALITY name
     is the installed lineage that names the pair, so the camouflage is what a
-    scanning client sees rather than an Xray fingerprint.
+    scanning client sees rather than an Xray fingerprint. A fourth claim is what
+    the scanner asks next: no name that terminates on the decoy answers a
+    management path, so the cover apex, its www, the REALITY name without
+    REALITY authentication and an SNI the stream map does not list each answer
+    every management path with the site's own 404 page, while the panel's own
+    name refuses the same read with 401/403.
 
     The role that decides no apex (its own resolution puts the pair elsewhere)
     owes no cover route at all, so the case reads each role's own decision
@@ -4998,20 +5069,40 @@ def case_decoy_route(product: MultiNodeProduct) -> Dict[str, Any]:
         "the Master could not read its rendered cover site: "
         f"{(rendered.stderr or '').strip()[-500:]}",
     )
-    index_sha256 = (parse_cover_site(rendered.stdout or "")["files"].get("index.html") or {}).get(
-        "sha256", "")
+    rendered_site = parse_cover_site(rendered.stdout or "")
+    index_sha256 = (rendered_site["files"].get("index.html") or {}).get("sha256", "")
     require(
         case_id,
         index_sha256,
         f"the Master rendered no index.html for {apex}, so there is no page the decoy "
         "could be serving",
     )
+    not_found_sha256 = (rendered_site["files"].get("404.html") or {}).get("sha256", "")
+    require(
+        case_id,
+        not_found_sha256,
+        f"the Master rendered no 404.html for {apex}, so a refusal on the decoy could not be "
+        "told apart from a server default",
+    )
+    require(
+        case_id,
+        not_found_sha256 != index_sha256,
+        "the cover site's 404.html and its index.html are the same document, so a management "
+        "path answered with the front page would read as a refusal",
+    )
     wanted = [apex, f"www.{apex}"]
+    unmapped = topology.PROBE_UNMAPPED_SNI
     evidence["client"] = {
         "apex": require_decoy_page(case_id, host, apex, index_sha256, wanted),
         "www": require_decoy_page(case_id, host, f"www.{apex}", index_sha256, wanted),
         "reality": require_decoy_page(
             case_id, host, host.reality_domain, index_sha256, wanted,
+        ),
+        # The fallback lineage cannot name a hostname the product was never
+        # configured with, so this route is read without a name pin: what it
+        # proves is where an unlisted SNI lands, which is the decoy.
+        "unmapped": require_decoy_page(
+            case_id, host, unmapped, index_sha256, [], verify=False,
         ),
     }
     panel = cover_site_fetch(case_id, host, host.panel_domain, "/")
@@ -5025,6 +5116,22 @@ def case_decoy_route(product: MultiNodeProduct) -> Dict[str, Any]:
         "status": panel.get("status"),
         "body_sha256": panel.get("body_sha256"),
     }
+
+    # The routes above serve the site; the question a scanner asks next is
+    # whether the same names will answer for the deployment's own management
+    # paths. The cover names, the REALITY name without REALITY authentication
+    # and an SNI the stream map does not list are exactly the four ways into the
+    # camouflage listener, and none of them may answer one.
+    evidence["management"] = require_decoy_management(
+        case_id, host,
+        (
+            (apex, True),
+            (f"www.{apex}", True),
+            (host.reality_domain, True),
+            (unmapped, False),
+        ),
+        not_found_sha256,
+    )
 
     # Both client networks attempt the real TCP path: 443 has to answer from each
     # of them, because a decoy that is unreachable only where nothing is
