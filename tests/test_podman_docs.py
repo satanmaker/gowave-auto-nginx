@@ -899,6 +899,142 @@ class TestOsMatrixReconciliation(unittest.TestCase):
                 self.assertIn("modern" if above else "legacy", cells[3])
 
 
+REUSABLE_HEADING = "## What the suite reuses, and what it must not duplicate"
+WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
+WORKFLOW_REFERENCE = re.compile(r"\.github/workflows/([A-Za-z0-9_-]+\.yml)")
+
+
+def reusable_section() -> str:
+    text = discovered()
+    start = text.index(REUSABLE_HEADING)
+    end = text.find("\n## ", start + 1)
+    return text[start:end if end != -1 else len(text)]
+
+
+def fixture_row(alias: str):
+    """The table row whose first cell names `alias`, as its raw cells."""
+    needle = f"`{alias}`"
+    for line in reusable_section().splitlines():
+        if not line.startswith("| `"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if needle in cells[0]:
+            return cells
+    return None
+
+
+class TestReusableFixtureInventory(unittest.TestCase):
+    """Every contour and fixture the suite reuses says what it proves.
+
+    The suite is assembled from scripts, images and fixture servers that already
+    existed here, and each of them carries a scope in its own header. The risk
+    this class covers is quotation: a green run of the transport scaffold read
+    as an install, or a fixture described as if it were the product. So each
+    test reads the claim back from the file that owns it — the workflow list,
+    the image lock, the containerfile constants, the scripts the suite starts —
+    rather than from a second copy of the page.
+    """
+
+    def test_every_workflow_has_a_row_and_every_row_is_a_workflow(self):
+        existing = {path.name for path in WORKFLOW_DIR.glob("*.yml")}
+        self.assertEqual(len(existing), 5, "a workflow was added or removed; the page lists five")
+        cited = set(WORKFLOW_REFERENCE.findall(reusable_section()))
+        self.assertEqual(sorted(cited), sorted(existing),
+                         "a workflow runs without a row saying what it proves, "
+                         "or the page cites a workflow that does not exist")
+
+    def test_every_non_base_image_is_inventoried_with_its_role_and_pin(self):
+        lock = yaml.safe_load(IMAGES_LOCK.read_text(encoding="utf-8"))["images"]
+        self.assertEqual(sorted({entry["role"] for entry in lock.values()}),
+                         ["acme-fixture", "base", "client-base", "egress-fixture"])
+        for alias, entry in lock.items():
+            with self.subTest(alias=alias):
+                row = fixture_row(alias)
+                self.assertIsNotNone(row, "a fixture the suite starts has no row")
+                cells = " ".join(row)
+                self.assertIn(f"role `{entry['role']}`", cells,
+                              "the row does not say which lock role it is")
+                if entry.get("role") == "base":
+                    continue
+                # Read inside the row that names the alias: two fixtures share
+                # the python:3.12-slim base, so a section-wide search would let
+                # one row's pin excuse the other's drift.
+                self.assertIn(entry["reference"], cells, "the row does not name the pin")
+
+    def test_the_containerfiles_are_the_ones_the_builders_build_from(self):
+        from tools.podman_e2e import client_image
+        from tools.podman_e2e import target_image as builder
+
+        section = reusable_section()
+        for module in (builder, client_image):
+            relative = module.CONTAINERFILE.relative_to(REPO_ROOT).as_posix()
+            self.assertTrue(module.CONTAINERFILE.is_file())
+            self.assertIn(relative, section)
+        legacy = "tests/Containerfile.testbed"
+        self.assertTrue((REPO_ROOT / legacy).is_file())
+        self.assertIn(legacy, section)
+        for script in ("tests/podman_testbed.sh", "tests/multi_node_testbed.sh",
+                       "tests/systemd/boot.sh"):
+            with self.subTest(script=script):
+                self.assertIn("Containerfile.testbed", (REPO_ROOT / script).read_text(encoding="utf-8"),
+                              f"{script} stopped building the legacy image the page cites")
+        shared = sorted(
+            path.name
+            for path in (REPO_ROOT / "tools" / "podman_e2e").glob("*.py")
+            if "Containerfile.testbed" in path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(shared, [], "the acceptance suite runs on the legacy image")
+
+    def test_the_fixture_servers_are_the_scripts_the_suite_starts(self):
+        from tools.podman_e2e import topology
+
+        section = reusable_section()
+        for started in (topology.DNS_FIXTURE_SCRIPT, topology.ECHO_FIXTURE_SCRIPT):
+            with self.subTest(script=started):
+                self.assertTrue(
+                    started.startswith(f"{topology.REPO_IN_CONTAINER}/tests/fixtures/"),
+                    "a fixture is started from outside the repository copy",
+                )
+                relative = started[len(topology.REPO_IN_CONTAINER) + 1:]
+                self.assertTrue((REPO_ROOT / relative).is_file())
+                self.assertIn(relative, section)
+        pebble = "tests/fixtures/acme/pebble-config.json"
+        self.assertIn(pebble, section)
+        from tools.podman_e2e import acme_fixture
+
+        self.assertEqual(acme_fixture.PEBBLE_CONFIG_TEMPLATE.relative_to(REPO_ROOT).as_posix(), pebble,
+                         "the page cites a Pebble config the fixture does not read")
+
+    def test_the_contour_scopes_match_what_the_scripts_say(self):
+        section = " ".join(reusable_section().split())
+        scope = "deliberately does not claim to install GoWave Panel/Node or validate subscriptions"
+        self.assertIn(scope, (REPO_ROOT / "tests" / "multi_node_testbed.sh").read_text(encoding="utf-8"))
+        self.assertIn(scope, section, "the page quotes a scope the scaffold no longer states")
+        testbed = (REPO_ROOT / "tests" / "podman_testbed.sh").read_text(encoding="utf-8")
+        stages = re.findall(r'echo "\[Stage \d/8\]', testbed)
+        self.assertEqual(len(stages), 8,
+                         "the legacy pipeline changed length; the page still says eight stages")
+        self.assertIn("--systemd=always", testbed)
+        self.assertIn("eight stages", section)
+        guest = (REPO_ROOT / "tests" / "systemd" / "boot.sh").read_text(encoding="utf-8")
+        self.assertIn("tests/run_ci.py --suite systemd", guest)
+        self.assertIn("tests/run_ci.py --suite systemd", section,
+                      "the page stopped naming the suite the QEMU guest runs")
+
+    def test_the_install_is_the_operator_entrypoint_and_the_probe_is_named(self):
+        from tools.podman_e2e import aio
+
+        section = " ".join(reusable_section().split())
+        install = function_body("tools/podman_e2e/topology.py", "install_script")
+        self.assertIn("gowave-auto.sh install", install,
+                      "the suite stopped driving the operator's installer")
+        self.assertIn("gowave-auto.sh install", section)
+        self.assertIn("may never stand in for the product itself", section)
+        self.assertIn(aio.NGX_CONFIG_SNIPPET, section,
+                      "the page no longer names the one file the suite writes into NGINX")
+        self.assertIn(aio.NGX_CONFIG_DIRECTIVE, section)
+
+
 class TestPodmanE2EDocumentation(unittest.TestCase):
     def test_every_flag_in_a_documented_command_exists(self):
         unknown = sorted(documented_flags() - parser_flags())
