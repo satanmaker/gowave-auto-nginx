@@ -697,6 +697,20 @@ class TestLiveContractReconciliation(unittest.TestCase):
         self.assertIn('"cache_control": (response.getheader("Cache-Control") or "")',
                       function_body("tools/podman_e2e/panel_surface.py", "fetch"))
 
+    def test_the_database_contract_is_read_where_the_page_says_the_panel_writes(self):
+        self.assertIn("a running Panel writes its own rows", self.prose)
+        self.assertIn("`database_dump_digest_changed`", self.prose)
+        case = function_body("tools/podman_e2e/aio.py", "case_backup_store_full")
+        self.assertIn("require_database_intact(", case,
+                      "the case stopped asserting what a failed backup can destroy")
+        self.assertIn("require_served_surface_unchanged(", case,
+                      "the case stopped reading the database through the Panel's own surface")
+        intact = function_body("tools/podman_e2e/aio.py", "require_database_intact")
+        self.assertIn("lost rows the Panel stored", intact)
+        self.assertNotIn("logical", intact,
+                         "the row contract went back to comparing a whole dump, which the "
+                         "Panel's own writes move")
+
 
 class TestPodmanE2EDocumentation(unittest.TestCase):
     def test_every_flag_in_a_documented_command_exists(self):

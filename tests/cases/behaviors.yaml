@@ -476,9 +476,9 @@ behaviors:
       The fifteen fault scenarios are a matrix in their own right: a stopped
       unit, a killed core, a lost SSH session, a full disk, an injected delay
       and a restarted Worker each degrade only their own layer, leave operator
-      files and database rows unchanged, and recover when the cause is removed,
-      while duplicate registration, partial deployment and forged credentials
-      are refused without mutation.
+      files intact and lose none of the rows the database held, and recover when
+      the cause is removed, while duplicate registration, partial deployment and
+      forged credentials are refused without mutation.
     topology: [aio, multi-node]
     gate: pre-push
     cases: [NEG-01, AIO-FAULT-DISK, AIO-FAULT-PANEL, AIO-FAULT-XRAY, AIO-FAULT-LATENCY, MN-OUTAGE, MN-RESTART, MN-SSH-DOWN]
