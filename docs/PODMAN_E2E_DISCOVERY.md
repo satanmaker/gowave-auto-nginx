@@ -258,6 +258,33 @@ and `xray-json`, and `mihomo`, consuming `mihomo` and `clash` — and the table
 says "none pinned" instead of leaving a reader to infer that a parsed body was
 an imported one.
 
+### Both served shapes of `/v2ray-json`
+
+The route has two documented shapes and the Panel serves one of them per
+request: a single config object carrying `outbounds`, or a list of complete
+per-profile configs. The suite does not assume which. `SUB-JSON-SHAPES` reads
+the served shape first, then forms the other one from the Panel's own outbound,
+so both shapes are exercised against the same account instead of one of them
+being asserted from a fixture.
+
+The half that decides the claim is the wrapper. A list entry is a complete
+config — inbounds included — and is validated as such with `xray run -test`,
+byte for byte; a run in which an entry needed the minimal listener added would
+be a list of bare outbounds, which is not a shape the Panel serves. The bare
+object is the one that gets wrapped, and exactly once: `prepare_config` in
+`tools/podman_e2e/subscription_probe.py` adds a local SOCKS inbound only when
+the config carries no `inbounds` at all, and reports whether it did. That object
+carries one Panel outbound rather than one per host, because a config object is
+one host and the Panel tags every host outbound `proxy`, so merging profiles
+into a single object would collide on the tag instead of testing a shape.
+
+A reader can therefore tell the two shapes apart from the counts alone:
+`served_wrapped = 0` and `alternate_wrapped = 1` when the Panel served a list,
+and the pair inverted when it served an object. `SUB-JSON-SHAPES` requires
+exactly that, and `TestJsonShapeContract` holds this paragraph against
+`case_json_shapes` and `prepare_config`, so the page cannot keep describing a
+rule the probe stopped enforcing.
+
 ### What is declared but not driven
 
 `PATCH /api/users` and `PATCH /api/users/{userId}` update an existing client,

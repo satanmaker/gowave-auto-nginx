@@ -511,6 +511,77 @@ class TestSubscriptionFamilyInventory(unittest.TestCase):
         self.assertEqual(self.by_name["base64"]["case"].strip("`"), "SUB-B64")
 
 
+JSON_SHAPE_HEADING = "### Both served shapes of `/v2ray-json`"
+
+
+def json_shape_section() -> str:
+    text = discovered()
+    start = text.index(JSON_SHAPE_HEADING)
+    end = text.find("\n### ", start + 1)
+    return text[start:end if end != -1 else len(text)]
+
+
+def function_body(relative: str, name: str) -> str:
+    """The source of one function, so a guard reads the code and not a copy of it."""
+    text = (REPO_ROOT / relative).read_text(encoding="utf-8")
+    start = text.index(f"def {name}(")
+    end = text.find("\ndef ", start + 1)
+    return text[start:end if end != -1 else len(text)]
+
+
+class TestJsonShapeContract(unittest.TestCase):
+    """The two `/v2ray-json` shapes are recorded as the probe enforces them.
+
+    The distinction the page claims is the wrapper count: a served profile is a
+    complete config and is never wrapped, while the bare object the case builds
+    needs exactly one listener. Each test damages the claim it just read, so the
+    paragraph cannot survive a probe that stopped enforcing it.
+    """
+
+    def setUp(self):
+        self.section = json_shape_section()
+        self.case = function_body("tools/podman_e2e/aio.py", "case_json_shapes")
+        self.prepare = function_body("tools/podman_e2e/subscription_probe.py", "prepare_config")
+
+    def test_the_page_records_both_shapes_and_names_the_case(self):
+        prose = " ".join(self.section.split())
+        self.assertIn("a single config object", prose)
+        self.assertIn("a list of complete per-profile configs", prose)
+        self.assertIn("`SUB-JSON-SHAPES`", prose)
+        entries = {case["id"]: case for case in yaml.safe_load(CATALOG.read_text(encoding="utf-8"))["cases"]}
+        entry = entries["SUB-JSON-SHAPES"]
+        self.assertIn("both served shapes", entry["assertion"])
+        self.assertEqual(sorted(entry["topology"]), ["aio", "multi-node"])
+
+    def test_the_wrapper_counts_the_page_quotes_are_the_ones_the_case_asserts(self):
+        self.assertIn("`served_wrapped = 0`", self.section)
+        self.assertIn("`alternate_wrapped = 1`", self.section)
+        self.assertIn('facts.get("served_wrapped") == 0', self.case,
+                      "the page says a served profile is never wrapped; the case no longer asserts it")
+        self.assertIn('expected_alternate_wrapped = 1 if alternate == "object" else 0', self.case)
+
+    def test_a_served_profile_is_never_wrapped_but_a_bare_object_is(self):
+        self.assertIn('if not result.get("inbounds")', self.prepare,
+                      "the wrapper must key on a config with no inbounds, not on a served profile")
+        self.assertIn("SOCKS_INBOUND", self.prepare)
+        self.assertIn("wrapped = True", self.prepare)
+        self.assertIn("return result, wrapped", self.prepare)
+        self.assertNotIn('facts.get("served_wrapped") == 1', self.case,
+                         "a served profile needing a wrapper is a defect the case must never accept")
+
+    def test_the_alternate_object_carries_one_panel_outbound(self):
+        self.assertIn('facts.get("alternate_outbounds") == 1', self.case,
+                      "the alternate object is one host; a second outbound means profiles were merged")
+        self.assertIn("collide on the tag", self.case,
+                      "the case has to explain why profiles are not merged into one object")
+        self.assertIn("one Panel outbound rather than one per host", self.section)
+
+    def test_the_case_is_registered_in_the_all_in_one_suite(self):
+        aio_text = (REPO_ROOT / "tools" / "podman_e2e" / "aio.py").read_text(encoding="utf-8")
+        self.assertIn('Case("SUB-JSON-SHAPES", "aio"', aio_text,
+                      "the shapes case is not in the suite that runs it, so the page describes a case nobody runs")
+
+
 class TestPodmanE2EDocumentation(unittest.TestCase):
     def test_every_flag_in_a_documented_command_exists(self):
         unknown = sorted(documented_flags() - parser_flags())
