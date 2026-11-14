@@ -37,8 +37,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: ENV-02
   requirement: Disposable Environment Gate
@@ -63,8 +63,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: OWN-01
   requirement: Complete Mutation-Target Baseline and Resource Ownership
@@ -90,8 +90,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: OWN-02
   requirement: Complete Mutation-Target Baseline and Resource Ownership
@@ -115,8 +115,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: OWN-03
   requirement: Complete Mutation-Target Baseline and Resource Ownership
@@ -141,8 +141,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: OWN-04
   requirement: Complete Mutation-Target Baseline and Resource Ownership
@@ -167,8 +167,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: PRE-01
   requirement: Preflight SSH Trust and DNS Verification
@@ -189,8 +189,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: PRE-02
   requirement: Preflight SSH Trust and DNS Verification
@@ -210,8 +210,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: PRE-03
   requirement: Preflight SSH Trust and DNS Verification
@@ -232,8 +232,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: PRE-04
   requirement: Preflight SSH Trust and DNS Verification
@@ -256,8 +256,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   partial_split: Container proves the private/reserved rule against Podman addresses with an explicitly
     scoped, fail-closed exemption; the live run is authoritative for real public addresses.
   promotion_target: null
@@ -282,8 +282,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: PRE-06
   requirement: Preflight SSH Trust and DNS Verification
@@ -312,8 +312,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: ADDR-01
   requirement: Target Address, Domain, and SSH Identity Safety
@@ -334,8 +334,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: ADDR-02
   requirement: Target Address, Domain, and SSH Identity Safety
@@ -355,8 +355,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: ADDR-03
   requirement: Target Address, Domain, and SSH Identity Safety
@@ -380,8 +380,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: VIS-01
   requirement: Independent Optional Vision Domains
@@ -402,8 +402,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: VIS-02
   requirement: Independent Optional Vision Domains
@@ -424,8 +424,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: VIS-03
   requirement: Independent Optional Vision Domains
@@ -450,8 +450,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: VIS-04
   requirement: Independent Optional Vision Domains
@@ -472,8 +472,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: VIS-05
   requirement: Independent Optional Vision Domains
@@ -502,8 +502,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: VIS-06
   requirement: Independent Optional Vision Domains
@@ -526,8 +526,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: VIS-07
   requirement: Independent Optional Vision Domains
@@ -550,8 +550,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: VIS-08
   requirement: Independent Optional Vision Domains
@@ -572,8 +572,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: VER-01
   requirement: Pinned Version Fidelity
@@ -595,8 +595,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: VER-02
   requirement: Pinned Version Fidelity
@@ -622,8 +622,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: VER-03
   requirement: Pinned Version Fidelity
@@ -651,8 +651,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: AIO-01
   requirement: All-in-One Master VPS Installation Verification
@@ -674,8 +674,16 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_panel_ready
+      evidence:
+      - loopback_api
+      - loopback_login
+      - public_san
+      - public_status
+      - public_tls
   promotion_target: null
 - id: AIO-02
   requirement: All-in-One Master VPS Installation Verification
@@ -698,8 +706,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: AIO-03
   requirement: All-in-One Master VPS Installation Verification
@@ -722,8 +730,17 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_credentials
+      evidence:
+      - has_admin_password
+      - has_admin_username
+      - has_scoped_api_token
+      - has_short_uuid_key
+      - mode
+      - owner
   promotion_target: null
 - id: AIO-04
   requirement: All-in-One Master VPS Installation Verification
@@ -746,8 +763,13 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_services
+      evidence:
+      - listeners
+      - units
   promotion_target: null
 - id: AIO-05
   requirement: All-in-One Master VPS Installation Verification
@@ -775,8 +797,15 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_tls_and_identity
+      evidence:
+      - credentials_short_uuid_key
+      - lineages
+      - short_uuid_length
+      - short_uuid_source
   promotion_target: null
 - id: WRK-01
   requirement: Distributed Worker VPS Deployment Verification
@@ -805,8 +834,8 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: WRK-02
   requirement: Distributed Worker VPS Deployment Verification
@@ -830,8 +859,8 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: WRK-03
   requirement: Distributed Worker VPS Deployment Verification
@@ -859,8 +888,8 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: WRK-04
   requirement: Distributed Worker VPS Deployment Verification
@@ -880,8 +909,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_worker_registration
+      evidence: []
   promotion_target: null
 - id: WRK-05
   requirement: Distributed Worker VPS Deployment Verification
@@ -907,8 +939,19 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_worker_state
+      evidence:
+      - core
+      - daemon
+      - last_status_change
+      - panel_node_version
+      - panel_xray_version
+      - requested_version
+      - service
+      - worker_version
   promotion_target: null
 - id: MTLS-01
   requirement: Public mTLS Control Plane Verification (Master → Worker)
@@ -934,8 +977,15 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_mtls_verifier
+      evidence:
+      - handshake_line
+      - node_response
+      - payload_crypto_pass
+      - payload_verified_before_socket
   promotion_target: null
 - id: MTLS-02
   requirement: Public mTLS Control Plane Verification (Master → Worker)
@@ -955,8 +1005,14 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_mtls_http_classification
+      evidence:
+      - mtls_handshake_pass
+      - node_response
+      - worker_http_health_pass
   promotion_target: null
 - id: MTLS-03
   requirement: Public mTLS Control Plane Verification (Master → Worker)
@@ -977,8 +1033,14 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_mtls_panel_auth
+      evidence:
+      - panel_node_connected
+      - panel_worker_auth_pass
+      - unauthenticated_nodes_status
   promotion_target: null
 - id: MTLS-04
   requirement: Public mTLS Control Plane Verification (Master → Worker)
@@ -997,8 +1059,12 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_mtls_untrusted_client
+      evidence:
+      - untrusted_client
   promotion_target: null
 - id: MTLS-05
   requirement: Public mTLS Control Plane Verification (Master → Worker)
@@ -1017,8 +1083,12 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_mtls_absent_client
+      evidence:
+      - absent_client
   promotion_target: null
 - id: MTLS-06
   requirement: Public mTLS Control Plane Verification (Master → Worker)
@@ -1039,8 +1109,14 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_mtls_mismatched_pair
+      evidence:
+      - classification
+      - mismatched_crypto_failed
+      - sockets_opened
   promotion_target: null
 - id: MTLS-07
   requirement: Public mTLS Control Plane Verification (Master → Worker)
@@ -1062,8 +1138,13 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_mtls_untrusted_ca
+      evidence:
+      - classification
+      - untrusted_ca
   promotion_target: null
 - id: MTLS-08
   requirement: Public mTLS Control Plane Verification (Master → Worker)
@@ -1083,8 +1164,12 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_mtls_wrong_sni
+      evidence:
+      - wrong_sni
   promotion_target: null
 - id: APIC-01
   requirement: TLS-aware Bounded Panel API Client
@@ -1111,8 +1196,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: CLUS-01
   requirement: Panel API Cluster Structure Audit
@@ -1137,8 +1222,15 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_cluster_hosts
+      evidence:
+      - fingerprints
+      - host_count
+      - hosts_per_node
+      - security_layers
   promotion_target: null
 - id: CLUS-02
   requirement: Panel API Cluster Structure Audit
@@ -1160,8 +1252,15 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_cluster_squad
+      evidence:
+      - granted_inbound_count
+      - node_inbound_count
+      - squad
+      - unique_granted_inbound_count
   promotion_target: null
 - id: CLUS-03
   requirement: Panel API Cluster Structure Audit
@@ -1188,8 +1287,17 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_cluster_nodes
+      evidence:
+      - inbounds_per_node
+      - node_addresses
+      - nodes
+      - profile_count
+      - worker_host_count
+      - worker_vpn_addresses
   promotion_target: null
 - id: SUB-01
   requirement: Real Subscription Delivery and User-Agent Policy
@@ -1215,8 +1323,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: SUB-02
   requirement: Real Subscription Delivery and User-Agent Policy
@@ -1245,8 +1353,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: SUB-03
   requirement: Real Subscription Delivery and User-Agent Policy
@@ -1271,8 +1379,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: SUB-04
   requirement: Real Subscription Delivery and User-Agent Policy
@@ -1305,8 +1413,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: FW-01
   requirement: UFW Firewall Isolation Verification
@@ -1330,8 +1438,25 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_management_denial
+      evidence:
+      - input_policy
+      - master_address
+      - node_allow_packets
+      - node_allow_sources
+      - ssh_port_open_to_any_source
+      - trusted_mtls_response
+      - trusted_ssh
+      - untrusted_address
+      - untrusted_management
+      - untrusted_ssh
+      - untrusted_ssh_returncode
+      - worker_address
+      - worker_observation
+      - worker_observed_source
   promotion_target: null
 - id: FW-02
   requirement: UFW Firewall Isolation Verification
@@ -1352,8 +1477,16 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_denial_classification
+      evidence:
+      - allowed_source
+      - classification_requires
+      - denied_source
+      - reason
+      - verdict
   promotion_target: null
 - id: FW-03
   requirement: UFW Firewall Isolation Verification
@@ -1375,8 +1508,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_master_access
+      evidence: []
   partial_split: Container proves isolation between distinct source addresses; provider-level external
     reachability is live-only.
   promotion_target: null
@@ -1400,8 +1536,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_ipv6_policy
+      evidence: []
   promotion_target: null
 - id: NGX-01
   requirement: NGINX SNI Routing and REALITY Decoy Verification
@@ -1422,8 +1561,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: NGX-02
   requirement: NGINX SNI Routing and REALITY Decoy Verification
@@ -1444,8 +1583,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: NGX-03
   requirement: NGINX SNI Routing and REALITY Decoy Verification
@@ -1469,8 +1608,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: NGX-04
   requirement: NGINX SNI Routing and REALITY Decoy Verification
@@ -1494,8 +1633,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: DP-01
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -1518,8 +1657,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: DP-02
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -1540,8 +1679,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: DP-03
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -1564,8 +1703,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: DP-04
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -1587,8 +1726,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: DP-05
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -1612,8 +1751,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: DP-06
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -1635,8 +1774,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: DP-07
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -1658,8 +1797,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: DP-08
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -1680,8 +1819,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: DP-09
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -1705,8 +1844,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   partial_split: Container proves explicit verify anchors and no global trust change; public Let's Encrypt
     issuance is live-only.
   promotion_target: null
@@ -1737,8 +1876,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   partial_split: Container proves the injected verify anchor is required; real Staging material is live-only.
   promotion_target: null
 - id: DP-11
@@ -1765,8 +1904,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   partial_split: Container proves fixture CA pinning by digest; real Staging CA distribution is live-only.
   promotion_target: null
 - id: DP-12
@@ -1789,8 +1928,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: DP-13
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -1811,8 +1950,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: DP-14
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -1832,8 +1971,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: DP-15
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -1853,8 +1992,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: NEG-01
   requirement: Negative Scenario and Fault Injection Tests
@@ -1925,8 +2064,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: NEG-02
   requirement: Negative Scenario and Fault Injection Tests
@@ -1949,8 +2088,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: NEG-03
   requirement: Negative Scenario and Fault Injection Tests
@@ -1979,8 +2118,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: NEG-04
   requirement: Negative Scenario and Fault Injection Tests
@@ -2005,8 +2144,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: NEG-05
   requirement: Negative Scenario and Fault Injection Tests
@@ -2029,8 +2168,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: NEG-06
   requirement: Negative Scenario and Fault Injection Tests
@@ -2053,8 +2192,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: NEG-07
   requirement: Negative Scenario and Fault Injection Tests
@@ -2076,8 +2215,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: NEG-08
   requirement: Negative Scenario and Fault Injection Tests
@@ -2102,8 +2241,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: HOOK-01
   requirement: Global Certbot Deploy Hook Ownership
@@ -2125,8 +2264,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: HOOK-02
   requirement: Global Certbot Deploy Hook Ownership
@@ -2148,8 +2287,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: HOOK-03
   requirement: Global Certbot Deploy Hook Ownership
@@ -2171,8 +2310,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: HOOK-04
   requirement: Global Certbot Deploy Hook Ownership
@@ -2195,8 +2334,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: TXN-01
   requirement: Signal-Safe and Verifiable Transaction Compensation
@@ -2219,8 +2358,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: TXN-02
   requirement: Signal-Safe and Verifiable Transaction Compensation
@@ -2244,8 +2383,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: TXN-03
   requirement: Signal-Safe and Verifiable Transaction Compensation
@@ -2267,8 +2406,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: TD-01
   requirement: Teardown Policy Enforcement
@@ -2289,8 +2428,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: TD-02
   requirement: Teardown Policy Enforcement
@@ -2316,8 +2455,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: TD-03
   requirement: Teardown Policy Enforcement
@@ -2345,8 +2484,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: TD-04
   requirement: Teardown Policy Enforcement
@@ -2373,8 +2512,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: TD-05
   requirement: Teardown Policy Enforcement
@@ -2401,8 +2540,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   partial_split: Container proves lock ordering and hook protocol; provider snapshots are live-only.
   promotion_target: null
 - id: TD-06
@@ -2425,8 +2564,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: not-applicable
+  drivers: {}
   live_only_reason: Requires a provider snapshot and a real reboot; a container cannot reproduce the host
     lifecycle.
   promotion_target: null
@@ -2450,8 +2589,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: TD-08
   requirement: Teardown Policy Enforcement
@@ -2476,8 +2615,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: LOCK-01
   requirement: Pair-Wide Run Locking
@@ -2496,8 +2635,8 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: LOCK-02
   requirement: Pair-Wide Run Locking
@@ -2522,8 +2661,8 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: MLOCK-01
   requirement: Shared Mutation Lock Across All Management Entry Points
@@ -2548,8 +2687,8 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: MLOCK-02
   requirement: Shared Mutation Lock Across All Management Entry Points
@@ -2574,8 +2713,8 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: MLOCK-03
   requirement: Shared Mutation Lock Across All Management Entry Points
@@ -2598,8 +2737,8 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: STATE-01
   requirement: Durable Run State for Partial CLI Modes
@@ -2621,8 +2760,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: STATE-02
   requirement: Durable Run State for Partial CLI Modes
@@ -2660,8 +2799,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: RED-01
   requirement: Redacted Diagnostic Artifact Collection
@@ -2684,8 +2823,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: RED-02
   requirement: Redacted Diagnostic Artifact Collection
@@ -2712,8 +2851,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: RES-01
   requirement: Result Status Semantics
@@ -2735,8 +2874,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: RES-02
   requirement: Result Status Semantics
@@ -2758,8 +2897,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: RES-03
   requirement: Result Status Semantics
@@ -2807,8 +2946,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: BOOT-01
   requirement: Local Operator Credential Bootstrap and Cleanup
@@ -2828,8 +2967,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   partial_split: Container proves host identity precedes the password; the live controller's public-target
     path is live-only.
   promotion_target: null
@@ -2856,8 +2995,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   partial_split: Container proves bounded key lifetime and revocation; live account behaviour is live-only.
   promotion_target: null
 - id: PKT-01
@@ -2882,8 +3021,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: PKT-02
   requirement: Per-Case Data-Plane Packet Evidence
@@ -2908,8 +3047,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: PKT-03
   requirement: Per-Case Data-Plane Packet Evidence
@@ -2927,8 +3066,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: OP-01
   requirement: Local interactive operator entrypoint
@@ -2950,8 +3089,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: OP-02
   requirement: Local interactive operator entrypoint
@@ -2973,8 +3112,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: SSHID-01
   requirement: Out-of-band SSH host identity verification
@@ -2995,8 +3134,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: SSHID-02
   requirement: Out-of-band SSH host identity verification
@@ -3014,8 +3153,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: TSSH-01
   requirement: Temporary SSH access with remote expiry
@@ -3035,8 +3174,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: TSSH-02
   requirement: Temporary SSH access with remote expiry
@@ -3056,8 +3195,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: REV-01
   requirement: Immediate credential revocation gates overall status
@@ -3075,8 +3214,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: REV-02
   requirement: Immediate credential revocation gates overall status
@@ -3098,8 +3237,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: LOCAL-01
   requirement: Local-only live VPS credential handling
@@ -3117,8 +3256,8 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: null
 - id: LOCAL-02
   requirement: Local-only live VPS credential handling
@@ -3135,8 +3274,8 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: not-applicable
+  drivers: {}
   live_only_reason: Starts the interactive operator against real disposable VPS instances; live infrastructure
     only.
   promotion_target: null
@@ -3153,8 +3292,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:AioProduct.install
+      evidence: []
   promotion_target: All-in-One Master VPS Installation Verification
 - id: MN-INSTALL
   requirement: Distributed Worker VPS Deployment Verification
@@ -3170,8 +3312,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:MultiNodeProduct.install
+      evidence: []
   promotion_target: Distributed Worker VPS Deployment Verification
 - id: AIO-PACKAGES
   requirement: All-in-One Master VPS Installation Verification
@@ -3187,8 +3332,13 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_packages
+      evidence:
+      - installed_packages
+      - missing_packages
   promotion_target: All-in-One Master VPS Installation Verification
 - id: AIO-AUTH
   requirement: All-in-One Master VPS Installation Verification
@@ -3205,8 +3355,28 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_panel_auth
+      evidence:
+      - default_user_short_uuid_length
+      - host_count
+      - host_fingerprints
+      - host_security_layers
+      - inbound_digest
+      - inbound_ports
+      - inbound_types
+      - login_status
+      - node_connected_count
+      - node_count
+      - node_inbound_count
+      - profile_count
+      - profile_inbound_tags
+      - squad_count
+      - squad_inbound_count
+      - token_length
+      - unauthenticated_nodes_status
   promotion_target: All-in-One Master VPS Installation Verification
 - id: AIO-CLIENT
   requirement: All-in-One Master VPS Installation Verification
@@ -3222,8 +3392,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_client_lifecycle
+      evidence: []
   promotion_target: Real Subscription Delivery and User-Agent Policy
 - id: SUB-SERVED
   requirement: Panel subscription representations
@@ -3241,8 +3414,32 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_subscriptions
+      evidence:
+      - base64_link_count
+      - base64_schemes
+      - mihomo_servers
+      - singbox_outbounds
+      - ua_foreign
+      - xray_json_entries
+      - xray_json_protocols
+      - xray_json_shape
+      - xray_json_wrapped
+    multi-node:
+      driver: aio:case_subscriptions
+      evidence:
+      - base64_link_count
+      - base64_schemes
+      - mihomo_servers
+      - singbox_outbounds
+      - ua_foreign
+      - xray_json_entries
+      - xray_json_protocols
+      - xray_json_shape
+      - xray_json_wrapped
   promotion_target: Real Subscription Delivery and User-Agent Policy
 - id: SUB-B64
   requirement: Panel subscription representations
@@ -3259,8 +3456,34 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_share_links
+      evidence:
+      - cross_representation_matches
+      - fingerprints
+      - hosts
+      - json_body_links
+      - link_count
+      - networks
+      - ports
+      - protocols
+      - snis
+      - xray_outbounds
+    multi-node:
+      driver: aio:case_share_links
+      evidence:
+      - cross_representation_matches
+      - fingerprints
+      - hosts
+      - json_body_links
+      - link_count
+      - networks
+      - ports
+      - protocols
+      - snis
+      - xray_outbounds
   promotion_target: Real Subscription Delivery and User-Agent Policy
 - id: SUB-UA-ABSENT
   requirement: Real Panel subscription lifecycle
@@ -3276,8 +3499,11 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_user_agent_absent
+      evidence: []
   promotion_target: Real Subscription Delivery and User-Agent Policy
 - id: SUB-UA-BLANK
   requirement: Real Panel subscription lifecycle
@@ -3293,8 +3519,11 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_user_agent_blank
+      evidence: []
   promotion_target: Real Subscription Delivery and User-Agent Policy
 - id: SUB-JSON-SHAPES
   requirement: Panel subscription representations
@@ -3310,8 +3539,17 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_json_shapes
+      evidence:
+      - alternate_outbounds
+      - alternate_shape
+      - alternate_wrapped
+      - served_entries
+      - served_shape
+      - served_wrapped
   promotion_target: Real Subscription Delivery and User-Agent Policy
 - id: AIO-REVOKE
   requirement: Real client data-plane verification
@@ -3329,8 +3567,31 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_revocation
+      evidence:
+      - created_id_present
+      - created_short_uuid_length
+      - credential_digest_changed
+      - delete_status
+      - expected_source_ips
+      - new_subscription_status
+      - old_subscription_status
+      - patch_status
+      - positive_source_ips
+      - positive_transfer_count
+      - readiness_network
+      - recorded_request_ids
+      - representations
+      - revoke_status
+      - revoked_at_present
+      - revoked_attempt_count
+      - revoked_delivered
+      - revoked_networks
+      - revoked_refused
+      - revoked_rounds
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-RESTART
   requirement: All-in-One Master VPS Installation Verification
@@ -3347,8 +3608,19 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_restart
+      evidence:
+      - loopback_api
+      - loopback_login
+      - readiness_network
+      - recovery_seconds
+      - restart_units
+      - source_ips
+      - transfer_count
+      - unit_states
   promotion_target: All-in-One Master VPS Installation Verification
 - id: AIO-IDEMPOTENT
   requirement: All-in-One Master VPS Installation Verification
@@ -3366,8 +3638,20 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_idempotent
+      evidence:
+      - credential_digest_changed
+      - credentials
+      - nginx_files
+      - panel_counts
+      - reinstall_duration_seconds
+      - reinstall_returncode
+      - source_ips
+      - transfer_count
+      - unit_files
   promotion_target: All-in-One Master VPS Installation Verification
 - id: AIO-NEG-DEST
   requirement: Real client data-plane verification
@@ -3383,8 +3667,18 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_negative_destination
+      evidence:
+      - control_delivered
+      - delivered
+      - endpoint_records
+      - engine
+      - network
+      - reason
+      - status
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-NEG-PORT
   requirement: All-in-One Master VPS Installation Verification
@@ -3400,8 +3694,15 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_foreign_listener
+      evidence:
+      - after_release
+      - foreign_listener
+      - managed_listener
+      - port
   promotion_target: All-in-One Master VPS Installation Verification
 - id: AIO-NEG-ACME
   requirement: Fail-closed local ACME test mode
@@ -3417,8 +3718,15 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_acme_fail_closed
+      evidence:
+      - arbitrary_in_test_mode
+      - fixture_without_optin
+      - letsencrypt_production
+      - unpinned_ca
   promotion_target: Independent All-in-One Acceptance Topology
 - id: AIO-NEG-DEP
   requirement: Security and network isolation verification
@@ -3434,8 +3742,15 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_public_dependency
+      evidence:
+      - panel_loopback_login
+      - public_after_recovery
+      - public_before
+      - public_without_dependency
   promotion_target: All-in-One Master VPS Installation Verification
 - id: AIO-CHANNEL-NOOP
   requirement: All-in-One Master VPS Installation Verification
@@ -3451,8 +3766,17 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_channel_noop
+      evidence:
+      - channel
+      - journal_state
+      - main_pid
+      - message
+      - snapshots_after
+      - snapshots_before
   promotion_target: All-in-One Master VPS Installation Verification
 - id: AIO-CHANNEL-ROLLBACK
   requirement: Signal-Safe and Verifiable Transaction Compensation
@@ -3470,8 +3794,22 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_channel_rollback
+      evidence:
+      - channel_after
+      - clients_served
+      - health
+      - journal_state
+      - representations_identical
+      - sabotaged_targets
+      - snapshot
+      - source_ips
+      - switch_returncode
+      - transfer_count
+      - unit_state
   promotion_target: Signal-Safe and Verifiable Transaction Compensation
 - id: AIO-INTERRUPT
   requirement: Failure injection and recovery
@@ -3490,8 +3828,25 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_operator_interrupt
+      evidence:
+      - channel_after
+      - clients_served
+      - health
+      - interrupted_state
+      - journal_state
+      - journal_state_at_kill
+      - mutation_lock_free
+      - operator_exit
+      - recovery_returncode
+      - snapshot
+      - source_ips
+      - transfer_count
+      - unit_state
+      - waited_seconds
   promotion_target: Signal-Safe and Verifiable Transaction Compensation
 - id: AIO-CHANNEL-DEV
   requirement: All-in-One Master VPS Installation Verification
@@ -3509,8 +3864,23 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_channel_dev
+      evidence:
+      - channel_after
+      - channel_before
+      - clients_served
+      - downgrade_message
+      - downgrade_refused
+      - health
+      - journal_state
+      - snapshot
+      - snapshot_target_version
+      - source_ips
+      - transfer_count
+      - unit_state
   promotion_target: All-in-One Master VPS Installation Verification
 - id: AIO-FAULT-DISK
   requirement: Failure injection and recovery
@@ -3528,8 +3898,33 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_backup_store_full
+      evidence:
+      - archive
+      - archive_bytes
+      - archive_mode
+      - clients_captured
+      - clients_served
+      - database_dump_digest_changed
+      - database_integrity
+      - database_rows_after
+      - database_rows_before
+      - database_tables
+      - database_tables_added
+      - files_with_fault
+      - free_kb_with_fault
+      - health
+      - representations_identical
+      - returncode_after
+      - returncode_with_fault
+      - seconds_after
+      - seconds_before
+      - seconds_fault
+      - unit_state
+      - verify_returncode
   promotion_target: Backup and Restore Format v1
 - id: AIO-FAULT-PANEL
   requirement: Failure injection and recovery
@@ -3547,8 +3942,21 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_panel_service_down
+      evidence:
+      - health_after
+      - health_with_panel_down
+      - inventory_identical
+      - public_status_with_panel_down
+      - representations_identical
+      - rows_stable_with_panel_down
+      - subscription_status_with_panel_down
+      - transfers_after
+      - transfers_with_panel_down
+      - unit_sub_state_with_panel_down
   promotion_target: All-in-One Master VPS Installation Verification
 - id: AIO-FAULT-XRAY
   requirement: Failure injection and recovery
@@ -3565,8 +3973,20 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_core_process_killed
+      evidence:
+      - core_comm
+      - core_pid_after
+      - core_ppid_after
+      - killed_pid
+      - node_main_pid
+      - node_restarts
+      - restart_seconds
+      - transfer_count
+      - xray_units
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-FAULT-LATENCY
   requirement: Failure injection and recovery
@@ -3583,8 +4003,17 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_public_latency
+      evidence:
+      - baseline_seconds
+      - delay_ms
+      - delayed_seconds
+      - health_after
+      - recovered_seconds
+      - transfers_with_delay
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: NGX-05
   requirement: NGINX SNI Routing and REALITY Decoy Verification
@@ -3603,8 +4032,14 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_nginx_config
+      evidence: []
+    multi-node:
+      driver: multi_node:case_nginx_config
+      evidence: []
   promotion_target: NGINX SNI Routing and REALITY Decoy Verification
 - id: TLS-01
   requirement: NGINX SNI Routing and REALITY Decoy Verification
@@ -3624,8 +4059,16 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_tls_surface
+      evidence: []
+    multi-node:
+      driver: multi_node:case_tls_surface
+      evidence:
+      - master
+      - worker
   promotion_target: NGINX SNI Routing and REALITY Decoy Verification
 - id: DECOY-01
   requirement: NGINX SNI Routing and REALITY Decoy Verification
@@ -3644,8 +4087,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_decoy
+      evidence: []
   promotion_target: NGINX SNI Routing and REALITY Decoy Verification
 - id: ACME-01
   requirement: Real ACME issuance and renewal through the pinned directory
@@ -3663,8 +4109,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_acme_renewal
+      evidence: []
   promotion_target: Global Certbot Deploy Hook Ownership
 - id: ACME-02
   requirement: Real ACME issuance and renewal through the pinned directory
@@ -3682,8 +4131,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_acme_outage
+      evidence: []
   promotion_target: Global Certbot Deploy Hook Ownership
 - id: DNS-01
   requirement: Preflight SSH Trust and DNS Verification
@@ -3705,8 +4157,18 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_dns
+      evidence:
+      - attribution
+      - case
+      - expiry
+      - restored
+      - selection
+      - steered
+      - zone
   promotion_target: Preflight SSH Trust and DNS Verification
 - id: NGX-COVER-DERIVE
   requirement: Camouflage decoy and certificate lineage
@@ -3722,8 +4184,11 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_cover_derive
+      evidence: []
   promotion_target: NGINX SNI Routing and REALITY Decoy Verification
 - id: NGX-COVER-SITE
   requirement: Camouflage decoy and certificate lineage
@@ -3743,8 +4208,19 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_cover_site
+      evidence:
+      - apex
+      - assets
+      - brand
+      - documents
+      - files
+      - leaks
+      - pages
+      - placeholders
   promotion_target: NGINX SNI Routing and REALITY Decoy Verification
 - id: NGX-DECOY-ROUTE
   requirement: Camouflage decoy and certificate lineage
@@ -3764,8 +4240,14 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_decoy_route
+      evidence:
+      - client
+      - paths
+      - roles
   promotion_target: NGINX SNI Routing and REALITY Decoy Verification
 - id: NGX-COVER-UNRESOLVED
   requirement: Camouflage decoy and certificate lineage
@@ -3781,8 +4263,13 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_cover_unresolved
+      evidence:
+      - probes
+      - zone_restored
   promotion_target: NGINX SNI Routing and REALITY Decoy Verification
 - id: NGX-WORKER-ACME80
   requirement: Camouflage decoy and certificate lineage
@@ -3797,8 +4284,26 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_acme80
+      evidence:
+      - after_domain_change
+      - bound_9443
+      - certificate
+      - challenge
+      - decoy
+      - domain_change
+      - enabled
+      - listen
+      - map
+      - reapply
+      - roles
+      - root
+      - server_name
+      - stale
+      - vhost
   promotion_target: Distributed Worker VPS Deployment Verification
 - id: TLS-VERIFY-ANCHORS
   requirement: Private test CA trust for both client engines
@@ -3814,8 +4319,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-BACKUP
   requirement: Backup and Restore Format v1
@@ -3833,8 +4338,12 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_backup_types
+      evidence:
+      - roles
   promotion_target: Signal-Safe and Verifiable Transaction Compensation
 - id: MN-BACKUP-VOL
   requirement: Backup and Restore Format v1
@@ -3853,8 +4362,14 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_backup_volume
+      evidence:
+      - artifacts
+      - cleanup
+      - roles
   promotion_target: Signal-Safe and Verifiable Transaction Compensation
 - id: MN-BACKUP-BAD
   requirement: Backup and Restore Format v1
@@ -3874,8 +4389,15 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_backup_rejected
+      evidence:
+      - control
+      - master_state
+      - node_refused
+      - refused
   promotion_target: Signal-Safe and Verifiable Transaction Compensation
 - id: MN-RESTORE
   requirement: Backup and Restore Format v1
@@ -3894,8 +4416,12 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_backup_restore
+      evidence:
+      - roles
   promotion_target: Signal-Safe and Verifiable Transaction Compensation
 - id: PODNET-MASTER-ADDR
   requirement: Podman-only Master address selection for Worker provisioning
@@ -3911,8 +4437,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_master_address
+      evidence: []
   promotion_target: Distributed Worker VPS Deployment Verification
 - id: WRK-06
   requirement: Distributed Worker VPS Deployment Verification
@@ -3928,8 +4457,25 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_worker_config
+      evidence:
+      - api_inbound_listen
+      - api_inbound_tag
+      - api_inbound_type
+      - api_services
+      - applied_inbound_count
+      - config_mode
+      - declared_inbound_count
+      - env_mode
+      - inbound_ports
+      - inbound_tags
+      - node_port
+      - outbound_count
+      - runtime_mode
+      - worker_inbound_count
   promotion_target: Distributed Worker VPS Deployment Verification
 - id: ACME-REJECT-ARB
   requirement: Fail-closed local ACME test mode
@@ -3945,8 +4491,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: Global Certbot Deploy Hook Ownership
 - id: GATE-BUDGET
   requirement: Pre-push and pull-request acceptance gate
@@ -3962,8 +4508,28 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: budget:case_budget
+      evidence:
+      - aggregate_of_incomplete
+      - declared_budget_seconds
+      - elapsed_seconds
+      - enforced_budget_seconds
+      - probe_case_message
+      - probe_exit_status
+      - probe_overall
+    multi-node:
+      driver: budget:case_budget
+      evidence:
+      - aggregate_of_incomplete
+      - declared_budget_seconds
+      - elapsed_seconds
+      - enforced_budget_seconds
+      - probe_case_message
+      - probe_exit_status
+      - probe_overall
   promotion_target: Result Status Semantics
 - id: GATE-COVERAGE
   requirement: Coverage completeness and error paths
@@ -3979,8 +4545,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: Result Status Semantics
 - id: GATE-PREPUSH
   requirement: Pre-push and pull-request acceptance gate
@@ -3996,8 +4562,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: Result Status Semantics
 - id: GATE-DIVERGENCE
   requirement: Live scenario parity
@@ -4013,8 +4579,8 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver: null
   driver_status: planned
+  drivers: {}
   promotion_target: Result Status Semantics
 - id: MN-REVOKE
   requirement: Real client data-plane verification
@@ -4032,8 +4598,31 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: aio:case_revocation
+      evidence:
+      - created_id_present
+      - created_short_uuid_length
+      - credential_digest_changed
+      - delete_status
+      - expected_source_ips
+      - new_subscription_status
+      - old_subscription_status
+      - patch_status
+      - positive_source_ips
+      - positive_transfer_count
+      - readiness_network
+      - recorded_request_ids
+      - representations
+      - revoke_status
+      - revoked_at_present
+      - revoked_attempt_count
+      - revoked_delivered
+      - revoked_networks
+      - revoked_refused
+      - revoked_rounds
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-OUTAGE
   requirement: Failure injection and recovery
@@ -4051,8 +4640,28 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_worker_outage
+      evidence:
+      - baseline_source_ip
+      - baseline_status
+      - control_peers
+      - control_plane_seconds
+      - master_control_source_ip
+      - master_control_status
+      - offline_seconds
+      - panel_master_connected
+      - panel_worker_offline
+      - recovered_source_ip
+      - recovery_seconds
+      - refused_reason
+      - refused_status
+      - worker_client
+      - worker_inbound
+      - worker_unit_after_start
+      - worker_unit_after_stop
   promotion_target: Negative Scenario and Fault Injection Tests
 - id: MN-RESTART
   requirement: Failure injection and recovery
@@ -4069,8 +4678,25 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_worker_restart
+      evidence:
+      - control_peers
+      - control_plane_seconds
+      - main_pid_after
+      - main_pid_before
+      - panel_inbound_count
+      - panel_node_endpoint
+      - panel_node_uuid
+      - panel_node_version
+      - recovered_source_ip
+      - recovered_status
+      - recovery_seconds
+      - unit_after_restart
+      - worker_client
+      - worker_inbound
   promotion_target: Negative Scenario and Fault Injection Tests
 - id: MN-SSHKEY
   requirement: Preflight SSH Trust and DNS Verification
@@ -4087,8 +4713,21 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_ssh_host_key
+      evidence:
+      - known_hosts_entry
+      - new_key_accepted
+      - new_key_executed_remotely
+      - old_key_executed_remotely
+      - old_key_rejected
+      - worker_host_key_after
+      - worker_host_key_before
+      - worker_ip
+      - wrong_key_executed_remotely
+      - wrong_key_refused
   promotion_target: Preflight SSH Trust and DNS Verification
 - id: MN-SSH-DOWN
   requirement: Failure injection and recovery
@@ -4106,8 +4745,28 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_ssh_service_down
+      evidence:
+      - action
+      - detail
+      - recovered_returncode
+      - refusal_names_transport
+      - refused_returncode
+      - remote_effect_after_restore
+      - remote_effect_during_fault
+      - service
+      - socket
+      - ssh_socket_after_start
+      - ssh_socket_after_stop
+      - ssh_unit_after_start
+      - ssh_unit_after_stop
+      - worker_ip
+      - worker_source_ip_with_sshd_down
+      - worker_status_with_sshd_down
+      - worker_unit_with_sshd_down
   promotion_target: Negative Scenario and Fault Injection Tests
 - id: MN-VISION
   requirement: Independent Optional Vision Domains
@@ -4126,8 +4785,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_vision_independence
+      evidence: []
   promotion_target: Independent Optional Vision Domains
 - id: AIO-DP-REALITY-xray
   requirement: Real client data-plane verification
@@ -4144,8 +4806,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-REALITY-mihomo
   requirement: Real client data-plane verification
@@ -4162,8 +4827,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-XHTTP-xray
   requirement: Real client data-plane verification
@@ -4180,8 +4848,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-XHTTP-mihomo
   requirement: Real client data-plane verification
@@ -4198,8 +4869,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-WS-xray
   requirement: Real client data-plane verification
@@ -4216,8 +4890,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-WS-mihomo
   requirement: Real client data-plane verification
@@ -4234,8 +4911,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-TROJAN-GRPC-xray
   requirement: Real client data-plane verification
@@ -4252,8 +4932,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-TROJAN-GRPC-mihomo
   requirement: Real client data-plane verification
@@ -4270,8 +4953,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-VISION-xray
   requirement: Real client data-plane verification
@@ -4288,8 +4974,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-DP-VISION-mihomo
   requirement: Real client data-plane verification
@@ -4306,8 +4995,11 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: AIO-MATRIX
   requirement: Real client data-plane verification
@@ -4324,8 +5016,18 @@ cases:
   topology:
   - aio
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_matrix
+      evidence:
+      - clients
+      - declared_cases
+      - executed_cases
+      - expected_positive_cases
+      - inbounds
+      - passed_cases
+      - vision
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-REALITY-xray
   requirement: Real client data-plane verification
@@ -4343,8 +5045,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-REALITY-mihomo
   requirement: Real client data-plane verification
@@ -4362,8 +5067,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-XHTTP-xray
   requirement: Real client data-plane verification
@@ -4381,8 +5089,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-XHTTP-mihomo
   requirement: Real client data-plane verification
@@ -4400,8 +5111,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-WS-xray
   requirement: Real client data-plane verification
@@ -4419,8 +5133,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-WS-mihomo
   requirement: Real client data-plane verification
@@ -4438,8 +5155,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-TROJAN-GRPC-xray
   requirement: Real client data-plane verification
@@ -4457,8 +5177,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-TROJAN-GRPC-mihomo
   requirement: Real client data-plane verification
@@ -4476,8 +5199,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-VISION-xray
   requirement: Real client data-plane verification
@@ -4495,8 +5221,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-master-VISION-mihomo
   requirement: Real client data-plane verification
@@ -4514,8 +5243,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-REALITY-xray
   requirement: Real client data-plane verification
@@ -4533,8 +5265,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-REALITY-mihomo
   requirement: Real client data-plane verification
@@ -4552,8 +5287,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-XHTTP-xray
   requirement: Real client data-plane verification
@@ -4571,8 +5309,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-XHTTP-mihomo
   requirement: Real client data-plane verification
@@ -4590,8 +5331,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-WS-xray
   requirement: Real client data-plane verification
@@ -4609,8 +5353,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-WS-mihomo
   requirement: Real client data-plane verification
@@ -4628,8 +5375,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-TROJAN-GRPC-xray
   requirement: Real client data-plane verification
@@ -4647,8 +5397,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-TROJAN-GRPC-mihomo
   requirement: Real client data-plane verification
@@ -4666,8 +5419,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-VISION-xray
   requirement: Real client data-plane verification
@@ -4685,8 +5441,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-DP-worker-VISION-mihomo
   requirement: Real client data-plane verification
@@ -4704,8 +5463,11 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence: []
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-MATRIX
   requirement: Real client data-plane verification
@@ -4723,8 +5485,19 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_matrix
+      evidence:
+      - clients
+      - declared_cases
+      - executed_cases
+      - expected_positive_cases
+      - inbounds
+      - passed_cases
+      - per_node
+      - vision
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-EGRESS
   requirement: Non-bypassable node egress attribution
@@ -4742,6 +5515,16 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver: null
-  driver_status: planned
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_egress
+      evidence:
+      - attributed_cases
+      - denials
+      - denied_sources
+      - master_identity
+      - payload_sources
+      - per_node
+      - worker_identity
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints

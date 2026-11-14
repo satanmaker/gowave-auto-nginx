@@ -21,13 +21,14 @@ and refuses a rendered report that is not the text the inventory renders to:
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import yaml
 
@@ -59,6 +60,34 @@ BEHAVIOR_AREAS: Tuple[str, ...] = (
 
 PODMAN_CASES: Sequence[str] = ("aio", "multi-node")
 ALL_CASES: Sequence[str] = ("podman", "live")
+
+# The modules that build the Podman case list, keyed by the topology their
+# `Case(...)` calls declare. Implementation facts are read from this code and
+# written into the catalog, never the other way round: an entry cannot claim a
+# driver no function implements, and a function cannot run a case the catalog
+# does not declare implemented.
+DRIVER_MODULES: Dict[str, Path] = {
+    "aio": REPO_ROOT / "tools" / "podman_e2e" / "aio.py",
+    "multi-node": REPO_ROOT / "tools" / "podman_e2e" / "multi_node.py",
+}
+
+# Two drivers mint one `Case` per matrix tuple instead of writing each out, so
+# their ids are computed rather than spelled. The exception is a closed list —
+# the ids themselves are the ones `data_plane_cases()` puts in the catalog and
+# `tests/test_podman_matrix.py` checks against the matrix — and a new builder
+# appearing in the code is refused rather than silently escaping the catalog.
+# Keyed by module file stem, because that is what the source names.
+MATRIX_DRIVEN_BUILDERS: Set[Tuple[str, str]] = {
+    ("aio", "_data_plane_case"),
+    ("multi_node", "data_plane_case"),
+}
+
+DRIVER_STATUSES: Sequence[str] = ("implemented", "planned", "not-applicable")
+
+
+class CatalogError(RuntimeError):
+    """The catalog and the code that implements it disagree."""
+
 
 REQUIREMENT_PREFIX = {
     "Disposable Environment Gate": "ENV",
@@ -673,6 +702,279 @@ def classify(requirement: str, title: str) -> Tuple[str, Optional[str]]:
     return "container", None
 
 
+_CONSTANT_CACHE: Dict[str, Dict[str, str]] = {}
+
+
+def _module_constants(module: str) -> Dict[str, str]:
+    """The string constants of a sibling module, read once per process."""
+    if module not in _CONSTANT_CACHE:
+        path = REPO_ROOT / "tools" / "podman_e2e" / f"{module}.py"
+        if not path.is_file():
+            _CONSTANT_CACHE[module] = {}
+        else:
+            _CONSTANT_CACHE[module] = _string_constants(ast.parse(path.read_text(encoding="utf-8")))
+    return _CONSTANT_CACHE[module]
+
+
+def _string_constants(tree: ast.Module) -> Dict[str, str]:
+    """Module-level string constants, which is how a case id is spelled.
+
+    Three spellings are read, because the suite uses all of them:
+    `NAME = "..."`, the annotated `NAME: str = "..."`, and an alias such as
+    `NGINX_CONFIG_CASE_ID = aio.NGX_CONFIG_CASE_ID` or `NAME = OTHER_NAME`.
+    A missed spelling would be refused as a builder rather than resolved, which
+    is safe but would hide the real case behind a wrong error.
+    """
+    aliases = _imported_modules(tree)
+    pending: Dict[str, ast.AST] = {}
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            pending[node.target.id] = node.value
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    pending[target.id] = node.value
+
+    def resolve(node: ast.AST, seen: Set[str]) -> Optional[str]:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id in constants:
+                return constants[node.id]
+            if node.id in pending and node.id not in seen:
+                return resolve(pending[node.id], seen | {node.id})
+            return None
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            owner = aliases.get(node.value.id)
+            if owner is None:
+                return None
+            return _module_constants(owner).get(node.attr)
+        return None
+
+    constants: Dict[str, str] = {}
+    for _ in range(4):
+        before = len(constants)
+        for name, value in pending.items():
+            if name in constants:
+                continue
+            resolved = resolve(value, {name})
+            if resolved is not None:
+                constants[name] = resolved
+        if len(constants) == before:
+            break
+    return constants
+
+
+def _imported_modules(tree: ast.Module) -> Dict[str, str]:
+    """Local alias -> module name, for `budget.case_budget`-style callables.
+
+    Both spellings this package uses are read: `from . import budget` and
+    `from tools.podman_e2e import budget, aio`. Anything else — a stdlib alias,
+    say — is not a module of this suite and is resolved as a local object.
+    """
+    alias: Dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        inside_package = node.module == "tools.podman_e2e" or (
+            node.level == 1 and node.module is None
+        )
+        if not inside_package:
+            continue
+        for name in node.names:
+            alias[name.asname or name.name] = name.name
+    return alias
+
+
+def _dotted_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        head = _dotted_name(node.value)
+        return f"{head}.{node.attr}" if head else node.attr
+    return ""
+
+
+def _case_callable(run_argument: ast.AST) -> str:
+    """The callable a `Case(...)` wraps, as the source spells it."""
+    body: ast.AST = run_argument
+    if isinstance(run_argument, ast.Lambda):
+        body = run_argument.body
+    if isinstance(body, ast.Call):
+        body = body.func
+    return _dotted_name(body)
+
+
+def _case_nodes(tree: ast.Module) -> List[ast.Call]:
+    return [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "Case" and len(node.args) >= 3
+    ]
+
+
+def _dict_literal_keys(node: ast.Dict) -> Set[str]:
+    return {key.value for key in node.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)}
+
+
+def evidence_keys(function: ast.FunctionDef) -> List[str]:
+    """The evidence keys a driver's own source records.
+
+    Three shapes count, because they are the three the runner turns into a
+    ``CaseResult.evidence`` entry: ``evidence["key"] = ...``, a dict literal
+    assigned to ``evidence``, and a dict literal the driver returns. A key the
+    driver stopped recording disappears from here, which is what lets the
+    catalog statement be checked rather than believed.
+    """
+    keys: Set[str] = set()
+    for node in ast.walk(function):
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) \
+                and node.value.id == "evidence":
+            if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+                keys.add(node.slice.value)
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
+            if any(isinstance(target, ast.Name) and target.id == "evidence" for target in node.targets):
+                keys |= _dict_literal_keys(node.value)
+        elif isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
+            keys |= _dict_literal_keys(node.value)
+    return sorted(keys)
+
+
+def _resolve_callable(
+    topology: str, dotted: str, module_tree: ast.Module, aliases: Dict[str, str],
+) -> Optional[Tuple[str, str]]:
+    """Resolve a `Case` callable to (file stem, name) or None when it is not ours.
+
+    A bare name and a `product.method` belong to the topology's own module; a
+    `budget.case_budget` names another module of this package.
+    """
+    head, _, tail = dotted.partition(".")
+    if tail and head in aliases:
+        target = REPO_ROOT / "tools" / "podman_e2e" / f"{aliases[head]}.py"
+        if not target.is_file():
+            return None
+        target_tree = ast.parse(target.read_text(encoding="utf-8"))
+        names = {node.name for node in target_tree.body if isinstance(node, ast.FunctionDef)}
+        return (aliases[head], tail) if tail in names else None
+    if tail:
+        classes = [node for node in module_tree.body if isinstance(node, ast.ClassDef)]
+        for cls in classes:
+            if any(isinstance(item, ast.FunctionDef) and item.name == tail for item in cls.body):
+                return (DRIVER_MODULES[topology].stem, f"{cls.name}.{tail}")
+        return None
+    names = {node.name for node in module_tree.body if isinstance(node, ast.FunctionDef)}
+    return (DRIVER_MODULES[topology].stem, head) if head in names else None
+
+
+def _function_node(module_tree: ast.Module, name: str) -> Optional[ast.FunctionDef]:
+    """The driver node for a resolved callable (`Class.method` resolves to the method)."""
+    if "." in name:
+        _, _, method = name.partition(".")
+        for cls in module_tree.body:
+            if isinstance(cls, ast.ClassDef):
+                for item in cls.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == method:
+                        return item
+        return None
+    for node in module_tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    return None
+
+
+def matrix_driven_ids(topology: str) -> Set[str]:
+    """The case ids the matrix-driven builders mint, taken from the catalog's own rows."""
+    return {
+        entry["id"] for entry in data_plane_cases()
+        if entry["topology"] == [topology] and "-DP-" in entry["id"]
+    }
+
+
+def driver_registry() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """case id -> topology -> {driver, evidence}, read from the code that runs it.
+
+    Raises ``CatalogError`` when a `Case` names a callable this package does not
+    define, or when a builder mints ids outside the closed matrix-driven list:
+    both are cases the catalog could not check, so they are refused here rather
+    than recorded as if they had been.
+    """
+    registry: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for topology, path in DRIVER_MODULES.items():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        constants = _string_constants(tree)
+        aliases = _imported_modules(tree)
+
+        def record(case_id: str, dotted: str) -> None:
+            resolved = _resolve_callable(topology, dotted, tree, aliases)
+            if resolved is None:
+                raise CatalogError(
+                    f"{topology}: Case({case_id!r}) names {dotted!r}, which this package does not define"
+                )
+            module, name = resolved
+            function = _function_node(tree, name) if module == path.stem else _function_node(
+                ast.parse((REPO_ROOT / "tools" / "podman_e2e" / f"{module}.py").read_text(encoding="utf-8")),
+                name,
+            )
+            if function is None:
+                raise CatalogError(f"{topology}: {module}:{name} has no function body to read")
+            registry.setdefault(case_id, {})[topology] = {
+                "driver": f"{module}:{name}",
+                "evidence": evidence_keys(function),
+            }
+
+        for node in _case_nodes(tree):
+            first = node.args[0]
+            dotted = _case_callable(node.args[2])
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                record(first.value, dotted)
+            elif isinstance(first, ast.Name) and first.id in constants:
+                record(constants[first.id], dotted)
+            elif isinstance(first, ast.Attribute) and isinstance(first.value, ast.Name):
+                owner = _imported_modules(tree).get(first.value.id)
+                sibling = REPO_ROOT / "tools" / "podman_e2e" / f"{owner}.py"
+                if owner is None or not sibling.is_file():
+                    raise CatalogError(f"{topology}: Case id {ast.unparse(first)} has no resolvable constant")
+                sibling_constants = _string_constants(ast.parse(sibling.read_text(encoding="utf-8")))
+                if first.attr not in sibling_constants:
+                    raise CatalogError(f"{topology}: Case id {ast.unparse(first)} is not a literal constant")
+                record(sibling_constants[first.attr], dotted)
+            else:
+                builder = dotted or ast.unparse(first)
+                if (path.stem, builder) not in MATRIX_DRIVEN_BUILDERS:
+                    raise CatalogError(
+                        f"{topology}: Case({ast.unparse(first)!r}) mints ids this catalog cannot check; "
+                        f"add {builder!r} to MATRIX_DRIVEN_BUILDERS with the ids it produces"
+                    )
+
+        for builder in sorted(name for module, name in MATRIX_DRIVEN_BUILDERS if module == path.stem):
+            function = _function_node(tree, builder)
+            if function is None:
+                raise CatalogError(f"{topology}: the declared matrix-driven builder {builder!r} is gone")
+            for case_id in sorted(matrix_driven_ids(topology)):
+                registry.setdefault(case_id, {})[topology] = {
+                    "driver": f"{path.stem}:{builder}",
+                    "evidence": evidence_keys(function),
+                }
+    return registry
+
+
+def apply_implementations(cases: List[Dict[str, Any]], registry: Dict[str, Dict[str, Dict[str, Any]]]) -> None:
+    """Write the code's own implementation facts into the catalog entries."""
+    known = {case["id"] for case in cases}
+    unknown = sorted(set(registry) - known)
+    if unknown:
+        raise CatalogError(
+            "the code runs cases the catalog does not define: " + ", ".join(unknown)
+        )
+    for case in cases:
+        drivers = registry.get(case["id"], {})
+        case["drivers"] = {topology: dict(facts) for topology, facts in sorted(drivers.items())}
+        if drivers:
+            case["driver_status"] = "implemented"
+        elif case.get("driver_status") == "implemented":
+            case["driver_status"] = "planned"
+
+
 def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
     scenarios = parse_live_spec(spec_path)
     counters: Dict[str, int] = {}
@@ -705,8 +1007,8 @@ def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
             "environment": environment,
             "topology": topologies,
             "gate": "pre-push",
-            "driver": None,
             "driver_status": "planned" if "podman" in runs_in else "not-applicable",
+            "drivers": {},
         }
         if note:
             key = "partial_split" if environment == "partial" else "live_only_reason"
@@ -727,10 +1029,12 @@ def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
             "environment": "container",
             "topology": extra["topology"],
             "gate": "pre-push",
-            "driver": None,
             "driver_status": "planned",
+            "drivers": {},
             "promotion_target": extra["promotion_target"],
         })
+
+    apply_implementations(cases, driver_registry())
 
     counts = {
         "live_total": len(scenarios),
@@ -828,14 +1132,87 @@ def validate_catalog(catalog: Dict[str, Any], spec_path: Path = LIVE_SPEC) -> Li
             errors.append(f"{case.get('id')}: Podman-first case must run only in Podman")
         if not case.get("live_scenario") and not case.get("promotion_target"):
             errors.append(f"{case.get('id')}: Podman-first case requires a promotion target")
+    errors.extend(_implementation_errors(catalog))
     return errors
+
+
+def _implementation_errors(catalog: Dict[str, Any]) -> List[str]:
+    """The code and the catalog must name each other's cases, both ways."""
+    errors: List[str] = []
+    registry = driver_registry()
+    cases = catalog.get("cases", [])
+    by_id = {case.get("id"): case for case in cases}
+    for case in cases:
+        case_id = case.get("id")
+        status = case.get("driver_status")
+        drivers = case.get("drivers") or {}
+        if status not in DRIVER_STATUSES:
+            errors.append(f"{case_id}: driver_status {status!r} is not one of {list(DRIVER_STATUSES)}")
+        if status == "implemented" and not drivers:
+            errors.append(f"{case_id}: implemented, but names no driver")
+        if status != "implemented" and drivers:
+            errors.append(f"{case_id}: driver_status {status!r}, but names drivers")
+        for topology, facts in sorted(drivers.items()):
+            expected = (registry.get(case_id) or {}).get(topology)
+            if expected is None:
+                errors.append(
+                    f"{case_id}: the {topology} driver {facts.get('driver')!r} is not a Case the code builds"
+                )
+                continue
+            if topology not in case.get("topology", []):
+                errors.append(f"{case_id}: driven in {topology}, which its topology list does not name")
+            if facts.get("driver") != expected["driver"]:
+                errors.append(
+                    f"{case_id} / {topology}: driver {facts.get('driver')!r} is not the one the code wraps, "
+                    f"{expected['driver']!r}"
+                )
+            if list(facts.get("evidence") or []) != expected["evidence"]:
+                errors.append(
+                    f"{case_id} / {topology}: the evidence keys differ from what the driver records: "
+                    f"{facts.get('evidence')} != {expected['evidence']}"
+                )
+    for case_id, topologies in sorted(registry.items()):
+        entry = by_id.get(case_id)
+        if entry is None:
+            errors.append(f"the code runs {case_id}, which the catalog does not define")
+            continue
+        if entry.get("driver_status") != "implemented":
+            errors.append(f"{case_id}: the code runs it, the catalog says {entry.get('driver_status')!r}")
+        for topology in sorted(topologies):
+            if topology not in (entry.get("drivers") or {}):
+                errors.append(f"{case_id}: the code drives it in {topology}, the catalog does not name it")
+    return errors
+
+
+def require_executable(cases: Iterable[Tuple[str, str]]) -> None:
+    """Refuse a run whose case list is not what the catalog declares.
+
+    The runner builds its cases in Python and the catalog states which of them
+    exist; without this check a case could run under an id no audit knows. It is
+    called before the install, so a disagreement costs no product time.
+    """
+    catalog = load_catalog()
+    by_id = {case.get("id"): case for case in catalog.get("cases", [])}
+    problems: List[str] = []
+    for case_id, topology in cases:
+        entry = by_id.get(case_id)
+        if entry is None:
+            problems.append(f"{case_id}: no catalog entry")
+        elif entry.get("driver_status") != "implemented":
+            problems.append(f"{case_id}: the catalog says {entry.get('driver_status')!r}")
+        elif topology not in (entry.get("drivers") or {}):
+            problems.append(f"{case_id}: the catalog names no {topology} driver")
+    if problems:
+        raise CatalogError(
+            "the case list does not match tests/cases/catalog.yaml: " + "; ".join(problems)
+        )
 
 
 def executable_gaps(catalog: Dict[str, Any], suite: str = "podman") -> List[str]:
     """Return cases that claim to run in a suite but have no implemented driver."""
     gaps = []
     for case in catalog.get("cases", []):
-        if suite in case.get("runs_in", []) and not case.get("driver"):
+        if suite in case.get("runs_in", []) and not case.get("drivers"):
             gaps.append(f"{case['id']} ({case.get('environment')})")
     return gaps
 
