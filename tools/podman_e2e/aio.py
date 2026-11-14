@@ -5150,6 +5150,7 @@ def case_decoy(product: AioProduct) -> Dict[str, Any]:
 CHANNEL_NOOP_CASE_ID = "AIO-CHANNEL-NOOP"
 CHANNEL_DEV_CASE_ID = "AIO-CHANNEL-DEV"
 CHANNEL_ROLLBACK_CASE_ID = "AIO-CHANNEL-ROLLBACK"
+CHANNEL_INTERRUPT_CASE_ID = "AIO-INTERRUPT"
 
 # One switch captures a snapshot, rewrites the channel, restarts the panel and
 # polls its health for thirty seconds before it commits or restores the whole
@@ -5163,6 +5164,13 @@ CHANNEL_ONCE_FAIL_MARKER = "/root/gowave-e2e-once.marker"
 # is done by a file the hook executes rather than by a program streamed into
 # `python3 -` from the hook's own body.
 CHANNEL_SABOTAGE_EXEC = "/usr/local/sbin/gowave-e2e-sabotage.py"
+# The interruption case holds the restarted Panel at a one-shot ExecStartPre hook,
+# so the kill lands inside the product's APPLYING state instead of racing the few
+# hundred milliseconds between the environment rewrite and the commit.
+CHANNEL_HOLD_UNIT = "/etc/systemd/system/gowave.service.d/99-e2e-hold.conf"
+CHANNEL_HOLD_EXEC = "/usr/local/sbin/gowave-e2e-hold"
+CHANNEL_HOLD_MARKER = "/root/gowave-e2e-hold.started"
+CHANNEL_INTERRUPT_PID = "/tmp/gowave-e2e-interrupt.pid"
 
 
 def channel_state_paths(base: str = "") -> Dict[str, str]:
@@ -6110,6 +6118,472 @@ def case_channel_rollback(product: AioProduct) -> Dict[str, Any]:
             )
 
 
+CHANNEL_INTERRUPT_BODY = r"""
+rm -f /tmp/gowave-e2e-interrupt.out /tmp/gowave-e2e-interrupt.err \
+      /tmp/gowave-e2e-interrupt.recovery.out /tmp/gowave-e2e-interrupt.recovery.err \
+      /tmp/gowave-e2e-interrupt.journal.json /tmp/gowave-e2e-interrupt.unit \
+      /tmp/gowave-e2e-hold.err /root/gowave-e2e-hold.started
+install -d -m 0755 /usr/local/sbin
+cat > /usr/local/sbin/gowave-e2e-hold <<'HOLD'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+exec 2>>/tmp/gowave-e2e-hold.err
+echo "hold entered in uid $(id -u)" >&2
+: >/root/gowave-e2e-hold.started
+# The operator is killed while the restarted Panel waits here. A restart of a
+# healthy Panel commits within milliseconds, so a kill timed against the journal
+# alone would usually land after the commit and prove nothing about an
+# interrupted transaction.
+exec sleep 120
+HOLD
+chmod 0755 /usr/local/sbin/gowave-e2e-hold
+install -d -m 0755 /etc/systemd/system/gowave.service.d
+cat > /etc/systemd/system/gowave.service.d/99-e2e-hold.conf <<'UNIT'
+[Service]
+# `+` runs the hook with the manager's own privileges, as the sabotage hook does:
+# holding the start must not depend on the gowave user's sandbox.
+ExecStartPre=+/usr/local/sbin/gowave-e2e-hold
+UNIT
+systemctl daemon-reload
+configured=$(systemctl show gowave.service -p ExecStartPre | tr '\n' ' ')
+
+setsid bash "$repo/gowave-auto.sh" channel dev \
+    >/tmp/gowave-e2e-interrupt.out 2>/tmp/gowave-e2e-interrupt.err &
+operator=$!
+echo "$operator" >/tmp/gowave-e2e-interrupt.pid
+
+started=$SECONDS
+deadline=$((SECONDS + 120))
+hold_started=0
+observed_state=""
+observed_channel=""
+while (( SECONDS < deadline )); do
+    if [[ -e /root/gowave-e2e-hold.started ]]; then
+        hold_started=1
+    fi
+    observed_channel=$(sed -n 's/^GOWAVE_CHANNEL=//p' /opt/gowave/.env 2>/dev/null | head -n 1 || true)
+    observed_state=$(python3 - <<'PY' || true
+import json
+try:
+    with open("/var/lib/gowave-auto-nginx/recovery/journal.json", encoding="utf-8") as handle:
+        print(json.load(handle).get("state", ""))
+except (OSError, ValueError):
+    print("")
+PY
+)
+    if (( hold_started == 1 )) && [[ "$observed_state" == "APPLYING" && "$observed_channel" == "dev" ]]; then
+        break
+    fi
+    sleep 0.2
+done
+waited=$((SECONDS - started))
+systemctl show gowave.service -p ActiveState -p SubState -p MainPID \
+    >/tmp/gowave-e2e-interrupt.unit 2>&1 || true
+cp /var/lib/gowave-auto-nginx/recovery/journal.json /tmp/gowave-e2e-interrupt.journal.json 2>/dev/null || true
+
+# The process group, not only the leader: `channel` is one shell, but a signal sent
+# to the leader alone would leave a `systemctl` child of it running.
+kill -9 -- "-$operator" 2>/dev/null || true
+for _ in $(seq 1 50); do
+    kill -0 "$operator" 2>/dev/null || break
+    sleep 0.1
+done
+operator_alive=0
+if kill -0 "$operator" 2>/dev/null; then
+    operator_alive=1
+fi
+set +e
+wait "$operator" 2>/dev/null
+operator_exit=$?
+set -e
+
+# Disarm the hold before the product's own recovery restarts the Panel: a hook
+# left in place would hold that restart the same way and blame the product for
+# this sleep. Stopping the unit is also what ends the held ExecStartPre.
+rm -f /etc/systemd/system/gowave.service.d/99-e2e-hold.conf /usr/local/sbin/gowave-e2e-hold
+systemctl daemon-reload
+systemctl stop gowave.service >/dev/null 2>&1 || true
+systemctl reset-failed gowave.service >/dev/null 2>&1 || true
+
+journal_valid=0
+if python3 "$repo/modules/recovery.py" --validate-journal \
+        /var/lib/gowave-auto-nginx/recovery/journal.json >/dev/null 2>&1; then
+    journal_valid=1
+fi
+# The killed operator died holding fd 9; an OS flock is released with the process,
+# so a fresh invocation must be able to take it. A surviving lease file is reported
+# with its holder, because a lease naming a dead pid is refused by the product.
+lock_free=0
+if flock -n /run/lock/gowave-managed-mutation.lock true >/dev/null 2>&1; then
+    lock_free=1
+fi
+
+set +e
+bash "$repo/gowave-auto.sh" recover --boot-files \
+    >/tmp/gowave-e2e-interrupt.recovery.out 2>/tmp/gowave-e2e-interrupt.recovery.err
+recovery_rc=$?
+set -e
+
+OPERATOR_PID="$operator" OPERATOR_ALIVE="$operator_alive" OPERATOR_EXIT="$operator_exit" \
+HOLD_STARTED="$hold_started" WAITED="$waited" OBSERVED_STATE="$observed_state" \
+OBSERVED_CHANNEL="$observed_channel" CONFIGURED="$configured" \
+JOURNAL_VALID="$journal_valid" LOCK_FREE="$lock_free" RECOVERY_RC="$recovery_rc" \
+python3 - <<'PY'
+import json, os, urllib.request
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            return handle.read()[-4000:]
+    except OSError:
+        return ""
+
+
+def journal(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+unit = {}
+for line in read("/tmp/gowave-e2e-interrupt.unit").splitlines():
+    key, _, value = line.partition("=")
+    if key.strip():
+        unit[key.strip()] = value.strip()
+
+lease = {}
+try:
+    with open("/run/lock/gowave-mutation-lease.json", encoding="utf-8") as handle:
+        lease = json.load(handle)
+except (OSError, ValueError):
+    lease = {}
+
+holder_alive = None
+holder = lease.get("holder_pid")
+if isinstance(holder, int) and holder > 0:
+    try:
+        os.kill(holder, 0)
+        holder_alive = True
+    except OSError:
+        holder_alive = False
+
+health = None
+try:
+    with urllib.request.urlopen(
+        "http://127.0.0.1:3000/api/system/health", timeout=5
+    ) as response:
+        health = response.status
+except Exception as error:  # noqa: BLE001 - the probe reports, the case decides
+    health = type(error).__name__ + ": " + str(error)
+
+switch_output = read("/tmp/gowave-e2e-interrupt.out") + read("/tmp/gowave-e2e-interrupt.err")
+print(json.dumps({
+    "operator_pid": int(os.environ["OPERATOR_PID"]),
+    "operator_alive": os.environ["OPERATOR_ALIVE"] == "1",
+    "operator_exit": int(os.environ["OPERATOR_EXIT"]),
+    "hold_started": os.environ["HOLD_STARTED"] == "1",
+    "waited_seconds": int(os.environ["WAITED"]),
+    "observed_journal_state": os.environ.get("OBSERVED_STATE", ""),
+    "observed_channel": os.environ.get("OBSERVED_CHANNEL", ""),
+    "configured": os.environ.get("CONFIGURED", ""),
+    "journal_at_kill": journal("/tmp/gowave-e2e-interrupt.journal.json"),
+    "journal_valid": os.environ["JOURNAL_VALID"] == "1",
+    "lock_free": os.environ["LOCK_FREE"] == "1",
+    "lease": lease,
+    "lease_holder_alive": holder_alive,
+    "unit_at_kill": unit,
+    "switch_stdout": read("/tmp/gowave-e2e-interrupt.out"),
+    "switch_stderr": read("/tmp/gowave-e2e-interrupt.err"),
+    "switch_reported_success": "Switched to channel 'dev' successfully." in switch_output,
+    "recovery_returncode": int(os.environ["RECOVERY_RC"]),
+    "recovery_output": read("/tmp/gowave-e2e-interrupt.recovery.out")
+    + read("/tmp/gowave-e2e-interrupt.recovery.err"),
+    "journal_after_recovery": journal("/var/lib/gowave-auto-nginx/recovery/journal.json"),
+    "health": health,
+}, sort_keys=True))
+PY
+"""
+
+
+def channel_interrupt_script() -> str:
+    """Run the real switch, then kill the operator inside its APPLYING state.
+
+    Everything happens in one payload because the kill needs the process group the
+    operator was started in: the entrypoint would otherwise be describing a
+    background pid to a second, unrelated shell. The hold hook is armed before the
+    switch starts, so the restart's ExecStartPre blocks and the transaction provably
+    stays at APPLYING until the SIGKILL lands.
+    """
+    return (
+        "set -Eeuo pipefail\n"
+        "umask 077\n"
+        f"repo={shlex.quote(topology.REPO_IN_CONTAINER)}\n"
+        f"{CHANNEL_INTERRUPT_BODY.strip()}\n"
+    )
+
+
+def channel_interrupt_cleanup_script() -> str:
+    """Disarm the hold and let the product recover, even when the case has failed.
+
+    Cleanup runs after the case and after an exception, so a failure between the
+    kill and the recovery cannot leave the hold armed, the Panel stopped, or an
+    operator still running for every later case to measure. The healer is the
+    product's own `recover --boot-files`, not a harness restore.
+    """
+    return f"""set -Eeuo pipefail
+pid=$(cat {shlex.quote(CHANNEL_INTERRUPT_PID)} 2>/dev/null || true)
+rm -f {shlex.quote(CHANNEL_HOLD_UNIT)} {shlex.quote(CHANNEL_HOLD_EXEC)} \
+{shlex.quote(CHANNEL_HOLD_MARKER)} {shlex.quote(CHANNEL_INTERRUPT_PID)}
+systemctl daemon-reload
+if [[ -n "$pid" ]] && ps -o args= -p "$pid" 2>/dev/null | grep -q 'gowave-auto.sh channel'; then
+    kill -9 -- "-$pid" 2>/dev/null || true
+fi
+systemctl stop gowave.service >/dev/null 2>&1 || true
+systemctl reset-failed gowave.service >/dev/null 2>&1 || true
+state=$(python3 - <<'PY' || true
+import json
+try:
+    with open("/var/lib/gowave-auto-nginx/recovery/journal.json", encoding="utf-8") as handle:
+        print(json.load(handle).get("state", ""))
+except (OSError, ValueError):
+    print("")
+PY
+)
+if [[ -n "$state" && "$state" != "ROLLED_BACK" && "$state" != "COMMITTED" ]]; then
+    bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh recover --boot-files || true
+fi
+systemctl start gowave.service >/dev/null 2>&1 || true
+systemctl is-active gowave.service || true
+"""
+
+
+def case_operator_interrupt(product: AioProduct) -> Dict[str, Any]:
+    """AIO-INTERRUPT: the operator is killed mid-switch and the product recovers.
+
+    `switch_channel` snapshots the tree, records APPLYING, rewrites the channel and
+    restarts the Panel; only then does it commit. This case kills the operator's
+    process group inside that window, with the restart held by a one-shot
+    ExecStartPre hook so the kill lands at APPLYING rather than racing the commit.
+
+    What the interruption leaves is read from the product's own side: the operator
+    is dead, its journal is schema-valid and still names the in-progress
+    transaction with the snapshot it took, the mutation lock it held is free, and
+    the switch never printed the success line it did not earn. The documented
+    recovery entrypoint `recover --boot-files` must then roll back that very
+    snapshot, restore the pre-switch tree and leave an active Panel serving the
+    same clients — the "subsequent supported retry or rollback" half of the
+    scenario. The snapshot tree is compared against the pre-switch state, so a
+    journal that names a snapshot the switch never finished taking is refused.
+    """
+    host = product.require_installed()
+    product.subscription_payloads(CHANNEL_INTERRUPT_CASE_ID)
+    before = channel_state(product, CHANNEL_INTERRUPT_CASE_ID)
+    require(
+        CHANNEL_INTERRUPT_CASE_ID,
+        before.get("environment", {}).get("GOWAVE_CHANNEL") == "stable",
+        f"the host is on channel {before.get('environment', {}).get('GOWAVE_CHANNEL')!r}, so "
+        "interrupting a stable-to-dev switch would interrupt a different transition",
+    )
+    captured = channel_client_surface(product, CHANNEL_INTERRUPT_CASE_ID, "capture")
+    require(
+        CHANNEL_INTERRUPT_CASE_ID,
+        captured.get("readback_status") == 200 and captured.get("short_uuid_length"),
+        "the Panel served no default client before the interrupt, so a restored database "
+        f"would have nothing to prove: {captured!r}",
+    )
+    try:
+        interrupted = probe_json(
+            CHANNEL_INTERRUPT_CASE_ID, "the interrupted channel switch",
+            product.host_script(channel_interrupt_script(), timeout=CHANNEL_TIMEOUT_SECONDS),
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            CHANNEL_HOLD_EXEC in (interrupted.get("configured") or ""),
+            "the ExecStartPre hold never reached the unit, so the switch was not interrupted "
+            f"in APPLYING: configured as {(interrupted.get('configured') or '').strip()!r}",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, interrupted.get("hold_started") is True,
+            "the restarted Panel never reached the hold hook, so the operator was not "
+            "interrupted inside a running transaction",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            interrupted.get("observed_journal_state") == "APPLYING"
+            and interrupted.get("observed_channel") == "dev",
+            "the operator was not interrupted after taking the snapshot and rewriting the "
+            f"channel: journal {interrupted.get('observed_journal_state')!r}, environment "
+            f"{interrupted.get('observed_channel')!r}, after "
+            f"{interrupted.get('waited_seconds')!r}s",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            interrupted.get("operator_exit") == -9 or interrupted.get("operator_exit") == 137,
+            f"the operator exited {interrupted.get('operator_exit')!r} instead of dying from "
+            "SIGKILL, so the state left behind is not the one an interruption produces",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, interrupted.get("operator_alive") is False,
+            "the operator process survived the SIGKILL and is still mutating the host",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, interrupted.get("switch_reported_success") is False,
+            "the interrupted switch printed its success line, so it committed before the "
+            "kill and the case measured a completed transition",
+        )
+
+        journal_at_kill = interrupted.get("journal_at_kill") or {}
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, journal_at_kill.get("state") == "APPLYING",
+            f"the killed operator left the journal at {journal_at_kill.get('state')!r} instead "
+            "of the documented in-progress state APPLYING",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, interrupted.get("journal_valid") is True,
+            "the journal the interrupted operator left does not pass the product's own "
+            "--validate-journal, so boot recovery would refuse it",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, interrupted.get("lock_free") is True,
+            "the mutation lock stayed held after the operator died, so every later "
+            "invocation would refuse to run",
+        )
+        lease = interrupted.get("lease") or {}
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            not lease or interrupted.get("lease_holder_alive") is False,
+            f"the lease file names a live holder after the operator died: {lease!r}",
+        )
+
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, interrupted.get("recovery_returncode") == 0,
+            "`gowave-auto.sh recover --boot-files` exited "
+            f"{interrupted.get('recovery_returncode')!r} on the interrupted transaction: "
+            f"{(interrupted.get('recovery_output') or '').strip()[-800:]}",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            "Interrupted transaction rolled back successfully."
+            in (interrupted.get("recovery_output") or ""),
+            "the recovery command did not report a completed rollback: "
+            f"{(interrupted.get('recovery_output') or '').strip()[-800:]}",
+        )
+        recovery_journal = interrupted.get("journal_after_recovery") or {}
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, recovery_journal.get("state") == "ROLLED_BACK",
+            f"the recovery left the journal at {recovery_journal.get('state')!r} instead of "
+            "ROLLED_BACK",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            recovery_journal.get("snapshot_dir") == journal_at_kill.get("snapshot_dir"),
+            "the recovery rolled back a different transaction: it names "
+            f"{recovery_journal.get('snapshot_dir')!r}, the interrupted operator took "
+            f"{journal_at_kill.get('snapshot_dir')!r}",
+        )
+
+        after = channel_state(product, CHANNEL_INTERRUPT_CASE_ID)
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            after.get("environment", {}).get("GOWAVE_CHANNEL") == "stable",
+            "the recovery did not restore the pre-switch channel in /opt/gowave/.env",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID,
+            after.get("database", {}).get("integrity") == "ok",
+            f"the recovered database does not pass integrity_check: "
+            f"{after.get('database', {}).get('integrity')!r}",
+        )
+        snapshot_name = (journal_at_kill.get("snapshot_dir") or "").rsplit("/", 1)[-1]
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, bool(snapshot_name),
+            f"the interrupted journal names no snapshot directory: {journal_at_kill!r}",
+        )
+        snapshot = channel_state(
+            product, CHANNEL_INTERRUPT_CASE_ID, base=f"{CHANNEL_RECOVERY_ROOT}/{snapshot_name}",
+        )
+        require_channel_snapshot(
+            CHANNEL_INTERRUPT_CASE_ID, before, snapshot,
+            f"{CHANNEL_RECOVERY_ROOT}/{snapshot_name}",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, after.get("unit", {}).get("ActiveState") == "active",
+            f"gowave.service is {after.get('unit', {}).get('ActiveState')!r} after the recovery",
+        )
+        health = wait_for_channel_health(product, CHANNEL_INTERRUPT_CASE_ID)
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, health == "200",
+            f"the Panel health route answered {health!r} after the recovery",
+        )
+        surface = channel_client_surface(product, CHANNEL_INTERRUPT_CASE_ID, "verify")
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, surface.get("inventory_identical") is True,
+            f"the recovered database serves {surface.get('users')!r} clients instead of the "
+            f"{surface.get('users_captured')!r} it held before the interrupt",
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, surface.get("user_present") is True,
+            "the client the host served before the interrupt is missing from the recovered "
+            "inventory",
+        )
+        changed = sorted(
+            name for name, identical in (surface.get("representations_identical") or {}).items()
+            if not identical
+        )
+        require(
+            CHANNEL_INTERRUPT_CASE_ID, not changed,
+            f"the recovered database serves different bytes for {', '.join(changed)}: "
+            f"{surface.get('representations')!r}",
+        )
+        # Both engines are read after the recovery: a Panel that answers its health
+        # route but no longer carries a payload would satisfy every file comparison.
+        traffic = require_channel_traffic(product, CHANNEL_INTERRUPT_CASE_ID, host)
+        # The case's own facts are written beside the verdict: the observation that
+        # the kill landed at APPLYING, the journal on both sides of the recovery and
+        # the lease left behind. A PASS that only says "PASS" cannot be audited.
+        product.context.evidence_text(
+            "channel-interrupt.json",
+            json.dumps(
+                {
+                    "interrupted": interrupted,
+                    "journal_at_kill": journal_at_kill,
+                    "journal_after_recovery": recovery_journal,
+                },
+                indent=2, sort_keys=True,
+            ),
+        )
+        return {
+            "interrupted_state": interrupted.get("observed_journal_state"),
+            "waited_seconds": interrupted.get("waited_seconds"),
+            "operator_exit": interrupted.get("operator_exit"),
+            "mutation_lock_free": interrupted.get("lock_free"),
+            "journal_state_at_kill": journal_at_kill.get("state"),
+            "snapshot": snapshot_name,
+            "recovery_returncode": interrupted.get("recovery_returncode"),
+            "journal_state": recovery_journal.get("state"),
+            "channel_after": after.get("environment", {}).get("GOWAVE_CHANNEL"),
+            "unit_state": after.get("unit", {}).get("ActiveState"),
+            "health": health,
+            "clients_served": surface.get("users"),
+            "transfer_count": traffic.get("transfer_count"),
+            "source_ips": ",".join(traffic.get("source_ips") or []),
+        }
+    finally:
+        healing = product.host_script(
+            channel_interrupt_cleanup_script(), timeout=CHANNEL_TIMEOUT_SECONDS,
+        )
+        healed = channel_state(product, CHANNEL_INTERRUPT_CASE_ID)
+        if healing.returncode != 0 or healed.get("unit", {}).get("ActiveState") != "active":
+            product.context.evidence_text(
+                "channel-interrupt-cleanup.log",
+                f"exit {healing.returncode}\n{(healing.stdout or '')[-2000:]}\n"
+                f"{(healing.stderr or '')[-4000:]}\nunit {healed.get('unit')!r}",
+            )
+
+
 def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False) -> List[Case]:
     """The AIO suite: the install case plus every case that reuses its host.
 
@@ -6202,11 +6676,15 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # The channel cases come last because a switch restarts the Panel, and an
         # earlier case must never be measured across one. Their own order is the
         # contract: the same-channel no-op is proven before anything mutates the
-        # channel, the failed switch starts from stable, and only the last case
-        # leaves the host on dev, which has no safe automatic way back.
+        # channel, the failed and the interrupted switch both start from stable and
+        # end back on it, and only the last case leaves the host on dev, which has
+        # no safe automatic way back.
         Case(CHANNEL_NOOP_CASE_ID, "aio", lambda context: case_channel_noop(product),
              timeout_seconds=600),
         Case(CHANNEL_ROLLBACK_CASE_ID, "aio", lambda context: case_channel_rollback(product),
+             timeout_seconds=CHANNEL_TIMEOUT_SECONDS + TUNNEL_READY_TIMEOUT_SECONDS
+             + TRAFFIC_TIMEOUT_SECONDS),
+        Case(CHANNEL_INTERRUPT_CASE_ID, "aio", lambda context: case_operator_interrupt(product),
              timeout_seconds=CHANNEL_TIMEOUT_SECONDS + TUNNEL_READY_TIMEOUT_SECONDS
              + TRAFFIC_TIMEOUT_SECONDS),
         Case(CHANNEL_DEV_CASE_ID, "aio", lambda context: case_channel_dev(product),

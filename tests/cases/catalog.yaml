@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 86
-  total: 211
+  podman_first: 87
+  total: 212
 expected_positive_case_counts:
   aio:
     vision_disabled: 8
@@ -3463,6 +3463,26 @@ cases:
     than staying at APPLYING, and the restored installation answers its authenticated API and carries
     a payload through every served outbound of both pinned clients.'
   assertion_sha256: 07bc8c791adabbee3270ee2a22277055e016be1fbebedd760a8b60a14766f2bb
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver: null
+  driver_status: planned
+  promotion_target: Signal-Safe and Verifiable Transaction Compensation
+- id: AIO-INTERRUPT
+  requirement: Failure injection and recovery
+  live_scenario: null
+  assertion: 'An operator killed with SIGKILL while its channel switch is in the product''s APPLYING state
+    leaves a documented recoverable state: the journal still validates and names that in-progress transaction
+    with the snapshot it took, the mutation lock is free, the switch never printed its success line, and
+    the supported `recover --boot-files` entrypoint rolls that very snapshot back to the pre-switch channel,
+    the journal ends ROLLED_BACK, and the Panel comes back active serving the same clients and a payload
+    through both pinned engines.'
+  assertion_sha256: 9d0b6b2404c9b4ebdd02d260a993c32df80b4b9b40ceebb820213fcb283264be
   runs_in:
   - podman
   state: incubating

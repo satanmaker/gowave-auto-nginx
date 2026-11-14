@@ -560,7 +560,7 @@ class TestNegativeCases(unittest.TestCase):
 
 
 class TestChannelCases(unittest.TestCase):
-    """AIO-CHANNEL-NOOP / -DEV / -ROLLBACK: what each case accepts as proof.
+    """AIO-CHANNEL-NOOP / -DEV / -ROLLBACK / -INTERRUPT: what each case accepts as proof.
 
     The channel cases read the product's snapshot, journal and unit rather than
     the command's exit status alone, so what each one refuses matters as much as
@@ -972,6 +972,171 @@ class TestChannelCases(unittest.TestCase):
         with self.assertRaises(AssertionError) as caught:
             aio.case_channel_rollback(product)
         self.assertIn("did not restore the NGINX configuration", str(caught.exception))
+
+    # ------------------------------------------------ AIO-INTERRUPT (operator kill)
+    def interrupted(self, **overrides):
+        payload = {
+            "operator_pid": 4242,
+            "operator_alive": False,
+            "operator_exit": -9,
+            "hold_started": True,
+            "waited_seconds": 3,
+            "observed_journal_state": "APPLYING",
+            "observed_channel": "dev",
+            "configured": f"ExecStartPre=+{aio.CHANNEL_HOLD_EXEC}",
+            "journal_at_kill": {
+                "state": "APPLYING",
+                "snapshot_dir": f"{aio.CHANNEL_RECOVERY_ROOT}/update-4",
+                "target_version": "dev",
+            },
+            "journal_valid": True,
+            "lock_free": True,
+            "lease": {},
+            "lease_holder_alive": None,
+            "unit_at_kill": {"ActiveState": "activating", "SubState": "start-pre"},
+            "switch_stdout": "Capturing pre-update persistent recovery snapshot...\n",
+            "switch_stderr": "",
+            "switch_reported_success": False,
+            "recovery_returncode": 0,
+            "recovery_output": "Interrupted transaction rolled back successfully.\n",
+            "journal_after_recovery": {
+                "state": "ROLLED_BACK",
+                "snapshot_dir": f"{aio.CHANNEL_RECOVERY_ROOT}/update-4",
+                "target_version": "dev",
+            },
+            "health": 200,
+        }
+        payload.update(overrides)
+        return payload
+
+    def interrupt_results(self, payload, before=None, after=None):
+        """The host calls AIO-INTERRUPT makes, in the order it makes them."""
+        before = before or self.state()
+        after = after or self.state()
+        return [
+            (json.dumps(before), 0),                       # pre-interrupt state
+            (json.dumps({"channel": self.surface()}), 0),  # client surface, capture
+            (json.dumps(payload), 0),                      # interrupt + recovery payload
+            (json.dumps(after), 0),                        # post-recovery state
+            (json.dumps(before), 0),                       # the snapshot the journal names
+            ("200", 0),                                    # Panel health
+            (json.dumps({"channel": self.surface()}), 0),  # client surface, verify
+            ("active\n", 0),                               # cleanup: is-active
+            (json.dumps(after), 0),                        # cleanup: healed state
+        ]
+
+    def interrupt_failure_results(self, payload):
+        """The host calls made when the case refuses before it reaches the recovery."""
+        return [
+            (json.dumps(self.state()), 0),
+            (json.dumps({"channel": self.surface()}), 0),
+            (json.dumps(payload), 0),
+            ("active\n", 0),                  # cleanup: is-active
+            (json.dumps(self.state()), 0),    # cleanup: healed state
+        ]
+
+    def test_the_interrupt_payload_holds_the_restart_and_kills_the_group(self):
+        for script in (aio.channel_interrupt_script(), aio.channel_interrupt_cleanup_script()):
+            result = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        body = aio.channel_interrupt_script()
+        # The repo path is baked in: the payload arrives on stdin alone, so a
+        # positional argument would be empty and `set -u` would abort mid-switch.
+        self.assertIn(f"repo={aio.topology.REPO_IN_CONTAINER}", body)
+        self.assertIn('bash "$repo/gowave-auto.sh" channel dev', body)
+        self.assertIn(f"ExecStartPre=+{aio.CHANNEL_HOLD_EXEC}", body)
+        # The hold is what makes the interruption land in APPLYING: without it the
+        # restart commits in milliseconds and the kill measures a finished switch.
+        self.assertIn("exec sleep", body)
+        self.assertLess(body.index("99-e2e-hold.conf"), body.index("setsid"))
+        # The whole group dies, not only the shell that leads it, and the product's
+        # own recovery entrypoint is what the case then invokes.
+        self.assertIn('kill -9 -- "-$operator"', body)
+        self.assertIn("flock -n /run/lock/gowave-managed-mutation.lock", body)
+        self.assertIn('bash "$repo/gowave-auto.sh" recover --boot-files', body)
+        self.assertLess(body.index('kill -9 -- "-$operator"'), body.index("recover --boot-files"))
+        cleanup = aio.channel_interrupt_cleanup_script()
+        self.assertIn("gowave-auto.sh recover --boot-files", cleanup)
+        self.assertIn(aio.CHANNEL_HOLD_UNIT, cleanup)
+
+    def test_the_interrupt_case_proves_an_applying_journal_and_the_rollback_of_it(self):
+        product, podman = self.switched_product(self.interrupt_results(self.interrupted()))
+        with mock.patch.object(aio, "wait_until", lambda predicate, *a, **k: predicate()):
+            evidence = aio.case_operator_interrupt(product)
+        self.assertEqual(evidence["interrupted_state"], "APPLYING")
+        self.assertEqual(evidence["journal_state_at_kill"], "APPLYING")
+        self.assertEqual(evidence["journal_state"], "ROLLED_BACK")
+        self.assertEqual(evidence["channel_after"], "stable")
+        self.assertEqual(evidence["unit_state"], "active")
+        self.assertEqual(evidence["mutation_lock_free"], True)
+        self.assertEqual(evidence["snapshot"], "update-4")
+        self.assertEqual(evidence["clients_served"], 1)
+        self.assertEqual(evidence["transfer_count"], 8)
+        # The kill runs the product's command in the host's own process group, and
+        # the healing is the product's recovery entrypoint rather than a harness
+        # restore: the same two facts, read from the scripts that were sent.
+        self.assertIn("kill -9 --", podman.scripts[2])
+        self.assertIn("recover --boot-files", podman.scripts[2])
+        self.assertIn("gowave-auto.sh recover --boot-files", podman.scripts[7])
+        # The artifact has to carry the observation, not only the verdict: a later
+        # audit reads APPLYING and ROLLED_BACK out of the case's own evidence file.
+        written = Path(self.context.artifact_dir) / "evidence" / "channel-interrupt.json"
+        self.assertIn("evidence/channel-interrupt.json", self.context.evidence_files)
+        recorded = json.loads(written.read_text(encoding="utf-8"))
+        self.assertEqual(recorded["journal_at_kill"]["state"], "APPLYING")
+        self.assertEqual(recorded["journal_after_recovery"]["state"], "ROLLED_BACK")
+        self.assertEqual(recorded["interrupted"]["observed_journal_state"], "APPLYING")
+
+    def test_a_switch_that_committed_before_the_kill_fails_the_interrupt_case(self):
+        payload = self.interrupted(observed_journal_state="COMMITTED")
+        product, _ = self.switched_product(self.interrupt_failure_results(payload))
+        with mock.patch.object(aio, "wait_until", lambda predicate, *a, **k: predicate()):
+            with self.assertRaises(AssertionError) as caught:
+                aio.case_operator_interrupt(product)
+        self.assertIn("was not interrupted after taking the snapshot", str(caught.exception))
+
+    def test_a_lock_the_killed_operator_kept_fails_the_interrupt_case(self):
+        product, _ = self.switched_product(
+            self.interrupt_failure_results(self.interrupted(lock_free=False))
+        )
+        with mock.patch.object(aio, "wait_until", lambda predicate, *a, **k: predicate()):
+            with self.assertRaises(AssertionError) as caught:
+                aio.case_operator_interrupt(product)
+        self.assertIn("mutation lock stayed held", str(caught.exception))
+
+    def test_a_recovery_of_another_snapshot_fails_the_interrupt_case(self):
+        payload = self.interrupted()
+        payload["journal_after_recovery"] = {
+            "state": "ROLLED_BACK",
+            "snapshot_dir": f"{aio.CHANNEL_RECOVERY_ROOT}/update-9",
+        }
+        product, _ = self.switched_product(self.interrupt_failure_results(payload))
+        with mock.patch.object(aio, "wait_until", lambda predicate, *a, **k: predicate()):
+            with self.assertRaises(AssertionError) as caught:
+                aio.case_operator_interrupt(product)
+        self.assertIn("rolled back a different transaction", str(caught.exception))
+
+    def test_the_interrupt_case_sits_between_the_failed_and_the_dev_switch(self):
+        suite = aio.cases(ScriptedPodman(self.context, []))
+        cases = {case.id: case for case in suite}
+        self.assertIn(aio.CHANNEL_INTERRUPT_CASE_ID, cases)
+        self.assertEqual(cases[aio.CHANNEL_INTERRUPT_CASE_ID].topology, "aio")
+        self.assertEqual(
+            cases[aio.CHANNEL_INTERRUPT_CASE_ID].timeout_seconds,
+            aio.CHANNEL_TIMEOUT_SECONDS + aio.TUNNEL_READY_TIMEOUT_SECONDS
+            + aio.TRAFFIC_TIMEOUT_SECONDS,
+        )
+        ids = [case.id for case in suite]
+        self.assertLess(ids.index(aio.CHANNEL_ROLLBACK_CASE_ID),
+                        ids.index(aio.CHANNEL_INTERRUPT_CASE_ID))
+        self.assertLess(ids.index(aio.CHANNEL_INTERRUPT_CASE_ID), ids.index(aio.CHANNEL_DEV_CASE_ID))
+        record = {
+            case["id"]: case for case in catalog.load_catalog()["cases"]
+        }[aio.CHANNEL_INTERRUPT_CASE_ID]
+        self.assertEqual(record["requirement"], "Failure injection and recovery")
+        self.assertEqual(record["state"], "incubating")
+        self.assertEqual(record["runs_in"], ["podman"])
+        self.assertEqual(record["topology"], ["aio"])
 
 
 class TestPanelApiCases(unittest.TestCase):

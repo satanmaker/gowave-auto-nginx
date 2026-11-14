@@ -240,6 +240,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
     },
     {
+        "id": "AIO-INTERRUPT",
+        "requirement": "Failure injection and recovery",
+        "assertion": "An operator killed with SIGKILL while its channel switch is in the product's APPLYING state leaves a documented recoverable state: the journal still validates and names that in-progress transaction with the snapshot it took, the mutation lock is free, the switch never printed its success line, and the supported `recover --boot-files` entrypoint rolls that very snapshot back to the pre-switch channel, the journal ends ROLLED_BACK, and the Panel comes back active serving the same clients and a payload through both pinned engines.",
+        "topology": ["aio"],
+        "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
+    },
+    {
         "id": "AIO-CHANNEL-DEV",
         "requirement": "All-in-One Master VPS Installation Verification",
         "assertion": "The documented stable-to-dev transition is a snapshot, an environment rewrite and a restart: the journal ends COMMITTED with the target channel recorded, exactly one snapshot holds the pre-switch tree, the Panel answers its health route and serves every representation, both pinned clients transfer a payload through every served outbound, and the guarded dev-to-stable direction is still refused without --force and changes nothing.",
