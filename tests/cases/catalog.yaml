@@ -9,6 +9,42 @@ counts:
   live_only: 2
   podman_first: 87
   total: 212
+run_starts:
+- step: acme
+  started_by: tools/podman_e2e/topology.py
+  scope: run
+  fixture_image: false
+  acme_module: true
+- step: client
+  started_by: tools/podman_e2e/topology.py
+  scope: run
+  fixture_image: true
+  acme_module: false
+- step: dns
+  started_by: tools/podman_e2e/topology.py
+  scope: run
+  fixture_image: true
+  acme_module: false
+- step: echo
+  started_by: tools/podman_e2e/topology.py
+  scope: run
+  fixture_image: true
+  acme_module: true
+- step: target
+  started_by: tools/podman_e2e/topology.py
+  scope: run
+  fixture_image: false
+  acme_module: false
+- step: untrusted_client
+  started_by: tools/podman_e2e/topology.py
+  scope: run
+  fixture_image: false
+  acme_module: false
+- step: worker
+  started_by: tools/podman_e2e/topology.py
+  scope: run
+  fixture_image: false
+  acme_module: false
 expected_positive_case_counts:
   aio:
     vision_disabled: 8

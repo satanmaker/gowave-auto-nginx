@@ -7,7 +7,9 @@ driver can be renamed and leave the entry pointing at a callable nobody wraps,
 and a recorded evidence key can disappear from the driver that used to emit it.
 These tests read the drivers out of the source — the callable each ``Case``
 wraps and the evidence keys its own body records — and hold the catalog to that,
-in both directions.
+in both directions. The run's start sequence is read the same way, from the
+topology's own ``create()``, because a per-case fixture list cannot be derived
+from a driver at all.
 """
 import copy
 import sys
@@ -190,6 +192,131 @@ class TestImplementationRegistry(unittest.TestCase):
                 catalog.driver_registry()
         self.assertIn("case_no_such_builder", str(caught.exception))
         self.assertIn("is gone", str(caught.exception))
+
+
+class TestRunStarts(unittest.TestCase):
+    """A run starts a fixed sequence of containers, and the catalog states it.
+
+    A case cannot carry a fixture list: it consumes a fixture through an endpoint
+    or a container it never names, and no syntactic marker separates the fixtures
+    from the rest of the contour. What the source does prove is the sequence the
+    topology's own ``create()`` performs, so that is what the catalog records.
+    """
+
+    def setUp(self):
+        self.catalog = catalog.load_catalog()
+        self.derived = catalog.run_starts()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def problems(self, document):
+        return catalog.validate_catalog(document)
+
+    def doctored(self):
+        return copy.deepcopy(self.catalog)
+
+    def test_the_recorded_sequence_is_the_one_the_topology_performs(self):
+        self.assertEqual(
+            self.catalog.get("run_starts"), self.derived,
+            "the catalog's start inventory must be the sequence create() performs",
+        )
+        steps = [entry["step"] for entry in self.derived]
+        self.assertEqual(steps, sorted(steps), "the inventory is recorded in a stable order")
+        for entry in self.derived:
+            self.assertEqual(entry["started_by"], "tools/podman_e2e/topology.py")
+            self.assertEqual(entry["scope"], "run", "a start step belongs to the run, not to a case")
+
+    def test_a_step_the_topology_performs_and_the_catalog_omits_is_refused(self):
+        document = self.doctored()
+        document["run_starts"] = [entry for entry in document["run_starts"] if entry["step"] != "echo"]
+        self.assertTrue(
+            any("start step 'echo' is performed by the topology and not recorded" in problem
+                for problem in self.problems(document)),
+            self.problems(document),
+        )
+
+    def test_a_step_the_catalog_invents_is_refused(self):
+        document = self.doctored()
+        document["run_starts"] = list(document["run_starts"]) + [{
+            "step": "pebble", "started_by": "tools/podman_e2e/topology.py", "scope": "run",
+            "fixture_image": False, "acme_module": True,
+        }]
+        self.assertTrue(
+            any("start step 'pebble' is recorded, but no topology `create()` performs it" in problem
+                for problem in self.problems(document)),
+            self.problems(document),
+        )
+
+    def test_a_step_recorded_twice_is_refused(self):
+        document = self.doctored()
+        document["run_starts"] = list(document["run_starts"]) + [self.derived[0]]
+        self.assertTrue(
+            any("is recorded twice" in problem for problem in self.problems(document)),
+            self.problems(document),
+        )
+
+    def test_a_changed_marker_is_refused(self):
+        document = self.doctored()
+        changed = next(entry for entry in document["run_starts"] if entry["step"] == "target")
+        changed["fixture_image"] = True
+        problems = self.problems(document)
+        self.assertTrue(
+            any("start step 'target': fixture_image is True, the topology says False" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_a_per_case_fixtures_field_is_refused(self):
+        document = self.doctored()
+        document["cases"][0]["fixtures"] = ["dns"]
+        problems = self.problems(document)
+        self.assertTrue(
+            any("the run-level sequence is `run_starts`" in problem for problem in problems),
+            problems,
+        )
+        self.assertTrue(
+            any(document["cases"][0]["id"] in problem for problem in problems),
+            "the refusal must name the case that carries the field",
+        )
+
+    def test_the_inventory_follows_create_when_the_topology_changes(self):
+        source = (REPO_ROOT / "tools" / "podman_e2e" / "topology.py").read_text(encoding="utf-8")
+        block = (
+            "        self._start_dns()\n"
+            "        self._start_acme()\n"
+            "        self._start_target()\n"
+            "        self._start_echo()\n"
+            "        self._start_client()\n"
+        )
+        self.assertIn(block, source, "the All-in-One create() sequence moved; re-anchor this test")
+        anchor = "    def _start_dns(self) -> None:\n"
+        self.assertIn(anchor, source)
+        rewritten = source.replace(block, block + "        self._start_probe()\n", 1).replace(
+            anchor, "    def _start_probe(self) -> None:\n        self.probe = None\n\n" + anchor, 1,
+        )
+        doctored_topology = self.tmp / "topology.py"
+        doctored_topology.write_text(rewritten, encoding="utf-8")
+
+        real = catalog.run_starts
+        extended = {entry["step"]: entry for entry in real(doctored_topology)}
+        self.assertIn("probe", extended, "a step create() performs must appear in the inventory")
+        self.assertFalse(extended["probe"]["fixture_image"])
+        self.assertFalse(extended["probe"]["acme_module"])
+
+        def derive_from_the_copy():
+            entries = real(doctored_topology)
+            for entry in entries:
+                entry["started_by"] = "tools/podman_e2e/topology.py"
+            return entries
+
+        with mock.patch.object(catalog, "run_starts", derive_from_the_copy):
+            problems = self.problems(self.catalog)
+        self.assertTrue(
+            any("start step 'probe' is performed by the topology and not recorded" in problem
+                for problem in problems),
+            problems,
+        )
 
 
 class TestEntrypointRefusesAnUnknownSuite(unittest.TestCase):

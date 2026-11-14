@@ -184,6 +184,7 @@ SUITES = {
         "test_podman_budget.TestEntrypointBudget",
         "test_podman_catalog.TestImplementationRegistry",
         "test_podman_catalog.TestEntrypointRefusesAnUnknownSuite",
+        "test_podman_catalog.TestRunStarts",
         "test_podman_behaviors.TestBehaviorInventory",
         "test_podman_contracts.TestSharedContracts",
         "test_ci_workflows.TestIndependentAcceptanceWorkflows",
