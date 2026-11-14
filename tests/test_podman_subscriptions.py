@@ -206,6 +206,10 @@ SINGBOX_BODY = json.dumps({"outbounds": [
     {"type": "trojan", "tag": "trojan"},
     {"type": "direct", "tag": "direct"},
 ]})
+# The value the product's own vhost adds on /api/sub/ (modules/nginx.sh); a
+# subscription a cache may keep would outlive the client it describes.
+NO_STORE = "no-store, no-cache, must-revalidate, max-age=0"
+
 BODIES = {
     "base64": (BASE64_BODY, "text/plain; charset=utf-8"),
     "xray-json": (JSON_BODY, "application/json"),
@@ -231,14 +235,19 @@ def served_facts(overrides=None):
         "short_uuid_length": len(SHORT_UUID),
         "representations": {
             "base64": {"status": 200, "content_type": "text/plain", "bytes": len(BASE64_BODY),
+                       "cache_control": NO_STORE,
                        "foreign_status": 200, "foreign_identical": True},
             "xray-json": {"status": 200, "content_type": "application/json", "bytes": len(JSON_BODY),
+                          "cache_control": NO_STORE,
                           "foreign_status": 200, "foreign_identical": True},
             "mihomo": {"status": 200, "content_type": "text/yaml", "bytes": len(MIHOMO_YAML),
+                       "cache_control": NO_STORE,
                        "foreign_status": 200, "foreign_identical": True},
             "clash": {"status": 200, "content_type": "text/yaml", "bytes": len(MIHOMO_YAML),
+                      "cache_control": NO_STORE,
                       "foreign_status": 200, "foreign_identical": True},
             "singbox": {"status": 200, "content_type": "application/json", "bytes": len(SINGBOX_BODY),
+                        "cache_control": NO_STORE,
                         "foreign_status": 200, "foreign_identical": True},
         },
     }, overrides)
@@ -316,6 +325,7 @@ class StubPanel:
         self.requests = []
         self.enforce_user_agent = False
         self.refuse_foreign_user_agent = False
+        self.no_cache_control = False
         directory = Path(tempfile.mkdtemp(prefix="gowave-subscription-panel-"))
         self.credentials = directory / "credentials"
         self.credentials.write_text(
@@ -335,6 +345,8 @@ class StubPanel:
                 raw = body.encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
+                if not panel.no_cache_control:
+                    self.send_header("Cache-Control", NO_STORE)
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
@@ -440,6 +452,21 @@ class TestPanelSubscriptionProbe(unittest.TestCase):
         self.assertIn(panel_surface.MIHOMO_USER_AGENT, agents[f"/api/sub/{SHORT_UUID}/mihomo"])
         self.assertIn(panel_surface.CLASH_USER_AGENT, agents[f"/api/sub/{SHORT_UUID}/clash"])
         self.assertIn(panel_surface.SINGBOX_USER_AGENT, agents[f"/api/sub/{SHORT_UUID}/singbox"])
+
+    def test_the_probe_records_the_cache_control_header_it_received(self):
+        facts, _ = probe_output(self.panel, "subscriptions", str(self.payload_dir))
+        facts = facts["subscriptions"]
+        for name in ("base64", "xray-json", "mihomo", "clash", "singbox"):
+            with self.subTest(representation=name):
+                self.assertIn("no-store", facts["representations"][name]["cache_control"])
+
+    def test_a_panel_that_lets_the_subscription_be_cached_is_visible_to_the_probe(self):
+        self.panel.no_cache_control = True
+        facts, _ = probe_output(self.panel, "subscriptions", str(self.payload_dir))
+        facts = facts["subscriptions"]
+        for name in ("base64", "xray-json", "mihomo", "clash", "singbox"):
+            with self.subTest(representation=name):
+                self.assertEqual(facts["representations"][name]["cache_control"], "")
 
     def test_an_absent_user_agent_is_a_request_without_the_header(self):
         response = panel_surface.fetch(self.panel.url, f"/api/sub/{SHORT_UUID}", None)
@@ -1072,6 +1099,26 @@ class TestSubscriptionCases(unittest.TestCase):
 
     def test_subscriptions_case_rejects_a_representation_that_is_not_served(self):
         self.reject("instead of 200", served=served_facts({"representations.clash.status": 500}))
+
+    def test_subscriptions_case_rejects_a_cachable_representation(self):
+        self.reject("lets a cache serve a subscription",
+                    served=served_facts(
+                        {"representations.mihomo.cache_control": "public, max-age=600"}))
+
+    def test_subscriptions_case_rejects_a_representation_with_no_cache_control(self):
+        self.reject("lets a cache serve a subscription",
+                    served=served_facts({"representations.base64.cache_control": ""}))
+
+    def test_subscriptions_case_names_the_cache_control_it_received(self):
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"subscriptions": served_facts()})],
+            engine_results=[engine_result(engine_representations())],
+        )
+        evidence = aio.case_subscriptions(product)
+        for name in aio.REPRESENTATIONS:
+            with self.subTest(representation=name):
+                self.assertEqual(evidence[f"{name}_cache_control"], NO_STORE)
 
     def test_subscriptions_case_rejects_an_empty_representation(self):
         self.reject("is empty", served=served_facts({"representations.singbox.bytes": 0}))

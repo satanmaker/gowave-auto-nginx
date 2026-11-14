@@ -149,6 +149,7 @@ SUITES = {
         "test_podman_docs.TestPanelApiContract",
         "test_podman_docs.TestSubscriptionFamilyInventory",
         "test_podman_docs.TestJsonShapeContract",
+        "test_podman_docs.TestLiveContractReconciliation",
         "test_podman_docs.TestPodmanE2EDocumentation",
         "test_fixture_dns.TestDnsFixture",
         "test_fixture_echo.TestEchoFixture",
