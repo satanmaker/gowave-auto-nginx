@@ -80,6 +80,7 @@ SUITES = {
         "test_podman_traffic.TestTrafficTopology",
         "test_podman_matrix.TestProtocolMatrix",
         "test_podman_matrix.TestMatrixCatalog",
+        "test_podman_matrix.TestHostProjection",
         "test_podman_multi_node.TestMultiNodePlan",
         "test_podman_multi_node.TestSshHostKeyCase",
         "test_podman_multi_node.TestMultiNodeRoles",

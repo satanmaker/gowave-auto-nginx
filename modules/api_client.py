@@ -68,6 +68,71 @@ def reality_fingerprint():
     return value
 
 
+def host_projection(panel_domain, reality_domain, node_name="local-node", vision_domain=None):
+    """The Host record one provisioned inbound is posted with, keyed by profile tag.
+
+    ``provision_hosts`` posts exactly this mapping to ``POST /api/hosts``. It is
+    a module function rather than a local so ``tests/cases/matrix.yaml`` can be
+    compared with the record the install really writes instead of with a second
+    hand-maintained copy: the matrix names the address role, SNI role, path,
+    ALPN and ``securityLayer`` of every tuple it declares.
+    """
+    v_domain = vision_domain or (f"vision.{panel_domain}" if panel_domain else panel_domain)
+    return {
+        "vless-reality": {
+            "remark": f"VLESS-REALITY-Vision@{node_name}",
+            "address": panel_domain,
+            "port": 443,
+            "sni": reality_domain,
+            "path": None,
+            "securityLayer": "DEFAULT",
+            "alpn": "h2,http/1.1",
+            "fingerprint": reality_fingerprint(),
+            "mihomoX25519": mihomo_x25519_enabled(),
+        },
+        "vless-vision": {
+            "remark": f"VLESS-Vision-TLS@{node_name}",
+            "address": v_domain,
+            "port": 443,
+            "sni": v_domain,
+            "path": None,
+            "securityLayer": "TLS",
+            "alpn": "http/1.1",
+            "fingerprint": "firefox",
+        },
+        "vless-xhttp": {
+            "remark": f"VLESS-XHTTP-TLS@{node_name}",
+            "address": panel_domain,
+            "port": 443,
+            "sni": panel_domain,
+            "path": "/xhttp-down/",
+            "securityLayer": "TLS",
+            "alpn": "h2,http/1.1",
+            "fingerprint": "firefox",
+        },
+        "vless-ws": {
+            "remark": f"VLESS-WS-TLS@{node_name}",
+            "address": panel_domain,
+            "port": 443,
+            "sni": panel_domain,
+            "path": "/ws",
+            "securityLayer": "TLS",
+            "alpn": "http/1.1",
+            "fingerprint": "firefox",
+        },
+        "trojan-grpc": {
+            "remark": f"Trojan-gRPC-TLS@{node_name}",
+            "address": panel_domain,
+            "port": 443,
+            "sni": panel_domain,
+            "path": "trojan-grpc",
+            "securityLayer": "TLS",
+            "alpn": "h2",
+            "fingerprint": "firefox",
+        },
+    }
+
+
 class GoWaveAPIError(Exception):
     def __init__(self, message, status_code=None, response_body=None):
         super().__init__(message)
@@ -586,61 +651,7 @@ class GoWaveClient:
         return squad_uuid
 
     def provision_hosts(self, profile_uuid, inbounds_list, node_uuid, squad_uuid, panel_domain, reality_domain, node_name="local-node", vision_domain=None):
-        v_domain = vision_domain or (f"vision.{panel_domain}" if panel_domain else panel_domain)
-        # Protocol to config mapping
-        proto_map = {
-            "vless-reality": {
-                "remark": f"VLESS-REALITY-Vision@{node_name}",
-                "address": panel_domain,
-                "port": 443,
-                "sni": reality_domain,
-                "path": None,
-                "securityLayer": "DEFAULT",
-                "alpn": "h2,http/1.1",
-                "fingerprint": reality_fingerprint(),
-                "mihomoX25519": mihomo_x25519_enabled(),
-            },
-            "vless-vision": {
-                "remark": f"VLESS-Vision-TLS@{node_name}",
-                "address": v_domain,
-                "port": 443,
-                "sni": v_domain,
-                "path": None,
-                "securityLayer": "TLS",
-                "alpn": "http/1.1",
-                "fingerprint": "firefox",
-            },
-            "vless-xhttp": {
-                "remark": f"VLESS-XHTTP-TLS@{node_name}",
-                "address": panel_domain,
-                "port": 443,
-                "sni": panel_domain,
-                "path": "/xhttp-down/",
-                "securityLayer": "TLS",
-                "alpn": "h2,http/1.1",
-                "fingerprint": "firefox",
-            },
-            "vless-ws": {
-                "remark": f"VLESS-WS-TLS@{node_name}",
-                "address": panel_domain,
-                "port": 443,
-                "sni": panel_domain,
-                "path": "/ws",
-                "securityLayer": "TLS",
-                "alpn": "http/1.1",
-                "fingerprint": "firefox",
-            },
-            "trojan-grpc": {
-                "remark": f"Trojan-gRPC-TLS@{node_name}",
-                "address": panel_domain,
-                "port": 443,
-                "sni": panel_domain,
-                "path": "trojan-grpc",
-                "securityLayer": "TLS",
-                "alpn": "h2",
-                "fingerprint": "firefox",
-            },
-        }
+        proto_map = host_projection(panel_domain, reality_domain, node_name, vision_domain)
 
         # Check existing hosts
         hosts_res = self.request("GET", "/api/hosts")
