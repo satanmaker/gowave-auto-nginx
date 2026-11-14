@@ -51,6 +51,51 @@ class TestPodmanRunnerContract(unittest.TestCase):
         self.assertEqual(suite.attrib["tests"], "1")
         self.assertEqual(suite.attrib["failures"], "0")
 
+    def test_each_case_names_the_evidence_files_it_wrote(self):
+        # The inline evidence dict cannot be grepped from a shell, so a case also
+        # carries the paths of the files it produced — and only its own.
+        context = self.context()
+        runner = Runner(context)
+
+        def with_logs(ctx):
+            ctx.evidence_text("aio-install.stdout.log", "install output")
+            ctx.evidence_text("aio-install.stderr.log", "install warning")
+            return {"note": "ok"}
+
+        runner.add(Case("AIO-ONE", "aio", with_logs))
+        runner.add(Case("AIO-TWO", "aio", lambda ctx: {}))
+        self.assertEqual(runner.execute(), 0)
+        report = json.loads((context.artifact_dir / "result.json").read_text())
+        self.assertEqual(
+            report["cases"][0]["evidence_files"],
+            ["evidence/aio-install.stdout.log", "evidence/aio-install.stderr.log"],
+        )
+        self.assertEqual(report["cases"][1]["evidence_files"], [])
+        for named in report["cases"][0]["evidence_files"]:
+            self.assertTrue((context.artifact_dir / named).is_file(), named)
+        suite = ET.parse(context.artifact_dir / "junit.xml").getroot()
+        cases = suite.findall("testcase")
+        self.assertEqual(
+            cases[0].findtext("system-out"),
+            "evidence/aio-install.stdout.log\nevidence/aio-install.stderr.log",
+        )
+        self.assertIsNone(cases[1].find("system-out"))
+
+    def test_rewriting_one_evidence_file_references_it_once(self):
+        context = self.context()
+        runner = Runner(context)
+
+        def rewritten(ctx):
+            ctx.evidence_text("same.log", "first")
+            ctx.evidence_text("same.log", "second")
+            return {}
+
+        runner.add(Case("AIO-ONE", "aio", rewritten))
+        self.assertEqual(runner.execute(), 0)
+        report = json.loads((context.artifact_dir / "result.json").read_text())
+        self.assertEqual(report["cases"][0]["evidence_files"], ["evidence/same.log"])
+        self.assertEqual((context.artifact_dir / "evidence" / "same.log").read_text(), "second")
+
     def test_the_result_names_the_commit_it_measured(self):
         # A run is evidence only for the revision it started on, so the artifact
         # carries that revision instead of leaving it to a timestamp argument.
