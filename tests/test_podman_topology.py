@@ -178,8 +178,45 @@ class TestPodmanTopology(unittest.TestCase):
             "nameserver 192.168.1.1\nnameserver 9.9.9.9\n",
             encoding="utf-8",
         )
-        self.assertEqual(topology.egress_resolvers(resolv), ["192.168.1.1", "9.9.9.9"])
-        self.assertEqual(topology.egress_resolvers(directory / "absent"), [])
+        self.assertEqual(topology.egress_resolvers(resolv, upstreams=()), ["192.168.1.1", "9.9.9.9"])
+        self.assertEqual(topology.egress_resolvers(directory / "absent", upstreams=()), [])
+
+    def test_a_stub_only_resolv_conf_follows_the_upstream_list(self):
+        # A host running systemd-resolved answers /etc/resolv.conf with its own
+        # 127.0.0.53 listener, which does not exist inside the container. The
+        # upstream file beside it is the only address the target can use.
+        directory = Path(tempfile.mkdtemp(prefix="gowave-resolv-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, True))
+        stub = directory / "resolv.conf"
+        stub.write_text("nameserver 127.0.0.53\nnameserver ::1\n", encoding="utf-8")
+        upstream = directory / "upstream.conf"
+        upstream.write_text(
+            "nameserver 168.63.129.16\nnameserver 127.0.0.1\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            topology.egress_resolvers(stub, upstreams=(upstream,)),
+            ["168.63.129.16"],
+        )
+
+    def test_a_real_address_in_the_host_file_is_not_replaced(self):
+        directory = Path(tempfile.mkdtemp(prefix="gowave-resolv-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, True))
+        resolv = directory / "resolv.conf"
+        resolv.write_text("nameserver 192.168.1.1\n", encoding="utf-8")
+        upstream = directory / "upstream.conf"
+        upstream.write_text("nameserver 9.9.9.9\n", encoding="utf-8")
+        self.assertEqual(topology.egress_resolvers(resolv, upstreams=(upstream,)), ["192.168.1.1"])
+
+    def test_a_stub_only_host_without_an_upstream_file_yields_nothing(self):
+        directory = Path(tempfile.mkdtemp(prefix="gowave-resolv-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, True))
+        stub = directory / "resolv.conf"
+        stub.write_text("nameserver 127.0.0.53\n", encoding="utf-8")
+        self.assertEqual(
+            topology.egress_resolvers(stub, upstreams=(directory / "absent.conf",)),
+            [],
+        )
 
     def test_a_run_without_an_egress_resolver_never_starts(self):
         instance, podman = self.topology(egress_resolvers=[])
