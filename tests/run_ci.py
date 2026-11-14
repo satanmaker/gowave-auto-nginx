@@ -149,6 +149,7 @@ SUITES = {
         "test_fixture_dns.TestDnsFixture",
         "test_fixture_echo.TestEchoFixture",
         "test_fixture_echo.TestEchoFixtureSourceAllowlist",
+        "test_ci_isolation.TestNormalCiIsolation",
         "test_podman_images.TestPodmanImagePinning",
         "test_podman_images.TestPodmanEnvironmentFingerprint",
         "test_podman_preconditions.TestPodmanPrivilegeScopes",
