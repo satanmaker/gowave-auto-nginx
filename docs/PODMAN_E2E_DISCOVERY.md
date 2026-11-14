@@ -392,7 +392,7 @@ emit `GEOIP,private,DIRECT,no-resolve`. Its Mihomo template carries
 (`internal/database/default_data.go:108`), which is the same intent — keep
 private destinations off the proxy — under the rule name that template uses.
 The live runner accepts either family, a GEOIP rule or a MATCH rule
-(`tools/live_vps/subscriptions.py:371`), and the container case asserts that a
+(`tools/live_vps/subscriptions.py:379`), and the container case asserts that a
 `MATCH` rule exists so a client would route something at all, because a
 representation the engine loads but never routes through is not a working
 subscription. Restating the live sentence's literal line would fail against the
@@ -557,6 +557,51 @@ asserted in both suites from one text. A container run that reported a
 live-only id as PASS, or presented a partial id's container half as the whole
 scenario, would be claiming evidence it never produced; the catalog and
 `python3 -m tools.podman_e2e.catalog check` make that unrepresentable.
+
+## The contracts both contours assert, and the one owner each has
+
+The two acceptance contours differ in environment, not in product. Where a
+contract is shared, it has exactly one owner and both suites read it; a
+container-only variant of a shared contract is a divergence, and this change
+fixed the two such divergences it found rather than keeping them apart.
+
+| Shared contract | Owner | Live assertion | Container assertion |
+| --- | --- | --- | --- |
+| Subscription path vocabulary | `tests/cases/matrix.yaml` `representations`, `internal/server/server.go` | `tools/live_vps/subscriptions.py` | `SUB-SERVED`, `SUB-B64` |
+| User-Agent refusal code | `internal/subscription/serve.go` | `tools/live_vps/subscriptions.py` `SUBSCRIPTION_UA_REFUSAL_STATUS` | `tools/podman_e2e/aio.py` `UA_REFUSAL_STATUS`, `SUB-UA-ABSENT`, `SUB-UA-BLANK` |
+| REALITY fingerprint vocabulary | `modules/api_client.py` `REALITY_FINGERPRINTS` | `tools/live_vps/config.py` | `SUB-SERVED`, `tests/cases/matrix.yaml` `host_record` |
+| `Cache-Control: no-store` on `/api/sub/` | `modules/nginx.sh` | `openspec/specs/live-vps-e2e/spec.md` | `SUB-SERVED` |
+
+**The refusal code was the divergence that mattered.** The live runner accepted
+`400` or `403` for a missing and for an explicitly blank User-Agent, while the
+container case requires exactly `403` (`UA_REFUSAL_STATUS`). The pinned Panel
+answers `403` — `internal/subscription/serve.go` sends it when the header is
+absent or empty, and the Panel's own test asserts that body — so the tolerance
+did not describe a second product, it excused a Panel that had started
+answering `400`. That is a weaker claim about one product made by one contour,
+which is what this task forbids: the live runner now compares against
+`SUBSCRIPTION_UA_REFUSAL_STATUS` in `verify_user_agent_policy` and in `NEG-09`.
+
+**The fingerprint vocabulary had two copies.** `tools/live_vps/config.py`
+restated the ten uTLS presets that `modules/api_client.py` already declares, and
+both files spelled the `firefox` default. The live config now imports the tuple
+and the default, so the live runner cannot accept a preset the Host record it
+provisions cannot mint; the two `reality_fingerprint` defaults in
+`tools/live_vps/subscriptions.py` read the same constant.
+
+**Where the vocabulary is legitimately wider here.** The live runner dials three
+representations (`/v2ray-json`, `/clash`, `/mihomo`); the container matrix
+declares five, and `base64` and `singbox` are driven only by this contour —
+`singbox` with no pinned client, as recorded above. That is a superset, not a
+divergence: both name the same paths for the three they share, which is what
+`tests/test_podman_docs.py` checks rather than comparing counts.
+
+**The engine pinning is the divergence that stays recorded.** Both suites
+validate with the real Xray and Mihomo and neither substitutes a parser, but
+this contour pins `26.11.9`/`1.19.34` while the live runner reads `latest`; the
+shared contract is "accepted by the real engine", and the pinned build is named
+only where a run has to be reproducible. It is recorded in §The live contract,
+capability by capability instead of being resolved by weakening either side.
 
 ## What the suite does not drive, and why
 

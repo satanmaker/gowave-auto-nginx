@@ -152,6 +152,7 @@ SUITES = {
         "test_podman_docs.TestSubscriptionFamilyInventory",
         "test_podman_docs.TestJsonShapeContract",
         "test_podman_docs.TestLiveContractReconciliation",
+        "test_podman_docs.TestLiveContractParity",
         "test_podman_docs.TestOsMatrixReconciliation",
         "test_podman_docs.TestReusableFixtureInventory",
         "test_podman_docs.TestContourBoundary",
