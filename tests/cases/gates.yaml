@@ -39,30 +39,36 @@ ruleset:
 # review. `events` is what the job's `if:` must allow: the two full suites run
 # on every push as well, the two recovery jobs only where a review can stop the
 # merge, because a push already spends the minutes on the full pair.
+#
+# `timeout_minutes` has to outlive the suite it runs: the suite stops at the
+# `runtime_budget_seconds` the matrix declares and reports what it did not run,
+# while a job GitHub kills at its timeout reports nothing. The audit requires
+# at least 15 minutes of headroom over that budget for checkout, the package
+# install, cleanup and the artifact upload.
 checks:
   - name: All-in-One Podman Acceptance
     topology: aio
     group:
     events: [push, pull_request, workflow_dispatch]
-    timeout_minutes: 45
+    timeout_minutes: 60
     artifact_prefix: podman-aio-
   - name: Multi-Node Podman Acceptance
     topology: multi-node
     group:
     events: [push, pull_request, workflow_dispatch]
-    timeout_minutes: 60
+    timeout_minutes: 90
     artifact_prefix: podman-multi-node-
   - name: All-in-One Lifecycle and Recovery Acceptance
     topology: aio
     group: recovery
     events: [pull_request, workflow_dispatch]
-    timeout_minutes: 45
+    timeout_minutes: 60
     artifact_prefix: podman-aio-recovery-
   - name: Multi-Node Lifecycle and Recovery Acceptance
     topology: multi-node
     group: recovery
     events: [pull_request, workflow_dispatch]
-    timeout_minutes: 60
+    timeout_minutes: 90
     artifact_prefix: podman-multi-node-recovery-
 
 # A change to one of these paths reaches backup, restore, channel update or

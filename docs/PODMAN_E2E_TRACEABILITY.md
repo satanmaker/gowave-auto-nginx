@@ -48,7 +48,7 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Failure injection and recovery | Interrupted operator execution | — | `AIO-INTERRUPT` | `test_podman_aio.TestChannelCases` | All-in-One Podman Acceptance, All-in-One Lifecycle and Recovery Acceptance | — |
 | Independent topology CI gates | One topology job is absent or incomplete | — | — | `test_ci_workflows.TestIndependentAcceptanceWorkflows`, `test_podman_groups.TestRequiredGroupRun`, `test_podman_gate.TestPodmanGateContract` | All-in-One Podman Acceptance, Multi-Node Podman Acceptance, All-in-One Lifecycle and Recovery Acceptance, Multi-Node Lifecycle and Recovery Acceptance | — |
 | Pre-push and pull-request acceptance gate | Pre-push run blocks a regressed change | — | — | `test_podman_pre_push.TestPrePushGate` | Lint, Completeness, and Suite Nonroot | — |
-| Pre-push and pull-request acceptance gate | Budget overrun is not a truncated pass | — | — | — | — | 8.15 — GATE-BUDGET is catalogued but no suite declares it |
+| Pre-push and pull-request acceptance gate | Budget overrun is not a truncated pass | — | `GATE-BUDGET` | `test_podman_budget.TestBudgetCase`, `test_podman_budget.TestEntrypointBudget`, `test_podman_budget.TestDeclaredBudget`, `test_podman_gate.TestPodmanGateContract` | All-in-One Podman Acceptance, Multi-Node Podman Acceptance, All-in-One Lifecycle and Recovery Acceptance, Multi-Node Lifecycle and Recovery Acceptance, Lint, Completeness, and Suite Nonroot | — |
 | Coverage completeness and error paths | Unmapped behavior or orphan case fails the audit | — | — | `test_podman_traceability.TestTraceabilityRules` | Lint, Completeness, and Suite Nonroot | 8.16 — tests/cases/behaviors.yaml is missing, so `catalog check` is red on that file |
 | Coverage completeness and error paths | Shared contract diverges from live acceptance | — | — | — | — | 8.17 — the audit against openspec/specs/live-vps-e2e/spec.md has not been performed |
 | Case incubation and promotion path | New case starts in Podman | — | — | `test_podman_aio.TestNginxConfigCase.test_the_case_is_catalogued_as_an_incubating_podman_first_case` | Lint, Completeness, and Suite Nonroot | — |
@@ -100,6 +100,6 @@ answers what one promise rests on, not which scenario owns it.
 | A stale answer expires within the record TTL instead of outliving it | Deterministic DNS and ACME fixtures | — | `DNS-01` | `test_podman_dns.TestDnsCase.test_a_resolver_that_keeps_the_old_answer_past_the_ttl_fails_the_case`, `test_fixture_dns.TestDnsFixture.test_zone_change_applies_without_a_restart` | All-in-One Podman Acceptance |
 | A steered wrong answer is served as published instead of being repaired | Deterministic DNS and ACME fixtures | — | `DNS-01` | `test_podman_dns.TestDnsCase.test_a_wrong_answer_that_is_repaired_fails_the_case`, `test_fixture_dns.TestDnsFixture.test_wrong_answer_mode_returns_the_steered_address` | All-in-One Podman Acceptance |
 
-Open gaps: 3.
+Open gaps: 2.
 
 Matrix rows named: 8 of 8 aio rows, 16 of 16 multi-node rows.

@@ -60,7 +60,10 @@ CONTAINER_FIXTURE_DIR = "/fixtures/acme"
 # ACME cases measure that route, so reuse is off. Pebble compares
 # ``rand.Intn(100) > percent``, so zero still reuses once in a hundred orders —
 # a reused renewal shows up as exit status 0 with no "http-01 challenge for"
-# line in its Certbot log.
+# line in its Certbot log. That floor cannot be configured away, so the renewal
+# probe treats it as the fixture's own coin flip: a renewal that came back
+# without a challenge is asked again (``RENEWAL_ATTEMPTS`` in ``aio.py``), while
+# a renewal that failed is taken as the answer.
 FIXTURE_ENVIRONMENT = {"PEBBLE_WFE_NONCEREJECT": "0", "PEBBLE_AUTHZREUSE": "0"}
 
 # Must stay byte-identical to GOWAVE_ACME_TEST_ENDPOINT in modules/nginx.sh and

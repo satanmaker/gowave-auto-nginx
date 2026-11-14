@@ -16,6 +16,7 @@ import json
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -150,7 +151,63 @@ class TestPodmanGateContract(unittest.TestCase):
         self.job(document, "Multi-Node Podman Acceptance")["timeout-minutes"] = 120
         problems = self.problems(document=document)
         self.assertTrue(
-            any("declares 60 minutes, the job allows 120" in problem for problem in problems),
+            any("declares 90 minutes, the job allows 120" in problem for problem in problems),
+            problems,
+        )
+
+    def test_a_timeout_that_does_not_outlive_the_declared_budget_is_refused(self):
+        # Both copies at 45 minutes agree with each other, so only the budget
+        # rule can catch it: the suite would be allowed 2700 s inside a 2700 s
+        # job, which leaves the setup and the artifact upload outside the ceiling.
+        contract = copy.deepcopy(self.contract)
+        document = copy.deepcopy(self.document)
+        name = "All-in-One Podman Acceptance"
+        for check in contract["checks"]:
+            if check["name"] == name:
+                check["timeout_minutes"] = 45
+        self.job(document, name)["timeout-minutes"] = 45
+        problems = self.problems(contract=contract, document=document)
+        self.assertTrue(
+            any(f"{name!r} allows 45 minutes" in problem and "declared budget is 2700s" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def budget_problems(self, doctor):
+        manifest = copy.deepcopy(gate.matrix.load())
+        doctor(manifest)
+        with unittest.mock.patch.object(gate.matrix, "load", return_value=manifest):
+            return gate._budget_problems(self.contract)
+
+    def test_a_topology_budget_that_breaks_the_pre_push_total_is_refused(self):
+        problems = self.budget_problems(
+            lambda manifest: manifest["topologies"]["aio"].__setitem__("runtime_budget_seconds", 3000)
+        )
+        self.assertTrue(
+            any("declares 7500s of budget, past runtime_budget.pre_push_total_seconds = 7200s"
+                in problem for problem in problems),
+            problems,
+        )
+
+    def test_a_topology_budget_that_breaks_the_pull_request_wave_is_refused(self):
+        problems = self.budget_problems(
+            lambda manifest: manifest["topologies"]["multi-node"].__setitem__(
+                "runtime_budget_seconds", 4600
+            )
+        )
+        self.assertTrue(
+            any("one full wave plus one recovery wave declares 9200s" in problem
+                and "pr_total_seconds = 9000s" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_a_manifest_without_a_declared_budget_is_refused(self):
+        problems = self.budget_problems(
+            lambda manifest: manifest["topologies"]["aio"].pop("runtime_budget_seconds")
+        )
+        self.assertTrue(
+            any("no runtime_budget_seconds for 'aio'" in problem for problem in problems),
             problems,
         )
 

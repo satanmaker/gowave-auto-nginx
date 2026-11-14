@@ -8,7 +8,10 @@ involved.
 
     python3 -m tools.run_podman_e2e --topology aio
 
-The exit status is 0 only when every declared case passed.
+The exit status is 0 only when every declared case passed. The wall-clock
+deadline is the ``runtime_budget_seconds`` the matrix declares for the topology:
+an override may tighten it, never widen it, and cases the deadline consumed are
+reported ``INCOMPLETE`` instead of being dropped from the report.
 """
 from __future__ import annotations
 
@@ -25,13 +28,6 @@ from tools.podman_e2e.podman import Podman  # noqa: E402
 from tools.podman_e2e.runner import Case, RunContext, Runner  # noqa: E402
 
 TOPOLOGIES = ("aio", "multi-node")
-
-# The install downloads releases and issues certificates; the budget is spent
-# across the whole suite, so it must cover a slow network without being open.
-# The Multi-Node suite provisions two hosts and moves real traffic through both,
-# so its default budget is larger than the single-host one.
-DEFAULT_BUDGET_SECONDS = 7200
-MULTI_NODE_BUDGET_SECONDS = 10800
 
 
 def build_suite(
@@ -94,9 +90,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except ValueError as exc:
             parser.error(str(exc))
 
-    budget = args.budget_seconds
-    if budget is None:
-        budget = MULTI_NODE_BUDGET_SECONDS if args.topology == "multi-node" else DEFAULT_BUDGET_SECONDS
+    # The matrix states the deadline, and the run reports INCOMPLETE rather than
+    # a shorter green when it is spent. An override may only tighten it: a run
+    # outside the declared envelope has not met the tier the manifest describes,
+    # so it must not be able to claim it by asking for more time.
+    try:
+        ceiling = matrix.runtime_budget_seconds(matrix.load(), args.topology)
+    except KeyError as exc:
+        parser.error(str(exc))
+    budget = args.budget_seconds if args.budget_seconds is not None else ceiling
+    if budget > ceiling:
+        parser.error(
+            f"--budget-seconds {budget} exceeds the {ceiling}s tests/cases/matrix.yaml "
+            f"declares for {args.topology}: an override may only tighten the deadline"
+        )
 
     context = RunContext(
         topology=args.topology,

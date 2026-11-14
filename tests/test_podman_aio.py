@@ -26,6 +26,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from tools.podman_e2e import (  # noqa: E402
     acme_fixture,
     aio,
+    budget,
     catalog,
     matrix,
     panel_surface,
@@ -196,6 +197,14 @@ class TestAioSuite(unittest.TestCase):
         self.assertEqual(case.topology, "aio")
         self.assertGreater(case.timeout_seconds, 0)
         self.assertLessEqual(case.timeout_seconds, aio.INSTALL_TIMEOUT_SECONDS)
+
+    def test_the_budget_case_is_declared_last(self):
+        # It reports on the clock the whole run spent, so any case after it would
+        # close the report on time it never saw — and a suite that spends its
+        # deadline before the case runs loses it to INCOMPLETE, not to silence.
+        suite = aio.cases(FakePodman(self.context))
+        self.assertEqual(suite[-1].id, budget.BUDGET_CASE_ID)
+        self.assertEqual(suite[-1].topology, "aio")
 
 
 class ScriptedPodman:
@@ -2130,7 +2139,10 @@ def acme_probe(
     )
     facts.update({
         "renewal": {"returncode": renewal_exit, "stdout": text, "stderr": "",
-                    "tail": text, "duration_seconds": 6.5},
+                    "tail": text, "duration_seconds": 6.5, "attempts": [
+                        {"attempt": 1, "returncode": renewal_exit,
+                         "challenged": f"http-01 challenge for {domain}" in text},
+                    ]},
         "certbot_log": text,
         "live_after": acme_certificate(live_path, renewed_serial, second),
         "archive_after": [
@@ -2267,18 +2279,20 @@ class TestAcmeRenewalCase(unittest.TestCase):
                            "stdout": "", "stderr": "connection refused"})
 
     def test_a_renewal_that_never_performs_http01_fails_the_case(self):
-        self.reject("did not perform an HTTP-01 challenge",
+        self.reject("performed no HTTP-01 challenge",
                     after=acme_probe("renew", transcript="dns-01 challenge for "
                                      f"{aio.PANEL_DOMAIN}\n{aio.CERTBOT_RENEWAL_SUCCEEDED}: "))
 
     def test_a_renewal_the_ca_answered_without_a_challenge_names_the_reuse(self):
-        # Pebble answers with an already-valid authorization half the time, and
-        # such an order performs no challenge: the log says so and is quoted.
+        # Pebble answers with an already-valid authorization one order in a hundred
+        # even with reuse switched off, and such an order performs no challenge: the
+        # log says so, the message counts the attempts, and the log is quoted.
         reused = acme_probe("renew", transcript=(
             f"Renewing an existing certificate for {aio.PANEL_DOMAIN}\n"
             f"{aio.CERTBOT_RENEWAL_SUCCEEDED}: "
         ))
         caught = self.reject("reuses a valid authorization", after=reused)
+        self.assertIn("in 1 attempt(s)", str(caught.exception))
         self.assertIn(f"Renewing an existing certificate for {aio.PANEL_DOMAIN}",
                       str(caught.exception))
 
@@ -2526,6 +2540,62 @@ class TestAcmeRenewalProbe(unittest.TestCase):
         self.assertEqual(facts["service_after"]["worker_pids"], ["5100", "5101"])
         self.assertEqual(anchor, "/fixtures/ca/acme-trust.pem",
                          "the renewal has to be handed the fixture CA the install used")
+
+    def rewrite_certbot(self, layout: dict, prefix: str) -> Path:
+        """The stub renewer with shell inserted ahead of its own body."""
+        certbot = layout["bindir"] / "certbot"
+        certbot.write_text(
+            prefix + certbot.read_text(encoding="utf-8").split("\n", 1)[1],
+            encoding="utf-8",
+        )
+        certbot.chmod(0o755)
+        return certbot
+
+    def test_a_renewal_the_ca_finished_without_a_challenge_is_asked_again(self):
+        # Pebble reuses a valid authorization for one order in a hundred even with
+        # PEBBLE_AUTHZREUSE=0, and a reused order performs no challenge at all: the
+        # certificate is real and the route this phase exists to exercise was never
+        # used. The fixture is the unreliable part — the product is asked the same
+        # question either way — so the probe asks again instead of reporting a pass
+        # for a challenge that never happened.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main_pid = self.spare_pid()
+            layout = self.build_target(Path(tmpdir), main_pid)
+            counter = layout["root"] / "certbot-calls"
+            self.rewrite_certbot(layout, (
+                "#!/bin/sh\n"
+                f'calls=$(cat {counter} 2>/dev/null || echo 0)\n'
+                f"printf '%s' $((calls + 1)) > {counter}\n"
+                'if [ "$calls" = 0 ]; then\n'
+                f'  printf "%s\\n" "Renewing an existing certificate for {aio.PANEL_DOMAIN}" >&2\n'
+                "  exit 0\n"
+                "fi\n"
+            ))
+            facts = self.run_probe("renew", layout, main_pid)
+            calls = counter.read_text(encoding="utf-8")
+        self.assertEqual(calls, "2", "the silent renewal must be asked again exactly once")
+        self.assertEqual([item["challenged"] for item in facts["renewal"]["attempts"]],
+                         [False, True])
+        self.assertIn(f"http-01 challenge for {aio.PANEL_DOMAIN}", facts["certbot_log"])
+
+    def test_a_refused_renewal_is_not_asked_again(self):
+        # A refusal is the answer, not a fixture coin flip: retrying it would spend
+        # the outage's evidence and could turn one refusal into a reported success.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            main_pid = self.spare_pid()
+            layout = self.build_target(Path(tmpdir), main_pid)
+            counter = layout["root"] / "certbot-calls"
+            self.rewrite_certbot(layout, (
+                "#!/bin/sh\n"
+                f'calls=$(cat {counter} 2>/dev/null || echo 0)\n'
+                f"printf '%s' $((calls + 1)) > {counter}\n"
+                'printf "%s\\n" "Some challenges have failed." >&2\n'
+                "exit 1\n"
+            ))
+            facts = self.run_probe("renew", layout, main_pid)
+            calls = counter.read_text(encoding="utf-8")
+        self.assertEqual(calls, "1")
+        self.assertEqual([item["returncode"] for item in facts["renewal"]["attempts"]], [1])
 
     def test_an_unreadable_certificate_keeps_the_readers_own_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -24,10 +24,13 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import yaml
+
+from tools.podman_e2e import matrix as matrix_data
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -36,6 +39,10 @@ MATRIX_PATH = REPO_ROOT / "tests" / "cases" / "matrix.yaml"
 SUITE_MODULE = "tools.run_podman_e2e"
 GATE_MODULE = "tools.pre_push_e2e"
 HOOK_MARKER = "# gowave pre-push acceptance gate"
+# The gate label in the manifest's ``gate:`` lists, and the key its tier budget
+# is declared under (``runtime_budget.pre_push_total_seconds``).
+GATE = "pre-push"
+TIER = "pre_push"
 
 HOOK_BODY = f"""#!/usr/bin/env bash
 {HOOK_MARKER} — installed by `python3 -m {GATE_MODULE} --install-hook`.
@@ -52,12 +59,12 @@ def load_matrix(path: Path = MATRIX_PATH) -> Dict[str, Any]:
     return yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
 
 
-def pre_push_topologies(matrix: Dict[str, Any]) -> List[str]:
+def pre_push_topologies(data: Dict[str, Any]) -> List[str]:
     """The topologies the manifest puts behind ``pre-push``, in its own order."""
     return [
         str(name)
-        for name, topology in (matrix.get("topologies") or {}).items()
-        if "pre-push" in ((topology or {}).get("gate") or [])
+        for name, topology in (data.get("topologies") or {}).items()
+        if GATE in ((topology or {}).get("gate") or [])
     ]
 
 
@@ -140,7 +147,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    topologies = pre_push_topologies(load_matrix())
+    data = load_matrix()
+    topologies = pre_push_topologies(data)
     if not topologies:
         print(
             "pre-push: the manifest puts no topology behind pre-push",
@@ -175,6 +183,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     commit, tree = repository_state()
     print(f"pre-push: judging {commit} (tree: {tree}) with {', '.join(topologies)}")
+    total_budget = matrix_data.tier_budget_seconds(data, TIER)
+    started = time.monotonic()
     for index, topology in enumerate(topologies):
         command = suite_command(topology)
         print(f"pre-push: {topology}: {' '.join(command)}", flush=True)
@@ -189,6 +199,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 print("pre-push: not run: " + ", ".join(remaining), file=sys.stderr)
             return 1
         print(f"pre-push: {topology} passed")
+    elapsed = time.monotonic() - started
+    # The tier has a wall-clock budget of its own, declared beside the
+    # per-topology ones. Each suite stops inside its own deadline, so this can
+    # only be exceeded by the pair together or by a suite that overran — either
+    # way the push has spent more than the manifest promised for it.
+    print(
+        f"pre-push: both suites took {elapsed:.1f}s of the {total_budget}s "
+        f"tests/cases/matrix.yaml declares for the pre-push tier"
+    )
+    if elapsed > total_budget:
+        print(
+            f"pre-push: the gate spent {elapsed:.1f}s, past the {total_budget}s the matrix "
+            "declares; the push is blocked",
+            file=sys.stderr,
+        )
+        return 1
     print("pre-push: every gated suite passed; the push may continue")
     return 0
 
