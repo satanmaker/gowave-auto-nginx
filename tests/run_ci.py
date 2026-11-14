@@ -74,6 +74,7 @@ SUITES = {
         "test_podman_traffic.TestTrafficProbeRevocation",
         "test_podman_traffic.TestTrafficProbeProhibited",
         "test_podman_traffic.TestTrafficProbeReadiness",
+        "test_podman_traffic.TestMihomoLaunch",
         "test_podman_traffic.TestDataPlaneCase",
         "test_podman_traffic.TestMatrixCase",
         "test_podman_traffic.TestRevocationCase",

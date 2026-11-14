@@ -442,6 +442,17 @@ follows the release. The shared contract is therefore "accepted by the real
 engine", not "accepted by this exact build", and the container suite is the
 place where a specific build is named.
 
+### The data plane: the request budget and the Mihomo config
+
+Two data-plane sentences are witnessable without a VPS, and both are read from
+what the probe itself reports rather than from a stalled resolver or from a
+second machine.
+
+| Live scenario | Container case | Where the two differ |
+| --- | --- | --- |
+| `TRAFFIC_TIMEOUT` bounds every egress request | every matrix-driven data-plane case of both contours; `DP-02` is observed through the REALITY/xray tuple of each, and the catalog entry names that case | The live runner passes the budget to `curl --connect-timeout max(10, timeout // 2)` and `--max-time timeout` (`tools/live_vps/traffic.py:325`); the container probe carries the payload itself, so the same split is two facts per request — `connect_budget_seconds` and `transfer_budget_seconds` — read back from the transfer the case already made, and both are required on every tuple. |
+| `Mihomo config preserves proxies and rules, assigns loopback listeners, refuses a non-loopback control endpoint` | every tuple the `mihomo` client runs; `DP-05` is observed through the REALITY/mihomo tuple of each contour, and the catalog entry names that case | The live runner rewrites the served YAML through `yaml.safe_load`; the client container has no PyYAML, so the probe edits top-level scalars textually and lets `scan_mihomo` remain the authority on what was preserved. Both assign collision-free loopback ports and pin the controller to `127.0.0.1` with `allow-lan: false`; the container probe invents no listener the Panel's document does not declare, so `socks-port`/`redir-port`/`tproxy-port` are rebound only where they are already present. |
+
 ### What is declared but not driven
 
 `PATCH /api/users` and `PATCH /api/users/{userId}` update an existing client,

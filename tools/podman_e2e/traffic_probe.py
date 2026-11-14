@@ -44,7 +44,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -59,8 +59,6 @@ MIHOMO_BINARY = "mihomo"
 ECHO_HTTP_PORT = 18080
 ECHO_HTTPS_PORT = 18443
 
-MIHOMO_MIXED_PORT = 7890
-MIHOMO_CONTROLLER_PORT = 9090
 MIHOMO_GLOBAL_GROUP = "GLOBAL"
 
 STARTUP_SECONDS = 60
@@ -72,6 +70,41 @@ SHUTDOWN_SECONDS = 10
 PROHIBITED_TIMEOUT_SECONDS = 15
 
 TRANSFER_PATH = "/traffic"
+
+# A resolver that stalls once must not fail an otherwise healthy endpoint, so the
+# handshake gets its own budget instead of sharing the exchange's. The live
+# runner divides its traffic timeout the same way; here the per-request budget is
+# what is divided.
+MIN_CONNECT_BUDGET_SECONDS = 10
+
+# Mihomo's control surfaces. Each one names an interface the engine listens on, so
+# each one has to be loopback before the engine is launched.
+MIHOMO_CONTROL_KEYS: Sequence[str] = (
+    "bind-address",
+    "external-controller",
+    "external-ui",
+    "internal-controller",
+)
+MIHOMO_LOOPBACK_HOSTS: Sequence[str] = ("127.0.0.1", "::1", "localhost")
+# Listeners the served document may declare. They are re-bound to fresh ports,
+# never added: a listener the Panel did not issue is not this run's to invent.
+MIHOMO_REBOUND_KEYS: Sequence[str] = ("socks-port", "redir-port", "tproxy-port")
+
+# What the launched Mihomo document contributes to a transfer, so a case reads
+# what the engine was given instead of only that it carried a payload.
+MIHOMO_FACT_KEYS: Sequence[str] = (
+    "mihomo_mixed_port",
+    "mihomo_socks_port",
+    "mihomo_redir_port",
+    "mihomo_tproxy_port",
+    "mihomo_controller",
+    "mihomo_allow_lan",
+    "mihomo_bind_address",
+    "mihomo_control_endpoints",
+    "mihomo_proxies",
+    "mihomo_rules",
+    "mihomo_preserved",
+)
 
 PROXY_PROTOCOLS = ("freedom", "blackhole")
 
@@ -349,6 +382,33 @@ def mihomo_label(proxy: Dict[str, str]) -> Dict[str, str]:
     }
 
 
+def connect_budget_seconds(transfer_seconds: int = REQUEST_TIMEOUT_SECONDS) -> int:
+    """The part of a request's budget the handshake may spend.
+
+    Half the transfer budget, and never below the floor: the point of the split
+    is that one slow resolver answer costs the handshake its own time instead of
+    the exchange's, so an endpoint that is healthy once the name resolves still
+    has room to answer.
+    """
+    return max(MIN_CONNECT_BUDGET_SECONDS, transfer_seconds // 2)
+
+
+def dial(host: str, port: int, timeout: int = REQUEST_TIMEOUT_SECONDS) -> http.client.HTTPConnection:
+    """A connection whose name resolution and TCP handshake have their own budget.
+
+    ``http.client`` applies one timeout to every socket operation, so a request
+    that passes it would give the resolver and the exchange the same allowance
+    and a stall in the first would read as a dead endpoint. The handshake runs
+    under ``connect_budget_seconds`` here, and only the established socket is
+    left on the transfer budget.
+    """
+    connection = http.client.HTTPConnection(host, port, timeout=connect_budget_seconds(timeout))
+    connection.connect()
+    if connection.sock is not None:
+        connection.sock.settimeout(timeout)
+    return connection
+
+
 def transfer(
     proxy_port: Optional[int],
     destination: str,
@@ -377,12 +437,20 @@ def transfer(
     digest = hashlib.sha256(body).hexdigest()
     host, _, port = destination.partition(":")
     if proxy_port is None:
-        connection = http.client.HTTPConnection(host, int(port or ECHO_HTTP_PORT), timeout=timeout)
+        dial_host, dial_port = host, int(port or ECHO_HTTP_PORT)
         target = TRANSFER_PATH
     else:
-        connection = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=timeout)
+        dial_host, dial_port = "127.0.0.1", proxy_port
         target = f"http://{destination}{TRANSFER_PATH}"
+    budgets = {
+        "connect_budget_seconds": connect_budget_seconds(timeout),
+        "transfer_budget_seconds": timeout,
+    }
+    connection: Optional[http.client.HTTPConnection] = None
     try:
+        # The handshake is part of what a refusal is observed on: an endpoint
+        # that refuses the connection is a result here, not a crash.
+        connection = dial(dial_host, dial_port, timeout)
         connection.request(
             "POST",
             target,
@@ -399,19 +467,26 @@ def transfer(
         raw = response.read(65536)
     except (OSError, http.client.HTTPException) as exc:
         if expect_refusal:
-            return refusal(engine, label, request_id, status=None, reason=f"{type(exc).__name__}: {sanitize(str(exc), 200)}")
+            return refusal(
+                engine, label, request_id, status=None,
+                reason=f"{type(exc).__name__}: {sanitize(str(exc), 200)}", extra=budgets,
+            )
         raise SystemExit(
             f"the {engine} transfer through {label['network']} did not reach the endpoint: "
             f"{type(exc).__name__}: {sanitize(str(exc), 300)}{engine_detail(log_path)}"
         )
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
 
     try:
         recorded = json.loads(raw.decode("utf-8", errors="replace"))
     except json.JSONDecodeError:
         if expect_refusal:
-            return refusal(engine, label, request_id, status=status, reason=f"HTTP {status} without an endpoint report")
+            return refusal(
+                engine, label, request_id, status=status,
+                reason=f"HTTP {status} without an endpoint report", extra=budgets,
+            )
         raise SystemExit(
             f"the {engine} transfer through {label['network']} returned HTTP {status} without an "
             f"endpoint report: {sanitize(raw.decode('utf-8', errors='replace'), 300)}"
@@ -426,6 +501,7 @@ def transfer(
             engine, label, request_id, status=status,
             reason=f"HTTP {status} {recorded.get('error') or ''}".strip(),
             source_ip=str(recorded.get("source_ip") or ""),
+            extra=budgets,
         )
     if expect_refusal:
         # A delivered payload is a fact for the case to judge, not a crash: the
@@ -434,6 +510,7 @@ def transfer(
         return {
             "engine": engine,
             **label,
+            **budgets,
             "request_id": request_id,
             "delivered": True,
             "status": status,
@@ -444,6 +521,7 @@ def transfer(
     return {
         "engine": engine,
         **label,
+        **budgets,
         "request_id": request_id,
         "delivered": True,
         "status": status,
@@ -460,11 +538,13 @@ def refusal(
     status: Optional[int],
     reason: str,
     source_ip: str = "",
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """A transfer the tunnel refused: no endpoint report came back for it."""
     return {
         "engine": engine,
         **label,
+        **(extra or {}),
         "request_id": request_id,
         "delivered": False,
         "status": status,
@@ -582,35 +662,208 @@ def xray_transfers(
     return transfers
 
 
-def mihomo_config(text: str, ca_file: str) -> str:
-    """The served YAML plus the fixture trust anchor.
+def top_level_scalars(text: str) -> Dict[str, str]:
+    """Every unindented ``key: value`` the document states, as it states it.
 
-    Mihomo reads its extra anchor from ``tls.custom-certifactes`` (the upstream
-    key is spelled that way), and that key is a list of PEM documents rather than
-    of file names: Mihomo hands each entry to ``AppendCertsFromPEM``, so naming
-    the mounted path would leave every TLS outbound on the system pool and fail
-    verification instead of proving the transfer. The block is appended only when
-    the served YAML does not declare ``tls`` itself: a second top-level ``tls``
-    key would be a different document, so failing closed is the only honest
-    option.
+    Only scalars are read: a section header (``dns:`` with nothing after it) is
+    a mapping this probe must not touch, and a top-level list item carries no
+    colon in the position a key would. The reader is deliberately this small
+    because the probe runs inside the client container, where the only YAML
+    library available is the one in this repository.
+    """
+    values: Dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line or line[0].isspace() or line.lstrip().startswith("#"):
+            continue
+        key, separator, value = line.partition(":")
+        value = value.strip()
+        if not separator or not value or value.startswith(("#", "|", ">")):
+            continue
+        values[key.strip()] = value.strip("'\"")
+    return values
+
+
+def assign_top_level(text: str, values: Dict[str, str]) -> str:
+    """The same document with the named top-level keys set to the given scalars.
+
+    A key the document already carries is rewritten in place, because a second
+    top-level copy is a duplicate the engine refuses to load. A key it does not
+    carry is inserted ahead of the first section, after any header comment, so
+    nothing below it is renamed by the insertion. Every other line — proxies,
+    proxy-groups, rules, the DNS block — is copied through untouched: this is
+    the Panel's document, not a template of ours.
+    """
+    remaining = dict(values)
+    lines: List[str] = []
+    for raw in text.rstrip("\n").splitlines():
+        line = raw.rstrip()
+        key = ""
+        if line and not line[0].isspace():
+            key = line.partition(":")[0].strip()
+        if key and key in remaining:
+            lines.append(f"{key}: {remaining.pop(key)}")
+            continue
+        lines.append(line)
+    if remaining:
+        insert_at = 0
+        for index, line in enumerate(lines):
+            if line and not line[0].isspace() and not line.lstrip().startswith("#"):
+                insert_at = index
+                break
+        lines[insert_at:insert_at] = [f"{key}: {value}" for key, value in remaining.items()]
+    return "\n".join(lines) + "\n"
+
+
+def free_loopback_port(taken: Set[int]) -> int:
+    """A port nothing is listening on, distinct from the ones already assigned."""
+    for _attempt in range(64):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = int(probe.getsockname()[1])
+        if port not in taken:
+            return port
+    raise SystemExit("no free loopback port was found for the Mihomo listeners")
+
+
+def mihomo_config(text: str, ca_file: str) -> Tuple[str, Dict[str, Any]]:
+    """The served YAML as this run will launch it, together with what it says.
+
+    Two things are added to what the Panel issued. The fixture trust anchor goes
+    into ``tls.custom-certifactes`` (the upstream key is spelled that way), a
+    list of PEM documents rather than of file names: Mihomo hands each entry to
+    ``AppendCertsFromPEM``, so naming the mounted path would leave every TLS
+    outbound on the system pool and fail verification instead of proving the
+    transfer. A serving document that already declares ``tls`` is refused
+    rather than merged, because a second top-level key is a different document.
+    And every listener is re-bound to a free loopback port, with ``allow-lan``
+    off and the controller pinned to ``127.0.0.1``: the Panel's document names
+    7890/7891/7892/9090, and two runs on one machine would collide on all four.
+    Listener keys the document does not declare are not invented — a profile
+    under test is not a place to add surfaces the Panel never issued.
     """
     if any(line.startswith("tls:") for line in text.splitlines()):
         raise SystemExit(
             "the served Mihomo YAML already declares 'tls', so the fixture anchor cannot be added "
             "without editing what the Panel issued"
         )
+    served = subscription_probe.scan_mihomo(text)
+    if not served["proxies"]:
+        raise SystemExit("the served Mihomo YAML declares no proxy, so there is nothing to launch")
+    declared = top_level_scalars(text)
+    taken: Set[int] = set()
+    mixed_port = free_loopback_port(taken)
+    taken.add(mixed_port)
+    controller_port = free_loopback_port(taken)
+    taken.add(controller_port)
+    assigned = {
+        "mixed-port": str(mixed_port),
+        "allow-lan": "false",
+        "bind-address": "127.0.0.1",
+        "external-controller": f"127.0.0.1:{controller_port}",
+        "secret": '""',
+    }
+    rebounded: Dict[str, int] = {}
+    for key in MIHOMO_REBOUND_KEYS:
+        if key not in declared:
+            continue
+        port = free_loopback_port(taken)
+        taken.add(port)
+        assigned[key] = str(port)
+        rebounded[key] = port
     lines = [line for line in client_trust.ca_pem(ca_file).splitlines() if line.strip()]
     anchor = "\n".join(f"      {line}" for line in lines)
-    return (
-        text.rstrip("\n")
-        + "\n"
-        + f"tls:\n  {client_trust.MIHOMO_CA_KEY}:\n    - |\n{anchor}\n"
-    )
+    prepared = assign_top_level(text, assigned).rstrip("\n")
+    prepared += f"\ntls:\n  {client_trust.MIHOMO_CA_KEY}:\n    - |\n{anchor}\n"
+    return prepared, {
+        "mixed_port": mixed_port,
+        "controller_port": controller_port,
+        "socks_port": rebounded.get("socks-port"),
+        "redir_port": rebounded.get("redir-port"),
+        "tproxy_port": rebounded.get("tproxy-port"),
+        "proxies": served["proxies"],
+        "groups": served["groups"],
+        "rules": served["rules"],
+    }
 
 
-def select_mihomo_proxy(name: str, timeout: int = REQUEST_TIMEOUT_SECONDS) -> None:
+def control_endpoints(text: str) -> Dict[str, str]:
+    """Every control surface the document declares, as ``key -> host[:port]``."""
+    scalars = top_level_scalars(text)
+    return {key: scalars[key] for key in MIHOMO_CONTROL_KEYS if key in scalars}
+
+
+def endpoint_host(value: str) -> str:
+    """The host part of ``host:port``, ``[v6]:port`` and a bare host."""
+    value = value.strip()
+    if value.startswith("["):
+        return value[1:].partition("]")[0].strip()
+    host, _, port = value.rpartition(":")
+    if host and port.isdigit():
+        return host.strip()
+    return value
+
+
+def read_mihomo_config(path: Path, served: Dict[str, Any]) -> Dict[str, Any]:
+    """Read the launched file back and state what it actually binds and keeps.
+
+    The claim DP-05 makes is about the document Mihomo loads, not about what the
+    preparation intended, so every fact here is parsed from the bytes on disk.
+    A control surface bound anywhere but loopback stops the run before the
+    engine starts.
+    """
+    text = path.read_text(encoding="utf-8")
+    scalars = top_level_scalars(text)
+    endpoints = control_endpoints(text)
+    off_loopback = {
+        key: value for key, value in endpoints.items()
+        if endpoint_host(value) not in MIHOMO_LOOPBACK_HOSTS
+    }
+    if off_loopback:
+        raise SystemExit(
+            "refusing to launch Mihomo: a control endpoint would bind outside loopback: "
+            + ", ".join(f"{key}={value}" for key, value in sorted(off_loopback.items()))
+        )
+    prepared = subscription_probe.scan_mihomo(text)
+    listeners = {
+        key: int(scalars[key]) for key in ("mixed-port", *MIHOMO_REBOUND_KEYS)
+        if key in scalars and scalars[key].isdigit()
+    }
+    if len(set(listeners.values())) != len(listeners):
+        raise SystemExit(
+            "the prepared Mihomo config assigns one port to two listeners: "
+            + ", ".join(f"{key}={port}" for key, port in sorted(listeners.items()))
+        )
+    controller = endpoints.get("external-controller", "")
+    return {
+        "mixed_port": listeners.get("mixed-port"),
+        "socks_port": listeners.get("socks-port"),
+        "redir_port": listeners.get("redir-port"),
+        "tproxy_port": listeners.get("tproxy-port"),
+        "controller": controller,
+        "controller_port": int(controller.rpartition(":")[2] or 0),
+        "allow_lan": scalars.get("allow-lan"),
+        "bind_address": endpoints.get("bind-address", ""),
+        "control_endpoints": ",".join(
+            f"{key}={value}" for key, value in sorted(endpoints.items())
+        ),
+        "proxies": prepared["proxies"],
+        "rules": prepared["rules"],
+        "preserved": (
+            prepared["proxies"] == served.get("proxies")
+            and prepared["rules"] == served.get("rules")
+            and prepared["groups"] == served.get("groups")
+            and [entry.get("name") for entry in prepared["proxy_details"]]
+            == [entry.get("name") for entry in served.get("proxy_details") or []]
+        ),
+    }
+
+
+def select_mihomo_proxy(
+    name: str, controller_port: int, timeout: int = REQUEST_TIMEOUT_SECONDS,
+) -> None:
     """Select one proxy in Mihomo's global selector, the way a client UI does."""
-    connection = http.client.HTTPConnection("127.0.0.1", MIHOMO_CONTROLLER_PORT, timeout=timeout)
+    connection = http.client.HTTPConnection("127.0.0.1", controller_port, timeout=timeout)
     body = json.dumps({"name": name})
     try:
         connection.request(
@@ -655,29 +908,58 @@ def mihomo_transfers(
         if not proxies:
             return []
     config = workdir / "traffic-mihomo.yaml"
-    write_private(config, mihomo_config(text, ca_file))
+    prepared, planned = mihomo_config(text, ca_file)
+    write_private(config, prepared)
+    bound = read_mihomo_config(config, served)
+    facts = {
+        "mihomo_mixed_port": bound["mixed_port"],
+        "mihomo_socks_port": bound["socks_port"],
+        "mihomo_redir_port": bound["redir_port"],
+        "mihomo_tproxy_port": bound["tproxy_port"],
+        "mihomo_controller": bound["controller"],
+        "mihomo_allow_lan": bound["allow_lan"] == "false",
+        "mihomo_bind_address": bound["bind_address"],
+        "mihomo_control_endpoints": bound["control_endpoints"],
+        "mihomo_proxies": bound["proxies"],
+        "mihomo_rules": bound["rules"],
+        "mihomo_preserved": bound["preserved"],
+    }
+    if (bound["mixed_port"], bound["controller_port"]) != (
+            planned["mixed_port"], planned["controller_port"]):
+        raise SystemExit(
+            f"the launched Mihomo config binds {bound['mixed_port']}/{bound['controller']} where the "
+            f"preparation assigned {planned['mixed_port']}/127.0.0.1:{planned['controller_port']}"
+        )
     home = workdir / "traffic-mihomo-home"
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    mixed_port = int(bound["mixed_port"] or 0)
+    controller_port = int(bound["controller_port"] or 0)
     transfers: List[Dict[str, Any]] = []
     try:
         with Engine(
             [MIHOMO_BINARY, "-f", str(config), "-d", str(home)],
             workdir / "traffic-mihomo.log",
             workdir / "traffic-mihomo.pid",
-            MIHOMO_MIXED_PORT,
+            mixed_port,
             "mihomo",
         ):
-            wait_port(MIHOMO_CONTROLLER_PORT, STARTUP_SECONDS, "the Mihomo controller",
-                      workdir / "traffic-mihomo.log")
+            wait_port(
+                controller_port, STARTUP_SECONDS, "the Mihomo controller",
+                workdir / "traffic-mihomo.log",
+            )
             for proxy in proxies:
                 label = mihomo_label(proxy)
                 if not label["tag"]:
                     raise SystemExit("the served Mihomo YAML declares a proxy without a name")
-                select_mihomo_proxy(label["tag"])
-                transfers.append(transfer(
-                    MIHOMO_MIXED_PORT, destination, label, "mihomo", workdir / "traffic-mihomo.log",
-                    expect_refusal=expect_refusal, timeout=timeout,
-                ))
+                select_mihomo_proxy(label["tag"], controller_port)
+                transfers.append({
+                    **transfer(
+                        mixed_port, destination, label, "mihomo",
+                        workdir / "traffic-mihomo.log",
+                        expect_refusal=expect_refusal, timeout=timeout,
+                    ),
+                    **facts,
+                })
     finally:
         config.unlink(missing_ok=True)
     return transfers
@@ -1047,7 +1329,7 @@ def transfer_one(
             f"outbound(s){where} for the matrix tuple, expected exactly one"
         )
     item = found[0]
-    return {
+    facts = {
         "outbounds": len(found),
         "engine": item.get("engine"),
         "tag": item.get("tag"),
@@ -1061,7 +1343,13 @@ def transfer_one(
         "body_match": bool(item.get("body_match")),
         "source_ip": item.get("source_ip") or "",
         "reason": item.get("reason", ""),
+        "connect_budget_seconds": item.get("connect_budget_seconds"),
+        "transfer_budget_seconds": item.get("transfer_budget_seconds"),
     }
+    for key in MIHOMO_FACT_KEYS:
+        if key in item:
+            facts[key] = item[key]
+    return facts
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
