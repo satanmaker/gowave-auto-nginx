@@ -1,0 +1,410 @@
+# Requirement -> scenario -> case/test -> CI job, for the delta spec.
+#
+# One row per scenario of
+# `openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`. `cases` names ids
+# the suites actually declare (`AIO-DP-*` and `MN-DP-*` expand against the
+# matrix); `tests` names `tests.<module>.<Class>[.<method>]` ids that exist;
+# `jobs` names jobs a workflow declares. A row with `gap` names the ledger task
+# that still owns the missing work, and `tools/podman_e2e/trace.py --strict`
+# refuses the table while any gap remains.
+schema: gowave-podman-traceability/v1
+version: 1
+spec: openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md
+requirements:
+  - requirement: Independent All-in-One acceptance topology
+    scenarios:
+      - scenario: All-in-One clean installation
+        cases: [AIO-INSTALL, AIO-PACKAGES, AIO-04, AIO-01, AIO-03, AIO-05, TLS-01]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestAioSuite
+          - tests.test_podman_aio.TestAioVerificationCases
+          - tests.test_podman_runner.TestPodmanRunnerContract
+        jobs: [All-in-One Podman Acceptance]
+      - scenario: All-in-One repeated provisioning
+        cases: [AIO-IDEMPOTENT, AIO-RESTART]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestIdempotentCase
+          - tests.test_podman_aio.TestRestartCase
+        jobs: [All-in-One Podman Acceptance]
+
+  - requirement: Independent Multi-Node acceptance topology
+    scenarios:
+      - scenario: Multi-Node clean installation and registration
+        cases: [MN-INSTALL, WRK-04, WRK-05, CLUS-01, CLUS-02, CLUS-03]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestMultiNodeSuite
+          - tests.test_podman_multi_node.TestWorkerRegistrationCase
+          - tests.test_podman_cluster.TestClusterCases
+        jobs: [Multi-Node Podman Acceptance]
+      - scenario: Master and Worker optional domain configuration
+        cases: [MN-VISION]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_cluster.TestVisionCase
+          - tests.test_podman_multi_node.TestMultiNodeCounts
+        jobs: [Multi-Node Podman Acceptance]
+
+  - requirement: Real Panel subscription lifecycle
+    scenarios:
+      - scenario: Subscription User-Agent policy is enforced
+        cases: [SUB-SERVED, SUB-UA-ABSENT, SUB-UA-BLANK]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_subscriptions.TestSubscriptionCases
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+      - scenario: Subscription is issued, updated where supported, and revoked
+        cases: [AIO-CLIENT, AIO-REVOKE, MN-REVOKE]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_traffic.TestRevocationCase
+          - tests.test_podman_aio.TestPanelApiCases
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+  - requirement: Panel subscription representations
+    scenarios:
+      - scenario: Base64 share-link list matches the profile inventory
+        cases: [SUB-B64]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_subscriptions.TestSubscriptionCases
+          - tests.test_podman_subscriptions.TestSubscriptionClientProbe
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+      - scenario: Xray JSON is validated in both served shapes
+        cases: [SUB-JSON-SHAPES]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_subscriptions.TestSubscriptionCases
+        jobs: [All-in-One Podman Acceptance]
+
+  - requirement: Versioned protocol and client coverage matrix
+    scenarios:
+      - scenario: Complete client and inbound matrix is executed
+        cases: [AIO-MATRIX, MN-MATRIX, WRK-06, AIO-DP-*, MN-DP-*]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_matrix.TestMatrixCatalog
+          - tests.test_podman_traffic.TestMatrixCase
+          - tests.test_podman_multi_node.TestMultiNodeCounts
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+  - requirement: Real client data-plane verification
+    scenarios:
+      - scenario: Supported protocol transfers payload
+        cases: [AIO-MATRIX, MN-MATRIX, AIO-DP-*, MN-DP-*]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_traffic.TestDataPlaneCase
+          - tests.test_podman_traffic.TestTrafficProbeTransfer
+          - tests.test_podman_worker_subscriptions.TestWorkerDataPlaneCase
+          - tests.test_podman_multi_node.TestDataPlaneSourceEvidence
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+      - scenario: Prohibited destination remains inaccessible
+        cases: [AIO-NEG-DEST]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_traffic.TestTrafficProbeProhibited
+          - tests.test_podman_aio.TestNegativeCases
+        jobs: [All-in-One Podman Acceptance]
+
+  - requirement: Deterministic DNS and ACME fixtures
+    scenarios:
+      - scenario: Certificate issuance and renewal
+        cases: [ACME-01, ACME-02, TLS-01]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestAcmeRenewalCase
+          - tests.test_podman_acme_fixture.TestPodmanAcmeFixture
+        jobs: [All-in-One Podman Acceptance]
+      - scenario: DNS A/AAAA and TTL behavior
+        cases: [DNS-01]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_dns.TestDnsCase
+          - tests.test_fixture_dns.TestDnsFixture
+        jobs: [All-in-One Podman Acceptance]
+      - scenario: NXDOMAIN and stale-answer handling
+        cases: [DNS-01]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_dns.TestDnsCaseWiring
+          - tests.test_podman_dns.TestDnsProbe
+        jobs: [All-in-One Podman Acceptance]
+      - scenario: ACME challenge and service failure
+        cases: [ACME-02, NGX-WORKER-ACME80]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_aio.TestAcmeOutageCase
+          - tests.test_podman_multi_node.TestAcme80Case
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+  - requirement: Camouflage decoy and certificate lineage
+    scenarios:
+      - scenario: Decoy renders for the derived apex
+        cases: [DECOY-01, NGX-COVER-DERIVE, NGX-COVER-SITE, NGX-DECOY-ROUTE]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_aio.TestDecoyCase
+          - tests.test_podman_multi_node.TestCoverDeriveCase
+          - tests.test_podman_multi_node.TestCoverSiteCase
+          - tests.test_podman_multi_node.TestDecoyRouteCase
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+      - scenario: Unresolvable cover names block rendering
+        cases: [NGX-COVER-UNRESOLVED]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestCoverUnresolvedCase
+        jobs: [Multi-Node Podman Acceptance]
+      - scenario: Worker keeps its decoy and ACME route
+        cases: [NGX-WORKER-ACME80, NGX-DECOY-ROUTE]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestAcme80Case
+          - tests.test_podman_multi_node.TestDecoyRouteCase
+        jobs: [Multi-Node Podman Acceptance]
+
+  - requirement: Private test CA trust for both client engines
+    scenarios:
+      - scenario: Fixture chain is trusted by Xray and Mihomo
+        cases:
+          - AIO-DP-XHTTP-xray
+          - AIO-DP-XHTTP-mihomo
+          - AIO-DP-WS-xray
+          - AIO-DP-WS-mihomo
+          - AIO-DP-TROJAN-GRPC-xray
+          - AIO-DP-TROJAN-GRPC-mihomo
+        topologies: [aio]
+        tests:
+          - tests.test_podman_client_trust.TestPodmanClientTrust
+          - tests.test_podman_client_image.TestClientImageContract
+        jobs: [All-in-One Podman Acceptance]
+
+  - requirement: Non-bypassable node egress attribution
+    scenarios:
+      - scenario: Worker data-plane traffic cannot bypass Worker
+        cases: [MN-EGRESS, MN-DP-worker-*]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestEgressCase
+          - tests.test_podman_multi_node.TestDataPlaneSourceEvidence
+          - tests.test_podman_worker_subscriptions.TestWorkerDataPlaneCase
+        jobs: [Multi-Node Podman Acceptance]
+
+  - requirement: Podman-only Master address selection for Worker provisioning
+    scenarios:
+      - scenario: Worker provisioning uses the actual private Master address
+        cases: [PODNET-MASTER-ADDR]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestMasterAddressCase
+          - tests.test_podman_address.TestPodmanAddressOverride
+          - tests.test_podman_multi_node.TestWorkerProvisioningCommand
+        jobs: [Multi-Node Podman Acceptance]
+
+  - requirement: Fail-closed local ACME test mode
+    scenarios:
+      - scenario: Pebble endpoint is rejected outside test mode
+        cases: [AIO-NEG-ACME]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestNegativeCases
+        jobs: [All-in-One Podman Acceptance]
+      - scenario: Arbitrary ACME URL is rejected inside test mode
+        cases: [AIO-NEG-ACME]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestNegativeCases
+        jobs: [All-in-One Podman Acceptance]
+
+  - requirement: Security and network isolation verification
+    scenarios:
+      - scenario: Unauthorized management access
+        cases: [FW-01, FW-02, FW-03, FW-04, AIO-NEG-PORT]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_denial.TestManagementDenialCase
+          - tests.test_podman_denial.TestHostFirewallParsers
+          - tests.test_podman_denial.TestHostFirewallIpv6Parsers
+          - tests.test_podman_multi_node.TestMasterAccessCase
+          - tests.test_podman_multi_node.TestIpv6PolicyCase
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+      - scenario: SSH host-key pinning rejects mismatch and supports rotation
+        cases: [MN-SSHKEY]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestSshHostKeyCase
+          - tests.test_podman_multi_node.TestWorkerTrustPin
+        jobs: [Multi-Node Podman Acceptance]
+      - scenario: mTLS rejects invalid client certificates
+        cases:
+          - MTLS-01
+          - MTLS-02
+          - MTLS-03
+          - MTLS-04
+          - MTLS-05
+          - MTLS-06
+          - MTLS-07
+          - MTLS-08
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestMtlsCases
+          - tests.test_podman_multi_node.TestMtlsNegativeReport
+        jobs: [Multi-Node Podman Acceptance]
+
+  - requirement: Lifecycle recovery acceptance
+    scenarios:
+      - scenario: Restore Panel and Worker backups
+        cases: [MN-BACKUP, MN-BACKUP-VOL, MN-RESTORE]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestBackupCase
+          - tests.test_podman_multi_node.TestBackupVolumeCase
+          - tests.test_podman_multi_node.TestRestoreCase
+        jobs: [Multi-Node Podman Acceptance, Multi-Node Lifecycle and Recovery Acceptance]
+      - scenario: Failed channel update rolls back
+        cases: [AIO-CHANNEL-NOOP, AIO-CHANNEL-ROLLBACK, AIO-CHANNEL-DEV]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestChannelCases
+        jobs: [All-in-One Podman Acceptance, All-in-One Lifecycle and Recovery Acceptance]
+
+  - requirement: Backup archive confidentiality
+    scenarios:
+      - scenario: Backup archives are excluded from exported evidence
+        cases: [MN-BACKUP, MN-BACKUP-BAD]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestArtifactLeaks
+          - tests.test_podman_multi_node.TestBackupRejectCase
+        jobs: [Multi-Node Podman Acceptance]
+
+  - requirement: Failure injection and recovery
+    scenarios:
+      - scenario: Recovery after Worker outage
+        cases: [MN-OUTAGE, MN-RESTART, MN-SSH-DOWN]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestWorkerOutageCase
+          - tests.test_podman_multi_node.TestWorkerRestartCase
+          - tests.test_podman_multi_node.TestSshServiceDownCase
+        jobs: [Multi-Node Podman Acceptance, Multi-Node Lifecycle and Recovery Acceptance]
+      - scenario: Interrupted operator execution
+        cases: [AIO-INTERRUPT]
+        topologies: [aio]
+        tests:
+          - tests.test_podman_aio.TestChannelCases
+        jobs: [All-in-One Podman Acceptance, All-in-One Lifecycle and Recovery Acceptance]
+
+  - requirement: Independent topology CI gates
+    scenarios:
+      - scenario: One topology job is absent or incomplete
+        tests:
+          - tests.test_ci_workflows.TestIndependentAcceptanceWorkflows
+          - tests.test_podman_groups.TestRequiredGroupRun
+        jobs:
+          - All-in-One Podman Acceptance
+          - Multi-Node Podman Acceptance
+          - All-in-One Lifecycle and Recovery Acceptance
+          - Multi-Node Lifecycle and Recovery Acceptance
+
+  - requirement: Pre-push and pull-request acceptance gate
+    scenarios:
+      - scenario: Pre-push run blocks a regressed change
+        gap: 8.14 — no pre-push entrypoint or git hook exists yet
+      - scenario: Budget overrun is not a truncated pass
+        gap: 8.15 — GATE-BUDGET is catalogued but no suite declares it
+
+  - requirement: Coverage completeness and error paths
+    scenarios:
+      - scenario: Unmapped behavior or orphan case fails the audit
+        tests:
+          - tests.test_podman_traceability.TestTraceabilityRules
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+        gap: 8.16 — tests/cases/behaviors.yaml is missing, so `catalog check` is red on that file
+      - scenario: Shared contract diverges from live acceptance
+        gap: 8.17 — the audit against openspec/specs/live-vps-e2e/spec.md has not been performed
+
+  - requirement: Case incubation and promotion path
+    scenarios:
+      - scenario: New case starts in Podman
+        tests:
+          - tests.test_podman_aio.TestNginxConfigCase.test_the_case_is_catalogued_as_an_incubating_podman_first_case
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+      - scenario: Promotion keeps one definition
+        tests:
+          - tests.test_podman_matrix.TestMatrixCatalog
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+      - scenario: Live-only case states its reason
+        tests:
+          - tests.test_podman_matrix.TestMatrixCatalog
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+
+  - requirement: Live scenario parity
+    scenarios:
+      - scenario: Parity inventory matches both suites
+        tests:
+          - tests.test_podman_matrix.TestMatrixCatalog
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+      - scenario: Partial case splits the proof
+        tests:
+          - tests.test_podman_matrix.TestMatrixCatalog
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+      - scenario: Podman-first case has a promotion target
+        tests:
+          - tests.test_podman_aio.TestAcmeRenewalCase.test_the_case_is_catalogued_as_an_incubating_podman_first_case
+          - tests.test_podman_aio.TestAcmeOutageCase.test_the_case_is_catalogued_as_an_incubating_podman_first_case
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+
+  - requirement: Trustworthy result and diagnostics
+    scenarios:
+      - scenario: Secret redaction
+        tests:
+          - tests.test_podman_redaction.TestRedactionFilter
+          - tests.test_podman_redaction.TestArtifactTreeHoldsNoSentinel
+          - tests.test_podman_redaction.TestDiagnosticsNeverPrintValues
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+      - scenario: Unexpected skip
+        tests:
+          - tests.test_podman_runner.TestResultSemantics
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
+
+  - requirement: Safe isolation and cleanup
+    scenarios:
+      - scenario: Cleanup after failure
+        tests:
+          - tests.test_podman_cleanup.TestPodmanStaleRunRecovery
+          - tests.test_podman_cleanup.TestEntrypointReclaimsStaleRuns
+          - tests.test_podman_fixture_isolation.TestPodmanFixtureIsolation
+        jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+# Cases that serve a requirement the delta spec states, where the spec writes no
+# scenario for the behavior the case proves. Each entry names the requirement and
+# why no scenario fits; `trace.py` still refuses an id no suite declares, and an
+# id that is also mapped to a scenario above.
+cases_by_requirement:
+  - requirement: Real Panel subscription lifecycle
+    cases: [AIO-AUTH]
+    reason: >-
+      the documented admin login, its bearer token and the authenticated read
+      surface are what every subscription call consumes; the spec states the
+      subscription scenarios and not the token underneath them
+  - requirement: Camouflage decoy and certificate lineage
+    cases: [NGX-05]
+    reason: >-
+      `nginx -t` on the generated tree and the deploy hook's refusal to reload a
+      broken snippet are the contract that keeps the decoy and its lineage
+      serving; the spec states the rendered decoy and not the tree reloaded
+  - requirement: Security and network isolation verification
+    cases: [AIO-NEG-DEP]
+    reason: >-
+      the public surface fails while the Panel's loopback API keeps answering,
+      which is the isolation the requirement names, stated by no scenario
+  - requirement: Failure injection and recovery
+    cases: [AIO-FAULT-DISK, AIO-FAULT-PANEL, AIO-FAULT-XRAY, AIO-FAULT-LATENCY]
+    reason: >-
+      the requirement names dependency, network, service, filesystem and process
+      failures; its two scenarios state a Worker outage and an interrupted
+      operator, so the disk, Panel, core-process and latency faults serve the
+      requirement directly

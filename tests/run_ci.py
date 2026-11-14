@@ -170,6 +170,7 @@ SUITES = {
         "test_podman_redaction.TestRedactionFilter",
         "test_podman_redaction.TestArtifactTreeHoldsNoSentinel",
         "test_podman_redaction.TestDiagnosticsNeverPrintValues",
+        "test_podman_traceability.TestTraceabilityRules",
     ),
     "integration": (
         "test_api_client.TestAPIClient",
