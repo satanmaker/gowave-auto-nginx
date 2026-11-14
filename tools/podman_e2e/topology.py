@@ -160,9 +160,9 @@ TRAFFIC_PROBE_SCRIPT = f"{REPO_IN_CONTAINER}/tools/podman_e2e/traffic_probe.py"
 # role's own resolution path, so both vantages are measured with the same code.
 DNS_PROBE_SCRIPT = f"{REPO_IN_CONTAINER}/tools/podman_e2e/dns_probe.py"
 DNS_PROBE_TIMEOUT_SECONDS = 60
-# Payloads are fetched on the host (the subscription routes are loopback-only)
-# and mounted into the engine container; they are never printed or copied into
-# the artifact directory.
+# Payloads are fetched on the host — the shortUuid comes from the Panel's
+# loopback API — and mounted into the engine container; they are never printed
+# or copied into the artifact directory.
 PAYLOAD_MOUNT = "/payloads"
 SECRETS_MOUNT = "/secrets"
 # Where the product keeps its unencrypted archives: a run-owned volume, removed
@@ -565,8 +565,10 @@ class AioTopology:
             privileged=True,
             volumes=(
                 f"{self._ca_dir}:{CA_MOUNT}:ro,Z",
-                # The subscription routes are loopback-only, so the payloads are
-                # fetched on the host and handed to the engine client from here.
+                # The payloads are fetched on the host and handed to the engine
+                # client from here: the client's shortUuid is read from the
+                # Panel's loopback API, and the bytes stay in a run-owned secret
+                # directory rather than in an artifact.
                 f"{self.payload_dir}:{PAYLOAD_MOUNT}:Z",
                 # The product writes its archives here; a run-owned volume keeps
                 # them out of the container layer and out of every artifact.

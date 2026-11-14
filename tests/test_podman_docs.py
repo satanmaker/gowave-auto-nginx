@@ -679,12 +679,20 @@ class TestLiveContractReconciliation(unittest.TestCase):
 
     def test_the_cache_control_contract_is_asserted_where_the_page_says(self):
         self.assertIn("`Cache-Control: no-store`", self.prose)
+        self.assertIn("read where a client reads it", self.prose)
         nginx = (REPO_ROOT / "modules" / "nginx.sh").read_text(encoding="utf-8")
         location = nginx[nginx.index("location ^~ /api/sub/"):]
         self.assertIn('add_header Cache-Control "no-store', location.split("location ", 1)[-1],
                       "the vhost no longer disables caching on the subscription location")
-        self.assertIn('"no-store" in str(record.get("cache_control") or "").lower()',
-                      function_body("tools/podman_e2e/aio.py", "case_subscriptions"))
+        case = function_body("tools/podman_e2e/aio.py", "case_subscriptions")
+        self.assertIn('record.get("edge_cache_control")', case,
+                      "the case stopped reading the header from the public edge")
+        self.assertIn('record.get("edge_identical") is True', case)
+        collect = function_body("tools/podman_e2e/aio.py", "collect_subscriptions")
+        self.assertIn("--edge-base https://{host.panel_domain}", collect,
+                      "the probe is no longer pointed at the public edge")
+        self.assertIn("GOWAVE_ACME_TEST_CA_FILE", collect,
+                      "the edge fetch is no longer given the run's CA bundle")
         self.assertIn('"cache_control": (response.getheader("Cache-Control") or "")',
                       function_body("tools/podman_e2e/panel_surface.py", "fetch"))
 
