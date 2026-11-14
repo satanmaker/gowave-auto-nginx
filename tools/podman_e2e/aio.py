@@ -1411,13 +1411,15 @@ class AioProduct:
         if self._subscription_error:
             raise CaseBlocked(f"SUB-SERVED: {self._subscription_error}")
         host = self.require_installed()
-        ca_file = str(host.install_environment().get("GOWAVE_ACME_TEST_CA_FILE", ""))
+        # The run CA is mounted into every role before the install starts, so the
+        # edge fetch verifies against the certificates the fixture directory
+        # issued and against nothing else.
+        ca_file = f"{topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}"
         arguments = [
             f"--payload-dir {topology.PAYLOAD_MOUNT}",
             f"--edge-base https://{host.panel_domain}",
+            f"--ca {ca_file}",
         ]
-        if ca_file:
-            arguments.append(f"--ca {ca_file}")
         result = self.host_script(
             f"python3 {PANEL_SURFACE_SCRIPT} --scope subscriptions " + " ".join(arguments)
         )
