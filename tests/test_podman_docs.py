@@ -113,6 +113,73 @@ def row_for(word: str) -> bool:
     return any(row == word or row.startswith(f"{word} ") for row in entrypoint_rows())
 
 
+BACKEND = REPO_ROOT / "sources" / "gowave" / "backend-go"
+CLIENT = REPO_ROOT / "modules" / "api_client.py"
+API_HEADING = "## The Panel API the suite is written to"
+ENDPOINT = re.compile(r"`([A-Z]+) (/api/[^`]+)`")
+DECLARATION = re.compile(r"`([\w./-]+\.go):(\d+)`")
+CALL_SITE = re.compile(r"`((?:modules|tools)/[\w./-]+\.py):(\d+)`")
+GO_VERB = {"get": "GET", "post": "POST", "patch": "PATCH", "put": "PUT", "delete": "DELETE"}
+GO_ROUTE = re.compile(r'\.(Get|Post|Patch|Put|Delete)\("(/api/[^"]+)"')
+
+
+def api_section() -> str:
+    text = discovered()
+    start = text.index(API_HEADING)
+    return text[start : text.index("\n## ", start + len(API_HEADING))]
+
+
+def normalised(path: str) -> str:
+    """A route with its placeholder names erased, so `{uuid}` equals `{userId}`."""
+    return re.sub(r"\{[^}]*\}", "{}", path)
+
+
+def api_rows():
+    """Each API table row as the four cells the page promises, whitespace removed."""
+    rows = []
+    for line in api_section().splitlines():
+        if not line.startswith("| ") or line.startswith("| ---"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) != 4 or cells[1] == "Endpoint":
+            continue
+        rows.append({"area": cells[0], "endpoint": cells[1], "declaration": cells[2], "caller": cells[3]})
+    return rows
+
+
+def row_routes(row) -> set:
+    return {(method, normalised(path)) for method, path in ENDPOINT.findall(row["endpoint"])}
+
+
+def covers(mapped: str, called: str) -> bool:
+    """Whether a mapped route answers a call: its placeholders stand for any segment."""
+    mapped_parts = normalised(mapped).split("/")
+    called_parts = normalised(called).split("/")
+    if len(mapped_parts) != len(called_parts):
+        return False
+    return all(mapped_part in ("{}", called_part) for mapped_part, called_part in zip(mapped_parts, called_parts))
+
+
+def page_routes() -> set:
+    return {route for row in api_rows() for route in row_routes(row)}
+
+
+def client_routes() -> set:
+    """Every (method, path) `modules/api_client.py` asks the Panel to serve."""
+    return {
+        (method, normalised(path))
+        for method, path in re.findall(r'"(GET|POST|PATCH|PUT|DELETE)",\s*f?"(/api/[^"]+)"', CLIENT.read_text(encoding="utf-8"))
+    }
+
+
+def backend_tree() -> bool:
+    return (BACKEND / "internal" / "server" / "server.go").is_file()
+
+
+def representation_paths():
+    return yaml.safe_load(MATRIX.read_text(encoding="utf-8"))["representations"]
+
+
 class TestDiscoveryInventory(unittest.TestCase):
     """The product surface page says what the product and the manifest say.
 
@@ -146,6 +213,133 @@ class TestDiscoveryInventory(unittest.TestCase):
 
     def test_the_guide_links_the_discovery_page(self):
         self.assertIn("docs/PODMAN_E2E_DISCOVERY.md", documented())
+
+
+class TestPanelApiContract(unittest.TestCase):
+    """The Panel API map on the discovery page is the map the code uses.
+
+    A page that lists endpoints the product never calls, or omits one it does,
+    reads as documentation and behaves as a trap: the reader checks the Panel
+    against a route nothing uses, or debugs a call the page never mentions. The
+    rows are therefore compared with `modules/api_client.py`, with the vendored
+    Panel and with the representations the manifest declares, and each
+    `file:line` is resolved rather than trusted.
+
+    `sources/gowave` is a local checkout — `/sources/` is in `.gitignore` — so
+    the two tests that read the Go declarations skip where the tree is absent,
+    naming what did not run. Everything else runs in CI.
+    """
+
+    def test_the_page_maps_every_panel_call_the_product_makes(self):
+        self.assertGreaterEqual(len(api_rows()), 25, "the API map has almost no rows, so it proves nothing")
+        missing = sorted(client_routes() - page_routes())
+        self.assertEqual(
+            missing, [],
+            "modules/api_client.py calls a route the discovery page does not map",
+        )
+
+    def test_every_row_cites_a_declaration_and_a_caller(self):
+        areas = set()
+        for row in api_rows():
+            with self.subTest(endpoint=row["endpoint"]):
+                self.assertEqual(len(ENDPOINT.findall(row["endpoint"])), 1, "a row must name exactly one endpoint")
+                self.assertRegex(row["endpoint"], r"^`(GET|POST|PATCH|PUT|DELETE) /api/")
+                self.assertTrue(DECLARATION.findall(row["declaration"]), "a row must cite the Go declaration")
+                self.assertTrue(
+                    CALL_SITE.findall(row["caller"]) or "none" in row["caller"],
+                    "a row must cite its caller, or say none and why",
+                )
+                areas.add(row["area"])
+        self.assertGreaterEqual(
+            areas,
+            {"authentication", "node registration", "provisioning", "client lifecycle", "update", "subscription"},
+            "the map must keep the areas the product's flows are divided into",
+        )
+
+    def test_every_cited_client_line_makes_the_call_it_is_cited_for(self):
+        for row in api_rows():
+            expected = {path for _, path in row_routes(row)}
+            for name, number in CALL_SITE.findall(row["caller"]):
+                with self.subTest(caller=f"{name}:{number}"):
+                    lines = (REPO_ROOT / name).read_text(encoding="utf-8").splitlines()
+                    self.assertLessEqual(int(number), len(lines), f"{name}:{number} is past the end of the file")
+                    cited = set(re.findall(r'"(/api/[^"]+)"', lines[int(number) - 1]))
+                    self.assertTrue(
+                        any(covers(mapped, call) for mapped in expected for call in cited),
+                        f"{name}:{number} does not call {row['endpoint']}; it calls {sorted(cited)}",
+                    )
+
+    def test_the_cited_panel_tree_still_declares_every_route(self):
+        if not backend_tree():
+            self.skipTest(
+                "sources/gowave is a local checkout (/sources/ is gitignored): "
+                "the Go route declarations were not re-read in this run"
+            )
+        for row in api_rows():
+            expected = row_routes(row)
+            for name, number in DECLARATION.findall(row["declaration"]):
+                with self.subTest(declaration=f"{name}:{number}"):
+                    source = BACKEND / name
+                    self.assertTrue(source.is_file(), f"{name} is not in the vendored Panel")
+                    lines = source.read_text(encoding="utf-8").splitlines()
+                    self.assertLessEqual(int(number), len(lines), f"{name}:{number} is past the end of the file")
+                    declared = {(GO_VERB[verb.lower()], normalised(path)) for verb, path in GO_ROUTE.findall(lines[int(number) - 1])}
+                    self.assertTrue(
+                        declared & expected,
+                        f"{name}:{number} declares {sorted(declared)} but the row promises {sorted(expected)}",
+                    )
+
+    def test_the_documented_panel_revision_is_the_one_in_the_tree(self):
+        section = api_section()
+        self.assertIn("sources/gowave/backend-go", section)
+        revision = re.search(r"`v[\d.]+-\d+-g([0-9a-f]+)`", section)
+        self.assertIsNotNone(revision, "the page does not pin the Panel revision its citations came from")
+        if not (BACKEND.parent / ".git").exists():
+            self.skipTest("sources/gowave carries no git metadata here: the documented revision was not compared")
+        head = subprocess.run(
+            ["git", "-C", str(BACKEND.parent), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=60, check=True,
+        ).stdout.strip()
+        self.assertEqual(
+            revision.group(1), head,
+            "the page was written against another revision of the vendored Panel; re-read it before trusting the map",
+        )
+
+    def test_every_manifest_representation_is_served_by_the_client_type_switch(self):
+        representations = representation_paths()
+        section = api_section()
+        self.assertIn(("GET", normalised("/api/sub/{shortUuid}")), page_routes())
+        self.assertIn(("GET", normalised("/api/sub/{shortUuid}/{clientType}")), page_routes())
+        for name in representations:
+            with self.subTest(representation=name):
+                self.assertIn(f"`{name}`", section, "the map does not name a representation the manifest declares")
+        if not backend_tree():
+            self.skipTest(
+                "sources/gowave is a local checkout (/sources/ is gitignored): "
+                "the client-type switch was not re-read, so the suffix arms were not checked in this run"
+            )
+        switch = (BACKEND / "internal" / "subscription" / "srr.go").read_text(encoding="utf-8")
+        arms = set(re.findall(r'case ((?:"[\w-]+"(?:, )?)+):', switch))
+        served = {name.strip('"') for arm in arms for name in re.findall(r'"([\w-]+)"', arm)}
+        self.assertIn("v2ray-json", served, "the handler's client-type switch moved; re-read the subscription route")
+        for name, path in representations.items():
+            with self.subTest(representation=name):
+                segment = path.rstrip("/").rsplit("/", 1)[-1]
+                if name == "base64":
+                    self.assertEqual(segment, "{shortUuid}", "the base64 representation is not the bare route")
+                    continue
+                self.assertIn(
+                    segment, served,
+                    f"tests/cases/matrix.yaml asks for /{segment} but the Panel answers that arm with BLOCK",
+                )
+
+    def test_the_client_update_is_recorded_as_a_gap_not_as_not_applicable(self):
+        rows = [row for row in api_rows() if "PATCH /api/users" in row["endpoint"]]
+        self.assertEqual(len(rows), 2, "the map must record both client-update routes the pinned Panel serves")
+        for row in rows:
+            with self.subTest(endpoint=row["endpoint"]):
+                self.assertIn("coverage gap", row["caller"], "a supported route with no caller is a gap, not a NOT_APPLICABLE")
+        self.assertIn("not a `NOT_APPLICABLE`", api_section())
 
 
 class TestPodmanE2EDocumentation(unittest.TestCase):

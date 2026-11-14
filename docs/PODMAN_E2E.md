@@ -7,9 +7,11 @@ mounted read-only at `/repo`, and each run owns its own networks, volumes and
 containers. No live host, live credential or public DNS name is involved.
 
 What the suite accepts — the product's operator entrypoints, its install modes,
-the topologies and which of them a case actually invokes — is recorded in
+the topologies and which of them a case actually invokes, and the Panel API the
+product's own client and the probes are written to — is recorded in
 `docs/PODMAN_E2E_DISCOVERY.md`, which is read back against `gowave-auto.sh`,
-`tests/cases/matrix.yaml` and `tests/cases/catalog.yaml` by the nonroot suite.
+`modules/api_client.py`, the vendored Panel, `tests/cases/matrix.yaml` and
+`tests/cases/catalog.yaml` by the nonroot suite.
 
 ## What a run builds
 
