@@ -1,0 +1,80 @@
+# The merge gate, written down.
+#
+# Three places decide whether a change may merge into a protected branch: this
+# contract, the workflow that publishes the status checks, and the repository
+# ruleset GitHub actually evaluates. They are kept equal by
+# `python3 -m tools.podman_e2e.gate --check` (offline, in the nonroot suite) and
+# `--live` (the ruleset read back). Editing a name here without editing the job
+# is refused, which is the point: a required check nothing publishes sits
+# `Expected` forever and blocks everybody but the bypass actor.
+schema: gowave-podman-gates/v1
+repository: satanmaker/gowave-auto-nginx
+workflow: podman-acceptance.yml
+
+# The live shape of ruleset 27258177, copied rather than paraphrased, because
+# `--live` compares these fields with what the API returns. `include` is exactly
+# the two branches: on any other ref the checks are informational only.
+ruleset:
+  id: 27258177
+  name: GoWave Podman acceptance
+  enforcement: active
+  include:
+    - refs/heads/main
+    - refs/heads/feature/podman-full-e2e
+  do_not_enforce_on_create: false
+  strict_required_status_checks_policy: false
+  bypass_actors:
+    - actor_id: 337811468
+      actor_type: User
+      bypass_mode: always
+  required_status_checks:
+    - All-in-One Podman Acceptance
+    - Multi-Node Podman Acceptance
+    - All-in-One Lifecycle and Recovery Acceptance
+    - Multi-Node Lifecycle and Recovery Acceptance
+
+# One entry per required check. `topology` and `group` say which half of the
+# matrix the job proves; the audit reads them back out of the job's own command
+# line, so a job that runs the other topology fails here rather than in a
+# review. `events` is what the job's `if:` must allow: the two full suites run
+# on every push as well, the two recovery jobs only where a review can stop the
+# merge, because a push already spends the minutes on the full pair.
+checks:
+  - name: All-in-One Podman Acceptance
+    topology: aio
+    group:
+    events: [push, pull_request, workflow_dispatch]
+    timeout_minutes: 45
+    artifact_prefix: podman-aio-
+  - name: Multi-Node Podman Acceptance
+    topology: multi-node
+    group:
+    events: [push, pull_request, workflow_dispatch]
+    timeout_minutes: 60
+    artifact_prefix: podman-multi-node-
+  - name: All-in-One Lifecycle and Recovery Acceptance
+    topology: aio
+    group: recovery
+    events: [pull_request, workflow_dispatch]
+    timeout_minutes: 45
+    artifact_prefix: podman-aio-recovery-
+  - name: Multi-Node Lifecycle and Recovery Acceptance
+    topology: multi-node
+    group: recovery
+    events: [pull_request, workflow_dispatch]
+    timeout_minutes: 60
+    artifact_prefix: podman-multi-node-recovery-
+
+# A change to one of these paths reaches backup, restore, channel update or
+# rollback code, so it must be judged by the recovery cases. The gate is the
+# pull-request trigger of the workflow, which is why the audit refuses a
+# `paths:` filter on that trigger: a filter is the only mechanism that could
+# keep a required check from running for a change to one of these paths, and a
+# check that never runs reads as `Expected`, not as a failure.
+lifecycle_paths:
+  - gowave-auto.sh
+  - gowave-node-auto.sh
+  - assets/backup/
+  - modules/
+  - tools/podman_e2e/
+  - tests/podman_testbed.sh

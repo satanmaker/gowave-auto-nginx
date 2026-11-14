@@ -642,9 +642,14 @@ def _run_count_problems(directory: Path) -> List[str]:
     return failures
 
 
-def report_problems(table: Dict[str, Any], path: Path = REPORT_PATH) -> List[str]:
-    """Why the published report is not the text the table renders to."""
-    path = Path(path)
+def report_problems(table: Dict[str, Any], path: Optional[Path] = None) -> List[str]:
+    """Why the published report is not the text the table renders to.
+
+    The path is resolved here rather than bound as a default, so a caller that
+    points the published report somewhere else — a test, a dry run — is judged
+    on the file it named.
+    """
+    path = Path(REPORT_PATH if path is None else path)
     try:
         label = str(path.relative_to(REPO_ROOT))
     except ValueError:
@@ -693,8 +698,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"traceability: {run} executed every positive case it owes")
         return 0
     # ``--markdown`` regenerates the report it is about to judge, so the report
-    # check runs after the write and not before it.
-    table, problems = audited(include_report=False)
+    # check runs after the write and not before it; every other mode judges the
+    # published page as it stands, because a report nobody re-renders is a page
+    # that has already drifted.
+    table, problems = audited(include_report=not markdown)
     if markdown and problems:
         print("traceability: refusing to publish a report over a table that disagrees")
         for problem in problems:

@@ -224,6 +224,35 @@ push already spends the minutes on the two full suites. The transport testbed
 `.github/workflows/systemd-acceptance.yml` as independent gates and are not
 replaced by this workflow.
 
+Those four names are also a contract that is checked in, because a required
+check is written down in three places and a name that drifts in one of them
+leaves the gate open: `tests/cases/gates.yaml` names each check, its topology,
+its case group, its timeout and the prefix its report is uploaded under;
+`podman-acceptance.yml` publishes them; and the repository ruleset decides what
+GitHub requires. The audit reads all three:
+
+```bash
+python3 -m tools.podman_e2e.gate --check   # contract vs workflow, offline
+python3 -m tools.podman_e2e.gate --live    # also reads ruleset 27258177 back
+```
+
+`--check` runs in the nonroot suite, so a renamed job, a job that runs the other
+topology, a job that runs both, a raised timeout, a path filter on the
+`pull_request` trigger or a suite-running job the ruleset does not require fails
+a test rather than a review. `--live` additionally refuses a disabled ruleset, a
+widened branch list or a changed bypass actor, and exits `2` when `gh` cannot
+answer, because an unread ruleset is not a passing one.
+
+An omitted topology cannot read as PASS because no job aggregates the two: the
+ruleset requires four names, two of them per topology. The same question can be
+asked of a directory of finished runs, where `PASS` is a claim about the pair —
+the newest run of each topology must exist, pass, carry the positive-case count
+the matrix owes it, and measure one commit:
+
+```bash
+python3 -m tools.podman_e2e.gate --artifacts artifacts/podman-e2e
+```
+
 The harness itself is tested without root:
 
 ```bash
