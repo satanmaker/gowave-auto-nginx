@@ -320,7 +320,9 @@ requirements:
   - requirement: Pre-push and pull-request acceptance gate
     scenarios:
       - scenario: Pre-push run blocks a regressed change
-        gap: 8.14 — no pre-push entrypoint or git hook exists yet
+        tests:
+          - tests.test_podman_pre_push.TestPrePushGate
+        jobs: ["Lint, Completeness, and Suite Nonroot"]
       - scenario: Budget overrun is not a truncated pass
         gap: 8.15 — GATE-BUDGET is catalogued but no suite declares it
 

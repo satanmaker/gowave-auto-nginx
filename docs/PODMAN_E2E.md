@@ -76,6 +76,35 @@ The matrix declares narrower per-topology budgets (`runtime_budget_seconds`
 2700 s and 4500 s in `tests/cases/matrix.yaml`); the defaults above are wider
 because a run also pays for image pulls and the install itself.
 
+## Pre-push gate
+
+The pull request gate is not the first place a regression should be caught.
+`tools/pre_push_e2e.py` runs the two full suites before a push leaves the
+machine, and installs the hook that runs it:
+
+```bash
+python3 -m tools.pre_push_e2e --install-hook   # writes .git/hooks/pre-push
+python3 -m tools.pre_push_e2e --list           # what the gate would run
+sudo python3 -m tools.pre_push_e2e             # same thing, now
+```
+
+Which topologies it runs is read from the `gate:` list of
+`tests/cases/matrix.yaml`, so a topology the manifest puts behind `pre-push` is
+run without editing the gate, and one it does not gate is never silently skipped
+into a shorter green. Each run is the same
+`python3 -m tools.run_podman_e2e --topology <t>` the acceptance jobs invoke,
+with the fixtures pinned by the matrix — no live host, no credential, no public
+DNS name — and it prints the commit and tree it judges.
+
+A failing topology stops the gate and the remaining ones are printed as
+`not run`: a later green suite would not change the verdict, and reporting it as
+checked when it was not is the one thing a gate must not do. The suites
+provision privileged systemd containers, so the gate runs as root, which is why
+the installed hook is `exec sudo python3 -m tools.pre_push_e2e`; `sudo` may
+prompt, and `git push --no-verify` bypasses the hook — the pull request gate
+then judges the change, which is where the required checks live. The installer
+owns only a hook carrying its own marker and refuses to replace a foreign one.
+
 ## Reading a result
 
 Every run writes `artifacts/podman-e2e/<run_id>/` where the run id is
