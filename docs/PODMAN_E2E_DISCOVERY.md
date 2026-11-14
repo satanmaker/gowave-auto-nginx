@@ -328,6 +328,22 @@ only the loopback answer and failed a real run
 although the vhost sent the header: the case, not the product, was wrong, and
 the two-vantage read is what closes that gap rather than a wider tolerance.
 
+**The database is read where the Panel writes it.** `AIO-FAULT-DISK` runs the
+operator's `backup --type panel` against a store with no room left, and the claim
+is that the failure publishes nothing and leaves the Panel's data alone. That
+data is not a dump compared end to end: a running Panel writes its own rows — a
+node heartbeat, a traffic sample, the rows a fresh process writes when it starts
+— so the case reads every table and its row count before and after and requires
+that no table and no row the database held is gone, then reads the client list
+and the digest of all five representations through the Panel's API, which is the
+same surface the channel cases use for their own database claim. The whole-dump
+digest is reported as `database_dump_digest_changed` instead of asserted. The
+first version compared the dump itself and failed run
+`podman-aio-20261114T195129-29de0443` (`AIO-FAULT-DISK`, one table's rows moved
+between the two reads, in a window that followed `AIO-RESTART`'s
+`systemctl restart gowave.service`), although the failed backup had published
+nothing: the case, not the product, was measuring the Panel's own writes.
+
 **The engines are the same binaries, pinned differently.** Both suites validate
 with the real Xray and Mihomo, and neither substitutes a parser for the engine:
 `mihomo -t` and `xray run -test` are what accept a representation, and the

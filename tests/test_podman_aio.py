@@ -692,6 +692,18 @@ class TestChannelCases(unittest.TestCase):
         self.assertEqual(facts["journal"], {})
         self.assertEqual(facts["snapshots"], [])
 
+    def test_the_state_probe_counts_the_rows_of_every_table(self):
+        snapshot = self.tree(Path(self.tmp.name) / "recovery" / "update-1")
+        database = sqlite3.connect(snapshot / "gowave.db")
+        try:
+            database.execute("insert into users (name) values ('bob')")
+            database.commit()
+        finally:
+            database.close()
+        facts = self.probe(aio.channel_state_paths(str(snapshot)))
+        self.assertEqual(facts["database"]["tables"], ["users"])
+        self.assertEqual(facts["database"]["rows"], {"users": 2})
+
     def test_the_state_probe_reports_a_file_that_is_not_a_database(self):
         snapshot = self.tree(Path(self.tmp.name) / "recovery" / "update-1")
         (snapshot / "gowave.db").write_bytes(b"this is not a sqlite database\n")
@@ -1146,6 +1158,145 @@ class TestChannelCases(unittest.TestCase):
         self.assertEqual(record["state"], "incubating")
         self.assertEqual(record["runs_in"], ["podman"])
         self.assertEqual(record["topology"], ["aio"])
+
+
+class TestBackupStoreFullCase(unittest.TestCase):
+    """AIO-FAULT-DISK: what counts as "the failed backup damaged nothing".
+
+    The Panel reads and writes its own rows while the operator's backup fails, so
+    a whole-dump comparison across that window measures the Panel, not the
+    backup. The case reads what a failure can destroy — the tables and rows the
+    database held — and what a client can observe — the client list and the bytes
+    of every representation.
+    """
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def state(self, **overrides):
+        facts = {
+            "database": {
+                "integrity": "ok",
+                "logical": "l" * 64,
+                "tables": ["nodes", "users"],
+                "rows": {"nodes": 1, "users": 1},
+            },
+            "env_digest": "e" * 64,
+            "frontend": "f" * 64,
+            "state": "s" * 64,
+            "nginx": "n" * 64,
+            "letsencrypt": "a" * 64,
+            "unit": {"ActiveState": "active"},
+            "health": 200,
+        }
+        facts.update(overrides)
+        return facts
+
+    def surface(self, **overrides):
+        facts = {
+            "readback_status": 200,
+            "short_uuid_length": 16,
+            "inventory_status": 200,
+            "users": 1,
+            "users_captured": 1,
+            "inventory_identical": True,
+            "user_present": True,
+            "representations": {
+                name: {"status": 200, "bytes": 128} for name in aio.REPRESENTATIONS
+            },
+            "representations_identical": {name: True for name in aio.REPRESENTATIONS},
+        }
+        facts.update(overrides)
+        return facts
+
+    def fault(self, **overrides):
+        facts = {
+            "free_kb": "12",
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "The backup store has 12 KiB free; nothing was published.\n",
+            "files_during": ["filler"],
+            "returncode_after": 0,
+            "stderr_after": "",
+            "archive": "gowave-backup-panel-20261114-000000.tar.gz",
+            "archive_mode": "600",
+            "archive_bytes": "78912",
+            "verify_returncode": 0,
+            "verify_output": "15-point preflight archive validation PASSED.\n",
+            "unit": {"gowave.service": "active"},
+            "health": 200,
+        }
+        facts.update(overrides)
+        return facts
+
+    def run_case(self, before=None, after=None, capture=None, verified=None, facts=None):
+        product, _ = installed_product(self.context, [
+            (json.dumps(before if before is not None else self.state()), 0),
+            (json.dumps({"channel": capture if capture is not None else self.surface()}), 0),
+            (json.dumps(facts if facts is not None else self.fault()), 0),
+            (json.dumps(after if after is not None else self.state()), 0),
+            (json.dumps({"channel": verified if verified is not None else self.surface()}), 0),
+        ])
+        return aio.case_backup_store_full(product)
+
+    def test_the_case_keeps_every_row_the_panel_had_and_the_bytes_it_served(self):
+        after = self.state(database={
+            "integrity": "ok",
+            "logical": "m" * 64,
+            "tables": ["nodes", "users"],
+            "rows": {"nodes": 3, "users": 1},
+        })
+        evidence = self.run_case(after=after)
+        self.assertEqual(evidence["database_integrity"], "ok")
+        self.assertEqual(evidence["database_tables"], 2)
+        self.assertEqual(evidence["database_rows_before"], 2)
+        self.assertEqual(evidence["database_rows_after"], 4)
+        # The Panel wrote its own rows in this window: recorded, not refused.
+        self.assertEqual(evidence["database_dump_digest_changed"], "true")
+        self.assertEqual(evidence["representations_identical"], len(aio.REPRESENTATIONS))
+        self.assertEqual(evidence["clients_served"], 1)
+        self.assertEqual(evidence["seconds_fault"] >= 0, True)
+        self.assertEqual(evidence["archive_mode"], "600")
+
+    def test_a_failed_backup_that_lost_rows_fails_the_case(self):
+        after = self.state(database={
+            "integrity": "ok", "logical": "l" * 64,
+            "tables": ["nodes", "users"], "rows": {"nodes": 1, "users": 0},
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(after=after)
+        self.assertIn("lost rows the Panel stored (before, after): {'users': [1, 0]}",
+                      str(caught.exception))
+
+    def test_a_failed_backup_that_lost_a_table_fails_the_case(self):
+        after = self.state(database={
+            "integrity": "ok", "logical": "l" * 64,
+            "tables": ["nodes"], "rows": {"nodes": 1},
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(after=after)
+        self.assertIn("no longer holds ['users']", str(caught.exception))
+
+    def test_a_failed_backup_that_changed_the_served_bytes_fails_the_case(self):
+        changed = {name: True for name in aio.REPRESENTATIONS}
+        changed["base64"] = False
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(verified=self.surface(representations_identical=changed))
+        self.assertIn("changed the bytes the Panel serves its client", str(caught.exception))
+
+    def test_a_failed_backup_that_lost_the_client_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(verified=self.surface(
+                inventory_identical=False, user_present=False, users=0,
+            ))
+        self.assertIn("changed the client inventory", str(caught.exception))
+
+    def test_the_case_will_not_measure_a_host_that_served_no_client_before_the_fault(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(capture=self.surface(readback_status=500, short_uuid_length=0))
+        self.assertIn("served no default client before the fault", str(caught.exception))
 
 
 class TestPanelApiCases(unittest.TestCase):

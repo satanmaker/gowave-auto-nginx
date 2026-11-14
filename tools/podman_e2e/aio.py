@@ -2447,9 +2447,19 @@ def case_backup_store_full(product: AioProduct) -> Dict[str, Any]:
     failing would be the worse defect, and the same command is run again after
     the fault is removed so "the store refused" is separated from "backup is
     broken".
+
+    The database is read where the Panel serves it. A running Panel writes to
+    SQLite on its own schedule — a heartbeat, a traffic sample, the rows it
+    writes when it starts — so a dump comparison across a window in which the
+    Panel served would measure the Panel's own write log, not the fault; the
+    rows are read as "nothing the database held is gone" and the client surface
+    is compared byte for byte through the API.
     """
     product.require_installed()
+    read_started = time.monotonic()
     before = channel_state(product, BACKUP_FAULT_CASE_ID)
+    captured = channel_client_surface(product, BACKUP_FAULT_CASE_ID, "capture")
+    before_seconds = round(time.monotonic() - read_started, 3)
     require(
         BACKUP_FAULT_CASE_ID,
         before.get("database", {}).get("integrity") == "ok"
@@ -2458,11 +2468,19 @@ def case_backup_store_full(product: AioProduct) -> Dict[str, Any]:
         f"{before.get('database', {}).get('integrity')!r}, unit "
         f"{before.get('unit', {}).get('ActiveState')!r}",
     )
+    require(
+        BACKUP_FAULT_CASE_ID,
+        captured.get("readback_status") == 200 and captured.get("short_uuid_length"),
+        f"the Panel served no default client before the fault, so keeping it afterwards "
+        f"would prove nothing: {captured!r}",
+    )
 
+    fault_started = time.monotonic()
     facts = probe_json(
         BACKUP_FAULT_CASE_ID, "the backup store fault",
         product.host_script(backup_fault_script(), timeout=BACKUP_FAULT_TIMEOUT_SECONDS),
     )
+    fault_seconds = round(time.monotonic() - fault_started, 3)
     require(
         BACKUP_FAULT_CASE_ID, int(facts.get("free_kb") or 0) < 64,
         f"the injected store still had {facts.get('free_kb')!r} KiB free, so the write was not "
@@ -2488,24 +2506,22 @@ def case_backup_store_full(product: AioProduct) -> Dict[str, Any]:
         "offered an archive that cannot be complete",
     )
 
+    after_started = time.monotonic()
     after = channel_state(product, BACKUP_FAULT_CASE_ID)
-    # The database is read by its integrity and by its rows, never by its file
-    # digest: the product checkpoints the WAL before it stages a copy, so even a
-    # backup that publishes nothing moves the pages of the live file while the
-    # content the Panel stores stays the same. Everything else is written by the
-    # operator's configuration and must not move at all.
-    require(
-        BACKUP_FAULT_CASE_ID, after.get("database", {}).get("integrity") == "ok",
-        f"the database does not pass integrity_check after the failed backup: "
-        f"{after.get('database', {}).get('integrity')!r}",
+    surface = channel_client_surface(product, BACKUP_FAULT_CASE_ID, "verify")
+    after_seconds = round(time.monotonic() - after_started, 3)
+    # The database is read by its integrity, by the tables it holds and by the
+    # rows it kept, never by its file digest or by a whole-dump digest: the
+    # product checkpoints the WAL before it stages a copy, so even a backup that
+    # publishes nothing moves the pages of the live file, and the Panel writes
+    # its own rows while it serves. What a failed backup can destroy is what is
+    # asserted. Everything else is written by the operator's configuration and
+    # must not move at all.
+    database = require_database_intact(
+        BACKUP_FAULT_CASE_ID, before, after, "after the failed backup",
     )
-    require(
-        BACKUP_FAULT_CASE_ID,
-        bool(before.get("database", {}).get("logical"))
-        and after.get("database", {}).get("logical") == before.get("database", {}).get("logical"),
-        f"the failed backup changed the rows the Panel stores: "
-        f"{after.get('database', {}).get('logical')!r} vs "
-        f"{before.get('database', {}).get('logical')!r}",
+    served = require_served_surface_unchanged(
+        BACKUP_FAULT_CASE_ID, captured, surface, "the failed backup",
     )
     for field, label in (
         ("env_digest", "the environment file"),
@@ -2558,11 +2574,114 @@ def case_backup_store_full(product: AioProduct) -> Dict[str, Any]:
         "archive_mode": facts.get("archive_mode"),
         "verify_returncode": facts.get("verify_returncode"),
         "database_integrity": after.get("database", {}).get("integrity"),
-        "database_rows_unchanged": str(
-            after.get("database", {}).get("logical") == before.get("database", {}).get("logical")
+        "database_tables": database.get("tables"),
+        "database_tables_added": ",".join(database.get("tables_added") or []),
+        "database_rows_before": database.get("rows_before"),
+        "database_rows_after": database.get("rows_after"),
+        "database_dump_digest_changed": str(
+            after.get("database", {}).get("logical") != before.get("database", {}).get("logical")
         ).lower(),
+        "clients_served": served.get("users"),
+        "clients_captured": served.get("users_captured"),
+        "representations_identical": served.get("representations_identical"),
+        "seconds_before": before_seconds,
+        "seconds_fault": fault_seconds,
+        "seconds_after": after_seconds,
         "unit_state": after.get("unit", {}).get("ActiveState"),
         "health": facts.get("health"),
+    }
+
+
+def require_database_intact(
+    case_id: str, before: Dict[str, Any], after: Dict[str, Any], what: str,
+) -> Dict[str, Any]:
+    """The database lost no table and no row, and what the Panel added is named.
+
+    Two statements are kept apart on purpose. A failed backup can only destroy,
+    so destruction is asserted: the integrity check, every table that was there,
+    and every row it held. Growth is the Panel's own writing — its heartbeat, a
+    traffic sample, the rows a fresh process writes on startup — and is reported
+    as evidence rather than refused, because a window in which the Panel served
+    cannot have a stable dump and a case that pretended otherwise would fail on
+    the Panel's schedule instead of on the backup's behaviour.
+    """
+    database_before = before.get("database") or {}
+    database_after = after.get("database") or {}
+    require(
+        case_id, database_after.get("integrity") == "ok",
+        f"the database does not pass integrity_check {what}: "
+        f"{database_after.get('integrity')!r}",
+    )
+    tables_before = [str(name) for name in database_before.get("tables") or []]
+    tables_after = [str(name) for name in database_after.get("tables") or []]
+    require(
+        case_id, bool(tables_before),
+        f"the database listed no table before the fault, so nothing about its schema "
+        f"could be compared: {database_before!r}",
+    )
+    missing = [name for name in tables_before if name not in tables_after]
+    require(
+        case_id, not missing,
+        f"the database {what} no longer holds {missing!r}, which it held before",
+    )
+    rows_before = database_before.get("rows") or {}
+    rows_after = database_after.get("rows") or {}
+    unreadable = [name for name in tables_before if not isinstance(rows_after.get(name), int)]
+    require(
+        case_id, not unreadable,
+        f"the rows of {unreadable!r} could not be counted {what}, so a table that "
+        f"cannot be read is not a table that survived: {rows_after!r}",
+    )
+    lost = {
+        name: [rows_before.get(name), rows_after.get(name)]
+        for name in tables_before
+        if isinstance(rows_before.get(name), int) and rows_after[name] < rows_before[name]
+    }
+    require(
+        case_id, not lost,
+        f"the database {what} lost rows the Panel stored (before, after): {lost!r}",
+    )
+    return {
+        "tables": len(tables_before),
+        "tables_added": [name for name in tables_after if name not in tables_before],
+        "rows_before": sum(
+            value for value in rows_before.values() if isinstance(value, int)
+        ),
+        "rows_after": sum(value for value in rows_after.values() if isinstance(value, int)),
+    }
+
+
+def require_served_surface_unchanged(
+    case_id: str, captured: Dict[str, Any], surface: Dict[str, Any], what: str,
+) -> Dict[str, Any]:
+    """The Panel serves the client it served before, byte for byte.
+
+    This is the database claim read from the side a client reads it: the client
+    list and the digest of every representation the default client fetches. A
+    backup that damaged the rows would change one of them, and neither moves on
+    the Panel's own schedule.
+    """
+    require(
+        case_id, surface.get("inventory_identical") is True,
+        f"{what} changed the client inventory: {surface.get('users')!r} clients after "
+        f"{surface.get('users_captured')!r} before",
+    )
+    require(
+        case_id, surface.get("user_present") is True,
+        "the client the Panel served before the fault is gone from its inventory",
+    )
+    identical = surface.get("representations_identical") or {}
+    require(
+        case_id, identical and all(identical.values()),
+        f"{what} changed the bytes the Panel serves its client: "
+        f"{surface.get('representations')!r}",
+    )
+    return {
+        "users": surface.get("users"),
+        "users_captured": surface.get("users_captured"),
+        "representations_identical": len(
+            [name for name, same in identical.items() if same]
+        ),
     }
 
 
@@ -5340,6 +5459,21 @@ def database(path):
         connection = sqlite3.connect("file:" + path + "?mode=ro", uri=True)
         try:
             record["integrity"] = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            names = [
+                row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+                )
+            ]
+            record["tables"] = names
+            record["rows"] = {}
+            for name in names:
+                quoted = '"' + name.replace('"', '""') + '"'
+                try:
+                    record["rows"][name] = connection.execute(
+                        "SELECT COUNT(*) FROM " + quoted
+                    ).fetchone()[0]
+                except sqlite3.Error as error:
+                    record["rows"][name] = "error: " + str(error)
             dump = "\n".join(connection.iterdump())
         finally:
             connection.close()
