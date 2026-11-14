@@ -682,6 +682,11 @@ class TestRunnerEntrypoint(unittest.TestCase):
             def __init__(self, context):
                 self.context = context
 
+            def remove_stale_runs(self):
+                # The entrypoint reclaims what a killed run left behind; this stub
+                # owns no host, so nothing is older than the age limit.
+                return []
+
             def register_cleanup(self):
                 pass
 

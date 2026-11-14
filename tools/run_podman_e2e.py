@@ -109,6 +109,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.topology == "multi-node":
         context.environment["worker_vision"] = "enabled" if args.worker_vision else "disabled"
     podman = Podman(context)
+    # A run killed with SIGKILL cannot clean up after itself, so the next
+    # invocation reclaims what a run of this suite older than
+    # STALE_AFTER_SECONDS left behind. The filter is this suite's own label plus
+    # that age: a young run, another tool's container, or an unlabelled one is
+    # never touched.
+    reclaimed = podman.remove_stale_runs()
+    if reclaimed:
+        print("reclaimed from stale runs: " + ", ".join(reclaimed))
     # Containers, the network, and run images belong to the run, not the shell.
     podman.register_cleanup()
     runner = Runner(context)

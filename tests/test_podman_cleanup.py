@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Suite nonroot: stale-run reclamation for the Podman E2E (label ownership only)."""
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -7,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -114,6 +117,66 @@ class TestPodmanStaleRunRecovery(unittest.TestCase):
         podman.listings["volumes"] = []
         podman.listings["networks"] = []
         self.assertEqual(podman.remove_stale_runs(now=now), [])
+
+
+class TestEntrypointReclaimsStaleRuns(unittest.TestCase):
+    """A killed run cannot clean up, so the next invocation must, and say so."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.events = []
+
+    def _main(self, reclaimed):
+        from tools import run_podman_e2e
+
+        events = self.events
+
+        class _Podman:
+            def __init__(self, context):
+                self.context = context
+
+            def remove_stale_runs(self):
+                events.append("reclaim")
+                return reclaimed
+
+            def register_cleanup(self):
+                events.append("register")
+
+        class _Runner:
+            def __init__(self, context):
+                pass
+
+            def add(self, case):
+                pass
+
+            def on_failure(self, hook):
+                pass
+
+            def execute(self):
+                events.append("execute")
+                return 0
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(run_podman_e2e, "Podman", _Podman), \
+                mock.patch.object(run_podman_e2e, "Runner", _Runner), \
+                mock.patch.object(run_podman_e2e, "build_suite", lambda *a, **k: []), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status = run_podman_e2e.main(["--topology", "aio", "--artifact-root", str(self.tmp.name)])
+        self.assertEqual(status, 0)
+        return stdout.getvalue()
+
+    def test_reclamation_runs_before_the_first_case_and_names_what_it_took(self):
+        output = self._main(["container:old-container", "network:old-network"])
+        self.assertEqual(self.events, ["reclaim", "register", "execute"])
+        self.assertIn(
+            "reclaimed from stale runs: container:old-container, network:old-network", output
+        )
+
+    def test_a_run_with_nothing_to_reclaim_says_nothing(self):
+        output = self._main([])
+        self.assertEqual(self.events, ["reclaim", "register", "execute"])
+        self.assertNotIn("reclaimed", output)
 
 
 if __name__ == "__main__":
