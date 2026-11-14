@@ -29,6 +29,11 @@ from tools.podman_e2e.runner import Case, RunContext, Runner  # noqa: E402
 
 TOPOLOGIES = ("aio", "multi-node")
 
+# The row every CI job installs on. Named here rather than inline because
+# `docs/PODMAN_E2E_DISCOVERY.md` §The OS matrix states which row executes, and a
+# test reads this constant back against that page and against the workflows.
+DEFAULT_DISTRIBUTION = "ubuntu-24.04"
+
 
 def build_suite(
     podman: Podman, topology: str, distribution: str,
@@ -49,7 +54,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--distribution",
         choices=sorted(target_image.DISTRIBUTIONS),
-        default="ubuntu-24.04",
+        default=DEFAULT_DISTRIBUTION,
         help="Target distribution alias from tests/cases/images.lock.yaml",
     )
     parser.add_argument(

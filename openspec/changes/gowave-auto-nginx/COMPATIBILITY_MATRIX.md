@@ -13,6 +13,8 @@
 - **ADAPTED**: Requires GoWave Auto NGINX compatibility layers or workarounds to function reliably.
 - **PROJECT_CI_PLANNED**: Automated containerized or unit tests designed and scheduled in the project CI pipeline; executes during implementation phase.
 - **PROJECT_CI_TESTED**: Automated containerized or unit tests actually executed and passed on the exact commit with preserved test artifacts.
+- **PROJECT_PODMAN_EXECUTED**: The full product-level Podman acceptance suite (`tools/run_podman_e2e.py`) has executed and passed an operator install on this distribution, from the digest-pinned base in `tests/cases/images.lock.yaml`.
+- **PROJECT_PODMAN_SELECTABLE**: The distribution is pinned and the acceptance suite accepts it through `--distribution`, but no CI job and no recorded run has executed it; this is a coverage gap, not a compatibility verdict.
 - **PROJECT_E2E_PLANNED**: End-to-end clean installation, reboot survival, and protocol handshake verification designed and scheduled in full systemd environment (QEMU); executes during implementation phase.
 - **PROJECT_E2E_VERIFIED**: Real system tests actually executed and passed on the target OS with preserved test run logs.
 - **NOT_SUPPORTED**: Incompatible, broken, or explicitly excluded from support scope.
@@ -45,7 +47,7 @@
 | **systemd-resolved / DoT** | Systemd 255+ | `UPSTREAM_SUPPORTED` | `UPSTREAM_SUPPORTED` | Global DoT drop-in (`DNSOverTLS=yes`). | `community-baseline/assets/security/managed.py:17-34` |
 | **unattended-upgrades** | Distro package | `UPSTREAM_SUPPORTED` | `UPSTREAM_SUPPORTED` | Set origin to `origin=Ubuntu,archive=${distro_codename}-security`. Set `Automatic-Reboot "false"`. | `community-baseline/assets/security/managed.py:84-86` |
 | **Backup Tooling** | Format v1 | `UPSTREAM_SUPPORTED` | `UPSTREAM_SUPPORTED` | Python 3 + tar + gzip + sqlite3 CLI. | `community-baseline/assets/backup/x-ui-backup.sh:13-14` |
-| **Test Runner / QEMU** | Python 3.12+ / QEMU 8+ | `PROJECT_CI_VERIFIED` | `PROJECT_CI_VERIFIED` | Full systemd QEMU matrix guest testing across Ubuntu 24.04 and Ubuntu 26.04. | `tests/systemd/boot.sh`, `.github/workflows/systemd-acceptance.yml` |
+| **Test Runner / QEMU** | Python 3.12+ / QEMU 8+ | `PROJECT_CI_VERIFIED` | `PROJECT_CI_VERIFIED` | The `qemu-cold-boot` job boots each distribution through `tests/systemd/boot.sh` and runs `tests/run_ci.py --suite systemd` inside the guest: the systemd unit contracts on a real systemd PID 1, not an operator install. Product-level installation on this distribution is `PROJECT_PODMAN_EXECUTED` for Ubuntu 24.04 and `PROJECT_PODMAN_SELECTABLE` for Ubuntu 26.04 — see §6. | `tests/systemd/boot.sh`, `.github/workflows/systemd-acceptance.yml` |
 
 ---
 
@@ -63,7 +65,7 @@
 | **systemd-resolved / DoT** | Systemd 252+ | `ADAPTED` | `UPSTREAM_SUPPORTED` | **Debian 12 adaptation**: `systemd-resolved` is NOT installed by default. Must run `apt-get install -y systemd-resolved` when DoT is requested. | Debian 12 package inventory; `community-baseline/assets/security/managed.py:111-120` |
 | **unattended-upgrades** | Distro package | `ADAPTED` | `UPSTREAM_SUPPORTED` | **Debian adaptation**: Set origin to `origin=Debian,label=Debian-Security,codename=${distro_codename}-security`. Set `Automatic-Reboot "false"`. | `community-baseline/assets/security/managed.py:87-88` |
 | **Backup Tooling** | Format v1 | `UPSTREAM_SUPPORTED` | `UPSTREAM_SUPPORTED` | Python 3 + tar + gzip + sqlite3 CLI. | Standard POSIX tools in Debian base |
-| **Test Runner / QEMU** | Python 3.11+ / QEMU 8+ | `PROJECT_CI_VERIFIED` | `PROJECT_CI_VERIFIED` | Full systemd QEMU matrix guest testing across Debian 12 and Debian 13. | `tests/systemd/boot.sh`, `.github/workflows/systemd-acceptance.yml` |
+| **Test Runner / QEMU** | Python 3.11+ / QEMU 8+ | `PROJECT_CI_VERIFIED` | `PROJECT_CI_VERIFIED` | The `qemu-cold-boot` job boots each distribution through `tests/systemd/boot.sh` and runs `tests/run_ci.py --suite systemd` inside the guest: the systemd unit contracts on a real systemd PID 1, not an operator install. Product-level installation on this distribution is `PROJECT_PODMAN_SELECTABLE` for both — see §6. | `tests/systemd/boot.sh`, `.github/workflows/systemd-acceptance.yml` |
 
 ---
 
@@ -106,21 +108,32 @@ To prevent acceptance of corrupt or pseudo-valid subscription files, verificatio
 
 ## 6. Local Podman Multi-Distribution Testbed Matrix
 
-Before deploying to physical or virtual cloud servers, the automated test harness (`tests/podman_testbed.sh`) executes containerized pre-flight tests across all 4 supported operating systems using Podman's native systemd integration (`--systemd=always --privileged`).
+Before deploying to physical or virtual cloud servers, two harnesses use Podman's native systemd integration (`--systemd=always --privileged`): the legacy `tests/podman_testbed.sh` runs an eight-stage module pre-flight pipeline on all 4 supported operating systems, and the product-level acceptance suite `tools/run_podman_e2e.py` runs a real operator install, the NGINX/Xray traffic plane and subscription delivery inside the same kind of container. Only the second one produces a `PROJECT_PODMAN_EXECUTED` verdict for a row, and it executes the row its `--distribution` names — by default `ubuntu-24.04`.
 
 > [!NOTE]
 > Because official Docker Hub base images (`ubuntu:24.04`, `debian:12`, etc.) strip systemd and `/sbin/init` to minimize footprint, `tests/podman_testbed.sh` compiles local testbed images (`gowave-testbed-${DISTRO}:latest`) using `tests/Containerfile.testbed` to install `systemd`, `systemd-sysv`, `dbus`, `python3-systemd`, `openssh-server`, `openssh-client`, and core utilities before container execution.
 
 | Operating System | Distribution Codename | Official Base Image | Testbed Container Target | Container Init System | NGINX Version | Testbed Validation Status | Verified Adaptations in Testbed |
 |---|---|---|---|---|---|---|---|
-| **Ubuntu 24.04 LTS** | Noble Numbat | `docker.io/library/ubuntu:24.04` | `gowave-testbed-ubuntu24:latest` | `systemd` 255.4 (PID 1) | 1.24.0 (`< 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Legacy HTTP/2 syntax (`listen ... ssl http2;`), UFW bridge rules, native Panel/Node systemd units |
-| **Ubuntu 26.04 LTS** | Resolute Raccoon | `docker.io/library/ubuntu:26.04` | `gowave-testbed-ubuntu26:latest` | `systemd` 256+ (PID 1) | 1.26+ (`>= 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Modern HTTP/2 syntax (`http2 on;`), Stream multiplexing, UFW isolation |
-| **Debian 12** | Bookworm | `docker.io/library/debian:12` | `gowave-testbed-debian12:latest` | `systemd` 252.30 (PID 1) | 1.22.1 (`< 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Legacy HTTP/2 syntax (`listen ... ssl http2;`), auto-installation of `systemd-resolved`, Debian security origins |
-| **Debian 13** | Trixie | `docker.io/library/debian:13` | `gowave-testbed-debian13:latest` | `systemd` 256+ (PID 1) | 1.26.3 (`>= 1.25.1`) | `PODMAN_TESTBED_PLANNED` | Modern HTTP/2 syntax (`http2 on;`), systemd-resolved integration, Stream multiplexing |
+| **Ubuntu 24.04 LTS** | Noble Numbat | `docker.io/library/ubuntu:24.04` | `gowave-testbed-ubuntu24:latest` | `systemd` 255.4 (PID 1) | 1.24.0 (`< 1.25.1`) | `PROJECT_PODMAN_EXECUTED` | Legacy HTTP/2 syntax (`listen ... ssl http2;`), UFW bridge rules, native Panel/Node systemd units |
+| **Ubuntu 26.04 LTS** | Resolute Raccoon | `docker.io/library/ubuntu:26.04` | `gowave-testbed-ubuntu26:latest` | `systemd` 256+ (PID 1) | 1.26+ (`>= 1.25.1`) | `PROJECT_PODMAN_SELECTABLE` | Modern HTTP/2 syntax (`http2 on;`), Stream multiplexing, UFW isolation |
+| **Debian 12** | Bookworm | `docker.io/library/debian:12` | `gowave-testbed-debian12:latest` | `systemd` 252.30 (PID 1) | 1.22.1 (`< 1.25.1`) | `PROJECT_PODMAN_SELECTABLE` | Legacy HTTP/2 syntax (`listen ... ssl http2;`), auto-installation of `systemd-resolved`, Debian security origins |
+| **Debian 13** | Trixie | `docker.io/library/debian:13` | `gowave-testbed-debian13:latest` | `systemd` 256+ (PID 1) | 1.26.3 (`>= 1.25.1`) | `PROJECT_PODMAN_SELECTABLE` | Modern HTTP/2 syntax (`http2 on;`), systemd-resolved integration, Stream multiplexing |
+
+The status column is the product-level verdict and it is narrow on purpose: the
+acceptance suite defaults to `ubuntu-24.04` and no workflow passes
+`--distribution`, so one row has executed an operator install and three are
+pinned and runnable without having done so. The QEMU column of §2 covers a
+different claim — the systemd unit contracts under a real PID 1 on all four —
+and `docs/PODMAN_E2E_DISCOVERY.md` §The OS matrix, and which contour executes
+each row states both. The legacy testbed scripts identify their base images by
+mutable tag (`docker.io/library/ubuntu:24.04`) while
+`tests/cases/images.lock.yaml` pins the same four references by manifest digest
+for the acceptance suite.
 
 ### Multi-Node Distributed Edge Testbed Matrix
 
-**Status: NOT IMPLEMENTED / NOT EXECUTED (2026-11-08).** The current `multi-node` command returns exit 77 intentionally. The former script was only a three-container/SSH scaffold and did not register a real Worker, verify mTLS, or exercise VPN data-plane traffic. The table below is a target architecture and acceptance plan, not evidence of tested compatibility:
+**Status: EXECUTED (2026-11-14) at the product level; the legacy scaffold is transport-only.** `tools/run_podman_e2e.py --topology multi-node` provisions a real Master and a real Worker through the operator's own `node add` path and asserts registration, the mTLS control plane and VPN data-plane traffic per node. `tests/podman_testbed.sh multi-node` runs `tests/multi_node_testbed.sh`, whose header scopes it to "isolated three-container transport acceptance … deliberately does not claim to install GoWave Panel/Node or validate subscriptions"; the QEMU workflow still invokes that script, so a green run there proves SSH, TLS 1.3 mTLS and the source-restricted `:3002`, not this table. The rows below are the roles the product-level suite now fills:
 
 | Node Role | Target Container Image | Assigned IP / Port | Verified Services & Components | Verification Scope in Testbed |
 |---|---|---|---|---|

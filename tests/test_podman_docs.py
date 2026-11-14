@@ -714,6 +714,191 @@ class TestLiveContractReconciliation(unittest.TestCase):
                          "Panel's own writes move")
 
 
+OS_MATRIX_HEADING = "## The OS matrix, and which contour executes each row"
+IMAGES_LOCK = REPO_ROOT / "tests" / "cases" / "images.lock.yaml"
+OS_MODULE = REPO_ROOT / "modules" / "os.sh"
+BOOT_SCRIPT = REPO_ROOT / "tests" / "systemd" / "boot.sh"
+TESTBED_SCRIPT = REPO_ROOT / "tests" / "podman_testbed.sh"
+ACCEPTANCE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "podman-acceptance.yml"
+SYSTEMD_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "systemd-acceptance.yml"
+COMPATIBILITY = REPO_ROOT / "openspec" / "changes" / "gowave-auto-nginx" / "COMPATIBILITY_MATRIX.md"
+CODENAME_ARM = re.compile(r'^\s*([a-z]+-\d+(?:\.\d+)?)\)\s+OS_CODENAME="([a-z]+)"', re.MULTILINE)
+ARRAY_ENTRY = re.compile(r'^\s*"(docker\.io/library/[^"]+)"', re.MULTILINE)
+NGINX_VERSION = re.compile(r"(\d+\.\d+(?:\.\d+)?)\+?\s*(<|>=)\s*1\.25\.1")
+
+
+def os_matrix_section() -> str:
+    text = discovered()
+    start = text.index(OS_MATRIX_HEADING)
+    end = text.find("\n## ", start + 1)
+    return text[start:end if end != -1 else len(text)]
+
+
+def os_matrix_rows():
+    """alias -> the four cells of its row, in the page's column order."""
+    rows = {}
+    for line in os_matrix_section().splitlines():
+        if not line.startswith("| `"):
+            continue
+        cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
+        rows[cells[0]] = cells[1:]
+    return rows
+
+
+def product_codenames():
+    return dict(CODENAME_ARM.findall(OS_MODULE.read_text(encoding="utf-8")))
+
+
+def pinned_base_images():
+    lock = yaml.safe_load(IMAGES_LOCK.read_text(encoding="utf-8"))
+    return {
+        alias: entry["reference"]
+        for alias, entry in lock["images"].items()
+        if entry.get("role") == "base"
+    }
+
+
+def declared_base_images(path: Path, variable: str):
+    text = path.read_text(encoding="utf-8")
+    start = text.index(f"{variable}=(")
+    body = text[start:text.index(")", start)]
+    return set(ARRAY_ENTRY.findall(body))
+
+
+def version_tuple(value: str):
+    return tuple(int(part) for part in value.split("."))
+
+
+def shell_function(relative: str, name: str) -> str:
+    """One Bash function's body, found by its `name() {` header and closing brace."""
+    text = (REPO_ROOT / relative).read_text(encoding="utf-8")
+    start = text.index(f"\n{name}() {{") + 1
+    end = text.index("\n}\n", start)
+    return text[start:end]
+
+
+class TestOsMatrixReconciliation(unittest.TestCase):
+    """The supported distributions are one set, and each contour says what it ran.
+
+    The product's supported list is `modules/os.sh`, the pins are
+    `tests/cases/images.lock.yaml`, and three contours cite them: the product
+    acceptance suite, the QEMU cold-boot matrix, and the legacy testbed
+    scripts. A row that only one of them knows about is a distribution nobody
+    installs on purpose; a status that claims more than the executed row
+    supports is the drift the compatibility matrix exists to prevent.
+    """
+
+    def setUp(self):
+        self.page = os_matrix_section()
+        self.prose = " ".join(self.page.split())
+        self.rows = os_matrix_rows()
+        self.lock = pinned_base_images()
+
+    def test_the_product_declares_the_four_distributions_the_lock_pins(self):
+        declared = product_codenames()
+        self.assertEqual(
+            declared,
+            {
+                "ubuntu-24.04": "noble",
+                "ubuntu-26.04": "resolute",
+                "debian-12": "bookworm",
+                "debian-13": "trixie",
+            },
+            "modules/os.sh no longer declares the four distributions the matrix supports",
+        )
+        self.assertEqual(set(self.lock), set(declared))
+        self.assertEqual(set(self.lock), set(target_image.DISTRIBUTIONS))
+        self.assertEqual(
+            list(target_image.DISTRIBUTIONS.values()).count("ubuntu"), 2,
+            "the suite accepts a distribution the product does not support",
+        )
+
+    def test_the_page_table_names_every_pinned_distribution_with_its_base_image(self):
+        self.assertEqual(set(self.rows), set(self.lock), "a pinned distribution has no row")
+        for alias, reference in self.lock.items():
+            with self.subTest(alias=alias):
+                self.assertEqual(self.rows[alias][0], reference)
+                self.assertIn(alias, self.prose)
+
+    def test_the_legacy_scripts_take_the_same_four_base_references(self):
+        expected = set(self.lock.values())
+        self.assertEqual(declared_base_images(BOOT_SCRIPT, "SUPPORTED_DISTROS"), expected,
+                         "the QEMU boot script cites a base image the lock does not pin")
+        self.assertEqual(declared_base_images(TESTBED_SCRIPT, "DISTROS"), expected,
+                         "the legacy testbed cites a base image the lock does not pin")
+
+    def test_the_qemu_matrix_covers_all_four_and_runs_the_systemd_suite(self):
+        workflow = yaml.safe_load(SYSTEMD_WORKFLOW.read_text(encoding="utf-8"))
+        job = workflow["jobs"]["qemu-cold-boot"]
+        self.assertEqual(
+            sorted(entry["distro"] for entry in job["strategy"]["matrix"]["include"]),
+            sorted(self.lock.values()),
+        )
+        commands = "\n".join(step.get("run", "") for step in job["steps"])
+        self.assertIn("tests/systemd/boot.sh", commands)
+        self.assertIn("${{ matrix.distro }}", commands)
+        guest = BOOT_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("tests/run_ci.py --suite systemd", guest,
+                      "the QEMU guest no longer runs the suite the page says it does")
+        self.assertNotIn("gowave-auto.sh install", guest,
+                         "the QEMU job now installs the product; the page's split is stale")
+        self.assertIn("not an operator install", self.prose)
+
+    def test_the_product_acceptance_executes_only_the_default_distribution(self):
+        workflow = yaml.safe_load(ACCEPTANCE_WORKFLOW.read_text(encoding="utf-8"))
+        commands = "\n".join(
+            step.get("run", "")
+            for job in workflow["jobs"].values()
+            for step in job["steps"]
+        )
+        self.assertNotIn("--distribution", commands,
+                         "a workflow selects a distribution; the page says none does")
+        default = run_podman_e2e.DEFAULT_DISTRIBUTION
+        executed = [alias for alias, cells in self.rows.items() if cells[1].startswith("executed")]
+        self.assertEqual(executed, ["ubuntu-24.04"])
+        self.assertIn(default, executed)
+        for alias, cells in self.rows.items():
+            if alias == default:
+                continue
+            with self.subTest(alias=alias):
+                self.assertEqual(cells[1], "selectable, not executed")
+        self.assertIn("--distribution", self.prose)
+        self.assertIn(default, self.prose)
+
+    def test_the_compatibility_matrix_claim_matches_the_execution(self):
+        text = COMPATIBILITY.read_text(encoding="utf-8")
+        self.assertNotIn("PODMAN_TESTBED_PLANNED", text,
+                         "the matrix still calls a suite that runs a plan")
+        statuses = {}
+        for line in text.splitlines():
+            cells = [cell.strip().strip("`") for cell in line.strip().strip("|").split("|")]
+            if len(cells) >= 7 and cells[2] in self.lock.values():
+                statuses[next(alias for alias, ref in self.lock.items() if ref == cells[2])] = cells[6]
+        self.assertEqual(statuses, {"ubuntu-24.04": "PROJECT_PODMAN_EXECUTED",
+                                    "ubuntu-26.04": "PROJECT_PODMAN_SELECTABLE",
+                                    "debian-12": "PROJECT_PODMAN_SELECTABLE",
+                                    "debian-13": "PROJECT_PODMAN_SELECTABLE"})
+        self.assertNotIn("NOT IMPLEMENTED / NOT EXECUTED", text,
+                         "the matrix still says Multi-Node is unimplemented")
+        self.assertIn("tools/run_podman_e2e.py --topology multi-node", text)
+        self.assertIn("tests/multi_node_testbed.sh", text)
+
+    def test_the_page_and_the_renderer_agree_on_the_two_listen_branches(self):
+        renderer = shell_function("modules/os.sh", "render_nginx_listen_ssl_http2")
+        self.assertIn('is_version_ge "$version" "1.25.1"', renderer)
+        self.assertIn("http2 on;", renderer)
+        self.assertIn("listen %s ssl http2%s;", renderer)
+        for alias, cells in self.rows.items():
+            with self.subTest(alias=alias):
+                match = NGINX_VERSION.search(cells[3])
+                self.assertIsNotNone(match, f"{alias} names no NGINX version and threshold")
+                version, sign = match.group(1), match.group(2)
+                above = version_tuple(version) >= (1, 25, 1)
+                self.assertEqual(sign == ">=", above,
+                                 f"{alias} states {version} {sign} 1.25.1, which is arithmetic")
+                self.assertIn("modern" if above else "legacy", cells[3])
+
+
 class TestPodmanE2EDocumentation(unittest.TestCase):
     def test_every_flag_in_a_documented_command_exists(self):
         unknown = sorted(documented_flags() - parser_flags())
