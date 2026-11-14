@@ -100,11 +100,20 @@ def limit_script() -> str:
 
 
 def probe_directory_script() -> str:
-    """Prepare the private trace directory and drop any earlier trace."""
-    return (
-        f"mkdir -p -m 0700 {shlex.quote(TRACE_DIR)} && "
-        f"rm -f {shlex.quote(TRACE_PATH)}"
-    )
+    """Create the private trace directory, and touch nothing in it.
+
+    Delivery must not clear the trace: the case places the probe after the
+    deployment has already written it, so a preparation that also dropped "an
+    earlier trace" would delete the file the case reads and report the dispatch
+    as never observed. Dropping a stale trace belongs to the dispatch itself,
+    which is ``trace_reset_script()``.
+    """
+    return f"mkdir -p -m 0700 {shlex.quote(TRACE_DIR)}"
+
+
+def trace_reset_script() -> str:
+    """Prepare the directory and drop the trace of an earlier dispatch."""
+    return f"{probe_directory_script()} && rm -f {shlex.quote(TRACE_PATH)}"
 
 
 def client_script() -> str:

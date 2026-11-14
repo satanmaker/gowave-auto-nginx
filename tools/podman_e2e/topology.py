@@ -1480,7 +1480,7 @@ class MultiNodeTopology(AioTopology):
         self.argv_observer = argv_probe.ensure_strace(self.podman, self.target_name)
         if self.argv_observer["ok"]:
             self.podman.exec_bash(
-                self.target_name, argv_probe.probe_directory_script(), check=False,
+                self.target_name, argv_probe.trace_reset_script(), check=False,
             )
             script = argv_probe.strace_prefix(argv_probe.TRACE_PATH, self.argv_observer["limit"]) + script
         started = time.monotonic()
