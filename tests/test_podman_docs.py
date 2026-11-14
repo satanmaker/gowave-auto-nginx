@@ -69,6 +69,85 @@ def parser_flags():
     return set(FLAG.findall(completed.stdout)) - {"--help"}
 
 
+DISCOVERY = REPO_ROOT / "docs" / "PODMAN_E2E_DISCOVERY.md"
+OPERATOR = REPO_ROOT / "gowave-auto.sh"
+CATALOG = REPO_ROOT / "tests" / "cases" / "catalog.yaml"
+MATRIX = REPO_ROOT / "tests" / "cases" / "matrix.yaml"
+CASE_ID = re.compile(r"\b(?:AIO|MN|NGX|SUB|ACME)-[A-Z0-9][A-Z0-9-]*")
+
+
+def discovered() -> str:
+    return DISCOVERY.read_text(encoding="utf-8")
+
+
+def usage_words(pattern: str):
+    """The command words a `Usage: gowave-auto.sh … {a|b|c}` line declares."""
+    text = OPERATOR.read_text(encoding="utf-8")
+    match = re.search(pattern, text)
+    if match is None:
+        raise AssertionError(f"no usage line matches {pattern!r}; the product's interface moved")
+    words = []
+    for word in match.group(1).split("|"):
+        words.append(word.split("<", 1)[0].strip())
+    return words
+
+
+def manifest_topologies():
+    return sorted(yaml.safe_load(MATRIX.read_text(encoding="utf-8"))["topologies"])
+
+
+def catalog_ids():
+    return {case["id"] for case in yaml.safe_load(CATALOG.read_text(encoding="utf-8"))["cases"]}
+
+
+def entrypoint_rows():
+    """The entrypoint a discovery table row is about, taking the first cell."""
+    rows = []
+    for line in discovered().splitlines():
+        if line.startswith("| `"):
+            rows.append(line.split("|")[1].strip().strip("`"))
+    return rows
+
+
+def row_for(word: str) -> bool:
+    return any(row == word or row.startswith(f"{word} ") for row in entrypoint_rows())
+
+
+class TestDiscoveryInventory(unittest.TestCase):
+    """The product surface page says what the product and the manifest say.
+
+    `docs/PODMAN_E2E_DISCOVERY.md` is where a reader checks whether a command
+    the suite never runs is a deliberate gap. That answer is only worth reading
+    while it matches the script, the manifest and the catalog, so each of those
+    three is parsed here rather than quoted by hand.
+    """
+
+    def test_every_operator_subcommand_has_a_table_row(self):
+        missing = [word for word in usage_words(r"Usage: gowave-auto\.sh \{([^}]+)\}") if not row_for(word)]
+        self.assertEqual(missing, [], "a subcommand exists without its own row in the discovery table")
+
+    def test_every_node_subcommand_has_a_table_row(self):
+        words = usage_words(r"Usage: gowave-auto\.sh node \{([^}]+)\}")
+        self.assertEqual(sorted(words), ["add", "list", "reapply", "rollback"])
+        missing = [word for word in words if not row_for(f"node {word}")]
+        self.assertEqual(missing, [], "a node subcommand exists without its own row in the discovery table")
+
+    def test_every_declared_topology_appears_in_the_page(self):
+        topologies = manifest_topologies()
+        self.assertIn("multi-node", topologies)
+        missing = [name for name in topologies if f"`{name}`" not in discovered()]
+        self.assertEqual(missing, [], "the manifest declares a topology the discovery page does not name")
+
+    def test_every_case_id_the_page_cites_exists_in_the_catalog(self):
+        cited = set(CASE_ID.findall(discovered()))
+        self.assertGreaterEqual(len(cited), 10, "the page cites almost no case ids, so it proves nothing")
+        invented = sorted(cited - catalog_ids())
+        self.assertEqual(invented, [], "the discovery page names a case id no suite declares")
+
+    def test_the_guide_links_the_discovery_page(self):
+        self.assertIn("docs/PODMAN_E2E_DISCOVERY.md", documented())
+
+
 class TestPodmanE2EDocumentation(unittest.TestCase):
     def test_every_flag_in_a_documented_command_exists(self):
         unknown = sorted(documented_flags() - parser_flags())
