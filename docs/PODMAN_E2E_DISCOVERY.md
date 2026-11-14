@@ -75,8 +75,66 @@ one represents. The suite accepts:
   Worker provisioned through the Master's own `node add` path, plus per-node
   Vision: neither, master-only, worker-only, or both.
 
-Both topologies run on the same four pinned distributions, which is what makes
-the OS matrix a property of the manifest rather than of a document.
+Both topologies run on the same four pinned distributions; the next section
+says which of them a workflow actually executes.
+
+## The OS matrix, and which contour executes each row
+
+The product decides which systems it supports in `modules/os.sh`, which turns
+`${OS_ID}-${OS_VERSION_ID}` into a codename for exactly four of them:
+`ubuntu-24.04` → `noble`, `ubuntu-26.04` → `resolute`, `debian-12` →
+`bookworm`, `debian-13` → `trixie`. `tests/cases/images.lock.yaml` pins one
+base image per row by registry digest, and `target_image.DISTRIBUTIONS` is the
+`--distribution` vocabulary the suite accepts, so the four names are one set
+rather than three opinions.
+
+What differs between the rows is what executes, and that is the part a reader
+has to be able to check rather than assume:
+
+| Distribution | Pinned base | Product acceptance | QEMU cold boot | NGINX `listen` branch |
+| --- | --- | --- | --- | --- |
+| `ubuntu-24.04` | `docker.io/library/ubuntu:24.04` | executed by every `podman-acceptance.yml` job | `qemu-cold-boot` matrix | legacy, `1.24.0 < 1.25.1` |
+| `ubuntu-26.04` | `docker.io/library/ubuntu:26.04` | selectable, not executed | `qemu-cold-boot` matrix | modern, `1.26+ >= 1.25.1` |
+| `debian-12` | `docker.io/library/debian:12` | selectable, not executed | `qemu-cold-boot` matrix | legacy, `1.22.1 < 1.25.1` |
+| `debian-13` | `docker.io/library/debian:13` | selectable, not executed | `qemu-cold-boot` matrix | modern, `1.26.3 >= 1.25.1` |
+
+**Only one row is executed against the product.** `--distribution` defaults to
+`ubuntu-24.04` and no workflow passes the flag, so all four acceptance jobs —
+the two topologies and their two recovery runs — install on the same
+distribution. The other three rows are pinned and runnable
+(`sudo python3 -m tools.run_podman_e2e --topology aio --distribution debian-13`),
+but no CI job has run them: that is a coverage gap of this suite, not a
+compatibility claim. The compatibility matrix's component tables are what say a
+row is supported, and this suite adds product-level evidence only where it
+executed.
+
+**The QEMU matrix is a different claim.** The `qemu-cold-boot` job in
+`.github/workflows/systemd-acceptance.yml` boots all four images through
+`tests/systemd/boot.sh`, but the unit that runs inside the guest is
+`tests/run_ci.py --suite systemd`: it proves the systemd unit contracts under a
+real systemd PID 1 on that distribution, not an operator install. Both facts
+matter and neither replaces the other — a green QEMU job does not mean the
+product installed there, and a green acceptance run does not mean the row's
+systemd contracts hold.
+
+**The two `listen` branches.** `render_nginx_listen_ssl_http2` in
+`modules/os.sh` reads `nginx -v` and prints `listen … ssl http2 …;` below
+1.25.1 and `listen … ssl …; http2 on;` from 1.25.1 up, which is the split the
+compatibility matrix records per distribution. The version that lands is
+whatever the distribution archive holds when the operator installs, so the
+branch is decided at run time by the probe rather than recorded in a manifest,
+and the numbers in the table are the expected values rather than assertions.
+The executed row therefore proves the legacy branch; the modern branch has no
+executed product run yet.
+
+**The legacy scripts identify by tag, the suite by digest.**
+`tests/podman_testbed.sh` and `tests/systemd/boot.sh` take
+`docker.io/library/ubuntu:24.04` and build from it, while
+`tests/cases/images.lock.yaml` pins the same four references by manifest digest
+and `tools/podman_e2e/images.py` refuses an unpinned reference before it
+invokes Podman. The divergence is recorded rather than fixed here: those two
+scripts belong to the transport and cold-boot contours, and changing their
+inputs belongs to the contour that owns them.
 
 ## The Panel API the suite is written to
 
