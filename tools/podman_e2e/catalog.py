@@ -538,6 +538,25 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "topology": ["multi-node"],
         "promotion_target": "Independent Optional Vision Domains",
     },
+    {
+        "id": "MN-ARGV-OBSERVER",
+        "requirement": "Distributed Worker VPS Deployment Verification",
+        "assertion": (
+            "The Master traces its own dispatch of `gowave-auto.sh node add` with "
+            "`strace -f -v -s 32*PAGE_SIZE -e trace=execve,execveat`, and before that "
+            "trace is read the observer proves on the same host that a sentinel after "
+            "byte 32 of an argument survives in both an `execve` and an `execveat` "
+            "record while the same argument under `-s 32` is cut and reported as "
+            "truncated, and that a 128-element argv arrives in order with its sentinel "
+            "last and no omission marker; the dispatch trace then counts as complete "
+            "only if every argv vector is whole, holds the SSH client's own exec "
+            "record and carries no `SECRET_KEY` in raw or encoded form in any argv, "
+            "and the file is removed on the Master so the `envp` strace printed never "
+            "leaves that host."
+        ),
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
 ]
 
 SCENARIO_RE = re.compile(r"^#### Scenario:\s*(.+?)\s*$")
@@ -1151,6 +1170,19 @@ LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     # Both cases serve that page byte for byte from the client, over the REALITY
     # lineage for the REALITY name and without a name pin for the unlisted one.
     "NGX-03": {"aio": "DECOY-01", "multi-node": "NGX-DECOY-ROUTE"},
+    # The Worker dispatch is traced on the Master the way the live runner traces
+    # its own: strace installed there, the trace written there, the scan and the
+    # removal there, so ``envp`` never leaves the host. One case holds all three
+    # sentences: the acceptance fixtures say this host's observer captures a long
+    # argument whole under both execve and execveat and keeps a 128-element argv
+    # unabbreviated, and the scan says the dispatch's own vectors are complete and
+    # carry no raw or base64 SECRET_KEY. The live sentence also covers the remote
+    # Worker's processes up to the SSH boundary; this contour observes the same
+    # local tree and records in docs/PODMAN_E2E_DISCOVERY.md that the remote side
+    # is beyond it.
+    "WRK-01": {"multi-node": "MN-ARGV-OBSERVER"},
+    "WRK-02": {"multi-node": "MN-ARGV-OBSERVER"},
+    "WRK-03": {"multi-node": "MN-ARGV-OBSERVER"},
 }
 
 

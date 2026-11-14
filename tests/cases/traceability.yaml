@@ -53,6 +53,17 @@ requirements:
           - tests.test_podman_cluster.TestVisionCase
           - tests.test_podman_multi_node.TestMultiNodeCounts
         jobs: [Multi-Node Podman Acceptance]
+      - scenario: Worker dispatch is observed without the secret
+        cases: [MN-ARGV-OBSERVER]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_argv_observer.TestStraceParsing
+          - tests.test_podman_argv_observer.TestAcceptanceFixtures
+          - tests.test_podman_argv_observer.TestObserverWiring
+          - tests.test_podman_argv_observer.TestNodeAddIsTraced
+          - tests.test_podman_argv_observer.TestArgvObserverCase
+          - tests.test_podman_argv_observer.TestObserverDocumentation
+        jobs: [Multi-Node Podman Acceptance]
 
   - requirement: Real Panel subscription lifecycle
     scenarios:

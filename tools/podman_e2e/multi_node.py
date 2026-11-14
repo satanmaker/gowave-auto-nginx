@@ -30,13 +30,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
-    acme_fixture, aio, budget, denial, matrix as matrix_data, mtls, topology,
+    acme_fixture, aio, argv_probe, budget, denial, matrix as matrix_data, mtls, topology,
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
 
 INSTALL_CASE_ID = "MN-INSTALL"
 NODE_ADD_CASE_ID = "WRK-04"
+ARGV_OBSERVER_CASE_ID = "MN-ARGV-OBSERVER"
 WORKER_STATE_CASE_ID = "WRK-05"
 WORKER_CONFIG_CASE_ID = "WRK-06"
 MASTER_ADDRESS_CASE_ID = "PODNET-MASTER-ADDR"
@@ -2047,6 +2048,104 @@ def case_worker_registration(product: MultiNodeProduct) -> Dict[str, Any]:
         },
         "unauthenticated_nodes_status": surface.get("unauthenticated_nodes_status"),
     })
+    return evidence
+
+
+def case_argv_observer(product: MultiNodeProduct) -> Dict[str, Any]:
+    """WRK-01..03: the Worker dispatch was observed completely, and without the secret.
+
+    Three live sentences share one observation, so one case holds them. The
+    acceptance fixtures say this Master's strace captures a long argument whole
+    (both ``execve`` and ``execveat``) and keeps every element of a 128-argument
+    vector; the scan says the dispatch's own trace holds no cut vector and no
+    ``SECRET_KEY`` — raw or base64 — in any argv.
+
+    The trace is the one taken around the operator's real ``node add``
+    (``MULTI-NODE``: ``topology.node_add``), so nothing here re-runs the
+    deployment. The fixtures are judged before the trace is scanned: an observer
+    that cannot see a sentinel cannot be read as having seen a clean dispatch.
+    The scan removes the trace on the Master, ``envp`` included, before it
+    reports a single count.
+    """
+    host = product.require_worker()
+    podman = product.podman
+    observer = host.argv_observer
+    client = (observer or {}).get("client", "")
+    delivered = argv_probe.deliver(podman, host.target_name)
+    fixtures = argv_probe.run_fixtures(podman, host.target_name)
+    secret, secret_error = argv_probe.extract_secret(podman, host.target_name)
+    verdict = argv_probe.scan(podman, host.target_name, secret, client)
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        observer is not None and observer["ok"],
+        "the Master's argv observer was not usable, so the dispatch was never "
+        f"traced: {(observer or {}).get('error') or 'the deployment recorded no observer state'}",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        delivered["delivered"],
+        f"the argv observer could not be placed on the Master: {delivered['error']}",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        fixtures.get("status") == "PASS",
+        "the argv observer failed its own acceptance fixtures on this Master, so "
+        "its verdict on the dispatch cannot be read as complete: "
+        f"{fixtures.get('errors') or 'no reason recorded'}",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        secret_error == "",
+        "the Master could not print its own SECRET_KEY, so the absence of that "
+        f"value from argv cannot be observed: {secret_error}",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        verdict.get("status") == "PASS",
+        f"the dispatch trace is {verdict.get('status')}: "
+        f"{verdict.get('errors') or 'no reason recorded'}",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        verdict.get("exec_count", 0) > 0,
+        "the dispatch trace holds no exec record, so the deployment it claims to "
+        "cover was not observed",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        verdict.get("secret_found") is False,
+        "a process argv vector in the dispatch trace carries the Master's SECRET_KEY",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        verdict.get("ssh_execs", 0) >= 1,
+        f"the dispatch trace holds {verdict.get('ssh_execs', 0)} exec records of the SSH "
+        "client, so it did not cover the deployment's own remote dispatch",
+    )
+    require(
+        ARGV_OBSERVER_CASE_ID,
+        verdict.get("trace_removed") is True,
+        "the trace carrying envp was not removed from the Master",
+    )
+    evidence = {
+        "argv_observer_strace_version": (observer or {}).get("version", ""),
+        "argv_observer_strace_installed": bool((observer or {}).get("installed")),
+        "argv_observer_limit": (observer or {}).get("limit", 0),
+        "argv_observer_ssh_client": client,
+        "argv_observer_probe_path": delivered.get("path", ""),
+        "argv_observer_fixtures": fixtures.get("fixtures", []),
+        "argv_observer_fixture_errors": fixtures.get("errors", []),
+        "argv_observer_exec_count": verdict.get("exec_count", 0),
+        "argv_observer_execve_count": verdict.get("execve_count", 0),
+        "argv_observer_execveat_count": verdict.get("execveat_count", 0),
+        "argv_observer_ssh_execs": verdict.get("ssh_execs", 0),
+        "argv_observer_secret_found": verdict.get("secret_found"),
+        "argv_observer_truncated": verdict.get("truncated"),
+        "argv_observer_abbreviated": verdict.get("abbreviated"),
+        "argv_observer_trace_bytes": verdict.get("trace_bytes", 0),
+        "argv_observer_trace_removed": verdict.get("trace_removed"),
+        "argv_observer_errors": verdict.get("errors", []),
+    }
     return evidence
 
 
@@ -7443,6 +7542,10 @@ def cases(
              timeout_seconds=SSH_TRUST_TIMEOUT_SECONDS),
         Case(NODE_ADD_CASE_ID, "multi-node", lambda context: case_worker_registration(product),
              timeout_seconds=NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
+        # The dispatch that case just ran was traced; this case reads the trace,
+        # proves the observer can see a sentinel whole, and removes the file.
+        Case(ARGV_OBSERVER_CASE_ID, "multi-node", lambda context: case_argv_observer(product),
+             timeout_seconds=argv_probe.FIXTURE_TIMEOUT_SECONDS + argv_probe.SCAN_TIMEOUT_SECONDS),
         Case(MASTER_ADDRESS_CASE_ID, "multi-node", lambda context: case_master_address(product),
              timeout_seconds=300),
         Case("MTLS-01", "multi-node", lambda context: case_mtls_verifier(product),

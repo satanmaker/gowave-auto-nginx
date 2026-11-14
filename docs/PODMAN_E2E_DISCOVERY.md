@@ -522,16 +522,16 @@ image.
 
 `tests/cases/catalog.yaml` defines each scenario once and stamps it with an
 `environment`, so the boundary between the contours is a checked field rather
-than a sentence in a document. The catalog holds 212 entries:
+than a sentence in a document. The catalog holds 213 entries:
 
 | Environment | Entries | Which contour answers it |
 | --- | ---: | --- |
-| `container` | 202 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
+| `container` | 203 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
 | `partial` | 8 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
 | `live-only` | 2 | Only the live suite. Every Podman run reports both as justified exclusions, and `tools/podman_e2e/catalog.py` refuses a catalog that lets one run here. |
 
 Of the 125 live scenarios projected into this catalog, 115 are container, 8 are
-partial and 2 are live-only; the other 87 entries are Podman-first cases with a
+partial and 2 are live-only; the other 88 entries are Podman-first cases with a
 promotion target, which `tests/cases/PARITY.md` lists separately.
 
 The ten entries that are not fully container-answerable are, by id: `PRE-04`,
@@ -613,6 +613,61 @@ this contour pins `26.11.9`/`1.19.34` while the live runner reads `latest`; the
 shared contract is "accepted by the real engine", and the pinned build is named
 only where a run has to be reproducible. It is recorded in §The live contract,
 capability by capability instead of being resolved by weakening either side.
+
+## How the Master's own command line is observed
+
+Three of those contracts assert a negative — that the Worker deployment never
+puts `SECRET_KEY` in a process argument — and a container answers them by
+tracing the command an operator runs rather than a reconstruction of it.
+`WRK-01`, `WRK-02` and `WRK-03` are observed by `MN-ARGV-OBSERVER` in the
+Multi-Node contour, and `tests/cases/catalog.yaml` records that as an observer on
+those three entries rather than as a second driver: one deployment per run, one
+trace, three assertions.
+
+The trace is taken inside the Master container, wrapped around
+`bash /repo/gowave-auto.sh node add '<worker>' …` — the same dispatch `WRK-04`
+then judges — as `strace -f -v -s 131072 -e trace=execve,execveat -o
+/run/gowave_e2e_strace/node_add.trace`, where `131072` is
+`32 * os.sysconf("SC_PAGE_SIZE")` read from the Master, so the limit follows the
+host's page size instead of a constant. `strace` is installed at run time in the
+Master for the same reason it is installed on a VPS: the target image is built
+clean, `target_image.PRODUCT_PACKAGES` refuses a package the product is
+responsible for, and the observer must not become an installed part of the image
+under test. A Master where `strace` cannot be installed is not a failed
+deployment: `node add` runs untraced, the facts say so, `MN-ARGV-OBSERVER` fails
+and `WRK-04` still judges what the deployment produced.
+
+Before the trace is read, acceptance legs have to show that the observer can see
+what it claims to see: a sentinel placed after byte 32 of an argument, once
+through `execve` and once through `execveat` — the latter produced with ctypes,
+because no shell builtin reaches it — and 128 arguments with a sentinel only in
+the last one. A third leg is the control: the same argument under a deliberately
+32-byte `-s` must come back cut, so an observation whose limit stopped working
+cannot pass as complete. Only then is the trace scanned, and the scan reads argv
+vectors alone: `-v` also prints `envp`, and the raw environment is discarded
+rather than reported.
+
+The scan rejoins records that `-f` split across `<unfinished ...>` and
+`<... execve resumed>` lines, because dropping either half would hide an exec,
+and it decodes strace's octal escapes before looking for the secret, because a
+value containing a quote or a backslash is invisible to a text search. The
+client whose exec record has to be present is the one `command -v` resolves on
+the Master — `basename "$(command -v ssh)"` — so a host that names its client
+differently is still observed rather than reported as a trace that missed the
+deployment. The secret itself is read through the product's own
+`modules/node.sh:extract_secret_key` on the Master and handed to the scanner on
+`stdin`; the probe source is streamed over `stdin` as well, only counts come
+back, and the trace file is removed inside the container before the verdict is
+printed.
+
+**What this does not observe.** The trace covers the Master-side descendant
+process tree, including the local SSH client; the Worker's processes beyond the
+SSH boundary are not traced, which the owning requirement states in the same
+words (`openspec/specs/live-vps-e2e/spec.md`, §Distributed Worker VPS Deployment
+Verification). It says nothing about `envp`, by design — the contract is about
+arguments. And it observes the one deployment the run makes: the observer is
+wrapped around the dispatch `WRK-04` depends on, so a second `node add` in the
+same run would not be traced.
 
 ## What the suite does not drive, and why
 

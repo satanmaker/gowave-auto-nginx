@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from tools.podman_e2e import acme_fixture, client_image, target_image
+from tools.podman_e2e import acme_fixture, argv_probe, client_image, target_image
 
 # Two networks, because one block cannot satisfy both ends of the run.
 #
@@ -1145,6 +1145,10 @@ class MultiNodeTopology(AioTopology):
         super().__post_init__()
         self.worker_name = self.context.resource_name("worker")
         self.untrusted_name = self.context.resource_name("untrusted")
+        # What the Master's argv observer reported before the dispatch ran: the
+        # strace it found or installed, its version, the -s limit and any reason
+        # the observer was unusable. ``None`` means the dispatch never ran.
+        self.argv_observer: Optional[Dict[str, Any]] = None
 
     def zone(self) -> Dict[str, Any]:
         """The base zone plus the Worker's own names, which only this topology has."""
@@ -1463,8 +1467,22 @@ class MultiNodeTopology(AioTopology):
         The command runs on the Master, over the same SSH transport and Panel API
         registration an operator uses; the harness only supplies the trusted
         host-key pin and the SSH identity the operator would establish first.
+
+        The dispatch runs under the Master-side argv observer, so this is the
+        same observation the live runner makes: strace is installed on the
+        Master first, the trace is written there, and ``MN-ARGV-OBSERVER`` scans
+        and removes it there. ``envp`` therefore never leaves this host. An
+        observer that cannot be installed is recorded in the facts rather than
+        raised — an unobserved deployment is still a deployment — and the case
+        that needs the observation refuses without it.
         """
         script = self.node_add_script(name)
+        self.argv_observer = argv_probe.ensure_strace(self.podman, self.target_name)
+        if self.argv_observer["ok"]:
+            self.podman.exec_bash(
+                self.target_name, argv_probe.probe_directory_script(), check=False,
+            )
+            script = argv_probe.strace_prefix(argv_probe.TRACE_PATH, self.argv_observer["limit"]) + script
         started = time.monotonic()
         proc = self.podman.exec_bash(
             self.target_name, script, check=False, timeout=NODE_ADD_TIMEOUT_SECONDS,
