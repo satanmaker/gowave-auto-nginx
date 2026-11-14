@@ -27,7 +27,8 @@ traffic plane is absent by design: Panel active and serving over 443, no Node un
 #### Scenario: The first worker after a panel-only Master registers with a squad
 
 - **GIVEN** a Panel-only Master with no nodes and no internal squad
-- **WHEN** the runner executes `gowave-auto.sh node add worker-1`
+- **WHEN** the runner executes `gowave-auto.sh node add worker-1 <worker-ip> <worker-domain> <reality-domain>` —
+  the full positional contract of `node add`
 - **THEN** `GET /api/nodes` shows `worker-1` connected, every host record created for it names a non-empty squad
   identifier, and no request body submitted during registration contained a null squad entry
 
