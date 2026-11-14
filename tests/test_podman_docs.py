@@ -645,11 +645,18 @@ class TestLiveContractReconciliation(unittest.TestCase):
 
     def test_the_geoip_divergence_names_the_pinned_template(self):
         self.assertIn("internal/database/default_data.go:108", self.prose)
-        self.assertIn("tools/live_vps/subscriptions.py:371", self.prose)
         live = (REPO_ROOT / "tools" / "live_vps" / "subscriptions.py").read_text(encoding="utf-8")
-        rule_check = live.splitlines()[370]
-        self.assertIn('any("GEOIP" in rule', rule_check)
-        self.assertIn('any("MATCH" in rule', rule_check)
+        lines = live.splitlines()
+        # Read the line the page cites rather than a remembered offset: the
+        # citation is the claim, and an offset would keep passing after the
+        # page started pointing somewhere else.
+        cited = re.findall(r"tools/live_vps/subscriptions\.py:(\d+)", self.prose)
+        self.assertTrue(cited, "the page stopped citing the rule the live runner accepts")
+        for number in cited:
+            with self.subTest(cited_line=number):
+                rule_check = lines[int(number) - 1]
+                self.assertIn('any("GEOIP" in rule', rule_check)
+                self.assertIn('any("MATCH" in rule', rule_check)
         if not backend_tree():
             self.skipTest(
                 "sources/gowave is a local checkout (/sources/ is gitignored): "
@@ -712,6 +719,171 @@ class TestLiveContractReconciliation(unittest.TestCase):
         self.assertNotIn("logical", intact,
                          "the row contract went back to comparing a whole dump, which the "
                          "Panel's own writes move")
+
+
+SHARED_CONTRACT_HEADING = "## The contracts both contours assert, and the one owner each has"
+LIVE_SUBSCRIPTIONS = REPO_ROOT / "tools" / "live_vps" / "subscriptions.py"
+LIVE_NEGATIVE = REPO_ROOT / "tools" / "live_vps" / "negative.py"
+LIVE_CONFIG_MODULE = REPO_ROOT / "tools" / "live_vps" / "config.py"
+SUBSCRIPTION_PATH = re.compile(r'/api/sub/[^\s"]+')
+SHARED_OWNER_PATH = re.compile(r"`((?:tools|modules|tests|openspec|internal)/[^`]+)`")
+
+
+def shared_contract_section() -> str:
+    text = discovered()
+    start = text.index(SHARED_CONTRACT_HEADING)
+    end = text.find("\n### ", start + 1)
+    return text[start:end if end != -1 else len(text)]
+
+
+def shared_contract_rows():
+    """contract -> [owner, live assertion, container assertion]."""
+    rows = {}
+    for line in shared_contract_section().splitlines():
+        if not line.startswith("| ") or line.startswith("| Shared contract") or set(line) <= set("|- "):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        rows[cells[0]] = cells[1:]
+    return rows
+
+
+def normalised_subscription_path(path: str) -> str:
+    """The matrix writes `{shortUuid}`; the live runner interpolates `{short_uuid}`."""
+    return path.replace("{short_uuid}", "{shortUuid}")
+
+
+def live_subscription_paths():
+    """Every `/api/sub/…` literal the live contour names, normalised."""
+    paths = set()
+    for source in (LIVE_SUBSCRIPTIONS, LIVE_NEGATIVE):
+        for line in source.read_text(encoding="utf-8").splitlines():
+            for path in SUBSCRIPTION_PATH.findall(line):
+                paths.add(normalised_subscription_path(path))
+    return paths
+
+
+class TestLiveContractParity(unittest.TestCase):
+    """One product, two environments: a shared contract is one claim.
+
+    `openspec/specs/live-vps-e2e/spec.md` owns the live contour, and the page
+    tabulates the contracts both contours assert with the single owner of each.
+    The risk this class closes is a divergence dressed as an environment
+    difference: a live runner that accepts a wider User-Agent policy than the
+    container, or a fingerprint vocabulary restated in two modules, is a second
+    opinion about one product. Every claim is read from its owner rather than
+    from the sentence that describes it.
+    """
+
+    def setUp(self):
+        self.section = shared_contract_section()
+        self.prose = " ".join(self.section.split())
+        self.manifest = yaml.safe_load(MATRIX.read_text(encoding="utf-8"))
+
+    def test_the_user_agent_refusal_is_one_code_in_both_contours(self):
+        from tools.live_vps import subscriptions as live
+        from tools.podman_e2e import aio
+
+        self.assertEqual(
+            aio.UA_REFUSAL_STATUS, live.SUBSCRIPTION_UA_REFUSAL_STATUS,
+            "the two contours disagree on what refusing a subscription answers",
+        )
+        for policy in ("absent", "blank"):
+            with self.subTest(policy=policy):
+                self.assertEqual(self.manifest["user_agent"][policy], aio.UA_REFUSAL_STATUS,
+                                 "the matrix disagrees with the case that reads it")
+        negative = LIVE_NEGATIVE.read_text(encoding="utf-8")
+        self.assertIn("code == SUBSCRIPTION_UA_REFUSAL_STATUS", negative,
+                      "NEG-09 stopped using the contour's own refusal code")
+        subscriptions = LIVE_SUBSCRIPTIONS.read_text(encoding="utf-8")
+        self.assertEqual(
+            subscriptions.count("== SUBSCRIPTION_UA_REFUSAL_STATUS"), 2,
+            "the live runner stopped comparing the absent and blank answers against the "
+            "contour's own refusal code; a literal here would pass the equality above and "
+            "still be a second opinion about the product",
+        )
+        self.assertNotIn("400, 403", subscriptions + negative,
+                         "a status range came back: the live contour accepts a weaker answer "
+                         "than the container does for the same product")
+
+    def test_every_subscription_path_the_live_runner_dials_is_a_representation(self):
+        declared = {
+            name: normalised_subscription_path(path)
+            for name, path in self.manifest["representations"].items()
+        }
+        dialled = live_subscription_paths()
+        self.assertTrue(dialled, "the live runner dials no subscription path; the probe is vacuous")
+        self.assertEqual(
+            dialled - set(declared.values()), set(),
+            "the live runner dials a path the matrix does not declare, so the two contours "
+            "name different products",
+        )
+        shared = set(declared.values()) - dialled
+        self.assertEqual(
+            shared,
+            {declared["base64"], declared["singbox"]},
+            "the representations only this contour drives changed; the page names base64 and single-box",
+        )
+        self.assertIn("`base64` and `singbox` are driven only by this contour", self.prose)
+
+    def test_the_live_runner_takes_the_fingerprint_vocabulary_from_the_installer(self):
+        from modules import api_client
+        from tools.live_vps import config as live_config
+
+        self.assertIs(
+            live_config.REALITY_FINGERPRINTS, api_client.REALITY_FINGERPRINTS,
+            "the live config restates the uTLS presets instead of importing the installer's",
+        )
+        self.assertEqual(live_config.REALITY_DEFAULT_FINGERPRINT, api_client.REALITY_DEFAULT_FINGERPRINT)
+        self.assertEqual(self.manifest["product"]["reality_fingerprint"], api_client.REALITY_DEFAULT_FINGERPRINT)
+        config_source = LIVE_CONFIG_MODULE.read_text(encoding="utf-8")
+        self.assertNotIn('"chrome", "firefox"', config_source,
+                         "a second copy of the preset tuple came back into the live config")
+        subscriptions = LIVE_SUBSCRIPTIONS.read_text(encoding="utf-8")
+        self.assertEqual(
+            subscriptions.count("reality_fingerprint: str = REALITY_DEFAULT_FINGERPRINT,"), 2,
+            "a subscription validator spells its own fingerprint default again",
+        )
+        self.assertNotIn('reality_fingerprint: str = "firefox"', subscriptions)
+
+    def test_the_page_names_the_owner_of_each_shared_contract(self):
+        rows = shared_contract_rows()
+        self.assertEqual(
+            set(rows),
+            {
+                "Subscription path vocabulary",
+                "User-Agent refusal code",
+                "REALITY fingerprint vocabulary",
+                "`Cache-Control: no-store` on `/api/sub/`",
+            },
+            "a shared contract was dropped from the table or a new one was added unguarded",
+        )
+        ids = catalog_ids()
+        for contract, (owner, live, container) in rows.items():
+            with self.subTest(contract=contract):
+                paths = SHARED_OWNER_PATH.findall(owner)
+                self.assertTrue(paths, f"{contract} names no owner path")
+                for relative in paths:
+                    with self.subTest(path=relative):
+                        if relative.startswith("internal/"):
+                            if not backend_tree():
+                                continue
+                            self.assertTrue((BACKEND / relative).is_file(), f"{relative} is not in the vendored Panel")
+                        else:
+                            self.assertTrue((REPO_ROOT / relative).exists(), f"{relative} does not exist")
+                self.assertTrue(SHARED_OWNER_PATH.search(live), f"{contract} names no live assertion site")
+                cited = set(CASE_ID.findall(container))
+                self.assertTrue(cited, f"{contract} names no container assertion")
+                self.assertEqual(cited - ids, set(), f"{contract} cites a case the catalog does not hold")
+
+    def test_the_design_records_the_same_relationship(self):
+        design = " ".join(DESIGN.read_text(encoding="utf-8").split())
+        self.assertIn("openspec/specs/live-vps-e2e/spec.md", design)
+        self.assertIn(SHARED_CONTRACT_HEADING.lstrip("# "), design,
+                      "the design no longer points at the table that owns this relationship")
+        self.assertIn("TestLiveContractParity", design,
+                      "the design claims a mechanism the tree does not name")
+        self.assertIn("differ in environment rather than in product", design)
+        self.assertTrue(LIVE_SPEC.is_file(), "the live spec this page defers to is gone")
 
 
 OS_MATRIX_HEADING = "## The OS matrix, and which contour executes each row"

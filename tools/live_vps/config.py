@@ -7,9 +7,19 @@ import ipaddress
 import os
 import re
 import stat
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict
+
+# The uTLS presets a Host record can carry are the installer's vocabulary, not a
+# second list here: a copy would let the live runner accept a preset the Host
+# record it provisions cannot mint. Appended, not prepended, so the repository
+# root only extends the search path and shadows nothing.
+if str(Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+
+from modules.api_client import REALITY_DEFAULT_FINGERPRINT, REALITY_FINGERPRINTS  # noqa: E402
 
 WHITELIST_KEYS = {
     "MASTER_IP",
@@ -81,11 +91,6 @@ DOMAIN_REGEX = re.compile(
 HEX40_REGEX = re.compile(r"^[0-9a-fA-F]{40}$")
 HEX64_REGEX = re.compile(r"^[0-9a-fA-F]{64}$")
 VERSION_REGEX = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$")
-
-REALITY_FINGERPRINTS = (
-    "chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq",
-    "random", "randomized",
-)
 
 
 def parse_bool(val: str, key_name: str) -> bool:
@@ -310,9 +315,11 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
             )
         parsed[version_key] = version_value
 
-    # REALITY Host fingerprint. Defaults to firefox and must match what the
-    # installer provisions; any supported uTLS preset can be pinned explicitly.
-    reality_fp = (raw_pairs.get("REALITY_FINGERPRINT", "firefox").strip().lower() or "firefox")
+    # REALITY Host fingerprint. Defaults to the one `modules/api_client` mints
+    # for a Host record and must match what the installer provisions; any
+    # supported uTLS preset can be pinned explicitly.
+    reality_fp = (raw_pairs.get("REALITY_FINGERPRINT", REALITY_DEFAULT_FINGERPRINT).strip().lower()
+                  or REALITY_DEFAULT_FINGERPRINT)
     if reality_fp not in REALITY_FINGERPRINTS:
         raise ValueError(
             f"Invalid REALITY_FINGERPRINT: '{reality_fp}'. "

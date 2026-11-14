@@ -22,7 +22,7 @@ from .config import LiveVPSConfig
 from .preflight import check_ssh_trust
 from .dns import verify_domain_dns, verify_domain_no_aaaa
 from .nginx import verify_nginx_config_syntax
-from .subscriptions import request_subscription_status
+from .subscriptions import SUBSCRIPTION_UA_REFUSAL_STATUS, request_subscription_status
 from .mtls import run_mtls_negative_tests
 
 
@@ -232,7 +232,7 @@ def run_neg_09_subscription_absent_user_agent(panel_domain: str, short_uuid: str
             panel_domain, f"/api/sub/{short_uuid}/v2ray-json",
             ssl_context, user_agent=None, timeout=5,
         )
-        rejected = code in (400, 403)
+        rejected = code == SUBSCRIPTION_UA_REFUSAL_STATUS
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
 

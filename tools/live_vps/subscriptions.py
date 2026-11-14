@@ -16,8 +16,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
+from modules.api_client import REALITY_DEFAULT_FINGERPRINT
+
 from .panel_api import E2EPanelClient
 from .redaction import register_secret
+
+# The pinned Panel answers 403 for a missing and for an explicitly blank
+# User-Agent (`internal/subscription/serve.go`, whose own test asserts it), and
+# that is the code the container contour requires. A range here would excuse a
+# Panel that started answering 400, which is a weaker claim about one product.
+SUBSCRIPTION_UA_REFUSAL_STATUS = 403
 
 
 def expected_proxy_count(has_vision: bool = False, vision_count: Optional[int] = None) -> int:
@@ -91,8 +99,8 @@ def verify_user_agent_policy(
     except Exception as exc:
         blank_error = f"{type(exc).__name__}: {exc}"
 
-    absent_rejected = absent_code in (400, 403)
-    blank_rejected = blank_code in (400, 403)
+    absent_rejected = absent_code == SUBSCRIPTION_UA_REFUSAL_STATUS
+    blank_rejected = blank_code == SUBSCRIPTION_UA_REFUSAL_STATUS
 
     # 2. Valid Xray User-Agent
     xray_accepted = False
@@ -160,7 +168,7 @@ def fetch_and_validate_xray_subscription(
     ssl_context: ssl.SSLContext,
     has_vision: bool = False,
     ca_bundle_path: Optional[Path] = None,
-    reality_fingerprint: str = "firefox",
+    reality_fingerprint: str = REALITY_DEFAULT_FINGERPRINT,
     vision_count: Optional[int] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Fetch Xray JSON subscription and validate schema, proxy outbounds, and xray run -test."""
@@ -305,7 +313,7 @@ def fetch_and_validate_mihomo_subscription(
     ssl_context: ssl.SSLContext,
     has_vision: bool = False,
     ca_bundle_path: Optional[Path] = None,
-    reality_fingerprint: str = "firefox",
+    reality_fingerprint: str = REALITY_DEFAULT_FINGERPRINT,
     vision_count: Optional[int] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Fetch Mihomo YAML subscription and validate schema, proxy entries, and mihomo -t."""
