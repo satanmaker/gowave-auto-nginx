@@ -20,6 +20,13 @@ is not a way to pass — ``--strict`` reports every gap as a failure, and the
 ledger keeps the audit open until the gap list is empty. ``--check`` stays
 usable while the gaps exist so the mapping can be reviewed as it is filled in.
 
+``behaviours`` is the second view: one entry per promise too narrow to be a
+scenario — a missing User-Agent header, one Vision combination, one kind of DNS
+answer. Each quotes the ``matrix.yaml`` declaration it rests on, so the report
+cannot describe a policy the manifest has dropped, and ``behaviour_obligations``
+names what the view has to cover, including every value of a list such as the
+four Vision combinations.
+
 ``docs/PODMAN_E2E_TRACEABILITY.md`` is the same table for a reader who will not
 open the YAML. It is generated (``--markdown``) and it is a fixed point: the
 audit re-renders the table and refuses a report that is not that text, so the
@@ -190,6 +197,54 @@ def expand(patterns: Iterable[str], declared: Dict[str, List[str]]) -> Tuple[Lis
     return pairs, empty
 
 
+def _case_problems(
+    label: str,
+    patterns: Sequence[str],
+    topologies: Optional[Sequence[str]],
+    declared: Dict[str, List[str]],
+) -> List[str]:
+    """Why the case ids a row names do not resolve against the suites.
+
+    A shared id such as ``TLS-01`` is declared by both suites; the row only has
+    to name one suite that declares it, and a shared id may run in both.
+    """
+    problems: List[str] = []
+    _pairs, empty = expand(patterns, declared)
+    for pattern in empty:
+        problems.append(f"{label}: no suite declares the case {pattern!r}")
+    if patterns and topologies is None:
+        problems.append(f"{label}: names cases but not the topologies they run in")
+    for topology in topologies or []:
+        if topology not in TOPOLOGIES:
+            problems.append(f"{label}: unknown topology {topology!r}")
+    if topologies is not None:
+        for pattern in patterns:
+            matched = expand([pattern], declared)[0]
+            if matched and not any(pair[0] in topologies for pair in matched):
+                problems.append(
+                    f"{label}: the case {pattern} is declared only by "
+                    f"{sorted({pair[0] for pair in matched})}, which the row does not name"
+                )
+    return problems
+
+
+def _test_problems(label: str, test_ids: Sequence[str], tests: Dict[str, Set[str]]) -> List[str]:
+    """Why a ``tests.<module>.<Class>[.<method>]`` id names nothing under ``tests/``."""
+    problems: List[str] = []
+    for test_id in test_ids:
+        parts = str(test_id).split(".")
+        if len(parts) not in (3, 4) or parts[0] != "tests":
+            problems.append(f"{label}: malformed test id {test_id!r}")
+            continue
+        class_id = ".".join(parts[:3])
+        if class_id not in tests:
+            problems.append(f"{label}: no test class {class_id}")
+            continue
+        if len(parts) == 4 and parts[3] not in tests[class_id]:
+            problems.append(f"{label}: no test method {test_id}")
+    return problems
+
+
 def validate(
     table: Dict[str, Any],
     spec: Sequence[Tuple[str, str]],
@@ -216,38 +271,10 @@ def validate(
         label = f"{requirement} / {scenario}"
 
         patterns = row.get("cases") or []
-        pairs, empty = expand(patterns, declared)
-        for pattern in empty:
-            problems.append(f"{label}: no suite declares the case {pattern!r}")
-        topologies = row.get("topologies")
-        if patterns and topologies is None:
-            problems.append(f"{label}: names cases but not the topologies they run in")
-        for topology in topologies or []:
-            if topology not in TOPOLOGIES:
-                problems.append(f"{label}: unknown topology {topology!r}")
-        # A shared id such as TLS-01 is declared by both suites; the row only has
-        # to name one suite that declares it, and a shared id may run in both.
-        if topologies is not None:
-            for pattern in patterns:
-                matched = [pair for pair in expand([pattern], declared)[0]]
-                if matched and not any(pair[0] in topologies for pair in matched):
-                    problems.append(
-                        f"{label}: the case {pattern} is declared only by "
-                        f"{sorted({pair[0] for pair in matched})}, which the row does not name"
-                    )
+        problems.extend(_case_problems(label, patterns, row.get("topologies"), declared))
 
         test_ids = row.get("tests") or []
-        for test_id in test_ids:
-            parts = str(test_id).split(".")
-            if len(parts) not in (3, 4) or parts[0] != "tests":
-                problems.append(f"{label}: malformed test id {test_id!r}")
-                continue
-            class_id = ".".join(parts[:3])
-            if class_id not in tests:
-                problems.append(f"{label}: no test class {class_id}")
-                continue
-            if len(parts) == 4 and parts[3] not in tests[class_id]:
-                problems.append(f"{label}: no test method {test_id}")
+        problems.extend(_test_problems(label, test_ids, tests))
 
         job_ids = row.get("jobs") or []
         for job in job_ids:
@@ -296,6 +323,172 @@ def validate(
                 problems.append(
                     f"orphan case: {case_id} ({topology}) is mapped to no scenario and no requirement"
                 )
+    return problems
+
+
+def behaviours(table: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The single promises the report publishes beside the scenario rows.
+
+    A scenario row answers "which case proves this sentence of the spec"; a
+    behaviour answers "what does this one promise rest on" — a missing
+    User-Agent, one Vision combination, one kind of DNS answer. Several
+    behaviours share a row and a case, which is why they are a second view and
+    not a second mapping: they add no coverage the row-level audit would
+    otherwise miss, and each one quotes a declaration the manifest states so
+    the report cannot claim a policy the matrix has moved away from.
+    """
+    return list(table.get("behaviours") or [])
+
+
+def resolve_declaration(path: str, matrix: Dict[str, Any]) -> Tuple[Any, bool]:
+    """The manifest value a dotted path names, and whether it is there."""
+    node: Any = matrix
+    for key in str(path).split("."):
+        if not isinstance(node, dict) or key not in node:
+            return None, False
+        node = node[key]
+    return node, True
+
+
+def declaration_text(entry: Dict[str, Any], matrix: Dict[str, Any]) -> str:
+    """How the report quotes a behaviour's declaration.
+
+    A scalar declaration is an equality and a list declaration is one element
+    of it, which is the difference the reader needs to see: the Vision
+    combinations live in one list, and a row that names ``both`` has not
+    restated the other three.
+    """
+    declares = entry.get("declares") or {}
+    path = str(declares.get("path") or "")
+    if not path:
+        return "—"
+    if "value" not in declares:
+        return f"`{path}`"
+    value, found = resolve_declaration(path, matrix)
+    if found and isinstance(value, list):
+        return f"`{path}` holds `{declares['value']}`"
+    return f"`{path}` = `{declares['value']}`"
+
+
+def _claim_key(value: Any) -> str:
+    """A value's identity as a claim: ``both`` and ``403`` never collide."""
+    return json.dumps(value, sort_keys=True)
+
+
+def _declaration_problems(
+    label: str,
+    declares: Dict[str, Any],
+    matrix: Dict[str, Any],
+    claims: Dict[Tuple[str, str], str],
+) -> List[str]:
+    """Why a behaviour does not quote the manifest exactly as it stands.
+
+    A declaration is either a scalar the behaviour repeats or a list it names
+    one element of, so a Vision combination can be quoted without restating the
+    whole list. Both forms are read from the manifest rather than trusted.
+    """
+    path = str(declares.get("path") or "")
+    if not path:
+        return [f"{label}: declares no manifest path"]
+    value, found = resolve_declaration(path, matrix)
+    if not found:
+        return [f"{label}: declares {path!r}, which the manifest does not hold"]
+    if "value" not in declares:
+        return [f"{label}: {path} has to be quoted with the value the manifest states"]
+    claimed = declares["value"]
+    if isinstance(value, list):
+        if claimed not in value:
+            return [f"{label}: {path} does not hold {claimed!r}"]
+    elif claimed != value:
+        return [
+            f"{label}: {path} is {value!r} in the manifest, the behaviour claims {claimed!r}"
+        ]
+    key = (path, _claim_key(claimed))
+    if key in claims:
+        return [f"{label}: {claims[key]} already claims {path} = {claimed!r}"]
+    claims[key] = label
+    return []
+
+
+def validate_behaviours(
+    table: Dict[str, Any],
+    spec: Sequence[Tuple[str, str]],
+    declared: Dict[str, List[str]],
+    jobs: Dict[str, str],
+    tests: Dict[str, Set[str]],
+    matrix: Dict[str, Any],
+) -> List[str]:
+    """Every way the named behaviours can disagree with what they quote.
+
+    The obligations are what keep the block from shrinking: a declaration the
+    table says the report covers has to be claimed by a behaviour, and an
+    ``every_value`` obligation makes each element of the manifest's list one
+    obligation of its own, so a new Vision combination is red until a behaviour
+    names it.
+    """
+    problems: List[str] = []
+    requirements = {requirement for requirement, _scenario in spec}
+    entries = behaviours(table)
+    seen: Set[str] = set()
+    claims: Dict[Tuple[str, str], str] = {}
+    for entry in entries:
+        name = str(entry.get("behaviour") or "").strip()
+        label = f"behaviour {name!r}" if name else "behaviour with no name"
+        if not name:
+            problems.append(f"{label}: has no text")
+        if name in seen:
+            problems.append(f"behaviour listed more than once: {name!r}")
+        seen.add(name)
+        requirement = entry.get("requirement")
+        if requirement not in requirements:
+            problems.append(f"{label}: no spec requirement {requirement!r}")
+        cases = entry.get("cases") or []
+        if not cases:
+            problems.append(f"{label}: names no case, so nothing proves it")
+        problems.extend(_case_problems(label, cases, entry.get("topologies"), declared))
+        problems.extend(_test_problems(label, entry.get("tests") or [], tests))
+        job_ids = entry.get("jobs") or []
+        if not job_ids:
+            problems.append(f"{label}: names no CI job, so nothing runs what it claims")
+        for job in job_ids:
+            if job not in jobs:
+                problems.append(f"{label}: no workflow declares the job {job!r}")
+        declares = entry.get("declares")
+        if declares is not None:
+            problems.extend(
+                _declaration_problems(label, declares if isinstance(declares, dict) else {},
+                                      matrix, claims)
+            )
+
+    obligations = list(table.get("behaviour_obligations") or [])
+    if not obligations:
+        problems.append(
+            "no behaviour obligation: the table names nothing the behaviours have to cover"
+        )
+    claimed_paths = {path for path, _key in claims}
+    for obligation in obligations:
+        if not isinstance(obligation, dict):
+            problems.append(f"behaviour obligation is not a mapping: {obligation!r}")
+            continue
+        path = str(obligation.get("path") or "")
+        value, found = resolve_declaration(path, matrix)
+        if not found:
+            problems.append(
+                f"behaviour obligation {path!r} names a declaration the manifest does not hold"
+            )
+            continue
+        if obligation.get("every_value"):
+            if not isinstance(value, list):
+                problems.append(
+                    f"behaviour obligation {path} asks for every value, but the manifest "
+                    "states a single one"
+                )
+                continue
+            for element in value:
+                if (path, _claim_key(element)) not in claims:
+                    problems.append(f"no behaviour names {path} = {element!r}")
+        elif path not in claimed_paths:
+            problems.append(f"no behaviour names {path}")
     return problems
 
 
@@ -362,6 +555,31 @@ def render(table: Dict[str, Any]) -> str:
         for entry in entries:
             cases = ", ".join(f"`{case}`" for case in entry["cases"])
             lines.append(f"| {entry['requirement']} | {cases} |")
+    named_behaviours = behaviours(table)
+    if named_behaviours:
+        lines += [
+            "",
+            "## Named behaviours",
+            "",
+            "The promises this change names one by one, with the `tests/cases/matrix.yaml`",
+            "declaration each one quotes, the cases that run it, the tests that pin it",
+            "and the job that runs them. Several behaviours share a scenario: this view",
+            "answers what one promise rests on, not which scenario owns it.",
+            "",
+            "| Behaviour | Requirement | Manifest | Cases | Tests | Job |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+        matrix = load_matrix()
+        for entry in named_behaviours:
+            cases = ", ".join(f"`{case}`" for case in entry.get("cases") or []) or "—"
+            tests = ", ".join(
+                f"`{'.'.join(test.split('.')[1:])}`" for test in entry.get("tests") or []
+            ) or "—"
+            jobs = ", ".join(entry.get("jobs") or []) or "—"
+            lines.append(
+                f"| {entry['behaviour']} | {entry['requirement']} "
+                f"| {declaration_text(entry, matrix)} | {cases} | {tests} | {jobs} |"
+            )
     lines += ["", f"Open gaps: {len(gaps(table))}.", ""]
     named = named_matrix_rows(table, declared)
     required = required_matrix_rows()
@@ -667,7 +885,11 @@ def audited(include_report: bool = True) -> Tuple[Dict[str, Any], List[str]]:
     """Load the checked-in table and every input it is judged against."""
     table = load_table()
     declared = declared_cases()
-    problems = validate(table, parse_spec(), declared, declared_jobs(), task_boxes(), test_index())
+    spec = parse_spec()
+    jobs = declared_jobs()
+    tests = test_index()
+    problems = validate(table, spec, declared, jobs, task_boxes(), tests)
+    problems.extend(validate_behaviours(table, spec, declared, jobs, tests, load_matrix()))
     problems.extend(positive_counts())
     problems.extend(matrix_problems(table, declared))
     if include_report:

@@ -7,6 +7,13 @@
 # `jobs` names jobs a workflow declares. A row with `gap` names the ledger task
 # that still owns the missing work, and `tools/podman_e2e/trace.py --strict`
 # refuses the table while any gap remains.
+#
+# The `behaviours` block below is a second view of the same cases: it names one
+# promise at a time and quotes the `tests/cases/matrix.yaml` declaration that
+# promise rests on, so a reader can ask what a single behaviour is proved by
+# without walking the scenario rows. `behaviour_obligations` names the
+# declarations the report has to cover; an obligation the behaviours stop
+# naming is a failure, not a shorter report.
 schema: gowave-podman-traceability/v1
 version: 1
 spec: openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md
@@ -409,3 +416,229 @@ cases_by_requirement:
       failures; its two scenarios state a Worker outage and an interrupted
       operator, so the disk, Panel, core-process and latency faults serve the
       requirement directly
+
+# What the published report has to cover, one declaration at a time. A plain
+# path is met by any behaviour that quotes it; `every_value` makes every element
+# of the manifest's list an obligation of its own, so a fifth Vision combination
+# added to the matrix turns this audit red instead of quietly widening a report
+# that still names four.
+behaviour_obligations:
+  - path: user_agent.accepted
+  - path: user_agent.absent
+  - path: user_agent.blank
+  - path: representations.base64
+  - path: representations.xray-json
+  - path: topologies.multi-node.vision_combinations
+    every_value: true
+
+# Behaviours the change names one by one. `declares` quotes the manifest — the
+# audit refuses a path it does not hold and a value it does not state — which is
+# what keeps a behaviour from claiming a policy the matrix has moved away from.
+behaviours:
+  - behaviour: A subscription request carrying a User-Agent is served
+    requirement: Real Panel subscription lifecycle
+    declares:
+      path: user_agent.accepted
+      value: non-empty header
+    cases: [SUB-SERVED]
+    topologies: [aio, multi-node]
+    tests:
+      - tests.test_podman_subscriptions.TestPanelSubscriptionProbe.test_each_representation_is_fetched_with_its_client_user_agent
+      - tests.test_podman_subscriptions.TestSubscriptionWiring.test_every_subscription_case_is_in_the_shared_catalog
+    jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+  - behaviour: A subscription request without a User-Agent header is refused
+    requirement: Real Panel subscription lifecycle
+    declares:
+      path: user_agent.absent
+      value: 403
+    cases: [SUB-UA-ABSENT]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_subscriptions.TestSubscriptionCases.test_absent_user_agent_case_is_refused_for_every_representation
+      - tests.test_podman_subscriptions.TestPanelSubscriptionProbe.test_an_absent_user_agent_is_a_request_without_the_header
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: A subscription request with a blank User-Agent header is refused
+    requirement: Real Panel subscription lifecycle
+    declares:
+      path: user_agent.blank
+      value: 403
+    cases: [SUB-UA-BLANK]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_subscriptions.TestSubscriptionCases.test_blank_user_agent_case_is_a_separate_result
+      - tests.test_podman_subscriptions.TestPanelSubscriptionProbe.test_a_blank_user_agent_is_an_empty_header_not_a_missing_one
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: The base64 representation is the share-link list the inventory describes
+    requirement: Panel subscription representations
+    declares:
+      path: representations.base64
+      value: /api/sub/{shortUuid}
+    cases: [SUB-B64]
+    topologies: [aio, multi-node]
+    tests:
+      - tests.test_podman_subscriptions.TestSubscriptionCases.test_share_link_case_imports_the_decoded_list
+      - tests.test_podman_subscriptions.TestSubscriptionClientProbe.test_the_base64_list_decodes_and_a_json_body_does_not
+    jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+  - behaviour: The Xray JSON representation is served as a bare object and as a list
+    requirement: Panel subscription representations
+    declares:
+      path: representations.xray-json
+      value: /api/sub/{shortUuid}/v2ray-json
+    cases: [SUB-JSON-SHAPES]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_subscriptions.TestSubscriptionCases.test_json_shape_case_loads_the_served_list_and_the_bare_object
+      - tests.test_podman_subscriptions.TestSubscriptionClientProbe.test_json_shapes_accepts_the_served_list_and_the_bare_object
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: Worker provisioning dials the Master's private run address
+    requirement: Podman-only Master address selection for Worker provisioning
+    cases: [PODNET-MASTER-ADDR]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_multi_node.TestMasterAddressCase.test_the_run_address_is_accepted_when_the_worker_uses_it
+      - tests.test_podman_address.TestPodmanAddressOverride.test_address_must_be_assigned_on_this_host
+      - tests.test_podman_multi_node.TestWorkerProvisioningCommand.test_the_command_is_the_operator_entrypoint_with_positional_roles
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: Vision runs on neither node
+    requirement: Independent Multi-Node acceptance topology
+    declares:
+      path: topologies.multi-node.vision_combinations
+      value: neither
+    cases: [MN-VISION, MN-DP-*]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_cluster.TestVisionCase.test_a_node_without_vision_is_proven_to_have_no_endpoint_under_its_name
+      - tests.test_podman_multi_node.TestMultiNodeCounts.test_the_four_vision_combinations_are_named_and_counted
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: Vision runs on the Master only
+    requirement: Independent Multi-Node acceptance topology
+    declares:
+      path: topologies.multi-node.vision_combinations
+      value: master-only
+    cases: [MN-VISION, MN-DP-*]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_cluster.TestVisionCase.test_the_inbound_is_matched_by_its_transport_not_by_its_tag
+      - tests.test_podman_multi_node.TestMultiNodeCounts.test_the_four_vision_combinations_are_named_and_counted
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: Vision runs on the Worker only
+    requirement: Independent Multi-Node acceptance topology
+    declares:
+      path: topologies.multi-node.vision_combinations
+      value: worker-only
+    cases: [MN-VISION, MN-DP-*]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_cluster.TestVisionCase.test_a_worker_that_keeps_a_vision_vhost_without_it_is_refused
+      - tests.test_podman_multi_node.TestMultiNodeCounts.test_the_four_vision_combinations_are_named_and_counted
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: Vision runs on both nodes
+    requirement: Independent Multi-Node acceptance topology
+    declares:
+      path: topologies.multi-node.vision_combinations
+      value: both
+    cases: [MN-VISION, MN-DP-*]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_cluster.TestVisionCase.test_each_combination_checks_both_nodes_against_their_own_names
+      - tests.test_podman_multi_node.TestMultiNodeCounts.test_the_four_vision_combinations_are_named_and_counted
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: A Worker whose pinned host key does not match is refused
+    requirement: Security and network isolation verification
+    cases: [MN-SSHKEY]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_multi_node.TestSshHostKeyCase.test_a_wrong_pin_that_still_connects_is_refused
+      - tests.test_podman_multi_node.TestWorkerTrustPin.test_the_pin_is_reported_and_present_on_both_sides
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: A rotated Worker host key is adopted and a stale pin is not
+    requirement: Security and network isolation verification
+    cases: [MN-SSHKEY]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_multi_node.TestSshHostKeyCase.test_the_pinned_key_gates_every_operation_and_a_rotation_is_adopted
+      - tests.test_podman_multi_node.TestSshHostKeyCase.test_a_stale_pin_accepted_after_rotation_is_refused
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: The decoy apex is derived from the cover names each role resolves
+    requirement: Camouflage decoy and certificate lineage
+    cases: [NGX-COVER-DERIVE]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_multi_node.TestCoverDeriveCase.test_both_roles_report_the_derived_apex_and_their_binding
+      - tests.test_podman_multi_node.TestCoverDeriveCase.test_the_generated_tables_run_the_shipped_decisions
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: A cover name that does not resolve blocks the decoy instead of rendering it
+    requirement: Camouflage decoy and certificate lineage
+    cases: [NGX-COVER-UNRESOLVED]
+    topologies: [multi-node]
+    tests:
+      - tests.test_podman_multi_node.TestCoverUnresolvedCase.test_every_probe_refuses_and_names_the_records_it_withheld
+      - tests.test_podman_multi_node.TestCoverUnresolvedCase.test_a_probe_that_renders_the_apex_is_rejected
+    jobs: [Multi-Node Podman Acceptance]
+
+  - behaviour: The decoy renders the site under the derived apex on every route
+    requirement: Camouflage decoy and certificate lineage
+    cases: [DECOY-01, NGX-COVER-SITE]
+    topologies: [aio, multi-node]
+    tests:
+      - tests.test_podman_aio.TestDecoyCase.test_every_route_serves_the_site_and_refuses_every_management_path
+      - tests.test_podman_multi_node.TestCoverSiteCase.test_the_shipped_site_passes_every_assertion
+    jobs: [All-in-One Podman Acceptance, Multi-Node Podman Acceptance]
+
+  - behaviour: DNS answers stay in the address family they were published for
+    requirement: Deterministic DNS and ACME fixtures
+    cases: [DNS-01]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_dns.TestDnsCase.test_a_family_answered_with_the_other_family_fails_the_case
+      - tests.test_fixture_dns.TestDnsFixture.test_answers_a_and_aaaa_with_configured_ttl
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: DNS answers carry the TTL the zone published
+    requirement: Deterministic DNS and ACME fixtures
+    cases: [DNS-01]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_dns.TestDnsCase.test_a_record_that_publishes_the_wrong_ttl_fails_the_case
+      - tests.test_fixture_dns.TestDnsFixture.test_stale_mode_uses_the_short_ttl
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: A name the zone does not hold answers NXDOMAIN
+    requirement: Deterministic DNS and ACME fixtures
+    cases: [DNS-01]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_dns.TestDnsCase.test_an_unknown_name_that_answers_fails_the_case
+      - tests.test_fixture_dns.TestDnsFixture.test_unknown_names_are_nxdomain_and_never_forwarded
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: A stale answer expires within the record TTL instead of outliving it
+    requirement: Deterministic DNS and ACME fixtures
+    cases: [DNS-01]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_dns.TestDnsCase.test_a_resolver_that_keeps_the_old_answer_past_the_ttl_fails_the_case
+      - tests.test_fixture_dns.TestDnsFixture.test_zone_change_applies_without_a_restart
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: A steered wrong answer is served as published instead of being repaired
+    requirement: Deterministic DNS and ACME fixtures
+    cases: [DNS-01]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_dns.TestDnsCase.test_a_wrong_answer_that_is_repaired_fails_the_case
+      - tests.test_fixture_dns.TestDnsFixture.test_wrong_answer_mode_returns_the_steered_address
+    jobs: [All-in-One Podman Acceptance]
