@@ -2299,6 +2299,9 @@ class TestCoverSiteCase(unittest.TestCase):
 
 _DECOY_ROUTE_INDEX = b"<html><title>A home for considered work | Testbed</title></html>"
 _DECOY_ROUTE_INDEX_SHA = hashlib.sha256(_DECOY_ROUTE_INDEX).hexdigest()
+_DECOY_ROUTE_404 = b"<html><title>Not found | Testbed</title></html>"
+_DECOY_ROUTE_404_SHA = hashlib.sha256(_DECOY_ROUTE_404).hexdigest()
+_DECOY_ROUTE_PANEL_API = b'{"error":"unauthorized"}'
 _DECOY_ROUTE_MASTER_MAP = (
     "map $ssl_preread_server_name $sni_backend {",
     "    panel.testbed.internal 127.0.0.1:7443;",
@@ -2390,6 +2393,7 @@ class _DecoyRoutePodman:
         }
         self.site_output = site_output if site_output is not None else (
             f"file\tindex.html\t{_DECOY_ROUTE_INDEX_SHA}\t{len(_DECOY_ROUTE_INDEX)}\n"
+            f"file\t404.html\t{_DECOY_ROUTE_404_SHA}\t{len(_DECOY_ROUTE_404)}\n"
         )
         self.outcomes = outcomes or {}
         self.scripts = {} if scripts is None else scripts
@@ -2442,26 +2446,43 @@ class _DecoyRouteHost:
     client_name = "client-01"
     untrusted_name = "untrusted-01"
 
-    def __init__(self, pages=None, status=None, sans=None):
+    def __init__(self, pages=None, status=None, sans=None, paths=None, insecure=None):
         self.pages = pages if pages is not None else {
             "testbed.internal": _DECOY_ROUTE_INDEX,
             "www.testbed.internal": _DECOY_ROUTE_INDEX,
             "reality.testbed.internal": _DECOY_ROUTE_INDEX,
+            "probe.testbed.internal": _DECOY_ROUTE_INDEX,
             "panel.testbed.internal": b"<html>panel login</html>",
         }
         self.status = status or {}
+        # Per-request answers: ``"<name><path>" -> (status, body)``. Anything not
+        # listed falls back to the site's own pages, so a path a management
+        # probe asks is refused with the cover site's 404.html.
+        self.paths = paths or {}
+        self.insecure = [] if insecure is None else insecure
         self.sans = sans if sans is not None else list(
             _DECOY_ROUTE_MASTER_LINEAGES[
                 "/etc/letsencrypt/live/reality.testbed.internal/cert.pem"])
         self.plan = type("Plan", (), {"target_ip": "10.89.0.10", "worker_ip": "10.89.0.11"})()
 
     def client_http(self, url, timeout=30, **kwargs):
-        name = url.split("://", 1)[1].split("/", 1)[0]
-        payload = self.pages.get(name, b"")
+        if kwargs.get("insecure"):
+            self.insecure.append(url)
+        name, _, path = url.split("://", 1)[1].partition("/")
+        path = f"/{path}"
+        answer = self.paths.get(f"{name}{path}")
+        if answer is None:
+            if path == "/":
+                answer = (self.status.get(name, 200), self.pages.get(name, b""))
+            elif name == self.panel_domain and path == "/api/nodes":
+                answer = (401, _DECOY_ROUTE_PANEL_API)
+            else:
+                answer = (404, _DECOY_ROUTE_404)
+        status, payload = answer
         probe = {
             "url": url,
             "method": "GET",
-            "status": self.status.get(name, 200),
+            "status": status,
             "headers": {"content-type": "text/html"},
             "body_length": len(payload),
             "body_sha256": hashlib.sha256(payload).hexdigest(),
@@ -2694,11 +2715,79 @@ class TestDecoyRouteCase(unittest.TestCase):
             self.run_case(host=host)
         self.assertIn("does not name www.testbed.internal", str(caught.exception))
 
+    def test_every_name_that_terminates_on_the_decoy_refuses_management_paths(self):
+        host = _DecoyRouteHost()
+        evidence = self.run_case(host=host)
+        names = evidence["management"]["names"]
+        self.assertEqual(sorted(names), sorted([
+            topology.COVER_APEX, f"www.{topology.COVER_APEX}",
+            topology.REALITY_DOMAIN, topology.PROBE_UNMAPPED_SNI,
+        ]))
+        for name, paths in names.items():
+            with self.subTest(name=name):
+                self.assertEqual(sorted(paths), sorted(aio.DECOY_MANAGEMENT_PATHS))
+                for path, fact in paths.items():
+                    self.assertEqual(fact["status"], 404, path)
+                    self.assertEqual(fact["sha256"], _DECOY_ROUTE_404_SHA, path)
+        self.assertEqual(evidence["management"]["panel_anonymous_api_status"], 401)
+        self.assertNotEqual(
+            evidence["management"]["panel_anonymous_api_sha256"], _DECOY_ROUTE_404_SHA)
+
+    def test_the_unlisted_sni_is_read_without_a_name_pin(self):
+        host = _DecoyRouteHost()
+        evidence = self.run_case(host=host)
+        self.assertEqual(evidence["client"]["unmapped"]["body_sha256"],
+                         _DECOY_ROUTE_INDEX_SHA)
+        self.assertIn(f"https://{topology.PROBE_UNMAPPED_SNI}/", host.insecure)
+
+    def test_a_management_path_answered_on_the_decoy_fails_the_run(self):
+        host = _DecoyRouteHost(paths={
+            f"{topology.COVER_APEX}/api/": (200, b'{"nodes":[]}'),
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("published a management interface", str(caught.exception))
+
+    def test_a_management_path_refused_with_another_body_fails_the_run(self):
+        host = _DecoyRouteHost(paths={
+            f"{topology.COVER_APEX}/api/nodes": (404, b"<html>nginx</html>"),
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("not the cover site's own 404.html", str(caught.exception))
+
+    def test_a_panel_that_answers_the_management_read_fails_the_control(self):
+        host = _DecoyRouteHost(paths={
+            f"{topology.PANEL_DOMAIN}/api/nodes": (200, b'{"nodes":[]}'),
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("control that tells the Panel from the decoy is gone",
+                      str(caught.exception))
+
+    def test_a_panel_name_served_by_the_decoy_fails_the_control(self):
+        host = _DecoyRouteHost(paths={
+            f"{topology.PANEL_DOMAIN}/api/nodes": (403, _DECOY_ROUTE_404),
+        })
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(host=host)
+        self.assertIn("is served by the decoy rather than by the Panel",
+                      str(caught.exception))
+
+    def test_a_site_without_a_404_document_is_rejected(self):
+        podman = _DecoyRoutePodman(site_output=(
+            f"file\tindex.html\t{_DECOY_ROUTE_INDEX_SHA}\t{len(_DECOY_ROUTE_INDEX)}\n"
+        ))
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(podman=podman)
+        self.assertIn("rendered no 404.html", str(caught.exception))
+
     def test_a_panel_name_serving_the_decoy_page_is_rejected(self):
         host = _DecoyRouteHost(pages={
             "testbed.internal": _DECOY_ROUTE_INDEX,
             "www.testbed.internal": _DECOY_ROUTE_INDEX,
             "reality.testbed.internal": _DECOY_ROUTE_INDEX,
+            "probe.testbed.internal": _DECOY_ROUTE_INDEX,
             "panel.testbed.internal": _DECOY_ROUTE_INDEX,
         })
         with self.assertRaises(AssertionError) as caught:

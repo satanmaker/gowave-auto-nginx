@@ -1669,8 +1669,17 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_panel_ready
+      evidence:
+      - loopback_api
+      - loopback_login
+      - public_san
+      - public_status
+      - public_tls
+      case: AIO-01
   promotion_target: null
 - id: NGX-02
   requirement: NGINX SNI Routing and REALITY Decoy Verification
@@ -1691,8 +1700,20 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_decoy
+      evidence: []
+      case: DECOY-01
+    multi-node:
+      driver: multi_node:case_decoy_route
+      evidence:
+      - client
+      - management
+      - paths
+      - roles
+      case: NGX-DECOY-ROUTE
   promotion_target: null
 - id: NGX-03
   requirement: NGINX SNI Routing and REALITY Decoy Verification
@@ -1716,8 +1737,20 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_decoy
+      evidence: []
+      case: DECOY-01
+    multi-node:
+      driver: multi_node:case_decoy_route
+      evidence:
+      - client
+      - management
+      - paths
+      - roles
+      case: NGX-DECOY-ROUTE
   promotion_target: null
 - id: NGX-04
   requirement: NGINX SNI Routing and REALITY Decoy Verification
@@ -4385,6 +4418,7 @@ cases:
       driver: multi_node:case_decoy_route
       evidence:
       - client
+      - management
       - paths
       - roles
   promotion_target: NGINX SNI Routing and REALITY Decoy Verification

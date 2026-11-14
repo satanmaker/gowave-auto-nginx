@@ -1074,6 +1074,31 @@ LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     # preset, no duplicate names, and a routing-rule family a client would
     # actually route through.
     "SUB-04": {"aio": "SUB-SERVED", "multi-node": "SUB-SERVED"},
+    # The live sentence asks for three things on one connection to the panel's
+    # name: TLS terminates, the certificate names that domain, and the Panel API
+    # answers. AIO-01 asserts all three — an authenticated `/api/nodes` call on
+    # the host and a client-side fetch pinned to the panel's SAN over TLS 1.3 —
+    # so it is read as the stricter form. The Multi-Node contour is deliberately
+    # absent: TLS-01 proves the Master's public HTTPS and its certificate policy,
+    # but no case there calls the Panel API over the public name (CLUS-01/02/03
+    # read it over the loopback), so the third clause would be claimed, not
+    # witnessed.
+    "NGX-01": {"aio": "AIO-01"},
+    # The decoy must hand out the cover site and never a management interface.
+    # DECOY-01 asks nine management paths on four ways into the camouflage
+    # listener and requires the site's own 404 page on every one, with the panel
+    # name as the control where the same read is refused by the Panel.
+    # NGX-DECOY-ROUTE is the cluster's version of that claim after the same
+    # probe was added there: the cover pair, the REALITY name without REALITY
+    # authentication and an SNI the stream map does not list each refuse all
+    # nine paths with the rendered 404.html.
+    "NGX-02": {"aio": "DECOY-01", "multi-node": "NGX-DECOY-ROUTE"},
+    # The fallback half: a client that reaches the node with an unrecognised
+    # REALITY handshake, or with a name the stream map does not list, lands on
+    # the rendered cover page rather than on anything the deployment manages.
+    # Both cases serve that page byte for byte from the client, over the REALITY
+    # lineage for the REALITY name and without a name pin for the unlisted one.
+    "NGX-03": {"aio": "DECOY-01", "multi-node": "NGX-DECOY-ROUTE"},
 }
 
 
