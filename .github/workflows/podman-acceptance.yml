@@ -117,3 +117,100 @@ jobs:
           path: artifacts/podman-e2e/
           if-no-files-found: warn
           retention-days: 14
+
+  # The two jobs above fail when a case fails; neither notices a recovery case
+  # that was deleted from `cases()`, because the shorter suite still reports
+  # PASS. These jobs run the same suites with `--require-group recovery`, which
+  # makes the case ids a promise the run has to keep: an absent id and a
+  # non-PASS one are both a red verdict, and the audit lands in result.json.
+  # They run on the merge gate only — a push already spends the minutes on the
+  # full suites, and the recovery contract is what a review must not merge past.
+  aio-lifecycle-recovery:
+    name: All-in-One Lifecycle and Recovery Acceptance
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install rootful Podman and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman iproute2 nftables iputils-ping
+          python3 -m pip install --disable-pip-version-check PyYAML
+
+      - name: Verify the runtime the suite depends on
+        run: |
+          sudo podman version
+          sudo podman info --format json | tee "${RUNNER_TEMP}/podman-info.json" >/dev/null
+          python3 - "${RUNNER_TEMP}/podman-info.json" <<'PY'
+          import json
+          import sys
+
+          host = json.load(open(sys.argv[1]))["host"]
+          print(f"podman host: cgroup={host['cgroupVersion']} network={host['networkBackend']}")
+          assert host["cgroupVersion"] == "v2", "the suite needs a cgroup v2 host"
+          assert host["networkBackend"] == "netavark", "the suite needs the netavark network backend"
+          PY
+
+      - name: Execute the full All-in-One suite with the recovery contract
+        run: sudo python3 -m tools.run_podman_e2e --topology aio --require-group recovery
+
+      - name: Upload the run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: podman-aio-recovery-${{ github.run_id }}
+          path: artifacts/podman-e2e/
+          if-no-files-found: warn
+          retention-days: 14
+
+  multi-node-lifecycle-recovery:
+    name: Multi-Node Lifecycle and Recovery Acceptance
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install rootful Podman and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman iproute2 nftables iputils-ping
+          python3 -m pip install --disable-pip-version-check PyYAML
+
+      - name: Verify the runtime the suite depends on
+        run: |
+          sudo podman version
+          sudo podman info --format json | tee "${RUNNER_TEMP}/podman-info.json" >/dev/null
+          python3 - "${RUNNER_TEMP}/podman-info.json" <<'PY'
+          import json
+          import sys
+
+          host = json.load(open(sys.argv[1]))["host"]
+          print(f"podman host: cgroup={host['cgroupVersion']} network={host['networkBackend']}")
+          assert host["cgroupVersion"] == "v2", "the suite needs a cgroup v2 host"
+          assert host["networkBackend"] == "netavark", "the suite needs the netavark network backend"
+          PY
+
+      - name: Execute the full Multi-Node suite with the recovery contract
+        run: sudo python3 -m tools.run_podman_e2e --topology multi-node --require-group recovery
+
+      - name: Upload the run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: podman-multi-node-recovery-${{ github.run_id }}
+          path: artifacts/podman-e2e/
+          if-no-files-found: warn
+          retention-days: 14

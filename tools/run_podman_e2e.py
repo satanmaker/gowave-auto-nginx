@@ -20,7 +20,7 @@ from typing import List, Optional, Sequence
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.podman_e2e import aio, diagnostics, multi_node, target_image  # noqa: E402
+from tools.podman_e2e import aio, diagnostics, groups, multi_node, target_image  # noqa: E402
 from tools.podman_e2e.podman import Podman  # noqa: E402
 from tools.podman_e2e.runner import Case, RunContext, Runner  # noqa: E402
 
@@ -75,10 +75,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=REPO_ROOT / "artifacts" / "podman-e2e",
     )
     parser.add_argument("--budget-seconds", type=int, default=None)
+    parser.add_argument(
+        "--require-group",
+        choices=groups.GROUPS,
+        default=None,
+        help=(
+            "Fail the run unless every case id in this group was declared and passed; "
+            "a case deleted from the suite would otherwise leave a shorter green run"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.worker_vision and args.topology != "multi-node":
         parser.error("--worker-vision configures a Worker, and the AIO topology has none")
+    if args.require_group:
+        try:
+            groups.required_ids(args.require_group, args.topology)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     budget = args.budget_seconds
     if budget is None:
@@ -98,6 +112,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Containers, the network, and run images belong to the run, not the shell.
     podman.register_cleanup()
     runner = Runner(context)
+    if args.require_group:
+        runner.require_group(args.require_group)
     # A failed case names a contradiction, not its cause, so every non-green case
     # also leaves the state of the run's own containers. The hook reads state and
     # cannot change a verdict, and it runs before the cleanup that removes them.

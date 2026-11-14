@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from tools.live_vps.redaction import redact, register_secret
+from tools.podman_e2e import groups
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -293,11 +294,24 @@ class Runner:
         # runner: collection needs Podman, while the runner stays a result
         # machine a unit test can drive without one.
         self.failure_hooks: List[Callable[[CaseResult], None]] = []
+        self.required_groups: List[str] = []
+        self._groups_applied = False
         self._diagnosed = False
         self._pending_abort = ""
 
     def add(self, case: Case) -> None:
         self.cases.append(case)
+
+    def require_group(self, group: str) -> None:
+        """Declare a set of case ids this run must contain and pass.
+
+        A case can be dropped from a suite by an ordinary edit and the remaining
+        run still reports PASS; naming the group makes that loss a red verdict
+        and records the audit in ``result.json``. The declaration is validated
+        here rather than at report time so a typo fails before the install.
+        """
+        groups.required_ids(group, self.context.topology)
+        self.required_groups.append(group)
 
     def on_failure(self, hook: Callable[[CaseResult], None]) -> None:
         """Register a collector that runs for every non-green case, before cleanup."""
@@ -447,6 +461,8 @@ class Runner:
         return threading.current_thread() is threading.main_thread()
 
     def report(self) -> int:
+        self._apply_required_groups()
+
         def payload() -> Dict[str, Any]:
             return {
                 "schema": "gowave-podman-e2e-result/v1",
@@ -490,6 +506,37 @@ class Runner:
 
         hand_back_artifacts(self.context.artifact_dir, self.context.operator)
         return 0 if data["overall"] == PASS else 1
+
+    def _apply_required_groups(self) -> None:
+        """Read the declared groups back and fail the run when one is unmet.
+
+        The audit travels in ``environment.required_groups`` so a green artifact
+        says which case ids the run promised, not only that nothing failed. The
+        failing verdict is a case result like any other, which keeps it visible
+        in JUnit and in the aggregate status instead of only in a log line.
+        """
+        if not self.required_groups or self._groups_applied:
+            return
+        self._groups_applied = True
+        audit: Dict[str, Any] = {}
+        problems: List[str] = []
+        for group in self.required_groups:
+            required = groups.required_ids(group, self.context.topology)
+            unmet = groups.unmet(required, self.results, passing=PASS)
+            audit[group] = {
+                "topology": self.context.topology,
+                "required": list(required),
+                "unmet": unmet,
+            }
+            problems.extend(f"{group}: {problem}" for problem in unmet)
+        self.context.environment["required_groups"] = audit
+        if problems:
+            self.results.append(CaseResult(
+                "REQUIRED-GROUP",
+                self.context.topology,
+                FAIL,
+                message="required cases missing or not passing: " + "; ".join(problems),
+            ))
 
 
 def redaction_audit(artifact_dir: Path) -> Dict[str, Any]:
