@@ -342,9 +342,9 @@ requirements:
     scenarios:
       - scenario: Unmapped behavior or orphan case fails the audit
         tests:
+          - tests.test_podman_behaviors.TestBehaviorInventory
           - tests.test_podman_traceability.TestTraceabilityRules
         jobs: ["Lint, Completeness, and Suite Nonroot"]
-        gap: 8.16 — tests/cases/behaviors.yaml is missing, so `catalog check` is red on that file
       - scenario: Shared contract diverges from live acceptance
         gap: 8.17 — the audit against openspec/specs/live-vps-e2e/spec.md has not been performed
 

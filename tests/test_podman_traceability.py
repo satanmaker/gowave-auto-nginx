@@ -197,9 +197,19 @@ class TestTraceabilityRules(unittest.TestCase):
         gaps = trace.gaps(self.table)
         self.assertEqual(
             {gap.split()[0] for _requirement, _scenario, gap in gaps},
-            {"8.16", "8.17"},
+            {"8.17"},
             "each open gap must name the ledger task that owns it",
         )
+
+    def test_a_closed_gap_is_cited_by_the_test_that_closed_it(self):
+        rows = {
+            row["scenario"]: row
+            for group in self.table.get("requirements") or []
+            for row in group.get("scenarios") or []
+        }
+        row = rows["Unmapped behavior or orphan case fails the audit"]
+        self.assertIn("tests.test_podman_behaviors.TestBehaviorInventory", row["tests"])
+        self.assertNotIn("gap", row)
 
     def test_the_published_report_is_the_table_rendered(self):
         self.assertEqual(
