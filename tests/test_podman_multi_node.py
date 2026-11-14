@@ -681,6 +681,7 @@ class TestRunnerEntrypoint(unittest.TestCase):
         class _Podman:
             def __init__(self, context):
                 self.context = context
+                captured["environment"] = dict(context.environment)
 
             def remove_stale_runs(self):
                 # The entrypoint reclaims what a killed run left behind; this stub
@@ -732,6 +733,28 @@ class TestRunnerEntrypoint(unittest.TestCase):
         captured = self._main(["--topology", "multi-node"])
         self.assertFalse(captured["vision"])
         self.assertFalse(captured["worker_vision"])
+
+    def test_the_artifact_names_the_vision_combination_the_flags_select(self):
+        """`result.json` has to say which of the four Multi-Node configurations ran.
+
+        `enabled`/`disabled` describes All-in-One, so a Multi-Node run labelled
+        that way cannot be matched to the positive-case count it owes — the
+        matrix states one count per combination, and two of them are 18.
+        """
+        cases = (
+            (["--topology", "aio"], "disabled"),
+            (["--topology", "aio", "--vision"], "enabled"),
+            (["--topology", "multi-node"], "neither"),
+            (["--topology", "multi-node", "--vision"], "master-only"),
+            (["--topology", "multi-node", "--worker-vision"], "worker-only"),
+            (
+                ["--topology", "multi-node", "--vision", "--worker-vision"],
+                "both",
+            ),
+        )
+        for argv, expected in cases:
+            with self.subTest(argv=" ".join(argv)):
+                self.assertEqual(self._main(argv)["environment"]["vision"], expected)
 
     def test_the_failure_bundle_is_wired_before_any_case_runs(self):
         captured = self._main(["--topology", "multi-node"])

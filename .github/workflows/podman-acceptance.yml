@@ -63,6 +63,14 @@ jobs:
       - name: Execute the full All-in-One acceptance suite
         run: sudo python3 -m tools.run_podman_e2e --topology aio
 
+      # `overall: PASS` is an aggregate: it would stay PASS if a data-plane case
+      # stopped being declared, because the shorter suite is still all-green.
+      # This reads the run's own case list back against the count the matrix owes
+      # for the Vision configuration the run recorded.
+      - name: Verify the positive-case counts the matrix owes
+        if: success()
+        run: sudo python3 -m tools.podman_e2e.trace --verify-run artifacts/podman-e2e
+
       # result.json, junit.xml and the evidence files are the debugging surface
       # of a failed case, so they are kept even when the step above exited 1.
       - name: Upload the run artifacts
@@ -108,6 +116,12 @@ jobs:
 
       - name: Execute the full Multi-Node acceptance suite
         run: sudo python3 -m tools.run_podman_e2e --topology multi-node
+
+      # Same read-back as the All-in-One job, with four Vision combinations to
+      # tell apart: 16, 18 or 20 positive cases depending on what ran.
+      - name: Verify the positive-case counts the matrix owes
+        if: success()
+        run: sudo python3 -m tools.podman_e2e.trace --verify-run artifacts/podman-e2e
 
       - name: Upload the run artifacts
         if: always()
@@ -161,6 +175,10 @@ jobs:
       - name: Execute the full All-in-One suite with the recovery contract
         run: sudo python3 -m tools.run_podman_e2e --topology aio --require-group recovery
 
+      - name: Verify the positive-case counts the matrix owes
+        if: success()
+        run: sudo python3 -m tools.podman_e2e.trace --verify-run artifacts/podman-e2e
+
       - name: Upload the run artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -205,6 +223,10 @@ jobs:
 
       - name: Execute the full Multi-Node suite with the recovery contract
         run: sudo python3 -m tools.run_podman_e2e --topology multi-node --require-group recovery
+
+      - name: Verify the positive-case counts the matrix owes
+        if: success()
+        run: sudo python3 -m tools.podman_e2e.trace --verify-run artifacts/podman-e2e
 
       - name: Upload the run artifacts
         if: always()

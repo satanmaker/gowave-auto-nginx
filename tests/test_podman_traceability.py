@@ -7,18 +7,23 @@ claims to what exists: the spec's scenario list, the ids the two suites declare,
 the test classes under `tests/`, the jobs the workflows declare, and the ledger's
 open boxes. A row that cites a case nobody declares, a test nobody wrote, a job
 no workflow has, or a task that is already closed must fail here rather than in
-a review.
+a review. The published report is judged the same way: it is what the table
+renders to, or it is refused.
 """
 import contextlib
+import copy
 import io
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.podman_e2e import trace  # noqa: E402
+from tools.podman_e2e import catalog, trace  # noqa: E402
 
 
 class TestTraceabilityRules(unittest.TestCase):
@@ -195,6 +200,200 @@ class TestTraceabilityRules(unittest.TestCase):
             {"8.14", "8.15", "8.16", "8.17"},
             "each open gap must name the ledger task that owns it",
         )
+
+    def test_the_published_report_is_the_table_rendered(self):
+        self.assertEqual(
+            trace.report_problems(self.table), [],
+            "docs/PODMAN_E2E_TRACEABILITY.md must be the text the table renders to",
+        )
+
+    def test_a_report_that_drifts_from_the_table_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "PODMAN_E2E_TRACEABILITY.md"
+            report.write_text("| Requirement | Scenario |\n| --- | --- |\n", encoding="utf-8")
+            problems = trace.report_problems(self.table, report)
+        self.assertTrue(
+            any("not what the table renders to" in problem for problem in problems), problems
+        )
+
+    def test_a_missing_report_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            problems = trace.report_problems(self.table, Path(directory) / "absent.md")
+        self.assertTrue(any("is missing" in problem for problem in problems), problems)
+
+    def test_the_report_carries_every_scenario_and_the_gap_count(self):
+        report = trace.render(self.table)
+        for requirement, scenario in self.spec:
+            with self.subTest(scenario=scenario):
+                self.assertIn(f"| {requirement} | {scenario} |", report)
+        self.assertIn(f"Open gaps: {len(trace.gaps(self.table))}.", report)
+        self.assertIn("## Cases serving a requirement that states no scenario", report)
+        for entry in trace.unstated(self.table):
+            with self.subTest(requirement=entry["requirement"]):
+                self.assertIn(entry["requirement"], report)
+
+    def test_the_positive_case_counts_are_what_the_suites_declare(self):
+        self.assertEqual(
+            trace.positive_counts(), [],
+            "the manifest's expected positive-case counts must be the ones the suites declare",
+        )
+
+    def test_a_manifest_count_the_suite_does_not_declare_is_refused(self):
+        doctored = copy.deepcopy(catalog.load_catalog())
+        doctored["expected_positive_case_counts"]["multi-node"]["vision_both"] = 21
+        with mock.patch.object(catalog, "load_catalog", return_value=doctored):
+            problems = trace.positive_counts()
+        self.assertTrue(
+            any("multi-node/vision_both" in problem and "21" in problem for problem in problems),
+            problems,
+        )
+
+    def test_every_non_optional_matrix_row_is_named_by_a_scenario(self):
+        self.assertEqual(trace.matrix_problems(self.table, self.declared), [])
+        required = trace.required_matrix_rows()
+        self.assertEqual(
+            len(required), 24,
+            "4 non-optional inbounds x 2 clients x (1 All-in-One + 2 Multi-Node nodes)",
+        )
+        self.assertEqual({row[0] for row in required}, {"aio", "multi-node"})
+
+    def test_a_matrix_row_no_scenario_names_is_refused(self):
+        table = copy.deepcopy(self.table)
+        for row in table["requirements"]:
+            for scenario_row in row["scenarios"]:
+                scenario_row["cases"] = [
+                    case for case in scenario_row.get("cases") or [] if case != "AIO-DP-*"
+                ]
+        problems = trace.matrix_problems(table, self.declared)
+        self.assertTrue(
+            any(
+                "aio: no scenario names the matrix row REALITY/xray" in problem
+                for problem in problems
+            ),
+            problems,
+        )
+
+    def test_a_case_id_naming_an_undeclared_inbound_is_refused(self):
+        table = copy.deepcopy(self.table)
+        row = self.row_in(table, "Fixture chain is trusted by Xray and Mihomo")
+        row["cases"][0] = "AIO-DP-QUIC-xray"
+        declared = dict(self.declared)
+        declared["aio"] = [*self.declared["aio"], "AIO-DP-QUIC-xray"]
+        problems = trace.matrix_problems(table, declared)
+        self.assertTrue(
+            any("names the inbound 'QUIC'" in problem for problem in problems), problems
+        )
+
+    def test_a_case_id_naming_an_undeclared_node_is_refused(self):
+        table = copy.deepcopy(self.table)
+        self.row_in(table, "Worker data-plane traffic cannot bypass Worker")["cases"] = [
+            "MN-DP-edge-REALITY-xray"
+        ]
+        declared = dict(self.declared)
+        declared["multi-node"] = [*self.declared["multi-node"], "MN-DP-edge-REALITY-xray"]
+        problems = trace.matrix_problems(table, declared)
+        self.assertTrue(any("names the node 'edge'" in problem for problem in problems), problems)
+
+    def test_a_data_plane_id_without_a_client_is_refused(self):
+        table = copy.deepcopy(self.table)
+        self.row_in(table, "Worker data-plane traffic cannot bypass Worker")["cases"] = [
+            "MN-DP-REALITY"
+        ]
+        declared = dict(self.declared)
+        declared["multi-node"] = [*self.declared["multi-node"], "MN-DP-REALITY"]
+        problems = trace.matrix_problems(table, declared)
+        self.assertTrue(any("names no client" in problem for problem in problems), problems)
+
+    def test_the_matrix_column_names_the_rows_the_case_ids_decode_to(self):
+        report = trace.render(self.table)
+        self.assertIn(
+            "| Requirement | Scenario | Matrix rows | Cases | Tests | Job | Gap |", report
+        )
+        self.assertIn("8 of 8 aio rows, 16 of 16 multi-node rows", report)
+        row = next(
+            line for line in report.splitlines()
+            if line.startswith("| Private test CA trust for both client engines |")
+        )
+        for label in ("XHTTP/xray", "WS/mihomo", "TROJAN-GRPC/xray"):
+            with self.subTest(label=label):
+                self.assertIn(f"`{label}`", row)
+        multi_row = next(
+            line for line in report.splitlines()
+            if line.startswith("| Non-bypassable node egress attribution |")
+        )
+        self.assertIn("`worker/REALITY/xray`", multi_row)
+        self.assertNotIn("`master/REALITY/xray`", multi_row)
+
+    def make_run(self, directory, count=8, status="PASS", vision="disabled"):
+        """A run directory with the shape ``result.json`` actually has."""
+        ids = [case for case in self.declared["aio"] if "-DP-" in case][:count]
+        result = {
+            "schema": "gowave-podman-e2e-result/v1",
+            "run_id": "podman-aio-stub",
+            "topology": "aio",
+            "environment": {"vision": vision},
+            "cases": [{"id": case_id, "status": status} for case_id in ids],
+            "overall": "PASS",
+        }
+        path = Path(directory) / "result.json"
+        path.write_text(json.dumps(result), encoding="utf-8")
+        return path
+
+    def test_a_run_that_executed_every_positive_case_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_run(directory)
+            self.assertEqual(trace.run_count_problems(directory), [])
+
+    def test_a_run_short_of_the_manifest_count_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_run(directory, count=7)
+            problems = trace.run_count_problems(directory)
+        self.assertTrue(
+            any("owes 8 positive cases for aio/disabled" in p and "executed 7" in p
+                for p in problems),
+            problems,
+        )
+
+    def test_a_positive_case_that_did_not_pass_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_run(directory, count=8, status="SKIP")
+            problems = trace.run_count_problems(directory)
+        self.assertTrue(any("is SKIP, so it is not a positive case" in p for p in problems), problems)
+
+    def test_a_run_of_an_undeclared_vision_combination_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_run(directory, vision="sometimes")
+            problems = trace.run_count_problems(directory)
+        self.assertTrue(any("declares no count for" in p for p in problems), problems)
+
+    def test_the_verify_run_entrypoint_reads_a_run_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_run(directory)
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                self.assertEqual(trace.main(["--verify-run", directory]), 0)
+            self.assertIn("executed every positive case it owes", printed.getvalue())
+            self.make_run(directory, count=7)
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                self.assertEqual(trace.main(["--verify-run", directory]), 1)
+            self.assertIn("did not execute the positive cases", printed.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(trace.main(["--verify-run"]), 2)
+
+    def test_an_artifact_root_is_judged_run_by_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, count in (("podman-aio-good", 8), ("podman-aio-short", 7)):
+                (root / name).mkdir()
+                self.make_run(root / name, count=count)
+            problems = trace.run_count_problems(root)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("podman-aio-short", problems[0])
+        self.assertIn("executed 7", problems[0])
+
+    def test_a_root_with_no_finished_run_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            problems = trace.run_count_problems(directory)
+        self.assertTrue(any("holds no finished run" in problem for problem in problems), problems)
 
     def test_the_audit_entrypoint_reads_the_checked_in_table(self):
         with contextlib.redirect_stdout(io.StringIO()) as printed:

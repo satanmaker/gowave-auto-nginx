@@ -20,7 +20,7 @@ from typing import List, Optional, Sequence
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.podman_e2e import aio, diagnostics, groups, multi_node, target_image  # noqa: E402
+from tools.podman_e2e import aio, diagnostics, groups, matrix, multi_node, target_image  # noqa: E402
 from tools.podman_e2e.podman import Podman  # noqa: E402
 from tools.podman_e2e.runner import Case, RunContext, Runner  # noqa: E402
 
@@ -104,8 +104,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         budget_seconds=budget,
     )
     # The selected Vision configuration is part of the run's identity: the
-    # matrix owes 8 or 10 positive cases (AIO) or 16/18/20 (Multi-Node).
-    context.environment["vision"] = "enabled" if args.vision else "disabled"
+    # matrix owes 8 or 10 positive cases (AIO) or 16/18/20 (Multi-Node). The label
+    # is the matrix's own combination key, because All-in-One has two
+    # configurations and Multi-Node has four: recording ``enabled``/``disabled``
+    # for a Multi-Node run would hide which node carried Vision.
+    context.environment["vision"] = matrix.combination(
+        args.topology, args.vision, args.worker_vision
+    )
     if args.topology == "multi-node":
         context.environment["worker_vision"] = "enabled" if args.worker_vision else "disabled"
     podman = Podman(context)

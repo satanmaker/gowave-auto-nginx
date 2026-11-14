@@ -94,6 +94,21 @@ evidence/diagnostics/<CASE-ID>/   the failure bundle, when a case failed
 and tree state the run measured, the image digests it resolved, the selected
 Vision configuration, the `required_groups` audit and the `redaction_audit`.
 
+`environment.vision` is the matrix's own combination key — `disabled`/`enabled`
+on All-in-One, `neither`/`master-only`/`worker-only`/`both` on Multi-Node — so a
+run can be matched to the positive-case count the matrix owes it (8/10 and
+16/18/20). `overall: PASS` is an aggregate and says nothing about how many
+data-plane cases contributed, so the count is read back from the artifact:
+
+```bash
+sudo python3 -m tools.podman_e2e.trace --verify-run artifacts/podman-e2e
+```
+
+It exits `1` naming the run, the count and the shortfall; CI runs it after every
+acceptance suite. The full requirement → scenario → matrix row → case → test →
+CI job mapping, and the count itself, are published in
+[`docs/PODMAN_E2E_TRACEABILITY.md`](PODMAN_E2E_TRACEABILITY.md).
+
 States are never collapsed: `PASS`, `FAIL`, `BLOCKED`, `SKIP`,
 `NOT_APPLICABLE`, `INCOMPLETE`. Any `SKIP` fails the run, `BLOCKED` and
 `INCOMPLETE` never read as `PASS`, and a run in which nothing applied is
