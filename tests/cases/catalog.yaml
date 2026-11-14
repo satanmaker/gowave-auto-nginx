@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 87
-  total: 212
+  podman_first: 88
+  total: 213
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -870,8 +870,29 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_argv_observer
+      evidence:
+      - argv_observer_abbreviated
+      - argv_observer_errors
+      - argv_observer_exec_count
+      - argv_observer_execve_count
+      - argv_observer_execveat_count
+      - argv_observer_fixture_errors
+      - argv_observer_fixtures
+      - argv_observer_limit
+      - argv_observer_probe_path
+      - argv_observer_secret_found
+      - argv_observer_ssh_client
+      - argv_observer_ssh_execs
+      - argv_observer_strace_installed
+      - argv_observer_strace_version
+      - argv_observer_trace_bytes
+      - argv_observer_trace_removed
+      - argv_observer_truncated
+      case: MN-ARGV-OBSERVER
   promotion_target: null
 - id: WRK-02
   requirement: Distributed Worker VPS Deployment Verification
@@ -895,8 +916,29 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_argv_observer
+      evidence:
+      - argv_observer_abbreviated
+      - argv_observer_errors
+      - argv_observer_exec_count
+      - argv_observer_execve_count
+      - argv_observer_execveat_count
+      - argv_observer_fixture_errors
+      - argv_observer_fixtures
+      - argv_observer_limit
+      - argv_observer_probe_path
+      - argv_observer_secret_found
+      - argv_observer_ssh_client
+      - argv_observer_ssh_execs
+      - argv_observer_strace_installed
+      - argv_observer_strace_version
+      - argv_observer_trace_bytes
+      - argv_observer_trace_removed
+      - argv_observer_truncated
+      case: MN-ARGV-OBSERVER
   promotion_target: null
 - id: WRK-03
   requirement: Distributed Worker VPS Deployment Verification
@@ -924,8 +966,29 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_argv_observer
+      evidence:
+      - argv_observer_abbreviated
+      - argv_observer_errors
+      - argv_observer_exec_count
+      - argv_observer_execve_count
+      - argv_observer_execveat_count
+      - argv_observer_fixture_errors
+      - argv_observer_fixtures
+      - argv_observer_limit
+      - argv_observer_probe_path
+      - argv_observer_secret_found
+      - argv_observer_ssh_client
+      - argv_observer_ssh_execs
+      - argv_observer_strace_installed
+      - argv_observer_strace_version
+      - argv_observer_trace_bytes
+      - argv_observer_trace_removed
+      - argv_observer_truncated
+      case: MN-ARGV-OBSERVER
   promotion_target: null
 - id: WRK-04
   requirement: Distributed Worker VPS Deployment Verification
@@ -5056,6 +5119,48 @@ cases:
       driver: multi_node:case_vision_independence
       evidence: []
   promotion_target: Independent Optional Vision Domains
+- id: MN-ARGV-OBSERVER
+  requirement: Distributed Worker VPS Deployment Verification
+  live_scenario: null
+  assertion: The Master traces its own dispatch of `gowave-auto.sh node add` with `strace -f -v -s 32*PAGE_SIZE
+    -e trace=execve,execveat`, and before that trace is read the observer proves on the same host that
+    a sentinel after byte 32 of an argument survives in both an `execve` and an `execveat` record while
+    the same argument under `-s 32` is cut and reported as truncated, and that a 128-element argv arrives
+    in order with its sentinel last and no omission marker; the dispatch trace then counts as complete
+    only if every argv vector is whole, holds the SSH client's own exec record and carries no `SECRET_KEY`
+    in raw or encoded form in any argv, and the file is removed on the Master so the `envp` strace printed
+    never leaves that host.
+  assertion_sha256: 5dba9aeb0106e9f8d6ccba125f6c9c86ffcbd558585a6a315c433189aee78e84
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_argv_observer
+      evidence:
+      - argv_observer_abbreviated
+      - argv_observer_errors
+      - argv_observer_exec_count
+      - argv_observer_execve_count
+      - argv_observer_execveat_count
+      - argv_observer_fixture_errors
+      - argv_observer_fixtures
+      - argv_observer_limit
+      - argv_observer_probe_path
+      - argv_observer_secret_found
+      - argv_observer_ssh_client
+      - argv_observer_ssh_execs
+      - argv_observer_strace_installed
+      - argv_observer_strace_version
+      - argv_observer_trace_bytes
+      - argv_observer_trace_removed
+      - argv_observer_truncated
+  promotion_target: Distributed Worker VPS Deployment Verification
 - id: AIO-DP-REALITY-xray
   requirement: Real client data-plane verification
   live_scenario: null

@@ -38,6 +38,19 @@ The test framework MUST provide distinct Control, Master/Panel, and Worker roles
 - **AND** only the host with a configured Vision domain provisions its Vision certificate, inbound, Panel host, and NGINX route
 - **AND** the other host remains installable and its core protocol cases continue to pass
 
+#### Scenario: Worker dispatch is observed without the secret
+
+- **WHEN** the Master runs the real `gowave-auto.sh node add` that provisions the Worker
+- **THEN** the Master traces its own descendant exec calls with
+  `strace -f -v -s 32*PAGE_SIZE -e trace=execve,execveat`, and before reading that trace the
+  observer proves on the same host that a sentinel after byte 32 survives in both an `execve`
+  and an `execveat` record and that a 128-element argv arrives in order with its sentinel last
+- **AND** only a complete trace passes: every argv vector whole, the SSH client's own exec record
+  present, and no `SECRET_KEY` in raw or encoded form in any argv
+- **AND** the trace is removed on the Master, so the `envp` strace printed never enters a report or a log
+- **AND** the observation covers the Master-side process tree only, not the remote Worker beyond the
+  SSH boundary
+
 ### Requirement: Real Panel subscription lifecycle
 
 The framework MUST use the actual GoWave Panel endpoint and the version-pinned contract to create, retrieve, update where supported, and revoke test client access. It MUST exercise the real User-Agent policy: a non-empty header is accepted, while absent and blank headers are rejected. If the pinned API exposes no client-update operation, that case is NOT_APPLICABLE only with a cited contract and a separate check of the closest supported mutation; the harness MUST NOT invent endpoints.

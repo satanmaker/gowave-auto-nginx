@@ -13,12 +13,12 @@ behaviour with no case, a behaviour covered only on its happy path, an
 area the delta spec names but no entry covers, and a case no behaviour
 names (an orphan) or two behaviours claim.
 
-Behaviours: 37 across 9 areas, naming 212 of 212 catalog cases.
+Behaviours: 37 across 9 areas, naming 213 of 213 catalog cases.
 
 | Area | Behaviours | Cases | Error-path cases |
 |---|---:|---:|---:|
 | installation | 5 | 15 | 5 |
-| provisioning | 8 | 25 | 16 |
+| provisioning | 8 | 27 | 15 |
 | subscription-representations | 1 | 6 | 3 |
 | data-plane | 5 | 45 | 9 |
 | decoy | 2 | 7 | 2 |
@@ -48,7 +48,7 @@ Behaviours: 37 across 9 areas, naming 212 of 212 catalog cases.
 | Temporary access is bounded by an armed remote expiry | aio, multi-node | pre-push | `TSSH-01`, `BOOT-02` | `TSSH-02` |
 | Target credentials stay on the control machine and are revoked | aio, multi-node | pre-push | `LOCAL-01`, `LOCAL-02`, `REV-01` | `REV-02` |
 | Each Vision domain is provisioned per node or refuses the host | aio, multi-node | pre-push | `VIS-01`, `VIS-02`, `VIS-03`, `VIS-07`, `VIS-08`, `MN-VISION` | `VIS-04`, `VIS-05`, `VIS-06` |
-| A Worker is deployed without a secret and registered as it runs | multi-node | pre-push | `MN-INSTALL`, `WRK-04`, `WRK-05`, `WRK-06`, `CLUS-01`, `CLUS-02`, `CLUS-03` | `WRK-01`, `WRK-02`, `WRK-03`, `PODNET-MASTER-ADDR` |
+| A Worker is deployed without a secret and registered as it runs | multi-node | pre-push | `MN-INSTALL`, `MN-ARGV-OBSERVER`, `WRK-01`, `WRK-04`, `WRK-05`, `WRK-06`, `CLUS-01`, `CLUS-02`, `CLUS-03` | `WRK-02`, `WRK-03`, `PODNET-MASTER-ADDR` |
 
 ## subscription-representations
 
