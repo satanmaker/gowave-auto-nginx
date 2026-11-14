@@ -29,7 +29,7 @@ COMMIT = "6be5a9a0c9626933f068ceafe06d24d64cb0db10"
 class TestPrePushGate(unittest.TestCase):
     """What the gate runs, what it refuses, and what it writes."""
 
-    def run_gate(self, *arguments, codes=None, euid=0, tree="clean"):
+    def run_gate(self, *arguments, codes=None, euid=0, tree="clean", clock=None):
         """Invoke ``main`` with the suites replaced by the exit codes given.
 
         Returns the status, both streams and the commands that were run, so a
@@ -50,6 +50,8 @@ class TestPrePushGate(unittest.TestCase):
             stack.enter_context(
                 mock.patch.object(gate, "repository_state", return_value=(COMMIT, tree))
             )
+            if clock is not None:
+                stack.enter_context(mock.patch.object(gate.time, "monotonic", side_effect=clock))
             out = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             err = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
             status = gate.main(arguments)
@@ -95,7 +97,24 @@ class TestPrePushGate(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertIn("aio passed", out)
         self.assertIn("multi-node passed", out)
+        self.assertIn(
+            "both suites took 0.0s of the 7200s tests/cases/matrix.yaml declares "
+            "for the pre-push tier",
+            out,
+        )
         self.assertIn("every gated suite passed; the push may continue", out)
+
+    def test_a_gate_that_outspends_the_declared_tier_budget_blocks_the_push(self):
+        status, out, err, calls = self.run_gate(clock=[0.0, 7201.0])
+        self.assertEqual(status, 1)
+        self.assertEqual(len(calls), 2, "the pair ran; the total is judged afterwards")
+        self.assertIn("past the 7200s the matrix declares", err)
+        self.assertIn("the push is blocked", err)
+        self.assertNotIn("every gated suite passed", out)
+
+    def test_a_gate_exactly_at_the_declared_total_is_not_over_it(self):
+        status, _out, _err, _calls = self.run_gate(clock=[0.0, 7200.0])
+        self.assertEqual(status, 0)
 
     def test_the_gate_refuses_to_run_without_root(self):
         status, _out, err, calls = self.run_gate(euid=1000)

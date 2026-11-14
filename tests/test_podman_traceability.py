@@ -197,7 +197,7 @@ class TestTraceabilityRules(unittest.TestCase):
         gaps = trace.gaps(self.table)
         self.assertEqual(
             {gap.split()[0] for _requirement, _scenario, gap in gaps},
-            {"8.15", "8.16", "8.17"},
+            {"8.16", "8.17"},
             "each open gap must name the ledger task that owns it",
         )
 

@@ -65,16 +65,31 @@ sudo python3 -m tools.run_podman_e2e --topology aio --require-group recovery
 | `--vision` | off | Install the optional VLESS Vision inbound. The positive-case count becomes 10 instead of 8 (AIO) or 18/20 instead of 16 (Multi-Node). |
 | `--worker-vision` | off | Configure the same optional inbound on the Multi-Node Worker. Refused on `aio`, which has no Worker. |
 | `--artifact-root` | `artifacts/podman-e2e` | Directory the run's own run directory is created under. |
-| `--budget-seconds` | `7200` (AIO), `10800` (Multi-Node) | Wall-clock budget for the whole suite. On exhaustion the cases that did not run are reported `INCOMPLETE`, never dropped and never made green. |
+| `--budget-seconds` | the matrix's `runtime_budget_seconds`: `2700` (AIO), `4500` (Multi-Node) | Wall-clock deadline for the whole suite. It may be lowered, never raised. On exhaustion the cases that did not run are reported `INCOMPLETE`, never dropped and never made green. |
 | `--require-group` | — | Fail the run unless every case id of a declared group was present and passed. Today the only group is `recovery`. |
 
 Exit status is `0` only when `result.json` says `overall: PASS`; every other
 state exits `1`. Argument errors, including `--worker-vision` on the AIO
-topology and an unknown group, exit `2` before any container is created.
+topology, an unknown group and a `--budget-seconds` above the declared budget,
+exit `2` before any container is created.
 
-The matrix declares narrower per-topology budgets (`runtime_budget_seconds`
-2700 s and 4500 s in `tests/cases/matrix.yaml`); the defaults above are wider
-because a run also pays for image pulls and the install itself.
+The deadline is the `runtime_budget_seconds` the manifest declares for the
+topology — 2700 s and 4500 s — and it is a ceiling rather than a default: a run
+that asks for more wall clock than the matrix promises has left the envelope the
+`pre-push` and `pr` tiers are defined by, so the entrypoint refuses it
+(`--budget-seconds` may only tighten). Every run also executes `GATE-BUDGET`
+first, which asserts that deadline is inside the declared one and then produces
+an exhausted run of the real runner with no container at all, reading its report
+back to prove the unexecuted case is named and `overall` is `INCOMPLETE` rather
+than a shorter green.
+
+The tier totals in the same manifest are enforced where the tier runs:
+`runtime_budget.pre_push_total_seconds` (7200 s) is measured across both suites
+by `tools/pre_push_e2e.py` and blocks the push when exceeded, and
+`runtime_budget.pr_total_seconds` (9000 s) bounds one full wave plus one recovery
+wave of the required checks — `python3 -m tools.podman_e2e.gate --check` refuses
+a job timeout that does not leave those budgets room, because a job GitHub kills
+at its timeout reports nothing at all.
 
 ## Pre-push gate
 
@@ -94,7 +109,10 @@ run without editing the gate, and one it does not gate is never silently skipped
 into a shorter green. Each run is the same
 `python3 -m tools.run_podman_e2e --topology <t>` the acceptance jobs invoke,
 with the fixtures pinned by the matrix — no live host, no credential, no public
-DNS name — and it prints the commit and tree it judges.
+DNS name — and it prints the commit and tree it judges. Neither the gate nor the
+required checks pass `--distribution`, `--vision`, `--worker-vision` or
+`--budget-seconds`, so a pushed commit is judged against the same pinned target
+image, client releases and deadline the pull request will be judged against.
 
 A failing topology stops the gate and the remaining ones are printed as
 `not run`: a later green suite would not change the verdict, and reporting it as

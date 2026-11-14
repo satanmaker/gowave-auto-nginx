@@ -89,14 +89,21 @@ class TestPodmanE2EDocumentation(unittest.TestCase):
             with self.subTest(alias=alias):
                 self.assertIn(alias, documented())
 
-    def test_documented_budgets_are_the_defaults_and_the_matrix_values(self):
-        for default in (run_podman_e2e.DEFAULT_BUDGET_SECONDS, run_podman_e2e.MULTI_NODE_BUDGET_SECONDS):
-            with self.subTest(default=default):
-                self.assertIn(str(default), documented())
+    def test_documented_budgets_are_the_matrix_values(self):
         matrix = yaml.safe_load((REPO_ROOT / "tests" / "cases" / "matrix.yaml").read_text(encoding="utf-8"))
         for topology, entry in matrix["topologies"].items():
             with self.subTest(topology=topology):
                 self.assertIn(str(entry["runtime_budget_seconds"]), documented())
+        for tier, key in (("pre-push", "pre_push_total_seconds"), ("9000", "pr_total_seconds")):
+            with self.subTest(tier=tier):
+                self.assertIn(tier, documented())
+                self.assertIn(str(matrix["runtime_budget"][key]), documented())
+
+    def test_the_guide_says_the_budget_is_a_ceiling(self):
+        text = documented()
+        self.assertIn("never raised", text)
+        self.assertIn("may only tighten", text)
+        self.assertIn("INCOMPLETE", text)
 
     def test_the_guide_names_every_area_the_failure_bundle_writes(self):
         self.assertIn("index.txt", documented())

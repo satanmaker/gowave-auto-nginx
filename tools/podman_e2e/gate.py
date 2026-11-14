@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import yaml
 
-from tools.podman_e2e import groups, trace
+from tools.podman_e2e import groups, matrix, trace
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 CONTRACT_PATH = REPO_ROOT / "tests" / "cases" / "gates.yaml"
@@ -43,6 +43,12 @@ TOPOLOGIES = ("aio", "multi-node")
 EVENTS = ("push", "pull_request", "workflow_dispatch")
 BYPASS_MODES = ("always", "pull_request")
 SUITE_MODULE = "tools.run_podman_e2e"
+
+# What a job needs past the suite's own deadline: checkout, the package install,
+# the container images, cleanup, the count read-back and the artifact upload. A
+# job killed at its timeout reports nothing at all — not even INCOMPLETE — so the
+# ceiling has to outlive the budget it is supposed to honour.
+GATE_HEADROOM_SECONDS = 900
 
 
 def load_contract(path: Path = CONTRACT_PATH) -> Dict[str, Any]:
@@ -179,9 +185,78 @@ def contract_problems(
         if job is None:
             continue
         problems.extend(_check_problems(check, job, document))
+    problems.extend(_budget_problems(contract))
     problems.extend(_trigger_problems(contract, document))
     problems.extend(_lifecycle_problems(contract, root))
     return problems
+
+
+def _budget_problems(contract: Dict[str, Any]) -> List[str]:
+    """The required checks have to outlive the budgets the matrix declares.
+
+    A suite stops at its declared deadline and reports what it did not run. A job
+    that GitHub kills first reports nothing, so a timeout at or below the budget
+    turns the promise into a cancelled check. The tier totals are the other half:
+    the pair of topologies behind ``pre-push`` and the two overlapping waves
+    behind ``pr`` each have a declared wall clock, and a topology budget raised
+    without raising the total would make the tier claim a bound it cannot keep.
+    """
+    problems: List[str] = []
+    manifest = matrix.load()
+    budgets: Dict[str, int] = {}
+    for topology in TOPOLOGIES:
+        try:
+            budgets[topology] = matrix.runtime_budget_seconds(manifest, topology)
+        except KeyError as exc:
+            problems.append(str(exc))
+    checks = contract.get("checks") or []
+    for check in checks:
+        name = check.get("name")
+        budget = budgets.get(str(check.get("topology")))
+        timeout = check.get("timeout_minutes")
+        if budget is None or not isinstance(timeout, int):
+            continue
+        allowed = timeout * 60
+        if allowed < budget + GATE_HEADROOM_SECONDS:
+            problems.append(
+                f"{name!r} allows {timeout} minutes for a suite whose declared budget is "
+                f"{budget}s; it needs at least {(budget + GATE_HEADROOM_SECONDS) // 60} minutes, "
+                f"because a job killed at its timeout reports no INCOMPLETE at all"
+            )
+
+    gated = [
+        str(name)
+        for name, topology in (manifest.get("topologies") or {}).items()
+        if "pre-push" in ((topology or {}).get("gate") or [])
+    ]
+    problems.extend(
+        _tier_problem(manifest, "pre_push", sum(budgets.get(name, 0) for name in gated),
+                      f"the topologies behind pre-push ({', '.join(gated) or 'none'})")
+    )
+    full = {str(check.get("topology")) for check in checks if not check.get("group")}
+    recovery = {str(check.get("topology")) for check in checks if check.get("group")}
+    wave = (
+        max((budgets.get(topology, 0) for topology in full), default=0)
+        + max((budgets.get(topology, 0) for topology in recovery), default=0)
+    )
+    problems.extend(
+        _tier_problem(manifest, "pr", wave, "one full wave plus one recovery wave")
+    )
+    return problems
+
+
+def _tier_problem(manifest: Dict[str, Any], tier: str, spent: int, what: str) -> List[str]:
+    """One tier total against the budgets that have to fit inside it."""
+    try:
+        declared = matrix.tier_budget_seconds(manifest, tier)
+    except KeyError as exc:
+        return [str(exc)]
+    if spent > declared:
+        return [
+            f"{what} declares {spent}s of budget, past runtime_budget."
+            f"{tier}_total_seconds = {declared}s"
+        ]
+    return []
 
 
 def _check_problems(

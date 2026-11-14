@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
-    acme_fixture, aio, denial, matrix as matrix_data, mtls, topology,
+    acme_fixture, aio, budget, denial, matrix as matrix_data, mtls, topology,
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
@@ -7487,5 +7487,10 @@ def cases(
         # nothing after it may be blamed for the domains it installs.
         Case(ACME80_CASE_ID, "multi-node", lambda context: case_acme80(product),
              timeout_seconds=ACME80_TIMEOUT_SECONDS),
+        # Last, and the only case ACME80 may be followed by: the deadline it proves
+        # is this topology's own, and the elapsed clock it reads is the two hosts'
+        # install and transfer, not a single container's. It starts no container, so
+        # it cannot be blamed for the names ACME80 installed.
+        Case(budget.BUDGET_CASE_ID, "multi-node", budget.case_budget, timeout_seconds=120),
     ])
     return suite

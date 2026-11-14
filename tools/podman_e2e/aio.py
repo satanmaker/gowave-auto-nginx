@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from . import acme_fixture, client_trust, matrix, panel_surface, topology
+from . import acme_fixture, budget, client_trust, matrix, panel_surface, topology
 from .podman import wait_until
 from .runner import Case, CaseBlocked, require
 
@@ -534,6 +534,11 @@ ARCHIVE_DIR = "ARCHIVE_DIR_PLACEHOLDER"
 LINEAGE_DIR = "LINEAGE_DIR_PLACEHOLDER"
 RELOAD_WAIT_SECONDS = RELOAD_WAIT_PLACEHOLDER
 RENEWAL_TIMEOUT_SECONDS = RENEWAL_TIMEOUT_PLACEHOLDER
+# How many times a renewal that produced a certificate without performing a
+# challenge is asked again. Each attempt reuses the fixture's own randomness, so
+# the chance of exhausting them is the fixture's reuse rate cubed: one in a
+# million at Pebble's floor of one in a hundred.
+RENEWAL_ATTEMPTS = 3
 
 
 def run(argv, timeout=90, env=None):
@@ -716,13 +721,26 @@ def wait_for_new_workers(before_pids):
     return state, round(time.monotonic() - started, 2)
 
 
-def renewal_log():
+def renewal_log(directory):
     try:
-        with open(os.path.join(LOG_DIR, "letsencrypt.log"), encoding="utf-8",
+        with open(os.path.join(directory, "letsencrypt.log"), encoding="utf-8",
                   errors="replace") as handle:
             return handle.read()[-20000:]
     except OSError:
         return ""
+
+
+def challenged(result, log_text):
+    # A CA may answer a new order with an authorization it already holds, and then
+    # Certbot finalizes the order without performing any challenge: the renewal
+    # succeeds and the route this phase exists to exercise was never used. Pebble
+    # cannot be told not to: PEBBLE_AUTHZREUSE=0 still reuses one order in a
+    # hundred, because it compares rand.Intn(100) > percent. The fixture is the
+    # unreliable part here — the product is asked the same question either way — so
+    # an attempt that came back with a certificate but no challenge is retried,
+    # while an attempt that failed is not (a refusal must stay a refusal).
+    transcript = "\n".join([result["stdout"] or "", result["stderr"] or "", log_text])
+    return ("http-01 challenge for %s" % DOMAIN) in transcript
 
 
 report = {
@@ -744,12 +762,30 @@ if MODE == "renew":
         # renewal has to be handed the anchor the install was handed.
         environment["REQUESTS_CA_BUNDLE"] = CA_FILE
         environment["SSL_CERT_FILE"] = CA_FILE
+    # The deadline covers every attempt, so a retry can never turn one hang guard
+    # into three: each attempt gets what is left of the phase.
+    deadline = time.monotonic() + RENEWAL_TIMEOUT_SECONDS
     started = time.monotonic()
-    renewal = run(
-        ("certbot", "renew", "--cert-name", DOMAIN, "--force-renewal",
-         "--non-interactive", "--no-random-sleep-on-renew", "--logs-dir", LOG_DIR),
-        timeout=RENEWAL_TIMEOUT_SECONDS, env=environment,
-    )
+    attempts = []
+    renewal, log_text = None, ""
+    for attempt in range(1, RENEWAL_ATTEMPTS + 1):
+        attempt_dir = "%s-%d" % (LOG_DIR, attempt)
+        renewal = run(
+            ("certbot", "renew", "--cert-name", DOMAIN, "--force-renewal",
+             "--non-interactive", "--no-random-sleep-on-renew", "--logs-dir", attempt_dir),
+            timeout=max(1, int(deadline - time.monotonic())), env=environment,
+        )
+        log_text = renewal_log(attempt_dir)
+        performed = challenged(renewal, log_text)
+        attempts.append({
+            "attempt": attempt,
+            "returncode": renewal["returncode"],
+            "challenged": performed,
+        })
+        # A failed attempt is the answer when an outage is installed, so only the
+        # silent one — success with no challenge — is worth asking again.
+        if renewal["returncode"] != 0 or performed:
+            break
     elapsed = round(time.monotonic() - started, 2)
     after_hook, waited = wait_for_new_workers(report["service"]["worker_pids"])
     report.update({
@@ -759,8 +795,9 @@ if MODE == "renew":
             "stderr": (renewal["stderr"] or "").strip()[-3000:],
             "tail": tail(renewal, 3000),
             "duration_seconds": elapsed,
+            "attempts": attempts,
         },
-        "certbot_log": renewal_log(),
+        "certbot_log": log_text,
         "live_after": live(),
         "archive_after": archive(),
         "service_after": after_hook,
@@ -3541,8 +3578,10 @@ def require_renewal_issued(case_id: str, role: str, domain: str, facts: Dict[str
         str(renewal.get("stdout") or ""),
         str(renewal.get("stderr") or ""),
     ])
+    attempts = renewal.get("attempts") or []
     require(case_id, f"http-01 challenge for {domain}" in transcript,
-            f"{role}: the renewal for {domain} did not perform an HTTP-01 challenge, so the "
+            f"{role}: the renewal for {domain} performed no HTTP-01 challenge in "
+            f"{len(attempts)} attempt(s) ({[item.get('returncode') for item in attempts]}), so the "
             f"challenge route this case validates is not the one that was used (a CA that "
             f"reuses a valid authorization asks for no challenge at all): "
             f"{transcript.strip()[-800:]}")
@@ -3568,6 +3607,8 @@ def require_renewal_issued(case_id: str, role: str, domain: str, facts: Dict[str
         "returncode": renewal.get("returncode"),
         "duration_seconds": renewal.get("duration_seconds"),
         "challenge": f"http-01 for {domain}",
+        "attempts": len(attempts),
+        "authorization_reused": len(attempts) > 1,
         "installed_certificates_before": len(before),
         "installed_certificates_after": len(after),
         "serial_before": old.get("serial"),
@@ -6690,5 +6731,11 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case(CHANNEL_DEV_CASE_ID, "aio", lambda context: case_channel_dev(product),
              timeout_seconds=CHANNEL_TIMEOUT_SECONDS + TUNNEL_READY_TIMEOUT_SECONDS
              + TRAFFIC_TIMEOUT_SECONDS),
+        # Last, because the deadline it proves is the one the whole run spent: the
+        # case reads the elapsed wall clock and the enforced budget, then produces
+        # an exhausted run of the real runner and reads its report. A suite that
+        # spent the deadline before reaching this point never runs it, and the
+        # runner marks it INCOMPLETE with the rest of the tail instead.
+        Case(budget.BUDGET_CASE_ID, "aio", budget.case_budget, timeout_seconds=120),
     ])
     return suite

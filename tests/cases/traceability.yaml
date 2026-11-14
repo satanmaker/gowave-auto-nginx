@@ -324,7 +324,19 @@ requirements:
           - tests.test_podman_pre_push.TestPrePushGate
         jobs: ["Lint, Completeness, and Suite Nonroot"]
       - scenario: Budget overrun is not a truncated pass
-        gap: 8.15 — GATE-BUDGET is catalogued but no suite declares it
+        cases: [GATE-BUDGET]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_budget.TestBudgetCase
+          - tests.test_podman_budget.TestEntrypointBudget
+          - tests.test_podman_budget.TestDeclaredBudget
+          - tests.test_podman_gate.TestPodmanGateContract
+        jobs:
+          - All-in-One Podman Acceptance
+          - Multi-Node Podman Acceptance
+          - All-in-One Lifecycle and Recovery Acceptance
+          - Multi-Node Lifecycle and Recovery Acceptance
+          - Lint, Completeness, and Suite Nonroot
 
   - requirement: Coverage completeness and error paths
     scenarios:

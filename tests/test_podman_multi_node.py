@@ -29,7 +29,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TESTS_DIR))
 
-from tools.podman_e2e import aio, matrix, mtls, multi_node, panel_surface, topology  # noqa: E402
+from tools.podman_e2e import aio, budget, matrix, mtls, multi_node, panel_surface, topology  # noqa: E402
 from tools.podman_e2e.runner import Case, CaseBlocked  # noqa: E402
 from test_podman_aio import BROKEN_TAIL, nginx_probe  # noqa: E402
 
@@ -1687,6 +1687,16 @@ class TestMultiNodeSuite(unittest.TestCase):
         self.assertEqual(ids[30], "MN-DP-worker-REALITY-xray")
         self.assertEqual(ids[37], "MN-DP-worker-TROJAN-GRPC-mihomo")
 
+    def test_the_budget_case_is_declared_last(self):
+        # It reads this topology's deadline and the clock two hosts spent, so no
+        # case may close the report behind it. It starts no container, which is why
+        # it is also the only case ACME80 — which installs its own names — may be
+        # followed by.
+        suite = multi_node.cases(self.podman)
+        self.assertEqual([case.id for case in suite][-2:],
+                         [multi_node.ACME80_CASE_ID, budget.BUDGET_CASE_ID])
+        self.assertEqual(suite[-1].topology, "multi-node")
+
     def test_every_node_contributes_its_own_matrix_tuples(self):
         data = matrix.load()
         ids = {case.id for case in multi_node.cases(self.podman)}
@@ -1763,10 +1773,12 @@ class TestMultiNodeSuite(unittest.TestCase):
         # 5.9: revocation and the Worker's own stop/start/restart change the
         # cluster under the suite, so nothing that observes a healthy cluster may
         # run after them. 6.12 then re-provisions that Worker and renames the
-        # Master, so it closes the run instead of reading what they left behind.
+        # Master, so it closes the install-facing run instead of reading what they
+        # left behind. GATE-BUDGET, which starts no container, is the one case after
+        # it: the clock it reads is the whole run's.
         ids = [case.id for case in multi_node.cases(self.podman)]
         self.assertEqual(
-            ids[-4:],
+            ids[-5:-1],
             [multi_node.REVOCATION_CASE_ID, multi_node.OUTAGE_CASE_ID,
              multi_node.RESTART_CASE_ID, multi_node.ACME80_CASE_ID],
         )
