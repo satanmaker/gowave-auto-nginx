@@ -114,6 +114,7 @@ class CaseResult:
     duration: float = 0.0
     message: str = ""
     evidence: Dict[str, Any] = field(default_factory=dict)
+    evidence_files: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -123,6 +124,7 @@ class CaseResult:
             "duration": round(self.duration, 3),
             "message": redact(self.message),
             "evidence": {key: redact(str(value)) for key, value in self.evidence.items()},
+            "evidence_files": list(self.evidence_files),
         }
 
 
@@ -198,6 +200,9 @@ class RunContext:
         self.labels.update(labels or {})
         self.cleanup_actions: List[Callable[[], None]] = []
         self.environment: Dict[str, Any] = {}
+        # Every evidence file is listed here as it is written, so a case result can
+        # name the files it produced instead of only inlining their content.
+        self.evidence_files: List[str] = []
         # Secrets never live under artifact_dir: artifacts are retained and shared.
         self.secret_dir = Path(tempfile.mkdtemp(prefix=f"gowave-e2e-{self.run_id}-"))
         self.secret_dir.chmod(0o700)
@@ -254,6 +259,9 @@ class RunContext:
         path.write_text(redact(text), encoding="utf-8")
         path.chmod(0o600)
         hand_back_artifacts(path, self.operator)
+        relative = str(path.relative_to(self.artifact_dir))
+        if relative not in self.evidence_files:
+            self.evidence_files.append(relative)
         return path
 
     def run_cleanup(self) -> List[str]:
@@ -285,6 +293,7 @@ class Runner:
                     unexecuted = list(self.cases[index:])
                     break
                 started = time.monotonic()
+                evidence_before = len(self.context.evidence_files)
                 timeout, capped_by_budget = self._case_timeout(case)
                 try:
                     self._arm_timeout(timeout)
@@ -297,7 +306,7 @@ class Runner:
                     abort_message = str(exc)
                     unexecuted = list(self.cases[index + 1:])
                     result = CaseResult(case.id, case.topology, INCOMPLETE, message=abort_message)
-                    self.results.append(result)
+                    self.results.append(self._finish(result, started, evidence_before))
                     break
                 except CaseTimeout:
                     status = INCOMPLETE if capped_by_budget else FAIL
@@ -318,8 +327,7 @@ class Runner:
                         FAIL,
                         message=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
                     )
-                result.duration = time.monotonic() - started
-                self.results.append(result)
+                self.results.append(self._finish(result, started, evidence_before))
         finally:
             # Cleanup must survive every exit path, so signal handlers are restored
             # before running it; a second SIGINT then behaves like an operator abort.
@@ -342,6 +350,12 @@ class Runner:
         if declared > remaining:
             return remaining, True
         return declared, False
+
+    def _finish(self, result: CaseResult, started: float, evidence_before: int) -> CaseResult:
+        """Stamp the duration and the evidence files this case produced."""
+        result.duration = time.monotonic() - started
+        result.evidence_files = self.context.evidence_files[evidence_before:]
+        return result
 
     def _arm_timeout(self, seconds: float) -> None:
         self._armed = False
@@ -429,6 +443,10 @@ def write_junit(artifact_dir: Path, data: Dict[str, Any]) -> Path:
             ET.SubElement(element, "error", attrib={"message": case.get("message", "incomplete")})
         elif status == SKIP:
             ET.SubElement(element, "skipped", attrib={"message": case.get("message", "skipped")})
+        evidence_files = case.get("evidence_files") or []
+        if evidence_files:
+            # JUnit has no evidence field, so the references travel in system-out.
+            ET.SubElement(element, "system-out").text = "\n".join(evidence_files)
     path = artifact_dir / "junit.xml"
     path.write_text(redact(ET.tostring(root, encoding="unicode")), encoding="utf-8")
     path.chmod(0o600)
