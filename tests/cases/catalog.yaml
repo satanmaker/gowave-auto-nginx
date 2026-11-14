@@ -1693,8 +1693,31 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_matrix
+      evidence:
+      - clients
+      - declared_cases
+      - executed_cases
+      - expected_positive_cases
+      - inbounds
+      - passed_cases
+      - vision
+      case: AIO-MATRIX
+    multi-node:
+      driver: multi_node:case_matrix
+      evidence:
+      - clients
+      - declared_cases
+      - executed_cases
+      - expected_positive_cases
+      - inbounds
+      - passed_cases
+      - per_node
+      - vision
+      case: MN-MATRIX
   promotion_target: null
 - id: DP-02
   requirement: Data Plane E2E Traffic Through All VPN Endpoints

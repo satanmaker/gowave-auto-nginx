@@ -99,11 +99,23 @@ class TestImplementationRegistry(unittest.TestCase):
                        if case.get("driver_status") == "implemented"]
         self.assertTrue(implemented, "no entry claims an implementation, so nothing is checked")
         for case in implemented:
+            observed = {topology: facts.get("case") or case["id"]
+                        for topology, facts in case["drivers"].items()}
+            expected = set()
+            for observer in set(observed.values()):
+                expected |= set(self.registry.get(observer, {}))
             with self.subTest(case=case["id"]):
                 self.assertEqual(
-                    sorted(case["drivers"]), sorted(self.registry[case["id"]]),
-                    f"{case['id']}: the catalog names different topologies than the code",
+                    sorted(case["drivers"]), sorted(expected),
+                    f"{case['id']}: the catalog names different topologies than the code, "
+                    f"counting the case it runs and the observers it names",
                 )
+                for topology, observer in observed.items():
+                    self.assertEqual(
+                        case["drivers"][topology]["driver"],
+                        self.registry[observer][topology]["driver"],
+                        f"{case['id']} / {topology}: the named driver is not the one {observer} wraps",
+                    )
 
     def test_an_implemented_entry_that_names_no_driver_is_refused(self):
         document = self.doctored()
@@ -192,6 +204,67 @@ class TestImplementationRegistry(unittest.TestCase):
                 catalog.driver_registry()
         self.assertIn("case_no_such_builder", str(caught.exception))
         self.assertIn("is gone", str(caught.exception))
+
+    def test_a_live_scenario_is_observed_by_the_case_the_declaration_names(self):
+        entry = self.by_id["DP-01"]
+        self.assertEqual(entry["driver_status"], "implemented")
+        self.assertEqual(entry["drivers"]["aio"]["case"], "AIO-MATRIX")
+        self.assertEqual(entry["drivers"]["multi-node"]["case"], "MN-MATRIX")
+        self.assertEqual(
+            entry["drivers"]["aio"]["evidence"],
+            self.registry["AIO-MATRIX"]["aio"]["evidence"],
+            "the evidence of an observed entry is the observer's own, not a hand-written list",
+        )
+        self.assertEqual(
+            entry["drivers"]["aio"]["driver"], "aio:case_matrix",
+            "the recorded driver is the callable the observer case wraps",
+        )
+
+    def test_an_observer_the_code_does_not_build_is_refused(self):
+        cases = [{"id": "DP-01", "driver_status": "planned", "drivers": {}}]
+        with mock.patch.object(catalog, "LIVE_PARITY_OBSERVERS", {"DP-01": {"aio": "AIO-NOT-A-CASE"}}):
+            with self.assertRaises(catalog.CatalogError) as caught:
+                catalog.apply_implementations(cases, {})
+        self.assertIn("AIO-NOT-A-CASE", str(caught.exception))
+        self.assertIn("is not a Case the code builds", str(caught.exception))
+
+    def test_a_scenario_an_observer_names_but_the_catalog_does_not_define_is_refused(self):
+        with mock.patch.object(catalog, "LIVE_PARITY_OBSERVERS", {"DP-NOT-A-CASE": {"aio": "AIO-MATRIX"}}):
+            with self.assertRaises(catalog.CatalogError) as caught:
+                catalog.apply_implementations([{"id": "DP-01", "drivers": {}}], {})
+        self.assertIn("DP-NOT-A-CASE", str(caught.exception))
+        self.assertIn("does not define", str(caught.exception))
+
+    def test_a_case_that_runs_and_is_also_mapped_is_refused(self):
+        cases = [{"id": "DP-01", "driver_status": "planned", "drivers": {}}]
+        registry = {"DP-01": {"aio": {"driver": "aio:case_x", "evidence": []}}}
+        with mock.patch.object(catalog, "LIVE_PARITY_OBSERVERS", {"DP-01": {"aio": "AIO-MATRIX"}}):
+            with self.assertRaises(catalog.CatalogError) as caught:
+                catalog.apply_implementations(cases, registry)
+        self.assertIn("is also mapped to the observer", str(caught.exception))
+
+    def test_an_observer_changed_in_the_catalog_is_refused(self):
+        document = self.doctored()
+        entry = next(case for case in document["cases"] if case["id"] == "DP-01")
+        entry["drivers"]["aio"]["case"] = "AIO-04"
+        problems = self.problems(document)
+        self.assertTrue(
+            any("the observer is 'AIO-04', the declaration says 'AIO-MATRIX'" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_evidence_the_observer_stopped_recording_is_refused(self):
+        document = self.doctored()
+        entry = next(case for case in document["cases"] if case["id"] == "DP-01")
+        entry["drivers"]["aio"]["evidence"] = [
+            key for key in entry["drivers"]["aio"]["evidence"] if key != "passed_cases"
+        ]
+        problems = self.problems(document)
+        self.assertTrue(
+            any("DP-01 / aio: the evidence keys differ" in problem for problem in problems),
+            problems,
+        )
 
 
 class TestRunStarts(unittest.TestCase):
