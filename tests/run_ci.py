@@ -163,6 +163,7 @@ SUITES = {
         "test_podman_groups.TestGroupDefinitions",
         "test_podman_groups.TestUnmet",
         "test_podman_groups.TestRequiredGroupRun",
+        "test_ci_workflows.TestIndependentAcceptanceWorkflows",
         "test_podman_redaction.TestRedactionFilter",
         "test_podman_redaction.TestArtifactTreeHoldsNoSentinel",
         "test_podman_redaction.TestDiagnosticsNeverPrintValues",
