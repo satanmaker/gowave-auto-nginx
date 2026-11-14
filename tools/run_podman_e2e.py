@@ -20,7 +20,7 @@ from typing import List, Optional, Sequence
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.podman_e2e import aio, multi_node, target_image  # noqa: E402
+from tools.podman_e2e import aio, diagnostics, multi_node, target_image  # noqa: E402
 from tools.podman_e2e.podman import Podman  # noqa: E402
 from tools.podman_e2e.runner import Case, RunContext, Runner  # noqa: E402
 
@@ -98,6 +98,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Containers, the network, and run images belong to the run, not the shell.
     podman.register_cleanup()
     runner = Runner(context)
+    # A failed case names a contradiction, not its cause, so every non-green case
+    # also leaves the state of the run's own containers. The hook reads state and
+    # cannot change a verdict, and it runs before the cleanup that removes them.
+    runner.on_failure(lambda result: diagnostics.collect(context, podman, result))
     for case in build_suite(
         podman, args.topology, args.distribution,
         vision=args.vision, worker_vision=args.worker_vision,
