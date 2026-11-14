@@ -154,6 +154,7 @@ SUITES = {
         "test_podman_readiness.TestWaitUntil",
         "test_podman_readiness.TestBoundedReadinessHelpers",
         "test_podman_runner.TestPodmanRunnerContract",
+        "test_podman_runner.TestResultSemantics",
         "test_podman_runner.TestPodmanRunOwnership",
         "test_podman_runner.TestArtifactOwnership",
         "test_podman_runner.TestFailureDiagnosticsHook",

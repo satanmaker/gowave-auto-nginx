@@ -161,6 +161,16 @@ class CaseTimeout(Exception):
     pass
 
 
+class CaseNotApplicable(Exception):
+    """The environment does not contain the subject the case would judge.
+
+    Distinct from INCOMPLETE (the subject was observed, but what was seen cannot
+    decide the question) and from SKIP (a declared case that was not executed):
+    here there is nothing to observe, and saying so is not a failure of the
+    product. A run made only of these proves nothing and is not green either.
+    """
+
+
 class RunAborted(Exception):
     def __init__(self, signum: int) -> None:
         super().__init__(f"run aborted by {signal.Signals(signum).name}")
@@ -329,6 +339,8 @@ class Runner:
                     result = CaseResult(case.id, case.topology, FAIL, message=str(exc))
                 except CaseBlocked as exc:
                     result = CaseResult(case.id, case.topology, BLOCKED, message=str(exc))
+                except CaseNotApplicable as exc:
+                    result = CaseResult(case.id, case.topology, NOT_APPLICABLE, message=str(exc))
                 except CaseIncomplete as exc:
                     result = CaseResult(case.id, case.topology, INCOMPLETE, message=str(exc))
                 except BudgetExhausted as exc:
@@ -529,8 +541,14 @@ def overall_status(results: Iterable[CaseResult]) -> str:
         if any(status == INCOMPLETE for status in statuses):
             return INCOMPLETE
         return BLOCKED
+    # A declared case that did not run is not a green result.
     if any(status == SKIP for status in statuses):
         return FAIL
+    # Reaching here means only PASS and NOT_APPLICABLE remain. A run in which
+    # nothing was applicable demonstrated nothing, and calling that green would
+    # reward an empty suite.
+    if not any(status == PASS for status in statuses):
+        return INCOMPLETE
     return PASS
 
 
@@ -552,7 +570,9 @@ def write_junit(artifact_dir: Path, data: Dict[str, Any]) -> Path:
         "tests": str(len(cases)),
         "failures": str(sum(1 for c in cases if c.get("status") == FAIL)),
         "errors": str(sum(1 for c in cases if c.get("status") in (BLOCKED, INCOMPLETE))),
-        "skipped": str(sum(1 for c in cases if c.get("status") == SKIP)),
+        # JUnit has no "not applicable" concept, so both outcomes that did not
+        # judge the product are counted here and told apart by their message.
+        "skipped": str(sum(1 for c in cases if c.get("status") in (SKIP, NOT_APPLICABLE))),
     })
     for case in cases:
         element = ET.SubElement(root, "testcase", attrib={
@@ -565,8 +585,10 @@ def write_junit(artifact_dir: Path, data: Dict[str, Any]) -> Path:
             ET.SubElement(element, "failure", attrib={"message": case.get("message", "failed")})
         elif status in (BLOCKED, INCOMPLETE):
             ET.SubElement(element, "error", attrib={"message": case.get("message", "incomplete")})
-        elif status == SKIP:
-            ET.SubElement(element, "skipped", attrib={"message": case.get("message", "skipped")})
+        elif status in (SKIP, NOT_APPLICABLE):
+            ET.SubElement(element, "skipped", attrib={
+                "message": f"{status}: {case.get('message', '')}".rstrip(),
+            })
         evidence_files = case.get("evidence_files") or []
         if evidence_files:
             # JUnit has no evidence field, so the references travel in system-out.

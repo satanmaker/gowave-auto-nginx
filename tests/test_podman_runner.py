@@ -17,18 +17,21 @@ from tools.podman_e2e.runner import (  # noqa: E402
     BLOCKED,
     FAIL,
     INCOMPLETE,
+    NOT_APPLICABLE,
     PASS,
     SKIP,
     BudgetExhausted,
     Case,
     CaseBlocked,
     CaseIncomplete,
+    CaseNotApplicable,
     CaseResult,
     RunAborted,
     RunContext,
     Runner,
     overall_status,
     repository_state,
+    write_junit,
 )
 
 
@@ -237,6 +240,133 @@ class TestPodmanRunnerContract(unittest.TestCase):
                 time.sleep(1)
         finally:
             context.restore_signal_handlers()
+
+
+class TestResultSemantics(unittest.TestCase):
+    """The six result states, and the verdict each of them can produce.
+
+    The artifact is what the operator reads after the run, so a state that
+    reaches it under a different name — or that JUnit silently promotes to a
+    pass — is a lie about what happened. These tests pin the vocabulary to the
+    constants and pin the verdict to what the run actually demonstrated.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def context(self) -> RunContext:
+        return RunContext("aio", self.root, budget_seconds=60, run_id="podman-aio-semantics-abcdef12")
+
+    def report(self, context: RunContext):
+        return json.loads((context.artifact_dir / "result.json").read_text())
+
+    def test_each_state_is_recorded_under_its_own_name(self):
+        # One case per state the runner can produce. SKIP is absent on purpose:
+        # it is a verdict-level state for a declared case that never ran, and a
+        # case body cannot put itself there.
+        context = self.context()
+
+        def failing(ctx):
+            raise AssertionError("AIO-DP: the stream carried no payload")
+
+        def blocked(ctx):
+            raise CaseBlocked("AIO-TLS: no certificate was issued")
+
+        def incomplete(ctx):
+            raise CaseIncomplete("FW-02: the refusal is not attributable to a policy")
+
+        def not_applicable(ctx):
+            raise CaseNotApplicable("AIO-IPV6: the host has no IPv6 address")
+
+        runner = Runner(context)
+        runner.add(Case("AIO-PASS", "aio", lambda ctx: {}))
+        runner.add(Case("AIO-FAIL", "aio", failing))
+        runner.add(Case("AIO-BLOCKED", "aio", blocked))
+        runner.add(Case("AIO-INCOMPLETE", "aio", incomplete))
+        runner.add(Case("AIO-NA", "aio", not_applicable))
+        self.assertEqual(runner.execute(), 1)
+
+        cases = {case["id"]: case for case in self.report(context)["cases"]}
+        self.assertEqual(cases["AIO-PASS"]["status"], PASS)
+        self.assertEqual(cases["AIO-FAIL"]["status"], FAIL)
+        self.assertEqual(cases["AIO-BLOCKED"]["status"], BLOCKED)
+        self.assertEqual(cases["AIO-INCOMPLETE"]["status"], INCOMPLETE)
+        self.assertEqual(cases["AIO-NA"]["status"], NOT_APPLICABLE)
+        self.assertEqual(self.report(context)["overall"], FAIL)
+
+    def test_junit_keeps_the_six_states_apart(self):
+        # JUnit has three outcome channels, so four of the six states have to
+        # share one. NOT_APPLICABLE shares <skipped> with SKIP, which is why the
+        # message carries the state name: a reader must not mistake a case that
+        # judged nothing for one that passed.
+        artifact_dir = self.root / "semantics"
+        artifact_dir.mkdir(parents=True)
+        cases = [
+            {"id": "AIO-PASS", "status": PASS, "message": "", "duration": 0},
+            {"id": "AIO-FAIL", "status": FAIL, "message": "payload mismatch", "duration": 0},
+            {"id": "AIO-BLOCKED", "status": BLOCKED, "message": "no certificate", "duration": 0},
+            {"id": "AIO-INCOMPLETE", "status": INCOMPLETE, "message": "not attributable", "duration": 0},
+            {"id": "AIO-SKIP", "status": SKIP, "message": "declared but not executed", "duration": 0},
+            {"id": "AIO-NA", "status": NOT_APPLICABLE, "message": "no IPv6 address", "duration": 0},
+        ]
+        write_junit(artifact_dir, {"topology": "aio", "cases": cases})
+        suite = ET.parse(artifact_dir / "junit.xml").getroot()
+        self.assertEqual(
+            (suite.attrib["tests"], suite.attrib["failures"], suite.attrib["errors"], suite.attrib["skipped"]),
+            ("6", "1", "2", "2"),
+        )
+        by_name = {case.attrib["name"]: case for case in suite.findall("testcase")}
+        self.assertIsNone(by_name["AIO-PASS"].find("failure"))
+        self.assertIsNone(by_name["AIO-PASS"].find("error"))
+        self.assertIsNone(by_name["AIO-PASS"].find("skipped"))
+        self.assertEqual(by_name["AIO-FAIL"].find("failure").attrib["message"], "payload mismatch")
+        self.assertIsNotNone(by_name["AIO-BLOCKED"].find("error"))
+        self.assertIsNotNone(by_name["AIO-INCOMPLETE"].find("error"))
+        self.assertEqual(by_name["AIO-SKIP"].find("skipped").attrib["message"], "SKIP: declared but not executed")
+        self.assertEqual(
+            by_name["AIO-NA"].find("skipped").attrib["message"],
+            "NOT_APPLICABLE: no IPv6 address",
+        )
+
+    def test_a_case_without_a_subject_is_not_applicable_and_does_not_pass_the_run(self):
+        context = self.context()
+        runner = Runner(context)
+        runner.add(Case(
+            "AIO-IPV6", "aio",
+            lambda ctx: (_ for _ in ()).throw(CaseNotApplicable("the host has no IPv6 address")),
+        ))
+        self.assertEqual(runner.execute(), 1)
+        report = self.report(context)
+        self.assertEqual(report["cases"][0]["status"], NOT_APPLICABLE)
+        self.assertEqual(report["overall"], INCOMPLETE)
+        self.assertIn("no IPv6 address", report["cases"][0]["message"])
+
+    def test_a_verdict_needs_at_least_one_applicable_pass(self):
+        self.assertEqual(overall_status([CaseResult("X", "aio", NOT_APPLICABLE)]), INCOMPLETE)
+        self.assertEqual(
+            overall_status([CaseResult("X", "aio", NOT_APPLICABLE), CaseResult("Y", "aio", NOT_APPLICABLE)]),
+            INCOMPLETE,
+        )
+        # Not-applicable never softens a real failure into something greener.
+        self.assertEqual(
+            overall_status([CaseResult("X", "aio", NOT_APPLICABLE), CaseResult("Y", "aio", FAIL)]),
+            FAIL,
+        )
+
+    def test_a_pass_beside_a_not_applicable_case_stays_green(self):
+        context = self.context()
+        runner = Runner(context)
+        runner.add(Case("AIO-PASS", "aio", lambda ctx: {}))
+        runner.add(Case(
+            "AIO-IPV6", "aio",
+            lambda ctx: (_ for _ in ()).throw(CaseNotApplicable("the host has no IPv6 address")),
+        ))
+        self.assertEqual(runner.execute(), 0)
+        report = self.report(context)
+        self.assertEqual(report["overall"], PASS)
+        self.assertEqual([case["status"] for case in report["cases"]], [PASS, NOT_APPLICABLE])
 
 
 class TestPodmanRunOwnership(unittest.TestCase):
