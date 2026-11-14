@@ -1049,6 +1049,18 @@ def driver_registry() -> Dict[str, Dict[str, Dict[str, Any]]]:
     return registry
 
 
+# Some live-parity scenarios are witnessed by a container case that carries a
+# different id: DP-01 quantifies over every active endpoint and client, and the
+# case that quantifies over exactly those tuples is AIO-MATRIX / MN-MATRIX. Which
+# container case witnesses a given live sentence is a judgement the source cannot
+# make for us, so it is declared here — and pinned from both sides: the named case
+# must be one the code builds for that topology, and the evidence written into the
+# catalog entry is read out of that case rather than typed by hand.
+LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
+    "DP-01": {"aio": "AIO-MATRIX", "multi-node": "MN-MATRIX"},
+}
+
+
 def apply_implementations(cases: List[Dict[str, Any]], registry: Dict[str, Dict[str, Dict[str, Any]]]) -> None:
     """Write the code's own implementation facts into the catalog entries."""
     known = {case["id"] for case in cases}
@@ -1057,9 +1069,37 @@ def apply_implementations(cases: List[Dict[str, Any]], registry: Dict[str, Dict[
         raise CatalogError(
             "the code runs cases the catalog does not define: " + ", ".join(unknown)
         )
+    undeclared = sorted(set(LIVE_PARITY_OBSERVERS) - known)
+    if undeclared:
+        raise CatalogError(
+            "an observer is mapped to a live scenario the catalog does not define: "
+            + ", ".join(undeclared)
+        )
     for case in cases:
-        drivers = registry.get(case["id"], {})
-        case["drivers"] = {topology: dict(facts) for topology, facts in sorted(drivers.items())}
+        drivers = {
+            topology: {**facts, "evidence": list(facts.get("evidence") or [])}
+            for topology, facts in sorted(registry.get(case["id"], {}).items())
+        }
+        for topology, observer in sorted(LIVE_PARITY_OBSERVERS.get(case["id"], {}).items()):
+            if topology in drivers:
+                raise CatalogError(
+                    f"{case['id']}: it runs as a case and is also mapped to the observer "
+                    f"{observer!r} in {topology}, so one of the two is stale"
+                )
+            facts = registry.get(observer, {}).get(topology)
+            if facts is None:
+                raise CatalogError(
+                    f"{case['id']}: the declared {topology} observer {observer!r} is not a Case "
+                    "the code builds for that topology"
+                )
+            # A fresh list per entry: two entries sharing one list would be dumped
+            # as a YAML anchor and alias, which reads as a link nobody declared.
+            drivers[topology] = {
+                **facts,
+                "evidence": list(facts.get("evidence") or []),
+                "case": observer,
+            }
+        case["drivers"] = drivers
         if drivers:
             case["driver_status"] = "implemented"
         elif case.get("driver_status") == "implemented":
@@ -1246,12 +1286,18 @@ def _implementation_errors(catalog: Dict[str, Any]) -> List[str]:
         if status != "implemented" and drivers:
             errors.append(f"{case_id}: driver_status {status!r}, but names drivers")
         for topology, facts in sorted(drivers.items()):
-            expected = (registry.get(case_id) or {}).get(topology)
+            observed = facts.get("case") or case_id
+            expected = (registry.get(observed) or {}).get(topology)
             if expected is None:
                 errors.append(
                     f"{case_id}: the {topology} driver {facts.get('driver')!r} is not a Case the code builds"
                 )
                 continue
+            if facts.get("case") != LIVE_PARITY_OBSERVERS.get(case_id, {}).get(topology):
+                errors.append(
+                    f"{case_id} / {topology}: the observer is {facts.get('case')!r}, "
+                    f"the declaration says {LIVE_PARITY_OBSERVERS.get(case_id, {}).get(topology)!r}"
+                )
             if topology not in case.get("topology", []):
                 errors.append(f"{case_id}: driven in {topology}, which its topology list does not name")
             if facts.get("driver") != expected["driver"]:
