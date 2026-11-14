@@ -1588,9 +1588,112 @@ class TestLocalNodeIdempotency(unittest.TestCase):
         self.assertIn('if local_node_is_serving "$node_port" "$normalized_node_ver"; then', install)
         self.assertIn("node_restart_required=0", install)
         self.assertLess(install.index("if (( node_restart_required == 1 )); then"),
-                        install.index('bash "$upstream_installer" </dev/null'))
+                        install.index('run_node_installer_with_retry "$upstream_installer"'))
         self.assertIn("if (( node_restart_required == 1 )) && "
                       '[[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then', install)
+
+
+class TestNodeInstallerRetry(unittest.TestCase):
+    """One slow answer from api.github.com must not end a whole deployment.
+
+    gowave-node lists the Xray releases with a 10-second deadline and no retry of
+    its own, so the installer it runs behind is the only place a transient network
+    fault can be absorbed. The retry is bounded and applies to nothing else:
+    repeating a configuration error would only print it twice.
+    """
+
+    def write_installer(self, tmp: Path, name: str, body: str) -> Path:
+        path = tmp / f"{name}.sh"
+        path.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
+        path.chmod(0o700)
+        return path
+
+    def run_helper(self, tmp: Path, installer: Path):
+        # The delays are a module default, so the test shortens them by assignment
+        # rather than through a prefix, which bash would treat as a string value.
+        command = (
+            f'source "{NODE_SH}" && '
+            "NODE_INSTALLER_RETRY_DELAYS=(0 0)\n"
+            f'run_node_installer_with_retry "{installer}" hidden-secret 3002 latest'
+        )
+        return subprocess.run(["bash", "-c", command], capture_output=True, text=True, cwd=tmp)
+
+    def counting_installer(self, tmp: Path, failure: str, fail_until: int = 1) -> Path:
+        count = tmp / "attempts"
+        body = (
+            f'count=$(cat "{count}" 2>/dev/null || echo 0)\n'
+            "count=$(( count + 1 ))\n"
+            f'printf "%s\\n" "$count" > "{count}"\n'
+            'echo "attempt $count"\n'
+            f"if (( count <= {fail_until} )); then {failure}; fi\n"
+            "exit 0\n"
+        )
+        return self.write_installer(tmp, "counting", body)
+
+    def test_a_network_fault_is_retried_and_the_second_attempt_decides(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            installer = self.counting_installer(
+                tmp,
+                "echo '[ERROR] Failed to fetch releases: Get "
+                '"https://api.github.com/repos/XTLS/Xray-core/releases?per_page=100": '
+                "context deadline exceeded' >&2 && exit 1",
+            )
+            res = self.run_helper(tmp, installer)
+            attempts = (tmp / "attempts").read_text().strip()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(attempts, "2")
+        self.assertIn("attempt 1", res.stdout, "the failed attempt's own output is still shown")
+        self.assertIn("context deadline exceeded", res.stderr, "its stderr is replayed")
+        self.assertIn("retrying in 0s (attempt 2 of 3)", res.stdout)
+
+    def test_a_failure_that_is_not_a_network_fault_is_reported_at_once(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            installer = self.counting_installer(
+                tmp, "echo 'Error: unsupported architecture: riscv64' >&2 && exit 4", fail_until=99,
+            )
+            res = self.run_helper(tmp, installer)
+            attempts = (tmp / "attempts").read_text().strip()
+        self.assertEqual(res.returncode, 4, "the installer's own exit code is preserved")
+        self.assertEqual(attempts, "1", "a configuration error is not worth repeating")
+        self.assertIn("unsupported architecture", res.stderr)
+        self.assertNotIn("retrying", res.stdout)
+
+    def test_repeated_network_faults_stop_at_the_declared_attempt_count(self):
+        before = set(Path(tempfile.gettempdir()).glob("gowave-node-installer-*"))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            installer = self.counting_installer(
+                tmp, "echo '[ERROR] Failed to fetch releases: i/o timeout' >&2 && exit 1",
+                fail_until=99,
+            )
+            res = self.run_helper(tmp, installer)
+            attempts = (tmp / "attempts").read_text().strip()
+        after = set(Path(tempfile.gettempdir()).glob("gowave-node-installer-*"))
+        self.assertEqual(res.returncode, 1)
+        self.assertEqual(attempts, "3")
+        self.assertEqual(res.stderr.count("i/o timeout"), 3, "every attempt's evidence survives")
+        self.assertEqual(after, before, "the attempt logs live in a directory the helper removes")
+
+    def test_the_secret_travels_in_the_environment_and_never_in_the_arguments(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            seen = tmp / "env"
+            argv = tmp / "argv"
+            installer = self.write_installer(
+                tmp,
+                "env",
+                f'printf "%s %s %s\\n" "$SECRET_KEY" "$NODE_PORT" "$GOWAVE_NODE_VERSION" > "{seen}"\n'
+                f'tr "\\0" " " < /proc/$$/cmdline > "{argv}"\n',
+            )
+            res = self.run_helper(tmp, installer)
+            environment = seen.read_text().strip()
+            arguments = argv.read_text()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(environment, "hidden-secret 3002 latest")
+        self.assertNotIn("hidden-secret", arguments)
+        self.assertNotIn("hidden-secret", res.stdout + res.stderr)
 
 
 class TestWorkerPayloadBootstrap(unittest.TestCase):
@@ -1682,6 +1785,66 @@ class TestWorkerPayloadBootstrap(unittest.TestCase):
             self.assertIn("install", only_openssl)
             self.assertIn("openssl", only_openssl)
             self.assertNotIn("python3", only_openssl)
+
+
+class TestWorkerInstallerRetry(unittest.TestCase):
+    """The Worker payload absorbs the same transient fault before it rolls back.
+
+    The payload cannot source ``modules/``, so it carries its own copy of the
+    retry; running the streamed script's functions proves that copy, not the
+    module's.
+    """
+
+    def payload_functions(self, tmp: Path) -> Path:
+        payload = capture_remote_script(tmp, "remote_payload", "127.0.0.1", "22",
+                                        "worker.example.com", "reality.example.com", "root")
+        script = tmp / "payload-functions.sh"
+        script.write_text(
+            "\n".join(line for line in payload.splitlines() if not line.startswith('main "$@"')) + "\n",
+            encoding="utf-8",
+        )
+        return script
+
+    def test_a_network_fault_is_retried_inside_the_payload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            script = self.payload_functions(tmp)
+            count = tmp / "attempts"
+            installer = tmp / "install.sh"
+            installer.write_text(
+                "#!/usr/bin/env bash\n"
+                f'count=$(cat "{count}" 2>/dev/null || echo 0)\n'
+                "count=$(( count + 1 ))\n"
+                f'printf "%s\\n" "$count" > "{count}"\n'
+                'echo "attempt $count"\n'
+                "if (( count == 1 )); then\n"
+                "    echo '[ERROR] Failed to fetch releases: i/o timeout' >&2\n"
+                "    exit 1\n"
+                "fi\n",
+                encoding="utf-8",
+            )
+            installer.chmod(0o700)
+            driver = (
+                f'source "{script}"\n'
+                "NODE_INSTALLER_RETRY_DELAYS=(0)\n"
+                f'run_node_installer_with_retry "{installer}" "" 3002 latest'
+            )
+            res = subprocess.run(["bash", "-c", driver], capture_output=True, text=True)
+            attempts = count.read_text().strip()
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(attempts, "2")
+        self.assertIn("i/o timeout", res.stderr, "the failed attempt's stderr is replayed")
+        self.assertIn("retrying in 0s (attempt 2 of 3)", res.stdout)
+
+    def test_the_payload_installer_failure_still_reaches_the_rollback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload = capture_remote_script(tmpdir, "remote_payload", "127.0.0.1", "22",
+                                            "worker.example.com", "reality.example.com", "root")
+        installer_body = payload.split("run_upstream_node_installer() {", 1)[1].split(
+            "\ncompensate_remote_worker() {", 1)[0]
+        self.assertIn("run_node_installer_with_retry", installer_body,
+                      "the payload's only installer invocation must be the retrying one")
+        self.assertIn('return "$installer_rc"', installer_body)
 
 
 class TestWorkerReapply(unittest.TestCase):

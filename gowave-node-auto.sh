@@ -2708,6 +2708,61 @@ ensure_pinned_xray_core() {
     return 1
 }
 
+# gowave-node resolves the Xray core through one HTTPS GET to api.github.com with
+# a 10-second deadline and no retry of its own, so a single slow answer ends a
+# Worker whose whole provisioning then rolls back. A repeat is the only repair such
+# a hiccup has, while a configuration error would only print itself twice: the
+# retry is therefore limited to failures whose own stderr names a network fault.
+NODE_INSTALLER_ATTEMPTS=3
+NODE_INSTALLER_RETRY_DELAYS=(10 30)
+NODE_INSTALLER_NETWORK_FAULTS='context deadline exceeded|i/o timeout|TLS handshake timeout|Client\.Timeout|Temporary failure in name resolution|Could not resolve host|Connection reset by peer|Connection refused|network is unreachable|No route to host|502 Bad Gateway|503 Service Unavailable|504 Gateway Timeout'
+
+node_installer_stderr_names_network_fault() {
+    grep -Eqi "$NODE_INSTALLER_NETWORK_FAULTS" "$1"
+}
+
+# run_node_installer_with_retry INSTALLER SECRET_KEY NODE_PORT VERSION
+#
+# The installer's stderr is captured so the finished attempt can be classified;
+# it is replayed to stderr at once, so the payload's own output keeps both streams
+# apart exactly as the operator's SSH session receives them.
+run_node_installer_with_retry() {
+    local installer="$1"
+    local secret_key="$2"
+    local node_port="$3"
+    local version="$4"
+    local attempt=1 rc=0 workdir stdout_log stderr_log delay
+
+    workdir=$(mktemp -d "/tmp/gowave-node-install-attempts-XXXXXX")
+    while : ; do
+        stdout_log="$workdir/attempt-$attempt.stdout.log"
+        stderr_log="$workdir/attempt-$attempt.stderr.log"
+        rc=0
+        if ! (
+            export SECRET_KEY="$secret_key"
+            export NODE_PORT="$node_port"
+            export GOWAVE_NODE_VERSION="$version"
+            bash "$installer" </dev/null
+        ) 2>"$stderr_log" | tee "$stdout_log"; then
+            rc=${PIPESTATUS[0]}
+        fi
+        cat "$stderr_log" >&2 || true
+        if (( rc == 0 )); then
+            break
+        fi
+        if (( attempt >= NODE_INSTALLER_ATTEMPTS )) ||
+            ! node_installer_stderr_names_network_fault "$stderr_log"; then
+            break
+        fi
+        delay=${NODE_INSTALLER_RETRY_DELAYS[$(( attempt - 1 ))]}
+        echo "GoWave Node installer failed on a network fault (exit $rc); retrying in ${delay}s (attempt $(( attempt + 1 )) of $NODE_INSTALLER_ATTEMPTS)..."
+        sleep "$delay"
+        attempt=$(( attempt + 1 ))
+    done
+    rm -rf -- "$workdir"
+    return "$rc"
+}
+
 run_upstream_node_installer() {
     local tmp_inst
     : "${GOWAVE_NODE_INSTALLER_COMMIT:?Pinned upstream installer commit is required}"
@@ -2739,7 +2794,7 @@ run_upstream_node_installer() {
     if [[ "$normalized_node_ver" != "latest" && "$normalized_node_ver" != v* ]]; then
         normalized_node_ver="v$normalized_node_ver"
     fi
-    if GOWAVE_NODE_VERSION="$normalized_node_ver" bash "$tmp_inst" </dev/null; then
+    if run_node_installer_with_retry "$tmp_inst" "${SECRET_KEY:-}" "${NODE_PORT:-}" "$normalized_node_ver"; then
         rm -f "$tmp_inst"
     else
         local installer_rc=$?
