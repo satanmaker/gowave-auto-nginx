@@ -480,6 +480,57 @@ install test needs, so the acceptance suite builds `Containerfile.target` and
 `Containerfile.client` and nothing under `tools/podman_e2e/` names the testbed
 image.
 
+## Where Podman stops, where QEMU starts, and what only a VPS can answer
+
+`tests/cases/catalog.yaml` defines each scenario once and stamps it with an
+`environment`, so the boundary between the contours is a checked field rather
+than a sentence in a document. The catalog holds 212 entries:
+
+| Environment | Entries | Which contour answers it |
+| --- | ---: | --- |
+| `container` | 202 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
+| `partial` | 8 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
+| `live-only` | 2 | Only the live suite. Every Podman run reports both as justified exclusions, and `tools/podman_e2e/catalog.py` refuses a catalog that lets one run here. |
+
+Of the 125 live scenarios projected into this catalog, 115 are container, 8 are
+partial and 2 are live-only; the other 87 entries are Podman-first cases with a
+promotion target, which `tests/cases/PARITY.md` lists separately.
+
+The ten entries that are not fully container-answerable are, by id: `PRE-04`,
+`FW-03`, `DP-09`, `DP-10`, `DP-11`, `TD-05`, `BOOT-01`, `BOOT-02` (partial) and
+`TD-06`, `LOCAL-02` (live-only). Their reasons are not restated here:
+`tests/cases/PARITY.md` is regenerated from the catalog, and the guard on this
+page compares both lists, so an id that changes section in the catalog has to
+change here as well.
+
+The QEMU contour answers a question none of those entries ask: whether the
+units the product writes survive a real cold boot under a genuine systemd PID 1.
+`tests/systemd/boot.sh` builds a rootfs from `tests/Containerfile.testbed` for
+all four base images, boots it with QEMU (KVM when available, TCG otherwise),
+and the guest's own `gowave-ci.service` runs `python3 tests/run_ci.py --suite
+systemd`. That suite is five tests and installs nothing: four of them read
+files — the unit templates in `modules/panel.sh` and `modules/security.sh`, and
+`tests/systemd/boot.sh` itself for executability and the four-image/KVM matrix
+— and `test_guest_genuine_pid1_when_in_vm` reads `/proc/1/comm` and
+`systemctl is-system-running` from inside the guest. No `gowave-auto.sh install`
+runs there, no traffic flows, no subscription is fetched, and the contour
+carries no catalog case id at all: it is a check that the units are accepted,
+not a scenario of the product. What it cannot answer is therefore not a gap in
+the cases — a container with `--systemd=always` runs a systemd as PID 1 that
+belongs to the container, and the cold boot is what removes that difference.
+
+What only a VPS can answer is the live half of the eight partial entries plus
+the two live-only ones: provider-level reachability, real public addresses and
+real Let's Encrypt issuance, a provider snapshot followed by a reboot, the live
+controller's public-target bootstrap, and the operator starting a run against
+real disposable hosts. `openspec/specs/live-vps-e2e/spec.md` owns those, and the
+shared contracts — subscription delivery, User-Agent policy, Vision
+independence, firewall evidence rules, redaction, result semantics — are
+asserted in both suites from one text. A container run that reported a
+live-only id as PASS, or presented a partial id's container half as the whole
+scenario, would be claiming evidence it never produced; the catalog and
+`python3 -m tools.podman_e2e.catalog check` make that unrepresentable.
+
 ## What the suite does not drive, and why
 
 Six entrypoints are not invoked by a container case, for two different reasons,
@@ -492,8 +543,9 @@ fetches over the authenticated API, which is the path a real client uses.
 their absence is recorded here so that a future parity review sees a gap rather
 than a coverage claim.
 
-Acceptance boundaries that are not container cases live in
-`docs/PODMAN_E2E.md` and `openspec/changes/podman-full-e2e/design.md`
-(§Scope boundary): the QEMU cold-boot matrix and the live VPS capability answer
-questions a disposable container cannot, and neither is a substitute for the
-other.
+Acceptance boundaries that are not container cases are divided in §Where
+Podman stops, where QEMU starts, and what only a VPS can answer above, and
+restated in `openspec/changes/podman-full-e2e/design.md` (§Scope boundary): the
+QEMU cold-boot matrix and the live VPS capability answer questions a disposable
+container cannot, and neither is a substitute for the other. The operator-facing
+guide `docs/PODMAN_E2E.md` describes the invocations themselves.

@@ -153,6 +153,7 @@ SUITES = {
         "test_podman_docs.TestLiveContractReconciliation",
         "test_podman_docs.TestOsMatrixReconciliation",
         "test_podman_docs.TestReusableFixtureInventory",
+        "test_podman_docs.TestContourBoundary",
         "test_podman_docs.TestPodmanE2EDocumentation",
         "test_fixture_dns.TestDnsFixture",
         "test_fixture_echo.TestEchoFixture",
