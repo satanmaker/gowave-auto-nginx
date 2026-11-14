@@ -685,8 +685,10 @@ class TestLiveContractReconciliation(unittest.TestCase):
         self.assertIn('add_header Cache-Control "no-store', location.split("location ", 1)[-1],
                       "the vhost no longer disables caching on the subscription location")
         case = function_body("tools/podman_e2e/aio.py", "case_subscriptions")
-        self.assertIn('record.get("edge_cache_control")', case,
-                      "the case stopped reading the header from the public edge")
+        self.assertIn('edge_control = str(record.get("edge_cache_control") or "")', case,
+                      "the case stopped judging the header the public edge returned")
+        self.assertIn('require("SUB-SERVED", "no-store" in edge_control.lower()', case,
+                      "the case records the edge header without requiring it to disable caching")
         self.assertIn('record.get("edge_identical") is True', case)
         collect = function_body("tools/podman_e2e/aio.py", "collect_subscriptions")
         self.assertIn("--edge-base https://{host.panel_domain}", collect,
