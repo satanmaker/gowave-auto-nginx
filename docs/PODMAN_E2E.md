@@ -107,7 +107,14 @@ sudo python3 -m tools.podman_e2e.trace --verify-run artifacts/podman-e2e
 It exits `1` naming the run, the count and the shortfall; CI runs it after every
 acceptance suite. The full requirement → scenario → matrix row → case → test →
 CI job mapping, and the count itself, are published in
-[`docs/PODMAN_E2E_TRACEABILITY.md`](PODMAN_E2E_TRACEABILITY.md).
+[`docs/PODMAN_E2E_TRACEABILITY.md`](PODMAN_E2E_TRACEABILITY.md). That page also
+carries a `Named behaviours` table: one row per promise too narrow to be a
+scenario — a subscription request with no User-Agent, one Vision combination,
+one kind of DNS answer — with the `tests/cases/matrix.yaml` declaration each one
+quotes. The audit refuses a behaviour that quotes a value the manifest does not
+state, and refuses the table when a declaration the report is supposed to cover
+is named by no behaviour, so the page cannot keep describing a policy the
+matrix has moved away from.
 
 States are never collapsed: `PASS`, `FAIL`, `BLOCKED`, `SKIP`,
 `NOT_APPLICABLE`, `INCOMPLETE`. Any `SKIP` fails the run, `BLOCKED` and

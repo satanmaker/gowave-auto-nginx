@@ -413,5 +413,207 @@ class TestTraceabilityRules(unittest.TestCase):
         self.assertIn("is not what the table renders to", printed.getvalue())
 
 
+class TestNamedBehaviours(unittest.TestCase):
+    """The second view: one promise at a time, each quoting the manifest.
+
+    `behaviours` publishes what a single behaviour rests on — the cases, the
+    tests, the job — and quotes the `matrix.yaml` declaration it depends on, so
+    a policy that moves in the manifest cannot leave the report describing the
+    old one. These tests damage the block they read: a dropped behaviour, a
+    changed value, a lost Vision combination, an obligation nobody meets.
+    """
+
+    def setUp(self):
+        self.spec = trace.parse_spec()
+        self.declared = trace.declared_cases()
+        self.jobs = trace.declared_jobs()
+        self.tests = trace.test_index()
+        self.matrix = trace.load_matrix()
+        self.table = trace.load_table()
+
+    def problems(self, table=None):
+        return trace.validate_behaviours(
+            table if table is not None else self.table,
+            self.spec, self.declared, self.jobs, self.tests, self.matrix,
+        )
+
+    def entry_in(self, table, behaviour):
+        for entry in table.get("behaviours") or []:
+            if entry.get("behaviour") == behaviour:
+                return entry
+        raise AssertionError(f"no behaviour {behaviour!r}")
+
+    def test_the_checked_in_behaviours_agree_with_what_they_quote(self):
+        self.assertEqual(self.problems(), [])
+        cited = set()
+        for entry in trace.behaviours(self.table):
+            for _topology, case_id in trace.expand(entry["cases"], self.declared)[0]:
+                cited.add(case_id)
+        for case_id in (
+            "SUB-SERVED", "SUB-UA-ABSENT", "SUB-UA-BLANK", "SUB-B64",
+            "SUB-JSON-SHAPES", "PODNET-MASTER-ADDR", "MN-SSHKEY", "MN-VISION",
+            "NGX-COVER-DERIVE", "NGX-COVER-UNRESOLVED", "DECOY-01",
+            "NGX-COVER-SITE", "DNS-01",
+        ):
+            with self.subTest(case=case_id):
+                self.assertIn(case_id, cited)
+        dns = [
+            entry for entry in trace.behaviours(self.table)
+            if "DNS-01" in (entry.get("cases") or [])
+        ]
+        self.assertEqual(len(dns), 5, "each DNS behaviour is named on its own")
+
+    def test_a_behaviour_that_stops_quoting_a_declaration_is_refused(self):
+        table = trace.load_table()
+        table["behaviours"] = [
+            entry for entry in table["behaviours"]
+            if entry["behaviour"] != "A subscription request without a User-Agent header is refused"
+        ]
+        self.assertIn("no behaviour names user_agent.absent", self.problems(table))
+
+    def test_a_behaviour_quoting_a_value_the_manifest_does_not_state_is_refused(self):
+        table = trace.load_table()
+        self.entry_in(
+            table, "A subscription request without a User-Agent header is refused"
+        )["declares"]["value"] = 200
+        problems = self.problems(table)
+        self.assertTrue(
+            any("user_agent.absent is 403 in the manifest" in problem for problem in problems),
+            problems,
+        )
+
+    def test_a_vision_combination_no_behaviour_names_is_refused(self):
+        table = trace.load_table()
+        table["behaviours"] = [
+            entry for entry in table["behaviours"]
+            if entry["behaviour"] != "Vision runs on both nodes"
+        ]
+        problems = self.problems(table)
+        self.assertTrue(
+            any(
+                "no behaviour names topologies.multi-node.vision_combinations = 'both'" in problem
+                for problem in problems
+            ),
+            problems,
+        )
+
+    def test_a_behaviour_listed_twice_is_refused(self):
+        table = trace.load_table()
+        table["behaviours"].append(copy.deepcopy(table["behaviours"][0]))
+        problems = self.problems(table)
+        self.assertTrue(any("listed more than once" in problem for problem in problems), problems)
+
+    def test_a_behaviour_serving_a_requirement_the_spec_does_not_state_is_refused(self):
+        table = trace.load_table()
+        table["behaviours"][0]["requirement"] = "A Requirement Nobody Wrote"
+        problems = self.problems(table)
+        self.assertTrue(
+            any("no spec requirement 'A Requirement Nobody Wrote'" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_a_behaviour_citing_a_case_no_suite_declares_is_refused(self):
+        table = trace.load_table()
+        table["behaviours"][0]["cases"] = ["SUB-NOT-A-CASE"]
+        problems = self.problems(table)
+        self.assertTrue(
+            any("no suite declares the case 'SUB-NOT-A-CASE'" in problem for problem in problems),
+            problems,
+        )
+
+    def test_a_behaviour_citing_a_job_no_workflow_declares_is_refused(self):
+        table = trace.load_table()
+        table["behaviours"][0]["jobs"] = ["A Job Nobody Runs"]
+        problems = self.problems(table)
+        self.assertTrue(
+            any("no workflow declares the job 'A Job Nobody Runs'" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_a_behaviour_citing_a_test_nobody_wrote_is_refused(self):
+        table = trace.load_table()
+        table["behaviours"][0]["tests"] = [
+            "tests.test_podman_subscriptions.TestSubscriptionCases.test_nobody_wrote_this"
+        ]
+        problems = self.problems(table)
+        self.assertTrue(any("no test method" in problem for problem in problems), problems)
+
+    def test_a_behaviour_with_no_case_is_refused(self):
+        table = trace.load_table()
+        table["behaviours"][0]["cases"] = []
+        problems = self.problems(table)
+        self.assertTrue(
+            any("names no case, so nothing proves it" in problem for problem in problems),
+            problems,
+        )
+
+    def test_two_behaviours_claiming_one_declaration_are_refused(self):
+        table = trace.load_table()
+        self.entry_in(
+            table, "A subscription request with a blank User-Agent header is refused"
+        )["declares"] = {"path": "user_agent.absent", "value": 403}
+        problems = self.problems(table)
+        self.assertTrue(
+            any("already claims user_agent.absent" in problem for problem in problems),
+            problems,
+        )
+
+    def test_a_declaration_path_the_manifest_does_not_hold_is_refused(self):
+        table = trace.load_table()
+        table["behaviours"][0]["declares"]["path"] = "user_agent.sometimes"
+        problems = self.problems(table)
+        self.assertTrue(
+            any("declares 'user_agent.sometimes', which the manifest does not hold" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_a_list_declaration_that_names_no_value_is_refused(self):
+        table = trace.load_table()
+        del self.entry_in(table, "Vision runs on both nodes")["declares"]["value"]
+        problems = self.problems(table)
+        self.assertTrue(
+            any("has to be quoted with the value the manifest states" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_an_obligation_the_manifest_does_not_hold_is_refused(self):
+        table = trace.load_table()
+        table["behaviour_obligations"].append({"path": "user_agent.sometimes"})
+        problems = self.problems(table)
+        self.assertTrue(
+            any("names a declaration the manifest does not hold" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_an_obligation_on_a_single_value_cannot_ask_for_every_value(self):
+        table = trace.load_table()
+        table["behaviour_obligations"].append(
+            {"path": "user_agent.absent", "every_value": True}
+        )
+        problems = self.problems(table)
+        self.assertTrue(any("asks for every value" in problem for problem in problems), problems)
+
+    def test_a_table_with_no_obligations_is_refused(self):
+        table = trace.load_table()
+        table["behaviour_obligations"] = []
+        problems = self.problems(table)
+        self.assertTrue(any("no behaviour obligation" in problem for problem in problems), problems)
+
+    def test_the_report_publishes_every_named_behaviour(self):
+        report = trace.render(self.table)
+        self.assertIn("## Named behaviours", report)
+        self.assertIn("| Behaviour | Requirement | Manifest | Cases | Tests | Job |", report)
+        for entry in trace.behaviours(self.table):
+            with self.subTest(behaviour=entry["behaviour"]):
+                self.assertIn(f"| {entry['behaviour']} |", report)
+        self.assertIn("`user_agent.absent` = `403`", report)
+        self.assertIn("`topologies.multi-node.vision_combinations` holds `both`", report)
+
+
 if __name__ == "__main__":
     unittest.main()
