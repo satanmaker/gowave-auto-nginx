@@ -341,6 +341,48 @@ class TestPanelApiContract(unittest.TestCase):
                 self.assertIn("coverage gap", row["caller"], "a supported route with no caller is a gap, not a NOT_APPLICABLE")
         self.assertIn("not a `NOT_APPLICABLE`", api_section())
 
+    def test_the_page_pins_the_user_agent_policy_per_path(self):
+        section = api_section()
+        for anchor in (
+            "internal/subscription/serve.go:118",
+            "internal/subscription/srr.go:77",
+            "internal/database/default_data.go:10",
+        ):
+            with self.subTest(citation=anchor):
+                self.assertIn(anchor, section, "the page no longer cites the rule that decides the policy")
+        manifest = yaml.safe_load(MATRIX.read_text(encoding="utf-8"))["user_agent"]
+        self.assertEqual(
+            sorted(manifest), ["absent", "accepted", "blank"],
+            "tests/cases/matrix.yaml must state the acceptance rule and the two refusals, never an allowlist",
+        )
+        self.assertEqual(manifest["accepted"], "non-empty header")
+        from tools.podman_e2e import aio, panel_surface
+
+        self.assertNotIn(panel_surface.FOREIGN_USER_AGENT, {agent for _n, _t, agent in panel_surface.REPRESENTATIONS})
+        family = {name for name, _template, _agent in panel_surface.REPRESENTATIONS}
+        self.assertEqual(family, set(aio.REPRESENTATIONS))
+
+    def test_the_pinned_panel_enforces_the_policy_the_page_describes(self):
+        if not backend_tree():
+            self.skipTest(
+                "sources/gowave is a local checkout (/sources/ is gitignored): "
+                "the User-Agent policy was not re-read in this run"
+            )
+        serve = (BACKEND / "internal" / "subscription" / "serve.go").read_text(encoding="utf-8").splitlines()
+        self.assertIn('userAgent == nil || *userAgent == ""', serve[117],
+                      "the Panel no longer refuses an absent and a blank header at serve.go:118")
+        matcher = (BACKEND / "internal" / "subscription" / "srr.go").read_text(encoding="utf-8")
+        self.assertIn("func (config *SRRConfig) Match", matcher)
+        self.assertLess(
+            matcher.index("func (config *SRRConfig) Match"),
+            matcher.index("handleOverrideClientType(overrideClientType)"),
+            "the path override must be decided before any rule is read",
+        )
+        defaults = (BACKEND / "internal" / "database" / "default_data.go").read_text(encoding="utf-8")
+        self.assertIn('"name":"Fallback Base64"', defaults)
+        self.assertIn('"conditions":[],"responseType":"XRAY_BASE64"', defaults,
+                      "the unconditional fallback rule is what serves a header that names no client family")
+
 
 class TestPodmanE2EDocumentation(unittest.TestCase):
     def test_every_flag_in_a_documented_command_exists(self):

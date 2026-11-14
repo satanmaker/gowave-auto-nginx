@@ -191,14 +191,14 @@ to a generator. The five representations are declared once, in
 `tests/cases/matrix.yaml`: `base64` at `/api/sub/{shortUuid}`, `xray-json` at
 `/v2ray-json`, `mihomo` at `/mihomo`, `clash` at `/clash` and `singbox` at
 `/singbox`. The probe carries the client family and User-Agent for each
-(`tools/podman_e2e/panel_surface.py:57`-`61`); `SUB-B64` is the case that checks
+(`tools/podman_e2e/panel_surface.py:63`-`67`); `SUB-B64` is the case that checks
 the base64 list an Xray-family client imports.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| subscription | `GET /api/sub/{shortUuid}` | `internal/server/server.go:522` | `tools/podman_e2e/panel_surface.py:57` `base64` |
+| subscription | `GET /api/sub/{shortUuid}` | `internal/server/server.go:522` | `tools/podman_e2e/panel_surface.py:63` `base64` |
 | subscription | `GET /api/sub/{shortUuid}/info` | `internal/server/server.go:523` | none — coverage gap |
-| subscription | `GET /api/sub/{shortUuid}/{clientType}` | `internal/server/server.go:524` | `tools/podman_e2e/panel_surface.py:58` `xray-json` |
+| subscription | `GET /api/sub/{shortUuid}/{clientType}` | `internal/server/server.go:524` | `tools/podman_e2e/panel_surface.py:64` `xray-json` |
 
 The path segment is not free-form: `handleOverrideClientType`
 (`internal/subscription/srr.go:165`) switches on `stash`, `singbox`, `mihomo`,
@@ -207,6 +207,28 @@ manifest's `xray-json` entry asks for `/v2ray-json`, which is the fourth arm of
 that switch, and `TestPanelApiContract` refuses a representation whose segment
 the switch does not name — otherwise a typo in the manifest would be answered by
 `BLOCK` and would look like a Panel defect.
+
+**The User-Agent policy, per path.** The two paths do not decide the same way.
+On the client-type path the segment decides and the header only has to be
+present: `Match` (`internal/subscription/srr.go:77`) returns
+`handleOverrideClientType(...)` before it reads a single rule. On the bare path
+the header decides, through the Panel's default rule set: `DefaultSRRConfig`
+(`internal/database/default_data.go:10`) lists the Mihomo, Stash, sing-box,
+Clash and browser rules and then an unconditional `Fallback Base64` rule, so any
+other non-empty header is served the base64 list. In both cases an absent or a
+blank header is refused with 403 before a rule is read
+(`internal/subscription/serve.go:118`), which is the policy `user_agent` in
+`tests/cases/matrix.yaml` states and `SUB-UA-ABSENT` and `SUB-UA-BLANK` assert
+separately: two probes, two results, because a client that sends no header and a
+client that sends an empty one are different requests.
+
+That policy is why `SUB-SERVED` asks every representation a second time with
+`curl/8.5.0`, a header that names no client family
+(`tools/podman_e2e/panel_surface.py:58`). It has to be served, and with the same
+bytes: a refusal would mean the Panel requires a format rather than a header,
+and different bytes would mean the header selects the representation and the
+family headers were carrying the assertion. Neither is true of the pinned Panel,
+and the suite would be inventing an allowlist if it assumed either.
 
 ### What is declared but not driven
 

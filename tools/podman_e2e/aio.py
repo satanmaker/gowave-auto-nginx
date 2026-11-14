@@ -4549,6 +4549,18 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
                 f"the {name} representation is empty")
         require("SUB-SERVED", bool(record.get("content_type")),
                 f"the {name} representation came back without a media type")
+        # The pinned policy is "a non-empty header", not "a header naming this
+        # format". Sending a header that names no client family is the only way
+        # to keep the suite from turning client identification into a server
+        # requirement the Panel never had.
+        require("SUB-SERVED", record.get("foreign_status") == 200,
+                f"GET /api/sub/<shortUuid>/{name} answered {record.get('foreign_status')!r} to "
+                f"User-Agent {panel_surface.FOREIGN_USER_AGENT!r}, which names no client family; "
+                f"the Panel requires a non-empty header, not a format")
+        require("SUB-SERVED", record.get("foreign_identical") is True,
+                f"the {name} representation answers User-Agent {panel_surface.FOREIGN_USER_AGENT!r} "
+                f"with different bytes than the header of the client that consumes it, so the header "
+                f"is selecting the representation instead of identifying the client")
 
     loaded = product.engine_facts("SUB-SERVED", "representations")
 
@@ -4620,6 +4632,9 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
         evidence[f"{name}_status"] = record.get("status")
         evidence[f"{name}_content_type"] = record.get("content_type")
         evidence[f"{name}_bytes"] = record.get("bytes")
+        evidence[f"{name}_foreign_status"] = record.get("foreign_status")
+        evidence[f"{name}_foreign_identical"] = record.get("foreign_identical")
+    evidence["ua_foreign"] = panel_surface.FOREIGN_USER_AGENT
     evidence["base64_link_count"] = base64.get("link_count")
     evidence["base64_schemes"] = ",".join(base64.get("schemes") or [])
     evidence["xray_json_shape"] = shape

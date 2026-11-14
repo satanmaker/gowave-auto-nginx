@@ -230,11 +230,16 @@ def served_facts(overrides=None):
     return merge({
         "short_uuid_length": len(SHORT_UUID),
         "representations": {
-            "base64": {"status": 200, "content_type": "text/plain", "bytes": len(BASE64_BODY)},
-            "xray-json": {"status": 200, "content_type": "application/json", "bytes": len(JSON_BODY)},
-            "mihomo": {"status": 200, "content_type": "text/yaml", "bytes": len(MIHOMO_YAML)},
-            "clash": {"status": 200, "content_type": "text/yaml", "bytes": len(MIHOMO_YAML)},
-            "singbox": {"status": 200, "content_type": "application/json", "bytes": len(SINGBOX_BODY)},
+            "base64": {"status": 200, "content_type": "text/plain", "bytes": len(BASE64_BODY),
+                       "foreign_status": 200, "foreign_identical": True},
+            "xray-json": {"status": 200, "content_type": "application/json", "bytes": len(JSON_BODY),
+                          "foreign_status": 200, "foreign_identical": True},
+            "mihomo": {"status": 200, "content_type": "text/yaml", "bytes": len(MIHOMO_YAML),
+                       "foreign_status": 200, "foreign_identical": True},
+            "clash": {"status": 200, "content_type": "text/yaml", "bytes": len(MIHOMO_YAML),
+                      "foreign_status": 200, "foreign_identical": True},
+            "singbox": {"status": 200, "content_type": "application/json", "bytes": len(SINGBOX_BODY),
+                        "foreign_status": 200, "foreign_identical": True},
         },
     }, overrides)
 
@@ -310,6 +315,7 @@ class StubPanel:
         self.statuses = {}
         self.requests = []
         self.enforce_user_agent = False
+        self.refuse_foreign_user_agent = False
         directory = Path(tempfile.mkdtemp(prefix="gowave-subscription-panel-"))
         self.credentials = directory / "credentials"
         self.credentials.write_text(
@@ -344,6 +350,8 @@ class StubPanel:
                 if name is None:
                     return self._send(404, json.dumps({"message": "not found"}))
                 if panel.enforce_user_agent and (agent is None or not agent.strip()):
+                    return self._send(403, "forbidden", "text/plain")
+                if panel.refuse_foreign_user_agent and agent == panel_surface.FOREIGN_USER_AGENT:
                     return self._send(403, "forbidden", "text/plain")
                 status = panel.statuses.get(name, 200)
                 body, content_type = panel.bodies[name]
@@ -423,12 +431,15 @@ class TestPanelSubscriptionProbe(unittest.TestCase):
 
     def test_each_representation_is_fetched_with_its_client_user_agent(self):
         probe_output(self.panel, "subscriptions", str(self.payload_dir))
-        agents = {path: agent for path, agent in self.panel.requests if "/api/sub/" in path}
-        self.assertEqual(agents[f"/api/sub/{SHORT_UUID}"], panel_surface.MOBILE_USER_AGENT)
-        self.assertEqual(agents[f"/api/sub/{SHORT_UUID}/v2ray-json"], panel_surface.XRAY_USER_AGENT)
-        self.assertEqual(agents[f"/api/sub/{SHORT_UUID}/mihomo"], panel_surface.MIHOMO_USER_AGENT)
-        self.assertEqual(agents[f"/api/sub/{SHORT_UUID}/clash"], panel_surface.CLASH_USER_AGENT)
-        self.assertEqual(agents[f"/api/sub/{SHORT_UUID}/singbox"], panel_surface.SINGBOX_USER_AGENT)
+        agents = {}
+        for path, agent in self.panel.requests:
+            if "/api/sub/" in path:
+                agents.setdefault(path, []).append(agent)
+        self.assertIn(panel_surface.MOBILE_USER_AGENT, agents[f"/api/sub/{SHORT_UUID}"])
+        self.assertIn(panel_surface.XRAY_USER_AGENT, agents[f"/api/sub/{SHORT_UUID}/v2ray-json"])
+        self.assertIn(panel_surface.MIHOMO_USER_AGENT, agents[f"/api/sub/{SHORT_UUID}/mihomo"])
+        self.assertIn(panel_surface.CLASH_USER_AGENT, agents[f"/api/sub/{SHORT_UUID}/clash"])
+        self.assertIn(panel_surface.SINGBOX_USER_AGENT, agents[f"/api/sub/{SHORT_UUID}/singbox"])
 
     def test_an_absent_user_agent_is_a_request_without_the_header(self):
         response = panel_surface.fetch(self.panel.url, f"/api/sub/{SHORT_UUID}", None)
@@ -439,6 +450,29 @@ class TestPanelSubscriptionProbe(unittest.TestCase):
         response = panel_surface.fetch(self.panel.url, f"/api/sub/{SHORT_UUID}", "")
         self.assertEqual(response["status"], 200)
         self.assertEqual(self.panel.requests[-1][1], "")
+
+    def test_the_accepted_header_names_no_client_family(self):
+        families = {agent for _name, _template, agent in panel_surface.REPRESENTATIONS}
+        self.assertNotIn(panel_surface.FOREIGN_USER_AGENT, families)
+        for agent in families:
+            with self.subTest(agent=agent):
+                self.assertNotIn(agent.split("/")[0].lower(), panel_surface.FOREIGN_USER_AGENT.lower())
+
+    def test_a_foreign_user_agent_is_served_the_same_bytes(self):
+        self.panel.enforce_user_agent = True
+        facts, output = probe_output(self.panel, "subscriptions", str(self.payload_dir))
+        served = facts["subscriptions"]["representations"]
+        self.assertEqual(sorted(served), sorted(aio.REPRESENTATIONS))
+        for name, record in served.items():
+            with self.subTest(representation=name):
+                self.assertEqual(record["status"], 200)
+                self.assertEqual(record["foreign_status"], 200)
+                self.assertIs(record["foreign_identical"], True)
+        asked = {path: agent for path, agent in self.panel.requests
+                 if "/api/sub/" in path and agent == panel_surface.FOREIGN_USER_AGENT}
+        self.assertEqual(len(asked), len(aio.REPRESENTATIONS),
+                         "the probe did not ask every representation with the foreign header")
+        self.assertNotIn(self.panel.password, output)
 
     def test_the_pinned_policy_refuses_both_kinds_of_missing_header(self):
         self.panel.enforce_user_agent = True
@@ -1045,6 +1079,27 @@ class TestSubscriptionCases(unittest.TestCase):
     def test_subscriptions_case_rejects_a_missing_media_type(self):
         self.reject("without a media type",
                     served=served_facts({"representations.mihomo.content_type": ""}))
+
+    def test_subscriptions_case_rejects_a_panel_that_refuses_a_foreign_header(self):
+        self.reject("names no client family",
+                    served=served_facts({"representations.mihomo.foreign_status": 403}))
+
+    def test_subscriptions_case_rejects_a_representation_selected_by_the_header(self):
+        self.reject("selecting the representation",
+                    served=served_facts({"representations.base64.foreign_identical": False}))
+
+    def test_subscriptions_case_names_the_header_it_sent(self):
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"subscriptions": served_facts()})],
+            engine_results=[engine_result(engine_representations())],
+        )
+        evidence = aio.case_subscriptions(product)
+        self.assertEqual(evidence["ua_foreign"], panel_surface.FOREIGN_USER_AGENT)
+        for name in aio.REPRESENTATIONS:
+            with self.subTest(representation=name):
+                self.assertEqual(evidence[f"{name}_foreign_status"], 200)
+                self.assertIs(evidence[f"{name}_foreign_identical"], True)
 
     def test_subscriptions_case_rejects_a_default_client_without_a_short_uuid(self):
         self.reject("no shortUuid", served=served_facts({"short_uuid_length": 0}))

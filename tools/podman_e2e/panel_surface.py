@@ -51,6 +51,12 @@ MIHOMO_USER_AGENT = "mihomo/1.19.34"
 CLASH_USER_AGENT = "clash.meta/1.19.34"
 SINGBOX_USER_AGENT = "sing-box/1.10.0"
 
+# A header that names no client family at all. The Panel's rule is "non-empty
+# header", not "a header naming this format", so this is what proves the suite
+# encodes no allowlist the product does not have: every representation has to
+# answer it with the same bytes it answers the family header.
+FOREIGN_USER_AGENT = "curl/8.5.0"
+
 # name, path template, the client that consumes it. The order is the order the
 # representation inventory is documented in.
 REPRESENTATIONS: Sequence[tuple[str, str, str]] = (
@@ -502,12 +508,21 @@ def subscriptions(panel: Panel, payload_dir: Optional[Path]) -> Dict[str, Any]:
     short_uuid = default_user_short_uuid(panel)
     facts: Dict[str, Any] = {"short_uuid_length": len(short_uuid), "representations": {}}
     for name, template, user_agent in REPRESENTATIONS:
-        response = fetch(panel.base_url, template.format(short_uuid=short_uuid), user_agent)
+        path = template.format(short_uuid=short_uuid)
+        response = fetch(panel.base_url, path, user_agent)
         body = response["body"]
+        # The same path again with a header that names no client family. The
+        # Panel requires a non-empty header, so this must be served, and with
+        # the same bytes: anything else would mean the path selected a
+        # representation from the header and the family headers above were
+        # carrying the assertion instead of identifying a client.
+        foreign = fetch(panel.base_url, path, FOREIGN_USER_AGENT)
         facts["representations"][name] = {
             "status": response["status"],
             "content_type": media_type(response["content_type"]),
             "bytes": len(body),
+            "foreign_status": foreign["status"],
+            "foreign_identical": foreign["body"] == body,
         }
         if name == "xray-json":
             # The credentials every engine derives from the same user, reduced to
