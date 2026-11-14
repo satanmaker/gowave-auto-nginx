@@ -23,7 +23,9 @@ from typing import List, Optional, Sequence
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.podman_e2e import aio, diagnostics, groups, matrix, multi_node, target_image  # noqa: E402
+from tools.podman_e2e import (  # noqa: E402
+    aio, catalog, diagnostics, groups, matrix, multi_node, target_image,
+)
 from tools.podman_e2e.podman import Podman  # noqa: E402
 from tools.podman_e2e.runner import Case, RunContext, Runner  # noqa: E402
 
@@ -143,10 +145,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # also leaves the state of the run's own containers. The hook reads state and
     # cannot change a verdict, and it runs before the cleanup that removes them.
     runner.on_failure(lambda result: diagnostics.collect(context, podman, result))
-    for case in build_suite(
+    suite = build_suite(
         podman, args.topology, args.distribution,
         vision=args.vision, worker_vision=args.worker_vision,
-    ):
+    )
+    # The suite is built from Python objects while the catalog is a separate
+    # artifact, so a case could run under an id no audit knows. Refusing the
+    # disagreement here costs no product time: the install has not started.
+    try:
+        catalog.require_executable([(case.id, case.topology) for case in suite])
+    except catalog.CatalogError as exc:
+        parser.error(str(exc))
+    for case in suite:
         runner.add(case)
     status = runner.execute()
     print(f"artifacts: {context.artifact_dir}")
