@@ -431,6 +431,55 @@ configuration update and every subscription representation the manifest declares
 are all present in the pinned API and mapped above, so every route the suite
 depends on has a declaration to point at.
 
+## What the suite reuses, and what it must not duplicate
+
+The acceptance suite is assembled from contours and fixtures that were already
+in this repository, and one rule separates them: a fixture may stand in for
+something outside the product — a resolver, an ACME directory, an upstream site,
+a client device — and may never stand in for the product itself. The contours
+below therefore say what each one proves and, in the second column that matters
+more, what it must not be quoted as proving.
+
+| Contour | What it proves | What it must not claim |
+| --- | --- | --- |
+| `tests/podman_testbed.sh` | eight stages per base image from `tests/Containerfile.testbed`, all inside a `--systemd=always --privileged` container: `check_os`, `detect_nginx_version`, `check_port_availability 80 443`, systemd readiness, `test_api_client.py`, `test_nginx_routing.py`, `test_services.py`, and a `modules/recovery.py --validate-journal` round trip | a product install: it sources `modules/*.sh` and runs unit modules in an image that already carries systemd, SSH and python3, and the product is never invoked |
+| `tests/multi_node_testbed.sh` | real SSH between three containers, TLS 1.3 mTLS on `rw-v1`, and TCP `:3002` reachable only from the source it allows | Panel or Node installation and subscription delivery — its own header says it "deliberately does not claim to install GoWave Panel/Node or validate subscriptions", and that sentence is the scope |
+| `tests/systemd/boot.sh` | `tests/run_ci.py --suite systemd` inside the guest, under a real systemd PID 1 on all four base images, booted from a `Containerfile.testbed` rootfs | an operator install; `qemu-cold-boot` never runs `gowave-auto.sh install`, which is the split §The OS matrix describes |
+| `.github/workflows/podman-acceptance.yml` | the product install, the traffic plane, the five representations and the recovery contract, as four jobs — two topologies × {plain, `--require-group recovery`} | the transport scaffold's claims, and any row other than `ubuntu-24.04` |
+| `.github/workflows/systemd-acceptance.yml` | four jobs that are not an install: `services` and the static `systemd` unit contracts on the runner, `multi-node-podman` running the transport scaffold, and `qemu-cold-boot` booting all four images | a product install: none of the four invokes the installer, which is what `qemu-cold-boot` is checked against |
+| `.github/workflows/lint-and-nonroot.yml` | `--check-completeness` then `--suite nonroot` on a runner that installs nothing | acceptance: no container is started |
+| `.github/workflows/root-integration.yml` | `--suite root` with sudo, then `--suite integration` without | acceptance, for the same reason |
+| `.github/workflows/live-vps-unit.yml` | the live runner's unit tests | the live suite: nothing in this job reaches a VPS |
+
+The fixtures are pinned so that a case can never report "the resolver answered
+wrongly" about a resolver that was swapped underneath it:
+
+| Fixture | Stands in for | Pinned by | Consumed by |
+| --- | --- | --- | --- |
+| `ubuntu-24.04`, `ubuntu-26.04`, `debian-12`, `debian-13` | the operator's VPS | role `base`: one manifest digest per row in `tests/cases/images.lock.yaml`, resolved to `repository@sha256:…` before Podman runs | every case; `AIO-INSTALL` records the digest and the `assert_clean` fact set |
+| `acme-pebble` (`ghcr.io/letsencrypt/pebble:2.10.3`) and `tests/fixtures/acme/pebble-config.json` | the Let's Encrypt directory | role `acme-fixture`: digest in the lock, config template copied into the run's own directory at mode `0600`, fixture CA mounted read-only | `ACME-01`, `ACME-02`, and the first certificate the install obtains |
+| `fixture-echo` (`docker.io/library/python:3.12-slim`) running `tests/fixtures/echo_server.py` | an upstream site and an egress peer | role `egress-fixture`: digest in the lock plus a per-run source allowlist, so only the vantage under test is answered | the egress and decoy cases |
+| `client-base` (`docker.io/library/python:3.12-slim`) built from `tests/Containerfile.client` through `tests/install_client_artifact.py` | the client devices | role `client-base`: digest for the base, SHA-256 for each release artifact, and the version the binary prints for itself (`Xray 26.11.9`, `v1.19.34`) | `SUB-SERVED`, `SUB-B64`, `SUB-JSON-SHAPES` and the data-plane cases that dial from the client |
+| `tests/fixtures/dns_server.py` | authoritative DNS for `testbed.internal` | its own container from the `fixture-echo` alias at the run's `dns_ip`, with the zone in a writable volume; the script never forwards and never reads `/etc/resolv.conf` | `DNS-01` and every case that resolves a hostname |
+
+**What the suite does not reimplement.** The target image
+(`tests/Containerfile.target`) installs no package the product is responsible
+for: `target_image.PRODUCT_PACKAGES` is that list, `assert_clean` reads
+`dpkg-query` for every entry of it, and a case that finds one fails before the
+install runs. The install itself is `bash /repo/gowave-auto.sh install '<panel
+domain> …'`, rendered by `Topology.install_script`, so the suite drives the
+same entrypoint an operator does. It writes none of the configuration the
+product is supposed to generate, with one deliberate exception: `NGX-05` drops
+`/etc/nginx/conf.d/zz-gowave-e2e-broken.conf`, a snippet carrying the unknown
+directive `gowave_e2e_broken_probe`, because an invalid file in a directory
+NGINX reads is how the case proves that the reload gate refuses what `nginx -t`
+rejects. The file is the probe, not a second configuration. The legacy image is
+kept for the legacy contours and not shared: `tests/Containerfile.testbed` bakes
+systemd, SSH and python3 into the image, which is the opposite of what an
+install test needs, so the acceptance suite builds `Containerfile.target` and
+`Containerfile.client` and nothing under `tools/podman_e2e/` names the testbed
+image.
+
 ## What the suite does not drive, and why
 
 Six entrypoints are not invoked by a container case, for two different reasons,
