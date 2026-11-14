@@ -268,6 +268,11 @@ SSH_ROTATION_TX_ID = "worker_install_sshkey_rotation"
 # unit and a control port, so the two can be faulted separately.
 SSH_DOWN_CASE_ID = "MN-SSH-DOWN"
 SSH_UNIT = "ssh.service"
+# Ubuntu 24.04 ships socket activation alongside the daemon: `ssh.socket` owns
+# port 22 and starts an `ssh@…service` instance per connection, so stopping the
+# service alone leaves the port answering and prints that its triggering unit is
+# still active. Both units are the fault; neither is the node.
+SSH_SOCKET_UNIT = "ssh.socket"
 SSH_DOWN_TX_ID = "worker_install_sshdown"
 SSH_DOWN_TIMEOUT_SECONDS = 900
 # OpenSSH names the reason it never reached a listener; each of these is a
@@ -1777,7 +1782,9 @@ def case_ssh_service_down(product: MultiNodeProduct) -> Dict[str, Any]:
     Everything the operator does to a Worker travels over OpenSSH, so losing the
     daemon must stop those operations before they act — and it must stop nothing
     else: the node keeps its unit and keeps carrying payload, because the control
-    plane and the data plane never used that port.
+    plane and the data plane never used that port. The fault is both units that
+    can answer on 22, ``ssh.socket`` and ``ssh.service``: stopping the service
+    alone leaves the socket activating a daemon on the next connection.
 
     The observation is the same one SSHKEY uses: the controller's remote-finalize
     operation deletes a leftover ACME snapshot on the Worker, so a refused
@@ -1799,20 +1806,26 @@ def case_ssh_service_down(product: MultiNodeProduct) -> Dict[str, Any]:
         ).returncode == 0
 
     def ssh_state(action: str) -> Dict[str, Any]:
+        # The socket goes first on the way down: while it is active it would
+        # start a fresh per-connection daemon, and on the way back up it is the
+        # listener a client actually reaches.
         result = product.podman.exec_bash(
             host.worker_name,
-            f"systemctl {action} {SSH_UNIT} </dev/null; rc=$?\n"
-            f"systemctl is-active {SSH_UNIT} || true\n"
-            f"echo \"rc=$rc\"\n",
+            f"systemctl {action} {SSH_SOCKET_UNIT} </dev/null >/dev/null 2>&1 || true\n"
+            f"systemctl {action} {SSH_UNIT} </dev/null >/dev/null 2>&1 || true\n"
+            f"echo \"service=$(systemctl is-active {SSH_UNIT} 2>/dev/null || true)\"\n"
+            f"echo \"socket=$(systemctl is-active {SSH_SOCKET_UNIT} 2>/dev/null || true)\"\n",
             check=False, timeout=120,
         )
-        lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
-        state = lines[0] if lines else ""
-        code = next((line.partition("=")[2] for line in lines if line.startswith("rc=")), "")
+        fields: Dict[str, str] = {}
+        for line in (result.stdout or "").splitlines():
+            key, separator, value = line.strip().partition("=")
+            if separator:
+                fields[key.strip()] = value.strip()
         return {
             "action": action,
-            "returncode": int(code) if code.lstrip("-").isdigit() else None,
-            "state": state,
+            "service": fields.get("service", ""),
+            "socket": fields.get("socket", ""),
             "detail": (result.stderr or "").strip()[-400:],
         }
 
@@ -1855,9 +1868,10 @@ test -f {shlex.quote(sentinel)}
     stopped = ssh_state("stop")
     require(
         SSH_DOWN_CASE_ID,
-        stopped.get("returncode") == 0 and stopped.get("state") != "active",
-        f"`systemctl stop {SSH_UNIT}` on the Worker exited {stopped.get('returncode')!r} "
-        f"leaving it {stopped.get('state')!r}: {stopped.get('detail') or 'no output'}",
+        stopped.get("service") != "active" and stopped.get("socket") != "active",
+        f"the Worker still answers for SSH after `systemctl stop {SSH_SOCKET_UNIT} {SSH_UNIT}`: "
+        f"{SSH_UNIT}={stopped.get('service')!r} {SSH_SOCKET_UNIT}={stopped.get('socket')!r} "
+        f"({stopped.get('detail') or 'no output'})",
     )
 
     refused: Dict[str, Any] = {}
@@ -1880,8 +1894,9 @@ test -f {shlex.quote(sentinel)}
         require(
             SSH_DOWN_CASE_ID,
             refused.returncode != 0,
-            f"the controller's remote operation exited 0 while the Worker's {SSH_UNIT} was "
-            f"stopped: {refused_output.strip()[-800:]}",
+            f"the controller's remote operation exited 0 while the Worker's "
+            f"{SSH_SOCKET_UNIT} and {SSH_UNIT} were stopped: "
+            f"{refused_output.strip()[-800:]}",
         )
         require(
             SSH_DOWN_CASE_ID,
@@ -1894,8 +1909,8 @@ test -f {shlex.quote(sentinel)}
         require(
             SSH_DOWN_CASE_ID,
             "Host key verification failed" not in refused_output,
-            f"the operation was refused by host-key verification, so {SSH_UNIT} was still "
-            f"answering: {refused_output.strip()[-800:]!r}",
+            f"the operation was refused by host-key verification, so a daemon was still "
+            f"answering on 22: {refused_output.strip()[-800:]!r}",
         )
         require(
             SSH_DOWN_CASE_ID,
@@ -1906,7 +1921,7 @@ test -f {shlex.quote(sentinel)}
         require(
             SSH_DOWN_CASE_ID,
             unit_during == "active",
-            f"{WORKER_UNIT} is {unit_during!r} on the Worker whose {SSH_UNIT} was stopped, "
+            f"{WORKER_UNIT} is {unit_during!r} on the Worker whose SSH was stopped, "
             "so losing SSH took the node with it",
         )
         require(
@@ -1930,9 +1945,10 @@ test -f {shlex.quote(sentinel)}
 
     require(
         SSH_DOWN_CASE_ID,
-        started.get("returncode") == 0 and started.get("state") == "active",
-        f"`systemctl start {SSH_UNIT}` left the Worker's daemon {started.get('state')!r} "
-        f"(exit {started.get('returncode')!r}): {started.get('detail') or 'no output'}",
+        started.get("service") == "active",
+        f"`systemctl start {SSH_SOCKET_UNIT} {SSH_UNIT}` left the Worker's daemon "
+        f"{started.get('service')!r} with its socket {started.get('socket')!r}: "
+        f"{started.get('detail') or 'no output'}",
     )
 
     recovered = product.remote_finalize(known_hosts, SSH_DOWN_TX_ID)
@@ -1953,8 +1969,10 @@ test -f {shlex.quote(sentinel)}
 
     return {
         "worker_ip": worker_ip,
-        "ssh_unit_after_stop": stopped.get("state"),
-        "ssh_unit_after_start": started.get("state"),
+        "ssh_unit_after_stop": stopped.get("service"),
+        "ssh_socket_after_stop": stopped.get("socket"),
+        "ssh_unit_after_start": started.get("service"),
+        "ssh_socket_after_start": started.get("socket"),
         "refused_returncode": refused.returncode,
         "refusal_names_transport": str(
             any(marker in ((refused.stdout or "") + (refused.stderr or ""))

@@ -1314,24 +1314,28 @@ class TestSshHostKeyCase(unittest.TestCase):
 class _SshDownPodman:
     """A two-host stand-in for OpenSSH, the Worker's units, and its data plane.
 
-    Five rules the case depends on are encoded here: sshd is one unit whose state
-    decides whether the controller's operation connects, the node is a different
-    unit that the daemon cannot take with it, the planted snapshot disappears only
-    when a remote command really runs, and the Worker keeps carrying payload
-    while its own daemon is down. Each flag below breaks exactly one rule.
+    Six rules the case depends on are encoded here: the daemon is a unit plus a
+    socket unit and *either* of them can put a daemon on 22 for the next
+    connection, so both have to go down; the node is a different unit that the
+    daemon cannot take with it; the planted snapshot disappears only when a
+    remote command really runs; and the Worker keeps carrying payload while its
+    own SSH is down. Each flag below breaks exactly one rule.
     """
 
     def __init__(
-        self, *, stop_leaves_active=False, leaks_command=False,
+        self, *, stop_leaves_active=False, socket_leaves_active=False,
+        leaks_command=False,
         refusal="ssh: connect to host 10.89.0.12 port 22: Connection refused",
         worker_unit="active", down_delivered=True, down_status=200,
         down_source_ip=None, start_fails=False, delete_on_recovery=True,
     ):
         self.ssh_active = True
+        self.ssh_socket_active = True
         self.sentinel = False
         self.state_calls = []
         self.remote_calls = 0
         self.stop_leaves_active = stop_leaves_active
+        self.socket_leaves_active = socket_leaves_active
         self.leaks_command = leaks_command
         self.refusal = refusal
         self.worker_unit = worker_unit
@@ -1349,32 +1353,42 @@ class _SshDownPodman:
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=None):
         ssh_unit = multi_node.SSH_UNIT
+        ssh_socket = multi_node.SSH_SOCKET_UNIT
         if name == "worker" and "install -d" in script:
             self.sentinel = True
             self.state_calls.append("plant")
             return _SshCompleted(0)
-        if name == "worker" and f"systemctl stop {ssh_unit}" in script:
+        if name == "worker" and f"systemctl stop {ssh_socket}" in script:
             self.state_calls.append("stop")
             if not self.stop_leaves_active:
                 self.ssh_active = False
-            state = "active" if self.ssh_active else "inactive"
-            return _SshCompleted(0, f"{state}\nrc=0\n")
-        if name == "worker" and f"systemctl start {ssh_unit}" in script:
+            if not self.socket_leaves_active:
+                self.ssh_socket_active = False
+            return _SshCompleted(0, self._ssh_states())
+        if name == "worker" and f"systemctl start {ssh_socket}" in script:
             self.state_calls.append("start")
             if self.start_fails:
-                return _SshCompleted(1, "inactive\nrc=1\n")
+                return _SshCompleted(0, self._ssh_states())
             self.ssh_active = True
-            return _SshCompleted(0, "active\nrc=0\n")
+            self.ssh_socket_active = True
+            return _SshCompleted(0, self._ssh_states())
         if name == "worker" and f"systemctl is-active {multi_node.WORKER_UNIT}" in script:
             return _SshCompleted(0, self.worker_unit + "\n")
         if name == "master" and "remote_finalize" in script:
             return self._remote_finalize()
         raise AssertionError(f"unexpected bash script on {name}: {script[:200]!r}")
 
+    def _ssh_states(self):
+        service = "active" if self.ssh_active else "inactive"
+        socket = "active" if self.ssh_socket_active else "inactive"
+        return f"service={service}\nsocket={socket}\n"
+
     # ------------------------------------------------------------- the rules
     def _remote_finalize(self):
         self.remote_calls += 1
-        if not self.ssh_active:
+        # Socket activation is the reason this is not just "is the service up":
+        # an active ssh.socket starts a daemon for the very next connection.
+        if not self.ssh_active and not self.ssh_socket_active:
             if self.leaks_command:
                 self.sentinel = False
                 return _SshCompleted(
@@ -1445,7 +1459,9 @@ class TestSshServiceDownCase(unittest.TestCase):
     def test_a_worker_without_sshd_refuses_the_operation_and_keeps_serving(self):
         evidence, product = self._run()
         self.assertEqual(evidence["ssh_unit_after_stop"], "inactive")
+        self.assertEqual(evidence["ssh_socket_after_stop"], "inactive")
         self.assertEqual(evidence["ssh_unit_after_start"], "active")
+        self.assertEqual(evidence["ssh_socket_after_start"], "active")
         self.assertNotEqual(evidence["refused_returncode"], 0)
         self.assertEqual(evidence["refusal_names_transport"], "true")
         self.assertEqual(evidence["remote_effect_during_fault"], "false")
@@ -1461,12 +1477,20 @@ class TestSshServiceDownCase(unittest.TestCase):
         self.assertEqual(product.podman.state_calls, ["plant", "stop", "start"])
         self.assertEqual(product.podman.remote_calls, 2)
         self.assertIs(product.podman.ssh_active, True)
+        self.assertIs(product.podman.ssh_socket_active, True)
         self.assertIs(product.podman.sentinel, False)
 
     def test_a_stop_that_leaves_the_daemon_active_is_refused(self):
         with self.assertRaises(AssertionError) as caught:
             self._run(stop_leaves_active=True)
-        self.assertIn("leaving it 'active'", str(caught.exception))
+        self.assertIn("the Worker still answers for SSH after", str(caught.exception))
+
+    def test_a_stop_that_leaves_the_socket_activating_is_refused(self):
+        # Ubuntu 24.04 answers on 22 through ssh.socket even with ssh.service
+        # stopped, so a case that only stops the service proves nothing.
+        with self.assertRaises(AssertionError) as caught:
+            self._run(socket_leaves_active=True)
+        self.assertIn("ssh.socket='active'", str(caught.exception))
 
     def test_a_refusal_that_still_runs_the_script_is_refused(self):
         with self.assertRaises(AssertionError) as caught:
