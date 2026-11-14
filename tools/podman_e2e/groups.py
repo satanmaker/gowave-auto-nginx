@@ -33,6 +33,7 @@ GROUP_CASES: Dict[str, Dict[str, Tuple[str, ...]]] = {
             "ACME-02",
             "AIO-CHANNEL-NOOP",
             "AIO-CHANNEL-ROLLBACK",
+            "AIO-INTERRUPT",
             "AIO-CHANNEL-DEV",
         ),
         "multi-node": (
