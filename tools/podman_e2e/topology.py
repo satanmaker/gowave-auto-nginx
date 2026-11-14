@@ -79,6 +79,12 @@ DNS_PORT = 53
 DNS_ZONE_TTL = 30
 DNS_ZONE_SUFFIX = "testbed.internal"
 HOST_RESOLV_CONF = Path("/etc/resolv.conf")
+# Where a stub-listener host keeps the servers it forwards to. Only consulted
+# when /etc/resolv.conf itself yields nothing usable.
+SYSTEMD_UPSTREAM_RESOLV_CONFS = (
+    Path("/run/systemd/resolve/resolv.conf"),
+    Path("/run/resolvconf/resolv.conf"),
+)
 
 FIXTURE_IMAGE = "fixture-echo"
 DNS_FIXTURE_SCRIPT = "/repo/tests/fixtures/dns_server.py"
@@ -265,28 +271,38 @@ def allocate_plan(used_subnets: Sequence[str]) -> NetworkPlan:
     )
 
 
-def egress_resolvers(resolv_conf: Path = HOST_RESOLV_CONF) -> List[str]:
+def egress_resolvers(
+    resolv_conf: Path = HOST_RESOLV_CONF,
+    upstreams: Sequence[Path] = SYSTEMD_UPSTREAM_RESOLV_CONFS,
+) -> List[str]:
     """Real resolvers the disposable host may use for names outside the fixture zone.
 
     The fixture answers its own zone authoritatively and refuses everything else,
     so the target falls through to these servers for package mirrors and release
-    downloads exactly like a fresh VPS. Loopback entries are dropped: they point
-    at the workstation's stub resolver, which does not exist in the container.
+    downloads exactly like a fresh VPS. Loopback entries are dropped: a stub
+    listener such as systemd-resolved's 127.0.0.53 exists on the host and not
+    inside the container, so handing it over would leave the target unable to
+    resolve anything. A host that answers with nothing but stubs is therefore
+    followed to the upstream list kept beside them (`upstreams`); the file the
+    caller named is still read first, so a real address there wins.
     """
-    try:
-        text = resolv_conf.read_text(encoding="utf-8")
-    except OSError:
-        return []
-    resolvers: List[str] = []
-    for line in text.splitlines():
-        fields = line.split()
-        if len(fields) >= 2 and fields[0] == "nameserver":
-            address = fields[1]
-            if address.startswith("127.") or address.startswith("169.254.") or address == "::1":
-                continue
-            if address not in resolvers:
-                resolvers.append(address)
-    return resolvers
+    for candidate in (resolv_conf, *upstreams):
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        resolvers: List[str] = []
+        for line in text.splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[0] == "nameserver":
+                address = fields[1]
+                if address.startswith("127.") or address.startswith("169.254.") or address == "::1":
+                    continue
+                if address not in resolvers:
+                    resolvers.append(address)
+        if resolvers:
+            return resolvers
+    return []
 
 
 def free_loopback_port() -> int:
@@ -408,8 +424,11 @@ class AioTopology:
 
     def create(self) -> "AioTopology":
         if not self.egress_resolvers:
+            consulted = ", ".join(
+                str(path) for path in (HOST_RESOLV_CONF, *SYSTEMD_UPSTREAM_RESOLV_CONFS)
+            )
             raise TopologyError(
-                f"no egress resolver found in {HOST_RESOLV_CONF}; the disposable host could not install packages"
+                f"no egress resolver found in {consulted}; the disposable host could not install packages"
             )
         self.payload_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.podman.network_create(self.network, self.plan.subnet, disable_dns=True)
