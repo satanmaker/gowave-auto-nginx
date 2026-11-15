@@ -144,3 +144,5 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **MN-DP-worker-VISION-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **MN-MATRIX** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **MN-EGRESS** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
+- **AIO-PKT-02** — promotion target: Per-Case Data-Plane Packet Evidence
+- **MN-PKT-03** — promotion target: Per-Case Data-Plane Packet Evidence

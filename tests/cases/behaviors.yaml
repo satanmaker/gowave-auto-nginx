@@ -273,7 +273,7 @@ behaviors:
     topology: [aio, multi-node]
     gate: pre-push
     cases: [MN-EGRESS, PKT-01]
-    error_paths: [PKT-02, PKT-03]
+    error_paths: [PKT-02, PKT-03, AIO-PKT-02, MN-PKT-03]
 
   # ----------------------------------------------------------------------- decoy
   - name: The cover apex is derived, rendered complete and refused when unresolved

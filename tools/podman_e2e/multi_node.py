@@ -30,7 +30,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
-    acme_fixture, aio, argv_probe, budget, denial, matrix as matrix_data, mtls, topology,
+    acme_fixture, aio, argv_probe, budget, denial, ingress, matrix as matrix_data, mtls,
+    topology,
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
@@ -7542,6 +7543,77 @@ def data_plane_case(
     return evidence
 
 
+PKT_WRONG_HOST_CASE_ID = "MN-PKT-03"
+PKT_WRONG_HOST_TIMEOUT_SECONDS = aio.DATA_PLANE_TIMEOUT_SECONDS + 300
+
+
+def case_packet_wrong_host(product: MultiNodeProduct) -> Dict[str, Any]:
+    """PKT-03: a packet at the other node fails the case, whatever the egress says.
+
+    The sentence is short and absolute: if the VPS that was *not* supposed to serve
+    the request captured matching inbound packets, the case is FAIL even though
+    the payload left from the address the endpoint expected. Both nodes here serve
+    the same transport, so the only thing standing between a Worker tuple and a
+    Master one is which host the packets reached — and a runner that never
+    compared the two captures would still report a 200, the right SNI, and the
+    right egress address.
+
+    The case produces that confusion the way the live runner would have suffered
+    it: a real Worker request, bracketed by both captures, judged as if the Master
+    had carried it. Everything about the payload is correct, so a FAIL here can
+    only come from the packet evidence, and the case requires both — the verdict
+    and the harness assertion a failing case raises.
+    """
+    host = product.master.require_installed()
+    inbound = matrix_data.inbound(product.matrix, "REALITY")
+    worker_tuple = matrix_data.case_id(
+        product.matrix, matrix_data.MULTI_NODE, str(inbound["id"]), "xray", node="worker",
+    )
+
+    measurement = product.master.bracket_request(
+        lambda: product.master.transfer_facts(
+            PKT_WRONG_HOST_CASE_ID, str(inbound["id"]), "xray", node="worker",
+        ),
+        inbound, "worker", intended="master",
+    )
+    facts = ingress.evaluate(measurement)
+    payload = measurement.request or {}
+
+    require(PKT_WRONG_HOST_CASE_ID, payload.get("status") == 200,
+            f"the {worker_tuple} payload returned {payload.get('status')!r}, so this case would "
+            "be reporting a broken transfer rather than a misplaced one")
+    require(PKT_WRONG_HOST_CASE_ID, payload.get("source_ip") == str(host.plan.data_worker_ip),
+            f"the payload left from {payload.get('source_ip')!r} instead of the Worker's "
+            f"{host.plan.data_worker_ip}, so the egress half of the sentence is not met")
+    require(PKT_WRONG_HOST_CASE_ID, facts["verdict"] == ingress.FAIL,
+            f"a request the {facts['intended']} host did not carry came back "
+            f"{facts['verdict']} instead of FAIL")
+    require(PKT_WRONG_HOST_CASE_ID, facts["intended_matched"] == 0,
+            f"the {facts['intended']} host captured {facts['intended_matched']} segment(s) from "
+            "the client, so the request was not the mislabelled one this case needs")
+
+    refused = False
+    try:
+        ingress.require(PKT_WRONG_HOST_CASE_ID, facts)
+    except AssertionError:
+        refused = True
+    require(PKT_WRONG_HOST_CASE_ID, refused,
+            "the bracket returned FAIL but the case body was not stopped, so a misplaced request "
+            "would have been recorded as a pass")
+
+    return {
+        "worker_tuple": worker_tuple,
+        "intended_host": facts["intended"],
+        "capturing_host": facts["other"],
+        "capturing_matched": facts["other_matched"],
+        "intended_matched": facts["intended_matched"],
+        "egress_source_ip": payload.get("source_ip"),
+        "egress_expected": str(host.plan.data_worker_ip),
+        "verdict": facts["verdict"],
+        "reason": facts["reason"],
+    }
+
+
 def data_plane_cases(product: MultiNodeProduct) -> List[Tuple[str, Dict[str, Any], str, str]]:
     """Every matrix tuple this cluster owes: each node's inbounds, both clients.
 
@@ -7644,6 +7716,14 @@ def cases(
     suite.append(Case(
         MATRIX_CASE_ID, "multi-node", lambda context: case_matrix(product),
         timeout_seconds=MATRIX_TIMEOUT_SECONDS,
+    ))
+    # The misplaced-request control runs after the count so a FAIL it produces on
+    # purpose cannot be read as a matrix tuple's own verdict, and before any
+    # lifecycle case revokes the client whose packets it captures.
+    suite.append(Case(
+        PKT_WRONG_HOST_CASE_ID, "multi-node",
+        lambda context: case_packet_wrong_host(product),
+        timeout_seconds=PKT_WRONG_HOST_TIMEOUT_SECONDS,
     ))
     # Attribution reads what the tuples left behind, so it belongs immediately
     # after the count and before any lifecycle case revokes a client.

@@ -28,6 +28,7 @@ from tools.podman_e2e import (  # noqa: E402
     aio,
     budget,
     catalog,
+    ingress,
     matrix,
     panel_surface,
     target_image,
@@ -214,11 +215,19 @@ class ScriptedPodman:
         self.context = context
         self.results = list(results)
         self.scripts = []
+        self.execs = []
+        # What a `find` for a persisted capture would print: nothing, because the
+        # probe reports over the pipe it already holds.
+        self.find_output = ""
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
         self.scripts.append(script)
         stdout, returncode = self.results.pop(0)
         return subprocess.CompletedProcess(["bash", "-lc", script], returncode, stdout, "")
+
+    def exec(self, name, argv, check=True, input_text=None, timeout=300):
+        self.execs.append((name, list(argv)))
+        return subprocess.CompletedProcess(list(argv), 0, self.find_output, "")
 
 
 class StubHost:
@@ -4235,6 +4244,211 @@ class TestFaultCases(unittest.TestCase):
             self.assertEqual(records[case_id]["state"], "incubating")
             self.assertEqual(records[case_id]["runs_in"], ["podman"])
             self.assertEqual(records[case_id]["topology"], ["aio"])
+
+
+CLIENT_ADDRESS = "198.51.100.7"
+OTHER_SOURCE = "203.0.113.9"
+
+
+def packet_summary(captured=3, source=CLIENT_ADDRESS, stopped_by="harness", drops=0):
+    return {
+        "captured": captured, "sources": {source: captured},
+        "stopped_by": stopped_by, "drops": drops, "port": 443, "seconds": 4.0,
+    }
+
+
+class TestPacketEvidenceCase(unittest.TestCase):
+    """AIO-PKT-02: each way the packet evidence is missing has to say INCOMPLETE.
+
+    The bracket is `tests/test_podman_ingress.py`; what this class holds is the
+    case built on it — that every degradation reaches the verdict through the
+    real `evaluate`, that a missing attribution is never read off a count, and
+    that a capture file left on the host is refused.
+    """
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def _measurement(self, request, inbound, *, identity_error="", captures=None,
+                     capture_errors=None, client=CLIENT_ADDRESS, identity_engine=""):
+        return ingress.Measurement(
+            port=ingress.listener_port(inbound),
+            intended="local",
+            client="" if identity_error else client,
+            captures=captures if captures is not None else {"local": packet_summary()},
+            capture_errors=capture_errors or {},
+            identity_error=identity_error,
+            request=request(),
+        )
+
+    def _bracket(self, inbound, overrides=None):
+        """The four degradations the case produces, keyed by how it asks for them."""
+
+        def bracket(request, inbound, node="", window=ingress.CAPTURE_WINDOW_SECONDS, *,
+                    intended="", identity_port=ingress.IDENTITY_PORT,
+                    probe_script=ingress.PROBE_SCRIPT, identity_engine=""):
+            key = "foreign_source_only" if identity_engine else ""
+            if probe_script != ingress.PROBE_SCRIPT:
+                key = "no_capture_tool"
+            elif identity_port != ingress.IDENTITY_PORT:
+                key = "no_identity"
+            elif window != ingress.CAPTURE_WINDOW_SECONDS:
+                key = "window_expired"
+            if overrides and key in overrides:
+                return overrides[key](request, inbound)
+            shapes = {
+                "no_capture_tool": dict(
+                    captures={},
+                    capture_errors={"local": "no_probe_summary: python3 exited at once"},
+                ),
+                "no_identity": dict(
+                    identity_error="no_identity_connection",
+                    captures={"local": packet_summary()},
+                ),
+                "window_expired": dict(
+                    captures={"local": packet_summary(captured=5, stopped_by="window")},
+                ),
+                "foreign_source_only": dict(
+                    captures={"local": packet_summary(captured=4, source=OTHER_SOURCE)},
+                ),
+            }
+            return self._measurement(request, inbound, **shapes[key])
+
+        return bracket
+
+    def _product(self, findings="", overrides=None):
+        product, podman = installed_product(self.context, [])
+        inbound = matrix.inbound(matrix.load(), "REALITY")
+        product.host.client_name = "aio-client"
+        product.transfer_facts = lambda *args, **kwargs: {
+            "status": 200, "source_ip": "10.0.0.2",
+        }
+        product.bracket_request = self._bracket(inbound, overrides)
+        product.host.podman = podman
+        podman.find_output = findings
+        return product
+
+    def test_every_degradation_is_incomplete_with_a_reason(self):
+        evidence = aio.case_packet_evidence_incomplete(self._product())
+        self.assertEqual(
+            evidence["degradations"],
+            "foreign_source_only,no_capture_tool,no_identity,window_expired",
+        )
+        self.assertEqual(evidence["verdicts"], ",".join(["INCOMPLETE"] * 4))
+        for key in ("no_capture_tool_reason", "no_identity_reason",
+                    "window_expired_reason", "foreign_source_reason"):
+            self.assertTrue(evidence[key], f"{key} names nothing that was missing")
+
+    def test_a_missing_tool_is_incomplete_with_no_count_to_fall_back_on(self):
+        evidence = aio.case_packet_evidence_incomplete(self._product())
+        self.assertEqual(evidence["tool_less_captured"], 0)
+        self.assertEqual(evidence["persisted_files"], "")
+
+    def test_a_tool_less_run_that_counted_is_refused(self):
+        """The missing-tool branch is the case only when nothing was counted.
+
+        A capture tool that is not there cannot count segments, so a run filed
+        under that name which did count is some other run — and a case that
+        accepted it would be reporting a degradation it never produced.
+        """
+        inbound = matrix.inbound(matrix.load(), "REALITY")
+
+        def counted_anyway(request, inbound):
+            return self._measurement(
+                request, inbound,
+                captures={"local": packet_summary(captured=4, drops=3)},
+            )
+
+        product = self._product(overrides={"no_capture_tool": counted_anyway})
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_packet_evidence_incomplete(product)
+        self.assertIn("the tool-missing run counted 4 segment(s)", str(caught.exception))
+
+    def test_a_wrong_vantage_run_without_a_vantage_is_refused(self):
+        """An address that differs means nothing unless the host reported one."""
+        inbound = matrix.inbound(matrix.load(), "REALITY")
+
+        def no_identity(request, inbound):
+            return self._measurement(
+                request, inbound, identity_error="no_identity_connection",
+                captures={"local": packet_summary(captured=4, source=OTHER_SOURCE)},
+            )
+
+        product = self._product(overrides={"foreign_source_only": no_identity})
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_packet_evidence_incomplete(product)
+        self.assertIn("could not identify the client at all", str(caught.exception))
+
+    def test_a_wrong_vantage_run_that_saw_no_foreign_address_is_refused(self):
+        inbound = matrix.inbound(matrix.load(), "REALITY")
+
+        def saw_only_the_client(request, inbound):
+            return self._measurement(
+                request, inbound, captures={"local": packet_summary(captured=3, drops=2)},
+            )
+
+        product = self._product(overrides={"foreign_source_only": saw_only_the_client})
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_packet_evidence_incomplete(product)
+        self.assertIn("recorded no non-matching source address", str(caught.exception))
+
+    def test_an_incomplete_without_a_reason_is_refused(self):
+        """INCOMPLETE has to name what was missing, or the verdict is a shrug."""
+        shapeless = {
+            "verdict": ingress.INCOMPLETE, "reason": "", "intended_captured": 0,
+            "intended_matched": 0, "foreign": "",
+        }
+        with mock.patch.object(ingress, "evaluate", return_value=dict(shapeless)):
+            with self.assertRaises(AssertionError) as caught:
+                aio.case_packet_evidence_incomplete(self._product())
+        self.assertIn("is INCOMPLETE without naming what was missing", str(caught.exception))
+
+    def test_the_foreign_source_is_recorded_rather_than_assumed(self):
+        evidence = aio.case_packet_evidence_incomplete(self._product())
+        self.assertEqual(evidence["foreign_sources"], f"{OTHER_SOURCE}:4")
+
+    def test_a_degradation_that_came_back_pass_is_refused(self):
+        inbound = matrix.inbound(matrix.load(), "REALITY")
+        pass_shape = lambda request, inbound: self._measurement(request, inbound)  # noqa: E731
+        product = self._product(overrides={"no_identity": pass_shape})
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_packet_evidence_incomplete(product)
+        self.assertIn("the no_identity run came back PASS", str(caught.exception))
+
+    def test_a_degradation_that_never_made_its_request_is_refused(self):
+        inbound = matrix.inbound(matrix.load(), "REALITY")
+
+        def no_request(request, inbound):
+            measurement = self._measurement(request, inbound)
+            measurement.request = None
+            return measurement
+
+        # A run that measured nothing would report the evidence it never armed as
+        # the reason, which blames the instrument for a transfer that never ran.
+        product = self._product(overrides={"window_expired": no_request})
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_packet_evidence_incomplete(product)
+        self.assertIn("the window_expired run never completed its request", str(caught.exception))
+
+    def test_a_capture_file_left_on_the_host_is_refused(self):
+        product = self._product(findings="/tmp/gowave-e2e-ingress.pcap\n")
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_packet_evidence_incomplete(product)
+        self.assertIn("packet evidence is reported, never persisted", str(caught.exception))
+
+    def test_the_case_is_registered_after_the_matrix_case(self):
+        suite = aio.cases(ScriptedPodman(self.context, []))
+        cases = {case.id: case for case in suite}
+        ids = [case.id for case in suite]
+        self.assertIn(aio.PKT_INCOMPLETE_CASE_ID, cases)
+        self.assertEqual(cases[aio.PKT_INCOMPLETE_CASE_ID].topology, "aio")
+        self.assertEqual(
+            cases[aio.PKT_INCOMPLETE_CASE_ID].timeout_seconds, aio.PKT_INCOMPLETE_TIMEOUT_SECONDS,
+        )
+        self.assertLess(ids.index("AIO-MATRIX"), ids.index(aio.PKT_INCOMPLETE_CASE_ID))
+
 
 
 if __name__ == "__main__":

@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from tools.podman_e2e import acme_fixture, argv_probe, client_image, target_image
+from tools.podman_e2e import acme_fixture, argv_probe, client_image, ingress, target_image
 
 # Two networks, because one block cannot satisfy both ends of the run.
 #
@@ -759,6 +759,33 @@ class AioTopology:
             raise TopologyError(f"the All-in-One topology has one node, not {node!r}")
         return str(self.plan.data_target_ip)
 
+    def ingress_hosts(self) -> List["ingress.Host"]:
+        """Every host a proxy request could arrive at, and the name it answers to.
+
+        One host here: the node the client's names resolve to. The container is
+        that node itself, because the capture has to read the kernel the product
+        installed into rather than the vantage point the request was sent from.
+        """
+        return [ingress.Host(role="local", container=self.target_name, name=self.panel_domain)]
+
+    def ingress_role(self, node: str = "") -> str:
+        """The capture host a node's traffic belongs to, as the evidence names it."""
+        if node not in ("", "local"):
+            raise TopologyError(f"the All-in-One topology has one node, not {node!r}")
+        return "local"
+
+    def ingress_engine(self) -> str:
+        """The container whose connections make each host report the client's address."""
+        return self.engine_client()
+
+    def ingress_backend(self) -> "ingress.Backend":
+        """How a probe is started inside a host: one ``podman exec`` per probe.
+
+        The pipe is the transport for both the readiness line and the summary, so
+        a capture has nothing to write down and nothing to delete afterwards.
+        """
+        return ingress.PodmanBackend(self.podman)
+
     def echo_allow_sources(self) -> List[str]:
         """The only node identities the endpoint accepts a payload from.
 
@@ -1214,6 +1241,27 @@ class MultiNodeTopology(AioTopology):
     def echo_allow_sources(self) -> List[str]:
         """Both node identities, and only those: the endpoint has two egress peers."""
         return [str(self.plan.data_target_ip), str(self.plan.data_worker_ip)]
+
+    def ingress_hosts(self) -> List["ingress.Host"]:
+        """Both nodes, each under the name a client dials to reach it.
+
+        A request is bracketed by a capture on *both* hosts, which is the whole
+        difference from the All-in-One contour: with one node there is no second
+        place the traffic could arrive, so "the other host saw nothing" is not a
+        fact that contour can produce.
+        """
+        return [
+            ingress.Host(role="master", container=self.target_name, name=self.panel_domain),
+            ingress.Host(role="worker", container=self.worker_name, name=self.worker_domain),
+        ]
+
+    def ingress_role(self, node: str = "") -> str:
+        """The capture host a node's traffic belongs to, as the evidence names it."""
+        if node in ("", "master"):
+            return "master"
+        if node == "worker":
+            return "worker"
+        raise TopologyError(f"the Multi-Node topology has a Master and a Worker, not {node!r}")
 
     def create(self) -> "MultiNodeTopology":
         super().create()

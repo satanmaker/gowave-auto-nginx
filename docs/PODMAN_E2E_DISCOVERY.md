@@ -477,6 +477,47 @@ second machine.
 | `TRAFFIC_TIMEOUT` bounds every egress request | every matrix-driven data-plane case of both contours; `DP-02` is observed through the REALITY/xray tuple of each, and the catalog entry names that case | The live runner passes the budget to `curl --connect-timeout max(10, timeout // 2)` and `--max-time timeout` (`tools/live_vps/traffic.py:325`); the container probe carries the payload itself, so the same split is two facts per request — `connect_budget_seconds` and `transfer_budget_seconds` — read back from the transfer the case already made, and both are required on every tuple. |
 | `Mihomo config preserves proxies and rules, assigns loopback listeners, refuses a non-loopback control endpoint` | every tuple the `mihomo` client runs; `DP-05` is observed through the REALITY/mihomo tuple of each contour, and the catalog entry names that case | The live runner rewrites the served YAML through `yaml.safe_load`; the client container has no PyYAML, so the probe edits top-level scalars textually and lets `scan_mihomo` remain the authority on what was preserved. Both assign collision-free loopback ports and pin the controller to `127.0.0.1` with `allow-lan: false`; the container probe invents no listener the Panel's document does not declare, so `socks-port`/`redir-port`/`tproxy-port` are rebound only where they are already present. |
 
+### Packet evidence: a per-source account instead of an aggregate delta
+
+The live capability's packet-evidence requirement is the one sentence in
+`openspec/specs/live-vps-e2e/spec.md` that names the instrument: simultaneous
+captures on both VPS, no matching ingress on the other host, the expected egress
+address, missing evidence as INCOMPLETE, and an aggregate counter explicitly
+refused as a PASS fallback. The live runner does it with `tcpdump -nn -i any -Q
+in -l "tcp and dst port <port> and not dst port <ssh port>"` on each host
+(`tools/live_vps/traffic.py`) and reads the client's address out of the target's
+own `$SSH_CONNECTION`.
+
+The container image is a deliberately clean VPS — no `tcpdump`, no `ss` — so the
+instrument is the one thing this suite writes: `tools/podman_e2e/ingress_probe.py`,
+started inside each host by `tools/podman_e2e/ingress.py`. It opens an
+`AF_PACKET` socket per address family, filters on the proxy port the matrix
+declares for the inbound, counts the segments per source address, and reports the
+kernel's own drop counter (`PACKET_STATISTICS`) beside them. Nothing is written
+to a file and no packet payload is kept: the summary is a JSON line on the pipe
+the harness already holds, so a capture cannot leave a `.pcap` or a body behind
+even if the case dies mid-transfer. `tests/test_podman_ingress.py` holds that as
+a property of the source, not as a promise in this page.
+
+The client's identity comes from the same shape the live runner reads: the target
+reports the peer address of a TCP connection to port 22 as `/proc/net/tcp` holds
+it, which is what `$SSH_CONNECTION` is on a real VPS. Port 22 is the product's own
+sshd, allowed from any source, and — like the live filter's `not dst port <ssh
+port>` — it cannot pollute a capture filtered on the proxy port.
+
+| Live sentence | Where it is witnessed | How the container differs |
+| --- | --- | --- |
+| The intended host saw the request | `PKT-01`, observed through the Master's REALITY/xray tuple — the catalog entry names that case; `DP-04` in both contours | Same tuple, same port; the count is per source address rather than the live runner's delta of an aggregate counter across the request window. |
+| No matching ingress on the other host | `PKT-01` (Multi-Node); `PKT-03` is the negative control — a Worker request whose payload, SNI and egress are all correct, judged as the Master's, which the Worker's own capture refuses | Only a cluster has an "other VPS". A single All-in-One host has no second place the traffic could have arrived, so `DP-07`/`DP-08` and `PKT-01`/`PKT-03` are witnessed on the Multi-Node contour and the All-in-One contour is absent by construction. |
+| Missing evidence is INCOMPLETE, never a PASS | `PKT-02` (`AIO-PKT-02`) | Four degradations against a real request: no capture tool, no source-IP identity, a window that expired before the harness stopped it, and an identity channel that did not travel the request's path. The last is the container's NAT: the target reports the client's address from one vantage and captures the other, so a source that is counted is not the source the target named. Every one comes back INCOMPLETE with a reason. |
+| Aggregate counters are not a fallback | `PKT-02`, plus the unit branch in `tests/test_podman_ingress.py` where a count exists and no attribution does | The tool-missing run is required to have counted nothing at all yet still be INCOMPLETE, which is the sentence in the only form a container can state it. |
+| No PCAP or payload is persisted | the probe's source is audited for write-mode file opens, and `PKT-02` searches the hosts for a capture file after the four degradations | Same rule; the live runner keeps its captures in `/tmp` only for the length of the case, the container probe never creates one. |
+
+The verdict is written as one record — `ingress_port`, `ingress_client`,
+`ingress_intended`, the captured and matched counts for the intended and the
+other host, the non-matching sources, and the reason whenever it is not PASS — so
+a run that failed to arm a capture cannot be read as a run that saw nothing.
+
 ### What is declared but not driven
 
 `PATCH /api/users` and `PATCH /api/users/{userId}` update an existing client,
@@ -546,16 +587,16 @@ image.
 
 `tests/cases/catalog.yaml` defines each scenario once and stamps it with an
 `environment`, so the boundary between the contours is a checked field rather
-than a sentence in a document. The catalog holds 213 entries:
+than a sentence in a document. The catalog holds 215 entries:
 
 | Environment | Entries | Which contour answers it |
 | --- | ---: | --- |
-| `container` | 203 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
+| `container` | 205 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
 | `partial` | 8 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
 | `live-only` | 2 | Only the live suite. Every Podman run reports both as justified exclusions, and `tools/podman_e2e/catalog.py` refuses a catalog that lets one run here. |
 
 Of the 125 live scenarios projected into this catalog, 115 are container, 8 are
-partial and 2 are live-only; the other 88 entries are Podman-first cases with a
+partial and 2 are live-only; the other 90 entries are Podman-first cases with a
 promotion target, which `tests/cases/PARITY.md` lists separately.
 
 The ten entries that are not fully container-answerable are, by id: `PRE-04`,

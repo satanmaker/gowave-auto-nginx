@@ -25,13 +25,14 @@ from . import (
     acme_fixture,
     budget,
     client_trust,
+    ingress,
     matrix,
     panel_surface,
     topology,
     traffic_probe,
 )
 from .podman import wait_until
-from .runner import Case, CaseBlocked, require
+from .runner import Case, CaseBlocked, CaseIncomplete, require
 
 INSTALL_CASE_ID = "AIO-INSTALL"
 
@@ -1542,6 +1543,37 @@ class AioProduct:
         """Run the policy probe: one permitted control, one destination the product denies."""
         host = self.require_installed()
         return self._probe_json(case_id, "the policy probe", host.prohibited_facts())
+
+    def bracket_request(
+        self, request: Any, inbound: Dict[str, Any], node: str = "",
+        window: int = ingress.CAPTURE_WINDOW_SECONDS,
+        *, intended: str = "", identity_port: int = ingress.IDENTITY_PORT,
+        probe_script: str = ingress.PROBE_SCRIPT, identity_engine: str = "",
+    ) -> ingress.Measurement:
+        """Run one request inside a capture on every host that could have taken it.
+
+        The capture is started from inside each host, so the account of which host
+        received the client's packets is the host's own rather than the vantage
+        point the request was sent from. ``request`` is called once, between the
+        captures being ready and being stopped.
+
+        The keyword arguments exist so a case can ask for the same bracket with one
+        fact deliberately unavailable, and see it come back as INCOMPLETE rather
+        than as a pass on whatever the other hosts still managed to count.
+        """
+        host = self.require_installed()
+        return ingress.measure(
+            request,
+            backend=host.ingress_backend(),
+            hosts=host.ingress_hosts(),
+            engine=host.ingress_engine(),
+            port=ingress.listener_port(inbound),
+            intended=intended or host.ingress_role(node),
+            window=window,
+            identity_port=identity_port,
+            probe_script=probe_script,
+            identity_engine=identity_engine,
+        )
 
     def _probe_json(self, case_id: str, label: str, result: Any) -> Dict[str, Any]:
         """A probe that exited non-zero or printed no JSON fails the case."""
@@ -5275,7 +5307,16 @@ def case_data_plane(
                              node=node)
     product.subscription_payloads(case_id)
     expectations = matrix_expectations(product, inbound, node)
-    facts = product.transfer_facts(case_id, str(inbound["id"]), client, node=node)
+    # The request runs inside a capture on every host that could have taken it,
+    # so the endpoint's account of the payload is joined by the hosts' account of
+    # the connection: which of them the client's packets reached, from which
+    # address, and with nothing persisted to read it back from later.
+    measurement = product.bracket_request(
+        lambda: product.transfer_facts(case_id, str(inbound["id"]), client, node=node),
+        inbound, node,
+    )
+    facts = measurement.request
+    packets = ingress.evaluate(measurement)
 
     transport = f"{inbound['transport']}/{inbound['security']}"
     require(case_id, int(facts.get("outbounds") or 0) == 1,
@@ -5331,6 +5372,13 @@ def case_data_plane(
         require(case_id, len(set(listeners.values())) == len(listeners),
                 f"the Mihomo listeners share a port: {listeners}")
 
+    # Last, because a payload the endpoint never accepted has a clearer reason
+    # than the capture that bracketed it, and the first failure is the one worth
+    # reading. A request that reached the wrong host is a FAIL from here; a
+    # capture that could not account for the request is INCOMPLETE, which is not
+    # a pass and does not excuse the case.
+    ingress.require(case_id, packets)
+
     evidence = {
         "inbound": inbound["id"],
         "client": client,
@@ -5344,6 +5392,7 @@ def case_data_plane(
         "connect_budget_seconds": facts.get("connect_budget_seconds"),
         "transfer_budget_seconds": facts.get("transfer_budget_seconds"),
     }
+    evidence.update(ingress.evidence(packets))
     if client == "mihomo":
         evidence["mihomo_allow_lan"] = facts.get("mihomo_allow_lan")
         evidence["mihomo_controller"] = facts.get("mihomo_controller")
@@ -5360,11 +5409,20 @@ def case_data_plane(
 def _data_plane_case(
     product: AioProduct, inbound: Dict[str, Any], client: str, node: str = "",
 ) -> Dict[str, Any]:
-    """Run one matrix tuple and record its own verdict for the count case."""
+    """Run one matrix tuple and record its own verdict for the count case.
+
+    A capture that could not account for the request is recorded as INCOMPLETE
+    rather than FAIL: the case has not shown the product wrong, it has failed to
+    show it right, and the count case reports the two separately because only one
+    of them is a defect in the deployment.
+    """
     case_id = matrix.case_id(product.matrix, product.case_topology, str(inbound["id"]), client,
                              node=node)
     try:
         evidence = case_data_plane(product, inbound, client, node=node)
+    except CaseIncomplete:
+        product.record_data_plane(case_id, "INCOMPLETE")
+        raise
     except AssertionError:
         product.record_data_plane(case_id, "FAIL")
         raise
@@ -5405,7 +5463,13 @@ def case_matrix(product: AioProduct) -> Dict[str, Any]:
     not_run = [case_id for case_id in expected_ids if case_id not in executed]
     require("AIO-MATRIX", not not_run,
             f"{len(not_run)} matrix case(s) produced no result: {', '.join(not_run)}")
-    failed = sorted(case_id for case_id, status in executed.items() if status != "PASS")
+    incomplete = sorted(case_id for case_id, status in executed.items()
+                        if status == "INCOMPLETE")
+    require("AIO-MATRIX", not incomplete,
+            f"{len(incomplete)} matrix case(s) could not account for the request they measured: "
+            f"{', '.join(incomplete)}")
+    failed = sorted(case_id for case_id, status in executed.items()
+                    if status not in ("PASS", "INCOMPLETE"))
     require("AIO-MATRIX", not failed,
             f"{len(failed)} matrix case(s) did not pass: {', '.join(failed)}")
     require("AIO-MATRIX", len(executed) == declared_count,
@@ -5420,6 +5484,134 @@ def case_matrix(product: AioProduct) -> Dict[str, Any]:
         "declared_cases": len(declared),
         "executed_cases": len(executed),
         "passed_cases": sum(1 for status in executed.values() if status == "PASS"),
+        "incomplete_cases": len(incomplete),
+    }
+
+
+PKT_INCOMPLETE_CASE_ID = "AIO-PKT-02"
+# A port every host leaves closed, so the identity connection is refused rather
+# than answered: the live requirement's "no target-reported source-IP identity".
+PKT_SILENT_PORT = 9
+# A path the repository mount does not carry: `podman exec` starts, python3
+# exits, and no capture is ever armed. The live analogue is tcpdump missing.
+PKT_MISSING_PROBE = "/repo/tools/podman_e2e/absent_ingress_probe.py"
+# A window shorter than the request it brackets, so the capture ends on its own
+# instead of being stopped by the harness, and the wait that lets it close.
+PKT_SHORT_WINDOW_SECONDS = 1
+PKT_SLOW_REQUEST_SECONDS = 3
+PKT_INCOMPLETE_TIMEOUT_SECONDS = DATA_PLANE_TIMEOUT_SECONDS + 300
+
+
+def wait_past_capture_window(seconds: float) -> None:
+    """Outlast a deliberately short capture window before the request is issued.
+
+    The window branch is a case only if nothing is armed when the payload moves:
+    a probe still capturing would make the run a race the transfer happens to
+    lose, and the summary would be a valid one the harness stopped. The wait is
+    the degradation, and ``PKT_SHORT_WINDOW_SECONDS`` is the bound it clears.
+    """
+    time.sleep(seconds)
+
+
+def case_packet_evidence_incomplete(product: AioProduct) -> Dict[str, Any]:
+    """PKT-02: evidence that is unavailable makes the case INCOMPLETE, not a pass.
+
+    The live sentence lists four ways a packet capture can fail to account for a
+    request, and this case produces each of them against a real transfer rather
+    than restating them: a capture tool that is not there, a host that cannot say
+    who the client is, a capture that ran out its own window, and a client whose
+    identity connection does not travel the path the request takes — the container
+    analogue of a NAT or a split tunnel, which is what makes an address the target
+    reports differ from the address its capture saw.
+
+    Every one of them has to come back INCOMPLETE. A PASS would mean the evidence
+    that is missing was not needed, and a FAIL would mean the product was blamed
+    for the runner's own blindness. The aggregate counters are the trap this
+    closes: the tool-missing run counts nothing, and the window run may count
+    plenty, and neither may be read as an answer. Finally the hosts are searched
+    for a capture file or a saved payload, because a summary that only exists in a
+    process's memory cannot leave one behind.
+    """
+    host = product.require_installed()
+    inbound = matrix.inbound(product.matrix, "REALITY")
+
+    def request() -> Dict[str, Any]:
+        return product.transfer_facts(PKT_INCOMPLETE_CASE_ID, str(inbound["id"]), "xray")
+
+    def slow_request() -> Dict[str, Any]:
+        # The capture has to end before the request it was armed for starts, or
+        # the window branch is a race with the transfer instead of a case.
+        wait_past_capture_window(PKT_SLOW_REQUEST_SECONDS)
+        return request()
+
+    degradations = {
+        "no_capture_tool": product.bracket_request(
+            request, inbound, probe_script=PKT_MISSING_PROBE,
+        ),
+        "no_identity": product.bracket_request(
+            request, inbound, identity_port=PKT_SILENT_PORT,
+        ),
+        "window_expired": product.bracket_request(
+            slow_request, inbound, window=PKT_SHORT_WINDOW_SECONDS,
+        ),
+        "foreign_source_only": product.bracket_request(
+            request, inbound, identity_engine=host.client_name,
+        ),
+    }
+
+    verdicts = {}
+    reasons = {}
+    for name, measurement in degradations.items():
+        facts = ingress.evaluate(measurement)
+        verdicts[name] = facts["verdict"]
+        reasons[name] = facts["reason"]
+        require(PKT_INCOMPLETE_CASE_ID, measurement.request is not None,
+                f"the {name} run never completed its request, so it measured no traffic at all")
+        require(PKT_INCOMPLETE_CASE_ID, facts["verdict"] == ingress.INCOMPLETE,
+                f"the {name} run came back {facts['verdict']} instead of INCOMPLETE: "
+                f"{facts['reason'] or 'no reason was given'}")
+        require(PKT_INCOMPLETE_CASE_ID, bool(facts["reason"]),
+                f"the {name} run is INCOMPLETE without naming what was missing")
+
+    # The two degradations whose verdict depends on a count that exists: the one
+    # where no counter moved at all, and the one where the only counted address is
+    # not the client's. Both are still INCOMPLETE, which is the sentence.
+    tool_less = ingress.evaluate(degradations["no_capture_tool"])
+    require(PKT_INCOMPLETE_CASE_ID, tool_less["intended_captured"] == 0,
+            f"the tool-missing run counted {tool_less['intended_captured']} segment(s), so it was "
+            "not the case it claims to be")
+    foreign = ingress.evaluate(degradations["foreign_source_only"])
+    require(PKT_INCOMPLETE_CASE_ID, not degradations["foreign_source_only"].identity_error,
+            "the wrong-vantage run could not identify the client at all, so a differing address "
+            f"was never the reason: {degradations['foreign_source_only'].identity_detail}")
+    require(PKT_INCOMPLETE_CASE_ID, bool(foreign["foreign"]),
+            "the foreign-source run recorded no non-matching source address, so it did not "
+            "reproduce an address the target reports differently from the one it captured")
+
+    persisted = host.podman.exec(
+        host.target_name,
+        ["bash", "-lc",
+         "find /run /tmp /var/tmp -maxdepth 3 "
+         "\\( -name '*.pcap' -o -name '*.pcapng' -o -name 'gowave-e2e-ingress*' \\) -print "
+         "2>/dev/null"],
+        check=False,
+        timeout=60,
+    )
+    strays = persisted.stdout.strip()
+    require(PKT_INCOMPLETE_CASE_ID, not strays,
+            f"the capture left {strays!r} on {host.target_name}; packet evidence is reported, "
+            "never persisted")
+
+    return {
+        "degradations": ",".join(sorted(degradations)),
+        "verdicts": ",".join(verdicts[name] for name in sorted(verdicts)),
+        "tool_less_captured": tool_less["intended_captured"],
+        "foreign_sources": foreign["foreign"],
+        "persisted_files": strays,
+        "no_capture_tool_reason": reasons["no_capture_tool"],
+        "no_identity_reason": reasons["no_identity"],
+        "window_expired_reason": reasons["window_expired"],
+        "foreign_source_reason": reasons["foreign_source_only"],
     }
 
 
@@ -7622,6 +7814,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         ))
     suite.append(Case(
         "AIO-MATRIX", "aio", lambda context: case_matrix(product), timeout_seconds=120,
+    ))
+    # The bracket's failure paths run after the positive ones, so a degradation
+    # that would be indistinguishable from a broken install is measured against a
+    # host the matrix cases have already shown carries traffic.
+    suite.append(Case(
+        PKT_INCOMPLETE_CASE_ID, "aio",
+        lambda context: case_packet_evidence_incomplete(product),
+        timeout_seconds=PKT_INCOMPLETE_TIMEOUT_SECONDS,
     ))
     suite.extend([
         Case("AIO-REVOKE", "aio", lambda context: case_revocation(product),
