@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 88
-  total: 213
+  podman_first: 90
+  total: 215
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -1998,6 +1998,7 @@ cases:
       - executed_cases
       - expected_positive_cases
       - inbounds
+      - incomplete_cases
       - passed_cases
       - vision
       case: AIO-MATRIX
@@ -2041,6 +2042,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -2064,6 +2075,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -2126,8 +2147,74 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: AIO-DP-REALITY-xray
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: MN-DP-master-REALITY-xray
   promotion_target: null
 - id: DP-05
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -2159,6 +2246,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -2182,6 +2279,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -2220,8 +2327,74 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: AIO-DP-REALITY-mihomo
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: MN-DP-master-REALITY-mihomo
   promotion_target: null
 - id: DP-07
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -2243,8 +2416,41 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: MN-DP-worker-REALITY-xray
   promotion_target: null
 - id: DP-08
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -2265,8 +2471,41 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: MN-DP-worker-REALITY-mihomo
   promotion_target: null
 - id: DP-09
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -3467,8 +3706,41 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: MN-DP-master-REALITY-xray
   promotion_target: null
 - id: PKT-02
   requirement: Per-Case Data-Plane Packet Evidence
@@ -3493,8 +3765,21 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_packet_evidence_incomplete
+      evidence:
+      - degradations
+      - foreign_source_reason
+      - foreign_sources
+      - no_capture_tool_reason
+      - no_identity_reason
+      - persisted_files
+      - tool_less_captured
+      - verdicts
+      - window_expired_reason
+      case: AIO-PKT-02
   promotion_target: null
 - id: PKT-03
   requirement: Per-Case Data-Plane Packet Evidence
@@ -3512,8 +3797,21 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_packet_wrong_host
+      evidence:
+      - capturing_host
+      - capturing_matched
+      - egress_expected
+      - egress_source_ip
+      - intended_host
+      - intended_matched
+      - reason
+      - verdict
+      - worker_tuple
+      case: MN-PKT-03
   promotion_target: null
 - id: OP-01
   requirement: Local interactive operator entrypoint
@@ -5325,6 +5623,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5365,6 +5673,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5405,6 +5723,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5445,6 +5773,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5485,6 +5823,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5525,6 +5873,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5565,6 +5923,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5605,6 +5973,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5645,6 +6023,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5685,6 +6073,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5727,6 +6125,7 @@ cases:
       - executed_cases
       - expected_positive_cases
       - inbounds
+      - incomplete_cases
       - passed_cases
       - vision
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
@@ -5754,6 +6153,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5795,6 +6204,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5836,6 +6255,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5877,6 +6306,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5918,6 +6357,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -5959,6 +6408,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6000,6 +6459,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6041,6 +6510,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6082,6 +6561,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6123,6 +6612,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6164,6 +6663,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6205,6 +6714,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6246,6 +6765,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6287,6 +6816,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6328,6 +6867,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6369,6 +6918,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6410,6 +6969,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6451,6 +7020,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6492,6 +7071,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6533,6 +7122,16 @@ cases:
       - client
       - connect_budget_seconds
       - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
       - mihomo_allow_lan
       - mihomo_controller
       - mihomo_mixed_port
@@ -6609,3 +7208,65 @@ cases:
       - per_node
       - worker_identity
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
+- id: AIO-PKT-02
+  requirement: Per-Case Data-Plane Packet Evidence
+  live_scenario: null
+  assertion: Four degradations are produced against a real transfer through the installed host — a capture
+    tool that is not there, a host that cannot report the client's address because nothing answers the
+    identity port, a capture that ran out its own window before the harness stopped it, and an identity
+    channel that did not travel the request's path — and every one of them is INCOMPLETE with the missing
+    fact named, the non-matching source address recorded for the last, no aggregate counter read as an
+    answer, and no capture file or saved payload left on the host.
+  assertion_sha256: 5eaea8042ce6f1daeb137082f7f2e33722bb8c4a8e8e92dac10ed193b269c5f5
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_packet_evidence_incomplete
+      evidence:
+      - degradations
+      - foreign_source_reason
+      - foreign_sources
+      - no_capture_tool_reason
+      - no_identity_reason
+      - persisted_files
+      - tool_less_captured
+      - verdicts
+      - window_expired_reason
+  promotion_target: Per-Case Data-Plane Packet Evidence
+- id: MN-PKT-03
+  requirement: Per-Case Data-Plane Packet Evidence
+  live_scenario: null
+  assertion: 'A real Worker request is bracketed by captures on both nodes and judged as if the Master
+    had carried it: the payload returns 200, the SNI is the inbound''s, and the egress address is the
+    Worker''s, so the case can only be refused by the packet evidence — the Worker captured the client''s
+    packets, the Master captured none, and the harness raises the failure instead of recording a pass.'
+  assertion_sha256: 05946d4f54c2bebc776bff44b9526eaf649abf781b65c8683f583f7b769f14a7
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_packet_wrong_host
+      evidence:
+      - capturing_host
+      - capturing_matched
+      - egress_expected
+      - egress_source_ip
+      - intended_host
+      - intended_matched
+      - reason
+      - verdict
+      - worker_tuple
+  promotion_target: Per-Case Data-Plane Packet Evidence

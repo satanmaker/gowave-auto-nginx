@@ -28,6 +28,22 @@ def _enclosing_functions(tree):
     return mapping
 
 
+def _function_parameters(tree):
+    """Function name -> the parameters its signature declares."""
+    mapping = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            arguments = node.args
+            names = {argument.arg for argument in arguments.args}
+            names |= {argument.arg for argument in arguments.kwonlyargs}
+            if arguments.vararg is not None:
+                names.add(arguments.vararg.arg)
+            if arguments.kwarg is not None:
+                names.add(arguments.kwarg.arg)
+            mapping[node.name] = names
+    return mapping
+
+
 class TestNoUnboundedWaits(unittest.TestCase):
     def test_no_while_true_loops(self):
         for path, tree in _python_sources():
@@ -59,7 +75,9 @@ class TestNoUnboundedWaits(unittest.TestCase):
                     continue
                 func = node.func
                 name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-                if name not in ("run", "Popen", "check_output"):
+                # ``Popen`` returns while the child is still running and takes no
+                # ``timeout`` of its own, so it is held by its own test below.
+                if name not in ("run", "check_output"):
                     continue
                 if not isinstance(func, ast.Attribute) or not isinstance(func.value, ast.Name):
                     continue
@@ -67,6 +85,40 @@ class TestNoUnboundedWaits(unittest.TestCase):
                     continue
                 keywords = {keyword.arg for keyword in node.keywords}
                 self.assertIn("timeout", keywords, f"{path.name}:{node.lineno} subprocess.{name} without timeout")
+
+    def test_a_supervised_process_lives_in_a_spawn_helper_that_names_its_deadline(self):
+        """``Popen`` is the one spawn that owes its bound to the caller.
+
+        A streamed probe answers over the pipe for as long as the case needs it,
+        which ``run`` cannot express, so the process is started by a ``spawn_``
+        helper that has to declare the deadline it enforces — the convention the
+        ``wait_`` rule applies to sleeps. Any ``Popen`` outside such a helper is
+        a child nobody kills when the case stops answering.
+        """
+        for path, tree in _python_sources():
+            functions = _enclosing_functions(tree)
+            parameters = _function_parameters(tree)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if name != "Popen":
+                    continue
+                if not isinstance(func, ast.Attribute) or not isinstance(func.value, ast.Name):
+                    continue
+                if func.value.id != "subprocess":
+                    continue
+                helper = functions.get(id(node), "")
+                self.assertTrue(
+                    helper.startswith("spawn_"),
+                    f"{path.name}:{node.lineno} Popen outside a bounded spawn helper "
+                    f"({helper or 'module level'})",
+                )
+                self.assertIn(
+                    "timeout", parameters.get(helper, set()),
+                    f"{path.name}:{node.lineno} the spawn helper {helper} names no deadline",
+                )
 
     def test_no_interactive_input_calls(self):
         for path, tree in _python_sources():

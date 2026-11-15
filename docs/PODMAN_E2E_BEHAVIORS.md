@@ -13,14 +13,14 @@ behaviour with no case, a behaviour covered only on its happy path, an
 area the delta spec names but no entry covers, and a case no behaviour
 names (an orphan) or two behaviours claim.
 
-Behaviours: 37 across 9 areas, naming 213 of 213 catalog cases.
+Behaviours: 37 across 9 areas, naming 215 of 215 catalog cases.
 
 | Area | Behaviours | Cases | Error-path cases |
 |---|---:|---:|---:|
 | installation | 5 | 15 | 5 |
 | provisioning | 8 | 27 | 15 |
 | subscription-representations | 1 | 6 | 3 |
-| data-plane | 5 | 45 | 9 |
+| data-plane | 5 | 45 | 11 |
 | decoy | 2 | 7 | 2 |
 | tls-dns-acme | 5 | 7 | 9 |
 | network-policy | 2 | 6 | 6 |
@@ -64,7 +64,7 @@ Behaviours: 37 across 9 areas, naming 213 of 213 catalog cases.
 | Both pinned clients carry a payload through every Multi-Node outbound | multi-node | pre-push | `MN-DP-master-REALITY-xray`, `MN-DP-master-REALITY-mihomo`, `MN-DP-master-XHTTP-xray`, `MN-DP-master-XHTTP-mihomo`, `MN-DP-master-WS-xray`, `MN-DP-master-WS-mihomo`, `MN-DP-master-TROJAN-GRPC-xray`, `MN-DP-master-TROJAN-GRPC-mihomo`, `MN-DP-master-VISION-xray`, `MN-DP-master-VISION-mihomo`, `MN-DP-worker-REALITY-xray`, `MN-DP-worker-REALITY-mihomo`, `MN-DP-worker-XHTTP-xray`, `MN-DP-worker-XHTTP-mihomo`, `MN-DP-worker-WS-xray`, `MN-DP-worker-WS-mihomo`, `MN-DP-worker-TROJAN-GRPC-xray`, `MN-DP-worker-TROJAN-GRPC-mihomo`, `MN-DP-worker-VISION-xray`, `MN-DP-worker-VISION-mihomo`, `MN-MATRIX` | `MN-REVOKE` |
 | A runtime request traverses the endpoint its case selects | aio, multi-node | pre-push | `DP-01`, `DP-02`, `DP-03`, `DP-04`, `DP-05`, `DP-06`, `DP-07`, `DP-08` | `DP-13`, `DP-14` |
 | Both engines trust exactly the declared chain | aio, multi-node | pre-push | `DP-09`, `DP-10`, `DP-11` | `DP-12`, `TLS-VERIFY-ANCHORS` |
-| A payload is attributed to the node that carried it | aio, multi-node | pre-push | `MN-EGRESS`, `PKT-01` | `PKT-02`, `PKT-03` |
+| A payload is attributed to the node that carried it | aio, multi-node | pre-push | `MN-EGRESS`, `PKT-01` | `PKT-02`, `PKT-03`, `AIO-PKT-02`, `MN-PKT-03` |
 
 ## decoy
 

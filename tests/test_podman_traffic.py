@@ -30,6 +30,7 @@ from tools.podman_e2e import (  # noqa: E402
     acme_fixture,
     aio,
     client_trust,
+    ingress,
     matrix,
     subscription_probe,
     target_image,
@@ -1226,6 +1227,32 @@ def data_plane_facts(**overrides):
     return facts
 
 
+CLIENT_ADDRESS = "198.51.100.77"
+
+
+class StubIngress:
+    """The packet bracket as these cases see it, without containers.
+
+    The container plumbing — the probe, the pipes, the verdict branches — is held
+    by ``tests/test_podman_ingress.py``. What a case here depends on is that the
+    request is bracketed at all, so the stub runs the request and answers with one
+    host that saw it from the address that host reports.
+    """
+
+    @staticmethod
+    def bracket(request, inbound, node="", window=0):
+        return ingress.Measurement(
+            port=ingress.listener_port(inbound),
+            intended="local",
+            client=CLIENT_ADDRESS,
+            captures={"local": {
+                "captured": 3, "sources": {CLIENT_ADDRESS: 3},
+                "stopped_by": "harness", "drops": 0,
+            }},
+            request=request(),
+        )
+
+
 def installed_product(context, facts=None, returncode=0, stdout=None, bodies=None, vision=False):
     podman = ScriptedPodman(context)
     product = aio.AioProduct(podman, vision=vision)
@@ -1233,6 +1260,7 @@ def installed_product(context, facts=None, returncode=0, stdout=None, bodies=Non
         facts=facts, returncode=returncode, stdout=stdout, bodies=bodies, vision=vision,
     )
     product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
+    product.bracket_request = StubIngress.bracket
     return product, podman
 
 

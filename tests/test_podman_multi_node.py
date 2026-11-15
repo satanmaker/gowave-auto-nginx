@@ -29,7 +29,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TESTS_DIR))
 
-from tools.podman_e2e import aio, budget, matrix, mtls, multi_node, panel_surface, topology  # noqa: E402
+from tools.podman_e2e import aio, budget, ingress, matrix, mtls, multi_node, panel_surface, topology  # noqa: E402
 from tools.podman_e2e.runner import Case, CaseBlocked  # noqa: E402
 from test_podman_aio import (  # noqa: E402
     BROKEN_TAIL, VISION_OTHER_SHA, VISION_ROUTED_SHA, nginx_probe, vision_answer,
@@ -6780,6 +6780,109 @@ class TestNodeEnvProbe(unittest.TestCase):
             with self.assertRaises(AssertionError) as caught:
                 multi_node.require_node_env("MN-RESTORE", "after the restore", facts, "a" * 64)
             self.assertIn(message, str(caught.exception))
+
+
+CLIENT_ADDRESS = "198.51.100.7"
+
+
+class TestPacketWrongHostCase(unittest.TestCase):
+    """MN-PKT-03: a correct Worker payload judged as the Master's has to fail.
+
+    Everything the egress half of the live sentence asks for is right in this
+    case — a 200, the right SNI, the Worker's own address — so the only thing
+    that can refuse it is the packet comparison. What this class holds is that
+    the comparison is what decides, and that the case does not settle for
+    computing FAIL without the harness actually refusing the case.
+    """
+
+    def product(self, *, master_matched=0, worker_matched=3, status=200, worker_ip=True):
+        product = _MatrixProduct()
+        self.addCleanup(product.cleanup)
+        product.master.host = product.topology
+        product.master.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
+        inbound = matrix.inbound(product.matrix, "REALITY")
+        port = ingress.listener_port(inbound)
+        egress = (
+            str(product.topology.plan.data_worker_ip) if worker_ip
+            else str(product.topology.plan.data_target_ip)
+        )
+        product.master.transfer_facts = lambda *args, **kwargs: {
+            "status": status, "source_ip": egress,
+        }
+
+        def bracket(request, inbound, node="", window=ingress.CAPTURE_WINDOW_SECONDS, *,
+                    intended="", identity_port=ingress.IDENTITY_PORT,
+                    probe_script=ingress.PROBE_SCRIPT, identity_engine=""):
+            return ingress.Measurement(
+                port=port, intended=intended or "master", client=CLIENT_ADDRESS,
+                captures={
+                    "master": {"captured": master_matched,
+                               "sources": {CLIENT_ADDRESS: master_matched},
+                               "stopped_by": "harness", "drops": 0},
+                    "worker": {"captured": worker_matched,
+                               "sources": {CLIENT_ADDRESS: worker_matched},
+                               "stopped_by": "harness", "drops": 0},
+                },
+                request=request(),
+            )
+
+        product.master.bracket_request = bracket
+        return product
+
+    def test_a_worker_payload_the_master_did_not_carry_is_a_fail(self):
+        evidence = multi_node.case_packet_wrong_host(self.product())
+        self.assertEqual(evidence["verdict"], ingress.FAIL)
+        self.assertEqual(evidence["intended_host"], "master")
+        self.assertEqual(evidence["capturing_host"], "worker")
+        self.assertEqual(evidence["intended_matched"], 0)
+        self.assertEqual(evidence["capturing_matched"], 3)
+        self.assertEqual(evidence["egress_source_ip"], evidence["egress_expected"])
+        self.assertEqual(evidence["worker_tuple"], "MN-DP-worker-REALITY-xray")
+
+    def test_a_payload_that_also_reached_the_master_is_not_this_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_packet_wrong_host(self.product(master_matched=2))
+        self.assertIn("so the request was not the mislabelled one", str(caught.exception))
+
+    def test_a_broken_transfer_is_refused_before_the_verdict(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_packet_wrong_host(self.product(status=502))
+        self.assertIn("would be reporting a broken transfer", str(caught.exception))
+
+    def test_an_egress_from_the_master_does_not_meet_the_sentence(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_packet_wrong_host(self.product(worker_ip=False))
+        self.assertIn("the egress half of the sentence is not met", str(caught.exception))
+
+    def test_no_capture_at_all_cannot_stand_in_for_a_wrong_host(self):
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_packet_wrong_host(self.product(worker_matched=0))
+        self.assertIn("instead of FAIL", str(caught.exception))
+
+    def test_a_fail_that_was_not_raised_is_refused(self):
+        """Computing FAIL is not the case: the harness has to stop the case.
+
+        A bracket that returns FAIL while ``ingress.require`` lets it through
+        would leave this case green with the misplaced request recorded as a
+        pass, which is the one outcome the live sentence forbids.
+        """
+        with unittest.mock.patch.object(ingress, "require", lambda *args, **kwargs: None):
+            with self.assertRaises(AssertionError) as caught:
+                multi_node.case_packet_wrong_host(self.product())
+        self.assertIn("would have been recorded as a pass", str(caught.exception))
+
+    def test_the_case_is_registered_after_the_matrix_case(self):
+        suite = multi_node.cases(_StubPodman(Path(tempfile.mkdtemp())))
+        cases = {case.id: case for case in suite}
+        ids = [case.id for case in suite]
+        self.assertIn(multi_node.PKT_WRONG_HOST_CASE_ID, cases)
+        self.assertEqual(cases[multi_node.PKT_WRONG_HOST_CASE_ID].topology, "multi-node")
+        self.assertEqual(
+            cases[multi_node.PKT_WRONG_HOST_CASE_ID].timeout_seconds,
+            multi_node.PKT_WRONG_HOST_TIMEOUT_SECONDS,
+        )
+        self.assertLess(ids.index(multi_node.MATRIX_CASE_ID),
+                        ids.index(multi_node.PKT_WRONG_HOST_CASE_ID))
 
 
 if __name__ == "__main__":

@@ -648,6 +648,34 @@ def data_plane_cases() -> List[Dict[str, Any]]:
         "topology": ["multi-node"],
         "promotion_target": "Data Plane E2E Traffic Through All VPN Endpoints",
     })
+    entries.append({
+        "id": "AIO-PKT-02",
+        "requirement": "Per-Case Data-Plane Packet Evidence",
+        "assertion": (
+            "Four degradations are produced against a real transfer through the installed host — a "
+            "capture tool that is not there, a host that cannot report the client's address because "
+            "nothing answers the identity port, a capture that ran out its own window before the "
+            "harness stopped it, and an identity channel that did not travel the request's path — "
+            "and every one of them is INCOMPLETE with the missing fact named, the non-matching "
+            "source address recorded for the last, no aggregate counter read as an answer, and no "
+            "capture file or saved payload left on the host."
+        ),
+        "topology": ["aio"],
+        "promotion_target": "Per-Case Data-Plane Packet Evidence",
+    })
+    entries.append({
+        "id": "MN-PKT-03",
+        "requirement": "Per-Case Data-Plane Packet Evidence",
+        "assertion": (
+            "A real Worker request is bracketed by captures on both nodes and judged as if the "
+            "Master had carried it: the payload returns 200, the SNI is the inbound's, and the "
+            "egress address is the Worker's, so the case can only be refused by the packet evidence "
+            "— the Worker captured the client's packets, the Master captured none, and the harness "
+            "raises the failure instead of recording a pass."
+        ),
+        "topology": ["multi-node"],
+        "promotion_target": "Per-Case Data-Plane Packet Evidence",
+    })
     return entries
 
 
@@ -836,6 +864,40 @@ def _dict_literal_keys(node: ast.Dict) -> Set[str]:
     return {key.value for key in node.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)}
 
 
+def _merged_keys(
+    call: ast.Call, module_tree: Optional[ast.Module], followed: Tuple[str, ...],
+) -> Set[str]:
+    """The keys ``evidence.update(module.helper(...))`` adds, read from the helper.
+
+    The helper has to be a module of this package, reached through the alias this
+    module imported it under, and has to build its record as a dict literal — the
+    two conditions that make the keys knowable from source instead of guessed. A
+    helper that is not found, is already being followed, or assembles its keys at
+    run time contributes nothing rather than a wrong list.
+    """
+    if module_tree is None:
+        return set()
+    name = _dotted_name(call.func)
+    if name.count(".") != 1:
+        return set()
+    head, _, tail = name.partition(".")
+    module = _imported_modules(module_tree).get(head)
+    if not module:
+        return set()
+    path = REPO_ROOT / "tools" / "podman_e2e" / f"{module}.py"
+    if not path.is_file():
+        return set()
+    label = f"{module}.{tail}"
+    if label in followed:
+        return set()
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    helper = _function_node(tree, tail)
+    if helper is None or not any(isinstance(node, ast.Return) and isinstance(node.value, ast.Dict)
+                                 for node in ast.walk(helper)):
+        return set()
+    return set(evidence_keys(helper, tree, (*followed, label)))
+
+
 def evidence_keys(
     function: ast.FunctionDef,
     module_tree: Optional[ast.Module] = None,
@@ -843,15 +905,20 @@ def evidence_keys(
 ) -> List[str]:
     """The evidence keys a driver's own source records.
 
-    Four shapes count, because they are the four the runner turns into a
+    Five shapes count, because they are the five the runner turns into a
     ``CaseResult.evidence`` entry: ``evidence["key"] = ...``, a dict literal
-    assigned to ``evidence``, a dict literal the driver returns, and a driver
-    that assigns the verdict of one helper to ``evidence`` and returns it. That
-    last shape is a delegation, not a record of its own: read literally it would
+    assigned to ``evidence``, a dict literal the driver returns, a driver that
+    assigns the verdict of one helper to ``evidence`` and returns it, and a
+    driver that merges a helper's fixed record in with ``evidence.update(...)``.
+    The fourth is a delegation, not a record of its own: read literally it would
     report a builder such as ``_data_plane_case`` as carrying no evidence at all,
-    which is how a tuple case loses the facts its helper does write. The helper
-    is followed inside the same module only, and one name once, so a cycle or a
-    helper that lives elsewhere stops the walk instead of looping on it.
+    which is how a tuple case loses the facts its helper does write. The fifth is
+    the same blind spot one level down — ``evidence.update(ingress.evidence(...))``
+    keeps the keys in another module, so a driver that published only its own
+    literals would report fewer facts than the run records. A helper is followed
+    by name once, inside this package, and only when it returns a dict literal,
+    so a cycle or a helper that computes its keys stops the walk instead of
+    looping on it.
     """
     keys: Set[str] = set()
     delegated: Optional[ast.FunctionDef] = None
@@ -876,6 +943,11 @@ def evidence_keys(
                 keys |= _dict_literal_keys(node.value)
         elif isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
             keys |= _dict_literal_keys(node.value)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                and node.func.attr == "update" and isinstance(node.func.value, ast.Name) \
+                and node.func.value.id == "evidence" and len(node.args) == 1 \
+                and isinstance(node.args[0], ast.Call):
+            keys |= _merged_keys(node.args[0], module_tree, (*_followed, function.name))
     if module_tree is not None and len(assignments) == 1 and returns_evidence \
             and isinstance(assignments[0].value, ast.Call):
         name = _dotted_name(assignments[0].value.func)
@@ -1129,6 +1201,25 @@ LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     # false. Any Mihomo tuple reports the same document, because the document is
     # the served profile rather than the tuple; the REALITY one is named.
     "DP-05": {"aio": "AIO-DP-REALITY-mihomo", "multi-node": "MN-DP-master-REALITY-mihomo"},
+    # A real engine process sends one request through the selected outbound, and
+    # the live sentence asks for two more facts beside the 200: the egress address
+    # and packet evidence that grew on that VPS during the request window. Every
+    # matrix tuple now runs inside a capture on each host of its contour, so the
+    # case asserts the address the host itself reports saw at least one segment on
+    # the proxy port and that no other host saw one. That is a per-source
+    # attribution in place of the live runner's delta of an aggregate counter,
+    # which the same requirement refuses as a PASS fallback; the difference is
+    # recorded in docs/PODMAN_E2E_DISCOVERY.md.
+    "DP-04": {"aio": "AIO-DP-REALITY-xray", "multi-node": "MN-DP-master-REALITY-xray"},
+    # The Mihomo half of the same tuple: the YAML the Panel served is the document
+    # the engine dialled, and the capture brackets the request it carried.
+    "DP-06": {"aio": "AIO-DP-REALITY-mihomo", "multi-node": "MN-DP-master-REALITY-mihomo"},
+    # A Worker request is the same body with the node named, and the sentence's
+    # whole content is that the Worker served it rather than the Master, so these
+    # two are witnessed only where a second node exists. The All-in-One contour is
+    # absent by construction: one host has no Worker to be confused with.
+    "DP-07": {"multi-node": "MN-DP-worker-REALITY-xray"},
+    "DP-08": {"multi-node": "MN-DP-worker-REALITY-mihomo"},
     # The live contract asks for the status an absent User-Agent produces. The
     # container case asks every served path rather than `/v2ray-json` alone and
     # pins the code the pinned Panel answers, which is the same product rule read
@@ -1184,6 +1275,23 @@ LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     # Both cases serve that page byte for byte from the client, over the REALITY
     # lineage for the REALITY name and without a name pin for the unlisted one.
     "NGX-03": {"aio": "DECOY-01", "multi-node": "NGX-DECOY-ROUTE"},
+    # Both halves of the sentence in one verdict: the intended host recorded at
+    # least one matching packet and the other recorded none, with the egress
+    # address asserted beside them. Only a cluster has an "other VPS", so this is
+    # witnessed in the Multi-Node contour and the All-in-One host is absent by
+    # construction rather than by omission.
+    "PKT-01": {"multi-node": "MN-DP-master-REALITY-xray"},
+    # Four degradations against a real request — no capture tool, no identity, a
+    # window that ran out before the harness stopped it, and an identity channel
+    # that did not travel the request's path, which is what a NAT looks like from
+    # the target. Each has to come back INCOMPLETE, the non-matching source is
+    # recorded for the last one, no counter is read as an answer, and no capture
+    # file or payload is left on any host.
+    "PKT-02": {"aio": "AIO-PKT-02"},
+    # A real Worker request judged as the Master's: the payload is right, the SNI
+    # is right, the egress address is right, and the capture at the Worker still
+    # refuses the case.
+    "PKT-03": {"multi-node": "MN-PKT-03"},
     # The Worker dispatch is traced on the Master the way the live runner traces
     # its own: strace installed there, the trace written there, the scan and the
     # removal there, so ``envp`` never leaves the host. One case holds all three

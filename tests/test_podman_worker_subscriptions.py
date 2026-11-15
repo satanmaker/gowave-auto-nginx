@@ -25,6 +25,7 @@ from tests.test_podman_subscriptions import (  # noqa: E402
     engine_share_links, installed_product, panel_result, served_facts,
 )
 from tests.test_podman_topology import FakePodman  # noqa: E402
+from tests.test_podman_traffic import StubIngress  # noqa: E402
 from tools.podman_e2e import aio, matrix, multi_node, topology, traffic_probe  # noqa: E402
 
 
@@ -421,6 +422,9 @@ class TestWorkerDataPlaneCase(unittest.TestCase):
         )
         product.case_topology = matrix.MULTI_NODE
         product.host = node_host
+        # The packet bracket is held by `tests/test_podman_ingress.py`; here it
+        # only has to run the request and answer PASS, which is what the stub does.
+        product.bracket_request = StubIngress.bracket
         return product
 
     def _host(self, **overrides):
