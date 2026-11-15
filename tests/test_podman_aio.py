@@ -3885,6 +3885,52 @@ class TestVisionRouteCase(unittest.TestCase):
     def test_a_map_that_is_not_the_one_in_force_is_refused(self):
         self.reject("not the one deciding the traffic", contour=vision_contour(maps=2))
 
+    def test_the_probe_reads_the_directive_argument_out_of_the_running_dump(self):
+        # The dump keeps the directive's terminating semicolon, so a target read
+        # verbatim is `127.0.0.1:8444;` — an address no contract can compare
+        # against, and one a live run proved the contract could not. The rendered
+        # script is run against a stand-in `nginx -T` so the reading is what is
+        # tested, not the text of the heredoc.
+        dump = (
+            "stream {\n"
+            "    map $ssl_preread_server_name $sni_backend {\n"
+            f"        {topology.VISION_DOMAIN} 127.0.0.1:8444;\n"
+            f"        {topology.COVER_APEX} 127.0.0.1:9443;\n"
+            "        default 127.0.0.1:8443;\n"
+            "    }\n"
+            "}\n"
+            "server {\n"
+            f"    listen {aio.VISION_FALLBACK_LISTEN};\n"
+            f"    root {VISION_ROOT};\n"
+            "}\n"
+        )
+        sockets = (
+            "LISTEN 0 511 127.0.0.1:8444 0.0.0.0:*\n"
+            "LISTEN 0 511 127.0.0.1:9444 0.0.0.0:*\n"
+            "LISTEN 0 511 0.0.0.0:443 0.0.0.0:*\n"
+        )
+        with tempfile.TemporaryDirectory() as bindir:
+            for name, body in (("nginx", dump), ("ss", sockets)):
+                path = Path(bindir) / name
+                path.write_text(f"#!/bin/sh\ncat <<'OUT'\n{body}OUT\n", encoding="utf-8")
+                path.chmod(0o755)
+            script = aio.vision_contour_script(topology.VISION_DOMAIN)
+            _, _, body = script.partition("<<'PY'\n")
+            body = body.rsplit("\nPY\n", 1)[0]
+            result = subprocess.run(
+                [sys.executable, "-c", body, topology.VISION_DOMAIN],
+                capture_output=True, text=True, check=False,
+                env={**os.environ, "PATH": f"{bindir}:{os.environ.get('PATH', '')}"},
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        facts = json.loads(result.stdout)
+        self.assertEqual(facts["routes"][topology.VISION_DOMAIN], aio.VISION_MAP_TARGET)
+        self.assertEqual(facts["routes"]["default"], "127.0.0.1:8443")
+        self.assertEqual(facts["stream_maps"], 1)
+        self.assertEqual(facts["fallback_listen"], 1)
+        self.assertEqual(facts["fallback_root"], VISION_ROOT)
+        self.assertEqual(facts["bound"], {"8444": ["127.0.0.1:8444"], "9444": ["127.0.0.1:9444"]})
+
     def test_the_case_is_registered_before_the_reloads_and_catalogued(self):
         suite = aio.cases(ScriptedPodman(self.context, []))
         cases = {case.id: case for case in suite}
