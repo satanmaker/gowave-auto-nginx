@@ -26,6 +26,7 @@ type, a byte count, and the transport header.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import http.client
 import json
@@ -44,6 +45,23 @@ REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_USER = "default-user"
 MVP_SQUAD = "Default MVP Squad"
 CLIENT_PREFIX = "podman-e2e-"
+
+# The server-side secrets a subscription must never carry. The Panel's signing
+# key is the one that would be catastrophic to leak and the administrator's
+# password the one that is already in this host's credentials file; both are
+# read only to be compared, never printed. A subscription legitimately carries a
+# user's own UUID and Trojan password, so the scan is a value scan, not a
+# key-name scan — a key named `password` in a trojan outbound is what a client
+# needs, and refusing it would refuse the product's own contract.
+#
+# The two products name their key differently: the Panel writes `APP_SECRET`
+# (sources/gowave/backend-go/config/config.go reads it, modules/panel.sh writes
+# it) and the Node writes `SECRET_KEY` (modules/node.sh). An All-in-One host
+# carries both files and a subscription must carry neither value, so both files
+# are read for both names.
+PRODUCT_ENV_FILES = ("/opt/gowave/.env", "/opt/gowave-node/.env")
+SERVER_SECRET_KEYS = ("APP_SECRET", "SECRET_KEY")
+MIN_SCANNED_SECRET_LENGTH = 8
 
 # The User-Agent strings name the client family that really imports each
 # representation. The Panel's pinned policy only requires a non-empty header, but
@@ -512,6 +530,62 @@ def media_type(value: str) -> str:
     return (value or "").split(";", 1)[0].strip().lower()
 
 
+def server_secret_values(
+    password: str, env_files: Sequence[str] = PRODUCT_ENV_FILES
+) -> List[str]:
+    """The server-side values a subscription must never carry, read without echoing.
+
+    The Panel's signing key, the Node's key and the administrator's password are
+    what a leak would hand an attacker; a client needs none of them. They are
+    read here only to be compared, and every fact this module reports about them
+    is a count.
+    """
+    values: List[str] = [password] if password else []
+    for env_file in env_files:
+        path = Path(env_file)
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            name, separator, value = line.partition("=")
+            if not separator or name.strip() not in SERVER_SECRET_KEYS:
+                continue
+            values.append(value.strip().strip("'\""))
+    unique: List[str] = []
+    for value in values:
+        # A short value matches ordinary prose, so it could not distinguish a
+        # leak from a coincidence; the floor is the one the redaction filter uses.
+        if len(value) >= MIN_SCANNED_SECRET_LENGTH and value not in unique:
+            unique.append(value)
+    return unique
+
+
+def secret_forms(value: str) -> List[bytes]:
+    """The encodings a leak could wear: raw, base64, base64url and URL-quoted."""
+    raw = value.encode("utf-8", "surrogateescape")
+    standard = base64.b64encode(raw)
+    url_safe = base64.urlsafe_b64encode(raw)
+    forms = [raw, standard, standard.rstrip(b"="), url_safe, url_safe.rstrip(b"=")]
+    quoted = urllib.parse.quote(value, safe="")
+    if quoted != value:
+        forms.append(quoted.encode("utf-8", "surrogateescape"))
+    return forms
+
+
+def scan_payload_for_secrets(payload: bytes, values: Sequence[str]) -> int:
+    """How many of the server-side values this payload carries, in any encoding."""
+    return sum(1 for value in values if any(form in payload for form in secret_forms(value)))
+
+
+def decode_subscription_list(payload: bytes) -> bytes:
+    """The link list a base64 body stands for, or nothing when it is not one."""
+    try:
+        text = payload.decode("ascii", "ignore").strip()
+        padding = "=" * (-len(text) % 4)
+        return base64.b64decode(text + padding, validate=False)
+    except (ValueError, TypeError):
+        return b""
+
+
 def write_payload(path: Path, body: bytes) -> None:
     """Write a subscription payload as a 0600 file; it carries client secrets."""
     if not path.parent.is_dir():
@@ -527,6 +601,7 @@ def subscriptions(
     payload_dir: Optional[Path],
     edge_base: str = "",
     ca_file: Optional[str] = None,
+    secrets_to_scan: Sequence[str] = (),
 ) -> Dict[str, Any]:
     """Fetch every served representation once and store its payload for the clients.
 
@@ -537,9 +612,18 @@ def subscriptions(
     where a client receives them — the vhost adds ``Cache-Control`` and the Panel
     process does not, so a header read only on loopback would be a claim about a
     response nobody gets.
+
+    ``secrets_to_scan`` are the server-side values this payload must not carry;
+    each record reports how many of them it does, never which one or where. The
+    base64 body stands for a link list, so its decoded text is scanned as well:
+    a secret inside a link would be base64 twice and invisible in the body alone.
     """
     short_uuid = default_user_short_uuid(panel)
-    facts: Dict[str, Any] = {"short_uuid_length": len(short_uuid), "representations": {}}
+    facts: Dict[str, Any] = {
+        "short_uuid_length": len(short_uuid),
+        "representations": {},
+        "secret_needles": len(secrets_to_scan),
+    }
     for name, template, user_agent in REPRESENTATIONS:
         path = template.format(short_uuid=short_uuid)
         response = fetch(panel.base_url, path, user_agent)
@@ -558,7 +642,12 @@ def subscriptions(
             "bytes": len(body),
             "foreign_status": foreign["status"],
             "foreign_identical": foreign["body"] == body,
+            "secret_hits": scan_payload_for_secrets(body, secrets_to_scan),
         }
+        if name == "base64":
+            record["secret_hits"] += scan_payload_for_secrets(
+                decode_subscription_list(body), secrets_to_scan
+            )
         if edge_base:
             edge = fetch(edge_base, path, user_agent, ca_file=ca_file)
             record.update({
@@ -577,6 +666,29 @@ def subscriptions(
             facts["credential_digest"] = subscription_credentials(body)
         if payload_dir is not None and response["status"] == 200 and body:
             write_payload(payload_dir / f"{name}.payload", body)
+
+    # The records the subscription has to agree with. A client dials whatever the
+    # Host record it was issued for says, so the address and SNI it is served are
+    # read from the same source the Panel hands a client's config — not from the
+    # projection the installer posts, which would agree with itself.
+    status, body = panel.call("GET", "/api/hosts")
+    hosts = [host for host in items(body, "hosts") if isinstance(host, dict)]
+    facts["hosts"] = {
+        "status": status,
+        "records": [
+            {
+                "remark": str(host.get("remark") or ""),
+                "address": str(host.get("address") or ""),
+                "port": str(host.get("port") or ""),
+                "sni": str(host.get("sni") or ""),
+                "path": str(host.get("path") or ""),
+                "security_layer": str(host.get("securityLayer") or ""),
+                "alpn": str(host.get("alpn") or ""),
+                "disabled": host.get("isDisabled") is True,
+            }
+            for host in hosts
+        ],
+    }
     return facts
 
 
@@ -1132,6 +1244,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         payload_dir = Path(args.payload_dir) if args.payload_dir else None
         facts["subscriptions"] = subscriptions(
             panel, payload_dir, edge_base=args.edge_base, ca_file=args.ca or None,
+            secrets_to_scan=server_secret_values(password),
         )
     if args.scope == "ua-absent":
         facts["policy"] = user_agent_policy(panel, None, "absent")

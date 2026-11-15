@@ -89,6 +89,18 @@ CLASH_PROXY_TYPES: Sequence[str] = ("trojan",)
 # Every served representation the Panel exposes, and the client family that
 # consumes it. The order matches the documented representation inventory.
 REPRESENTATIONS: Sequence[str] = ("base64", "xray-json", "mihomo", "clash", "singbox")
+# The media type each representation is served with, as `panel_surface.media_type`
+# reduces it. The base64 list is text because a client imports it as text, and
+# both YAML dialects are `text/yaml` because that is the type the Panel's own
+# generators name; a representation served as something else would be handed to
+# the wrong importer.
+REPRESENTATION_MEDIA_TYPES = {
+    "base64": "text/plain",
+    "xray-json": "application/json",
+    "mihomo": "text/yaml",
+    "clash": "text/yaml",
+    "singbox": "application/json",
+}
 # Non-base64 representations are validated structurally; these two are loaded by
 # the real engine that consumes them.
 ENGINE_LOADED: Sequence[str] = ("base64", "xray-json", "mihomo", "clash")
@@ -4857,6 +4869,15 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
     facts = product.collect_subscriptions("SUB-SERVED")
     require("SUB-SERVED", int(facts.get("short_uuid_length") or 0) > 0,
             "the default client has no shortUuid, so no subscription could be fetched")
+    # A scan with nothing to look for passes for the wrong reason. The values a
+    # leak would hand an attacker — the administrator's password, the Panel's
+    # signing key and, on an All-in-One host, the Node's key — are each readable
+    # on the host the probe ran on, so the probe has to have found more than the
+    # one value it could always fall back on before its counts mean anything.
+    require("SUB-SERVED", int(facts.get("secret_needles") or 0) >= 2,
+            f"the secret scan looked for {facts.get('secret_needles')!r} value(s), so a zero hit "
+            "count is not evidence: the administrator's password and the keys in the product's "
+            "environment files are readable on the host the probe ran on")
 
     served = facts.get("representations") or {}
     for name in REPRESENTATIONS:
@@ -4865,8 +4886,17 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
                 f"GET /api/sub/<shortUuid>/{name} returned {record.get('status')!r} instead of 200")
         require("SUB-SERVED", int(record.get("bytes") or 0) > 0,
                 f"the {name} representation is empty")
-        require("SUB-SERVED", bool(record.get("content_type")),
-                f"the {name} representation came back without a media type")
+        # The type is a claim about which importer the bytes belong to, so a
+        # generic or wrong one is not a cosmetic difference: a client selects on
+        # the type before it parses.
+        expected_type = REPRESENTATION_MEDIA_TYPES[name]
+        require("SUB-SERVED", record.get("content_type") == expected_type,
+                f"the {name} representation came back as media type "
+                f"{record.get('content_type')!r} instead of {expected_type!r}")
+        require("SUB-SERVED", int(record.get("secret_hits") or 0) == 0,
+                f"the {name} representation carries {record.get('secret_hits')!r} server-side "
+                f"secret(s) out of the {facts.get('secret_needles')!r} the probe looked for, so a "
+                f"client that stores its subscription stores the server's credentials too")
         # The vhost disables caching on /api/sub/, because a cached list would
         # keep working after the client it describes was revoked. The Panel
         # process itself sends no Cache-Control, so the header is read through
@@ -4948,6 +4978,53 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
             f"{xray_json.get('sni_missing')!r} served Xray outbound(s) carry no SNI, so the "
             "certificate the client presents its name to is the wrong one")
 
+    # Every served outbound has to dial a host the Panel itself records, or the
+    # client reaches a name the fleet does not describe. The comparison is with
+    # `GET /api/hosts` — the document the Panel derives a client's config from —
+    # and not with the projection the installer posted, which would agree with
+    # itself. Address and SNI are what the clause names; the path or gRPC service
+    # name is what tells two inbounds sharing one name apart.
+    def dial_path(dial: Dict[str, Any]) -> str:
+        return str(dial.get("path") or dial.get("service_name") or "")
+
+    hosts = facts.get("hosts") or {}
+    records = [record for record in hosts.get("records") or [] if isinstance(record, dict)]
+    require("SUB-SERVED", hosts.get("status") == 200,
+            f"GET /api/hosts answered {hosts.get('status')!r}, so the served subscription could "
+            "not be compared with the records it is supposed to describe")
+    require("SUB-SERVED", bool(records),
+            "GET /api/hosts returned no Host record, so a subscription that agrees with nothing "
+            "would pass the comparison")
+    dials = [dial for dial in xray_json.get("dials") or [] if isinstance(dial, dict)]
+    require("SUB-SERVED", len(dials) == product.subscription_inbound_count,
+            f"{len(dials)} served Xray outbound(s) carry a dial tuple, expected one per inbound "
+            f"({product.subscription_inbound_count})")
+    unrecorded = []
+    mispathed = []
+    for dial in dials:
+        candidates = [
+            record for record in records
+            if record.get("address") == dial.get("address") and record.get("sni") == dial.get("sni")
+        ]
+        if not candidates:
+            unrecorded.append(dial)
+        elif dial_path(dial) and not any(record.get("path") == dial_path(dial) for record in candidates):
+            mispathed.append(dial)
+    described = ", ".join(
+        f"{record.get('remark')!r} {record.get('address')!r}/{record.get('sni')!r}"
+        f"{' path ' + repr(record.get('path')) if record.get('path') else ''}"
+        for record in records
+    )
+    require("SUB-SERVED", not unrecorded,
+            "the subscription dials "
+            + ", ".join(f"{dial.get('tag')!r} at {dial.get('address')!r}/{dial.get('sni')!r}"
+                        for dial in unrecorded)
+            + f", which no Host record names (records: {described})")
+    require("SUB-SERVED", not mispathed,
+            "the subscription dials "
+            + ", ".join(f"{dial.get('tag')!r} at path {dial_path(dial)!r}" for dial in mispathed)
+            + f", which no Host record on that address and SNI names (records: {described})")
+
     # Clash keeps only the trojan subset, and each node issues one, so a cluster
     # serves one Clash proxy per node rather than the single one an All-in-One
     # install serves.
@@ -5002,11 +5079,27 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
     require("SUB-SERVED", int(singbox.get("outbounds") or 0) > 0,
             "the sing-box JSON carries no outbounds")
 
+    # The private half of REALITY never leaves the Panel: a client is issued
+    # `publicKey` and has no reader for the other one, so a document that carries
+    # it hands every subscriber the server's own key. The count is of key names in
+    # the served bytes, which is why a Trojan password — legitimate client
+    # material — is not mistaken for one.
+    private_documents = (
+        ("base64", base64), ("xray-json", xray_json),
+        ("mihomo", mihomo), ("clash", loaded.get("clash") or {}), ("singbox", singbox),
+    )
+    for name, record in private_documents:
+        require("SUB-SERVED", int(record.get("private_keys") or 0) == 0,
+                f"the {name} representation carries {record.get('private_keys')!r} server-side "
+                "private key field(s), so every client that imports it holds the server's key")
+
     evidence: Dict[str, Any] = {"short_uuid_length": facts.get("short_uuid_length")}
+    evidence["secret_needles"] = facts.get("secret_needles")
     for name in REPRESENTATIONS:
         record = served.get(name) or {}
         evidence[f"{name}_status"] = record.get("status")
         evidence[f"{name}_content_type"] = record.get("content_type")
+        evidence[f"{name}_secret_hits"] = record.get("secret_hits")
         evidence[f"{name}_cache_control"] = record.get("edge_cache_control")
         evidence[f"{name}_backend_cache_control"] = record.get("cache_control")
         evidence[f"{name}_edge_status"] = record.get("edge_status")
@@ -5025,6 +5118,10 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
     evidence["xray_json_fingerprints"] = ",".join(xray_json.get("fingerprints") or [])
     evidence["xray_json_sni_missing"] = xray_json.get("sni_missing")
     evidence["xray_json_expected_transports"] = ",".join(expected_transports)
+    evidence["xray_json_dials"] = len(dials)
+    evidence["host_records"] = len(records)
+    evidence["host_record_mismatches"] = len(unrecorded) + len(mispathed)
+    evidence["xray_json_private_keys"] = xray_json.get("private_keys")
     for name in ("mihomo", "clash"):
         record = loaded.get(name) or {}
         evidence[f"{name}_proxies"] = record.get("proxies")
@@ -5034,8 +5131,11 @@ def case_subscriptions(product: AioProduct) -> Dict[str, Any]:
         evidence[f"{name}_rule_names"] = ",".join(record.get("rule_names") or [])
         evidence[f"{name}_duplicate_names"] = record.get("duplicate_names")
         evidence[f"{name}_client_fingerprints"] = ",".join(record.get("client_fingerprints") or [])
+        evidence[f"{name}_private_keys"] = record.get("private_keys")
     evidence["mihomo_servers"] = ",".join(sorted(mihomo_servers))
+    evidence["base64_private_keys"] = base64.get("private_keys")
     evidence["singbox_outbounds"] = singbox.get("outbounds")
+    evidence["singbox_private_keys"] = singbox.get("private_keys")
     return evidence
 
 

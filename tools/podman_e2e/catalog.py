@@ -1145,6 +1145,20 @@ LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     # preset, no duplicate names, and a routing-rule family a client would
     # actually route through.
     "SUB-04": {"aio": "SUB-SERVED", "multi-node": "SUB-SERVED"},
+    # The Xray JSON half, read clause by clause. `SUB-SERVED` asks the status, the
+    # media type every representation is served with, the `no-store` the public
+    # edge adds, and that the pinned Xray binary accepts each served profile — the
+    # clause that names this sentence's own validator. It also compares every
+    # served outbound with `GET /api/hosts` on address and SNI plus the path that
+    # tells two inbounds on one name apart, and scans each representation for the
+    # keys the product writes into its own environment files — the Panel's
+    # `APP_SECRET` and the Node's `SECRET_KEY` — plus the administrator's password,
+    # in four encodings, while requiring that no document carries a server-side
+    # private key field. The live text's "all mandatory response headers" is
+    # claimed only for the header it names itself, `Cache-Control: no-store`; the
+    # other response headers are recorded as facts, not asserted, because no
+    # container case reads one.
+    "SUB-03": {"aio": "SUB-SERVED", "multi-node": "SUB-SERVED"},
     # The live sentence asks for three things on one connection to the panel's
     # name: TLS terminates, the certificate names that domain, and the Panel API
     # answers. AIO-01 asserts all three — an authenticated `/api/nodes` call on
