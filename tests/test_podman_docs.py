@@ -1033,6 +1033,229 @@ class TestTeardownPolicyContract(unittest.TestCase):
             self.damaged(miscounted).test_the_scenarios_left_to_the_live_runner_are_named_and_counted()
 
 
+VISION_HEADING = "### Vision: two optional domains, and which host owes the gate"
+VISION_REQUIREMENT = "### Requirement: Independent Optional Vision Domains"
+VISION_REQUIREMENT_NAME = "Independent Optional Vision Domains"
+VISION_CASE = re.compile(r"\b(?:VIS|MN|NGX)-[A-Z0-9][A-Z0-9-]*")
+
+
+def vision_section() -> str:
+    text = discovered()
+    start = text.index(VISION_HEADING)
+    end = text.find("\n### ", start + 1)
+    return text[start:end if end != -1 else len(text)]
+
+
+def vision_requirement_block() -> str:
+    text = LIVE_SPEC.read_text(encoding="utf-8")
+    start = text.index(VISION_REQUIREMENT)
+    return text[start : text.find("\n### Requirement: ", start + 1)]
+
+
+def vision_entries() -> dict:
+    """The live-scenario entries that own the requirement, keyed by scenario name."""
+    return {
+        case["live_scenario"]: case
+        for case in yaml.safe_load(CATALOG.read_text(encoding="utf-8"))["cases"]
+        if case.get("requirement") == VISION_REQUIREMENT_NAME and case.get("live_scenario")
+    }
+
+
+def vision_product_cases() -> set:
+    """The requirement's own cases: the ones it declares with no live scenario."""
+    return {
+        case["id"]
+        for case in yaml.safe_load(CATALOG.read_text(encoding="utf-8"))["cases"]
+        if case.get("requirement") == VISION_REQUIREMENT_NAME and not case.get("live_scenario")
+    }
+
+
+def vision_driver_cases(entry) -> set:
+    return {
+        str(facts.get("case"))
+        for facts in (entry.get("drivers") or {}).values()
+        if facts.get("case")
+    }
+
+
+def vision_rows(section: str):
+    return [line for line in section.splitlines() if line.startswith("| `")]
+
+
+def vision_row_scenario(line: str) -> str:
+    return line.strip().strip("|").split("|")[0].strip().strip("`")
+
+
+def vision_row_cases(line: str) -> set:
+    return set(VISION_CASE.findall(line))
+
+
+class TestVisionContract(unittest.TestCase):
+    """Two optional domains are mapped onto the cases that decide them.
+
+    Most of the requirement is already witnessed by cases that predate it, so
+    the page is held from both sides: every scenario the catalog drives has a row
+    citing that case, every row names a scenario the requirement states, and the
+    two policy cases the requirement owns — the parser's matrix and the per-host
+    gate — are cited too. The scenarios left to the live runner are counted and
+    named, so a driver that starts or stops covering one has to move the page.
+    """
+
+    def setUp(self):
+        self.section = vision_section()
+        self.rows = vision_rows(self.section)
+        self.prose = " ".join(self.section.split())
+        self.entries = vision_entries()
+
+    def damaged(self, section: str) -> "TestVisionContract":
+        probe = TestVisionContract("test_every_driven_scenario_has_a_row_citing_the_case")
+        probe.section = section
+        probe.prose = " ".join(section.split())
+        probe.rows = vision_rows(section)
+        probe.entries = vision_entries()
+        return probe
+
+    def test_the_spec_and_the_catalog_state_the_same_scenarios(self):
+        self.assertEqual(
+            set(self.entries), set(SCENARIO.findall(vision_requirement_block())),
+            "the catalog and the live requirement disagree about its scenarios",
+        )
+
+    def test_every_case_the_requirement_owns_is_cited(self):
+        owned = vision_product_cases()
+        self.assertEqual(
+            owned, {"MN-VISION", "VIS-CONFIG", "VIS-GATE"},
+            "the requirement's own cases are the per-node case and the two policy "
+            "cases; the page maps them",
+        )
+        cited = set()
+        for line in self.rows:
+            cited |= vision_row_cases(line)
+        self.assertEqual(owned - cited, set(), "a case the catalog owns is cited by no row")
+
+    def test_every_driven_scenario_has_a_row_citing_the_case(self):
+        rows = {}
+        for line in self.rows:
+            rows.setdefault(vision_row_scenario(line), []).append(line)
+        for scenario, entry in self.entries.items():
+            driven = vision_driver_cases(entry)
+            with self.subTest(scenario=scenario):
+                if not driven:
+                    self.assertNotIn(
+                        scenario, rows,
+                        "the page claims a row for a scenario nothing in the catalog drives",
+                    )
+                    continue
+                self.assertIn(
+                    scenario, rows,
+                    "the catalog drives this scenario and the page has no row for it",
+                )
+                cited = set()
+                for line in rows[scenario]:
+                    cited |= vision_row_cases(line)
+                self.assertEqual(
+                    driven - cited, set(),
+                    f"the page's rows for {scenario!r} do not cite {sorted(driven - cited)}",
+                )
+
+    def test_every_row_names_a_scenario_the_requirement_states(self):
+        stated = set(SCENARIO.findall(vision_requirement_block()))
+        for line in self.rows:
+            self.assertIn(
+                vision_row_scenario(line), stated,
+                "the page maps a scenario the Vision requirement does not state",
+            )
+
+    def test_each_row_cites_the_case_the_catalog_maps_to_that_scenario(self):
+        for line in self.rows:
+            scenario = vision_row_scenario(line)
+            cited = vision_row_cases(line)
+            with self.subTest(scenario=scenario):
+                self.assertTrue(cited, f"a row claims no case: {line[:60]}")
+                driven = vision_driver_cases(self.entries[scenario])
+                self.assertEqual(
+                    cited - driven, set(),
+                    f"the page cites {sorted(cited - driven)} for {scenario!r} "
+                    "and the catalog drives it elsewhere",
+                )
+
+    def test_the_policy_cases_run_in_both_contours(self):
+        for case in yaml.safe_load(CATALOG.read_text(encoding="utf-8"))["cases"]:
+            if case.get("id") not in {"VIS-CONFIG", "VIS-GATE"}:
+                continue
+            with self.subTest(case=case["id"]):
+                self.assertEqual(
+                    set(case.get("drivers") or {}), {"aio", "multi-node"},
+                    "a policy case the page says both contours read is driven by fewer",
+                )
+
+    def test_the_scenarios_left_to_the_live_runner_are_named_and_counted(self):
+        undriven = sorted(
+            entry["id"] for entry in self.entries.values() if not vision_driver_cases(entry)
+        )
+        self.assertTrue(
+            undriven,
+            "every scenario of the requirement is now driven; the page still says otherwise",
+        )
+        stated = re.search(r"(\w+) scenarios? of that requirement stay live-only", self.prose)
+        self.assertIsNotNone(
+            stated, "the page does not say how much of the requirement stays live-only",
+        )
+        self.assertEqual(
+            stated.group(1).lower(), NUMBER_WORDS.get(len(undriven), str(len(undriven))),
+            f"the catalog leaves {len(undriven)} scenarios undriven and the page says "
+            f"{stated.group(1)!r}",
+        )
+        for case_id in undriven:
+            self.assertIn(
+                f"`{case_id}`", self.prose,
+                f"the page leaves {case_id} undriven without naming it",
+            )
+
+    def test_each_guard_fails_on_its_own_damage(self):
+        section = vision_section()
+        driven = next(
+            row for row in vision_rows(section)
+            if vision_driver_cases(self.entries[vision_row_scenario(row)])
+        )
+        driven = vision_row_scenario(driven)
+        undriven = next(
+            entry["live_scenario"] for entry in self.entries.values()
+            if not vision_driver_cases(entry)
+        )
+
+        lost = "\n".join(
+            line for line in section.splitlines() if not line.startswith(f"| `{driven}`")
+        )
+        with self.assertRaises(AssertionError):
+            self.damaged(lost).test_every_driven_scenario_has_a_row_citing_the_case()
+
+        claimed = f"{section}\n| `{undriven}` | `VIS-GATE` | invented |\n"
+        with self.assertRaises(AssertionError):
+            self.damaged(claimed).test_every_driven_scenario_has_a_row_citing_the_case()
+
+        needle = f"| `{driven}` | `{sorted(vision_driver_cases(self.entries[driven]))[0]}`"
+        self.assertEqual(
+            section.count(needle), 1, "the row this probe damages is not identifiable",
+        )
+        retargeted = section.replace(needle, f"| `{driven}` | `GATE-BUDGET`", 1)
+        with self.assertRaises(AssertionError):
+            self.damaged(retargeted).test_each_row_cites_the_case_the_catalog_maps_to_that_scenario()
+
+        miscounted = re.sub(
+            r"\w+( scenarios? of that requirement stay live-only)",
+            r"seven\1", section, count=1,
+        )
+        self.assertNotEqual(miscounted, section, "the sentence this probe damages is not there")
+        with self.assertRaises(AssertionError):
+            self.damaged(miscounted).test_the_scenarios_left_to_the_live_runner_are_named_and_counted()
+
+        unnamed = re.sub(r"`VIS-05`", "`VIS-XX`", section, count=1)
+        self.assertNotEqual(unnamed, section, "the sentence this probe damages is not there")
+        with self.assertRaises(AssertionError):
+            self.damaged(unnamed).test_the_scenarios_left_to_the_live_runner_are_named_and_counted()
+
+
 SHARED_CONTRACT_HEADING = "## The contracts both contours assert, and the one owner each has"
 LIVE_SUBSCRIPTIONS = REPO_ROOT / "tools" / "live_vps" / "subscriptions.py"
 LIVE_NEGATIVE = REPO_ROOT / "tools" / "live_vps" / "negative.py"
@@ -1570,8 +1793,8 @@ class TestContourBoundary(unittest.TestCase):
         environments = {}
         for case in catalog["cases"]:
             environments[case["environment"]] = environments.get(case["environment"], 0) + 1
-        self.assertEqual(len(catalog["cases"]), 218, "the catalog changed size; the page quotes its total")
-        self.assertEqual(environments, {"container": 208, "partial": 8, "live-only": 2})
+        self.assertEqual(len(catalog["cases"]), 220, "the catalog changed size; the page quotes its total")
+        self.assertEqual(environments, {"container": 210, "partial": 8, "live-only": 2})
         rows = [line for line in boundary_section().splitlines() if line.startswith("| `")]
         self.assertEqual(len(rows), 3, "the environment table gained or lost a row")
         for environment, expected in environments.items():

@@ -33,6 +33,9 @@ from . import (
     teardown,
     topology,
     traffic_probe,
+    # ``cases()`` takes a ``vision`` boolean, so the module is imported under a
+    # name the parameter cannot shadow.
+    vision as vision_policy,
 )
 from .podman import wait_until
 from .runner import Case, CaseBlocked, CaseIncomplete, require
@@ -6652,6 +6655,20 @@ def case_vision_route(product: AioProduct) -> Dict[str, Any]:
         VISION_ROUTE_CASE_ID, "the Master", topology.VISION_DOMAIN, bool(product.vision),
         product.host_script, host.client_http,
     )
+    # The route's other half is the count it belongs to: a contour that reached
+    # the stream without the Panel declaring the inbound it fronts, or a Panel
+    # declaring one the host does not run, is two records disagreeing about the
+    # same endpoint. The matrix's own case count is read here for the same reason.
+    evidence.update(vision_policy.endpoint_contract(
+        VISION_ROUTE_CASE_ID,
+        vision_policy.cluster_document(
+            VISION_ROUTE_CASE_ID,
+            panel_probe(product, VISION_ROUTE_CASE_ID, "cluster"),
+        ),
+        (("master", None, product.inbound_count),),
+        len(matrix.clients(product.matrix)),
+        matrix.positive_count(product.matrix, matrix.AIO, product.vision),
+    ))
     return evidence
 
 
@@ -8241,6 +8258,13 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # exercises — the one it ends in.
         Case(teardown.TEARDOWN_CASE_ID, "aio", teardown.case_teardown_policy,
              timeout_seconds=120),
+        # Beside it, and for the same reason: Vision's two container-reproducible
+        # scenarios decide a configuration file and a host's port baseline, so
+        # neither starts a container. They run in both contours because both read
+        # the same parser and the same gate.
+        Case(vision_policy.CONFIG_CASE_ID, "aio", vision_policy.case_config_contract,
+             timeout_seconds=120),
+        Case(vision_policy.GATE_CASE_ID, "aio", vision_policy.case_port_gate, timeout_seconds=120),
         # Last, because the deadline it proves is the one the whole run spent: the
         # case reads the elapsed wall clock and the enforced budget, then produces
         # an exhausted run of the real runner and reads its report. A suite that

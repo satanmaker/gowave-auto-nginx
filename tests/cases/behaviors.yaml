@@ -31,10 +31,12 @@ behaviors:
     description: >-
       The baseline gate accepts a clean supported systemd host and refuses one
       whose packages, units or filesystem would make the measurement
-      meaningless, before any remote modification.
+      meaningless, before any remote modification; the Vision ports belong only
+      to the host whose own Vision domain is configured, and a host exempt from
+      them is still held to the default port set.
     topology: [aio, multi-node]
     gate: pre-push
-    cases: [ENV-01]
+    cases: [ENV-01, VIS-GATE]
     error_paths: [ENV-02]
 
   - name: The documented All-in-One install provisions the Panel and its node
@@ -158,7 +160,7 @@ behaviors:
     topology: [aio, multi-node]
     gate: pre-push
     cases: [VIS-01, VIS-02, VIS-03, VIS-07, VIS-08, MN-VISION]
-    error_paths: [VIS-04, VIS-05, VIS-06]
+    error_paths: [VIS-04, VIS-CONFIG, VIS-05, VIS-06]
 
   - name: A Worker is deployed without a secret and registered as it runs
     area: provisioning

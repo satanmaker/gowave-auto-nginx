@@ -257,9 +257,14 @@ class TestAioSuite(unittest.TestCase):
 class ScriptedPodman:
     """Podman stub that returns prepared host-script results in order."""
 
-    def __init__(self, context, results):
+    def __init__(self, context, results, panel_cluster=None):
         self.context = context
         self.results = list(results)
+        #: The cluster scope's own document. It is matched on the script rather
+        #: than queued, because the case asks the Panel exactly once whether the
+        #: contour is enabled or not, and a queue would hand that ask whatever
+        #: the contour leg happened to leave behind.
+        self.panel_cluster = panel_cluster
         self.scripts = []
         self.execs = []
         # What a `find` for a persisted capture would print: nothing, because the
@@ -268,6 +273,10 @@ class ScriptedPodman:
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
         self.scripts.append(script)
+        if self.panel_cluster is not None and "--scope cluster" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc", script], 0, self.panel_cluster, "",
+            )
         stdout, returncode = self.results.pop(0)
         return subprocess.CompletedProcess(["bash", "-lc", script], returncode, stdout, "")
 
@@ -3961,6 +3970,30 @@ def vision_answer(status="HTTP/1.1 200 OK", sha=VISION_ROUTED_SHA):
     ) + "\n"
 
 
+def panel_cluster_document(product) -> str:
+    """The cluster scope's report for this product's own combination.
+
+    One node record with one identifier per inbound, and one host publishing
+    each of them: the endpoint total and the hosts that carry it are the same
+    number the route is counted against, so the document is rendered from the
+    product's own arithmetic rather than written out. A fixture with its own
+    numbers would stay green while that arithmetic broke.
+    """
+    inbounds = [f"inbound-{index}" for index in range(product.inbound_count)]
+    document = {
+        "login": {"status": 200},
+        "cluster": {
+            "nodes": {"status": 200, "records": [
+                {"name": "aio-1", "uuid": "master-uuid", "inbounds": inbounds},
+            ]},
+            "hosts": {"status": 200, "records": [
+                {"inbound": value, "nodes": ["master-uuid"]} for value in inbounds
+            ]},
+        },
+    }
+    return json.dumps(document, sort_keys=True) + "\n"
+
+
 class TestVisionRouteCase(unittest.TestCase):
     """NGX-04: the delegated name's own contour, and its absence when none is configured."""
 
@@ -3996,6 +4029,7 @@ class TestVisionRouteCase(unittest.TestCase):
         ])
         product.vision = enabled
         product.host.client_reports = list(self.reports() if reports is None else reports)
+        podman.panel_cluster = panel_cluster_document(product)
         return product, podman
 
     def reject(self, expected, **kwargs):
@@ -4024,11 +4058,12 @@ class TestVisionRouteCase(unittest.TestCase):
         self.assertEqual(evidence["bare_sha256"], "")
         self.assertEqual(evidence["decoy_sha256"], VISION_ROUTED_SHA)
         self.assertEqual(evidence["management_status"], 404)
-        self.assertEqual(len(podman.scripts), 3)
+        self.assertEqual(len(podman.scripts), 4)
         self.assertIn(aio.VISION_FALLBACK_LISTEN, podman.scripts[0])
         self.assertIn("ss", podman.scripts[0])
-        for script in podman.scripts:
+        for script in podman.scripts[:3]:
             self.assertIn(topology.VISION_DOMAIN, script)
+        self.assertIn("--scope cluster", podman.scripts[3])
         self.assertIn("PROXY TCP4", podman.scripts[1])
         self.assertEqual(
             podman.scripts[1].splitlines()[0],

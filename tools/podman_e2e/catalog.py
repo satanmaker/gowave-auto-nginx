@@ -555,8 +555,22 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
     {
         "id": "MN-VISION",
         "requirement": "Independent Optional Vision Domains",
-        "assertion": "In each of the four per-node Vision combinations, every node is checked against its own Vision domain alone: a configured node declares exactly one Vision inbound and one disabled-free Panel host bound to it under its own name, holds a certificate covering that name that renews from this run's ACME directory, routes the name to its Vision inbound and runs that inbound in its applied config; an unconfigured node has none of those under its own name, so swapping the two nodes' Vision configuration fails.",
+        "assertion": "In each of the four per-node Vision combinations, every node is checked against its own Vision domain alone: a configured node declares exactly one Vision inbound and one disabled-free Panel host bound to it under its own name, holds a certificate covering that name that renews from this run's ACME directory, routes the name to its Vision inbound and runs that inbound in its applied config; an unconfigured node has none of those under its own name, so swapping the two nodes' Vision configuration fails. The configuration the run was given is also written as a document and read back through the live runner's whitelist parser: each of the two optional fields survives unchanged, and the endpoint total the parsed answer produces is the total the Panel declares across its nodes.",
         "topology": ["multi-node"],
+        "promotion_target": "Independent Optional Vision Domains",
+    },
+    {
+        "id": "VIS-CONFIG",
+        "requirement": "Independent Optional Vision Domains",
+        "assertion": "All four Vision combinations — neither, Master only, Worker only, both — are accepted by the whitelist parser and each optional field is restated exactly as configured, including an absent one staying absent; eight duplicate classes are refused, each naming what collided: the two Vision names equal, a Vision name repeating the Master Panel or Master REALITY name, a Vision name repeating the Worker or Worker REALITY name, the Master Vision name taking the Worker's name, the Worker Vision name taking the Master Panel name, and the same name in two letter cases; and the runner itself, given the same duplicate, exits nonzero reporting a configuration parse error and creates no run directory, so the refusal precedes any host being read.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Independent Optional Vision Domains",
+    },
+    {
+        "id": "VIS-GATE",
+        "requirement": "Independent Optional Vision Domains",
+        "assertion": "The Vision port set (8444 and 9444) is owed only by the host whose own Vision domain is configured: with both hosts holding both ports, the configured Master is refused naming 8444 and the unconfigured Worker is accepted, the reverse holds with only the Worker configured, both are refused when both are configured, and neither is refused when neither is — while a run in which only the unconfigured host holds the two ports reports PASS, and a host exempt from the Vision ports is still evaluated against the default set and refused when it holds 443.",
+        "topology": ["aio", "multi-node"],
         "promotion_target": "Independent Optional Vision Domains",
     },
     {
@@ -1443,6 +1457,38 @@ LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     # live reporter writes that status as a JUnit error beside a passing case, so
     # no reader of the report can take the run for green.
     "TD-08": {"aio": "GATE-TEARDOWN", "multi-node": "GATE-TEARDOWN"},
+    # Vision is two optional domains. Three of its scenarios are one node's own
+    # configuration, which is `MN-VISION`'s question: the Master-only and the
+    # Worker-only combinations ask it of each field in turn, and the disabled
+    # combination is the same case's absent branch — exactly four inbounds and four
+    # hosts per node, no certificate and no route. `MN-VISION` now also reads the
+    # configuration the run was given back through the whitelist parser, so the
+    # parsed answer and the Panel's own declaration are one statement.
+    "VIS-01": {"multi-node": "MN-VISION"},
+    "VIS-02": {"multi-node": "MN-VISION"},
+    "VIS-07": {"multi-node": "MN-VISION"},
+    # The both-configured combination adds the endpoint arithmetic to the same
+    # per-node facts: five inbounds and five published hosts per node, ten in all.
+    # `NGX-04` reads that beside its route on both contours, because the route to
+    # 8444 and the decoy fallback on 9444 are the scenario's other half.
+    "VIS-03": {"aio": "NGX-04", "multi-node": "NGX-04"},
+    # The two fields are configured independently and a duplicate is refused. That
+    # clause is decided by the parser, so `VIS-CONFIG` writes the configuration
+    # files and reads them back: four accepted combinations, eight duplicate
+    # classes, and the runner's own exit before any host is read.
+    "VIS-04": {"aio": "VIS-CONFIG", "multi-node": "VIS-CONFIG"},
+    # **VIS-05 and VIS-06 stay live-only.** A certificate failure that aborts the
+    # install and rolls the host back needs the ACME server to refuse a name the
+    # installer already committed to, and this contour's install is the fixture
+    # every later case reads — a host left rolled back poisons the run instead of
+    # proving the rollback. Reporting an incomplete compensation instead of hiding
+    # it needs a rollback that itself fails, which is a second injection on top of
+    # the first.
+    # Which host owes the Vision ports is decided before anything is contacted, and
+    # both contours read the same eligibility decision, so `VIS-GATE` asks it of
+    # both: the configured host is refused and the unconfigured one is not, and a
+    # host exempt from 8444/9444 is still evaluated against the default set.
+    "VIS-08": {"aio": "VIS-GATE", "multi-node": "VIS-GATE"},
 }
 
 
