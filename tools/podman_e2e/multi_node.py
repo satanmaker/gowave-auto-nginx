@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
     acme_fixture, aio, argv_probe, budget, denial, ingress, matrix as matrix_data, mtls,
-    topology,
+    status, topology,
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
@@ -7839,6 +7839,13 @@ def cases(
         # operator built it instead of reading what a fault left behind.
         Case(RESTORE_CASE_ID, "multi-node", lambda context: case_backup_restore(product),
              timeout_seconds=RESTORE_CASE_TIMEOUT_SECONDS),
+        # Before the lifecycle cases, because it reads no clock and starts no
+        # container: it produces the report an overall PASS is read from and
+        # asserts what a red one must name. Its eighteen- and twenty-case clauses
+        # run here because this is the contour whose count the per-node Vision
+        # configuration changes.
+        Case(status.STATUS_CASE_ID, "multi-node", status.case_status_semantics,
+             timeout_seconds=120),
         # The lifecycle cases run last: they revoke a client and fault the
         # Worker's own unit, so nothing that observes a healthy cluster may run
         # after them and no earlier case may be blamed for their state.

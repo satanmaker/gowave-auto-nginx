@@ -455,7 +455,7 @@ behaviors:
       FAIL or INCOMPLETE naming the case instead of PASS.
     topology: [aio, multi-node]
     gate: pre-push
-    cases: [RES-03]
+    cases: [RES-03, GATE-STATUS]
     error_paths: [RES-01, RES-02, DP-15]
 
   - name: The acceptance gate blocks a change it cannot prove

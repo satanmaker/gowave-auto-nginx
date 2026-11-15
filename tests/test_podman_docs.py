@@ -721,6 +721,110 @@ class TestLiveContractReconciliation(unittest.TestCase):
                          "Panel's own writes move")
 
 
+REPORT_HEADING = "### The report: what an overall PASS requires"
+RESULT_REQUIREMENT = "### Requirement: Result Status Semantics"
+ANY_CASE_ID = re.compile(r"\b(?:AIO|MN|NGX|SUB|ACME|GATE)-[A-Z0-9][A-Z0-9-]*")
+
+
+def report_section() -> str:
+    text = discovered()
+    start = text.index(REPORT_HEADING)
+    end = text.find("\n### ", start + 1)
+    return text[start:end if end != -1 else len(text)]
+
+
+def result_status_scenarios():
+    text = LIVE_SPEC.read_text(encoding="utf-8")
+    start = text.index(RESULT_REQUIREMENT)
+    end = text.find("\n### Requirement: ", start + 1)
+    return set(SCENARIO.findall(text[start:end if end != -1 else len(text)]))
+
+
+def all_live_scenarios():
+    """Every scenario the live spec states, since one row can come from another requirement."""
+    return set(SCENARIO.findall(LIVE_SPEC.read_text(encoding="utf-8")))
+
+
+def row_cases(line: str) -> set:
+    """The case ids a row cites, including the `GATE-` cases the suite declares."""
+    return set(ANY_CASE_ID.findall(line))
+
+
+class TestResultStatusContract(unittest.TestCase):
+    """The report requirement is mapped onto the case that produces a report.
+
+    The page's rows are held to the live spec and to the catalog from both
+    sides: a scenario without a row fails, a row about a scenario the spec does
+    not state fails, and a row that cites a case the catalog does not map to that
+    scenario fails — so a driver that moves has to move the page with it.
+    """
+
+    def setUp(self):
+        self.section = report_section()
+        self.prose = " ".join(self.section.split())
+        self.catalog = yaml.safe_load(CATALOG.read_text(encoding="utf-8"))["cases"]
+
+    def scenario_table(self) -> str:
+        """The first table only: the second one maps fields, not scenarios."""
+        return self.section.split("\n\n**", 1)[0]
+
+    def rows(self):
+        return [line for line in self.scenario_table().splitlines() if line.startswith("| `")]
+
+    def test_every_result_status_scenario_has_a_row(self):
+        scenarios = result_status_scenarios()
+        self.assertTrue(scenarios, "the live requirement declares no scenario")
+        rows = {line.strip().strip("|").split("|")[0].strip().strip("`") for line in self.rows()}
+        self.assertEqual(scenarios - rows, set(), "a live scenario has no container row")
+        self.assertEqual(rows - all_live_scenarios(), set(), "a row maps a scenario the live spec does not state")
+
+    def test_every_row_names_a_case_the_catalogue_holds_or_says_it_is_unclaimed(self):
+        ids = catalog_ids()
+        by_scenario = {case.get("live_scenario"): case for case in self.catalog}
+        for line in self.rows():
+            scenario = line.strip().strip("|").split("|")[0].strip().strip("`")
+            cited = row_cases(line)
+            if not cited:
+                self.assertIn("left to 9.3", line, f"a row claims nothing and does not say so: {line[:60]}")
+                entry = by_scenario.get(scenario) or {}
+                driven = {
+                    str(facts.get("case"))
+                    for facts in (entry.get("drivers") or {}).values()
+                    if facts.get("case")
+                }
+                self.assertEqual(
+                    driven, set(),
+                    f"the page defers {scenario!r} and the catalog drives it with {sorted(driven)}",
+                )
+                continue
+            self.assertEqual(cited - ids, set())
+
+    def test_each_row_names_the_case_the_catalog_maps_to_that_scenario(self):
+        by_scenario = {case.get("live_scenario"): case for case in self.catalog}
+        for line in self.rows():
+            scenario = line.strip().strip("|").split("|")[0].strip().strip("`")
+            cited = row_cases(line)
+            if not cited:
+                continue
+            entry = by_scenario.get(scenario)
+            self.assertIsNotNone(entry, f"the catalog holds no entry for {scenario!r}")
+            drivers = set()
+            for facts in (entry.get("drivers") or {}).values():
+                drivers.add(str(facts.get("case") or ""))
+            self.assertEqual(
+                cited - drivers, set(),
+                f"the page cites {cited - drivers} for {scenario!r} and the catalog drives it elsewhere",
+            )
+
+    def test_the_field_mapping_names_every_live_field(self):
+        text = LIVE_SPEC.read_text(encoding="utf-8")
+        start = text.index(RESULT_REQUIREMENT)
+        block = text[start : text.find("\n### Requirement: ", start + 1)]
+        fields = set(re.findall(r"`(test_run_id|repository_commit|started_at|finished_at|control_machine|master|worker|trust|results|traffic|overall)`", block))
+        for field in sorted(fields):
+            self.assertIn(f"`{field}`", self.prose, f"the page does not map the live field {field!r}")
+
+
 SHARED_CONTRACT_HEADING = "## The contracts both contours assert, and the one owner each has"
 LIVE_SUBSCRIPTIONS = REPO_ROOT / "tools" / "live_vps" / "subscriptions.py"
 LIVE_NEGATIVE = REPO_ROOT / "tools" / "live_vps" / "negative.py"
@@ -1258,8 +1362,8 @@ class TestContourBoundary(unittest.TestCase):
         environments = {}
         for case in catalog["cases"]:
             environments[case["environment"]] = environments.get(case["environment"], 0) + 1
-        self.assertEqual(len(catalog["cases"]), 216, "the catalog changed size; the page quotes its total")
-        self.assertEqual(environments, {"container": 206, "partial": 8, "live-only": 2})
+        self.assertEqual(len(catalog["cases"]), 217, "the catalog changed size; the page quotes its total")
+        self.assertEqual(environments, {"container": 207, "partial": 8, "live-only": 2})
         rows = [line for line in boundary_section().splitlines() if line.startswith("| `")]
         self.assertEqual(len(rows), 3, "the environment table gained or lost a row")
         for environment, expected in environments.items():

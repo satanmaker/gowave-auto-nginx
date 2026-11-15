@@ -59,7 +59,7 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Live scenario parity | Partial case splits the proof | — | — | `test_podman_matrix.TestMatrixCatalog` | Lint, Completeness, and Suite Nonroot | — |
 | Live scenario parity | Podman-first case has a promotion target | — | — | `test_podman_aio.TestAcmeRenewalCase.test_the_case_is_catalogued_as_an_incubating_podman_first_case`, `test_podman_aio.TestAcmeOutageCase.test_the_case_is_catalogued_as_an_incubating_podman_first_case` | Lint, Completeness, and Suite Nonroot | — |
 | Trustworthy result and diagnostics | Secret redaction | — | — | `test_podman_redaction.TestRedactionFilter`, `test_podman_redaction.TestArtifactTreeHoldsNoSentinel`, `test_podman_redaction.TestDiagnosticsNeverPrintValues` | Lint, Completeness, and Suite Nonroot | — |
-| Trustworthy result and diagnostics | Unexpected skip | — | — | `test_podman_runner.TestResultSemantics` | Lint, Completeness, and Suite Nonroot | — |
+| Trustworthy result and diagnostics | Unexpected skip | — | `GATE-STATUS` | `test_podman_runner.TestResultSemantics`, `test_podman_status.TestStatusCase` | All-in-One Podman Acceptance, Multi-Node Podman Acceptance | — |
 | Safe isolation and cleanup | Cleanup after failure | — | — | `test_podman_cleanup.TestPodmanStaleRunRecovery`, `test_podman_cleanup.TestEntrypointReclaimsStaleRuns`, `test_podman_fixture_isolation.TestPodmanFixtureIsolation` | All-in-One Podman Acceptance, Multi-Node Podman Acceptance | — |
 
 ## Cases serving a requirement that states no scenario

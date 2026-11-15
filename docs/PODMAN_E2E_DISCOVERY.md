@@ -554,6 +554,57 @@ printed, the identity report, and the request's own facts. The file is written b
 the case, not by `ingress.py`: the probe still persists nothing, which is what
 `tests/test_podman_ingress.py` holds.
 
+### The report: what an overall PASS requires
+
+`openspec/specs/live-vps-e2e/spec.md` §Result Status Semantics is the one
+requirement whose subject is the report rather than a host: an overall `PASS`
+requires every active Data Plane runtime case, a skip is non-passing, and each
+failing case is identified individually in the machine-readable result. A report
+is the one product surface this suite can produce with no VPS at all, so
+`GATE-STATUS` (`tools/podman_e2e/status.py`) produces runs of the real `Runner`
+over the case ids `tests/cases/matrix.yaml` declares — eight on one host, sixteen
+to twenty on a cluster — with the outcomes chosen by raising the runner's own
+exceptions, and reads the `result.json` and `junit.xml` back. The files it reads
+are written by the same `write_result` and `write_junit` that write an acceptance
+run's own report, which is what makes the case evidence rather than a second copy
+of the aggregation.
+
+| Live scenario | Container case | Where the two differ |
+| --- | --- | --- |
+| `Ingress evidence is ambiguous` | `AIO-PKT-02` | The live sentence is about a delta of listener counters that background traffic makes unattributable; the container refuses counters altogether and attributes each segment to the address the target itself reported, so the branch it exercises is the one that answers "every captured packet came from another address" — the NAT-like degradation — with `INCOMPLETE` and the non-matching sources recorded. The cluster contour asks the same question on every tuple rather than in a case of its own. |
+| `Data Plane is explicitly disabled` | none yet — this scenario is left to 9.3 | The live runner has `TEST_TRAFFIC_VERIFICATION` to turn the Data Plane off; this suite has no switch that disables its subject. The aggregate it would read is asserted — a declared case recorded `SKIP` beside a passing one is not green — but the run the sentence describes cannot be produced here, so it is not claimed. |
+| `One or more mandatory runtime cases fail` | `GATE-STATUS` | The case fails one tuple of the twenty a Vision-enabled cluster owes (eighteen on one host) and requires the aggregate to be `FAIL`, with that id named in `result.json`. |
+| `PASS requires all active Data Plane runtime cases` | `GATE-STATUS` | Two of the runtime cases fail and the rest pass; the case requires overall `FAIL`, the two ids to be the only ones marked `FAIL`, and each message to name its own case. On a cluster that is the live sentence's fourteen of sixteen; on one host it is six of eight, and the topology explains the smaller number. |
+| `Vision-enabled PASS requires all active runtime cases` | `GATE-STATUS` | One core and one Vision tuple fail; both are named in `result.json` and carried as a `<failure>` in `junit.xml`, which is all a CI reader sees. |
+| `result.json schema fields present` | `GATE-STATUS` | The two reports answer the same questions under different names — see the mapping below. The case requires every field the container schema promises, and every field of every case in it. |
+
+**One vocabulary, two spellings.** The live report names `test_run_id`,
+`repository_commit`, `started_at`, `finished_at`, `control_machine`, `master`,
+`worker`, `trust`, `results`, `traffic` and `overall`. This suite writes
+`schema`, `run_id`, `topology`, `started`, `duration`, `budget_seconds`,
+`environment`, `cases` and `overall`, and each case carries `id`, `topology`,
+`status`, `duration`, `message`, `evidence` and `evidence_files`:
+
+| Live field | Container field | Why it is not the same name |
+| --- | --- | --- |
+| `test_run_id` | `run_id`, `topology` | A run belongs to one topology here, so the topology travels beside the id instead of being implied. |
+| `repository_commit` | `environment.repository.commit` and `.tree` | The tree state is recorded too: a run started on a dirty tree is evidence for the commit it started on, not for its contents. |
+| `started_at`, `finished_at` | `started`, `duration` | The start and the window are recorded; the end is the sum, so a run that was killed before it wrote a finish time still has one. |
+| `control_machine`, `master`, `worker`, `trust` | `environment` | The two hosts of a cluster run are containers this run started, and no ACME trust material is installed; the block carries what the run measured about its own environment instead. |
+| `results` | `cases` | One entry per case, each with its own status and evidence. |
+| `traffic` | the `*-DP-*` cases | Traffic is the Data Plane cases themselves rather than a second section about them. |
+| `overall` | `overall` | The same string, computed by `overall_status`. |
+
+**The vocabularies differ in two places.** The live runner's statuses are `PASS`,
+`FAIL`, `SKIP`, `NOT_RUN`, `PARTIAL`, `INCOMPLETE` and `TEARDOWN_FAILED`; this
+suite reports `BLOCKED` for a case whose prerequisite failed, `NOT_APPLICABLE`
+for a case whose subject the environment does not contain, and has no partial or
+teardown phase to name. `NOT_APPLICABLE` is not a skip: it says the subject was
+absent, and a run that judged nothing with it is `INCOMPLETE` — but a pass beside
+it stays green, which is the deliberate difference from the live runner's
+treatment of `SKIP`. A `SKIP` in this suite means a declared case did not execute,
+and the aggregate refuses it outright.
+
 ### What is declared but not driven
 
 `PATCH /api/users` and `PATCH /api/users/{userId}` update an existing client,
@@ -623,16 +674,16 @@ image.
 
 `tests/cases/catalog.yaml` defines each scenario once and stamps it with an
 `environment`, so the boundary between the contours is a checked field rather
-than a sentence in a document. The catalog holds 216 entries:
+than a sentence in a document. The catalog holds 217 entries:
 
 | Environment | Entries | Which contour answers it |
 | --- | ---: | --- |
-| `container` | 206 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
+| `container` | 207 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
 | `partial` | 8 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
 | `live-only` | 2 | Only the live suite. Every Podman run reports both as justified exclusions, and `tools/podman_e2e/catalog.py` refuses a catalog that lets one run here. |
 
 Of the 125 live scenarios projected into this catalog, 115 are container, 8 are
-partial and 2 are live-only; the other 91 entries are Podman-first cases with a
+partial and 2 are live-only; the other 92 entries are Podman-first cases with a
 promotion target, which `tests/cases/PARITY.md` lists separately.
 
 The ten entries that are not fully container-answerable are, by id: `PRE-04`,
