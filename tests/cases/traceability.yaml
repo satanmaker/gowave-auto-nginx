@@ -21,11 +21,12 @@ requirements:
   - requirement: Independent All-in-One acceptance topology
     scenarios:
       - scenario: All-in-One clean installation
-        cases: [AIO-INSTALL, AIO-PACKAGES, AIO-04, AIO-01, AIO-03, AIO-05, TLS-01]
+        cases: [AIO-INSTALL, AIO-PACKAGES, AIO-04, AIO-01, AIO-03, AIO-05, AIO-02, TLS-01]
         topologies: [aio]
         tests:
           - tests.test_podman_aio.TestAioSuite
           - tests.test_podman_aio.TestAioVerificationCases
+          - tests.test_podman_aio.TestTlsCaBundleCase
           - tests.test_podman_runner.TestPodmanRunnerContract
         jobs: [All-in-One Podman Acceptance]
       - scenario: All-in-One repeated provisioning
