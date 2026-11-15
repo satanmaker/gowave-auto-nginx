@@ -1874,10 +1874,10 @@ def case_tls_ca_bundle(product: AioProduct) -> Dict[str, Any]:
     `gowave-auto.sh` the install dispatched (`/repo` is the same tree, mounted
     read-only) rather than re-implemented here. Five legs then ask what decides
     that decision: the fixture root succeeds, a foreign root does not, an absent
-    path and a symlink are refused before any handshake, the same probe with no
-    bundle at all rejects the served lineage (so the per-run root was supplied
-    per run and not installed where the host trusts it globally), and the probe
-    leaves nothing behind.
+    path and a symlink are refused before any handshake, the same probe with the
+    bundle removed from its environment rejects the served lineage (so the
+    per-run root was supplied per run and not installed where the host trusts it
+    globally), and the probe leaves nothing behind.
     """
     host = product.require_installed()
     domain = host.panel_domain
@@ -1984,15 +1984,21 @@ def _tls_ca_leg(product: AioProduct, domain: str,
                 ca_file: Optional[str]) -> Dict[str, Any]:
     """Run the product's probe once with one bundle, as the install does.
 
-    ``ca_file=None`` is the install's own fallback: no bundle in the environment,
-    so the probe judges the chain against whatever the host trusts globally.
+    ``ca_file=None`` is the install's fallback. The variable has to be removed
+    rather than left out: the target is created with the install environment,
+    so ``GOWAVE_TLS_CA_FILE`` is part of the container's own configuration and
+    every ``podman exec`` inherits it. Omitting it here would silently re-run
+    the anchored leg and call the result a store check.
     """
     inner = (
         f"source {TLS_CA_PROBE_SCRIPT} && "
         f"verify_public_tls_sni {shlex.quote(domain)} 127.0.0.1:443 {TLS_CA_ATTEMPTS}"
     )
-    prefix = "" if ca_file is None else f"GOWAVE_TLS_CA_FILE={shlex.quote(ca_file)} "
-    script = f"{prefix}bash -c {shlex.quote(inner)}"
+    command = f"bash -c {shlex.quote(inner)}"
+    if ca_file is None:
+        script = f"env -u GOWAVE_TLS_CA_FILE {command}"
+    else:
+        script = f"GOWAVE_TLS_CA_FILE={shlex.quote(ca_file)} {command}"
     result = product.host_script(script)
     output = ((result.stdout or "") + (result.stderr or "")).strip()
     return {"status": result.returncode, "output": output}
