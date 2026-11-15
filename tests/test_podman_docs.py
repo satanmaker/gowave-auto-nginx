@@ -825,6 +825,214 @@ class TestResultStatusContract(unittest.TestCase):
             self.assertIn(f"`{field}`", self.prose, f"the page does not map the live field {field!r}")
 
 
+TEARDOWN_HEADING = "### Teardown: the policy a run ends in"
+TEARDOWN_REQUIREMENT = "### Requirement: Teardown Policy Enforcement"
+TEARDOWN_REQUIREMENT_NAME = "Teardown Policy Enforcement"
+NUMBER_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five"}
+
+
+def teardown_section() -> str:
+    text = discovered()
+    start = text.index(TEARDOWN_HEADING)
+    end = text.find("\n### ", start + 1)
+    return text[start:end if end != -1 else len(text)]
+
+
+def teardown_requirement_block() -> str:
+    text = LIVE_SPEC.read_text(encoding="utf-8")
+    start = text.index(TEARDOWN_REQUIREMENT)
+    return text[start : text.find("\n### Requirement: ", start + 1)]
+
+
+def teardown_entries() -> dict:
+    """The live-scenario entries that own the requirement, keyed by scenario name."""
+    return {
+        case["live_scenario"]: case
+        for case in yaml.safe_load(CATALOG.read_text(encoding="utf-8"))["cases"]
+        if case.get("requirement") == TEARDOWN_REQUIREMENT_NAME and case.get("live_scenario")
+    }
+
+
+def teardown_product_cases() -> set:
+    """The requirement's own cases: the ones the catalog declares with no scenario,
+    because no live run states them and this suite is where they are decided."""
+    return {
+        case["id"]
+        for case in yaml.safe_load(CATALOG.read_text(encoding="utf-8"))["cases"]
+        if case.get("requirement") == TEARDOWN_REQUIREMENT_NAME and not case.get("live_scenario")
+    }
+
+
+def teardown_driver_cases(entry) -> set:
+    return {
+        str(facts.get("case"))
+        for facts in (entry.get("drivers") or {}).values()
+        if facts.get("case")
+    }
+
+
+def teardown_rows(section: str):
+    return [line for line in section.splitlines() if line.startswith("| `")]
+
+
+def teardown_row_scenario(line: str) -> str:
+    return line.strip().strip("|").split("|")[0].strip().strip("`")
+
+
+class TestTeardownPolicyContract(unittest.TestCase):
+    """The policy a run ends in is mapped onto the case that reads it — and only partly.
+
+    This is the one requirement where a stated scenario may be reproducible and
+    not yet reproduced, so the page is held from three sides: a scenario the
+    catalog drives has a row citing that case, a scenario it does not drive has
+    no row and is named as left alone, and the number left alone is the number
+    the page states — so a driver that starts or stops covering a scenario has
+    to move the page with it, and a page that quietly promotes one is refused.
+    """
+
+    def setUp(self):
+        self.section = teardown_section()
+        self.rows = teardown_rows(self.section)
+        self.prose = " ".join(self.section.split())
+        self.entries = teardown_entries()
+
+    def damaged(self, section: str) -> "TestTeardownPolicyContract":
+        """A copy of this case reading a doctored page, so each guard can be
+        shown to fail on the damage it exists for rather than on a fixture."""
+        probe = TestTeardownPolicyContract(
+            "test_every_driven_scenario_has_a_row_citing_the_case",
+        )
+        probe.section = section
+        probe.prose = " ".join(section.split())
+        probe.rows = teardown_rows(section)
+        probe.entries = teardown_entries()
+        return probe
+
+    def test_the_spec_and_the_catalog_state_the_same_scenarios(self):
+        self.assertEqual(
+            set(self.entries), set(SCENARIO.findall(teardown_requirement_block())),
+            "the catalog and the live requirement disagree about its scenarios",
+        )
+
+    def test_every_case_the_catalog_owns_for_the_requirement_is_cited(self):
+        owned = teardown_product_cases()
+        self.assertTrue(
+            owned,
+            "the requirement has no case of its own: the container contour holds none of it",
+        )
+        cited = set()
+        for line in self.rows:
+            cited |= row_cases(line)
+        self.assertEqual(owned - cited, set(), "a case the catalog owns is cited by no row")
+
+    def test_every_driven_scenario_has_a_row_citing_the_case(self):
+        rows = {}
+        for line in self.rows:
+            rows.setdefault(teardown_row_scenario(line), []).append(line)
+        for scenario, entry in self.entries.items():
+            driven = teardown_driver_cases(entry)
+            with self.subTest(scenario=scenario):
+                if not driven:
+                    self.assertNotIn(
+                        scenario, rows,
+                        "the page claims a row for a scenario nothing in the catalog drives",
+                    )
+                    continue
+                self.assertIn(
+                    scenario, rows,
+                    "the catalog drives this scenario and the page has no row for it",
+                )
+                cited = set()
+                for line in rows[scenario]:
+                    cited |= row_cases(line)
+                self.assertEqual(
+                    driven - cited, set(),
+                    f"the page's rows for {scenario!r} do not cite {sorted(driven - cited)}",
+                )
+
+    def test_every_row_names_a_scenario_the_requirement_states(self):
+        stated = set(SCENARIO.findall(teardown_requirement_block()))
+        for line in self.rows:
+            self.assertIn(
+                teardown_row_scenario(line), stated,
+                "the page maps a scenario the teardown requirement does not state",
+            )
+
+    def test_each_row_cites_the_case_the_catalog_maps_to_that_scenario(self):
+        for line in self.rows:
+            scenario = teardown_row_scenario(line)
+            cited = row_cases(line)
+            with self.subTest(scenario=scenario):
+                self.assertTrue(cited, f"a row claims no case: {line[:60]}")
+                driven = teardown_driver_cases(self.entries[scenario])
+                self.assertEqual(
+                    cited - driven, set(),
+                    f"the page cites {sorted(cited - driven)} for {scenario!r} "
+                    "and the catalog drives it elsewhere",
+                )
+
+    def test_the_scenarios_left_to_the_live_runner_are_named_and_counted(self):
+        undriven = sorted(
+            entry["id"] for entry in self.entries.values() if not teardown_driver_cases(entry)
+        )
+        self.assertTrue(
+            undriven,
+            "every scenario of the requirement is now driven; the page still says otherwise",
+        )
+        stated = re.search(r"(\w+) scenarios? of that requirement stay live-only", self.prose)
+        self.assertIsNotNone(
+            stated, "the page does not say how much of the requirement stays live-only",
+        )
+        self.assertEqual(
+            stated.group(1).lower(), NUMBER_WORDS.get(len(undriven), str(len(undriven))),
+            f"the catalog leaves {len(undriven)} scenarios undriven and the page says "
+            f"{stated.group(1)!r}",
+        )
+        for case_id in undriven:
+            self.assertIn(
+                f"`{case_id}`", self.prose,
+                f"the page leaves {case_id} undriven without naming it",
+            )
+
+    def test_each_guard_fails_on_its_own_damage(self):
+        section = teardown_section()
+        driven = next(
+            scenario for scenario in teardown_rows(section)
+            if teardown_driver_cases(self.entries[teardown_row_scenario(scenario)])
+        )
+        driven = teardown_row_scenario(driven)
+        undriven = next(
+            entry["live_scenario"] for entry in self.entries.values()
+            if not teardown_driver_cases(entry)
+        )
+
+        lost = "\n".join(
+            line for line in section.splitlines() if not line.startswith(f"| `{driven}`")
+        )
+        with self.assertRaises(AssertionError):
+            self.damaged(lost).test_every_driven_scenario_has_a_row_citing_the_case()
+
+        claimed = f"{section}\n| `{undriven}` | `GATE-TEARDOWN` | invented |\n"
+        with self.assertRaises(AssertionError):
+            self.damaged(claimed).test_every_driven_scenario_has_a_row_citing_the_case()
+
+        needle = f"| `{driven}` | `GATE-TEARDOWN`"
+        self.assertEqual(
+            section.count(needle), 1, "the row this probe damages is not identifiable",
+        )
+        retargeted = section.replace(needle, f"| `{driven}` | `GATE-BUDGET`", 1)
+        with self.assertRaises(AssertionError):
+            self.damaged(retargeted).test_each_row_cites_the_case_the_catalog_maps_to_that_scenario()
+
+        miscounted = re.sub(
+            r"\w+( scenarios? of that requirement stay live-only)",
+            r"seven\1", section, count=1,
+        )
+        self.assertNotEqual(miscounted, section, "the sentence this probe damages is not there")
+        with self.assertRaises(AssertionError):
+            self.damaged(miscounted).test_the_scenarios_left_to_the_live_runner_are_named_and_counted()
+
+
 SHARED_CONTRACT_HEADING = "## The contracts both contours assert, and the one owner each has"
 LIVE_SUBSCRIPTIONS = REPO_ROOT / "tools" / "live_vps" / "subscriptions.py"
 LIVE_NEGATIVE = REPO_ROOT / "tools" / "live_vps" / "negative.py"
@@ -1362,8 +1570,8 @@ class TestContourBoundary(unittest.TestCase):
         environments = {}
         for case in catalog["cases"]:
             environments[case["environment"]] = environments.get(case["environment"], 0) + 1
-        self.assertEqual(len(catalog["cases"]), 217, "the catalog changed size; the page quotes its total")
-        self.assertEqual(environments, {"container": 207, "partial": 8, "live-only": 2})
+        self.assertEqual(len(catalog["cases"]), 218, "the catalog changed size; the page quotes its total")
+        self.assertEqual(environments, {"container": 208, "partial": 8, "live-only": 2})
         rows = [line for line in boundary_section().splitlines() if line.startswith("| `")]
         self.assertEqual(len(rows), 3, "the environment table gained or lost a row")
         for environment, expected in environments.items():

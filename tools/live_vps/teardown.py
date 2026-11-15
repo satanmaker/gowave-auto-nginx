@@ -124,14 +124,22 @@ def execute_teardown(
             "error": f"Invalid restore hook: {hook_err}",
         }
 
-    # Prepare restore payload
+    # The request is the documented protocol, not an internal convenience:
+    # `schema_version`, `action` and one object per restored host are what a
+    # provider-side hook is written against, and a field renamed here is a hook
+    # that silently restores nothing.
     payload = {
-        "version": "1.0",
-        "run_id": run_id,
-        "master_ip": config.master_ip,
-        "master_snapshot_id": config.master_snapshot_id,
-        "worker_ip": config.worker_ip,
-        "worker_snapshot_id": config.worker_snapshot_id,
+        "schema_version": 1,
+        "action": "restore",
+        "test_run_id": run_id,
+        "master": {
+            "address": config.master_ip,
+            "snapshot_id": config.master_snapshot_id,
+        },
+        "worker": {
+            "address": config.worker_ip,
+            "snapshot_id": config.worker_snapshot_id,
+        },
     }
 
     try:
@@ -180,6 +188,16 @@ def execute_teardown(
             "error": "Restore hook JSON output must be an object",
         }
 
+    if hook_out.get("schema_version") != 1:
+        return {
+            "status": "TEARDOWN_FAILED",
+            "policy": "RESTORE_SNAPSHOT",
+            "error": (
+                "Restore hook answered schema_version "
+                f"{hook_out.get('schema_version')!r}, not 1"
+            ),
+        }
+
     if hook_out.get("status") != "RESTORED":
         return {
             "status": "TEARDOWN_FAILED",
@@ -187,15 +205,38 @@ def execute_teardown(
             "error": f"Hook reported status: {hook_out.get('status')}",
         }
 
-    if (
-        hook_out.get("master_snapshot_id") != config.master_snapshot_id
-        or hook_out.get("worker_snapshot_id") != config.worker_snapshot_id
+    # Both hosts, each with the id it was asked for and its own confirmation: a
+    # hook that echoes one host and drops the other has restored half a cluster,
+    # and a top-level id cannot say which host it belongs to.
+    for host, configured in (
+        ("master", config.master_snapshot_id),
+        ("worker", config.worker_snapshot_id),
     ):
-        return {
-            "status": "TEARDOWN_FAILED",
-            "policy": "RESTORE_SNAPSHOT",
-            "error": "Restore hook snapshot IDs mismatch response",
-        }
+        answered = hook_out.get(host)
+        if not isinstance(answered, dict):
+            return {
+                "status": "TEARDOWN_FAILED",
+                "policy": "RESTORE_SNAPSHOT",
+                "error": f"Restore hook answered no {host} object",
+            }
+        if answered.get("snapshot_id") != configured:
+            return {
+                "status": "TEARDOWN_FAILED",
+                "policy": "RESTORE_SNAPSHOT",
+                "error": (
+                    f"Restore hook snapshot IDs mismatch response: {host} answered "
+                    f"{answered.get('snapshot_id')!r}, expected {configured!r}"
+                ),
+            }
+        if answered.get("restored") is not True:
+            return {
+                "status": "TEARDOWN_FAILED",
+                "policy": "RESTORE_SNAPSHOT",
+                "error": (
+                    f"Restore hook did not report the {host} as restored: "
+                    f"restored={answered.get('restored')!r}"
+                ),
+            }
 
     # Reconnect and compare the captured pre/post state on both hosts. This is
     # deliberately not reported as PASS: D8 pair-lock reacquisition and the

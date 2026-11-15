@@ -452,18 +452,21 @@ cases_by_requirement:
       operator, so the disk, Panel, core-process and latency faults serve the
       requirement directly
   - requirement: Live scenario parity
-    cases: [AIO-PKT-02, MN-PKT-03, AIO-NEG-PIN]
+    cases: [AIO-PKT-02, MN-PKT-03, AIO-NEG-PIN, GATE-TEARDOWN]
     reason: >-
-      all three witness a sentence of the live capability the delta spec states
+      all four witness a sentence of the live capability the delta spec states
       no scenario of its own for. The first two serve its per-case
       packet-evidence requirement — INCOMPLETE when the capture tool, the
       source-IP identity or a valid summary is missing, FAIL when a correct
       payload is attributed to the wrong VPS — and AIO-NEG-PIN serves its
       pinned-version requirement, where a floating installer branch or an
       installer whose bytes miss the configured digest has to be refused before
-      anything runs; what the delta spec states about them is the parity
-      sentence itself, a Podman case for every container-reproducible live
-      scenario
+      anything runs. GATE-TEARDOWN serves its teardown-policy requirement: the
+      policy a run ends in is a configuration file, a digest-pinned hook and a
+      comparison, so the container reads what preflight refuses, what the hook
+      is handed and the status a broken restore may not become. What the delta
+      spec states about all four is the parity sentence itself, a Podman case
+      for every container-reproducible live scenario
 
 # What the published report has to cover, one declaration at a time. A plain
 # path is met by any behaviour that quotes it; `every_value` makes every element

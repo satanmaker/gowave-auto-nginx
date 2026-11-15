@@ -103,6 +103,7 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **ACME-REJECT-ARB** — promotion target: Global Certbot Deploy Hook Ownership
 - **GATE-BUDGET** — promotion target: Result Status Semantics
 - **GATE-STATUS** — promotion target: Result Status Semantics
+- **GATE-TEARDOWN** — promotion target: Teardown Policy Enforcement
 - **GATE-COVERAGE** — promotion target: Result Status Semantics
 - **GATE-PREPUSH** — promotion target: Result Status Semantics
 - **GATE-DIVERGENCE** — promotion target: Result Status Semantics

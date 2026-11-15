@@ -419,10 +419,12 @@ behaviors:
       PRESERVE and a pinned snapshot restore are both validated before the run,
       the hook receives a versioned request and its result is reported apart
       from the test outcome, and DESTROY or a failed hook is a teardown failure
-      rather than a passing run.
+      rather than a passing run. The container contour reads the whole policy
+      from a real configuration file and a real hook: what preflight refuses,
+      what the hook is handed, and the status a broken restore may not become.
     topology: [aio, multi-node]
     gate: pre-push
-    cases: [TD-02, TD-03, TD-04, TD-05, TD-06, TD-07]
+    cases: [TD-02, TD-03, TD-04, TD-05, TD-06, TD-07, GATE-TEARDOWN]
     error_paths: [TD-01, TD-08]
 
   - name: A run holds both hosts exclusively for its whole duration

@@ -420,9 +420,10 @@ class TestD18D21RegressionSuite(unittest.TestCase):
             mock_worker_ssh = MagicMock()
 
             mock_hook_stdout = json.dumps({
+                "schema_version": 1,
                 "status": "RESTORED",
-                "master_snapshot_id": "snap-master-1",
-                "worker_snapshot_id": "snap-worker-1",
+                "master": {"snapshot_id": "snap-master-1", "restored": True},
+                "worker": {"snapshot_id": "snap-worker-1", "restored": True},
             })
 
             with patch("live_vps.teardown.subprocess.run") as mock_subproc, \

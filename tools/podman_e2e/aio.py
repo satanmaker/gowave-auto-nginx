@@ -30,6 +30,7 @@ from . import (
     matrix,
     panel_surface,
     status,
+    teardown,
     topology,
     traffic_probe,
 )
@@ -8235,6 +8236,11 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # Before the budget case, because it reads no clock: it produces the report
         # an overall PASS is read from and asserts what a red one must name.
         Case(status.STATUS_CASE_ID, "aio", status.case_status_semantics, timeout_seconds=120),
+        # Also before the budget case, and for the same reason: it starts no
+        # container and touches no host, so it reads a policy the suite never
+        # exercises — the one it ends in.
+        Case(teardown.TEARDOWN_CASE_ID, "aio", teardown.case_teardown_policy,
+             timeout_seconds=120),
         # Last, because the deadline it proves is the one the whole run spent: the
         # case reads the elapsed wall clock and the enforced budget, then produces
         # an exhausted run of the real runner and reads its report. A suite that

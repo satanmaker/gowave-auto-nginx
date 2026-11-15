@@ -490,6 +490,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Result Status Semantics",
     },
     {
+        "id": "GATE-TEARDOWN",
+        "requirement": "Teardown Policy Enforcement",
+        "assertion": "`TEST_TEARDOWN_POLICY=DESTROY` and an invented policy are refused by configuration preflight before any host is read, naming the value and the policies v1 has; `PRESERVE` reports `PASS` while reading no host and restates no test outcome; every declared `RESTORE_SNAPSHOT` precondition is refused — a missing snapshot ID, hook path or digest, a relative, symlinked, absent, non-executable, group-writable or foreign-owned hook, a malformed digest — and a hook whose bytes changed after preflight is refused at execution; the request the hook receives on stdin is executed as its own program with no arguments and carries `schema_version: 1`, `action: \"restore\"`, the run id and one `master`/`worker` object per host with its address and snapshot ID, while an answer missing the version, missing a host object, reporting a host unrestored or naming another ID is refused; a conforming hook with matching baselines reports `INCOMPLETE` with the baseline comparison matched and the pair-lock and ownership comparisons still unimplemented, a differing baseline is `TEARDOWN_FAILED` naming the field, and a hook that times out, exits nonzero or answers non-JSON, a host that comes back unclean, are `TEARDOWN_FAILED`, which the contour's own report writes as a JUnit error beside a passing acceptance case.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Teardown Policy Enforcement",
+    },
+    {
         "id": "GATE-COVERAGE",
         "requirement": "Coverage completeness and error paths",
         "assertion": "An unmapped behavior, a behavior covered only on its happy path, or a case mapped to no behavior fails the coverage audit with the item named.",
@@ -1394,6 +1401,48 @@ LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     # schema promises and every case field in it, and the mapping is recorded in
     # docs/PODMAN_E2E_DISCOVERY.md.
     "RES-03": {"aio": "GATE-STATUS", "multi-node": "GATE-STATUS"},
+    # Teardown is decided by a configuration file and a hook rather than by a
+    # host, so one case witnesses the whole policy on both contours: it writes a
+    # real mode-0600 configuration, loads it through the product's own preflight
+    # and hands it to the product's own teardown. DESTROY is refused while the
+    # file is read, which is what "before any remote modification" means here —
+    # there is no remote, and the refusal precedes the object that could reach
+    # one.
+    "TD-01": {"aio": "GATE-TEARDOWN", "multi-node": "GATE-TEARDOWN"},
+    # PRESERVE answers PASS while two SSH clients that raise on any attribute read
+    # are handed in, so the case measures that the policy consults no host. The
+    # record it returns is asserted to carry the teardown status alone, because a
+    # record that restates the test outcome is the coupling the sentence refuses.
+    "TD-02": {"aio": "GATE-TEARDOWN", "multi-node": "GATE-TEARDOWN"},
+    # Eleven refusals, each with its own message: four mandatory values, a
+    # relative path, a symlink, a directory, an absent file, a non-executable
+    # hook, a group-writable one and a malformed digest, plus the foreign-owned
+    # hook where the runner can create one. The digest's second check is the
+    # tampering clause — the same configuration is accepted, the hook's bytes
+    # change, and execution refuses it.
+    "TD-03": {"aio": "GATE-TEARDOWN", "multi-node": "GATE-TEARDOWN"},
+    # The hook is a Python program at a path a shell would split into two
+    # commands, and it records the program name it was executed as, the arguments
+    # it was given and the JSON it read from stdin: an execution through `sh -c`
+    # cannot run it at all, and a request in argv would be in that record. The
+    # five reply shapes that are not a restored host are refused beside it, and
+    # the timeout the sentence binds the call to is the one configuration
+    # declares.
+    "TD-04": {"aio": "GATE-TEARDOWN", "multi-node": "GATE-TEARDOWN"},
+    # The baseline comparison is the product's own, over the eight fields it
+    # compares: matching manifests report the comparison as MATCHED and the
+    # status as INCOMPLETE, because the pair lock and the complete ownership
+    # comparison are still unimplemented — a PASS here would be the false pass
+    # the sentence exists to refuse. One differing field is TEARDOWN_FAILED and
+    # names the field.
+    "TD-07": {"aio": "GATE-TEARDOWN", "multi-node": "GATE-TEARDOWN"},
+    # Four ways a hook fails to restore both hosts — a nonzero exit, a non-JSON
+    # answer, JSON that is not an object, and a call that outlives
+    # RESTORE_TIMEOUT — plus a host that came back with the install still on it,
+    # which the disposable gate refuses. Every one is TEARDOWN_FAILED, and the
+    # live reporter writes that status as a JUnit error beside a passing case, so
+    # no reader of the report can take the run for green.
+    "TD-08": {"aio": "GATE-TEARDOWN", "multi-node": "GATE-TEARDOWN"},
 }
 
 
