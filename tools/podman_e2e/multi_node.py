@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
     acme_fixture, aio, argv_probe, budget, denial, ingress, matrix as matrix_data, mtls,
-    status, teardown, topology,
+    status, teardown, topology, vision as vision_policy,
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
@@ -3893,7 +3893,6 @@ def case_vision_independence(product: MultiNodeProduct) -> Dict[str, Any]:
     node applied. The absent configuration is asserted as exactly as the present
     one, so a node that received its neighbour's endpoint fails.
     """
-    product.require_worker()
     identity = vision_identity(product.matrix)
     port = identity["port"]
     target = "127.0.0.1:{};".format(port)
@@ -3920,6 +3919,7 @@ def case_vision_independence(product: MultiNodeProduct) -> Dict[str, Any]:
         "vision_type": identity["type"],
         "vision_internal_port": port,
     }
+    declared_counts: Dict[str, int] = {}
     for node, name, domain, enabled in planned:
         record = nodes.get(name)
         require(
@@ -3928,6 +3928,7 @@ def case_vision_independence(product: MultiNodeProduct) -> Dict[str, Any]:
             f"the Panel reports no node {name!r}; observed {sorted(nodes)}",
         )
         specs = [spec for spec in record.get("inbound_specs") or [] if isinstance(spec, dict)]
+        declared_counts[name] = len(specs)
         declared = [spec for spec in specs if vision_matches(spec, identity)]
         digests = [
             digest
@@ -4090,6 +4091,64 @@ def case_vision_independence(product: MultiNodeProduct) -> Dict[str, Any]:
             f"the {node} applied config carries a Vision inbound although the run did "
             f"not configure one: {describe_inbounds(loaded_vision)}",
         )
+
+    # The other half of the same sentence is the configuration the run was given:
+    # the live runner reads it with the whitelist parser, so this deployment's own
+    # names are written as a document and read back. The two optional fields have
+    # to survive the reader unchanged — a parser that dropped or merged one would
+    # hand preflight a deployment that is not the one the nodes were installed for
+    # — and the endpoint total the parser's answer produces has to be the total the
+    # Panel declares, which is what links the configuration to the cluster.
+    deployment = product.require_worker()
+    document = vision_policy.deployment_document(
+        panel_domain=deployment.panel_domain,
+        reality_domain=deployment.reality_domain,
+        worker_domain=deployment.worker_domain,
+        worker_reality_domain=deployment.worker_reality_domain,
+        master_vision=topology.VISION_DOMAIN if product.vision else None,
+        worker_vision=topology.WORKER_VISION_DOMAIN if product.worker_vision else None,
+    )
+    for node, name, domain, enabled in planned:
+        parsed = (
+            document.master_vision_domain if node == "master"
+            else document.worker_vision_domain
+        )
+        require(
+            VISION_CASE_ID,
+            parsed == (domain if enabled else None),
+            f"the configuration this run was given carries {node} Vision domain {parsed!r}, "
+            f"while {name!r} was installed with {domain if enabled else None!r}",
+        )
+        evidence[f"parsed_{node}_vision"] = str(parsed or "")
+
+    core = len(matrix_data.inbounds(product.matrix, vision=False))
+    parsed_total = (
+        2 * core
+        + int(bool(document.master_vision_domain))
+        + int(bool(document.worker_vision_domain))
+    )
+    require(
+        VISION_CASE_ID,
+        parsed_total == product.expected_inbound_total,
+        f"the configuration produces {parsed_total} endpoints ({core} per node plus "
+        f"{int(bool(document.master_vision_domain))} on the Master and "
+        f"{int(bool(document.worker_vision_domain))} on the Worker), while the matrix "
+        f"owes {product.expected_inbound_total}",
+    )
+    declared_total = sum(count for count in declared_counts.values())
+    require(
+        VISION_CASE_ID,
+        declared_total == parsed_total,
+        f"the Panel declares {declared_total} endpoints across its nodes, while the "
+        f"configuration these nodes were installed from produces {parsed_total}: "
+        f"{declared_counts}",
+    )
+    evidence["endpoint_core_per_node"] = core
+    evidence["parsed_endpoint_total"] = parsed_total
+    evidence["declared_endpoint_total"] = declared_total
+    evidence["declared_inbounds_per_node"] = ",".join(
+        f"{name}={count}" for name, count in sorted(declared_counts.items())
+    )
 
     return evidence
 
@@ -5305,6 +5364,19 @@ def case_vision_route(product: MultiNodeProduct) -> Dict[str, Any]:
         host.client_http,
     )
     evidence = {"master": master, "worker": worker}
+    # The route is one layer of the same endpoint: the Panel's node records, the
+    # hosts published for them and the matrix's own case count have to describe
+    # the combination the two contours above were just asked about.
+    evidence.update(vision_policy.endpoint_contract(
+        aio.VISION_ROUTE_CASE_ID,
+        product.cluster_facts(aio.VISION_ROUTE_CASE_ID),
+        (
+            ("master", LOCAL_NODE_NAME, product.master_inbound_count),
+            ("worker", topology.WORKER_NODE_NAME, product.worker_inbound_count),
+        ),
+        len(matrix_data.clients(product.matrix)),
+        product.positive_case_count,
+    ))
     return evidence
 
 
@@ -7851,6 +7923,13 @@ def cases(
         # cluster, so the case reads it here rather than after the cases that
         # fault the Worker.
         Case(teardown.TEARDOWN_CASE_ID, "multi-node", teardown.case_teardown_policy,
+             timeout_seconds=120),
+        # Beside them: both decide a configuration file and a host's own port
+        # baseline, so neither starts a container and neither can be blamed for the
+        # state the lifecycle cases below leave behind.
+        Case(vision_policy.CONFIG_CASE_ID, "multi-node", vision_policy.case_config_contract,
+             timeout_seconds=120),
+        Case(vision_policy.GATE_CASE_ID, "multi-node", vision_policy.case_port_gate,
              timeout_seconds=120),
         # The lifecycle cases run last: they revoke a client and fault the
         # Worker's own unit, so nothing that observes a healthy cluster may run

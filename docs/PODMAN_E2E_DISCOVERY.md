@@ -637,6 +637,51 @@ provider snapshot and a real reboot, which a container cannot produce.
 `TEARDOWN_FAILED` is not in this suite's vocabulary for the same reason the
 report section gives: a container run has no teardown phase to name.
 
+### Vision: two optional domains, and which host owes the gate
+
+`openspec/specs/live-vps-e2e/spec.md` §Independent Optional Vision Domains is
+eight scenarios over two optional fields, and most of what it states is already
+witnessed here: per-node counts and hosts by `CLUS-01` and `CLUS-03`, each node's
+certificate, route and absence by `MN-VISION`, and the stream route to
+`127.0.0.1:8444` with its PROXY-only decoy on `127.0.0.1:9444` by `NGX-04`. What
+those could not witness is the two sentences decided *before* a packet leaves the
+control machine: that the two fields are configured independently and that every
+configured name differs from every other name the run carries, and that only the
+host whose own Vision domain is configured owes the Vision ports. Both are
+decided by code this suite runs — the live runner's whitelist parser
+(`tools/live_vps/config.py::load_config`) and its eligibility decision
+(`tools/test_live_vps.py::evaluate_preflight_eligibility`) — so
+`tools/podman_e2e/vision.py` writes real mode-0600 configuration files and hands
+two real host manifests to those two functions. Neither case starts a container:
+a refusal that needs a VPS to be observed is not the refusal the sentence
+describes.
+
+The counts those sentences imply are read back where they are declared. `NGX-04`
+now asserts, beside its route on both contours, that each node's declared inbound
+count is the combination's own arithmetic, that the Panel publishes exactly one
+host per inbound for that node, that no published host names an inbound its node
+does not run, and that the matrix owes its runtime cases as that total times the
+clients it declares. `MN-VISION` closes the other end: the deployment's own names
+and addresses are written as a configuration document and read back through the
+parser, and the total the parsed answer produces has to equal the total the Panel
+declares across its nodes — so a parser that dropped an optional field and a
+Panel that declared the wrong count cannot both be true.
+
+| Live scenario | Container case | Where the two differ |
+| --- | --- | --- |
+| `Master-only Vision configuration` | `MN-VISION` | One node's own configuration, read by the same case that asks it of the Worker: the Master declares exactly one Vision inbound and one host under its own name and the Worker has neither, in the combination where only the Master was configured. The requirement is a cluster requirement, so no single-container run carries this case. |
+| `Worker-only Vision configuration` | `MN-VISION` | The same case in the combination where only the Worker was configured, which is the one that fails if the two nodes' fields are read from one switch. |
+| `Both Vision domains are configured` | `NGX-04` | The route, the decoy and the fallback are read per host, and the endpoint arithmetic is asserted beside them: five inbounds and five published hosts per node, ten in all, and the matrix's runtime count as that total times its clients. |
+| `Vision domains are unique` | `VIS-CONFIG` | Four accepted combinations — neither, Master only, Worker only, both — and eight duplicate classes refused, each naming what collided: the two Vision names equal, a Vision name repeating any of the four mandatory names, the two nodes' Vision names equal to each other's mandatory names, and the same name in two letter cases. The runner itself is run on the same duplicate and has to exit reporting a configuration error without creating a run directory, because that is what "before SSH or remote modification" means where there is no remote yet. |
+| `Vision disabled preserves the four-inbound topology` | `MN-VISION` | The absent branch of the same case: with both fields empty each node declares exactly four inbounds and four hosts, holds no certificate for the name, routes nothing and has no vhost, so a node that kept its neighbour's contour fails. |
+| `Vision port gate applies only to the Vision-enabled host` | `VIS-GATE` | Which host is refused is read from the runner's own decision over two manifests. With both hosts holding `8444` and `9444` the configured one is refused naming the port and the unconfigured one is accepted, the reverse holds for the other combination, and a run in which only the unconfigured host holds them reports `PASS` — the clause a gate widened to the whole run would fail. The exempt host is still held to the default port set, so it is refused when it holds `443`. |
+
+**Two scenarios of that requirement stay live-only.** `VIS-05` needs the ACME
+server to refuse a name the installer has already committed to, and the install
+this contour runs is the fixture every later case reads: a host left rolled back
+would poison the run rather than prove the rollback. `VIS-06` needs that rollback
+to fail as well, which is a second injection on top of the first.
+
 ### What is declared but not driven
 
 `PATCH /api/users` and `PATCH /api/users/{userId}` update an existing client,
@@ -706,16 +751,16 @@ image.
 
 `tests/cases/catalog.yaml` defines each scenario once and stamps it with an
 `environment`, so the boundary between the contours is a checked field rather
-than a sentence in a document. The catalog holds 218 entries:
+than a sentence in a document. The catalog holds 220 entries:
 
 | Environment | Entries | Which contour answers it |
 | --- | ---: | --- |
-| `container` | 208 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
+| `container` | 210 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
 | `partial` | 8 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
 | `live-only` | 2 | Only the live suite. Every Podman run reports both as justified exclusions, and `tools/podman_e2e/catalog.py` refuses a catalog that lets one run here. |
 
 Of the 125 live scenarios projected into this catalog, 115 are container, 8 are
-partial and 2 are live-only; the other 93 entries are Podman-first cases with a
+partial and 2 are live-only; the other 95 entries are Podman-first cases with a
 promotion target, which `tests/cases/PARITY.md` lists separately.
 
 The ten entries that are not fully container-answerable are, by id: `PRE-04`,

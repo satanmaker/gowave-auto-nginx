@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 93
-  total: 218
+  podman_first: 95
+  total: 220
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -438,8 +438,16 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_vision_independence
+      evidence:
+      - declared_endpoint_total
+      - declared_inbounds_per_node
+      - endpoint_core_per_node
+      - parsed_endpoint_total
+      case: MN-VISION
   promotion_target: null
 - id: VIS-02
   requirement: Independent Optional Vision Domains
@@ -460,8 +468,16 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_vision_independence
+      evidence:
+      - declared_endpoint_total
+      - declared_inbounds_per_node
+      - endpoint_core_per_node
+      - parsed_endpoint_total
+      case: MN-VISION
   promotion_target: null
 - id: VIS-03
   requirement: Independent Optional Vision Domains
@@ -486,8 +502,33 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_vision_route
+      evidence:
+      - bare_sha256
+      - bare_status
+      - bound
+      - combination
+      - decoy_sha256
+      - fallback_listen
+      - fallback_root
+      - management_status
+      - proxied_sha256
+      - proxied_status
+      - route_san
+      - route_sha256
+      - route_status
+      - routes
+      - vision_domain
+      case: NGX-04
+    multi-node:
+      driver: multi_node:case_vision_route
+      evidence:
+      - master
+      - worker
+      case: NGX-04
   promotion_target: null
 - id: VIS-04
   requirement: Independent Optional Vision Domains
@@ -508,8 +549,36 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: vision:case_config_contract
+      evidence:
+      - combinations
+      - cross_node_message
+      - duplicate_classes
+      - duplicate_message
+      - master_only_vision
+      - neither_master_vision
+      - runner_artifact_dir
+      - runner_message
+      - runner_returncode
+      - worker_only_vision
+      case: VIS-CONFIG
+    multi-node:
+      driver: vision:case_config_contract
+      evidence:
+      - combinations
+      - cross_node_message
+      - duplicate_classes
+      - duplicate_message
+      - master_only_vision
+      - neither_master_vision
+      - runner_artifact_dir
+      - runner_message
+      - runner_returncode
+      - worker_only_vision
+      case: VIS-CONFIG
   promotion_target: null
 - id: VIS-05
   requirement: Independent Optional Vision Domains
@@ -586,8 +655,16 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_vision_independence
+      evidence:
+      - declared_endpoint_total
+      - declared_inbounds_per_node
+      - endpoint_core_per_node
+      - parsed_endpoint_total
+      case: MN-VISION
   promotion_target: null
 - id: VIS-08
   requirement: Independent Optional Vision Domains
@@ -608,8 +685,40 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: vision:case_port_gate
+      evidence:
+      - both_gates
+      - combinations
+      - default_port_named
+      - default_port_status
+      - master_only_master_gate
+      - master_only_status
+      - master_only_worker_gate
+      - neither_gates
+      - unowed_vision_ports_status
+      - vision_ports_named
+      - worker_only_master_gate
+      - worker_only_worker_gate
+      case: VIS-GATE
+    multi-node:
+      driver: vision:case_port_gate
+      evidence:
+      - both_gates
+      - combinations
+      - default_port_named
+      - default_port_status
+      - master_only_master_gate
+      - master_only_status
+      - master_only_worker_gate
+      - neither_gates
+      - unowed_vision_ports_status
+      - vision_ports_named
+      - worker_only_master_gate
+      - worker_only_worker_gate
+      case: VIS-GATE
   promotion_target: null
 - id: VER-01
   requirement: Pinned Version Fidelity
@@ -6301,8 +6410,10 @@ cases:
     host bound to it under its own name, holds a certificate covering that name that renews from this
     run''s ACME directory, routes the name to its Vision inbound and runs that inbound in its applied
     config; an unconfigured node has none of those under its own name, so swapping the two nodes'' Vision
-    configuration fails.'
-  assertion_sha256: d2f511db3026f7c869f16738f9f9ecfe5971179baa6e0658203b65165d7785a2
+    configuration fails. The configuration the run was given is also written as a document and read back
+    through the live runner''s whitelist parser: each of the two optional fields survives unchanged, and
+    the endpoint total the parsed answer produces is the total the Panel declares across its nodes.'
+  assertion_sha256: 83a68e5a2cdb3fd5634632240f651b6e46198d04020127c137a89d8cff5cf63a
   runs_in:
   - podman
   state: incubating
@@ -6314,7 +6425,111 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:case_vision_independence
-      evidence: []
+      evidence:
+      - declared_endpoint_total
+      - declared_inbounds_per_node
+      - endpoint_core_per_node
+      - parsed_endpoint_total
+  promotion_target: Independent Optional Vision Domains
+- id: VIS-CONFIG
+  requirement: Independent Optional Vision Domains
+  live_scenario: null
+  assertion: 'All four Vision combinations — neither, Master only, Worker only, both — are accepted by
+    the whitelist parser and each optional field is restated exactly as configured, including an absent
+    one staying absent; eight duplicate classes are refused, each naming what collided: the two Vision
+    names equal, a Vision name repeating the Master Panel or Master REALITY name, a Vision name repeating
+    the Worker or Worker REALITY name, the Master Vision name taking the Worker''s name, the Worker Vision
+    name taking the Master Panel name, and the same name in two letter cases; and the runner itself, given
+    the same duplicate, exits nonzero reporting a configuration parse error and creates no run directory,
+    so the refusal precedes any host being read.'
+  assertion_sha256: e5a7af938311801e3619df49d304f795af465b26472af9d0485cd044877feb4e
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: vision:case_config_contract
+      evidence:
+      - combinations
+      - cross_node_message
+      - duplicate_classes
+      - duplicate_message
+      - master_only_vision
+      - neither_master_vision
+      - runner_artifact_dir
+      - runner_message
+      - runner_returncode
+      - worker_only_vision
+    multi-node:
+      driver: vision:case_config_contract
+      evidence:
+      - combinations
+      - cross_node_message
+      - duplicate_classes
+      - duplicate_message
+      - master_only_vision
+      - neither_master_vision
+      - runner_artifact_dir
+      - runner_message
+      - runner_returncode
+      - worker_only_vision
+  promotion_target: Independent Optional Vision Domains
+- id: VIS-GATE
+  requirement: Independent Optional Vision Domains
+  live_scenario: null
+  assertion: 'The Vision port set (8444 and 9444) is owed only by the host whose own Vision domain is
+    configured: with both hosts holding both ports, the configured Master is refused naming 8444 and the
+    unconfigured Worker is accepted, the reverse holds with only the Worker configured, both are refused
+    when both are configured, and neither is refused when neither is — while a run in which only the unconfigured
+    host holds the two ports reports PASS, and a host exempt from the Vision ports is still evaluated
+    against the default set and refused when it holds 443.'
+  assertion_sha256: 0664eb8457452203090ba476f81e891fd2b812611d528e2c6408896350264751
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: vision:case_port_gate
+      evidence:
+      - both_gates
+      - combinations
+      - default_port_named
+      - default_port_status
+      - master_only_master_gate
+      - master_only_status
+      - master_only_worker_gate
+      - neither_gates
+      - unowed_vision_ports_status
+      - vision_ports_named
+      - worker_only_master_gate
+      - worker_only_worker_gate
+    multi-node:
+      driver: vision:case_port_gate
+      evidence:
+      - both_gates
+      - combinations
+      - default_port_named
+      - default_port_status
+      - master_only_master_gate
+      - master_only_status
+      - master_only_worker_gate
+      - neither_gates
+      - unowed_vision_ports_status
+      - vision_ports_named
+      - worker_only_master_gate
+      - worker_only_worker_gate
   promotion_target: Independent Optional Vision Domains
 - id: MN-ARGV-OBSERVER
   requirement: Distributed Worker VPS Deployment Verification

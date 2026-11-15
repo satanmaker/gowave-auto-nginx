@@ -467,6 +467,17 @@ cases_by_requirement:
       is handed and the status a broken restore may not become. What the delta
       spec states about all four is the parity sentence itself, a Podman case
       for every container-reproducible live scenario
+  - requirement: Live scenario parity
+    cases: [VIS-CONFIG, VIS-GATE]
+    reason: >-
+      both serve the same parity sentence for the two Vision sentences the delta
+      spec writes no scenario about, because they are decided before anything is
+      contacted. VIS-CONFIG is the configuration's own reader: four accepted
+      combinations, eight duplicate classes refused by name, and the live runner
+      exiting on a duplicate before it creates a run directory — the uniqueness
+      sentence of the live requirement. VIS-GATE is the other one: only the host
+      whose own Vision domain is configured owes 8444 and 9444, and a host
+      exempt from them is still held to the default port set
 
 # What the published report has to cover, one declaration at a time. A plain
 # path is met by any behaviour that quotes it; `every_value` makes every element

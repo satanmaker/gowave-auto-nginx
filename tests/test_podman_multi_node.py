@@ -1872,16 +1872,54 @@ class _VisionRouteHost:
 
 
 class _VisionRouteProduct:
-    """The cluster the Vision route case reads, without containers."""
+    """The cluster the Vision route case reads, without containers.
+
+    The case counts the route against the Panel's own node records, so the
+    cluster is rendered from this product's arithmetic: one identifier per
+    inbound the node's own Vision flag owes, published by one host each. A
+    fixture with written-out numbers would stay green while that arithmetic
+    broke.
+    """
 
     def __init__(self, vision=False, worker_vision=False, answers=(), reports=()):
         self.vision = vision
         self.worker_vision = worker_vision
+        self.matrix = matrix.load()
         self.podman = _VisionRoutePodman(answers)
         self.host = _VisionRouteHost(reports)
 
     def require_worker(self):
         return self.host
+
+    @property
+    def master_inbound_count(self) -> int:
+        return len(matrix.inbounds(self.matrix, vision=self.vision))
+
+    @property
+    def worker_inbound_count(self) -> int:
+        return len(matrix.inbounds(self.matrix, vision=self.worker_vision))
+
+    @property
+    def positive_case_count(self) -> int:
+        return matrix.positive_count(
+            self.matrix, matrix.MULTI_NODE, self.vision, self.worker_vision,
+        )
+
+    def cluster_facts(self, case_id):
+        records = [
+            {"name": multi_node.LOCAL_NODE_NAME, "uuid": "master-uuid",
+             "inbounds": [f"master-{index}" for index in range(self.master_inbound_count)]},
+            {"name": topology.WORKER_NODE_NAME, "uuid": "worker-uuid",
+             "inbounds": [f"worker-{index}" for index in range(self.worker_inbound_count)]},
+        ]
+        hosts = [
+            {"inbound": value, "nodes": [record["uuid"]]}
+            for record in records for value in record["inbounds"]
+        ]
+        return {
+            "nodes": {"status": 200, "records": records},
+            "hosts": {"status": 200, "records": hosts},
+        }
 
 
 class TestVisionRouteCase(unittest.TestCase):

@@ -13,12 +13,12 @@ behaviour with no case, a behaviour covered only on its happy path, an
 area the delta spec names but no entry covers, and a case no behaviour
 names (an orphan) or two behaviours claim.
 
-Behaviours: 37 across 9 areas, naming 218 of 218 catalog cases.
+Behaviours: 37 across 9 areas, naming 220 of 220 catalog cases.
 
 | Area | Behaviours | Cases | Error-path cases |
 |---|---:|---:|---:|
-| installation | 5 | 15 | 6 |
-| provisioning | 8 | 27 | 15 |
+| installation | 5 | 16 | 6 |
+| provisioning | 8 | 27 | 16 |
 | subscription-representations | 1 | 6 | 3 |
 | data-plane | 5 | 45 | 11 |
 | decoy | 2 | 7 | 2 |
@@ -31,7 +31,7 @@ Behaviours: 37 across 9 areas, naming 218 of 218 catalog cases.
 
 | Behaviour | Topologies | Gate | Cases | Error paths |
 |---|---|---|---|---|
-| A disposable host is accepted or refused before it is touched | aio, multi-node | pre-push | `ENV-01` | `ENV-02` |
+| A disposable host is accepted or refused before it is touched | aio, multi-node | pre-push | `ENV-01`, `VIS-GATE` | `ENV-02` |
 | The documented All-in-One install provisions the Panel and its node | aio | pre-push | `AIO-INSTALL`, `AIO-PACKAGES` | `AIO-NEG-PORT` |
 | The installed host keeps serving across a restart and a repeated install | aio, multi-node | pre-push | `AIO-01`, `AIO-02`, `AIO-03`, `AIO-04`, `AIO-05`, `AIO-RESTART`, `AIO-IDEMPOTENT` | `AIO-NEG-DEP` |
 | The Panel API answers its documented caller and refuses the rest | aio, multi-node | pre-push | `AIO-AUTH`, `AIO-CLIENT`, `APIC-01` | `NEG-06` |
@@ -47,7 +47,7 @@ Behaviours: 37 across 9 areas, naming 218 of 218 catalog cases.
 | Host identity is confirmed out of band before a password is sent | aio, multi-node | pre-push | `SSHID-01` | `SSHID-02`, `BOOT-01` |
 | Temporary access is bounded by an armed remote expiry | aio, multi-node | pre-push | `TSSH-01`, `BOOT-02` | `TSSH-02` |
 | Target credentials stay on the control machine and are revoked | aio, multi-node | pre-push | `LOCAL-01`, `LOCAL-02`, `REV-01` | `REV-02` |
-| Each Vision domain is provisioned per node or refuses the host | aio, multi-node | pre-push | `VIS-01`, `VIS-02`, `VIS-03`, `VIS-07`, `VIS-08`, `MN-VISION` | `VIS-04`, `VIS-05`, `VIS-06` |
+| Each Vision domain is provisioned per node or refuses the host | aio, multi-node | pre-push | `VIS-01`, `VIS-02`, `VIS-03`, `VIS-07`, `VIS-08`, `MN-VISION` | `VIS-04`, `VIS-CONFIG`, `VIS-05`, `VIS-06` |
 | A Worker is deployed without a secret and registered as it runs | multi-node | pre-push | `MN-INSTALL`, `MN-ARGV-OBSERVER`, `WRK-01`, `WRK-04`, `WRK-05`, `WRK-06`, `CLUS-01`, `CLUS-02`, `CLUS-03` | `WRK-02`, `WRK-03`, `PODNET-MASTER-ADDR` |
 
 ## subscription-representations
