@@ -498,12 +498,21 @@ class TestTlsCaBundleCase(unittest.TestCase):
         self.assertEqual(len(legs), 5, f"five legs run the probe, got {len(legs)}")
         for script in legs:
             self.assertIn("127.0.0.1:443", script)
-        # Four legs supply a bundle; the fifth is the install's own fallback, so
-        # it must reach the probe with the variable absent rather than empty.
-        bundled = [script for script in legs if "GOWAVE_TLS_CA_FILE=" in script]
+        bundled = [script for script in legs if script.startswith("GOWAVE_TLS_CA_FILE=")]
         self.assertEqual(len(bundled), 4, f"four legs supply a bundle, got {len(bundled)}")
-        fallback = [script for script in legs if "GOWAVE_TLS_CA_FILE=" not in script]
-        self.assertEqual(len(fallback), 1, "exactly one leg runs without a bundle")
+        fallback = [script for script in legs if script.startswith("env -u GOWAVE_TLS_CA_FILE ")]
+        self.assertEqual(len(fallback), 1, "exactly one leg runs with the bundle removed")
+
+    def test_the_fallback_leg_removes_a_bundle_the_container_itself_carries(self):
+        # The target is created with the install environment, so the variable is
+        # part of the container's configuration and podman exec inherits it. A
+        # fallback leg that merely left it out would re-run the anchored leg.
+        _, podman = self.run_case()
+        fallback = [script for script in podman.scripts
+                    if "verify_public_tls_sni " in script
+                    and script.startswith("env -u GOWAVE_TLS_CA_FILE ")]
+        self.assertEqual(len(fallback), 1)
+        self.assertNotIn("GOWAVE_TLS_CA_FILE=", fallback[0])
 
     def test_the_per_run_bundle_leg_records_what_each_bundle_decided(self):
         evidence, _ = self.run_case()
