@@ -5678,15 +5678,20 @@ for line in dump.splitlines():
         continue
     parts = stripped.split()
     if len(parts) == 2 and not stripped.startswith("#"):
-        routes[parts[0]] = parts[1]
+        # The terminating semicolon is the directive's punctuation, not part of
+        # the backend it names; keeping it would make every target a string no
+        # contract could compare an address against.
+        routes[parts[0]] = parts[1].rstrip(";")
 
 # The fallback vhost is the server block that owns the PROXY-protocol listener,
-# and its root is the document tree that listener hands out.
+# and its root is the document tree that listener hands out. The dump prints the
+# directive as the file writes it, `listen` keyword included.
 lines = dump.splitlines()
 fallback_listen = 0
 fallback_root = ""
+listen_line = "listen FALLBACK_LISTEN_PLACEHOLDER;"
 for index, line in enumerate(lines):
-    if line.strip() != "FALLBACK_LISTEN_PLACEHOLDER;":
+    if line.strip() != listen_line:
         continue
     fallback_listen += 1
     for following in lines[index + 1:]:
