@@ -21,12 +21,13 @@ requirements:
   - requirement: Independent All-in-One acceptance topology
     scenarios:
       - scenario: All-in-One clean installation
-        cases: [AIO-INSTALL, AIO-PACKAGES, AIO-04, AIO-01, AIO-03, AIO-05, AIO-02, TLS-01]
+        cases: [AIO-INSTALL, AIO-PACKAGES, AIO-04, AIO-01, AIO-03, AIO-05, AIO-02, TLS-01, NGX-04]
         topologies: [aio]
         tests:
           - tests.test_podman_aio.TestAioSuite
           - tests.test_podman_aio.TestAioVerificationCases
           - tests.test_podman_aio.TestTlsCaBundleCase
+          - tests.test_podman_aio.TestVisionRouteCase
           - tests.test_podman_runner.TestPodmanRunnerContract
         jobs: [All-in-One Podman Acceptance]
       - scenario: All-in-One repeated provisioning
@@ -48,11 +49,12 @@ requirements:
           - tests.test_podman_cluster.TestClusterCases
         jobs: [Multi-Node Podman Acceptance]
       - scenario: Master and Worker optional domain configuration
-        cases: [MN-VISION]
+        cases: [MN-VISION, NGX-04]
         topologies: [multi-node]
         tests:
           - tests.test_podman_cluster.TestVisionCase
           - tests.test_podman_multi_node.TestMultiNodeCounts
+          - tests.test_podman_multi_node.TestVisionRouteCase
         jobs: [Multi-Node Podman Acceptance]
       - scenario: Worker dispatch is observed without the secret
         cases: [MN-ARGV-OBSERVER]

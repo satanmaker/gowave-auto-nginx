@@ -3695,6 +3695,220 @@ class TestDecoyCase(unittest.TestCase):
         self.assertEqual(record["topology"], ["aio"])
 
 
+VISION_ROUTED_SHA = "d" * 64
+VISION_OTHER_SHA = "e" * 64
+VISION_ROOT = "/var/www/gowave-auto-nginx/cover-reality"
+
+
+def vision_contour(
+    domain=topology.VISION_DOMAIN, target=aio.VISION_MAP_TARGET, listen=1,
+    bound=("127.0.0.1:8444", "127.0.0.1:9444"), root=VISION_ROOT, maps=1,
+):
+    """The contour probe's report, in the shape it prints it.
+
+    ``target=None`` is a host installed without the delegated name: the map it
+    runs carries no entry for it, and nothing listens on either Vision port.
+    """
+    routes = {"default": "127.0.0.1:8443"}
+    if target:
+        routes[domain] = target
+    return json.dumps({
+        "dump_returncode": 0,
+        "dump_bytes": 8192,
+        "stream_maps": maps,
+        "routes": routes,
+        "fallback_listen": listen,
+        "fallback_root": root,
+        "bound": {
+            port: [address for address in bound if address.rsplit(":", 1)[-1] == port]
+            for port in ("8444", "9444")
+        },
+    }, sort_keys=True) + "\n"
+
+
+def vision_answer(status="HTTP/1.1 200 OK", sha=VISION_ROUTED_SHA):
+    """One raw request answered by the fallback vhost, or refused by it."""
+    return json.dumps(
+        {"status": status, "bytes": 1024 if sha else 0, "sha256": sha, "error": ""},
+        sort_keys=True,
+    ) + "\n"
+
+
+class TestVisionRouteCase(unittest.TestCase):
+    """NGX-04: the delegated name's own contour, and its absence when none is configured."""
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def reports(self, replace=None):
+        """The three fetches the case makes, with single answers replaceable."""
+        domain = topology.VISION_DOMAIN
+        reports = [
+            decoy_report(f"https://{domain}/", 200, VISION_ROUTED_SHA, [domain]),
+            decoy_report(f"https://{topology.COVER_APEX}/", 200, VISION_ROUTED_SHA,
+                         [topology.COVER_APEX]),
+            decoy_report(f"https://{domain}/api/nodes", 404, DECOY_404_SHA, [domain]),
+        ]
+        for url, report in (replace or {}).items():
+            for index, existing in enumerate(reports):
+                if existing["probe"]["url"] == url:
+                    reports[index] = report
+                    break
+            else:
+                raise AssertionError(f"the case never asks for {url}")
+        return reports
+
+    def product(self, contour=None, proxied=None, bare=None, reports=None, enabled=True):
+        product, podman = installed_product(self.context, [
+            (contour if contour is not None else vision_contour(), 0),
+            (proxied if proxied is not None else vision_answer(), 0),
+            (bare if bare is not None
+             else vision_answer("HTTP/1.1 400 Bad Request", ""), 0),
+        ])
+        product.vision = enabled
+        product.host.client_reports = list(self.reports() if reports is None else reports)
+        return product, podman
+
+    def reject(self, expected, **kwargs):
+        product, _podman = self.product(**kwargs)
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_vision_route(product)
+        self.assertIn(expected, str(caught.exception))
+        return caught
+
+    def test_the_contour_routes_the_name_and_the_fallback_needs_the_proxy_header(self):
+        product, podman = self.product()
+        evidence = aio.case_vision_route(product)
+        self.assertEqual(evidence["combination"], "enabled")
+        self.assertEqual(evidence["vision_domain"], topology.VISION_DOMAIN)
+        self.assertEqual(evidence["routes"][topology.VISION_DOMAIN], aio.VISION_MAP_TARGET)
+        self.assertEqual(evidence["bound"]["8444"], ["127.0.0.1:8444"])
+        self.assertEqual(evidence["bound"]["9444"], ["127.0.0.1:9444"])
+        self.assertEqual(evidence["fallback_listen"], 1)
+        self.assertEqual(evidence["fallback_root"], VISION_ROOT)
+        self.assertEqual(evidence["route_status"], 200)
+        self.assertEqual(evidence["route_san"], [topology.VISION_DOMAIN])
+        self.assertEqual(evidence["route_sha256"], VISION_ROUTED_SHA)
+        self.assertEqual(evidence["proxied_status"], "HTTP/1.1 200 OK")
+        self.assertEqual(evidence["proxied_sha256"], VISION_ROUTED_SHA)
+        self.assertEqual(evidence["bare_status"], "HTTP/1.1 400 Bad Request")
+        self.assertEqual(evidence["bare_sha256"], "")
+        self.assertEqual(evidence["decoy_sha256"], VISION_ROUTED_SHA)
+        self.assertEqual(evidence["management_status"], 404)
+        self.assertEqual(len(podman.scripts), 3)
+        self.assertIn(aio.VISION_FALLBACK_LISTEN, podman.scripts[0])
+        self.assertIn("ss", podman.scripts[0])
+        for script in podman.scripts:
+            self.assertIn(topology.VISION_DOMAIN, script)
+        self.assertIn("PROXY TCP4", podman.scripts[1])
+        self.assertEqual(
+            podman.scripts[1].splitlines()[0],
+            f"python3 - {topology.VISION_DOMAIN} 1 <<'PY'",
+        )
+        self.assertEqual(
+            podman.scripts[2].splitlines()[0],
+            f"python3 - {topology.VISION_DOMAIN} 0 <<'PY'",
+        )
+
+    def test_the_name_is_fetched_from_the_client_and_pinned_to_its_own_certificate(self):
+        product, _podman = self.product()
+        aio.case_vision_route(product)
+        calls = {call["url"]: call for call in product.host.client_calls}
+        route = calls[f"https://{topology.VISION_DOMAIN}/"]
+        self.assertEqual(route["expect_status"], 200)
+        self.assertNotIn("insecure", route)
+        self.assertFalse(route.get("insecure", False))
+        self.assertEqual(
+            calls[f"https://{topology.VISION_DOMAIN}/api/nodes"]["expect_status"], 404,
+        )
+
+    def test_a_host_without_the_domain_owes_no_route_listener_or_vhost(self):
+        product, _podman = self.product(
+            contour=vision_contour(target=None, listen=0, bound=(), root=""), enabled=False,
+        )
+        evidence = aio.case_vision_route(product)
+        self.assertEqual(evidence["combination"], "disabled")
+        self.assertNotIn(topology.VISION_DOMAIN, evidence["routes"])
+        self.assertEqual(evidence["bound"], {"8444": [], "9444": []})
+        self.assertEqual(evidence["fallback_listen"], 0)
+        self.assertEqual(product.host.client_calls, [])
+
+    def test_a_disabled_contour_that_still_routes_the_name_is_refused(self):
+        self.reject("still routes", contour=vision_contour(listen=0, bound=(), root=""),
+                    enabled=False)
+
+    def test_a_disabled_contour_that_still_listens_is_refused(self):
+        self.reject("still listens on 8444", contour=vision_contour(target=None, listen=0),
+                    enabled=False)
+
+    def test_a_route_to_another_backend_is_refused(self):
+        self.reject("does not reach the Vision inbound",
+                    contour=vision_contour(target="127.0.0.1:8443"))
+
+    def test_a_backend_bound_beyond_loopback_is_refused(self):
+        self.reject(
+            "instead of exactly 127.0.0.1:8444",
+            contour=vision_contour(bound=("0.0.0.0:8444", "127.0.0.1:9444")),
+        )
+
+    def test_a_fallback_without_the_proxy_listener_is_refused(self):
+        self.reject("the inbound hands over to", contour=vision_contour(listen=0, root=""))
+
+    def test_a_fallback_that_answers_a_bare_request_is_refused(self):
+        self.reject("is not enforced",
+                    bare=vision_answer("HTTP/1.1 200 OK", VISION_ROUTED_SHA))
+
+    def test_a_fallback_serving_another_document_is_refused(self):
+        self.reject("do not hand out one document",
+                    proxied=vision_answer(sha=VISION_OTHER_SHA))
+
+    def test_a_certificate_that_does_not_name_the_name_is_refused(self):
+        url = f"https://{topology.VISION_DOMAIN}/"
+        self.reject(
+            "does not name",
+            reports=self.reports({url: decoy_report(
+                url, 200, VISION_ROUTED_SHA, [topology.COVER_APEX],
+            )}),
+        )
+
+    def test_a_route_that_does_not_serve_the_rendered_site_is_refused(self):
+        url = f"https://{topology.COVER_APEX}/"
+        self.reject(
+            "does not hand out the camouflage site",
+            reports=self.reports({url: decoy_report(
+                url, 200, VISION_OTHER_SHA, [topology.COVER_APEX],
+            )}),
+        )
+
+    def test_a_map_that_is_not_the_one_in_force_is_refused(self):
+        self.reject("not the one deciding the traffic", contour=vision_contour(maps=2))
+
+    def test_the_case_is_registered_before_the_reloads_and_catalogued(self):
+        suite = aio.cases(ScriptedPodman(self.context, []))
+        cases = {case.id: case for case in suite}
+        self.assertIn(aio.VISION_ROUTE_CASE_ID, cases)
+        self.assertEqual(cases[aio.VISION_ROUTE_CASE_ID].topology, "aio")
+        self.assertEqual(cases[aio.VISION_ROUTE_CASE_ID].timeout_seconds,
+                         aio.VISION_ROUTE_TIMEOUT_SECONDS)
+        ids = [case.id for case in suite]
+        self.assertLess(ids.index(aio.DECOY_CASE_ID), ids.index(aio.VISION_ROUTE_CASE_ID))
+        self.assertLess(ids.index(aio.VISION_ROUTE_CASE_ID), ids.index(aio.ACME_CASE_ID))
+        record = {case["id"]: case for case in catalog.load_catalog()["cases"]}[
+            aio.VISION_ROUTE_CASE_ID
+        ]
+        self.assertEqual(record["state"], "live-parity")
+        self.assertEqual(sorted(record["runs_in"]), ["live", "podman"])
+        self.assertEqual(sorted(record["topology"]), ["aio", "multi-node"])
+        self.assertEqual(record["driver_status"], "implemented")
+        self.assertEqual(sorted(record["drivers"]), ["aio", "multi-node"])
+        self.assertEqual(record["drivers"]["aio"]["driver"], "aio:case_vision_route")
+        self.assertIn("proxied_sha256", record["drivers"]["aio"]["evidence"])
+        self.assertEqual(record["drivers"]["multi-node"]["driver"],
+                         "multi_node:case_vision_route")
+
+
 class TestFaultCases(unittest.TestCase):
     """AIO-FAULT-PANEL / -XRAY / -LATENCY: the rendered probes, executed.
 
