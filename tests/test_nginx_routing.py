@@ -105,6 +105,9 @@ class TestNginxRouting(unittest.TestCase):
             self.assertIn("ssl_protocols TLSv1.3;", c)
             self.assertIn("access_log /var/log/nginx/gowave-decoy-access.log combined;", c)
             self.assertIn(f"root {cover_dir};", c)
+            # The decoy is a static site, not an nginx: a response that names the
+            # build and the distribution is a fingerprint the site does not need.
+            self.assertIn("server_tokens off;", c)
 
             # Verify static assets copied
             self.assertTrue((cover_dir / "index.html").exists())
