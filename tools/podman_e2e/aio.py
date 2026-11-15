@@ -5631,6 +5631,366 @@ def case_decoy(product: AioProduct) -> Dict[str, Any]:
     return decoy_isolation_contract(product, DECOY_CASE_ID)
 
 
+VISION_ROUTE_CASE_ID = "NGX-04"
+VISION_BACKEND_PORT = 8444
+VISION_FALLBACK_PORT = 9444
+# Where the install sends the delegated name, and the listener its fallback vhost
+# is generated with. Both are read out of the running configuration: the map the
+# stream module loaded decides where a ClientHello goes, and the `listen` line
+# decides whether the fallback accepts anything but a PROXY-aware sender.
+VISION_MAP_TARGET = f"127.0.0.1:{VISION_BACKEND_PORT}"
+VISION_FALLBACK_LISTEN = f"127.0.0.1:{VISION_FALLBACK_PORT} proxy_protocol"
+# One `nginx -T` dump and one socket table; the ceiling guards a stalled NGINX.
+VISION_CONTOUR_TIMEOUT_SECONDS = 60
+# One page, one management read and two loopback attempts, each one a separate
+# process in another container: the ceiling is a hang guard, not an expectation.
+VISION_PROBE_TIMEOUT_SECONDS = 30
+VISION_ROUTE_TIMEOUT_SECONDS = 300
+
+VISION_CONTOUR_SCRIPT = r"""python3 - VISION_DOMAIN_PLACEHOLDER <<'PY'
+import json, subprocess, sys
+
+domain = sys.argv[1]
+
+
+def run(argv):
+    done = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    return (done.stdout or "") + (done.stderr or ""), done.returncode
+
+
+dump, dump_status = run(["nginx", "-T"])
+
+# The server-name map is the routing rule itself. Reading it out of the dump
+# rather than out of the file that generated it is what makes the answer about
+# the configuration in force, reloaded or not.
+routes = {}
+maps = 0
+inside = False
+for line in dump.splitlines():
+    stripped = line.strip()
+    if not inside:
+        if stripped.startswith("map ") and "$ssl_preread_server_name" in stripped:
+            inside = True
+            maps += 1
+        continue
+    if stripped == "}":
+        inside = False
+        continue
+    parts = stripped.split()
+    if len(parts) == 2 and not stripped.startswith("#"):
+        routes[parts[0]] = parts[1]
+
+# The fallback vhost is the server block that owns the PROXY-protocol listener,
+# and its root is the document tree that listener hands out.
+lines = dump.splitlines()
+fallback_listen = 0
+fallback_root = ""
+for index, line in enumerate(lines):
+    if line.strip() != "FALLBACK_LISTEN_PLACEHOLDER;":
+        continue
+    fallback_listen += 1
+    for following in lines[index + 1:]:
+        if following.strip() == "}":
+            break
+        if following.strip().startswith("root "):
+            fallback_root = following.strip().split(None, 1)[1].rstrip(";")
+            break
+
+# The socket table says whether the two ports exist and what they are bound to:
+# a loopback-only endpoint is a target, a wildcard one is a public surface.
+sockets, _ = run(["ss", "-Hltn"])
+bound = {"8444": [], "9444": []}
+for line in sockets.splitlines():
+    fields = line.split()
+    if len(fields) >= 4 and fields[3].rsplit(":", 1)[-1] in bound:
+        bound[fields[3].rsplit(":", 1)[-1]].append(fields[3])
+
+print(json.dumps({
+    "dump_returncode": dump_status,
+    "dump_bytes": len(dump),
+    "stream_maps": maps,
+    "routes": routes,
+    "fallback_listen": fallback_listen,
+    "fallback_root": fallback_root,
+    "bound": bound,
+}, sort_keys=True))
+PY
+"""
+
+# A raw HTTP request, sent with and without the PROXY v1 line the Vision inbound
+# writes. The bare form is the control: the vhost is generated with
+# `proxy_protocol`, so a request that carries no header must not be served.
+VISION_FALLBACK_PROBE = r"""python3 - VISION_DOMAIN_PLACEHOLDER VISION_PROXIED_PLACEHOLDER <<'PY'
+import hashlib, json, socket, sys
+
+domain, proxied = sys.argv[1], sys.argv[2] == "1"
+prefix = "PROXY TCP4 198.51.100.7 127.0.0.1 45678 VISION_PORT_PLACEHOLDER\r\n" if proxied else ""
+request = (prefix + f"GET / HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n").encode()
+raw = b""
+error = ""
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.settimeout(10)
+try:
+    sock.connect(("127.0.0.1", VISION_PORT_PLACEHOLDER))
+    sock.sendall(request)
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        raw += chunk
+except Exception as caught:  # noqa: BLE001 - the probe reports, the case decides
+    error = type(caught).__name__ + ": " + str(caught)
+finally:
+    sock.close()
+
+head, _, body = raw.partition(b"\r\n\r\n")
+lines = head.split(b"\r\n")
+print(json.dumps({
+    "status": lines[0].decode("latin-1") if lines and lines[0] else "",
+    "bytes": len(body),
+    "sha256": hashlib.sha256(body).hexdigest() if body else "",
+    "error": error,
+}, sort_keys=True))
+PY
+"""
+
+
+def vision_contour_script(domain: str) -> str:
+    return (
+        VISION_CONTOUR_SCRIPT
+        .replace("VISION_DOMAIN_PLACEHOLDER", shlex.quote(domain))
+        .replace("FALLBACK_LISTEN_PLACEHOLDER", VISION_FALLBACK_LISTEN)
+    )
+
+
+def vision_fallback_script(domain: str, proxied: bool) -> str:
+    return (
+        VISION_FALLBACK_PROBE
+        .replace("VISION_DOMAIN_PLACEHOLDER", shlex.quote(domain))
+        .replace("VISION_PROXIED_PLACEHOLDER", "1" if proxied else "0")
+        .replace("VISION_PORT_PLACEHOLDER", str(VISION_FALLBACK_PORT))
+    )
+
+
+def _vision_fetch(
+    case_id: str, label: str, client_http: Any, name: str, path: str, status: int,
+) -> Dict[str, Any]:
+    """One fetch from the independent client, or a failure naming what it asked."""
+    report = client_http(
+        f"https://{name}{path}", expect_status=status, timeout=VISION_PROBE_TIMEOUT_SECONDS,
+    )
+    probe = report.get("probe") or {}
+    require(
+        case_id,
+        report.get("returncode") == 0,
+        f"{label}: GET https://{name}{path} did not answer as the Vision contour should: "
+        f"{probe.get('error') or report.get('stderr') or 'the probe printed no report'}",
+    )
+    return probe
+
+
+def vision_route_contract(
+    case_id: str, label: str, domain: str, enabled: bool, run: Any, client_http: Any,
+) -> Dict[str, Any]:
+    """What one host owes the delegated name, in the configuration it is running.
+
+    Three layers make the Vision contour one route rather than a second public
+    surface. The stream map gives the name its own backend; that backend and the
+    fallback it falls back to are loopback-only sockets, so neither port is
+    reachable from a client network; and the fallback is a vhost generated with
+    `proxy_protocol`, so only a sender that writes the PROXY v1 line — the
+    inbound — is served, while a bare HTTP request is not.
+
+    The traffic legs are what tell the contour from a plausible dump. A client
+    that trusts only the run's CA fetches the delegated name over 443: the
+    certificate it receives has to name the domain, because the stream sends that
+    name to the inbound, which terminates TLS with its own lineage — the decoy
+    and the REALITY listeners hold the other lineups. The same page is then asked
+    for directly on the fallback port twice: with the PROXY v1 line it must be
+    the document the routed leg served, and without it must not be served at all.
+
+    A host installed without a delegated name owes the opposite, and it is read
+    the same way: no route for the name, no listener on either port, no
+    PROXY-protocol vhost in the dump.
+    """
+    contour = probe_json(
+        case_id, f"{label}'s Vision contour", run(vision_contour_script(domain)),
+    )
+    require(
+        case_id,
+        contour.get("dump_returncode") == 0 and int(contour.get("dump_bytes") or 0) > 0,
+        f"{label}: `nginx -T` produced no configuration dump",
+    )
+    require(
+        case_id,
+        contour.get("stream_maps") == 1,
+        f"{label}'s running configuration carries {contour.get('stream_maps')!r} ssl_preread "
+        "server-name maps, not one, so the route below could be read from a map that is not "
+        "the one deciding the traffic",
+    )
+    routes = dict(contour.get("routes") or {})
+    bound = contour.get("bound") or {}
+    evidence = {
+        "combination": "enabled" if enabled else "disabled",
+        "vision_domain": domain,
+        "routes": routes,
+        "bound": bound,
+        "fallback_listen": contour.get("fallback_listen"),
+        "fallback_root": contour.get("fallback_root"),
+    }
+
+    if not enabled:
+        require(
+            case_id,
+            domain not in routes,
+            f"{label} is installed without a Vision domain and still routes {domain} to "
+            f"{routes.get(domain)!r}",
+        )
+        for port in (VISION_BACKEND_PORT, VISION_FALLBACK_PORT):
+            listeners = bound.get(str(port)) or []
+            require(
+                case_id,
+                not listeners,
+                f"{label} is installed without a Vision domain and still listens on {port}: "
+                f"{listeners}",
+            )
+        require(
+            case_id,
+            contour.get("fallback_listen") == 0,
+            f"{label} is installed without a Vision domain and its running configuration still "
+            f"carries {contour.get('fallback_listen')!r} {VISION_FALLBACK_LISTEN}; listeners",
+        )
+        return evidence
+
+    require(
+        case_id,
+        routes.get(domain) == VISION_MAP_TARGET,
+        f"{label} routes {domain} to {routes.get(domain)!r} instead of {VISION_MAP_TARGET}, so "
+        "the delegated name does not reach the Vision inbound (map: "
+        f"{sorted(routes.items())})",
+    )
+    for port, wanted in (
+        (VISION_BACKEND_PORT, VISION_MAP_TARGET),
+        (VISION_FALLBACK_PORT, f"127.0.0.1:{VISION_FALLBACK_PORT}"),
+    ):
+        listeners = bound.get(str(port)) or []
+        require(
+            case_id,
+            listeners == [wanted],
+            f"{label}'s Vision contour listens on {listeners or 'nothing'} for port {port} "
+            f"instead of exactly {wanted}, so that port is not the loopback endpoint the "
+            "contour names",
+        )
+    require(
+        case_id,
+        contour.get("fallback_listen") == 1,
+        f"{label}'s running configuration carries {contour.get('fallback_listen')!r} listeners "
+        f"on {VISION_FALLBACK_LISTEN}, not one, so the fallback is not the PROXY-protocol vhost "
+        "the inbound hands over to",
+    )
+    require(
+        case_id,
+        contour.get("fallback_root"),
+        f"{label}'s {VISION_FALLBACK_PORT} vhost serves no document root, so it has no site to "
+        "hand out",
+    )
+
+    route = _vision_fetch(case_id, label, client_http, domain, "/", 200)
+    sans = list((route.get("peer") or {}).get("san") or [])
+    require(
+        case_id,
+        domain in sans,
+        f"https://{domain}/ was served a certificate that does not name {domain}: {sans}. The "
+        "stream sends that name to the Vision inbound, which terminates TLS with its own "
+        "lineage; any other certificate means the request never reached it",
+    )
+    routed_sha = route.get("body_sha256") or ""
+    require(
+        case_id,
+        int(route.get("body_length") or 0) > 0,
+        f"https://{domain}/ answered {route.get('status')!r} with an empty body, so the routed "
+        "leg served no site",
+    )
+
+    proxied = probe_json(
+        case_id, f"the {VISION_FALLBACK_PORT} vhost with a PROXY header",
+        run(vision_fallback_script(domain, True)),
+    )
+    bare = probe_json(
+        case_id, f"the {VISION_FALLBACK_PORT} vhost without one",
+        run(vision_fallback_script(domain, False)),
+    )
+    proxied_status = str(proxied.get("status") or "")
+    bare_status = str(bare.get("status") or "")
+    require(
+        case_id,
+        proxied_status.startswith("HTTP/1.1 200"),
+        f"{label}'s {VISION_FALLBACK_PORT} vhost refused a request carrying a PROXY v1 header "
+        f"with {proxied_status!r}: {proxied.get('error') or 'no error reported'}",
+    )
+    require(
+        case_id,
+        proxied.get("sha256") == routed_sha,
+        f"the fallback leg served {proxied.get('sha256')} and the routed leg {routed_sha}, so "
+        "the delegated name and the fallback do not hand out one document",
+    )
+    require(
+        case_id,
+        not bare_status.startswith("HTTP/1.1 200"),
+        f"{label}'s {VISION_FALLBACK_PORT} vhost answered {bare_status!r} to a request that "
+        "carried no PROXY header, so the listener accepts a plain HTTP client and the PROXY "
+        "protocol the contour documents is not enforced",
+    )
+    require(
+        case_id,
+        bare.get("sha256") != routed_sha,
+        f"the bare request received the routed leg's document ({bare.get('sha256')}), so the "
+        "fallback served a plain HTTP client as if the inbound had spoken for it",
+    )
+
+    cover = topology.COVER_APEX
+    decoy = _vision_fetch(case_id, label, client_http, cover, "/", 200)
+    require(
+        case_id,
+        decoy.get("body_sha256") == routed_sha,
+        f"https://{cover}/ serves {decoy.get('body_sha256')} while the Vision route serves "
+        f"{routed_sha}, so the fallback does not hand out the camouflage site the decoy renders",
+    )
+
+    management = _vision_fetch(case_id, label, client_http, domain, "/api/nodes", 404)
+    evidence["route_status"] = route.get("status")
+    evidence["route_san"] = sans
+    evidence["route_sha256"] = routed_sha
+    evidence["proxied_status"] = proxied_status
+    evidence["proxied_sha256"] = proxied.get("sha256")
+    evidence["bare_status"] = bare_status
+    evidence["bare_sha256"] = bare.get("sha256")
+    evidence["decoy_sha256"] = decoy.get("body_sha256")
+    evidence["management_status"] = management.get("status")
+    return evidence
+
+
+def case_vision_route(product: AioProduct) -> Dict[str, Any]:
+    """NGX-04: the delegated name reaches its inbound, and its fallback is PROXY-only.
+
+    The Vision route is the optional third contour of the deployment: the stream
+    hands the delegated name to a fifth inbound on ``127.0.0.1:8444``, and a
+    client the inbound does not authenticate is handed to a cleartext vhost on
+    ``127.0.0.1:9444`` that accepts only the PROXY v1 line Xray writes.
+
+    The case asks the shipped host both halves of that — the contour, when the
+    install was given the domain, and its absence when it was not — because a run
+    without the domain is a configured deployment too, and a listener left behind
+    on either port would be a public surface nothing declares.
+    """
+    host = product.require_installed()
+    evidence = vision_route_contract(
+        VISION_ROUTE_CASE_ID, "the Master", topology.VISION_DOMAIN, bool(product.vision),
+        product.host_script, host.client_http,
+    )
+    return evidence
+
+
 CHANNEL_NOOP_CASE_ID = "AIO-CHANNEL-NOOP"
 CHANNEL_DEV_CASE_ID = "AIO-CHANNEL-DEV"
 CHANNEL_ROLLBACK_CASE_ID = "AIO-CHANNEL-ROLLBACK"
@@ -7126,6 +7486,12 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # measured here, while no case has changed the tree or the lineage yet.
         Case(DECOY_CASE_ID, "aio", lambda context: case_decoy(product),
              timeout_seconds=DECOY_TIMEOUT_SECONDS),
+        # The Vision contour is read the same way: the running map and socket
+        # table, then the delegated name over 443 and its fallback over the
+        # loopback. Nothing here writes, so it stays with the other read-only
+        # surfaces above the reload cases.
+        Case(VISION_ROUTE_CASE_ID, "aio", lambda context: case_vision_route(product),
+             timeout_seconds=VISION_ROUTE_TIMEOUT_SECONDS),
         # The renewal runs before any traffic for the same reason: it reloads
         # NGINX onto a fresh lineage, and a data-plane case must not be measured
         # across a reload this one caused.

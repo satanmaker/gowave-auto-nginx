@@ -31,7 +31,10 @@ sys.path.insert(0, str(TESTS_DIR))
 
 from tools.podman_e2e import aio, budget, matrix, mtls, multi_node, panel_surface, topology  # noqa: E402
 from tools.podman_e2e.runner import Case, CaseBlocked  # noqa: E402
-from test_podman_aio import BROKEN_TAIL, nginx_probe  # noqa: E402
+from test_podman_aio import (  # noqa: E402
+    BROKEN_TAIL, VISION_OTHER_SHA, VISION_ROUTED_SHA, nginx_probe, vision_answer,
+    vision_contour,
+)
 
 
 class _StubContext:
@@ -1810,6 +1813,145 @@ class TestMultiNodeSuite(unittest.TestCase):
         self.assertEqual(suite[aio.TLS_CASE_ID].timeout_seconds,
                          multi_node.TLS_CASE_TIMEOUT_SECONDS)
         self.assertEqual(suite[aio.TLS_CASE_ID].topology, "multi-node")
+
+    def test_the_vision_route_case_precedes_the_lifecycle_cases(self):
+        # 9.2 NGX-04: both nodes' contours are read from the running cluster and
+        # from the traffic each name receives, so a later Worker shutdown or a
+        # renamed Master cannot be blamed for what the client saw here.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertLess(ids.index(aio.VISION_ROUTE_CASE_ID),
+                        ids.index(multi_node.REVOCATION_CASE_ID))
+        suite = {case.id: case for case in multi_node.cases(self.podman)}
+        self.assertEqual(suite[aio.VISION_ROUTE_CASE_ID].topology, "multi-node")
+        self.assertEqual(suite[aio.VISION_ROUTE_CASE_ID].timeout_seconds,
+                         2 * aio.VISION_ROUTE_TIMEOUT_SECONDS)
+
+
+class _VisionRoutePodman:
+    """The two hosts' probes, answered in the order the case asks for them."""
+
+    def __init__(self, answers):
+        self.answers = list(answers)
+        self.calls = []
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        self.calls.append((container, script, timeout))
+        return subprocess.CompletedProcess(["bash", "-lc", script], 0, self.answers.pop(0), "")
+
+
+class _VisionRouteHost:
+    """The Master's client role: one fetch per URL, answered in order."""
+
+    target_name = "aio-master"
+    worker_name = "worker-01"
+
+    def __init__(self, reports):
+        self.client_reports = list(reports)
+        self.client_calls = []
+
+    def client_http(self, url, **kwargs):
+        self.client_calls.append({"url": url, **kwargs})
+        return self.client_reports.pop(0)
+
+
+class _VisionRouteProduct:
+    """The cluster the Vision route case reads, without containers."""
+
+    def __init__(self, vision=False, worker_vision=False, answers=(), reports=()):
+        self.vision = vision
+        self.worker_vision = worker_vision
+        self.podman = _VisionRoutePodman(answers)
+        self.host = _VisionRouteHost(reports)
+
+    def require_worker(self):
+        return self.host
+
+
+class TestVisionRouteCase(unittest.TestCase):
+    """NGX-04 on a cluster: each node's own contour, or its own absence."""
+
+    def _reports(self, name=topology.WORKER_VISION_DOMAIN, sha=VISION_ROUTED_SHA):
+        return [
+            decoy_vision_report(f"https://{name}/", 200, sha, [name]),
+            decoy_vision_report(f"https://{topology.COVER_APEX}/", 200, sha,
+                                [topology.COVER_APEX]),
+            decoy_vision_report(f"https://{name}/api/nodes", 404, VISION_OTHER_SHA, [name]),
+        ]
+
+    def _product(self, vision=False, worker_vision=True, answers=None, reports=None):
+        return _VisionRouteProduct(
+            vision=vision, worker_vision=worker_vision,
+            answers=answers if answers is not None else [
+                vision_contour(target=None, listen=0, bound=(), root=""),
+                vision_contour(domain=topology.WORKER_VISION_DOMAIN),
+                vision_answer(),
+                vision_answer("HTTP/1.1 400 Bad Request", ""),
+            ],
+            reports=self._reports() if reports is None else reports,
+        )
+
+    def test_each_node_is_read_against_its_own_name_and_its_own_answer(self):
+        product = self._product()
+        evidence = multi_node.case_vision_route(product)
+        self.assertEqual(evidence["master"]["combination"], "disabled")
+        self.assertEqual(evidence["worker"]["combination"], "enabled")
+        self.assertEqual(evidence["master"]["vision_domain"], topology.VISION_DOMAIN)
+        self.assertEqual(evidence["worker"]["vision_domain"], topology.WORKER_VISION_DOMAIN)
+        self.assertEqual(evidence["worker"]["route_status"], 200)
+        self.assertEqual(evidence["worker"]["proxied_sha256"], VISION_ROUTED_SHA)
+        self.assertEqual([call[0] for call in product.podman.calls],
+                         ["aio-master", "worker-01", "worker-01", "worker-01"])
+        self.assertIn(topology.VISION_DOMAIN, product.podman.calls[0][1])
+        self.assertIn(topology.WORKER_VISION_DOMAIN, product.podman.calls[1][1])
+        self.assertIn(aio.VISION_FALLBACK_LISTEN, product.podman.calls[1][1])
+        self.assertEqual(
+            [call["url"] for call in product.host.client_calls],
+            [f"https://{topology.WORKER_VISION_DOMAIN}/",
+             f"https://{topology.COVER_APEX}/",
+             f"https://{topology.WORKER_VISION_DOMAIN}/api/nodes"],
+        )
+
+    def test_the_masters_absence_cannot_satisfy_the_workers_contour(self):
+        # A Worker installed without the domain is the common case, and the case
+        # has to prove that absence rather than let the Master's route answer for
+        # it: flipping only the flags leaves the contour's own answers in place,
+        # and each node must be refused for what it actually runs.
+        product = self._product(
+            vision=True, worker_vision=False,
+            answers=[vision_contour(), vision_answer(), vision_answer(
+                "HTTP/1.1 400 Bad Request", ""),
+                vision_contour(domain=topology.WORKER_VISION_DOMAIN)],
+            reports=self._reports(name=topology.VISION_DOMAIN),
+        )
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_vision_route(product)
+        self.assertIn("the Worker is installed without a Vision domain and still routes",
+                      str(caught.exception))
+
+    def test_a_worker_whose_own_contour_fails_is_named_as_the_worker(self):
+        product = self._product(
+            answers=[
+                vision_contour(target=None, listen=0, bound=(), root=""),
+                vision_contour(domain=topology.WORKER_VISION_DOMAIN,
+                               target="127.0.0.1:8443"),
+            ],
+        )
+        with self.assertRaises(AssertionError) as caught:
+            multi_node.case_vision_route(product)
+        self.assertIn("the Worker routes", str(caught.exception))
+
+
+def decoy_vision_report(url, status, sha, san=(), version="TLSv1.3", length=1024):
+    """One independent-client fetch, in the shape the probe prints it."""
+    probe = {
+        "url": url,
+        "status": status,
+        "body_length": length,
+        "body_sha256": sha,
+        "body_snippet": "",
+        "peer": {"san": list(san), "tls_version": version, "issuer": "CN=Pebble Intermediate CA"},
+    }
+    return {"returncode": 0, "probe": probe, "stdout": json.dumps(probe), "stderr": ""}
 
 
 _COVER_MASTER_IP = "10.89.0.10"

@@ -1865,8 +1865,31 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_vision_route
+      evidence:
+      - bare_sha256
+      - bare_status
+      - bound
+      - combination
+      - decoy_sha256
+      - fallback_listen
+      - fallback_root
+      - management_status
+      - proxied_sha256
+      - proxied_status
+      - route_san
+      - route_sha256
+      - route_status
+      - routes
+      - vision_domain
+    multi-node:
+      driver: multi_node:case_vision_route
+      evidence:
+      - master
+      - worker
   promotion_target: null
 - id: DP-01
   requirement: Data Plane E2E Traffic Through All VPN Endpoints

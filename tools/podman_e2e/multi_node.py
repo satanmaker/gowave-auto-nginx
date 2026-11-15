@@ -5245,6 +5245,43 @@ def case_decoy_route(product: MultiNodeProduct) -> Dict[str, Any]:
     return evidence
 
 
+def case_vision_route(product: MultiNodeProduct) -> Dict[str, Any]:
+    """NGX-04 on a cluster: each node's own contour, or its own absence.
+
+    The delegated name is provisioned per node, so the same contract is asked of
+    each host separately and against its own name: a cluster where the Master
+    carries the contour and the Worker does not is a legitimate deployment, and
+    reading only the Master would call it complete. The two answers are recorded
+    under the node they belong to, because flattening them would let the Worker's
+    absence satisfy the Master's route and vice versa.
+
+    Both nodes are asked through the operator's own host, and the traffic legs
+    leave from the Control Machine, which resolves each node's name to that
+    node's address: a Worker contour proven from the Master's address would be
+    evidence about the wrong host.
+    """
+    host = product.require_worker()
+    master = aio.vision_route_contract(
+        aio.VISION_ROUTE_CASE_ID, "the Master", topology.VISION_DOMAIN, bool(product.vision),
+        lambda script: product.podman.exec_bash(
+            host.target_name, script, check=False,
+            timeout=aio.VISION_CONTOUR_TIMEOUT_SECONDS * 2,
+        ),
+        host.client_http,
+    )
+    worker = aio.vision_route_contract(
+        aio.VISION_ROUTE_CASE_ID, "the Worker", topology.WORKER_VISION_DOMAIN,
+        bool(product.worker_vision),
+        lambda script: product.podman.exec_bash(
+            host.worker_name, script, check=False,
+            timeout=aio.VISION_CONTOUR_TIMEOUT_SECONDS * 2,
+        ),
+        host.client_http,
+    )
+    evidence = {"master": master, "worker": worker}
+    return evidence
+
+
 def acme_challenge_script(token: str) -> str:
     """Put a token in the role's own ACME webroot, where HTTP-01 reads it."""
     return f"""set -u
@@ -7629,6 +7666,13 @@ def cases(
         # nothing, so it runs here, before the cases that change the tree.
         Case(aio.TLS_CA_CASE_ID, "multi-node", lambda context: aio.case_tls_ca_bundle(product.master),
              timeout_seconds=aio.TLS_CA_TIMEOUT_SECONDS),
+        # Both nodes' Vision contours, read from the running configuration and
+        # from the traffic each name receives, before the cases below change the
+        # tree. A node without a delegated name owes its absence, which is read
+        # by the same contract rather than assumed.
+        Case(aio.VISION_ROUTE_CASE_ID, "multi-node",
+             lambda context: case_vision_route(product),
+             timeout_seconds=2 * aio.VISION_ROUTE_TIMEOUT_SECONDS),
         Case("SUB-SERVED", "multi-node", lambda context: aio.case_subscriptions(product.master),
              timeout_seconds=SUB_SERVED_TIMEOUT_SECONDS),
         Case("SUB-B64", "multi-node", lambda context: aio.case_share_links(product.master),
