@@ -544,6 +544,42 @@ def evidence(facts: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def account(measurement: Measurement, facts: Dict[str, Any]) -> str:
+    """The whole measurement as text, for a case whose verdict the capture decided.
+
+    ``evidence()`` is what a passing case records, and a failing one records
+    nothing at all: the runner keeps only the files a case wrote, so an
+    INCOMPLETE capture leaves a reader with the verdict's one sentence and no
+    account of what each probe actually printed — which host reported which
+    address, what its summary said, and what the request itself claimed. This
+    renders that account; the caller decides whether to write it, so the property
+    that nothing here persists stays true.
+    """
+    lines = [
+        f"verdict: {facts['verdict']}",
+        f"reason: {facts['reason']}",
+        f"port: {measurement.port}",
+        f"intended: {measurement.intended}",
+        f"client: {measurement.client or 'unreported'}",
+    ]
+    if measurement.identity_error:
+        lines.append(f"identity_error: {measurement.identity_error}: {measurement.identity_detail}")
+    roles = sorted(
+        set(measurement.addresses) | set(measurement.captures) | set(measurement.capture_errors)
+    )
+    for role in roles:
+        lines.append(f"host {role}:")
+        lines.append(f"  address: {measurement.addresses.get(role) or 'unreported'}")
+        if role in measurement.capture_errors:
+            lines.append(f"  capture_error: {measurement.capture_errors[role]}")
+            continue
+        lines.append(f"  summary: {json.dumps(measurement.captures.get(role), sort_keys=True)}")
+    request = measurement.request if isinstance(measurement.request, dict) else {}
+    for key in sorted(request):
+        lines.append(f"request.{key}: {request[key]}")
+    return "\n".join(lines) + "\n"
+
+
 def require(case_id: str, facts: Dict[str, Any]) -> None:
     """Refuse a request whose packet evidence does not decide in the product's favour."""
     if facts["verdict"] == PASS:

@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 90
-  total: 215
+  podman_first: 91
+  total: 216
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -631,8 +631,16 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:AioProduct.install
+      evidence: []
+      case: AIO-INSTALL
+    multi-node:
+      driver: multi_node:MultiNodeProduct.install
+      evidence: []
+      case: MN-INSTALL
   promotion_target: null
 - id: VER-02
   requirement: Pinned Version Fidelity
@@ -658,8 +666,21 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_installer_pin
+      evidence:
+      - floating_commit
+      - install_refused
+      - installer_untouched
+      - matching_bytes
+      - mismatched_bytes
+      - missing_digest
+      - pinned_pair
+      - short_digest
+      - url_names_commit
+      case: AIO-NEG-PIN
   promotion_target: null
 - id: VER-03
   requirement: Pinned Version Fidelity
@@ -687,8 +708,80 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
+      - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: AIO-DP-REALITY-xray
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
+      - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: MN-DP-master-REALITY-xray
   promotion_target: null
 - id: AIO-01
   requirement: All-in-One Master VPS Installation Verification
@@ -2041,6 +2134,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -2074,6 +2170,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -2124,29 +2223,6 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
-  promotion_target: null
-- id: DP-04
-  requirement: Data Plane E2E Traffic Through All VPN Endpoints
-  live_scenario: Xray runtime request traverses the selected Master endpoint
-  assertion: '**GIVEN** a Master endpoint outbound has been extracted from the real Xray subscription
-
-    **WHEN** a real Xray process exposes a local SOCKS5 listener and the runner sends an HTTPS request
-    through that selected outbound
-
-    **THEN** the request succeeds, egress matches the configured Master expectation (or documented direct-egress
-    baseline), and isolated packet evidence increases on Master during the request window'
-  assertion_sha256: 62cf714d00e8f50ecb990c4407550afb3646cc08bda9b4a8dd07d3f48aed2c3c
-  runs_in:
-  - podman
-  - live
-  state: live-parity
-  environment: container
-  topology:
-  - aio
-  - multi-node
-  gate: pre-push
   driver_status: implemented
   drivers:
     aio:
@@ -2154,6 +2230,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -2187,6 +2266,104 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
+      - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: MN-DP-master-REALITY-xray
+  promotion_target: null
+- id: DP-04
+  requirement: Data Plane E2E Traffic Through All VPN Endpoints
+  live_scenario: Xray runtime request traverses the selected Master endpoint
+  assertion: '**GIVEN** a Master endpoint outbound has been extracted from the real Xray subscription
+
+    **WHEN** a real Xray process exposes a local SOCKS5 listener and the runner sends an HTTPS request
+    through that selected outbound
+
+    **THEN** the request succeeds, egress matches the configured Master expectation (or documented direct-egress
+    baseline), and isolated packet evidence increases on Master during the request window'
+  assertion_sha256: 62cf714d00e8f50ecb990c4407550afb3646cc08bda9b4a8dd07d3f48aed2c3c
+  runs_in:
+  - podman
+  - live
+  state: live-parity
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:_data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
+      - inbound
+      - ingress_client
+      - ingress_foreign
+      - ingress_intended
+      - ingress_intended_captured
+      - ingress_intended_matched
+      - ingress_other
+      - ingress_other_captured
+      - ingress_other_matched
+      - ingress_port
+      - ingress_reason
+      - mihomo_allow_lan
+      - mihomo_controller
+      - mihomo_mixed_port
+      - mihomo_proxies
+      - mihomo_redir_port
+      - mihomo_rules
+      - mihomo_socks_port
+      - node
+      - outbounds
+      - server
+      - sni
+      - source_ip
+      - status
+      - tag
+      - transfer_budget_seconds
+      - transport
+      case: AIO-DP-REALITY-xray
+    multi-node:
+      driver: multi_node:data_plane_case
+      evidence:
+      - client
+      - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -2245,6 +2422,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -2278,6 +2458,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -2334,6 +2517,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -2367,6 +2553,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -2423,6 +2612,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -2478,6 +2670,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -3713,6 +3908,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -4518,6 +4716,37 @@ cases:
       - public_before
       - public_without_dependency
   promotion_target: All-in-One Master VPS Installation Verification
+- id: AIO-NEG-PIN
+  requirement: Pinned Version Fidelity
+  live_scenario: null
+  assertion: A floating installer branch, a missing digest, a digest that is not 64 hex characters and
+    an installer whose bytes do not match the configured SHA-256 are each refused, the pinned commit and
+    digest together are accepted, the URL the pin derives names that commit rather than a branch, and
+    the product's own install entrypoint returns non-zero for the floating branch while the node binary
+    and its unit stay byte-identical.
+  assertion_sha256: 9e4d66d69a661257f82913315400bc10efa20b9de8be35a18205694bb6c4027d
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_installer_pin
+      evidence:
+      - floating_commit
+      - install_refused
+      - installer_untouched
+      - matching_bytes
+      - mismatched_bytes
+      - missing_digest
+      - pinned_pair
+      - short_digest
+      - url_names_commit
+  promotion_target: Pinned Version Fidelity
 - id: AIO-CHANNEL-NOOP
   requirement: All-in-One Master VPS Installation Verification
   live_scenario: null
@@ -5622,6 +5851,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -5672,6 +5904,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -5722,6 +5957,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -5772,6 +6010,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -5822,6 +6063,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -5872,6 +6116,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -5922,6 +6169,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -5972,6 +6222,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6022,6 +6275,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6072,6 +6328,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6152,6 +6411,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6203,6 +6465,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6254,6 +6519,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6305,6 +6573,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6356,6 +6627,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6407,6 +6681,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6458,6 +6735,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6509,6 +6789,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6560,6 +6843,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6611,6 +6897,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6662,6 +6951,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6713,6 +7005,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6764,6 +7059,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6815,6 +7113,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6866,6 +7167,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6917,6 +7221,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -6968,6 +7275,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -7019,6 +7329,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -7070,6 +7383,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign
@@ -7121,6 +7437,9 @@ cases:
       evidence:
       - client
       - connect_budget_seconds
+      - engine_binary
+      - engine_version
+      - engine_version_expected
       - inbound
       - ingress_client
       - ingress_foreign

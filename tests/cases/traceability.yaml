@@ -447,14 +447,18 @@ cases_by_requirement:
       operator, so the disk, Panel, core-process and latency faults serve the
       requirement directly
   - requirement: Live scenario parity
-    cases: [AIO-PKT-02, MN-PKT-03]
+    cases: [AIO-PKT-02, MN-PKT-03, AIO-NEG-PIN]
     reason: >-
-      both witness a sentence of the live capability's per-case packet-evidence
-      requirement — INCOMPLETE when the capture tool, the source-IP identity or
-      a valid summary is missing, FAIL when a correct payload is attributed to
-      the wrong VPS — and the delta spec states no scenario for that
-      requirement; what it states about these two cases is the parity sentence
-      itself, a Podman case for every container-reproducible live scenario
+      all three witness a sentence of the live capability the delta spec states
+      no scenario of its own for. The first two serve its per-case
+      packet-evidence requirement — INCOMPLETE when the capture tool, the
+      source-IP identity or a valid summary is missing, FAIL when a correct
+      payload is attributed to the wrong VPS — and AIO-NEG-PIN serves its
+      pinned-version requirement, where a floating installer branch or an
+      installer whose bytes miss the configured digest has to be refused before
+      anything runs; what the delta spec states about them is the parity
+      sentence itself, a Podman case for every container-reproducible live
+      scenario
 
 # What the published report has to cover, one declaration at a time. A plain
 # path is met by any behaviour that quotes it; `every_value` makes every element

@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 from . import (
     acme_fixture,
     budget,
+    client_image,
     client_trust,
     ingress,
     matrix,
@@ -33,6 +34,10 @@ from . import (
 )
 from .podman import wait_until
 from .runner import Case, CaseBlocked, CaseIncomplete, require
+# One version rule for both contours: the live runner interrogates the same three
+# binaries over SSH, and a second copy would let the two disagree about what a
+# pin means.
+from tools.live_vps.versions import output_matches_expected_version, version_token
 
 INSTALL_CASE_ID = "AIO-INSTALL"
 
@@ -123,6 +128,48 @@ TRAFFIC_TIMEOUT_SECONDS = 900
 # One matrix case starts one engine and sends one payload; it must not inherit
 # the deadline of the whole matrix.
 DATA_PLANE_TIMEOUT_SECONDS = 300
+
+# The three binaries the live runner interrogates on the Master, read here inside
+# the target through one command each. Separate commands matter: a single probe
+# that fell back from the core to the Node binary would report the Node's version
+# twice and prove nothing about the core it supervises.
+INSTALLED_VERSION_SCRIPT = r"""
+python3 - <<'PY'
+import json
+import os
+import subprocess
+
+COMPONENTS = (
+    ("panel", ("/opt/gowave/gowave-server",), (("--version",), ("version",))),
+    ("node", ("/opt/gowave-node/gowave-node", "/usr/local/bin/gowave-node"),
+     (("--version",), ("version",))),
+    ("xray_server", ("/opt/gowave-node/rw-core",), (("version",),)),
+)
+
+report = {}
+for component, binaries, attempts in COMPONENTS:
+    binary = next((path for path in binaries if os.path.exists(path)), "")
+    entry = {"binary": binary, "argv": "", "returncode": None, "stdout": "", "stderr": ""}
+    for suffix in attempts:
+        if not binary:
+            break
+        try:
+            result = subprocess.run((binary, *suffix), capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as error:
+            entry["stderr"] = str(error)
+            break
+        entry.update({
+            "argv": " ".join((binary, *suffix)),
+            "returncode": result.returncode,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+        })
+        if result.returncode == 0 and (result.stdout.strip() or result.stderr.strip()):
+            break
+    report[component] = entry
+print(json.dumps(report, sort_keys=True))
+PY
+"""
 
 # A restart of the product's own units is bounded by the same kind of deadline as
 # any other readiness wait; the interval is coarse because every poll is an exec.
@@ -270,6 +317,114 @@ if GOWAVE_ACME_TEST_MODE=0 \
     echo "letsencrypt_production=accepted"
 else
     echo "letsencrypt_production=refused"
+fi
+"""
+
+# The installer pin, asked directly instead of by running an install: the commit
+# has to be one 40-hex SHA, the digest one 64-hex SHA-256, the URL the pin derives
+# must name that commit rather than a branch, and the bytes on disk must match the
+# digest before they are executed. The last probe calls the real install path with
+# a scratch SCRIPT_DIR, because this workstation bind-mounts /repo into the
+# container and the bundled installer there would otherwise answer for the pinned
+# branch the live runner takes.
+INSTALLER_PIN_SCRIPT = r"""
+source /repo/modules/node.sh
+# node.sh enables errexit; every probe below is a negative that has to be allowed
+# to fail, so each one is guarded instead of aborting the script.
+set +e
+pin_commit=0123456789abcdef0123456789abcdef01234567
+zero_digest=$(printf '%064d' 1)
+if GOWAVE_NODE_INSTALLER_COMMIT=main GOWAVE_NODE_INSTALLER_SHA256="$zero_digest" \
+    validate_node_installer_pin >/dev/null 2>&1; then
+    echo "floating_commit=accepted"
+else
+    echo "floating_commit=refused"
+fi
+if GOWAVE_NODE_INSTALLER_COMMIT="$pin_commit" GOWAVE_NODE_INSTALLER_SHA256= \
+    validate_node_installer_pin >/dev/null 2>&1; then
+    echo "missing_digest=accepted"
+else
+    echo "missing_digest=refused"
+fi
+if GOWAVE_NODE_INSTALLER_COMMIT="$pin_commit" \
+    GOWAVE_NODE_INSTALLER_SHA256="$pin_commit" \
+    validate_node_installer_pin >/dev/null 2>&1; then
+    echo "short_digest=accepted"
+else
+    echo "short_digest=refused"
+fi
+if GOWAVE_NODE_INSTALLER_COMMIT="$pin_commit" \
+    GOWAVE_NODE_INSTALLER_SHA256="$zero_digest" \
+    validate_node_installer_pin >/dev/null 2>&1; then
+    echo "pinned_pair=accepted"
+else
+    echo "pinned_pair=refused"
+fi
+url=$(GOWAVE_NODE_INSTALLER_COMMIT="$pin_commit" pinned_node_installer_url)
+if [[ "$url" == *"/$pin_commit/install.sh" ]]; then
+    echo "url_names_commit=yes"
+else
+    echo "url_names_commit=no"
+fi
+installer=$(mktemp)
+printf 'probe installer bytes\n' > "$installer"
+matching_sha=$(sha256sum "$installer" | awk '{print $1}')
+if GOWAVE_NODE_INSTALLER_SHA256="$matching_sha" \
+    verify_node_installer_digest "$installer" >/dev/null 2>&1; then
+    echo "matching_bytes=accepted"
+else
+    echo "matching_bytes=refused"
+fi
+if GOWAVE_NODE_INSTALLER_SHA256="$zero_digest" \
+    verify_node_installer_digest "$installer" >/dev/null 2>&1; then
+    echo "mismatched_bytes=accepted"
+else
+    echo "mismatched_bytes=refused"
+fi
+rm -f "$installer"
+scratch=$(mktemp -d)
+if [[ -f "$scratch/sources/gowave-node/install.sh" ]]; then
+    echo "scratch_carries_bundle=yes"
+else
+    echo "scratch_carries_bundle=no"
+fi
+node_bin=/opt/gowave-node/gowave-node
+[[ -x "$node_bin" ]] || node_bin=/usr/local/bin/gowave-node
+if [[ -x "$node_bin" ]]; then
+    echo "node_binary_present=yes"
+else
+    echo "node_binary_present=no"
+fi
+unit=$(systemctl show -p FragmentPath --value gowave-node.service 2>/dev/null)
+[[ -n "$unit" && -f "$unit" ]] || unit=/etc/systemd/system/gowave-node.service
+node_before=$(sha256sum "$node_bin" 2>/dev/null | awk '{print $1}')
+unit_before=$(sha256sum "$unit" 2>/dev/null | awk '{print $1}')
+saved_script_dir="$SCRIPT_DIR"
+SCRIPT_DIR="$scratch"
+refusal=$(GOWAVE_NODE_REQUIRE_PINNED_INSTALLER=1 \
+    GOWAVE_NODE_INSTALLER_COMMIT=main GOWAVE_NODE_INSTALLER_SHA256="$zero_digest" \
+    install_local_node not-a-credential 3002 2>&1 >/dev/null)
+rc=$?
+SCRIPT_DIR="$saved_script_dir"
+node_after=$(sha256sum "$node_bin" 2>/dev/null | awk '{print $1}')
+unit_after=$(sha256sum "$unit" 2>/dev/null | awk '{print $1}')
+rm -rf "$scratch"
+if (( rc != 0 )); then
+    echo "install_refused=yes"
+else
+    echo "install_refused=no"
+fi
+if [[ "$refusal" == *"40-character hex commit SHA"* ]]; then
+    echo "refusal_names_pin=yes"
+else
+    echo "refusal_names_pin=no"
+fi
+printf 'refusal_text=%s\n' \
+    "$(printf '%s' "$refusal" | tr -s '[:space:]' '-' | cut -c1-160)"
+if [[ "$node_before" == "$node_after" && "$unit_before" == "$unit_after" ]]; then
+    echo "installer_untouched=yes"
+else
+    echo "installer_untouched=no"
 fi
 """
 
@@ -1356,6 +1511,10 @@ class AioProduct:
         self._subscriptions: Optional[Dict[str, Any]] = None
         self._subscription_error = ""
         self.subscription_inbounds_override: Optional[List[Dict[str, Any]]] = None
+        # Read once by the install case and compared again by every data-plane
+        # tuple: the core a client ran must be the core the node deployed.
+        self._installed_versions: Optional[Dict[str, Any]] = None
+        self.server_core_version = ""
 
     @property
     def inbound_count(self) -> int:
@@ -1413,7 +1572,12 @@ class AioProduct:
             f"the operator full install failed with exit {self.outcome.returncode}:\n"
             f"{self.outcome.tail(6000)}",
         )
-        return host.evidence(self.outcome)
+        record = host.evidence(self.outcome)
+        # The install is not complete until the binaries it deployed are asked
+        # what they are: a host that answers health checks while running a version
+        # nobody configured is the failure this case exists to report.
+        record.update(self.require_configured_versions())
+        return record
 
     def reinstall(self, case_id: str) -> Dict[str, Any]:
         """Run the operator's install command a second time against the same host.
@@ -1449,6 +1613,122 @@ class AioProduct:
                 "so this case had nothing to verify"
             )
         return self.host
+
+    # ---------------------------------------------------------------- versions
+    def installed_versions(self) -> Dict[str, Any]:
+        """What the three installed binaries say they are, read once per run.
+
+        The live runner asks the Master's Panel, its Node binary and the
+        Node-managed core; the same three are asked here, inside the target, so
+        the container contour compares the same components rather than trusting
+        the installer's own account of what it deployed.
+        """
+        if self._installed_versions is not None:
+            return self._installed_versions
+        host = self.require_installed()
+        proc = self.podman.exec_bash(
+            host.target_name, INSTALLED_VERSION_SCRIPT, check=False, timeout=180,
+        )
+        require(
+            self.install_case_id,
+            proc.returncode == 0,
+            f"the installed-version probe exited {proc.returncode}: "
+            f"{(proc.stderr or proc.stdout or '').strip()[-2000:]}",
+        )
+        report: Optional[Dict[str, Any]] = None
+        try:
+            candidate = json.loads(proc.stdout or "")
+        except json.JSONDecodeError:
+            candidate = None
+        if isinstance(candidate, dict):
+            report = candidate
+        require(
+            self.install_case_id,
+            report is not None,
+            f"the installed-version probe printed no JSON object: {(proc.stdout or '')[:400]}",
+        )
+        self._installed_versions = report
+        return report
+
+    def require_configured_versions(self) -> Dict[str, str]:
+        """VER-01/VER-03: the installed binaries report the versions this deployment configured.
+
+        Three independent comparisons, because the live sentence is explicit that
+        a Node version is not evidence of the core it supervises: each component
+        is interrogated through its own binary, and a probe that answered for two
+        of them from one path is refused rather than counted twice.
+        """
+        report = self.installed_versions()
+        pins = matrix.product(self.matrix)
+        expectations = {
+            "panel": pins.get("panel_version", ""),
+            "node": pins.get("node_version", ""),
+            "xray_server": pins.get("xray_version", ""),
+        }
+        evidence: Dict[str, str] = {}
+        for component, expected in expectations.items():
+            facts = report.get(component) or {}
+            output = f"{facts.get('stdout') or ''}\n{facts.get('stderr') or ''}"
+            require(
+                self.install_case_id,
+                bool(facts.get("binary")),
+                f"the {component} binary is installed at no documented path, so its version "
+                "cannot be recorded",
+            )
+            require(
+                self.install_case_id,
+                facts.get("returncode") == 0 and bool(version_token(output)),
+                f"`{facts.get('argv') or component}` printed no version: {output.strip()[:300]!r}",
+            )
+            require(
+                self.install_case_id,
+                output_matches_expected_version(output, expected),
+                f"the installed {component} reports {output.strip()[:200]!r} while this "
+                f"deployment configured {expected!r}",
+            )
+            evidence[f"{component}_version"] = version_token(output)
+            evidence[f"{component}_version_expected"] = expected
+            evidence[f"{component}_version_binary"] = str(facts.get("binary") or "")
+        binaries = {
+            component: evidence[f"{component}_version_binary"] for component in expectations
+        }
+        require(
+            self.install_case_id,
+            len(set(binaries.values())) == len(binaries),
+            f"two components were interrogated through one binary: {binaries}",
+        )
+        self.server_core_version = evidence["xray_server_version"]
+        return evidence
+
+    def engine_version(self, case_id: str, client: str) -> Dict[str, str]:
+        """DP-03: the engine that carries a payload, as the client itself reports it.
+
+        The client image pins its artifacts by digest at build time; this reads
+        the version the installed binary prints at run time, so a tuple records
+        which core carried it rather than assuming the image still holds what the
+        matrix asked for.
+        """
+        engine = next(
+            (item for item in client_image.engine_list(self.matrix) if item["id"] == client),
+            None,
+        )
+        require(case_id, engine is not None, f"the matrix declares no client {client!r}")
+        host = self.require_installed()
+        proc = self.podman.exec(
+            host.engine_client(), [engine["binary"], engine["argument"]], check=False, timeout=60,
+        )
+        reported = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
+        require(
+            case_id,
+            proc.returncode == 0 and engine["contains"] in reported,
+            f"the {client} binary reports {reported[:200]!r} instead of the pinned "
+            f"{engine['contains']!r}",
+        )
+        return {
+            "engine_version": version_token(reported),
+            "engine_version_expected": engine["contains"],
+            "engine_binary": engine["binary"],
+        }
 
     # ------------------------------------------------------------------ probes
     def host_script(self, script: str, timeout: int = 120) -> Any:
@@ -3546,6 +3826,57 @@ def case_acme_fail_closed(product: AioProduct) -> Dict[str, Any]:
     }
 
 
+def case_installer_pin(product: AioProduct) -> Dict[str, Any]:
+    """AIO-NEG-PIN: a floating branch or an unverified installer never runs.
+
+    Both halves of the pin are asserted, because either one alone leaves the hole
+    open: a branch name must be refused even when a digest is configured, and bytes
+    that do not match the digest must be refused even when the commit is a real
+    SHA. The last probe calls the product's own install entrypoint with a scratch
+    SCRIPT_DIR, so what is proven is that the refusal happens before the installer
+    runs — not merely that a validator returns non-zero.
+    """
+    result = product.host_script(INSTALLER_PIN_SCRIPT, timeout=240)
+    require("AIO-NEG-PIN", result.returncode == 0,
+            f"the installer-pin probe failed: {(result.stderr or result.stdout or '').strip()[-600:]}")
+    values = _parse_key_values(result.stdout or "")
+    require("AIO-NEG-PIN", values.get("floating_commit") == "refused",
+            "a floating installer branch was accepted as a pinned commit")
+    require("AIO-NEG-PIN", values.get("missing_digest") == "refused",
+            "a pinned commit was accepted without the mandatory installer digest")
+    require("AIO-NEG-PIN", values.get("short_digest") == "refused",
+            "an installer digest that is not a 64-hex SHA-256 was accepted")
+    require("AIO-NEG-PIN", values.get("pinned_pair") == "accepted",
+            "a 40-hex commit with a 64-hex digest was refused, so the pin is unsatisfiable")
+    require("AIO-NEG-PIN", values.get("url_names_commit") == "yes",
+            "the derived installer URL does not name the pinned commit")
+    require("AIO-NEG-PIN", values.get("matching_bytes") == "accepted",
+            "an installer whose bytes match the configured digest was refused")
+    require("AIO-NEG-PIN", values.get("mismatched_bytes") == "refused",
+            "an installer whose bytes do not match the configured digest was accepted")
+    require("AIO-NEG-PIN", values.get("scratch_carries_bundle") == "no",
+            "the scratch directory carried a bundled installer, so the pinned branch was not the one exercised")
+    require("AIO-NEG-PIN", values.get("node_binary_present") == "yes",
+            "the node binary was not found, so an untouched installer proves nothing")
+    require("AIO-NEG-PIN", values.get("install_refused") == "yes",
+            f"install_local_node accepted a floating installer branch as a pin: {values.get('refusal_text', '')}")
+    require("AIO-NEG-PIN", values.get("refusal_names_pin") == "yes",
+            f"the install was refused, but not by the installer pin: {values.get('refusal_text', '')}")
+    require("AIO-NEG-PIN", values.get("installer_untouched") == "yes",
+            "the node binary or its unit changed, so an installer ran despite the refused pin")
+    return {
+        "floating_commit": values.get("floating_commit"),
+        "missing_digest": values.get("missing_digest"),
+        "short_digest": values.get("short_digest"),
+        "pinned_pair": values.get("pinned_pair"),
+        "url_names_commit": values.get("url_names_commit"),
+        "matching_bytes": values.get("matching_bytes"),
+        "mismatched_bytes": values.get("mismatched_bytes"),
+        "install_refused": values.get("install_refused"),
+        "installer_untouched": values.get("installer_untouched"),
+    }
+
+
 def case_public_dependency(product: AioProduct) -> Dict[str, Any]:
     """AIO-NEG-DEP: the public surface fails with its NGINX dependency and recovers.
 
@@ -5283,11 +5614,17 @@ def case_share_links(product: AioProduct) -> Dict[str, Any]:
 
 def case_data_plane(
     product: AioProduct, inbound: Dict[str, Any], client: str, node: str = "",
+    deployed_core: str = "",
 ) -> Dict[str, Any]:
     """One matrix tuple carries a payload through the product it belongs to.
 
     The case id comes from the matrix topology the product names (``AIO-DP-…``
     for one host, ``MN-DP-<node>-…`` for a cluster).
+
+    ``deployed_core`` is the Xray core of the node that serves this tuple, when
+    the caller can name it: in a cluster the Master and the Worker each run their
+    own, and the client core is compared with the one whose inbound carried the
+    payload rather than with whichever host happened to be interrogated.
 
     The engines run from the Control Machine, so a transfer that shows up at the
     endpoint with the installed host as its source address traversed the product.
@@ -5307,6 +5644,20 @@ def case_data_plane(
                              node=node)
     product.subscription_payloads(case_id)
     expectations = matrix_expectations(product, inbound, node)
+    # DP-03: the engine that carries the payload reports its own version, and an
+    # Xray client core has to be the build the node deployed. Read before the
+    # transfer, so the tuple records the core it ran under rather than the one the
+    # image was built with.
+    engine = product.engine_version(case_id, client)
+    if client == "xray":
+        serving_core = deployed_core or product.server_core_version
+        require(case_id, bool(serving_core),
+                f"the {node or 'local'} node's Xray core version was never read, so the client "
+                "core cannot be compared with it")
+        require(case_id, engine["engine_version"] == serving_core,
+                f"the {client} client core is {engine['engine_version']!r} while the "
+                f"{node or 'local'} node deployed {serving_core!r}, so this tuple ran an "
+                "unmatched core")
     # The request runs inside a capture on every host that could have taken it,
     # so the endpoint's account of the payload is joined by the hosts' account of
     # the connection: which of them the client's packets reached, from which
@@ -5317,6 +5668,15 @@ def case_data_plane(
     )
     facts = measurement.request
     packets = ingress.evaluate(measurement)
+    if packets["verdict"] != ingress.PASS:
+        # A capture that does not decide in the product's favour is exactly the
+        # case whose evidence the runner cannot keep: it attaches evidence only
+        # to a passing case, and this one is about to fail on the line below.
+        # The measurement is written here instead, so a red tuple is attributable
+        # from its own artifacts rather than from a rerun.
+        product.context.evidence_text(
+            f"{case_id.lower()}-ingress.txt", ingress.account(measurement, packets),
+        )
 
     transport = f"{inbound['transport']}/{inbound['security']}"
     require(case_id, int(facts.get("outbounds") or 0) == 1,
@@ -5391,6 +5751,9 @@ def case_data_plane(
         "outbounds": facts.get("outbounds"),
         "connect_budget_seconds": facts.get("connect_budget_seconds"),
         "transfer_budget_seconds": facts.get("transfer_budget_seconds"),
+        "engine_version": engine["engine_version"],
+        "engine_version_expected": engine["engine_version_expected"],
+        "engine_binary": engine["engine_binary"],
     }
     evidence.update(ingress.evidence(packets))
     if client == "mihomo":
@@ -5408,6 +5771,7 @@ def case_data_plane(
 
 def _data_plane_case(
     product: AioProduct, inbound: Dict[str, Any], client: str, node: str = "",
+    deployed_core: str = "",
 ) -> Dict[str, Any]:
     """Run one matrix tuple and record its own verdict for the count case.
 
@@ -5419,7 +5783,8 @@ def _data_plane_case(
     case_id = matrix.case_id(product.matrix, product.case_topology, str(inbound["id"]), client,
                              node=node)
     try:
-        evidence = case_data_plane(product, inbound, client, node=node)
+        evidence = case_data_plane(product, inbound, client, node=node,
+                                   deployed_core=deployed_core)
     except CaseIncomplete:
         product.record_data_plane(case_id, "INCOMPLETE")
         raise
@@ -7846,6 +8211,7 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
              timeout_seconds=TRAFFIC_TIMEOUT_SECONDS),
         Case("AIO-NEG-PORT", "aio", lambda context: case_foreign_listener(product), timeout_seconds=300),
         Case("AIO-NEG-ACME", "aio", lambda context: case_acme_fail_closed(product), timeout_seconds=300),
+        Case("AIO-NEG-PIN", "aio", lambda context: case_installer_pin(product), timeout_seconds=300),
         Case("AIO-NEG-DEP", "aio", lambda context: case_public_dependency(product),
              timeout_seconds=RECOVERY_TIMEOUT_SECONDS + 300),
         # The channel cases come last because a switch restarts the Panel, and an

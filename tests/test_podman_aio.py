@@ -89,10 +89,56 @@ class FakePodman:
         raise AssertionError(f"unexpected exec: {argv}")
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
+        if script == aio.INSTALLED_VERSION_SCRIPT:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc", script], 0, json.dumps(installed_version_report()), ""
+            )
         self.installs.append((name, script))
         return subprocess.CompletedProcess(
             ["bash", "-lc", script], self.install_returncode, self.install_output, ""
         )
+
+
+def installed_version_report() -> dict:
+    """The report the installed-version probe prints, from the matrix's own pins.
+
+    Derived rather than written out: the install compares each component with the
+    version the run configured, so a fake that answered with its own numbers would
+    stay green while that comparison was broken.
+    """
+    pins = matrix.product(matrix.load())
+
+    def reported(pin: str) -> str:
+        return "1.0.0" if str(pin).strip().lower() in ("", "latest") else str(pin).lstrip("vV")
+
+    panel, node, core = (
+        reported(pins.get("panel_version", "")),
+        reported(pins.get("node_version", "")),
+        reported(pins.get("xray_version", "")),
+    )
+    return {
+        "panel": {
+            "binary": "/opt/gowave/gowave-server",
+            "argv": "/opt/gowave/gowave-server --version",
+            "returncode": 0,
+            "stdout": f"GoWave Server v{panel}",
+            "stderr": "",
+        },
+        "node": {
+            "binary": "/opt/gowave-node/gowave-node",
+            "argv": "/opt/gowave-node/gowave-node version",
+            "returncode": 0,
+            "stdout": f"gowave-node v{node}",
+            "stderr": "",
+        },
+        "xray_server": {
+            "binary": "/opt/gowave-node/rw-core",
+            "argv": "/opt/gowave-node/rw-core version",
+            "returncode": 0,
+            "stdout": f"Xray {core} (Xray, Penetrates Everything.)",
+            "stderr": "",
+        },
+    }
 
 
 def fake_create(self):
@@ -247,6 +293,10 @@ class StubHost:
         self.client_calls.append({"url": url, **kwargs})
         report = self.client_reports.pop(0)
         return report
+
+    def engine_client(self):
+        """The engine role's container, which every client case reuses."""
+        return "aio-engines"
 
 
 def installed_product(context, results):
@@ -676,6 +726,80 @@ class TestNegativeCases(unittest.TestCase):
             aio.case_acme_fail_closed(product)
         self.assertIn("arbitrary ACME URL", str(caught.exception))
 
+    def pin_output(self, **overrides):
+        facts = {
+            "floating_commit": "refused",
+            "missing_digest": "refused",
+            "short_digest": "refused",
+            "pinned_pair": "accepted",
+            "url_names_commit": "yes",
+            "matching_bytes": "accepted",
+            "mismatched_bytes": "refused",
+            "scratch_carries_bundle": "no",
+            "node_binary_present": "yes",
+            "install_refused": "yes",
+            "refusal_names_pin": "yes",
+            "installer_untouched": "yes",
+        }
+        facts.update(overrides)
+        body = " ".join(f"{key}={value}" for key, value in facts.items())
+        return f"{body} refusal_text=Error:-GOWAVE_NODE_INSTALLER_COMMIT-must-be-a-40-character-hex-commit-SHA.\n"
+
+    def test_pin_case_requires_every_refusal_and_the_accepted_pin(self):
+        product, _ = installed_product(self.context, [(self.pin_output(), 0)])
+        evidence = aio.case_installer_pin(product)
+        self.assertEqual(evidence["pinned_pair"], "accepted")
+        self.assertEqual(evidence["install_refused"], "yes")
+        self.assertEqual(evidence["installer_untouched"], "yes")
+
+    def test_pin_case_fails_when_a_floating_branch_is_accepted(self):
+        product, _ = installed_product(self.context, [
+            (self.pin_output(floating_commit="accepted"), 0),
+        ])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_installer_pin(product)
+        self.assertIn("floating installer branch", str(caught.exception))
+
+    def test_pin_case_fails_when_the_digest_is_not_mandatory(self):
+        product, _ = installed_product(self.context, [
+            (self.pin_output(missing_digest="accepted"), 0),
+        ])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_installer_pin(product)
+        self.assertIn("without the mandatory installer digest", str(caught.exception))
+
+    def test_pin_case_fails_when_the_url_does_not_name_the_commit(self):
+        product, _ = installed_product(self.context, [
+            (self.pin_output(url_names_commit="no"), 0),
+        ])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_installer_pin(product)
+        self.assertIn("does not name the pinned commit", str(caught.exception))
+
+    def test_pin_case_fails_when_the_refusal_came_from_somewhere_else(self):
+        product, _ = installed_product(self.context, [
+            (self.pin_output(refusal_names_pin="no"), 0),
+        ])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_installer_pin(product)
+        self.assertIn("not by the installer pin", str(caught.exception))
+
+    def test_pin_case_fails_when_an_installer_ran_anyway(self):
+        product, _ = installed_product(self.context, [
+            (self.pin_output(installer_untouched="no"), 0),
+        ])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_installer_pin(product)
+        self.assertIn("despite the refused pin", str(caught.exception))
+
+    def test_pin_case_refuses_a_probe_that_ran_the_bundled_installer(self):
+        product, _ = installed_product(self.context, [
+            (self.pin_output(scratch_carries_bundle="yes"), 0),
+        ])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_installer_pin(product)
+        self.assertIn("bundled installer", str(caught.exception))
+
     def test_dependency_case_needs_the_public_surface_to_fail_and_recover(self):
         product, podman = installed_product(self.context, [
             ("inactive\n", 0),
@@ -709,10 +833,104 @@ class TestNegativeCases(unittest.TestCase):
         self.assertIn("does not depend on it", str(caught.exception))
 
     def test_the_host_scripts_the_negative_cases_run_are_valid_bash(self):
-        for script in (aio.FOREIGN_LISTENER_SCRIPT, aio.ACME_FAIL_CLOSED_SCRIPT):
+        for script in (aio.FOREIGN_LISTENER_SCRIPT, aio.ACME_FAIL_CLOSED_SCRIPT,
+                       aio.INSTALLER_PIN_SCRIPT):
             result = subprocess.run(["bash", "-n"], input=script, text=True,
                                     capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class TestInstalledVersionCases(unittest.TestCase):
+    """VER-01/VER-03: each installed component is compared with the pin it was given.
+
+    The install case reads three binaries inside the target and records all three
+    against the versions this deployment configured. What a mistake in it costs is
+    the whole version group's evidence — a comparison against the wrong pin, or
+    one binary answering for two components — so each refusal is asserted here
+    against a report that differs in exactly one place.
+    """
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def pins(self):
+        return matrix.product(matrix.load())
+
+    def report(self, **components):
+        """The probe's own shape: one object per component, keyed by its binary."""
+        defaults = {
+            "panel": ("/opt/gowave/gowave-server", "GoWave Server v1.2.3\n"),
+            "node": ("/opt/gowave-node/gowave-node", "gowave-node v1.2.3\n"),
+            "xray_server": (
+                "/opt/gowave-node/rw-core",
+                f"Xray {self.pins()['xray_version']} (Xray, Penetrates Everything.)\n",
+            ),
+        }
+        defaults.update(components)
+        return {
+            component: {
+                "binary": binary, "argv": "version", "returncode": 0,
+                "stdout": output, "stderr": "",
+            }
+            for component, (binary, output) in defaults.items()
+        }
+
+    def product_with(self, report):
+        product, _ = installed_product(self.context, [(json.dumps(report), 0)])
+        return product
+
+    def test_the_three_components_are_recorded_against_their_pins(self):
+        product = self.product_with(self.report())
+        evidence = product.require_configured_versions()
+        self.assertEqual(evidence["panel_version"], "1.2.3")
+        self.assertEqual(evidence["node_version"], "1.2.3")
+        self.assertEqual(evidence["xray_server_version"], self.pins()["xray_version"])
+        self.assertEqual(evidence["xray_server_version_binary"], "/opt/gowave-node/rw-core")
+        self.assertEqual(product.server_core_version, self.pins()["xray_version"])
+
+    def test_a_core_that_differs_from_the_pin_fails_the_install(self):
+        drifted = f"Xray {self.pins()['xray_version']}0 (Xray, Penetrates Everything.)\n"
+        product = self.product_with(
+            self.report(xray_server=("/opt/gowave-node/rw-core", drifted)),
+        )
+        with self.assertRaises(AssertionError) as caught:
+            product.require_configured_versions()
+        self.assertIn("this deployment configured", str(caught.exception))
+
+    def test_two_components_read_through_one_binary_fail_the_install(self):
+        product = self.product_with(
+            self.report(node=("/opt/gowave/gowave-server", "gowave-node v1.2.3\n")),
+        )
+        with self.assertRaises(AssertionError) as caught:
+            product.require_configured_versions()
+        self.assertIn("two components were interrogated through one binary", str(caught.exception))
+
+    def test_a_component_with_no_binary_fails_the_install(self):
+        product = self.product_with(
+            self.report(node=("", "gowave-node v1.2.3\n")),
+        )
+        with self.assertRaises(AssertionError) as caught:
+            product.require_configured_versions()
+        self.assertIn("installed at no documented path", str(caught.exception))
+
+    def test_a_component_that_prints_no_version_fails_the_install(self):
+        product = self.product_with(
+            self.report(panel=("/opt/gowave/gowave-server", "version output unavailable\n")),
+        )
+        with self.assertRaises(AssertionError) as caught:
+            product.require_configured_versions()
+        self.assertIn("printed no version", str(caught.exception))
+
+    def test_an_engine_that_reports_another_build_fails_the_tuple(self):
+        product = self.product_with(self.report())
+        product.podman.exec = lambda name, argv, check=True, input_text=None, timeout=0: (
+            subprocess.CompletedProcess(list(argv), 0, f"{argv[0]} 0.0.1 (fixture)\n", "")
+        )
+        with self.assertRaises(AssertionError) as caught:
+            product.engine_version("AIO-DP-REALITY-xray", "xray")
+        self.assertIn("instead of the pinned", str(caught.exception))
 
 
 class TestChannelCases(unittest.TestCase):

@@ -466,6 +466,33 @@ follows the release. The shared contract is therefore "accepted by the real
 engine", not "accepted by this exact build", and the container suite is the
 place where a specific build is named.
 
+### The version contract: a configured pin is read through its own binary
+
+**A configured version is compared through the binary that reports it.** The
+matrix declares all five versions a deployment configures —
+`product.panel_version`, `product.node_version`, `product.xray_version`,
+`product.xray_client_version` and `product.mihomo_client_version` — and the
+install environment passes the first three to the product. Panel and Node read
+`latest`, exactly as the live config's default does, and `latest` means "report
+a version at all"; the Xray core is the exact pin, because the client core
+below is the same build and a server core that drifted from it is the mismatch
+this sentence names. The installed side is read through three distinct binaries
+(`/opt/gowave/gowave-server` with `--version` or `version`, the node's own
+`version`, and `/opt/gowave-node/rw-core version`) and the case refuses two
+components interrogated through one binary, which is the sentence that a Node
+version is not evidence of the core it supervises. A client core is read the
+same way, through its own engine container's version argument. The rule that
+turns an output into a version token is `tools/live_vps/versions.py`, imported
+by both contours rather than restated: `26.11.90` does not satisfy a `26.11.9`
+pin and `v1.19.34-linux` does satisfy a `1.19.34` one.
+
+| Live scenario | Container case | Where the two differ |
+| --- | --- | --- |
+| `VER-01` a version mismatch detected after installation fails the install | `AIO-INSTALL`, `MN-INSTALL` | The live sentence pins `GOWAVE_PANEL_VERSION=1.2.3` and fails on the Panel's mismatch. The container can only make a component drift where the matrix pins it exactly, which is the Xray core; Panel and Node are held to "reports a version", because the matrix follows the channel for them the way the live config does. |
+| `VER-02` a floating installer branch or an installer digest mismatch is rejected before installation | `AIO-NEG-PIN` | The live runner validates the pin in `tools/live_vps/config.py` before it opens an SSH session. The container asks the product's own `validate_node_installer_pin`, `pinned_node_installer_url` and `verify_node_installer_digest`, then calls `install_local_node` with a scratch `SCRIPT_DIR` so the pinned branch — not the bundled installer this workstation bind-mounts into `/repo` — is the branch refused, and requires the node binary and its unit to be byte-identical afterwards. |
+| `VER-03` server and client Xray versions are independently pinned | the REALITY/xray tuple of each contour — the same tuple `DP-02` is observed through | The live runner records both versions in preflight and again after installation. The container compares them where they meet — the client engine's own version against the core the node reports it deployed — on every matrix tuple, and the install case carries the other half: the core is read through `rw-core` rather than through the node binary. |
+| `DP-03` the clients are the cores Panel and Node deploy | the same REALITY/xray tuple of each contour | One engine container per run, read through its own version argument and required to carry the configured pin before it carries a payload; the deployed core is the Xray core the node supervises, so the equality is asserted on the Xray tuple only. Both sides of that equality are reduced by `tools/live_vps/versions.version_token`: a Worker reports its core as a whole sentence (`Xray 26.11.9 (Xray, Penetrates Everything.) 676eaf6 …`) while the install reads the Master's as the token alone, and comparing the two strings refused every Worker tuple until the shapes were normalised. |
+
 ### The data plane: the request budget and the Mihomo config
 
 Two data-plane sentences are witnessable without a VPS, and both are read from
@@ -517,6 +544,15 @@ The verdict is written as one record — `ingress_port`, `ingress_client`,
 `ingress_intended`, the captured and matched counts for the intended and the
 other host, the non-matching sources, and the reason whenever it is not PASS — so
 a run that failed to arm a capture cannot be read as a run that saw nothing.
+
+That record only reaches a reader when the tuple passed: the runner attaches
+`evidence` to a PASS, and a case that fails keeps only the files it wrote. A
+capture that did not decide in the product's favour is exactly that case, so the
+measurement is also written as `evidence/<case id>-ingress.txt` whenever the
+verdict is not PASS — each host's reported address, the summary its probe
+printed, the identity report, and the request's own facts. The file is written by
+the case, not by `ingress.py`: the probe still persists nothing, which is what
+`tests/test_podman_ingress.py` holds.
 
 ### What is declared but not driven
 
@@ -587,16 +623,16 @@ image.
 
 `tests/cases/catalog.yaml` defines each scenario once and stamps it with an
 `environment`, so the boundary between the contours is a checked field rather
-than a sentence in a document. The catalog holds 215 entries:
+than a sentence in a document. The catalog holds 216 entries:
 
 | Environment | Entries | Which contour answers it |
 | --- | ---: | --- |
-| `container` | 205 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
+| `container` | 206 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
 | `partial` | 8 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
 | `live-only` | 2 | Only the live suite. Every Podman run reports both as justified exclusions, and `tools/podman_e2e/catalog.py` refuses a catalog that lets one run here. |
 
 Of the 125 live scenarios projected into this catalog, 115 are container, 8 are
-partial and 2 are live-only; the other 90 entries are Podman-first cases with a
+partial and 2 are live-only; the other 91 entries are Podman-first cases with a
 promotion target, which `tests/cases/PARITY.md` lists separately.
 
 The ten entries that are not fully container-answerable are, by id: `PRE-04`,

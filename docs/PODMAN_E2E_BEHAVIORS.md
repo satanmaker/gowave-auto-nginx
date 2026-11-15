@@ -13,11 +13,11 @@ behaviour with no case, a behaviour covered only on its happy path, an
 area the delta spec names but no entry covers, and a case no behaviour
 names (an orphan) or two behaviours claim.
 
-Behaviours: 37 across 9 areas, naming 215 of 215 catalog cases.
+Behaviours: 37 across 9 areas, naming 216 of 216 catalog cases.
 
 | Area | Behaviours | Cases | Error-path cases |
 |---|---:|---:|---:|
-| installation | 5 | 15 | 5 |
+| installation | 5 | 15 | 6 |
 | provisioning | 8 | 27 | 15 |
 | subscription-representations | 1 | 6 | 3 |
 | data-plane | 5 | 45 | 11 |
@@ -35,7 +35,7 @@ Behaviours: 37 across 9 areas, naming 215 of 215 catalog cases.
 | The documented All-in-One install provisions the Panel and its node | aio | pre-push | `AIO-INSTALL`, `AIO-PACKAGES` | `AIO-NEG-PORT` |
 | The installed host keeps serving across a restart and a repeated install | aio, multi-node | pre-push | `AIO-01`, `AIO-02`, `AIO-03`, `AIO-04`, `AIO-05`, `AIO-RESTART`, `AIO-IDEMPOTENT` | `AIO-NEG-DEP` |
 | The Panel API answers its documented caller and refuses the rest | aio, multi-node | pre-push | `AIO-AUTH`, `AIO-CLIENT`, `APIC-01` | `NEG-06` |
-| Every installed component reports its exact pinned version | aio, multi-node | pre-push | `VER-01`, `VER-03` | `VER-02` |
+| Every installed component reports its exact pinned version | aio, multi-node | pre-push | `VER-01`, `VER-03` | `VER-02`, `AIO-NEG-PIN` |
 
 ## provisioning
 

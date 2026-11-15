@@ -16,6 +16,13 @@ version: 1
 schema: gowave-podman-matrix/v1
 
 product:
+  # The versions a deployment configures, which is what a case compares the
+  # installed binaries against. Panel and Node follow the shipped channel, as the
+  # live config's default does (`latest`); the Xray core is pinned, because the
+  # client core below is the same build and a server core that drifted from it
+  # is the mismatch Pinned Version Fidelity names.
+  panel_version: "latest"
+  node_version: "latest"
   xray_version: "26.11.9"
   xray_client_version: "26.11.9"
   mihomo_client_version: "1.19.34"

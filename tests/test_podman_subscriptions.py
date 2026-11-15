@@ -25,6 +25,7 @@ from tools.podman_e2e import (  # noqa: E402
     aio,
     catalog,
     client_image,
+    matrix,
     panel_surface,
     subscription_probe,
     target_image,
@@ -1332,12 +1333,29 @@ class ScriptedPodman:
     def __init__(self, context, scripts):
         self.context = context
         self.scripts = []
+        self.execs = []
         self.results = list(scripts)
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
         self.scripts.append(script)
         stdout, returncode = self.results.pop(0)
         return subprocess.CompletedProcess(["bash", "-lc", script], returncode, stdout, "")
+
+    def exec(self, name, argv, check=True, input_text=None, timeout=300):
+        """The engine container printing the version the matrix pinned for it.
+
+        A data-plane case reads the version of the core that carried the payload,
+        so the stub answers that read from the manifest: a moved client pin would
+        otherwise leave a literal here naming a build the case no longer expects.
+        """
+        self.execs.append((name, list(argv)))
+        binary = list(argv)[0]
+        pinned = next(
+            (item["contains"] for item in client_image.engine_list(matrix.load())
+             if item["binary"] == binary),
+            "",
+        )
+        return subprocess.CompletedProcess(list(argv), 0, f"{binary} {pinned} (fixture)\n", "")
 
 
 class StubEngineHost:
@@ -1378,6 +1396,10 @@ class StubEngineHost:
             "required_snis": required_snis,
         }
 
+    def engine_client(self):
+        """The engine role's container, which a data-plane case reads a version from."""
+        return "engine-client"
+
 
 def panel_result(payload, returncode=0):
     body = payload if isinstance(payload, str) else json.dumps(payload)
@@ -1397,6 +1419,9 @@ def installed_product(context, host_scripts=(), engine_results=()):
     product = aio.AioProduct(podman)
     product.host = StubEngineHost(engine_results)
     product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
+    # What the install read out of `rw-core version`: a data-plane tuple compares
+    # the client core with the core its node deployed, so the fake names that core.
+    product.server_core_version = matrix.product(matrix.load()).get("xray_version", "")
     return product, podman
 
 

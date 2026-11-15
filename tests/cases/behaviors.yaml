@@ -74,12 +74,14 @@ behaviors:
     area: installation
     description: >-
       The Panel, the node and both client cores report the versions the run
-      pinned, independently of each other, and a floating installer branch or a
-      digest mismatch is refused before installation.
+      configured — exactly the pinned one where the run pins it, and a version
+      at all where it follows the channel — each read through its own binary,
+      and a floating installer branch or a digest mismatch is refused before
+      installation.
     topology: [aio, multi-node]
     gate: pre-push
     cases: [VER-01, VER-03]
-    error_paths: [VER-02]
+    error_paths: [VER-02, AIO-NEG-PIN]
 
   # ---------------------------------------------------------------- provisioning
   - name: An install owns only what it created

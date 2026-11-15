@@ -31,6 +31,17 @@ def load(path: Path = MATRIX_PATH) -> Dict[str, Any]:
         return yaml.safe_load(handle)
 
 
+def product(data: Dict[str, Any]) -> Dict[str, str]:
+    """The product versions a deployment configures, as strings.
+
+    Every consumer compares these against what a binary reported, so a key the
+    matrix omits is absent rather than a `None` a matcher would read as "any
+    version", and a pin that is present is always text.
+    """
+    pinned = data.get("product") or {}
+    return {str(key): str(value) for key, value in pinned.items() if value is not None}
+
+
 def inbounds(data: Dict[str, Any], vision: bool) -> List[Dict[str, Any]]:
     """The inbounds an install of the selected Vision configuration carries.
 
