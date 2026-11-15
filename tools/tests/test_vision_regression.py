@@ -101,6 +101,21 @@ class TestVisionRegressionCoverage(unittest.TestCase):
         self.assertEqual(vision_inbound["streamSettings"]["security"], "tls")
         self.assertTrue(vision_inbound["streamSettings"]["tcpSettings"]["acceptProxyProtocol"])
 
+        # The camouflage site answers every HTTPS visitor, so the fallback that
+        # hands it out cannot be filtered on ALPN: a client that offers none would
+        # be closed rather than shown the site, which is what a live run found.
+        fallbacks = vision_inbound["settings"]["fallbacks"]
+        self.assertTrue(fallbacks, "the Vision inbound owns no fallback at all")
+        for fallback in fallbacks:
+            self.assertEqual(fallback["dest"], "127.0.0.1:9444")
+            self.assertEqual(fallback["xver"], 1)
+            self.assertEqual(fallback["name"], "vision.worker.com")
+        self.assertTrue(
+            any(not fallback.get("alpn") for fallback in fallbacks),
+            "every fallback is filtered on ALPN, so a client that offers none is refused "
+            "instead of being handed to the decoy",
+        )
+
     def test_worker_bootstrap_vhost_includes_vision_domain(self):
         """00-bootstrap-worker-acme.conf includes WORKER_VISION_DOMAIN in server_name."""
         with tempfile.TemporaryDirectory() as td:
