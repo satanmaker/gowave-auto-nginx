@@ -29,6 +29,7 @@ from . import (
     ingress,
     matrix,
     panel_surface,
+    status,
     topology,
     traffic_probe,
 )
@@ -8231,6 +8232,9 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case(CHANNEL_DEV_CASE_ID, "aio", lambda context: case_channel_dev(product),
              timeout_seconds=CHANNEL_TIMEOUT_SECONDS + TUNNEL_READY_TIMEOUT_SECONDS
              + TRAFFIC_TIMEOUT_SECONDS),
+        # Before the budget case, because it reads no clock: it produces the report
+        # an overall PASS is read from and asserts what a red one must name.
+        Case(status.STATUS_CASE_ID, "aio", status.case_status_semantics, timeout_seconds=120),
         # Last, because the deadline it proves is the one the whole run spent: the
         # case reads the elapsed wall clock and the enforced budget, then produces
         # an exhausted run of the real runner and reads its report. A suite that

@@ -404,9 +404,14 @@ requirements:
           - tests.test_podman_redaction.TestDiagnosticsNeverPrintValues
         jobs: ["Lint, Completeness, and Suite Nonroot"]
       - scenario: Unexpected skip
+        cases: [GATE-STATUS]
+        topologies: [aio, multi-node]
         tests:
           - tests.test_podman_runner.TestResultSemantics
-        jobs: ["Lint, Completeness, and Suite Nonroot"]
+          - tests.test_podman_status.TestStatusCase
+        jobs:
+          - All-in-One Podman Acceptance
+          - Multi-Node Podman Acceptance
 
   - requirement: Safe isolation and cleanup
     scenarios:

@@ -483,6 +483,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Result Status Semantics",
     },
     {
+        "id": "GATE-STATUS",
+        "requirement": "Result Status Semantics",
+        "assertion": "A run in which two of the runtime cases fail reports overall FAIL and names both in result.json; a run whose runtime cases all came back INCOMPLETE reports INCOMPLETE and marks none of them FAIL; a Vision-enabled run names its failing core and Vision cases in result.json and junit.xml; a skipped case beside a passing one is not green; and every report carries the schema, run id, revision, start, duration, cases and overall the suite promises.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Result Status Semantics",
+    },
+    {
         "id": "GATE-COVERAGE",
         "requirement": "Coverage completeness and error paths",
         "assertion": "An unmapped behavior, a behavior covered only on its happy path, or a case mapped to no behavior fails the coverage audit with the item named.",
@@ -1344,6 +1351,49 @@ LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     # client must match the core the node deployed is asserted only on the Xray
     # tuple, because the deployed core is the Xray core the node supervises.
     "DP-03": {"aio": "AIO-DP-REALITY-xray", "multi-node": "MN-DP-master-REALITY-xray"},
+    # The live sentence is about a delta of listener counters that unrelated
+    # background traffic makes unattributable, and the verdict it demands is
+    # INCOMPLETE with the non-matching sources recorded. The container refuses
+    # counters as evidence altogether and attributes each segment to the address
+    # the target itself reported, so the branch the sentence names is the one
+    # `ingress` takes when every captured packet came from an address other than
+    # the client's. `AIO-PKT-02` is the case that reaches it — its last degradation
+    # is the container's NAT, where the counted source is not the source the
+    # target named — and the cluster contour asks the same question on every tuple
+    # instead of in a case of its own.
+    "DP-13": {"aio": "AIO-PKT-02"},
+    # The Data Plane is explicitly disabled and the live runner records the
+    # skipped cases as SKIP with an overall of INCOMPLETE. This contour has no
+    # switch that disables its subject, so `DP-14` is left for 9.3: the aggregate
+    # it would read is asserted by `GATE-STATUS` (a skip beside a pass is still
+    # not green), but the run the sentence describes — the Data Plane turned off
+    # for the whole suite — is one this suite cannot produce.
+    # Any failing runtime case makes the run FAIL, and the report names it. The
+    # case produces one failing tuple of the twenty a Vision-enabled cluster owes
+    # — eighteen on one host — and requires the aggregate to be FAIL.
+    "DP-15": {"aio": "GATE-STATUS", "multi-node": "GATE-STATUS"},
+    # Two of the runtime cases fail and the rest pass: the case requires overall
+    # FAIL, requires the two failing ids to be the only ones marked FAIL, and
+    # requires each message to name its own case. On a cluster that is the live
+    # sentence's fourteen of sixteen; on one host it is six of eight, and the
+    # topology explains the smaller number.
+    "RES-01": {"aio": "GATE-STATUS", "multi-node": "GATE-STATUS"},
+    # The run that decided nothing is told apart from the run that failed: every
+    # runtime case comes back INCOMPLETE, the aggregate is INCOMPLETE and no case
+    # is marked FAIL — the verdict the eight undecided All-in-One tuples of the run
+    # on 15 November earned. The Vision half then fails one core and one Vision
+    # tuple and requires both to be named in result.json and carried as a
+    # `<failure>` in junit.xml, which is all a CI reader sees.
+    "RES-02": {"aio": "GATE-STATUS", "multi-node": "GATE-STATUS"},
+    # The schema itself. The live report names `test_run_id`, `repository_commit`,
+    # `started_at`/`finished_at`, `control_machine`, `master`, `worker`, `trust`,
+    # `results`, `traffic` and `overall`; this suite writes `run_id`,
+    # `environment.repository`, `started` plus `duration`, `cases` and `overall`,
+    # because the two hosts of a cluster run are its own containers and it has no
+    # ACME trust block to describe. The case requires every field the container
+    # schema promises and every case field in it, and the mapping is recorded in
+    # docs/PODMAN_E2E_DISCOVERY.md.
+    "RES-03": {"aio": "GATE-STATUS", "multi-node": "GATE-STATUS"},
 }
 
 

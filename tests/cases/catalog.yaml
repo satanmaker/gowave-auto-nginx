@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 91
-  total: 216
+  podman_first: 92
+  total: 217
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -2830,8 +2830,21 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_packet_evidence_incomplete
+      evidence:
+      - degradations
+      - foreign_source_reason
+      - foreign_sources
+      - no_capture_tool_reason
+      - no_identity_reason
+      - persisted_files
+      - tool_less_captured
+      - verdicts
+      - window_expired_reason
+      case: AIO-PKT-02
   promotion_target: null
 - id: DP-14
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -2872,8 +2885,38 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: status:case_status_semantics
+      evidence:
+      - failing_named
+      - junit_child
+      - report_keys
+      - report_schema
+      - runtime_cases
+      - skip_aggregate
+      - two_failing_overall
+      - undecided_overall
+      - vision_failing_named
+      - vision_failing_overall
+      - vision_runtime_cases
+      case: GATE-STATUS
+    multi-node:
+      driver: status:case_status_semantics
+      evidence:
+      - failing_named
+      - junit_child
+      - report_keys
+      - report_schema
+      - runtime_cases
+      - skip_aggregate
+      - two_failing_overall
+      - undecided_overall
+      - vision_failing_named
+      - vision_failing_overall
+      - vision_runtime_cases
+      case: GATE-STATUS
   promotion_target: null
 - id: NEG-01
   requirement: Negative Scenario and Fault Injection Tests
@@ -3754,8 +3797,38 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: status:case_status_semantics
+      evidence:
+      - failing_named
+      - junit_child
+      - report_keys
+      - report_schema
+      - runtime_cases
+      - skip_aggregate
+      - two_failing_overall
+      - undecided_overall
+      - vision_failing_named
+      - vision_failing_overall
+      - vision_runtime_cases
+      case: GATE-STATUS
+    multi-node:
+      driver: status:case_status_semantics
+      evidence:
+      - failing_named
+      - junit_child
+      - report_keys
+      - report_schema
+      - runtime_cases
+      - skip_aggregate
+      - two_failing_overall
+      - undecided_overall
+      - vision_failing_named
+      - vision_failing_overall
+      - vision_runtime_cases
+      case: GATE-STATUS
   promotion_target: null
 - id: RES-02
   requirement: Result Status Semantics
@@ -3777,8 +3850,38 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: status:case_status_semantics
+      evidence:
+      - failing_named
+      - junit_child
+      - report_keys
+      - report_schema
+      - runtime_cases
+      - skip_aggregate
+      - two_failing_overall
+      - undecided_overall
+      - vision_failing_named
+      - vision_failing_overall
+      - vision_runtime_cases
+      case: GATE-STATUS
+    multi-node:
+      driver: status:case_status_semantics
+      evidence:
+      - failing_named
+      - junit_child
+      - report_keys
+      - report_schema
+      - runtime_cases
+      - skip_aggregate
+      - two_failing_overall
+      - undecided_overall
+      - vision_failing_named
+      - vision_failing_overall
+      - vision_runtime_cases
+      case: GATE-STATUS
   promotion_target: null
 - id: RES-03
   requirement: Result Status Semantics
@@ -3826,8 +3929,38 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: status:case_status_semantics
+      evidence:
+      - failing_named
+      - junit_child
+      - report_keys
+      - report_schema
+      - runtime_cases
+      - skip_aggregate
+      - two_failing_overall
+      - undecided_overall
+      - vision_failing_named
+      - vision_failing_overall
+      - vision_runtime_cases
+      case: GATE-STATUS
+    multi-node:
+      driver: status:case_status_semantics
+      evidence:
+      - failing_named
+      - junit_child
+      - report_keys
+      - report_schema
+      - runtime_cases
+      - skip_aggregate
+      - two_failing_overall
+      - undecided_overall
+      - vision_failing_named
+      - vision_failing_overall
+      - vision_runtime_cases
+      case: GATE-STATUS
   promotion_target: null
 - id: BOOT-01
   requirement: Local Operator Credential Bootstrap and Cleanup
@@ -5526,6 +5659,54 @@ cases:
       - probe_case_message
       - probe_exit_status
       - probe_overall
+  promotion_target: Result Status Semantics
+- id: GATE-STATUS
+  requirement: Result Status Semantics
+  live_scenario: null
+  assertion: A run in which two of the runtime cases fail reports overall FAIL and names both in result.json;
+    a run whose runtime cases all came back INCOMPLETE reports INCOMPLETE and marks none of them FAIL;
+    a Vision-enabled run names its failing core and Vision cases in result.json and junit.xml; a skipped
+    case beside a passing one is not green; and every report carries the schema, run id, revision, start,
+    duration, cases and overall the suite promises.
+  assertion_sha256: b333e98ca415cdbc1d617dfeb73f10412ff0505d7984a6a89a79c659ace55624
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: status:case_status_semantics
+      evidence:
+      - failing_named
+      - junit_child
+      - report_keys
+      - report_schema
+      - runtime_cases
+      - skip_aggregate
+      - two_failing_overall
+      - undecided_overall
+      - vision_failing_named
+      - vision_failing_overall
+      - vision_runtime_cases
+    multi-node:
+      driver: status:case_status_semantics
+      evidence:
+      - failing_named
+      - junit_child
+      - report_keys
+      - report_schema
+      - runtime_cases
+      - skip_aggregate
+      - two_failing_overall
+      - undecided_overall
+      - vision_failing_named
+      - vision_failing_overall
+      - vision_runtime_cases
   promotion_target: Result Status Semantics
 - id: GATE-COVERAGE
   requirement: Coverage completeness and error paths
