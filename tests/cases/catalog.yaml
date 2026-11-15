@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 92
-  total: 217
+  podman_first: 93
+  total: 218
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -3351,8 +3351,54 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: teardown:case_teardown_policy
+      evidence:
+      - baseline_change_named
+      - baseline_comparison
+      - destroy_refusal
+      - digest_at_execution
+      - foreign_owner_probe
+      - hook_arguments
+      - hook_failures
+      - hook_program
+      - invented_policy_refusal
+      - ownership_comparison
+      - pair_lock_reacquisition
+      - preflight_refusals
+      - preserve_status
+      - reply_refusals
+      - request_keys
+      - request_schema_version
+      - restored_status
+      - teardown_junit_errors
+      - teardown_result_status
+      case: GATE-TEARDOWN
+    multi-node:
+      driver: teardown:case_teardown_policy
+      evidence:
+      - baseline_change_named
+      - baseline_comparison
+      - destroy_refusal
+      - digest_at_execution
+      - foreign_owner_probe
+      - hook_arguments
+      - hook_failures
+      - hook_program
+      - invented_policy_refusal
+      - ownership_comparison
+      - pair_lock_reacquisition
+      - preflight_refusals
+      - preserve_status
+      - reply_refusals
+      - request_keys
+      - request_schema_version
+      - restored_status
+      - teardown_junit_errors
+      - teardown_result_status
+      case: GATE-TEARDOWN
   promotion_target: null
 - id: TD-02
   requirement: Teardown Policy Enforcement
@@ -3378,8 +3424,54 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: teardown:case_teardown_policy
+      evidence:
+      - baseline_change_named
+      - baseline_comparison
+      - destroy_refusal
+      - digest_at_execution
+      - foreign_owner_probe
+      - hook_arguments
+      - hook_failures
+      - hook_program
+      - invented_policy_refusal
+      - ownership_comparison
+      - pair_lock_reacquisition
+      - preflight_refusals
+      - preserve_status
+      - reply_refusals
+      - request_keys
+      - request_schema_version
+      - restored_status
+      - teardown_junit_errors
+      - teardown_result_status
+      case: GATE-TEARDOWN
+    multi-node:
+      driver: teardown:case_teardown_policy
+      evidence:
+      - baseline_change_named
+      - baseline_comparison
+      - destroy_refusal
+      - digest_at_execution
+      - foreign_owner_probe
+      - hook_arguments
+      - hook_failures
+      - hook_program
+      - invented_policy_refusal
+      - ownership_comparison
+      - pair_lock_reacquisition
+      - preflight_refusals
+      - preserve_status
+      - reply_refusals
+      - request_keys
+      - request_schema_version
+      - restored_status
+      - teardown_junit_errors
+      - teardown_result_status
+      case: GATE-TEARDOWN
   promotion_target: null
 - id: TD-03
   requirement: Teardown Policy Enforcement
@@ -3407,8 +3499,54 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: teardown:case_teardown_policy
+      evidence:
+      - baseline_change_named
+      - baseline_comparison
+      - destroy_refusal
+      - digest_at_execution
+      - foreign_owner_probe
+      - hook_arguments
+      - hook_failures
+      - hook_program
+      - invented_policy_refusal
+      - ownership_comparison
+      - pair_lock_reacquisition
+      - preflight_refusals
+      - preserve_status
+      - reply_refusals
+      - request_keys
+      - request_schema_version
+      - restored_status
+      - teardown_junit_errors
+      - teardown_result_status
+      case: GATE-TEARDOWN
+    multi-node:
+      driver: teardown:case_teardown_policy
+      evidence:
+      - baseline_change_named
+      - baseline_comparison
+      - destroy_refusal
+      - digest_at_execution
+      - foreign_owner_probe
+      - hook_arguments
+      - hook_failures
+      - hook_program
+      - invented_policy_refusal
+      - ownership_comparison
+      - pair_lock_reacquisition
+      - preflight_refusals
+      - preserve_status
+      - reply_refusals
+      - request_keys
+      - request_schema_version
+      - restored_status
+      - teardown_junit_errors
+      - teardown_result_status
+      case: GATE-TEARDOWN
   promotion_target: null
 - id: TD-04
   requirement: Teardown Policy Enforcement
@@ -3435,8 +3573,54 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: teardown:case_teardown_policy
+      evidence:
+      - baseline_change_named
+      - baseline_comparison
+      - destroy_refusal
+      - digest_at_execution
+      - foreign_owner_probe
+      - hook_arguments
+      - hook_failures
+      - hook_program
+      - invented_policy_refusal
+      - ownership_comparison
+      - pair_lock_reacquisition
+      - preflight_refusals
+      - preserve_status
+      - reply_refusals
+      - request_keys
+      - request_schema_version
+      - restored_status
+      - teardown_junit_errors
+      - teardown_result_status
+      case: GATE-TEARDOWN
+    multi-node:
+      driver: teardown:case_teardown_policy
+      evidence:
+      - baseline_change_named
+      - baseline_comparison
+      - destroy_refusal
+      - digest_at_execution
+      - foreign_owner_probe
+      - hook_arguments
+      - hook_failures
+      - hook_program
+      - invented_policy_refusal
+      - ownership_comparison
+      - pair_lock_reacquisition
+      - preflight_refusals
+      - preserve_status
+      - reply_refusals
+      - request_keys
+      - request_schema_version
+      - restored_status
+      - teardown_junit_errors
+      - teardown_result_status
+      case: GATE-TEARDOWN
   promotion_target: null
 - id: TD-05
   requirement: Teardown Policy Enforcement
@@ -3512,8 +3696,54 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: teardown:case_teardown_policy
+      evidence:
+      - baseline_change_named
+      - baseline_comparison
+      - destroy_refusal
+      - digest_at_execution
+      - foreign_owner_probe
+      - hook_arguments
+      - hook_failures
+      - hook_program
+      - invented_policy_refusal
+      - ownership_comparison
+      - pair_lock_reacquisition
+      - preflight_refusals
+      - preserve_status
+      - reply_refusals
+      - request_keys
+      - request_schema_version
+      - restored_status
+      - teardown_junit_errors
+      - teardown_result_status
+      case: GATE-TEARDOWN
+    multi-node:
+      driver: teardown:case_teardown_policy
+      evidence:
+      - baseline_change_named
+      - baseline_comparison
+      - destroy_refusal
+      - digest_at_execution
+      - foreign_owner_probe
+      - hook_arguments
+      - hook_failures
+      - hook_program
+      - invented_policy_refusal
+      - ownership_comparison
+      - pair_lock_reacquisition
+      - preflight_refusals
+      - preserve_status
+      - reply_refusals
+      - request_keys
+      - request_schema_version
+      - restored_status
+      - teardown_junit_errors
+      - teardown_result_status
+      case: GATE-TEARDOWN
   promotion_target: null
 - id: TD-08
   requirement: Teardown Policy Enforcement
@@ -3538,8 +3768,54 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: teardown:case_teardown_policy
+      evidence:
+      - baseline_change_named
+      - baseline_comparison
+      - destroy_refusal
+      - digest_at_execution
+      - foreign_owner_probe
+      - hook_arguments
+      - hook_failures
+      - hook_program
+      - invented_policy_refusal
+      - ownership_comparison
+      - pair_lock_reacquisition
+      - preflight_refusals
+      - preserve_status
+      - reply_refusals
+      - request_keys
+      - request_schema_version
+      - restored_status
+      - teardown_junit_errors
+      - teardown_result_status
+      case: GATE-TEARDOWN
+    multi-node:
+      driver: teardown:case_teardown_policy
+      evidence:
+      - baseline_change_named
+      - baseline_comparison
+      - destroy_refusal
+      - digest_at_execution
+      - foreign_owner_probe
+      - hook_arguments
+      - hook_failures
+      - hook_program
+      - invented_policy_refusal
+      - ownership_comparison
+      - pair_lock_reacquisition
+      - preflight_refusals
+      - preserve_status
+      - reply_refusals
+      - request_keys
+      - request_schema_version
+      - restored_status
+      - teardown_junit_errors
+      - teardown_result_status
+      case: GATE-TEARDOWN
   promotion_target: null
 - id: LOCK-01
   requirement: Pair-Wide Run Locking
@@ -5708,6 +5984,78 @@ cases:
       - vision_failing_overall
       - vision_runtime_cases
   promotion_target: Result Status Semantics
+- id: GATE-TEARDOWN
+  requirement: Teardown Policy Enforcement
+  live_scenario: null
+  assertion: '`TEST_TEARDOWN_POLICY=DESTROY` and an invented policy are refused by configuration preflight
+    before any host is read, naming the value and the policies v1 has; `PRESERVE` reports `PASS` while
+    reading no host and restates no test outcome; every declared `RESTORE_SNAPSHOT` precondition is refused
+    — a missing snapshot ID, hook path or digest, a relative, symlinked, absent, non-executable, group-writable
+    or foreign-owned hook, a malformed digest — and a hook whose bytes changed after preflight is refused
+    at execution; the request the hook receives on stdin is executed as its own program with no arguments
+    and carries `schema_version: 1`, `action: "restore"`, the run id and one `master`/`worker` object
+    per host with its address and snapshot ID, while an answer missing the version, missing a host object,
+    reporting a host unrestored or naming another ID is refused; a conforming hook with matching baselines
+    reports `INCOMPLETE` with the baseline comparison matched and the pair-lock and ownership comparisons
+    still unimplemented, a differing baseline is `TEARDOWN_FAILED` naming the field, and a hook that times
+    out, exits nonzero or answers non-JSON, a host that comes back unclean, are `TEARDOWN_FAILED`, which
+    the contour''s own report writes as a JUnit error beside a passing acceptance case.'
+  assertion_sha256: 3beb1cb9b18034f95ca0a59962f740385a997f068f0edca3f1e452267372072b
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: teardown:case_teardown_policy
+      evidence:
+      - baseline_change_named
+      - baseline_comparison
+      - destroy_refusal
+      - digest_at_execution
+      - foreign_owner_probe
+      - hook_arguments
+      - hook_failures
+      - hook_program
+      - invented_policy_refusal
+      - ownership_comparison
+      - pair_lock_reacquisition
+      - preflight_refusals
+      - preserve_status
+      - reply_refusals
+      - request_keys
+      - request_schema_version
+      - restored_status
+      - teardown_junit_errors
+      - teardown_result_status
+    multi-node:
+      driver: teardown:case_teardown_policy
+      evidence:
+      - baseline_change_named
+      - baseline_comparison
+      - destroy_refusal
+      - digest_at_execution
+      - foreign_owner_probe
+      - hook_arguments
+      - hook_failures
+      - hook_program
+      - invented_policy_refusal
+      - ownership_comparison
+      - pair_lock_reacquisition
+      - preflight_refusals
+      - preserve_status
+      - reply_refusals
+      - request_keys
+      - request_schema_version
+      - restored_status
+      - teardown_junit_errors
+      - teardown_result_status
+  promotion_target: Teardown Policy Enforcement
 - id: GATE-COVERAGE
   requirement: Coverage completeness and error paths
   live_scenario: null

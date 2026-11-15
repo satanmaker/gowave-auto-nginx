@@ -155,6 +155,21 @@ class LiveVPSConfig:
     def __getitem__(self, key: str) -> Any:
         return self.values[key]
 
+    # The teardown runner reads the hook as `restore_hook_path` and
+    # `restore_hook_sha256`, which `__getattr__` would resolve to
+    # `RESTORE_HOOK_PATH` and `RESTORE_HOOK_SHA256` — names no configuration
+    # carries, because the canonical keys are `SNAPSHOT_RESTORE_HOOK` and
+    # `SNAPSHOT_RESTORE_HOOK_SHA256`. Without these two properties the first
+    # RESTORE_SNAPSHOT teardown raised AttributeError instead of refusing, and
+    # every unit test passed because each one handed in a mock.
+    @property
+    def restore_hook_path(self) -> Any:
+        return self.values.get("SNAPSHOT_RESTORE_HOOK")
+
+    @property
+    def restore_hook_sha256(self) -> Any:
+        return self.values.get("SNAPSHOT_RESTORE_HOOK_SHA256")
+
     def __getattr__(self, name: str) -> Any:
         # Canonical storage uses uppercase environment keys; the runner uses
         # lowercase Python-style attributes. Resolve both consistently.

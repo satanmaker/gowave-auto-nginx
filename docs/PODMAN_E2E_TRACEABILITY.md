@@ -70,7 +70,7 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Camouflage decoy and certificate lineage | `NGX-05` |
 | Security and network isolation verification | `AIO-NEG-DEP` |
 | Failure injection and recovery | `AIO-FAULT-DISK`, `AIO-FAULT-PANEL`, `AIO-FAULT-XRAY`, `AIO-FAULT-LATENCY` |
-| Live scenario parity | `AIO-PKT-02`, `MN-PKT-03`, `AIO-NEG-PIN` |
+| Live scenario parity | `AIO-PKT-02`, `MN-PKT-03`, `AIO-NEG-PIN`, `GATE-TEARDOWN` |
 
 ## Named behaviours
 

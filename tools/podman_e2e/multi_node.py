@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
     acme_fixture, aio, argv_probe, budget, denial, ingress, matrix as matrix_data, mtls,
-    status, topology,
+    status, teardown, topology,
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
@@ -7845,6 +7845,12 @@ def cases(
         # run here because this is the contour whose count the per-node Vision
         # configuration changes.
         Case(status.STATUS_CASE_ID, "multi-node", status.case_status_semantics,
+             timeout_seconds=120),
+        # Beside it and before the lifecycle cases: the teardown policy a cluster
+        # run ends in is decided by a configuration file and a hook, not by the
+        # cluster, so the case reads it here rather than after the cases that
+        # fault the Worker.
+        Case(teardown.TEARDOWN_CASE_ID, "multi-node", teardown.case_teardown_policy,
              timeout_seconds=120),
         # The lifecycle cases run last: they revoke a client and fault the
         # Worker's own unit, so nothing that observes a healthy cluster may run

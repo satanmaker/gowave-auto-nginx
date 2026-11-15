@@ -605,6 +605,38 @@ it stays green, which is the deliberate difference from the live runner's
 treatment of `SKIP`. A `SKIP` in this suite means a declared case did not execute,
 and the aggregate refuses it outright.
 
+### Teardown: the policy a run ends in
+
+`openspec/specs/live-vps-e2e/spec.md` §Teardown Policy Enforcement is the one
+requirement whose subject is the end of a run rather than its work: `PRESERVE`
+records `PASS` without touching a host, `RESTORE_SNAPSHOT` hands a versioned
+request to a digest-pinned external hook and may not be `PASS` until both hosts
+are back on the manifest the run captured before it installed anything, and
+`DESTROY` does not exist in v1. None of that needs a VPS — it is a configuration
+file, a hook and a comparison — so `GATE-TEARDOWN`
+(`tools/podman_e2e/teardown.py`) writes a real mode-0600 configuration, loads it
+through the product's own `load_config` and drives `execute_teardown` with real
+hook programs. The hook it pins is a Python program at a path a shell would split
+into two commands, and it records the program name it was executed as, the
+arguments it was given and the JSON it read from stdin: a hook that answers at
+all is a hook that ran as a program, and the record is how the case knows.
+
+| Live scenario | Container case | Where the two differ |
+| --- | --- | --- |
+| `Destroy policy rejected before the run starts` | `GATE-TEARDOWN` | The refusal happens while the configuration is being read, so no host object exists to reach: that is what "before any remote modification" means where there is no remote. The case also refuses an invented policy, and requires the message to name the value and the two policies v1 has. |
+| `Preserve policy after success or failure` | `GATE-TEARDOWN` | The case hands in two SSH clients that raise on any attribute read, so a policy that reconnects to collect diagnostics cannot produce `PASS`. The record it returns is asserted to carry the teardown status alone — this contour keeps the test outcome in its own `result.json`, so a teardown record that restated it would be the coupling the sentence refuses. |
+| `Snapshot restore hook configuration and protocol are validated` | `GATE-TEARDOWN` | Eleven refusals, each with its own message: four mandatory values, a relative path, a symlink, a directory, an absent file, a non-executable hook, a group-writable one and a malformed digest. The foreign-owned hook is probed only where the runner can create one, and the evidence says which of the two happened. The digest's second check is the tampering clause: the same configuration is accepted, the hook's bytes change, and execution refuses it. |
+| `Restore hook receives a versioned request and returns both restored resources` | `GATE-TEARDOWN` | The request is read out of the hook's own record rather than from a mock, so `schema_version`, `action`, `test_run_id` and the per-host objects are what the hook was handed. The replies that are not a restored host — no version, a later version, no host object, a host unrestored, an id the run did not ask for — are refused beside it. `RESTORE_TIMEOUT` is the bound the configuration declares: a hook that outlives a one-second bound is refused at one second. |
+| `Snapshot restore hook success requires baseline verification` | `GATE-TEARDOWN` | Two matching manifests report the comparison as `MATCHED` and the status as `INCOMPLETE`, never `PASS`, because the pair lock and the complete ownership comparison are still unimplemented; one differing field is `TEARDOWN_FAILED` and names the field. What the case cannot do is recollect the manifest from a restored host, so the two manifests are supplied to the product's own comparison rather than read over SSH. |
+| `Snapshot restore hook does not restore both hosts` | `GATE-TEARDOWN` | A nonzero exit, a non-JSON answer, JSON that is not an object, a call that outlives the bound, and a host that came back with the install still on it are each `TEARDOWN_FAILED`. The last clause writes the live reporter's `junit.xml` — the contour that owns this status — and requires the failure to appear as a JUnit `<error>` beside a passing acceptance case, so no reader of the report can take the run for green. |
+
+**Two scenarios of that requirement stay live-only.** `TD-05` is `partial`: its
+container half is the lock-pair ordering, and this suite holds no remote lock, so
+the hook protocol half is witnessed and the ordering half is not. `TD-06` needs a
+provider snapshot and a real reboot, which a container cannot produce.
+`TEARDOWN_FAILED` is not in this suite's vocabulary for the same reason the
+report section gives: a container run has no teardown phase to name.
+
 ### What is declared but not driven
 
 `PATCH /api/users` and `PATCH /api/users/{userId}` update an existing client,
@@ -674,16 +706,16 @@ image.
 
 `tests/cases/catalog.yaml` defines each scenario once and stamps it with an
 `environment`, so the boundary between the contours is a checked field rather
-than a sentence in a document. The catalog holds 217 entries:
+than a sentence in a document. The catalog holds 218 entries:
 
 | Environment | Entries | Which contour answers it |
 | --- | ---: | --- |
-| `container` | 207 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
+| `container` | 208 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
 | `partial` | 8 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
 | `live-only` | 2 | Only the live suite. Every Podman run reports both as justified exclusions, and `tools/podman_e2e/catalog.py` refuses a catalog that lets one run here. |
 
 Of the 125 live scenarios projected into this catalog, 115 are container, 8 are
-partial and 2 are live-only; the other 92 entries are Podman-first cases with a
+partial and 2 are live-only; the other 93 entries are Podman-first cases with a
 promotion target, which `tests/cases/PARITY.md` lists separately.
 
 The ten entries that are not fully container-answerable are, by id: `PRE-04`,

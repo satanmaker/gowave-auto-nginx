@@ -172,9 +172,10 @@ class TestTeardownAndReporting(unittest.TestCase):
     ):
         hook = self.td_path / "valid_hook.sh"
         hook_resp = {
+            "schema_version": 1,
             "status": "RESTORED",
-            "master_snapshot_id": "snap-m-1",
-            "worker_snapshot_id": "snap-w-1",
+            "master": {"snapshot_id": "snap-m-1", "restored": True},
+            "worker": {"snapshot_id": "snap-w-1", "restored": True},
         }
         hook.write_text(f"#!/bin/sh\ncat >/dev/null\necho '{json.dumps(hook_resp)}'\n")
         hook.chmod(0o755)
@@ -238,13 +239,20 @@ class TestTeardownAndReporting(unittest.TestCase):
         cases = (
             ("nonzero exit", subprocess.CompletedProcess([], 7, "", "hook failed"), "exited with code 7"),
             ("invalid JSON", subprocess.CompletedProcess([], 0, "not-json", ""), "non-JSON output"),
-            ("wrong status", subprocess.CompletedProcess([], 0, json.dumps({"status": "FAILED"}), ""), "reported status"),
+            (
+                "wrong status",
+                subprocess.CompletedProcess(
+                    [], 0, json.dumps({"schema_version": 1, "status": "FAILED"}), "",
+                ),
+                "reported status",
+            ),
             (
                 "snapshot ID mismatch",
                 subprocess.CompletedProcess([], 0, json.dumps({
+                    "schema_version": 1,
                     "status": "RESTORED",
-                    "master_snapshot_id": "wrong-master",
-                    "worker_snapshot_id": "snap-worker",
+                    "master": {"snapshot_id": "wrong-master", "restored": True},
+                    "worker": {"snapshot_id": "snap-worker", "restored": True},
                 }), ""),
                 "snapshot IDs mismatch",
             ),
