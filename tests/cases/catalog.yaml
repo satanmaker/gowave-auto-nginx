@@ -742,8 +742,36 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_tls_ca_bundle
+      evidence:
+      - absent_ca_status
+      - default_trust_anchors_lineage
+      - default_trust_status
+      - foreign_ca_is_a_chain_error
+      - foreign_ca_status
+      - install_ca_file
+      - installer_sha256
+      - probe_removed
+      - run_ca_status
+      - scratch_leftovers
+      - symlink_ca_status
+    multi-node:
+      driver: aio:case_tls_ca_bundle
+      evidence:
+      - absent_ca_status
+      - default_trust_anchors_lineage
+      - default_trust_status
+      - foreign_ca_is_a_chain_error
+      - foreign_ca_status
+      - install_ca_file
+      - installer_sha256
+      - probe_removed
+      - run_ca_status
+      - scratch_leftovers
+      - symlink_ca_status
   promotion_target: null
 - id: AIO-03
   requirement: All-in-One Master VPS Installation Verification

@@ -15,7 +15,7 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 
 | Requirement | Scenario | Matrix rows | Cases | Tests | Job | Gap |
 | --- | --- | --- | --- | --- | --- | --- |
-| Independent All-in-One acceptance topology | All-in-One clean installation | — | `AIO-INSTALL`, `AIO-PACKAGES`, `AIO-04`, `AIO-01`, `AIO-03`, `AIO-05`, `TLS-01` | `test_podman_aio.TestAioSuite`, `test_podman_aio.TestAioVerificationCases`, `test_podman_runner.TestPodmanRunnerContract` | All-in-One Podman Acceptance | — |
+| Independent All-in-One acceptance topology | All-in-One clean installation | — | `AIO-INSTALL`, `AIO-PACKAGES`, `AIO-04`, `AIO-01`, `AIO-03`, `AIO-05`, `AIO-02`, `TLS-01` | `test_podman_aio.TestAioSuite`, `test_podman_aio.TestAioVerificationCases`, `test_podman_aio.TestTlsCaBundleCase`, `test_podman_runner.TestPodmanRunnerContract` | All-in-One Podman Acceptance | — |
 | Independent All-in-One acceptance topology | All-in-One repeated provisioning | — | `AIO-IDEMPOTENT`, `AIO-RESTART` | `test_podman_aio.TestIdempotentCase`, `test_podman_aio.TestRestartCase` | All-in-One Podman Acceptance | — |
 | Independent Multi-Node acceptance topology | Multi-Node clean installation and registration | — | `MN-INSTALL`, `WRK-04`, `WRK-05`, `CLUS-01`, `CLUS-02`, `CLUS-03` | `test_podman_multi_node.TestMultiNodeSuite`, `test_podman_multi_node.TestWorkerRegistrationCase`, `test_podman_cluster.TestClusterCases` | Multi-Node Podman Acceptance | — |
 | Independent Multi-Node acceptance topology | Master and Worker optional domain configuration | — | `MN-VISION` | `test_podman_cluster.TestVisionCase`, `test_podman_multi_node.TestMultiNodeCounts` | Multi-Node Podman Acceptance | — |

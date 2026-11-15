@@ -7624,6 +7624,11 @@ def cases(
         timeout_seconds=SSH_DOWN_TIMEOUT_SECONDS,
     ))
     suite.extend([
+        # The Master's own TLS/SNI probe, asked what decides its answer: the
+        # per-run bundle, and not what the host trusts without one. It reloads
+        # nothing, so it runs here, before the cases that change the tree.
+        Case(aio.TLS_CA_CASE_ID, "multi-node", lambda context: aio.case_tls_ca_bundle(product.master),
+             timeout_seconds=aio.TLS_CA_TIMEOUT_SECONDS),
         Case("SUB-SERVED", "multi-node", lambda context: aio.case_subscriptions(product.master),
              timeout_seconds=SUB_SERVED_TIMEOUT_SECONDS),
         Case("SUB-B64", "multi-node", lambda context: aio.case_share_links(product.master),

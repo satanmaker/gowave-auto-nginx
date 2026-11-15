@@ -944,6 +944,9 @@ TLS_CASE_ID = "TLS-01"
 # configuration read; the ceiling is a hang guard, not an expectation.
 TLS_PROBE_TIMEOUT_SECONDS = 60
 TLS_TIMEOUT_SECONDS = 300
+# Six short legs over the local listener plus one key generation; the ceiling
+# guards a stalled openssl, not the expected cost.
+TLS_CA_TIMEOUT_SECONDS = 300
 # The versions the product documents for its HTTPS vhosts. A role that inherits
 # a platform default instead would accept whatever the distribution shipped,
 # which is exactly the difference an independent client cannot see on its own.
@@ -951,6 +954,43 @@ TLS_POLICY_PROTOCOLS = ("TLSv1.2", "TLSv1.3")
 # A certificate with less headroom than this has no time left for the renewal
 # that is supposed to replace it.
 TLS_MINIMUM_REMAINING_SECONDS = 86400
+
+TLS_CA_CASE_ID = "AIO-02"
+TLS_CA_PROBE_DIR = "/run/gowave-e2e-tls-ca"
+TLS_CA_PROBE_SCRIPT = TLS_CA_PROBE_DIR + "/verify_public_tls_sni.sh"
+TLS_CA_PROBE_BODY = TLS_CA_PROBE_DIR + "/probe-body.sh"
+TLS_CA_FOREIGN_ROOT = TLS_CA_PROBE_DIR + "/foreign-root.pem"
+TLS_CA_FOREIGN_KEY = TLS_CA_PROBE_DIR + "/foreign-root.key"
+TLS_CA_SYMLINK = TLS_CA_PROBE_DIR + "/linked-root.pem"
+TLS_CA_ATTEMPTS = 3
+# The probe's own words for a bundle it will not read, so a failure leg can say
+# why it failed instead of only that it did.
+TLS_CA_REFUSAL = "GOWAVE_TLS_CA_FILE must be a readable regular file, not a symlink"
+# OpenSSL's ways of saying "this chain does not end in a root you gave me".
+TLS_CA_FAILURE_MARKERS = (
+    "unable to get local issuer certificate",
+    "self-signed certificate",
+    "certificate verify failed",
+)
+# The probe is lifted out of the installer the install actually ran, so the case
+# judges the shipped function rather than a copy of its logic. `/repo` is the
+# same tree, mounted read-only; the slice stops where the entrypoint's next
+# function starts, and the last two greps report that it did.
+TLS_CA_PROBE_SETUP = r"""set -Eeuo pipefail
+mkdir -p -m 0700 PROBE_DIR_PLACEHOLDER
+rm -f SCRIPT_PLACEHOLDER BODY_PLACEHOLDER FOREIGN_ROOT_PLACEHOLDER FOREIGN_KEY_PLACEHOLDER
+sed -n '/^verify_public_tls_sni() {$/,/^acquire_lock() {$/p' /repo/gowave-auto.sh \
+    | head -n -1 > BODY_PLACEHOLDER
+{
+    printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nsource /repo/modules/tempdir.sh\n'
+    cat BODY_PLACEHOLDER
+} > SCRIPT_PLACEHOLDER
+rm -f BODY_PLACEHOLDER
+chmod 0700 SCRIPT_PLACEHOLDER
+sha256sum /repo/gowave-auto.sh | cut -d' ' -f1
+grep -c '^verify_public_tls_sni() {$' SCRIPT_PLACEHOLDER || true
+grep -c '^acquire_lock() {$' SCRIPT_PLACEHOLDER || true
+"""
 
 TLS_POLICY_SCRIPT = r"""python3 - DOMAIN_PLACEHOLDER <<'PY'
 import glob
@@ -1824,6 +1864,138 @@ def case_tls_and_identity(product: AioProduct) -> Dict[str, Any]:
         "short_uuid_source": "api",
         "credentials_short_uuid_key": False,
     }
+
+
+def case_tls_ca_bundle(product: AioProduct) -> Dict[str, Any]:
+    """AIO-02: the install's TLS/SNI probe trusts the per-run bundle and nothing else.
+
+    The assertion is about the decision the *installer* made, so the probe under
+    test is the product's own function, sliced at run time out of the
+    `gowave-auto.sh` the install dispatched (`/repo` is the same tree, mounted
+    read-only) rather than re-implemented here. Five legs then ask what decides
+    that decision: the fixture root succeeds, a foreign root does not, an absent
+    path and a symlink are refused before any handshake, the same probe with no
+    bundle at all rejects the served lineage (so the per-run root was supplied
+    per run and not installed where the host trusts it globally), and the probe
+    leaves nothing behind.
+    """
+    host = product.require_installed()
+    domain = host.panel_domain
+    ca_file = f"{topology.CA_MOUNT}/{topology.ISSUED_ROOT_NAME}"
+    setup = (
+        TLS_CA_PROBE_SETUP
+        .replace("PROBE_DIR_PLACEHOLDER", TLS_CA_PROBE_DIR)
+        .replace("BODY_PLACEHOLDER", TLS_CA_PROBE_BODY)
+        .replace("SCRIPT_PLACEHOLDER", TLS_CA_PROBE_SCRIPT)
+        .replace("FOREIGN_ROOT_PLACEHOLDER", TLS_CA_FOREIGN_ROOT)
+        .replace("FOREIGN_KEY_PLACEHOLDER", TLS_CA_FOREIGN_KEY)
+    )
+    prepared = product.host_script(setup)
+    detail = (prepared.stderr or prepared.stdout or "").strip()[-2000:]
+    require(TLS_CA_CASE_ID, prepared.returncode == 0,
+            f"the probe could not be sliced out of the installer: {detail}")
+    lines = (prepared.stdout or "").split()
+    digest = lines[0] if lines else ""
+    functions = lines[1] if len(lines) > 1 else ""
+    stray = lines[2] if len(lines) > 2 else ""
+    require(TLS_CA_CASE_ID, len(digest) == 64, f"the installer's digest was not read: {lines}")
+    require(TLS_CA_CASE_ID, functions == "1",
+            f"the slice carries {functions} definitions of verify_public_tls_sni, not one")
+    # The slice ends at the next function: a stray `acquire_lock` body would mean
+    # the markers moved and the probe under test is not the installer's.
+    require(TLS_CA_CASE_ID, stray in ("", "0"), f"the slice ran past its end ({stray})")
+    try:
+        foreign = product.host_script(
+            "openssl req -x509 -newkey rsa:2048 -nodes -days 2 "
+            "-subj /CN=gowave-e2e-foreign-root "
+            f"-keyout {TLS_CA_FOREIGN_KEY} -out {TLS_CA_FOREIGN_ROOT} 2>/dev/null && "
+            f"sha256sum {TLS_CA_FOREIGN_ROOT}"
+        )
+        require(TLS_CA_CASE_ID, foreign.returncode == 0,
+                "a foreign root could not be created: "
+                f"{(foreign.stderr or foreign.stdout or '').strip()[-500:]}")
+
+        anchor = _tls_ca_leg(product, domain, ca_file)
+        require(TLS_CA_CASE_ID, anchor["status"] == 0,
+                "the install's probe rejected the per-run bundle: "
+                f"{anchor['output'][-600:]}")
+
+        untrusted = _tls_ca_leg(product, domain, TLS_CA_FOREIGN_ROOT)
+        require(TLS_CA_CASE_ID, untrusted["status"] != 0,
+                "the install's probe accepted a certificate no foreign root issued")
+        require(TLS_CA_CASE_ID,
+                any(marker in untrusted["output"] for marker in TLS_CA_FAILURE_MARKERS),
+                "the foreign root failed for a reason other than the chain: "
+                f"{untrusted['output'][-600:]}")
+
+        missing = _tls_ca_leg(product, domain, TLS_CA_PROBE_DIR + "/absent.pem")
+        require(TLS_CA_CASE_ID, missing["status"] != 0,
+                "a bundle path that does not exist was accepted")
+        require(TLS_CA_CASE_ID, TLS_CA_REFUSAL in missing["output"],
+                f"an absent bundle was not refused as such: {missing['output'][-600:]}")
+
+        linked = product.host_script(f"ln -sfn {ca_file} {TLS_CA_SYMLINK}")
+        require(TLS_CA_CASE_ID, linked.returncode == 0,
+                f"the symlink leg could not be set up: {(linked.stderr or '').strip()[-300:]}")
+        symlink = _tls_ca_leg(product, domain, TLS_CA_SYMLINK)
+        require(TLS_CA_CASE_ID, symlink["status"] != 0,
+                "a bundle that is a symlink was accepted")
+        require(TLS_CA_CASE_ID, TLS_CA_REFUSAL in symlink["output"],
+                f"a symlinked bundle was not refused as such: {symlink['output'][-600:]}")
+
+        store = _tls_ca_leg(product, domain, None)
+        require(TLS_CA_CASE_ID, store["status"] != 0,
+                "the install's probe verified the lineage without the per-run bundle, "
+                "so the fixture root reached the global trust store instead of being "
+                "supplied per run")
+        require(TLS_CA_CASE_ID,
+                any(marker in store["output"] for marker in TLS_CA_FAILURE_MARKERS),
+                "the default trust path failed for a reason other than the chain: "
+                f"{store['output'][-600:]}")
+
+        leftovers = product.host_script(
+            "ls -1d /tmp/gowave-tls-sni.* 2>/dev/null | wc -l"
+        )
+        scratch = (leftovers.stdout or "").strip()
+        require(TLS_CA_CASE_ID, leftovers.returncode == 0 and scratch == "0",
+                f"the probe left {scratch} scratch directories behind")
+    finally:
+        product.host_script(f"rm -rf {TLS_CA_PROBE_DIR}")
+    removed = product.host_script(f"test ! -e {TLS_CA_PROBE_DIR} && echo removed")
+    require(TLS_CA_CASE_ID, (removed.stdout or "").strip() == "removed",
+            "the foreign root and the sliced probe were left on the host")
+    return {
+        "installer_sha256": digest,
+        "install_ca_file": ca_file,
+        "run_ca_status": anchor["status"],
+        "foreign_ca_status": untrusted["status"],
+        "foreign_ca_is_a_chain_error": any(
+            marker in untrusted["output"] for marker in TLS_CA_FAILURE_MARKERS),
+        "absent_ca_status": missing["status"],
+        "symlink_ca_status": symlink["status"],
+        "default_trust_status": store["status"],
+        "default_trust_anchors_lineage": store["status"] == 0,
+        "scratch_leftovers": scratch,
+        "probe_removed": True,
+    }
+
+
+def _tls_ca_leg(product: AioProduct, domain: str,
+                ca_file: Optional[str]) -> Dict[str, Any]:
+    """Run the product's probe once with one bundle, as the install does.
+
+    ``ca_file=None`` is the install's own fallback: no bundle in the environment,
+    so the probe judges the chain against whatever the host trusts globally.
+    """
+    inner = (
+        f"source {TLS_CA_PROBE_SCRIPT} && "
+        f"verify_public_tls_sni {shlex.quote(domain)} 127.0.0.1:443 {TLS_CA_ATTEMPTS}"
+    )
+    prefix = "" if ca_file is None else f"GOWAVE_TLS_CA_FILE={shlex.quote(ca_file)} "
+    script = f"{prefix}bash -c {shlex.quote(inner)}"
+    result = product.host_script(script)
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    return {"status": result.returncode, "output": output}
 
 
 def case_tls_surface(product: AioProduct) -> Dict[str, Any]:
@@ -6926,6 +7098,11 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case("AIO-01", "aio", lambda context: case_panel_ready(product), timeout_seconds=300),
         Case("AIO-03", "aio", lambda context: case_credentials(product), timeout_seconds=300),
         Case("AIO-05", "aio", lambda context: case_tls_and_identity(product), timeout_seconds=300),
+        # The installer's own TLS/SNI probe is asked what decides its answer —
+        # the per-run bundle, or no bundle and whatever the host trusts — before
+        # any reload touches the tree this case reads it out of.
+        Case(TLS_CA_CASE_ID, "aio", lambda context: case_tls_ca_bundle(product),
+             timeout_seconds=TLS_CA_TIMEOUT_SECONDS),
         # The public certificate is read before the tree is reloaded, so a later
         # case's reload cannot be mistaken for a defect in what this one measured.
         Case(TLS_CASE_ID, "aio", lambda context: case_tls_surface(product),

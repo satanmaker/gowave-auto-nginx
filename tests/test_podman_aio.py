@@ -443,6 +443,135 @@ def probe_product(context, facts, returncode=0):
     return product, podman
 
 
+TLS_CA_DIGEST = "a" * 64
+TLS_CA_CHAIN_ERROR = (
+    "Error: The port 443 listener did not prove TLS for panel.testbed.internal.\n"
+    "  Last attempt answered with: verification failed: unable to get local issuer certificate\n"
+)
+TLS_CA_REFUSAL_OUTPUT = f"Fatal: {aio.TLS_CA_REFUSAL}.\n"
+TLS_CA_OTHER_FAILURE = (
+    "Error: The port 443 listener did not prove TLS for panel.testbed.internal.\n"
+    "  Last attempt answered with: no certificate was served\n"
+)
+
+
+def tls_ca_scripts(
+    *, functions="1", stray="0", anchor=0, untrusted=1, untrusted_output=TLS_CA_CHAIN_ERROR,
+    absent=1, absent_output=TLS_CA_REFUSAL_OUTPUT, symlink=1,
+    symlink_output=TLS_CA_REFUSAL_OUTPUT, default=1, default_output=TLS_CA_CHAIN_ERROR,
+    leftovers="0", removed="removed",
+):
+    """The eleven host scripts the case runs, in the order it runs them."""
+    return [
+        (f"{TLS_CA_DIGEST}\n{functions}\n{stray}\n", 0),
+        ("9b2f foreign-root.pem\n", 0),
+        ("", anchor),
+        (untrusted_output, untrusted),
+        (absent_output, absent),
+        ("", 0),
+        (symlink_output, symlink),
+        (default_output, default),
+        (f"{leftovers}\n", 0),
+        ("", 0),
+        (f"{removed}\n", 0),
+    ]
+
+
+class TestTlsCaBundleCase(unittest.TestCase):
+    """AIO-02: the installer's probe trusts the per-run bundle and nothing else."""
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def run_case(self, **overrides):
+        product, podman = installed_product(self.context, tls_ca_scripts(**overrides))
+        return aio.case_tls_ca_bundle(product), podman
+
+    def test_the_probe_under_test_is_sliced_out_of_the_installers_own_script(self):
+        _, podman = self.run_case()
+        self.assertIn("sed -n '/^verify_public_tls_sni() {$/,/^acquire_lock() {$/p' /repo/gowave-auto.sh",
+                      podman.scripts[0])
+        self.assertIn("source /repo/modules/tempdir.sh", podman.scripts[0])
+        legs = [script for script in podman.scripts if "verify_public_tls_sni " in script]
+        self.assertEqual(len(legs), 5, f"five legs run the probe, got {len(legs)}")
+        for script in legs:
+            self.assertIn("127.0.0.1:443", script)
+        # Four legs supply a bundle; the fifth is the install's own fallback, so
+        # it must reach the probe with the variable absent rather than empty.
+        bundled = [script for script in legs if "GOWAVE_TLS_CA_FILE=" in script]
+        self.assertEqual(len(bundled), 4, f"four legs supply a bundle, got {len(bundled)}")
+        fallback = [script for script in legs if "GOWAVE_TLS_CA_FILE=" not in script]
+        self.assertEqual(len(fallback), 1, "exactly one leg runs without a bundle")
+
+    def test_the_per_run_bundle_leg_records_what_each_bundle_decided(self):
+        evidence, _ = self.run_case()
+        self.assertEqual(evidence["install_ca_file"],
+                         f"{topology.CA_MOUNT}/{topology.ISSUED_ROOT_NAME}")
+        self.assertEqual(evidence["run_ca_status"], 0)
+        self.assertEqual(evidence["foreign_ca_status"], 1)
+        self.assertTrue(evidence["foreign_ca_is_a_chain_error"])
+        self.assertEqual(evidence["absent_ca_status"], 1)
+        self.assertEqual(evidence["symlink_ca_status"], 1)
+        self.assertEqual(evidence["default_trust_status"], 1)
+        self.assertFalse(evidence["default_trust_anchors_lineage"])
+        self.assertEqual(evidence["scratch_leftovers"], "0")
+        self.assertTrue(evidence["probe_removed"])
+        self.assertEqual(evidence["installer_sha256"], TLS_CA_DIGEST)
+
+    def test_a_foreign_root_that_is_accepted_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(untrusted=0, untrusted_output="")
+        self.assertIn("accepted a certificate no foreign root issued", str(caught.exception))
+
+    def test_a_failure_that_is_not_a_chain_error_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(untrusted_output=TLS_CA_OTHER_FAILURE)
+        self.assertIn("reason other than the chain", str(caught.exception))
+
+    def test_an_absent_bundle_that_is_read_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(absent=0, absent_output="")
+        self.assertIn("does not exist was accepted", str(caught.exception))
+
+    def test_a_symlinked_bundle_must_be_refused_as_one(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(symlink_output=TLS_CA_OTHER_FAILURE)
+        self.assertIn("not refused as such", str(caught.exception))
+
+    def test_a_lineage_the_default_trust_path_anchors_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(default=0, default_output="")
+        self.assertIn("without the per-run bundle", str(caught.exception))
+
+    def test_a_default_path_failure_that_is_not_a_chain_error_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(default_output=TLS_CA_OTHER_FAILURE)
+        self.assertIn("default trust path failed for a reason other than the chain",
+                      str(caught.exception))
+
+    def test_scratch_directories_left_behind_fail_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(leftovers="2")
+        self.assertIn("2 scratch directories", str(caught.exception))
+
+    def test_a_slice_without_exactly_one_definition_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(functions="2")
+        self.assertIn("not one", str(caught.exception))
+        with self.assertRaises(AssertionError) as stray:
+            self.run_case(stray="1")
+        self.assertIn("ran past its end", str(stray.exception))
+
+    def test_the_sliced_probe_is_removed_even_when_a_leg_fails(self):
+        product, podman = installed_product(self.context, tls_ca_scripts(leftovers="2"))
+        with self.assertRaises(AssertionError):
+            aio.case_tls_ca_bundle(product)
+        self.assertEqual(podman.scripts[-1], f"rm -rf {aio.TLS_CA_PROBE_DIR}",
+                         "the finally leg runs after the failed check, not before it")
+
+
 class TestNegativeCases(unittest.TestCase):
     """The negative cases: a refusal only counts against a working control."""
 
