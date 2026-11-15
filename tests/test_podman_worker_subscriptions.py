@@ -159,10 +159,10 @@ class TestWorkerSubscriptionCases(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.context = type("_Context", (), {"topology_name": "multi-node"})()
 
-    def _product(self, engine):
+    def _product(self, engine, served=None):
         product, _ = installed_product(
             self.context,
-            host_scripts=[panel_result({"subscriptions": served_facts()})],
+            host_scripts=[panel_result({"subscriptions": served or served_facts()})],
         )
         product.host = _ClusterHost([engine_result(engine)])
         return product
@@ -219,9 +219,24 @@ class TestWorkerSubscriptionCases(unittest.TestCase):
         # "the clash YAML declares 2 proxies, expected 1" while the Panel was right.
         data = matrix.load()
         cluster = (matrix.inbounds(data, vision=False) * 2)
+        dials = engine_representations()["xray_json"]["dials"]
+        worker_dials = [dict(dial) for dial in dials]
+        for dial in worker_dials:
+            dial["tag"] = f"{dial['tag']}-worker"
+            dial["address"] = topology.WORKER_DOMAIN
+            dial["sni"] = (topology.WORKER_REALITY_DOMAIN
+                           if dial["sni"] == topology.REALITY_DOMAIN else topology.WORKER_DOMAIN)
+        records = [dict(record) for record in served_facts()["hosts"]["records"]]
+        worker_records = [dict(record) for record in records]
+        for record in worker_records:
+            record["remark"] = record["remark"].replace("@local-node", "@worker-1")
+            record["address"] = topology.WORKER_DOMAIN
+            record["sni"] = (topology.WORKER_REALITY_DOMAIN
+                             if record["sni"] == topology.REALITY_DOMAIN else topology.WORKER_DOMAIN)
         engine = engine_representations({
             "base64.link_count": 8,
             "xray_json.entries": 8,
+            "xray_json.dials": dials + worker_dials,
             "mihomo.proxies": 8,
             "mihomo.proxy_details": [
                 {"name": "REALITY", "type": "vless", "server": topology.PANEL_DOMAIN},
@@ -236,11 +251,15 @@ class TestWorkerSubscriptionCases(unittest.TestCase):
             "clash.proxies": 2,
             "singbox.outbounds": 8,
         })
-        product = self._product(engine)
+        product = self._product(
+            engine, served_facts({"hosts.records": records + worker_records}),
+        )
         product.subscription_inbounds_override = cluster
         evidence = aio.case_subscriptions(product)
         self.assertEqual(evidence["clash_proxies"], 2)
         self.assertEqual(evidence["mihomo_proxies"], 8)
+        self.assertEqual(evidence["host_records"], 8)
+        self.assertEqual(evidence["host_record_mismatches"], 0)
 
 
 # The network the data-plane doubles hand out, so both nodes' egress addresses

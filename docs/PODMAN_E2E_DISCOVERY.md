@@ -249,14 +249,14 @@ to a generator. The five representations are declared once, in
 `tests/cases/matrix.yaml`: `base64` at `/api/sub/{shortUuid}`, `xray-json` at
 `/v2ray-json`, `mihomo` at `/mihomo`, `clash` at `/clash` and `singbox` at
 `/singbox`. The probe carries the client family and User-Agent for each
-(`tools/podman_e2e/panel_surface.py:66`-`70`); `SUB-B64` is the case that checks
+(`tools/podman_e2e/panel_surface.py:84`-`88`); `SUB-B64` is the case that checks
 the base64 list an Xray-family client imports.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| subscription | `GET /api/sub/{shortUuid}` | `internal/server/server.go:522` | `tools/podman_e2e/panel_surface.py:66` `base64` |
+| subscription | `GET /api/sub/{shortUuid}` | `internal/server/server.go:522` | `tools/podman_e2e/panel_surface.py:84` `base64` |
 | subscription | `GET /api/sub/{shortUuid}/info` | `internal/server/server.go:523` | none — coverage gap |
-| subscription | `GET /api/sub/{shortUuid}/{clientType}` | `internal/server/server.go:524` | `tools/podman_e2e/panel_surface.py:67` `xray-json` |
+| subscription | `GET /api/sub/{shortUuid}/{clientType}` | `internal/server/server.go:524` | `tools/podman_e2e/panel_surface.py:85` `xray-json` |
 
 The path segment is not free-form: `handleOverrideClientType`
 (`internal/subscription/srr.go:165`) switches on `stash`, `singbox`, `mihomo`,
@@ -282,7 +282,7 @@ client that sends an empty one are different requests.
 
 That policy is why `SUB-SERVED` asks every representation a second time with
 `curl/8.5.0`, a header that names no client family
-(`tools/podman_e2e/panel_surface.py:58`). It has to be served, and with the same
+(`tools/podman_e2e/panel_surface.py:79`). It has to be served, and with the same
 bytes: a refusal would mean the Panel requires a format rather than a header,
 and different bytes would mean the header selects the representation and the
 family headers were carrying the assertion. Neither is true of the pinned Panel,
@@ -320,7 +320,7 @@ stays `null`, so the client's Host header follows the dialled address.
 The manifest's `clients` block says which pinned binary imports which
 representation; this table says what the case that fetches it actually does with
 the body. The order is the order the probe fetches them in
-(`tools/podman_e2e/panel_surface.py:66`-`70`), and
+(`tools/podman_e2e/panel_surface.py:84`-`88`), and
 `TestSubscriptionFamilyInventory` reads every cell back against
 `tests/cases/matrix.yaml`, that tuple and `tests/cases/catalog.yaml`, so a
 representation added to the manifest without a row — or a row naming an engine
@@ -383,7 +383,7 @@ of quietly asserting the weaker half.
 | --- | --- | --- |
 | `Subscription rejected with absent User-Agent` | `SUB-UA-ABSENT`, `SUB-UA-BLANK` | The live contract passes on whatever status the installed Panel returns and fails only if it differs from the upstream policy; the container suite pins `403` because the pinned Panel answers `403`, and asks every served path rather than `/v2ray-json` alone. |
 | `Proxy-capable outbounds in Xray JSON` | `SUB-SERVED`, `SUB-B64` | The live contract counts 8, 9 or 10 outbounds because it always runs a Master and a Worker; an All-in-One subscription carries 4 (5 with Vision) and a Multi-Node one carries 8, 9 or 10. The count is per subscription, so the topology explains the smaller number and the product does not change. |
-| `Xray JSON subscription headers and content verified` | `SUB-SERVED`, `SUB-B64` | `SUB-SERVED` requires HTTP 200, the representation's media type and `Cache-Control: no-store`; `SUB-B64` decodes the link list and proves the Xray-family importer consumes it. The header is read through the public edge, because the Panel process itself sends none. |
+| `Xray JSON subscription headers and content verified` | `SUB-SERVED`, `SUB-B64` | `SUB-SERVED` requires HTTP 200, the media type each representation is served with, `Cache-Control: no-store`, every served outbound recorded by `GET /api/hosts` on address, SNI and path, no server-side secret in any representation and no private key field, and `xray run -test` over each served profile; `SUB-B64` decodes the link list and proves the Xray-family importer consumes it. The header is read through the public edge, because the Panel process itself sends none. The live text's "all mandatory response headers" is claimed only for the header it names itself; the rest are recorded, not asserted, because no container case reads one. |
 | `Mihomo YAML subscription verified` | `SUB-SERVED` | Both require HTTP 200, a media type, one proxy per served inbound and `mihomo -t`. The live text also names the rule `GEOIP,private,DIRECT,no-resolve`; see below. |
 
 **The one divergence that is prose, not behaviour.** The pinned Panel does not
@@ -412,6 +412,30 @@ only the loopback answer and failed a real run
 (`podman-aio-20261114T192016-4bb11a91`, `SUB-SERVED`, `Cache-Control ''`)
 although the vhost sent the header: the case, not the product, was wrong, and
 the two-vantage read is what closes that gap rather than a wider tolerance.
+
+**The subscription is compared with the records the Panel keeps, not with the
+projection the installer posted.** Every served outbound is read back as the
+tuple a client dials — address, port, SNI, and the path or gRPC service name —
+and matched against `GET /api/hosts`, the document the Panel derives a client's
+config from. Comparing it with `host_projection` instead would have agreed with
+itself: the installer is what wrote both. Three of the five records share one
+address and one SNI, so the path is the field that tells them apart, and the
+require is "every dial is recorded" rather than set equality, because the Panel
+keeps records no client dials. The probe reduces each record to the fields the
+claim needs and reports a count, never a value.
+
+**A representation is scanned for the values a client must never receive.**
+`SUB-SERVED` reads the keys the product writes into its own environment files —
+the Panel's `APP_SECRET` from `/opt/gowave/.env` and the Node's `SECRET_KEY` from
+`/opt/gowave-node/.env`, both of which an All-in-One host carries — plus the
+administrator's password from the credentials file the install wrote, and counts
+each of them in every representation in four encodings — raw, base64, base64url
+and URL-quoted — plus the decoded body of the base64 list, because a secret
+inside a link is base64 twice. The count is per representation and the needles
+are counted first: a scan with nothing to look for would report zero hits and
+look like evidence. The private key is a separate question and a separate count,
+because a Trojan `password` in a subscription is legitimate client material and a
+name-based scan of key fields is what distinguishes the two.
 
 **The database is read where the Panel writes it.** `AIO-FAULT-DISK` runs the
 operator's `backup --type panel` against a store with no room left, and the claim

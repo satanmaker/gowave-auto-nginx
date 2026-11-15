@@ -3,6 +3,7 @@
 import base64
 import io
 import json
+import re
 import ssl
 import subprocess
 import sys
@@ -251,28 +252,53 @@ def served_facts(overrides=None):
     ``edge_cache_control`` is the public vhost a client talks to. The product's
     Panel sends none of it and its vhost adds it, so a fixture that put the
     header on both would let a case pass while reading the wrong side.
+
+    ``hosts`` is `GET /api/hosts` as the probe reduces it, and the four records
+    are the ones the install posts for the four inbounds above — address, SNI and
+    path are literals here so a projection edit turns this fixture red instead of
+    moving with it. ``secret_needles`` is 2 because the probe reads the Panel's
+    signing key and the administrator's password, and every ``secret_hits`` is 0
+    because a served subscription carries neither.
     """
     return merge({
         "short_uuid_length": len(SHORT_UUID),
+        "secret_needles": 2,
+        "hosts": {
+            "status": 200,
+            "records": [
+                {"remark": "VLESS-REALITY-Vision@local-node", "address": "panel.testbed.internal",
+                 "port": "443", "sni": "reality.testbed.internal", "path": "",
+                 "security_layer": "DEFAULT", "alpn": "h2,http/1.1", "disabled": False},
+                {"remark": "VLESS-XHTTP-TLS@local-node", "address": "panel.testbed.internal",
+                 "port": "443", "sni": "panel.testbed.internal", "path": "/xhttp",
+                 "security_layer": "TLS", "alpn": "h2,http/1.1", "disabled": False},
+                {"remark": "VLESS-WS-TLS@local-node", "address": "panel.testbed.internal",
+                 "port": "443", "sni": "panel.testbed.internal", "path": "/ws",
+                 "security_layer": "TLS", "alpn": "http/1.1", "disabled": False},
+                {"remark": "Trojan-gRPC-TLS@local-node", "address": "panel.testbed.internal",
+                 "port": "443", "sni": "panel.testbed.internal", "path": "grpc",
+                 "security_layer": "TLS", "alpn": "h2", "disabled": False},
+            ],
+        },
         "representations": {
             "base64": {"status": 200, "content_type": "text/plain", "bytes": len(BASE64_BODY),
-                       "cache_control": "",
+                       "cache_control": "", "secret_hits": 0,
                        "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
                        "foreign_status": 200, "foreign_identical": True},
             "xray-json": {"status": 200, "content_type": "application/json", "bytes": len(JSON_BODY),
-                          "cache_control": "",
+                          "cache_control": "", "secret_hits": 0,
                           "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
                           "foreign_status": 200, "foreign_identical": True},
             "mihomo": {"status": 200, "content_type": "text/yaml", "bytes": len(MIHOMO_YAML),
-                       "cache_control": "",
+                       "cache_control": "", "secret_hits": 0,
                        "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
                        "foreign_status": 200, "foreign_identical": True},
             "clash": {"status": 200, "content_type": "text/yaml", "bytes": len(MIHOMO_YAML),
-                      "cache_control": "",
+                      "cache_control": "", "secret_hits": 0,
                       "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
                       "foreign_status": 200, "foreign_identical": True},
             "singbox": {"status": 200, "content_type": "application/json", "bytes": len(SINGBOX_BODY),
-                        "cache_control": "",
+                        "cache_control": "", "secret_hits": 0,
                         "edge_status": 200, "edge_cache_control": NO_STORE, "edge_identical": True,
                         "foreign_status": 200, "foreign_identical": True},
         },
@@ -282,19 +308,39 @@ def served_facts(overrides=None):
 def engine_representations(overrides=None):
     engine = {
         "base64": {"decoded": True, "decoded_bytes": 812, "link_count": 4,
-                   "schemes": ["trojan", "vless"]},
+                   "schemes": ["trojan", "vless"], "private_keys": 0},
         # The tuples and the fingerprint are what the probe reads back out of the
         # four served outbounds above, and what the matrix issues each inbound
         # for; they are literals here so a matrix edit turns this fixture red
-        # instead of moving with it.
+        # instead of moving with it. ``dials`` is the same read with the fields a
+        # Host record states kept, and every document carries no private key.
         "xray_json": {"shape": "list", "entries": 4, "wrapped": 0, "protocols": ["trojan", "vless"],
                       "transports": ["trojan/grpc/tls", "vless/tcp/reality",
                                      "vless/ws/tls", "vless/xhttp/tls"],
-                      "fingerprints": ["firefox"], "sni_missing": 0},
+                      "fingerprints": ["firefox"], "sni_missing": 0,
+                      "dials": [
+                          {"tag": "reality", "protocol": "vless",
+                           "address": "panel.testbed.internal", "port": "443",
+                           "sni": "reality.testbed.internal", "path": "", "service_name": "",
+                           "network": "tcp"},
+                          {"tag": "xhttp", "protocol": "vless",
+                           "address": "panel.testbed.internal", "port": "443",
+                           "sni": "panel.testbed.internal", "path": "/xhttp", "service_name": "",
+                           "network": "xhttp"},
+                          {"tag": "ws", "protocol": "vless",
+                           "address": "panel.testbed.internal", "port": "443",
+                           "sni": "panel.testbed.internal", "path": "/ws", "service_name": "",
+                           "network": "ws"},
+                          {"tag": "trojan", "protocol": "trojan",
+                           "address": "panel.testbed.internal", "port": "443",
+                           "sni": "panel.testbed.internal", "path": "", "service_name": "grpc",
+                           "network": "grpc"},
+                      ],
+                      "private_keys": 0},
         "mihomo": {"proxies": 4, "proxy_types": ["trojan", "vless"], "groups": 1, "rules": 1,
                    "match_rule": True, "exit": 0,
                    "rule_names": ["MATCH"], "duplicate_names": 0,
-                   "client_fingerprints": ["firefox"],
+                   "client_fingerprints": ["firefox"], "private_keys": 0,
                    "proxy_details": [
                        {"name": "REALITY", "type": "vless", "server": "panel.testbed.internal",
                         "network": "tcp", "tls": "true",
@@ -309,8 +355,8 @@ def engine_representations(overrides=None):
         "clash": {"proxies": 1, "proxy_types": ["trojan"], "groups": 1, "rules": 1,
                   "match_rule": True, "exit": 0,
                   "rule_names": ["MATCH"], "duplicate_names": 0,
-                  "client_fingerprints": ["firefox"]},
-        "singbox": {"parsed": True, "outbounds": 4},
+                  "client_fingerprints": ["firefox"], "private_keys": 0},
+        "singbox": {"parsed": True, "outbounds": 4, "private_keys": 0},
     }
     return merge(engine, overrides)
 
@@ -365,6 +411,23 @@ class StubPanel:
         self.bodies = dict(BODIES)
         self.statuses = {}
         self.requests = []
+        # `GET /api/hosts` as the Panel answers it: the document a client's config
+        # is derived from, and the one the subscription has to agree with. The
+        # four records are the install's own projection for the four inbounds.
+        self.hosts = [
+            {"remark": "VLESS-REALITY-Vision@local-node", "address": "panel.testbed.internal",
+             "port": 443, "sni": "reality.testbed.internal", "path": None,
+             "securityLayer": "DEFAULT", "alpn": "h2,http/1.1", "isDisabled": False},
+            {"remark": "VLESS-XHTTP-TLS@local-node", "address": "panel.testbed.internal",
+             "port": 443, "sni": "panel.testbed.internal", "path": "/xhttp",
+             "securityLayer": "TLS", "alpn": "h2,http/1.1", "isDisabled": False},
+            {"remark": "VLESS-WS-TLS@local-node", "address": "panel.testbed.internal",
+             "port": 443, "sni": "panel.testbed.internal", "path": "/ws",
+             "securityLayer": "TLS", "alpn": "http/1.1", "isDisabled": False},
+            {"remark": "Trojan-gRPC-TLS@local-node", "address": "panel.testbed.internal",
+             "port": 443, "sni": "panel.testbed.internal", "path": "grpc",
+             "securityLayer": "TLS", "alpn": "h2", "isDisabled": False},
+        ]
         self.enforce_user_agent = False
         self.refuse_foreign_user_agent = False
         self.no_cache_control = False
@@ -401,6 +464,8 @@ class StubPanel:
                     return self._send(200, json.dumps({"response": panel.user}))
                 if self.path == "/api/users":
                     return self._send(200, json.dumps({"response": {"users": panel.users}}))
+                if self.path == "/api/hosts":
+                    return self._send(200, json.dumps({"response": {"hosts": panel.hosts}}))
                 name = panel.representation(self.path)
                 if name is None:
                     return self._send(404, json.dumps({"message": "not found"}))
@@ -658,6 +723,127 @@ class TestPanelSubscriptionProbe(unittest.TestCase):
     def test_media_type_drops_the_parameters(self):
         self.assertEqual(panel_surface.media_type("Application/JSON; charset=utf-8"), "application/json")
         self.assertEqual(panel_surface.media_type(""), "")
+
+    def test_the_probe_reports_the_host_records_the_subscription_must_agree_with(self):
+        facts, output = probe_output(self.panel, "subscriptions", str(self.payload_dir))
+        hosts = facts["subscriptions"]["hosts"]
+        self.assertEqual(hosts["status"], 200)
+        self.assertEqual([record["remark"] for record in hosts["records"]],
+                         ["VLESS-REALITY-Vision@local-node", "VLESS-XHTTP-TLS@local-node",
+                          "VLESS-WS-TLS@local-node", "Trojan-gRPC-TLS@local-node"])
+        self.assertEqual(hosts["records"][0]["sni"], "reality.testbed.internal")
+        self.assertEqual(hosts["records"][0]["path"], "")
+        self.assertEqual(hosts["records"][1]["path"], "/xhttp")
+        self.assertEqual(hosts["records"][3]["path"], "grpc")
+        self.assertEqual(hosts["records"][1]["security_layer"], "TLS")
+        self.assertIs(hosts["records"][1]["disabled"], False)
+        self.assertEqual(hosts["records"][1]["port"], "443")
+
+    def test_a_host_record_count_is_reported_and_no_value_is(self):
+        """The hosts read is a fact, and the token that read it stays out of the output."""
+        facts, output = probe_output(self.panel, "subscriptions", str(self.payload_dir))
+        self.assertEqual(len(facts["subscriptions"]["hosts"]["records"]), 4)
+        self.assertNotIn(self.panel.token, output)
+
+    def test_server_secret_values_reads_both_product_keys_and_drops_short_values(self):
+        """The Panel writes APP_SECRET, the Node SECRET_KEY; both are scanned."""
+        panel_env = Path(self.tmp.name) / "gowave.env"
+        panel_env.write_text(
+            "APP_SECRET=an-example-signing-key-that-is-long\n"
+            "GOWAVE_PROXY=external\n",
+            encoding="utf-8",
+        )
+        node_env = Path(self.tmp.name) / "gowave-node.env"
+        node_env.write_text(
+            "SECRET_KEY=an-example-node-key-that-is-long\n",
+            encoding="utf-8",
+        )
+        short_env = Path(self.tmp.name) / "short.env"
+        short_env.write_text("SECRET_KEY=abc\n", encoding="utf-8")
+        values = panel_surface.server_secret_values(
+            "the-administrator-password",
+            env_files=[str(panel_env), str(node_env), str(short_env)],
+        )
+        self.assertEqual(values, [
+            "the-administrator-password",
+            "an-example-signing-key-that-is-long",
+            "an-example-node-key-that-is-long",
+        ])
+
+    def test_server_secret_values_tolerates_a_missing_environment_file(self):
+        values = panel_surface.server_secret_values(
+            "the-administrator-password",
+            env_files=[str(Path(self.tmp.name) / "absent.env")],
+        )
+        self.assertEqual(values, ["the-administrator-password"])
+
+    def test_the_scan_reads_the_files_and_keys_the_product_itself_writes(self):
+        """A scan of the wrong file, or of a key the product no longer sets, proves nothing.
+
+        The product writes its own environment files: the Panel's module into
+        `/opt/gowave/.env` and the Node's into `/opt/gowave-node/.env`. This reads
+        the two heredocs rather than trusting the probe's constants, so renaming a
+        key in the product — or moving an install directory — fails here instead of
+        silently making the secret scan look for a value that is nowhere on the host.
+        """
+        heredoc = re.compile(r'cat > "\$env_file" <<EOF\n(.*?)\nEOF', re.S)
+        writers = {
+            "modules/panel.sh": "GOWAVE_INSTALL_DIR",
+            "modules/node.sh": "GOWAVE_NODE_INSTALL_DIR",
+        }
+        written_keys = set()
+        for script, directory_variable in writers.items():
+            source = (REPO_ROOT / script).read_text(encoding="utf-8")
+            blocks = heredoc.findall(source)
+            self.assertTrue(blocks, f"{script} no longer writes an environment file this reads")
+            for block in blocks:
+                for line in block.splitlines():
+                    name, separator, _ = line.partition("=")
+                    if separator and re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+                        written_keys.add(name)
+            default = re.search(rf'^{directory_variable}="([^"]+)"', source, re.M)
+            self.assertIsNotNone(
+                default, f"{script} no longer declares {directory_variable}, so the scanned path is unproven",
+            )
+            self.assertIn(
+                f"{default.group(1)}/.env", panel_surface.PRODUCT_ENV_FILES,
+                f"the secret scan does not read {default.group(1)}/.env, which {script} writes",
+            )
+        secret_keys = {name for name in written_keys if "SECRET" in name or "KEY" in name}
+        self.assertTrue(secret_keys, "neither module writes a key this scan is supposed to look for")
+        self.assertEqual(
+            sorted(secret_keys), sorted(panel_surface.SERVER_SECRET_KEYS),
+            "the scanned key names are not the ones the product writes into its environment files",
+        )
+
+    def test_secret_forms_covers_every_encoding_a_leak_could_wear(self):
+        value = "s3cr3t value/with+peculiar"
+        forms = panel_surface.secret_forms(value)
+        self.assertIn(value.encode("utf-8"), forms)
+        self.assertIn(base64.b64encode(value.encode("utf-8")), forms)
+        self.assertIn(base64.urlsafe_b64encode(value.encode("utf-8")).rstrip(b"="), forms)
+        self.assertIn(b"s3cr3t%20value%2Fwith%2Bpeculiar", forms)
+
+    def test_the_probe_scans_a_payload_for_the_administrators_password(self):
+        self.panel.bodies["mihomo"] = (
+            MIHOMO_YAML + f"\n# secret={self.panel.password}\n", "text/yaml",
+        )
+        facts, output = probe_output(self.panel, "subscriptions", str(self.payload_dir))
+        served = facts["subscriptions"]["representations"]
+        self.assertEqual(facts["subscriptions"]["secret_needles"], 1)
+        self.assertEqual(served["mihomo"]["secret_hits"], 1)
+        self.assertEqual(served["clash"]["secret_hits"], 0)
+        self.assertNotIn(self.panel.password, output)
+
+    def test_the_probe_scans_the_link_list_the_base64_body_stands_for(self):
+        """A secret inside a link is base64 twice, so the body alone would hide it."""
+        link = f"vless://{CLIENT_UUID}@panel.testbed.internal:443?remark={self.panel.password}#leak"
+        body = base64.b64encode(link.encode("utf-8")).decode("ascii")
+        self.assertNotIn(self.panel.password.encode("utf-8"), body.encode("ascii"))
+        self.panel.bodies["base64"] = (body, "text/plain")
+        facts, output = probe_output(self.panel, "subscriptions", str(self.payload_dir))
+        self.assertEqual(facts["subscriptions"]["representations"]["base64"]["secret_hits"], 1)
+        self.assertNotIn(self.panel.password, output)
 
     def test_the_representation_inventory_matches_the_pinned_matrix(self):
         matrix = yaml.safe_load(
@@ -996,7 +1182,26 @@ class TestSubscriptionClientProbe(unittest.TestCase):
                           "protocols": ["trojan", "vless"],
                           "transports": ["trojan/grpc/tls", "vless/tcp/reality",
                                          "vless/ws/tls", "vless/xhttp/tls"],
-                          "fingerprints": ["firefox"], "sni_missing": 0})
+                          "fingerprints": ["firefox"], "sni_missing": 0,
+                          "dials": [
+                              {"tag": "reality", "protocol": "vless",
+                               "address": "panel.testbed.internal", "port": "443",
+                               "sni": "reality.testbed.internal", "path": "",
+                               "service_name": "", "network": "tcp"},
+                              {"tag": "xhttp", "protocol": "vless",
+                               "address": "panel.testbed.internal", "port": "443",
+                               "sni": "panel.testbed.internal", "path": "/xhttp",
+                               "service_name": "", "network": "xhttp"},
+                              {"tag": "ws", "protocol": "vless",
+                               "address": "panel.testbed.internal", "port": "443",
+                               "sni": "panel.testbed.internal", "path": "/ws",
+                               "service_name": "", "network": "ws"},
+                              {"tag": "trojan", "protocol": "trojan",
+                               "address": "panel.testbed.internal", "port": "443",
+                               "sni": "panel.testbed.internal", "path": "",
+                               "service_name": "grpc", "network": "grpc"},
+                          ],
+                          "private_keys": 0})
         for name in ("mihomo", "clash"):
             self.assertEqual(facts[name]["exit"], 0)
             self.assertEqual(facts[name]["proxies"], 4)
@@ -1004,11 +1209,30 @@ class TestSubscriptionClientProbe(unittest.TestCase):
             self.assertEqual(facts[name]["rule_names"], ["MATCH"])
             self.assertEqual(facts[name]["duplicate_names"], 0)
             self.assertEqual(facts[name]["client_fingerprints"], ["firefox"])
-        self.assertEqual(facts["singbox"], {"parsed": True, "outbounds": 4})
+            self.assertEqual(facts[name]["private_keys"], 0)
+        self.assertEqual(facts["singbox"], {"parsed": True, "outbounds": 4, "private_keys": 0})
+        self.assertEqual(facts["base64"]["private_keys"], 0)
         self.assertEqual([path.name for path in self.workdir.iterdir()
                           if path.suffix in (".json", ".yaml")], [])
         self.assertEqual(set(self.engines.modes), {0o600})
         self.assertEqual(len(self.engines.configs), 4)
+
+    def test_the_probe_counts_a_server_side_private_key(self):
+        """A counter that always reported zero would pass a document leaking a key."""
+        leaked = json.loads(JSON_BODY)
+        leaked[0]["outbounds"][0]["streamSettings"]["realitySettings"]["privateKey"] = "leak"
+        self.write_payloads(xray_json=json.dumps(leaked))
+        facts = subscription_probe.representations(str(self.payloads), str(self.ca), self.workdir)
+        self.assertEqual(facts["xray_json"]["private_keys"], 1)
+
+    def test_the_probe_counts_a_private_key_in_a_yaml_representation(self):
+        self.write_payloads()
+        (self.payloads / "mihomo.payload").write_text(
+            MIHOMO_YAML + "  private-key: leak\n", encoding="utf-8",
+        )
+        facts = subscription_probe.representations(str(self.payloads), str(self.ca), self.workdir)
+        self.assertEqual(facts["mihomo"]["private_keys"], 1)
+        self.assertEqual(facts["clash"]["private_keys"], 0)
 
     def test_json_shapes_accepts_the_served_list_and_the_bare_object(self):
         facts = subscription_probe.json_shapes(str(self.payloads), str(self.ca), self.workdir)
@@ -1280,8 +1504,88 @@ class TestSubscriptionCases(unittest.TestCase):
         self.reject("is empty", served=served_facts({"representations.singbox.bytes": 0}))
 
     def test_subscriptions_case_rejects_a_missing_media_type(self):
-        self.reject("without a media type",
+        self.reject("as media type '' instead of 'text/yaml'",
                     served=served_facts({"representations.mihomo.content_type": ""}))
+
+    def test_subscriptions_case_rejects_a_wrong_media_type(self):
+        # A media type is a claim about which importer the bytes belong to, so a
+        # well-formed but wrong one is the failure this require exists for.
+        self.reject("as media type 'text/plain' instead of 'application/json'",
+                    served=served_facts({"representations.xray-json.content_type": "text/plain"}))
+
+    def test_subscriptions_case_names_the_media_type_each_representation_is_served_with(self):
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"subscriptions": served_facts()})],
+            engine_results=[engine_result(engine_representations())],
+        )
+        evidence = aio.case_subscriptions(product)
+        for name in aio.REPRESENTATIONS:
+            with self.subTest(representation=name):
+                self.assertEqual(evidence[f"{name}_content_type"],
+                                 aio.REPRESENTATION_MEDIA_TYPES[name])
+
+    def test_subscriptions_case_rejects_a_secret_scan_with_nothing_to_scan(self):
+        self.reject("not evidence", served=served_facts({"secret_needles": 1}))
+
+    def test_subscriptions_case_rejects_a_representation_carrying_a_server_secret(self):
+        self.reject("server-side secret",
+                    served=served_facts({"representations.mihomo.secret_hits": 1}))
+
+    def test_subscriptions_case_rejects_a_host_list_it_could_not_read(self):
+        self.reject("GET /api/hosts answered 500", served=served_facts({"hosts.status": 500}))
+
+    def test_subscriptions_case_rejects_a_subscription_that_agrees_with_no_host(self):
+        self.reject("returned no Host record", served=served_facts({"hosts.records": []}))
+
+    def test_subscriptions_case_rejects_a_dial_address_no_host_record_names(self):
+        # The REALITY record is the one whose address and SNI pair no other record
+        # shares, so moving it leaves the dial with nothing to correspond to.
+        records = [dict(record) for record in served_facts()["hosts"]["records"]]
+        records[0]["address"] = "elsewhere.testbed.internal"
+        self.reject("which no Host record names",
+                    served=served_facts({"hosts.records": records}))
+
+    def test_subscriptions_case_rejects_a_dial_path_no_host_record_names(self):
+        # Three inbounds share ``panel.testbed.internal`` as both address and SNI,
+        # so the path is the only field that tells them apart; a record naming a
+        # different path is a different inbound.
+        records = [dict(record) for record in served_facts()["hosts"]["records"]]
+        records[1]["path"] = "/other"
+        self.reject("which no Host record on that address and SNI names",
+                    served=served_facts({"hosts.records": records}))
+
+    def test_subscriptions_case_rejects_a_dial_set_that_is_not_one_per_inbound(self):
+        dials = engine_representations()["xray_json"]["dials"][:3]
+        self.reject("carry a dial tuple",
+                    engine=engine_representations({"xray_json.dials": dials}))
+
+    def test_subscriptions_case_rejects_a_private_key_in_a_representation(self):
+        for name in ("base64", "xray_json", "mihomo", "clash", "singbox"):
+            with self.subTest(representation=name):
+                self.reject("server-side private key field",
+                            engine=engine_representations({f"{name}.private_keys": 1}))
+
+    def test_subscriptions_case_accepts_a_host_record_the_subscription_does_not_dial(self):
+        """The require is "every dial is recorded", not "the two sets are equal".
+
+        The Panel keeps records no client dials; an equality check would have
+        called such a record a defect and pointed at the wrong document.
+        """
+        records = list(served_facts()["hosts"]["records"]) + [{
+            "remark": "Panel@local-node", "address": "panel.testbed.internal", "port": "443",
+            "sni": "panel.testbed.internal", "path": "/api", "security_layer": "TLS",
+            "alpn": "http/1.1", "disabled": False,
+        }]
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"subscriptions": served_facts({"hosts.records": records})})],
+            engine_results=[engine_result(engine_representations())],
+        )
+        evidence = aio.case_subscriptions(product)
+        self.assertEqual(evidence["host_records"], 5)
+        self.assertEqual(evidence["host_record_mismatches"], 0)
+        self.assertEqual(evidence["xray_json_dials"], 4)
 
     def test_subscriptions_case_rejects_a_panel_that_refuses_a_foreign_header(self):
         self.reject("names no client family",

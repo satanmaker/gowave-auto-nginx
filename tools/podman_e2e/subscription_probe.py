@@ -385,6 +385,7 @@ def representations(payload_dir: str, ca_file: str, workdir: Path) -> Dict[str, 
         "decoded_bytes": len(decoded or ""),
         "link_count": len(links),
         "schemes": sorted({entry["protocol"] for entry in parsed if entry["protocol"]}),
+        "private_keys": private_key_markers(decoded or ""),
     }
 
     raw = read_payload(payload_dir, "xray-json")
@@ -417,12 +418,18 @@ def representations(payload_dir: str, ca_file: str, workdir: Path) -> Dict[str, 
         "transports": sorted({f"{i[0]}/{i[6]}/{i[5]}" for i in identities}),
         "fingerprints": sorted({i[4] for i in identities}),
         "sni_missing": sum(1 for i in identities if not i[3]),
+        # What the client dials, and whether the document also carries the
+        # server's half of REALITY. The second is a count of key names, not a
+        # guess about values, because a Trojan password is legitimate here.
+        "dials": [dial for dial in (outbound_dials(o) for o in proxy_outbounds(entries)) if dial],
+        "private_keys": private_key_markers(raw),
     }
 
     for name in ("mihomo", "clash"):
         text = read_payload(payload_dir, name)
         scan = scan_mihomo(text)
         scan["exit"] = mihomo_test(text, workdir, name)
+        scan["private_keys"] = private_key_markers(text)
         facts[name] = scan
 
     singbox = read_payload(payload_dir, "singbox")
@@ -434,6 +441,7 @@ def representations(payload_dir: str, ca_file: str, workdir: Path) -> Dict[str, 
     facts["singbox"] = {
         "parsed": outbounds is not None,
         "outbounds": len(outbounds or []),
+        "private_keys": private_key_markers(singbox),
     }
     return facts
 
@@ -463,6 +471,40 @@ def proxy_outbounds(profiles: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if protocol and protocol not in ("freedom", "blackhole"):
                 result.append(outbound)
     return result
+
+
+def outbound_dials(outbound: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """The address tuple a client dials, kept apart from the transport it rides.
+
+    ``outbound_identity`` reduces an outbound to the tuple the matrix declares;
+    this keeps the fields a Host record also states, so the two can be compared
+    field by field instead of through a digest neither side explains.
+    """
+    identity = outbound_identity(outbound)
+    if identity is None:
+        return None
+    protocol, host, port, sni, _fingerprint, _security, network, path, service_name = identity
+    return {
+        "tag": str(outbound.get("tag") or ""),
+        "protocol": protocol,
+        "address": host,
+        "port": port,
+        "sni": sni,
+        "path": path,
+        "service_name": service_name,
+        "network": network,
+    }
+
+
+# A REALITY client is issued ``publicKey``; the private half is the server's and
+# has no reader on the client side. The markers are key names, so the same test
+# reads a served JSON and a served YAML.
+PRIVATE_KEY_MARKERS = ('"privateKey"', '"private_key"', "private-key", "private_key:")
+
+
+def private_key_markers(text: str) -> int:
+    """How many server-side key fields a served document carries."""
+    return sum(text.count(marker) for marker in PRIVATE_KEY_MARKERS)
 
 
 def json_shapes(payload_dir: str, ca_file: str, workdir: Path) -> Dict[str, Any]:

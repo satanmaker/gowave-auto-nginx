@@ -1490,13 +1490,20 @@ cases:
       driver: aio:case_subscriptions
       evidence:
       - base64_link_count
+      - base64_private_keys
       - base64_schemes
+      - host_record_mismatches
+      - host_records
       - mihomo_servers
+      - secret_needles
       - singbox_outbounds
+      - singbox_private_keys
       - ua_foreign
+      - xray_json_dials
       - xray_json_entries
       - xray_json_expected_transports
       - xray_json_fingerprints
+      - xray_json_private_keys
       - xray_json_protocols
       - xray_json_shape
       - xray_json_sni_missing
@@ -1507,13 +1514,20 @@ cases:
       driver: aio:case_subscriptions
       evidence:
       - base64_link_count
+      - base64_private_keys
       - base64_schemes
+      - host_record_mismatches
+      - host_records
       - mihomo_servers
+      - secret_needles
       - singbox_outbounds
+      - singbox_private_keys
       - ua_foreign
+      - xray_json_dials
       - xray_json_entries
       - xray_json_expected_transports
       - xray_json_fingerprints
+      - xray_json_private_keys
       - xray_json_protocols
       - xray_json_shape
       - xray_json_sni_missing
@@ -1544,8 +1558,56 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_subscriptions
+      evidence:
+      - base64_link_count
+      - base64_private_keys
+      - base64_schemes
+      - host_record_mismatches
+      - host_records
+      - mihomo_servers
+      - secret_needles
+      - singbox_outbounds
+      - singbox_private_keys
+      - ua_foreign
+      - xray_json_dials
+      - xray_json_entries
+      - xray_json_expected_transports
+      - xray_json_fingerprints
+      - xray_json_private_keys
+      - xray_json_protocols
+      - xray_json_shape
+      - xray_json_sni_missing
+      - xray_json_transports
+      - xray_json_wrapped
+      case: SUB-SERVED
+    multi-node:
+      driver: aio:case_subscriptions
+      evidence:
+      - base64_link_count
+      - base64_private_keys
+      - base64_schemes
+      - host_record_mismatches
+      - host_records
+      - mihomo_servers
+      - secret_needles
+      - singbox_outbounds
+      - singbox_private_keys
+      - ua_foreign
+      - xray_json_dials
+      - xray_json_entries
+      - xray_json_expected_transports
+      - xray_json_fingerprints
+      - xray_json_private_keys
+      - xray_json_protocols
+      - xray_json_shape
+      - xray_json_sni_missing
+      - xray_json_transports
+      - xray_json_wrapped
+      case: SUB-SERVED
   promotion_target: null
 - id: SUB-04
   requirement: Real Subscription Delivery and User-Agent Policy
@@ -1584,13 +1646,20 @@ cases:
       driver: aio:case_subscriptions
       evidence:
       - base64_link_count
+      - base64_private_keys
       - base64_schemes
+      - host_record_mismatches
+      - host_records
       - mihomo_servers
+      - secret_needles
       - singbox_outbounds
+      - singbox_private_keys
       - ua_foreign
+      - xray_json_dials
       - xray_json_entries
       - xray_json_expected_transports
       - xray_json_fingerprints
+      - xray_json_private_keys
       - xray_json_protocols
       - xray_json_shape
       - xray_json_sni_missing
@@ -1601,13 +1670,20 @@ cases:
       driver: aio:case_subscriptions
       evidence:
       - base64_link_count
+      - base64_private_keys
       - base64_schemes
+      - host_record_mismatches
+      - host_records
       - mihomo_servers
+      - secret_needles
       - singbox_outbounds
+      - singbox_private_keys
       - ua_foreign
+      - xray_json_dials
       - xray_json_entries
       - xray_json_expected_transports
       - xray_json_fingerprints
+      - xray_json_private_keys
       - xray_json_protocols
       - xray_json_shape
       - xray_json_sni_missing
@@ -3790,13 +3866,20 @@ cases:
       driver: aio:case_subscriptions
       evidence:
       - base64_link_count
+      - base64_private_keys
       - base64_schemes
+      - host_record_mismatches
+      - host_records
       - mihomo_servers
+      - secret_needles
       - singbox_outbounds
+      - singbox_private_keys
       - ua_foreign
+      - xray_json_dials
       - xray_json_entries
       - xray_json_expected_transports
       - xray_json_fingerprints
+      - xray_json_private_keys
       - xray_json_protocols
       - xray_json_shape
       - xray_json_sni_missing
@@ -3806,13 +3889,20 @@ cases:
       driver: aio:case_subscriptions
       evidence:
       - base64_link_count
+      - base64_private_keys
       - base64_schemes
+      - host_record_mismatches
+      - host_records
       - mihomo_servers
+      - secret_needles
       - singbox_outbounds
+      - singbox_private_keys
       - ua_foreign
+      - xray_json_dials
       - xray_json_entries
       - xray_json_expected_transports
       - xray_json_fingerprints
+      - xray_json_private_keys
       - xray_json_protocols
       - xray_json_shape
       - xray_json_sni_missing
