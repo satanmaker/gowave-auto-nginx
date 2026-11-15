@@ -523,6 +523,7 @@ generate_decoy_vhost() {
 server {
     $listen_directive
     server_name $reality_domain$cover_names;
+    server_tokens off;
 
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
