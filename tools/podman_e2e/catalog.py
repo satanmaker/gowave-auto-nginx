@@ -280,6 +280,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "All-in-One Master VPS Installation Verification",
     },
     {
+        "id": "AIO-NEG-PIN",
+        "requirement": "Pinned Version Fidelity",
+        "assertion": "A floating installer branch, a missing digest, a digest that is not 64 hex characters and an installer whose bytes do not match the configured SHA-256 are each refused, the pinned commit and digest together are accepted, the URL the pin derives names that commit rather than a branch, and the product's own install entrypoint returns non-zero for the floating branch while the node binary and its unit stay byte-identical.",
+        "topology": ["aio"],
+        "promotion_target": "Pinned Version Fidelity",
+    },
+    {
         "id": "AIO-CHANNEL-NOOP",
         "requirement": "All-in-One Master VPS Installation Verification",
         "assertion": "The channel command invoked for the channel the host is already on reports that nothing changed, exits successfully, and takes no snapshot, rewrites no environment file or journal, and leaves the Panel process in place, so a repeated lifecycle call is a no-op rather than a restart.",
@@ -1305,6 +1312,38 @@ LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     "WRK-01": {"multi-node": "MN-ARGV-OBSERVER"},
     "WRK-02": {"multi-node": "MN-ARGV-OBSERVER"},
     "WRK-03": {"multi-node": "MN-ARGV-OBSERVER"},
+    # The install case is where a configured version is compared with an installed
+    # one: it interrogates the Panel, the node and the Xray core through their own
+    # binaries, records all three against the pin this deployment configured, and
+    # fails the install when a component reports something else or cannot be read
+    # at all. What differs from the live sentence is the pin's source — the
+    # container passes an explicit version where the live runner's channel default
+    # is `latest`, which asks only that a version be reported — and that the
+    # comparison lives in the case rather than in a post-install phase of its own;
+    # docs/PODMAN_E2E_DISCOVERY.md records both.
+    "VER-01": {"aio": "AIO-INSTALL", "multi-node": "MN-INSTALL"},
+    # The installer pin is not reachable by running the install the live runner
+    # runs: the container would take the floating `main` download unless the pin
+    # were set, and this workstation bind-mounts a bundled installer into /repo
+    # besides. AIO-NEG-PIN therefore asks the product's own pin functions and then
+    # calls its install entrypoint with a scratch SCRIPT_DIR, so the refused branch
+    # is the pinned one and the node binary is proven untouched afterwards.
+    "VER-02": {"aio": "AIO-NEG-PIN"},
+    # Both cores are read through their own binaries and compared with each other
+    # on every matrix tuple: the client engine reports its version and the node
+    # that served the tuple reports the core it deployed, and the tuple is refused
+    # unless the two are the same pinned version. The install case carries the
+    # sentence's other half — the core is read through `rw-core`, and three
+    # components read through one binary is refused — so the divergence recorded in
+    # docs/PODMAN_E2E_DISCOVERY.md is that the client/server comparison is a
+    # data-plane tuple here rather than a post-install phase.
+    "VER-03": {"aio": "AIO-DP-REALITY-xray", "multi-node": "MN-DP-master-REALITY-xray"},
+    # The sentence's subject is the two client cores, and the container's engine
+    # container is one binary per run, read through its own version argument and
+    # required to carry the configured pin before it is used. The clause that the
+    # client must match the core the node deployed is asserted only on the Xray
+    # tuple, because the deployed core is the Xray core the node supervises.
+    "DP-03": {"aio": "AIO-DP-REALITY-xray", "multi-node": "MN-DP-master-REALITY-xray"},
 }
 
 

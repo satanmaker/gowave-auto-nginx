@@ -57,6 +57,7 @@ class _StubPodman:
     def __init__(self, root):
         self.context = _StubContext(root)
         self.started = []
+        self.scripts = []
 
     def network_subnets(self):
         return []
@@ -64,6 +65,19 @@ class _StubPodman:
     def run(self, **kwargs):
         self.started.append(kwargs["name"])
         return kwargs["name"]
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
+        """The Worker's own status report, naming the core the matrix pinned.
+
+        A tuple names the core its node deployed, so the stub answers that read
+        from the manifest: a hard-coded version would keep the fake answering
+        after the matrix's pin moved, and the case would be comparing against a
+        core this deployment never configured.
+        """
+        self.scripts.append(script)
+        core = matrix.product(matrix.load()).get("xray_version", "")
+        body = json.dumps({"status": {"stdout": f"Xray Core: {core}\n"}})
+        return subprocess.CompletedProcess(["bash", "-lc", script], 0, body, "")
 
 
 class TestMultiNodePlan(unittest.TestCase):
@@ -827,7 +841,10 @@ class _MatrixProduct(multi_node.MultiNodeProduct):
         self._root = tempfile.TemporaryDirectory()
         super().__init__(_StubPodman(Path(self._root.name)),
                          vision=vision, worker_vision=worker_vision)
-        self.topology = type("Host", (), {"plan": topology.allocate_plan([])})()
+        plan = topology.allocate_plan([])
+        self.topology = type(
+            "Host", (), {"plan": plan, "worker_name": "worker-test"},
+        )()
 
     def cleanup(self):
         self._root.cleanup()

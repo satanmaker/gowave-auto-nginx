@@ -8,14 +8,13 @@ case refuses the disagreement it exists to catch instead of accepting a plausibl
 report.
 """
 import ast
+import copy
 import json
-import os
 import subprocess
 import sys
 import types
 import unittest
 from pathlib import Path
-from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = Path(__file__).resolve().parent
@@ -130,9 +129,23 @@ class _WorkerProduct(multi_node.MultiNodeProduct):
         return {"login": {"status": 200}, "cluster": self.cluster}
 
 
-def run_case(case, cluster=None, report=None, **flags):
+def run_case(case, cluster=None, report=None, pins=None, **flags):
     product = _WorkerProduct(cluster, report, **flags)
+    if pins:
+        product.matrix = matrix_with(pins)
     return case(product), product
+
+
+def matrix_with(pins):
+    """The manifest with the versions this deployment configured replaced.
+
+    A case reads its pin from the manifest, not from the environment the container
+    was created with — that environment is inherited and cannot be shown to be
+    absent — so a test that wants another pin has to move the manifest.
+    """
+    data = copy.deepcopy(matrix.load())
+    data["product"].update(pins)
+    return data
 
 
 def worker_record(cluster):
@@ -244,19 +257,20 @@ class TestWorkerStateCase(unittest.TestCase):
         self.assertEqual(evidence["daemon"], "RUNNING (managed runtime socket)")
 
     def test_a_requested_release_that_the_binary_does_not_match_is_refused(self):
-        with mock.patch.dict(os.environ, {"GOWAVE_NODE_VERSION": "v1.0.6"}):
-            with self.assertRaises(AssertionError) as caught:
-                run_case(multi_node.case_worker_state)
-        self.assertIn("requested 'v1.0.6'", str(caught.exception))
+        with self.assertRaises(AssertionError) as caught:
+            run_case(multi_node.case_worker_state, pins={"node_version": "v1.0.6"})
+        self.assertIn("although this deployment configured 'v1.0.6'", str(caught.exception))
 
     def test_a_requested_release_that_matches_is_accepted(self):
-        with mock.patch.dict(os.environ, {"GOWAVE_NODE_VERSION": "v1.0.5"}):
-            evidence, _product = run_case(multi_node.case_worker_state)
+        evidence, _product = run_case(
+            multi_node.case_worker_state, pins={"node_version": "v1.0.5"},
+        )
         self.assertEqual(evidence["requested_version"], "v1.0.5")
 
     def test_latest_is_resolved_to_whatever_the_binary_reports(self):
-        with mock.patch.dict(os.environ, {"GOWAVE_NODE_VERSION": "latest"}):
-            evidence, _product = run_case(multi_node.case_worker_state)
+        evidence, _product = run_case(
+            multi_node.case_worker_state, pins={"node_version": "latest"},
+        )
         self.assertEqual(evidence["requested_version"], "latest")
 
     def test_a_disabled_worker_is_refused(self):
@@ -307,6 +321,25 @@ class TestWorkerStateCase(unittest.TestCase):
         with self.assertRaises(AssertionError) as caught:
             run_case(multi_node.case_worker_state, report=report)
         self.assertIn("no executable node binary", str(caught.exception))
+
+    def test_a_core_that_differs_from_the_declared_pin_is_refused(self):
+        # Both sides of the pair agree with each other and disagree with the pin,
+        # which is the one shape the Panel-versus-Worker comparison cannot see.
+        # The drifted build extends the pin by a digit, so a rule that matched a
+        # prefix instead of a whole version token would call it the same core.
+        pin = matrix.product(matrix.load())["xray_version"]
+        drifted = f"{pin}0"
+        cluster = healthy_cluster()
+        worker_record(cluster)["versions"]["xray"] = f"v{drifted}"
+        report = worker_state()
+        report["status"]["stdout"] = STATUS_TEMPLATE.format(
+            daemon="RUNNING (managed runtime socket)",
+            core=CORE_LINE.replace("26.11.9", drifted),
+        )
+        with self.assertRaises(AssertionError) as caught:
+            run_case(multi_node.case_worker_state, cluster, report=report)
+        self.assertIn("this deployment configured", str(caught.exception))
+        self.assertIn(drifted, str(caught.exception))
 
     def test_a_version_command_that_failed_is_refused(self):
         report = worker_state()
@@ -495,6 +528,32 @@ class TestWorkerConfigCase(unittest.TestCase):
         with self.assertRaises(AssertionError) as caught:
             run_case(multi_node.case_worker_config, report=report)
         self.assertIn("serve port '3003'", str(caught.exception))
+
+
+class TestWorkerCoreVersion(unittest.TestCase):
+    """DP-03: the Worker's core is read as the version its report names.
+
+    The Worker prints its core as a whole sentence, while the install reads the
+    Master's core as a version token alone. Comparing the two strings directly
+    refused every Worker tuple in a live Multi-Node run — the client reported
+    `26.11.9` and the Worker reported `Xray 26.11.9 (Xray, Penetrates
+    Everything.) 676eaf6 (go1.27.3 linux/amd64)` — so the Worker side is reduced
+    by the same rule before the tuple compares it.
+    """
+
+    def test_the_self_report_is_reduced_to_the_version_it_names(self):
+        product = _WorkerProduct()
+        self.assertEqual(
+            product.worker_core_version("MN-DP-worker-REALITY-xray"), "26.11.9",
+        )
+
+    def test_a_self_report_that_names_no_version_reads_as_unread(self):
+        report = worker_state()
+        report["status"]["stdout"] = STATUS_TEMPLATE.format(
+            daemon="RUNNING (managed runtime socket)", core="NOT FOUND",
+        )
+        product = _WorkerProduct(report=report)
+        self.assertEqual(product.worker_core_version("MN-DP-worker-REALITY-xray"), "")
 
 
 if __name__ == "__main__":

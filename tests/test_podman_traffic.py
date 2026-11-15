@@ -29,6 +29,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from tools.podman_e2e import (  # noqa: E402
     acme_fixture,
     aio,
+    client_image,
     client_trust,
     ingress,
     matrix,
@@ -37,7 +38,7 @@ from tools.podman_e2e import (  # noqa: E402
     topology,
     traffic_probe,
 )
-from tools.podman_e2e.runner import CaseBlocked, RunContext  # noqa: E402
+from tools.podman_e2e.runner import CaseBlocked, CaseIncomplete, RunContext  # noqa: E402
 
 PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
 CLIENT_SECRET = "client-subscription-payload-do-not-print"
@@ -1127,17 +1128,35 @@ class TestMihomoLaunch(unittest.TestCase):
 
 
 class ScriptedPodman:
-    """Podman stub that answers only the host-side subscription fetch."""
+    """Podman stub that answers the host-side fetch and the engine's own version."""
 
     def __init__(self, context, result=None):
         self.context = context
         self.scripts = []
+        self.execs = []
         self.result = result or (json.dumps({"subscriptions": {}}), 0)
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
         self.scripts.append(script)
         stdout, returncode = self.result
         return subprocess.CompletedProcess(["bash", "-lc", script], returncode, stdout, "")
+
+    def exec(self, name, argv, check=True, input_text=None, timeout=300):
+        """The engine container printing the version the matrix pinned for it.
+
+        The case reads the version of the binary that carried the payload, so the
+        stub has to answer that read from the manifest rather than from a literal:
+        a matrix whose client pin moved would otherwise leave the fake naming the
+        build the case no longer expects.
+        """
+        self.execs.append((name, list(argv)))
+        binary = list(argv)[0]
+        pinned = next(
+            (item["contains"] for item in client_image.engine_list(MATRIX)
+             if item["binary"] == binary),
+            "",
+        )
+        return subprocess.CompletedProcess(list(argv), 0, f"{binary} {pinned} (fixture)\n", "")
 
 
 class StubEngineHost:
@@ -1158,6 +1177,9 @@ class StubEngineHost:
         self.returncode = returncode
         self.stdout = stdout
         self.bodies = bodies or {}
+
+    def engine_client(self):
+        return "aio-engines"
 
     def _probe(self, body, returncode):
         return subprocess.CompletedProcess(
@@ -1252,6 +1274,20 @@ class StubIngress:
             request=request(),
         )
 
+    @staticmethod
+    def empty(request, inbound, node="", window=0):
+        """The same bracket with a capture that started and counted no segment."""
+        return ingress.Measurement(
+            port=ingress.listener_port(inbound),
+            intended="local",
+            client=CLIENT_ADDRESS,
+            addresses={"local": CLIENT_ADDRESS},
+            captures={"local": {
+                "captured": 0, "sources": {}, "stopped_by": "harness", "drops": 0,
+            }},
+            request=request(),
+        )
+
 
 def installed_product(context, facts=None, returncode=0, stdout=None, bodies=None, vision=False):
     podman = ScriptedPodman(context)
@@ -1260,6 +1296,9 @@ def installed_product(context, facts=None, returncode=0, stdout=None, bodies=Non
         facts=facts, returncode=returncode, stdout=stdout, bodies=bodies, vision=vision,
     )
     product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
+    # What the install read out of `rw-core version`: the tuple compares the client
+    # core with the core its node deployed, so the fake has to name that core.
+    product.server_core_version = matrix.product(MATRIX).get("xray_version", "")
     product.bracket_request = StubIngress.bracket
     return product, podman
 
@@ -1355,6 +1394,56 @@ class TestDataPlaneCase(unittest.TestCase):
 
     def test_the_case_fails_when_the_tuple_matches_more_than_one_outbound(self):
         self.reject("expected exactly one", outbounds=2)
+
+    def test_a_capture_that_saw_nothing_leaves_its_account_beside_the_verdict(self):
+        # The runner attaches evidence only to a passing case, so an empty capture
+        # would reach a reader as one sentence and no account of what each probe
+        # printed — which is the state a red run cannot be diagnosed from.
+        product, _ = installed_product(self.context, facts=data_plane_facts(
+            engine="xray", network="tcp", security="reality", sni=served_sni(self.inbound("REALITY")),
+        ))
+        product.bracket_request = StubIngress.empty
+        with self.assertRaises(CaseIncomplete) as caught:
+            aio.case_data_plane(product, self.inbound("REALITY"), "xray")
+        self.assertIn("captured nothing on port 443", str(caught.exception))
+        name = "evidence/aio-dp-reality-xray-ingress.txt"
+        self.assertIn(name, self.context.evidence_files,
+                      "the file a red case wrote has to be listed on the case")
+        account = (self.context.artifact_dir / name).read_text(encoding="utf-8")
+        self.assertIn("verdict: INCOMPLETE", account)
+        self.assertIn("captured nothing on port 443", account)
+        self.assertIn(f"client: {CLIENT_ADDRESS}", account)
+        self.assertIn('"captured": 0', account, "the probe's own summary is what a reader needs")
+        self.assertIn('"stopped_by": "harness"', account)
+        self.assertIn(f"request.source_ip: {PLAN.data_target_ip}", account)
+
+    def test_a_passing_tuple_leaves_no_account_file(self):
+        self.run_case()
+        self.assertEqual(
+            [name for name in self.context.evidence_files if name.endswith("-ingress.txt")], [],
+            "a passing tuple's measurement is its evidence, not a file",
+        )
+
+    def test_a_client_core_that_differs_from_the_deployed_core_fails_the_tuple(self):
+        # The node that served the tuple names its core; a client running another
+        # build is the mismatch this comparison exists for, so the drift is made
+        # impossible to confuse with the pin rather than merely different.
+        product, _ = installed_product(self.context, facts=data_plane_facts(
+            engine="xray", network="tcp", security="reality", sni=served_sni(self.inbound("REALITY")),
+        ))
+        drifted = f"{matrix.product(MATRIX)['xray_version']}-drifted"
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_data_plane(product, self.inbound("REALITY"), "xray", deployed_core=drifted)
+        self.assertIn("ran an unmatched core", str(caught.exception))
+
+    def test_a_tuple_whose_node_core_was_never_read_fails_before_the_payload(self):
+        product, _ = installed_product(self.context, facts=data_plane_facts(
+            engine="xray", network="tcp", security="reality", sni=served_sni(self.inbound("REALITY")),
+        ))
+        product.server_core_version = ""
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_data_plane(product, self.inbound("REALITY"), "xray")
+        self.assertIn("was never read", str(caught.exception))
 
     def test_the_case_fails_when_the_payload_never_reached_the_endpoint(self):
         self.reject("never reached the controlled endpoint: connection refused",

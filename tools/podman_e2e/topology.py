@@ -30,7 +30,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from tools.podman_e2e import acme_fixture, argv_probe, client_image, ingress, target_image
+from tools.podman_e2e import (
+    acme_fixture, argv_probe, client_image, ingress, matrix, target_image,
+)
 
 # Two networks, because one block cannot satisfy both ends of the run.
 #
@@ -1036,6 +1038,7 @@ class AioTopology:
     def install_environment(self) -> Dict[str, str]:
         ca_file = f"{CA_MOUNT}/{ACME_CA_BUNDLE_NAME}"
         bundle = self._ca_dir / ACME_CA_BUNDLE_NAME if self._ca_dir else None
+        pins = matrix.product(matrix.load())
         return {
             "GOWAVE_ACME_SERVER": acme_fixture.ACME_DIRECTORY_URL,
             "GOWAVE_ACME_TEST_MODE": "1",
@@ -1047,6 +1050,13 @@ class AioTopology:
             "GOWAVE_PODMAN_TEST_MODE": "1",
             "GOWAVE_PODMAN_MASTER_ADDRESS": self.plan.target_ip,
             "GOWAVE_PODMAN_NETWORK_CIDR": self.plan.subnet,
+            # The versions this deployment configures. Passed to the install
+            # rather than only observed afterwards, so the case that compares the
+            # installed binaries is reading a configuration the operator gave
+            # instead of a value the harness wrote after the fact.
+            "GOWAVE_PANEL_VERSION": pins.get("panel_version", "latest"),
+            "GOWAVE_NODE_VERSION": pins.get("node_version", "latest"),
+            "XRAY_SERVER_VERSION": pins.get("xray_version", ""),
             "DEBIAN_FRONTEND": "noninteractive",
         }
 

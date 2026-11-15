@@ -35,6 +35,9 @@ from tools.podman_e2e import (
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
+# The same rule the live runner applies to a pin it configured, so the Worker's
+# core and the Master's are held to one definition of "the configured version".
+from tools.live_vps.versions import output_matches_expected_version, version_token
 
 INSTALL_CASE_ID = "MN-INSTALL"
 NODE_ADD_CASE_ID = "WRK-04"
@@ -1081,6 +1084,22 @@ class MultiNodeProduct:
             )
             self.worker_state_cache = parsed
         return self.worker_state_cache
+
+    def worker_core_version(self, case_id: str) -> str:
+        """The Xray core the Worker's own status reports, or an empty string.
+
+        A Worker tuple has to compare the client core with the core that served
+        it. The Master's core is read by the install, but the Worker's is not, so
+        it is read here from the same cached self-report the state case uses.
+
+        The self-report is a whole sentence — ``Xray 26.11.9 (Xray, Penetrates
+        Everything.) 676eaf6 (go1.27.3 linux/amd64)`` — while the install reads
+        the Master's core as the version token alone. Both sides are reduced by
+        the rule in ``tools/live_vps/versions.py``, so the tuple compares the
+        versions the two reports name rather than the shapes they arrive in.
+        """
+        status = self.worker_state(case_id).get("status") or {}
+        return version_token(parse_node_status(str(status.get("stdout") or "")).get("core") or "")
 
     def node_vision_facts(
         self, case_id: str, node: str, domain: str, port: int,
@@ -3688,12 +3707,12 @@ def case_worker_state(product: MultiNodeProduct) -> Dict[str, Any]:
         f"the Worker binary reports {version!r} while the Panel records "
         f"{versions.get('node')!r}",
     )
-    requested = (os.environ.get("GOWAVE_NODE_VERSION") or "").strip()
+    requested = matrix_data.product(product.matrix).get("node_version", "")
     if requested and requested.lower() != "latest":
         require(
             WORKER_STATE_CASE_ID,
             version_number(version) == version_number(requested),
-            f"the Worker runs {version!r} although this deployment requested {requested!r}",
+            f"the Worker runs {version!r} although this deployment configured {requested!r}",
         )
 
     status_command = facts.get("status") or {}
@@ -3715,6 +3734,12 @@ def case_worker_state(product: MultiNodeProduct) -> Dict[str, Any]:
         WORKER_STATE_CASE_ID,
         bool(panel_xray) and version_number(core) == version_number(panel_xray),
         f"the Worker's core reports {core!r} while the Panel records {panel_xray!r}",
+    )
+    xray_pin = matrix_data.product(product.matrix).get("xray_version", "")
+    require(
+        WORKER_STATE_CASE_ID,
+        output_matches_expected_version(core, xray_pin),
+        f"the Worker's core reports {core!r} while this deployment configured {xray_pin!r}",
     )
     return {
         "worker_version": version,
@@ -7535,9 +7560,15 @@ def data_plane_case(
     that left from the Master's address is caught by name instead of passing on
     the strength of a 200.
     """
-    evidence = aio._data_plane_case(product.master, inbound, client, node=node)
+    # A Worker tuple is served by the Worker's core, not the Master's: passing it
+    # in keeps the client/server core comparison about the host that carried the
+    # payload.
     case_id = matrix_data.case_id(
         product.matrix, matrix_data.MULTI_NODE, str(inbound["id"]), client, node=node,
+    )
+    deployed_core = product.worker_core_version(case_id) if node == "worker" else ""
+    evidence = aio._data_plane_case(
+        product.master, inbound, client, node=node, deployed_core=deployed_core,
     )
     product.record_data_plane_source(case_id, str(evidence.get("source_ip") or ""))
     return evidence

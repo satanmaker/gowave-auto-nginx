@@ -18,30 +18,14 @@ from .ssh import SSHClient, SSHResult
 from .redaction import redact
 from .config import LiveVPSConfig
 from .tls import build_runtime_ca_bundle
+# The container suite compares the same three components inside its target, so
+# the rule is shared rather than restated; preflight imports it from here.
+from .versions import output_matches_expected_version
 
 ACME_MODE_URLS = {
     "staging": "https://acme-staging-v02.api.letsencrypt.org/directory",
     "production": "https://acme-v02.api.letsencrypt.org/directory",
 }
-
-
-def output_matches_expected_version(output: str, expected: str) -> bool:
-    """Match a tool's reported version against the configured release channel.
-
-    The configured value is normally ``latest``: the installers resolve the
-    upstream channel, so the only honest assertion is that the component reports
-    a version at all. An explicit version/tag keeps the exact-token comparison
-    for a deliberate pin.
-    """
-    text = output or ""
-    normalized = str(expected).strip()
-    if normalized.lower() in ("", "latest"):
-        return re.search(r"(?<![A-Za-z0-9])v?[0-9]+(?:\.[0-9]+)+(?![A-Za-z0-9])", text) is not None
-    pinned = normalized.lstrip("vV")
-    if not pinned:
-        return False
-    pattern = rf"(?<![A-Za-z0-9])v?{re.escape(pinned)}(?![A-Za-z0-9])"
-    return re.search(pattern, text, flags=re.IGNORECASE) is not None
 
 
 def parse_strace_argv_output(trace_text: str, secrets: List[str]) -> Dict[str, Any]:
