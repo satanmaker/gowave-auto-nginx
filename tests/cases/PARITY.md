@@ -2,7 +2,7 @@
 
 Generated from `tests/cases/catalog.yaml`; do not edit by hand.
 
-Live scenarios: 125 — container 115, partial 8, live-only 2.
+Live scenarios: 125 — container 111, partial 12, live-only 2.
 
 | Live requirement group | Scenarios | Container | Partial | Live-only |
 |---|---:|---:|---:|---:|
@@ -21,7 +21,7 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 | UFW Firewall Isolation Verification | 4 | 3 | 1 | 0 |
 | NGINX SNI Routing and REALITY Decoy Verification | 4 | 4 | 0 | 0 |
 | Data Plane E2E Traffic Through All VPN Endpoints | 15 | 12 | 3 | 0 |
-| Negative Scenario and Fault Injection Tests | 8 | 8 | 0 | 0 |
+| Negative Scenario and Fault Injection Tests | 8 | 4 | 4 | 0 |
 | Global Certbot Deploy Hook Ownership | 4 | 4 | 0 | 0 |
 | Signal-Safe and Verifiable Transaction Compensation | 3 | 3 | 0 | 0 |
 | Teardown Policy Enforcement | 8 | 6 | 1 | 1 |
@@ -45,6 +45,10 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **DP-09** — Container proves explicit verify anchors and no global trust change; public Let's Encrypt issuance is live-only.
 - **DP-10** — Container proves the injected verify anchor is required; real Staging material is live-only.
 - **DP-11** — Container proves fixture CA pinning by digest; real Staging CA distribution is live-only.
+- **NEG-01** — Container witnesses the matrix one case per row, each at its own boundary; 'all 15 scenarios terminate at their designated boundaries' is a property of the suite's case list rather than a verdict one run can produce, and `catalog gaps` with the divergence table is what audits it.
+- **NEG-04** — Container witnesses the ten rows one case per sentence, including the timeout bounds `MN-OUTAGE` records as offline and control-plane seconds; the conjunction over the ten is a suite property, not a verdict a single case can read.
+- **NEG-07** — Container proves the aggregate refuses a run that recorded any non-PASS among its declared cases; the live `negative_tests` field, the `NOT_RUN` and `PARTIAL` states and a skip verdict of INCOMPLETE do not exist in this contour, whose aggregate turns a skipped declared case into FAIL.
+- **NEG-08** — Container proves a run cannot report PASS while a declared case is SKIP; the negative phase the sentence names, and its INCOMPLETE verdict, are live-only because this suite has no switch that disables a phase and aggregates a skip to FAIL.
 - **TD-05** — Container proves lock ordering and hook protocol; provider snapshots are live-only.
 - **BOOT-01** — Container proves host identity precedes the password; the live controller's public-target path is live-only.
 - **BOOT-02** — Container proves bounded key lifetime and revocation; live account behaviour is live-only.

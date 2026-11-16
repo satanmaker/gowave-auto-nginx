@@ -150,6 +150,14 @@ PARTIAL_SCENARIOS = {
         "Container proves host identity precedes the password; the live controller's public-target path is live-only.",
     ("Local Operator Credential Bootstrap and Cleanup", "Temporary access is bounded and revoked"):
         "Container proves bounded key lifetime and revocation; live account behaviour is live-only.",
+    ("Negative Scenario and Fault Injection Tests", "Matrix of fifteen fault scenarios verified (NEG-01..NEG-15)"):
+        "Container witnesses the matrix one case per row, each at its own boundary; 'all 15 scenarios terminate at their designated boundaries' is a property of the suite's case list rather than a verdict one run can produce, and `catalog gaps` with the divergence table is what audits it.",
+    ("Negative Scenario and Fault Injection Tests", "Preflight, lifecycle, and protocol scenarios verified (NEG-01..NEG-10)"):
+        "Container witnesses the ten rows one case per sentence, including the timeout bounds `MN-OUTAGE` records as offline and control-plane seconds; the conjunction over the ten is a suite property, not a verdict a single case can read.",
+    ("Negative Scenario and Fault Injection Tests", "Negative suite PASS requires all fifteen scenarios to pass"):
+        "Container proves the aggregate refuses a run that recorded any non-PASS among its declared cases; the live `negative_tests` field, the `NOT_RUN` and `PARTIAL` states and a skip verdict of INCOMPLETE do not exist in this contour, whose aggregate turns a skipped declared case into FAIL.",
+    ("Negative Scenario and Fault Injection Tests", "Negative suite cannot be silently skipped for a passing run"):
+        "Container proves a run cannot report PASS while a declared case is SKIP; the negative phase the sentence names, and its INCOMPLETE verdict, are live-only because this suite has no switch that disables a phase and aggregates a skip to FAIL.",
 }
 
 LIVE_ONLY_SCENARIOS = {
@@ -1766,10 +1774,14 @@ def validate_catalog(catalog: Dict[str, Any], spec_path: Path = LIVE_SPEC) -> Li
             errors.append(f"Catalog entry has no live scenario: {case.get('id')} / {key[1]}")
 
     counts = catalog.get("counts", {})
+    # 115 was the plan-time split. Four of those sentences turned out to be
+    # conjunctions over other cases' verdicts — no single run can own them — so
+    # they are `partial` with the split written out, and the container count
+    # says so instead of pinning a number the evidence no longer supports.
     expected = {
         "live_total": 125,
-        "container": 115,
-        "partial": 8,
+        "container": 111,
+        "partial": 12,
         "live_only": 2,
     }
     for field_name, expected_value in expected.items():

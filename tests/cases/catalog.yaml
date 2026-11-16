@@ -4,8 +4,8 @@ live_spec: openspec/specs/live-vps-e2e/spec.md
 live_spec_sha256: 485975c572e46198c2b42e05f01e3c25284aa22353f9704c9dcda2d937494863
 counts:
   live_total: 125
-  container: 115
-  partial: 8
+  container: 111
+  partial: 12
   live_only: 2
   podman_first: 102
   total: 227
@@ -3283,13 +3283,16 @@ cases:
   - podman
   - live
   state: live-parity
-  environment: container
+  environment: partial
   topology:
   - aio
   - multi-node
   gate: pre-push
   driver_status: planned
   drivers: {}
+  partial_split: Container witnesses the matrix one case per row, each at its own boundary; 'all 15 scenarios
+    terminate at their designated boundaries' is a property of the suite's case list rather than a verdict
+    one run can produce, and `catalog gaps` with the divergence table is what audits it.
   promotion_target: null
 - id: NEG-02
   requirement: Negative Scenario and Fault Injection Tests
@@ -3363,13 +3366,16 @@ cases:
   - podman
   - live
   state: live-parity
-  environment: container
+  environment: partial
   topology:
   - aio
   - multi-node
   gate: pre-push
   driver_status: planned
   drivers: {}
+  partial_split: Container witnesses the ten rows one case per sentence, including the timeout bounds
+    `MN-OUTAGE` records as offline and control-plane seconds; the conjunction over the ten is a suite
+    property, not a verdict a single case can read.
   promotion_target: null
 - id: NEG-05
   requirement: Negative Scenario and Fault Injection Tests
@@ -3434,13 +3440,16 @@ cases:
   - podman
   - live
   state: live-parity
-  environment: container
+  environment: partial
   topology:
   - aio
   - multi-node
   gate: pre-push
   driver_status: planned
   drivers: {}
+  partial_split: Container proves the aggregate refuses a run that recorded any non-PASS among its declared
+    cases; the live `negative_tests` field, the `NOT_RUN` and `PARTIAL` states and a skip verdict of INCOMPLETE
+    do not exist in this contour, whose aggregate turns a skipped declared case into FAIL.
   promotion_target: null
 - id: NEG-08
   requirement: Negative Scenario and Fault Injection Tests
@@ -3460,13 +3469,16 @@ cases:
   - podman
   - live
   state: live-parity
-  environment: container
+  environment: partial
   topology:
   - aio
   - multi-node
   gate: pre-push
   driver_status: planned
   drivers: {}
+  partial_split: Container proves a run cannot report PASS while a declared case is SKIP; the negative
+    phase the sentence names, and its INCOMPLETE verdict, are live-only because this suite has no switch
+    that disables a phase and aggregates a skip to FAIL.
   promotion_target: null
 - id: HOOK-01
   requirement: Global Certbot Deploy Hook Ownership
