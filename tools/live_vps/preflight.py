@@ -313,7 +313,7 @@ class LocalLock:
 #: object, or unlinks one: the holder only opens what the path already names and
 #: exits.
 LOCK_HOLDER_SCRIPT = r"""
-import errno, fcntl, json, os, secrets, stat, sys, time
+import errno, fcntl, json, os, secrets, stat, sys
 
 RUN_ID = %r
 HOST = %r
@@ -373,8 +373,13 @@ os.close(lease_fd)
 sys.stdout.write("LEASE_TOKEN:" + token + "\n")
 sys.stdout.flush()
 
-while True:
-    time.sleep(1)
+# The kernel drops this flock when the holder dies, so a holder that outlives
+# its session holds the host with nobody to release it: killing the local SSH
+# client does not signal the remote process, and an orphan sleeping here would
+# refuse every later run. EOF on stdin is that session ending, and it is the
+# one signal the transport cannot lose.
+while os.read(0, 1):
+    pass
 """
 
 
@@ -402,7 +407,7 @@ class RemotePairLock:
             try:
                 proc = subprocess.Popen(
                     cmd,
-                    stdin=subprocess.DEVNULL,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -445,7 +450,23 @@ class RemotePairLock:
         )
 
     def release(self) -> None:
+        """End both holders, each closing its own lock.
+
+        The session owns the lock, not the local client: a transport that dies
+        without telling the remote process leaves an orphan holding the flock,
+        so the holder is first told its session ended (EOF on stdin) and only
+        terminated if it is still there afterwards.
+        """
         for p in self._procs:
+            try:
+                if p.stdin is not None and not p.stdin.closed:
+                    p.stdin.close()
+                p.wait(timeout=5)
+                continue
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                pass
             try:
                 p.terminate()
                 p.wait(timeout=2)
