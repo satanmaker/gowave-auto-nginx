@@ -324,20 +324,36 @@ class TestWorkerTrustPin(unittest.TestCase):
         self.assertIn("known_hosts", str(caught.exception))
         self.assertIn(host.target_name, str(caught.exception))
 
-    def test_a_second_address_is_pinned_under_the_key_already_read(self):
+    def test_a_second_address_is_pinned_under_the_key_the_worker_presents_now(self):
         host = self.host()
         host.pin_worker_trust()
+        rotated = _ssh_ed25519(b"r" * 32, "root@worker")
+        host.podman.files[(host.worker_name, "/etc/ssh/ssh_host_ed25519_key.pub")] = rotated + "\n"
         entry = host.pin_worker_address(host.plan.second_node_ip)
         pinned = host.podman.files[(host.target_name, "/root/.ssh/known_hosts")]
-        self.assertIn(f"{host.plan.second_node_ip} ", pinned)
-        self.assertIn(topology.MultiNodeTopology._key_blob(WORKER_HOST_KEY), pinned)
+        self.assertIn(f"{host.plan.second_node_ip} {rotated}", pinned)
+        self.assertNotIn(f"{host.plan.second_node_ip} {WORKER_HOST_KEY}", pinned)
         self.assertTrue(entry.startswith(host.plan.second_node_ip))
 
-    def test_an_address_pinned_before_the_key_is_read_is_refused_by_name(self):
+    def test_an_address_is_refused_by_name_when_the_worker_has_no_host_key(self):
         host = self.host()
+        del host.podman.files[(host.worker_name, "/etc/ssh/ssh_host_ed25519_key.pub")]
         with self.assertRaises(topology.TopologyError) as caught:
             host.pin_worker_address(host.plan.second_node_ip)
-        self.assertIn("host key has not been read", str(caught.exception))
+        self.assertIn("no ed25519 host key", str(caught.exception))
+        self.assertIn(host.plan.second_node_ip, str(caught.exception))
+
+    def test_a_lost_second_address_write_is_refused_by_name(self):
+        host = self.host(drop_stdin=("known_hosts",))
+        # The key is already pinned under the Worker's own address, so only a
+        # check of the address line itself can notice that this write was lost.
+        host.podman.files[(host.target_name, "/root/.ssh/known_hosts")] = (
+            f"{host.plan.worker_ip} {WORKER_HOST_KEY}\n"
+        )
+        with self.assertRaises(topology.TopologyError) as caught:
+            host.pin_worker_address(host.plan.second_node_ip)
+        self.assertIn("did not land", str(caught.exception))
+        self.assertIn(host.plan.second_node_ip, str(caught.exception))
 
 
 class TestPodmanExecAttachesStdin(unittest.TestCase):

@@ -1516,12 +1516,20 @@ class MultiNodeTopology(AioTopology):
 
         A second node record reaches the same host through its own address, and
         the operator's rule that a key is verified out of band and pinned before
-        use applies to that address too. The key is the one already read from the
-        Worker's filesystem, so nothing is learned from the new address itself.
+        use applies to that address too. The key is read from the Worker's own
+        filesystem at the moment of the pin rather than reused from an earlier
+        read: the suite's own SSH host-key case rotates the Worker's keys, so a
+        key captured before it is a pin of a key the host no longer presents,
+        which OpenSSH refuses as a changed key instead of a new address.
         """
-        if not getattr(self, "_worker_host_key", ""):
-            raise TopologyError("the Worker host key has not been read yet")
-        entry = f"{address} {self._worker_host_key}\n"
+        worker_host_key = self.podman.exec(
+            self.worker_name, ["cat", "/etc/ssh/ssh_host_ed25519_key.pub"],
+        ).stdout.strip()
+        if not worker_host_key.startswith("ssh-ed25519 "):
+            raise TopologyError(
+                f"the Worker has no ed25519 host key to pin for {address}"
+            )
+        entry = f"{address} {worker_host_key}\n"
         self.podman.exec(
             self.target_name,
             ["bash", "-c", "umask 077; mkdir -p /root/.ssh; cat >> /root/.ssh/known_hosts"],
@@ -1531,10 +1539,12 @@ class MultiNodeTopology(AioTopology):
         pinned = self.podman.exec(
             self.target_name, ["cat", "/root/.ssh/known_hosts"], check=False,
         ).stdout
-        if self._key_blob(self._worker_host_key) not in pinned:
+        if entry.strip() not in pinned:
             raise TopologyError(
-                f"the Worker host key did not land in {self.target_name}:/root/.ssh/known_hosts"
+                f"{address} with the Worker host key did not land in "
+                f"{self.target_name}:/root/.ssh/known_hosts"
             )
+        self._worker_host_key = worker_host_key
         return entry.strip()
 
     @staticmethod
