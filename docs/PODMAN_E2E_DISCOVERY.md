@@ -785,16 +785,16 @@ image.
 
 `tests/cases/catalog.yaml` defines each scenario once and stamps it with an
 `environment`, so the boundary between the contours is a checked field rather
-than a sentence in a document. The catalog holds 223 entries:
+than a sentence in a document. The catalog holds 227 entries:
 
 | Environment | Entries | Which contour answers it |
 | --- | ---: | --- |
-| `container` | 213 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
+| `container` | 217 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
 | `partial` | 8 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
 | `live-only` | 2 | Only the live suite. Every Podman run reports both as justified exclusions, and `tools/podman_e2e/catalog.py` refuses a catalog that lets one run here. |
 
 Of the 125 live scenarios projected into this catalog, 115 are container, 8 are
-partial and 2 are live-only; the other 98 entries are Podman-first cases with a
+partial and 2 are live-only; the other 102 entries are Podman-first cases with a
 promotion target, which `tests/cases/PARITY.md` lists separately.
 
 The ten entries that are not fully container-answerable are, by id: `PRE-04`,

@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from tools.live_vps.preflight import RemotePairLock
 from tools.live_vps.runstate import MUTATING_PHASES, pair_lock_gate
@@ -35,6 +36,8 @@ from tools.podman_e2e.runner import CaseBlocked, require
 LOCK_CASE_ID = "MN-LOCK"
 LOCK_LOSS_CASE_ID = "MN-LOCK-LOSS"
 LOCK_PATH_CASE_ID = "MN-LOCK-PATH"
+CLI_CASE_ID = "MN-LOCK-CLI"
+NESTED_CASE_ID = "MN-LOCK-NESTED"
 
 #: The canonical paths ``modules/lock.sh`` and the holder agree on.
 LOCK_PATH = "/run/lock/gowave-managed-mutation.lock"
@@ -52,6 +55,65 @@ HOLDER_STOP_TIMEOUT_SECONDS = 60
 #: rather than a substring of the path: the operator's next action is to find the
 #: other runner, and a refusal that does not say the lock is held does not say so.
 HELD_SENTENCE = f"another process holds {LOCK_PATH}"
+
+#: What ``gowave-auto.sh`` itself says when the lock is occupied. Pinned as a
+#: sentence rather than a substring: an operator who reads it knows the host is
+#: owned by another run, and a command that failed for an unrelated reason does
+#: not say this at all.
+CLI_HELD_SENTENCE = f"Another process currently holds the mutation lock ({LOCK_PATH})."
+
+#: What a command says when it was handed a lease that no longer authorizes it.
+#: Distinct from the sentence above on purpose: being refused for holding nothing
+#: and being refused for holding the wrong thing are different operator problems.
+CLI_STALE_SENTENCE = "Invalid or stale mutation lock lease provided."
+
+#: An archive that exists so ``cmd_restore`` gets past its own existence check,
+#: and that is not a GoWave archive so nothing it contains could ever be applied.
+INVALID_ARCHIVE = "/tmp/gowave-invalid-archive.tar.gz"
+
+#: The file the nested command reads its lease from. A token handed to a child as
+#: an argument would be authority in every process list on the host, so it is
+#: written at mode 0600 and read by the child's own shell.
+NESTED_TOKEN_FILE = "/tmp/gowave-nested-lease-token"
+
+CLI_TIMEOUT_SECONDS = 180
+
+#: Every file a management command could rewrite, read as a digest set. A command
+#: that was refused has to leave all of them byte-identical, including the ones
+#: that are absent: a command that created one mutated the host by existing.
+_SNAPSHOT_PATHS = (
+    "/opt/gowave/.env",
+    "/opt/gowave/state.json",
+    "/etc/nginx/nginx.conf",
+    "/etc/nginx/conf.d/gowave-*.conf",
+    "/etc/nginx/stream-enabled/gowave-*.conf",
+    "/etc/systemd/system/gowave.service",
+    "/etc/systemd/system/gowave-node.service",
+    "/etc/systemd/system/gowave-recover.service",
+    "/etc/systemd/system/gowave-recover-provision.service",
+    "/etc/systemd/system/bbr-load.service",
+)
+
+_SNAPSHOT_SCRIPT = r"""
+import glob, hashlib, json, sys
+
+digests = {}
+for pattern in sys.argv[1:]:
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        digests[pattern] = "absent"
+    for path in matches:
+        try:
+            with open(path, "rb") as handle:
+                digests[path] = hashlib.sha256(handle.read()).hexdigest()
+        except OSError as error:
+            digests[path] = f"unreadable:{error.errno}"
+print(json.dumps(digests, sort_keys=True))
+"""
+
+_LOCK_FILES_SCRIPT = (
+    "import glob, json; print(json.dumps(sorted(glob.glob('/run/lock/*gowave*'))))"
+)
 
 #: The object a refused acquisition must leave exactly as it found it. Read with
 #: `lstat`, so a symlink is reported as a symlink and never as its target.
@@ -230,6 +292,130 @@ def _validate_lease(host: Any, container: str, token: str) -> bool:
         check=False,
     )
     return result.stdout.strip() == "VALID"
+
+
+def _snapshot(host: Any, container: str) -> Dict[str, str]:
+    """A digest per path a management command could rewrite, or ``"absent"``."""
+    output = host.podman.exec(
+        container, ["python3", "-c", _SNAPSHOT_SCRIPT, *_SNAPSHOT_PATHS],
+        timeout=SSH_TIMEOUT_SECONDS,
+    ).stdout
+    return json.loads(output)
+
+
+def _lock_files(host: Any, container: str) -> List[str]:
+    """The lock-protocol files present on the host, so a stray one is visible."""
+    output = host.podman.exec(
+        container, ["python3", "-c", _LOCK_FILES_SCRIPT], timeout=SSH_TIMEOUT_SECONDS,
+    ).stdout
+    return json.loads(output)
+
+
+def _current_channel(host: Any, container: str) -> Optional[str]:
+    """The channel ``.env`` records, or ``None`` when the host is not installed."""
+    result = host.podman.exec(
+        container,
+        ["bash", "-c",
+         "test -f /opt/gowave/.env && "
+         "sed -n 's/^GOWAVE_CHANNEL=//p' /opt/gowave/.env | head -n1"],
+        check=False, timeout=SSH_TIMEOUT_SECONDS,
+    )
+    channel = result.stdout.strip()
+    return channel if result.returncode == 0 and channel else None
+
+
+def _run_cli(
+    host: Any,
+    container: str,
+    argv: List[str],
+    *,
+    token_file: str = "",
+    stdin_text: Optional[str] = None,
+) -> Any:
+    """Run ``gowave-auto.sh`` as an operator would, with no interactive input.
+
+    A command with no stdin of its own would read the suite's stdin, so the
+    redirection is explicit unless the caller is deliberately feeding the lease
+    line. A lease is read from a file by the child's own shell, never spliced
+    into an argument: authority in ``argv`` is authority in every process list.
+    """
+    parts = ["cd /repo &&"]
+    if token_file:
+        parts.append(f'GOWAVE_LEASE_TOKEN="$(cat {token_file})"')
+    parts.append("exec bash ./gowave-auto.sh")
+    parts.extend(shlex.quote(argument) for argument in argv)
+    if stdin_text is None:
+        parts.append("</dev/null")
+    return host.podman.exec(
+        container, ["bash", "-c", " ".join(parts)],
+        input_text=stdin_text, check=False, timeout=CLI_TIMEOUT_SECONDS,
+    )
+
+
+def _combined(result: Any) -> str:
+    return (result.stdout or "") + (result.stderr or "")
+
+
+def _write_token(host: Any, container: str, token: str) -> str:
+    """Stage a lease at mode 0600 inside the host and return its path."""
+    host.podman.exec(
+        container,
+        ["bash", "-c", f"umask 077; cat > {NESTED_TOKEN_FILE}"],
+        input_text=token + "\n", timeout=SSH_TIMEOUT_SECONDS,
+    )
+    return NESTED_TOKEN_FILE
+
+
+def _entry_points(channel: Optional[str]) -> List[Dict[str, Any]]:
+    """Every management entry point the spec names, with its own post-lock marker.
+
+    The marker is the sentence the command prints *after* it took the lock and
+    before it changed anything: it is what makes a refusal attributable to the
+    lock rather than to a crash, a missing file, or a syntax error. ``channel``
+    needs the host's own channel so that its marker is the idempotent no-op
+    rather than a real switch; an uninstalled host gets the missing-``.env``
+    sentence instead, which is likewise printed after the lock.
+    """
+    if channel:
+        channel_argv = ["channel", channel]
+        channel_marker = f"GoWave is already on channel '{channel}'."
+    else:
+        channel_argv = ["channel", "stable"]
+        channel_marker = "Error: /opt/gowave/.env not found"
+    return [
+        {
+            "label": "install",
+            "argv": ["install", "invalid", "invalid", "ops@example.com"],
+            "marker": "Invalid DNS hostname: invalid",
+        },
+        {"label": "node add", "argv": ["node", "add"], "marker": "Usage: gowave-auto.sh node add"},
+        {
+            "label": "node rollback",
+            "argv": ["node", "rollback"],
+            "marker": "Usage: gowave-auto.sh node rollback",
+        },
+        {
+            "label": "node reapply",
+            "argv": ["node", "reapply"],
+            "marker": "Usage: gowave-auto.sh node reapply",
+        },
+        {
+            "label": "domain-change",
+            "argv": ["domain-change"],
+            "marker": "Usage: gowave-auto.sh domain-change",
+        },
+        {"label": "channel", "argv": channel_argv, "marker": channel_marker},
+        {
+            "label": "uninstall",
+            "argv": ["uninstall"],
+            "marker": "WARNING: This will remove GoWave Auto NGINX managed components.",
+        },
+        {
+            "label": "backup restore",
+            "argv": ["restore", INVALID_ARCHIVE],
+            "marker": "==> Initiating Restore from",
+        },
+    ]
 
 
 def _write_shape(host: Any, container: str, shape: str) -> bool:
@@ -725,4 +911,399 @@ def case_lock_path(product: Any) -> Dict[str, Any]:
         "directory_symlink_refusal": directory_refusals[0] if directory_refusals else "",
         "directory_restored": True,
         "control_acquired": True,
+    }
+
+
+def case_cli_entry_points(product: Any) -> Dict[str, Any]:
+    """MLOCK-01: every management entry point refuses while a run owns the host.
+
+    The lock is the runner's own — the same product holder the live runner uses —
+    and the commands are the shipped ``gowave-auto.sh`` and
+    ``assets/backup/gowave-backup.sh`` reading the same canonical path. A command
+    that kept a private lock, or that did not lock at all, would print its own
+    post-lock sentence here; the case asserts both that the sentence is absent and
+    that the lock's own refusal is present, so a command that failed for any other
+    reason cannot pass for a refusal.
+
+    The Worker half of the requirement — ``remote_payload`` and
+    ``remote_rollback`` — is not driven: a valid Worker lease would perform a full
+    reinstall of the Worker, which is a mutation this case is forbidden to make.
+    """
+    host = _topology(product)
+    master_container, worker_container = _containers(host)
+    channel = _current_channel(host, master_container)
+    host.podman.exec(
+        master_container,
+        ["bash", "-c",
+         f"umask 022; printf 'not-a-gowave-archive' > {INVALID_ARCHIVE}"],
+        timeout=SSH_TIMEOUT_SECONDS,
+    )
+    try:
+        with _pair(host) as (master, worker):
+            holder = RemotePairLock(master, worker, run_id="podman-lock-cli")
+            require(
+                CLI_CASE_ID,
+                holder.acquire(),
+                f"the run could not take the pair-wide lock the commands are refused "
+                f"against: {holder.last_error}",
+            )
+            try:
+                before = _snapshot(host, master_container)
+                locks_before = _lock_files(host, master_container)
+                refusals: Dict[str, str] = {}
+                exit_codes: Dict[str, int] = {}
+                reached: List[str] = []
+                for entry in _entry_points(channel):
+                    result = _run_cli(host, master_container, entry["argv"])
+                    output = _combined(result)
+                    if entry["marker"] in output:
+                        reached.append(entry["label"])
+                    require(
+                        CLI_CASE_ID,
+                        entry["marker"] not in output,
+                        f"`{' '.join(entry['argv'])}` was not stopped by the lock that owns "
+                        f"{master_container}: it printed {entry['marker']!r}. A command that "
+                        "keeps a private lock, or does not take one, would mutate the host "
+                        "underneath the runner",
+                    )
+                    require(
+                        CLI_CASE_ID,
+                        CLI_HELD_SENTENCE in output,
+                        f"`{' '.join(entry['argv'])}` was stopped, but not by the mutation "
+                        f"lock: it printed {output.strip()[-600:]!r} instead of "
+                        f"{CLI_HELD_SENTENCE!r}",
+                    )
+                    require(
+                        CLI_CASE_ID,
+                        result.returncode != 0,
+                        f"`{' '.join(entry['argv'])}` exited {result.returncode} after "
+                        "refusing the lock, so a caller could read the refusal as success",
+                    )
+                    refusals[entry["label"]] = CLI_HELD_SENTENCE
+                    exit_codes[entry["label"]] = result.returncode
+
+                after = _snapshot(host, master_container)
+                require(
+                    CLI_CASE_ID,
+                    after == before,
+                    "a refused command changed the host: "
+                    + json.dumps(
+                        {path: [before.get(path), after.get(path)]
+                         for path in sorted(set(before) | set(after))
+                         if before.get(path) != after.get(path)},
+                        sort_keys=True,
+                    ),
+                )
+                locks_after = _lock_files(host, master_container)
+                expected_locks = sorted([LOCK_PATH, LEASE_PATH])
+                require(
+                    CLI_CASE_ID,
+                    locks_before == expected_locks,
+                    f"the holder left {locks_before!r} in {LOCK_DIR} rather than the two "
+                    "files the protocol names",
+                )
+                require(
+                    CLI_CASE_ID,
+                    locks_after == locks_before,
+                    f"a refused command changed the lock protocol's own files: {locks_after!r} "
+                    f"instead of {locks_before!r}",
+                )
+                require(
+                    CLI_CASE_ID,
+                    holder.check_alive(),
+                    "a refused command ended the holder's own lock-holder session, so an "
+                    "ordinary operator command could cancel a run in progress",
+                )
+            finally:
+                holder.release()
+    finally:
+        host.podman.exec(
+            master_container, ["bash", "-c", f"rm -f {INVALID_ARCHIVE}"], check=False,
+            timeout=SSH_TIMEOUT_SECONDS,
+        )
+
+    # The Worker is the other half of the same protocol: the lease the holder
+    # published there is the one its own commands would be handed, and the file
+    # is the canonical one rather than a second, Worker-local name.
+    with _pair(host) as (master, worker):
+        worker_holder = RemotePairLock(master, worker, run_id="podman-lock-cli-worker")
+        require(
+            CLI_CASE_ID,
+            worker_holder.acquire(),
+            f"the Worker half of the pair could not be taken: {worker_holder.last_error}",
+        )
+        try:
+            worker_lease = _lease(host, worker_container)
+            require(
+                CLI_CASE_ID,
+                worker_lease.get("run_id") == "podman-lock-cli-worker",
+                f"{worker_container} published {worker_lease!r}, which does not name the run "
+                "that holds it",
+            )
+            require(
+                CLI_CASE_ID,
+                _object(host, worker_container).get("kind") == "regular",
+                f"{worker_container} has no canonical lock file at {LOCK_PATH}, so its "
+                "commands would take a lock the runner never touched",
+            )
+            worker_held = not _flock_free(host, worker_container)
+            require(
+                CLI_CASE_ID,
+                worker_held,
+                f"the canonical lock on {worker_container} is free while the runner holds the "
+                "pair, so a Worker command would not be refused",
+            )
+        finally:
+            worker_holder.release()
+
+    return {
+        "entry_points": len(refusals),
+        "refusals": json.dumps(refusals, sort_keys=True),
+        "exit_codes": json.dumps(exit_codes, sort_keys=True),
+        "post_lock_markers_absent": not reached,
+        "channel_target": channel or "",
+        "host_unchanged": after == before,
+        "lock_files": ",".join(Path(path).name for path in expected_locks),
+        "lock_files_unchanged": locks_after == locks_before,
+        "holder_session_survived": True,
+        "worker_lock_held": worker_held,
+    }
+
+
+def case_nested_lease(product: Any) -> Dict[str, Any]:
+    """MLOCK-02: a nested command runs on the run's own lease, and on nothing else.
+
+    The child is ``domain-change`` with no arguments: it takes the lock first and
+    then prints its usage, so acceptance is observable as that usage sentence and a
+    refusal is observable as the lock's own sentence, with no mutation on either
+    path. Acceptance is proved three ways beyond the sentence — the parent's holder
+    session is still alive afterwards, the lease file is byte-identical, and the
+    host's digests are unchanged — because "the child ran" would otherwise be
+    "the child took the lock the parent had already dropped".
+    """
+    host = _topology(product)
+    master_container, _ = _containers(host)
+    address = _address_for(host, master_container)
+    child = ["domain-change"]
+    marker = "Usage: gowave-auto.sh domain-change <panel-domain> <reality-domain>"
+
+    def drive(**arguments: Any) -> Tuple[Any, str]:
+        result = _run_cli(host, master_container, child, **arguments)
+        return result, _combined(result)
+
+    accepted_env = accepted_stdin = False
+    lease_unchanged = host_unchanged = False
+    holder_survived = False
+    bare_output = stale_output = replayed_output = ""
+    lost_rejected = False
+    try:
+        with _pair(host) as (master, worker):
+            holder = RemotePairLock(master, worker, run_id="podman-lock-nested")
+            require(
+                NESTED_CASE_ID,
+                holder.acquire(),
+                f"the run could not take the pair-wide lock its child is meant to reuse: "
+                f"{holder.last_error}",
+            )
+            try:
+                live_token = holder.lease_tokens[address]
+                before = _snapshot(host, master_container)
+                lease_before = host.podman.exec(
+                    master_container, ["cat", LEASE_PATH], timeout=SSH_TIMEOUT_SECONDS,
+                ).stdout
+
+                # 1. An operator with no lease at all: the lock refuses, so the
+                #    acceptance below is about the lease and not about the lock
+                #    being free.
+                _, bare_output = drive()
+                require(
+                    NESTED_CASE_ID,
+                    marker not in bare_output and CLI_HELD_SENTENCE in bare_output,
+                    f"a child with no lease was not refused by the lock: {bare_output.strip()!r}",
+                )
+
+                # 2. The run's own lease in the environment.
+                token_file = _write_token(host, master_container, live_token)
+                _, env_output = drive(token_file=token_file)
+                require(
+                    NESTED_CASE_ID,
+                    marker in env_output and CLI_HELD_SENTENCE not in env_output,
+                    f"the run's own lease was refused in the environment: "
+                    f"{env_output.strip()[-600:]!r}. A nested deployment could never run",
+                )
+                require(
+                    NESTED_CASE_ID,
+                    CLI_STALE_SENTENCE not in env_output,
+                    f"the run's own live lease was reported stale: {env_output.strip()!r}",
+                )
+                accepted_env = True
+
+                # 3. The same lease as the stdin line an SSH pipeline carries.
+                _, stdin_output = drive(
+                    stdin_text=f"GOWAVE_LEASE: {live_token}\n"
+                )
+                require(
+                    NESTED_CASE_ID,
+                    marker in stdin_output and CLI_HELD_SENTENCE not in stdin_output,
+                    f"the run's own lease was refused on stdin, so a child reached over an "
+                    f"SSH pipeline cannot run: {stdin_output.strip()[-600:]!r}",
+                )
+                accepted_stdin = True
+
+                lease_after = host.podman.exec(
+                    master_container, ["cat", LEASE_PATH], timeout=SSH_TIMEOUT_SECONDS,
+                ).stdout
+                require(
+                    NESTED_CASE_ID,
+                    lease_after == lease_before,
+                    f"an accepted child rewrote the lease: {lease_after.strip()!r} instead of "
+                    f"{lease_before.strip()!r}. The parent's authority is not the child's to "
+                    "re-publish",
+                )
+                lease_unchanged = True
+                after = _snapshot(host, master_container)
+                require(
+                    NESTED_CASE_ID,
+                    after == before,
+                    "an accepted child changed the host although it only printed its usage",
+                )
+                host_unchanged = True
+                require(
+                    NESTED_CASE_ID,
+                    holder.check_alive(),
+                    "an accepted child ended the parent's lock-holder session, so it released "
+                    "the exclusivity it was granted",
+                )
+                holder_survived = True
+                require(
+                    NESTED_CASE_ID,
+                    not _flock_free(host, master_container),
+                    "the lock is free after the child ran: the child's own descriptor took "
+                    "over instead of the parent keeping exclusivity",
+                )
+            finally:
+                holder.release()
+
+            # 4. A lease from a holder that has released: the host is owned by some
+            #    other run, so the token is presented while the lock is genuinely
+            #    occupied and the refusal is about the token, not about a free host.
+            stale_token = live_token
+            successor = RemotePairLock(master, worker, run_id="podman-lock-nested-next")
+            require(
+                NESTED_CASE_ID,
+                successor.acquire(),
+                f"the pair could not be taken by a second holder: {successor.last_error}",
+            )
+            try:
+                stale_run, stale_output = drive(
+                    stdin_text=f"GOWAVE_LEASE: {stale_token}\n"
+                )
+                require(
+                    NESTED_CASE_ID,
+                    marker not in stale_output,
+                    f"a lease from a released holder was accepted: the child printed "
+                    f"{marker!r} although its authority had ended",
+                )
+                require(
+                    NESTED_CASE_ID,
+                    CLI_STALE_SENTENCE in stale_output,
+                    f"a lease from a released holder was refused with "
+                    f"{stale_output.strip()[-600:]!r} rather than {CLI_STALE_SENTENCE!r}",
+                )
+                require(
+                    NESTED_CASE_ID,
+                    stale_run.returncode != 0,
+                    "a command handed a stale lease exited 0, so a pipeline would read the "
+                    "refusal as a completed mutation",
+                )
+            finally:
+                successor.release()
+
+            # 5. A lease whose holder died: authority is the live session, not the
+            #    bytes on disk, so the token is rejected by the product's own
+            #    validator and by a command once another holder owns the host.
+            replay = RemotePairLock(master, worker, run_id="podman-lock-nested-replay")
+            require(
+                NESTED_CASE_ID,
+                replay.acquire(),
+                f"the pair could not be taken for the loss half: {replay.last_error}",
+            )
+            replayed_token = replay.lease_tokens[address]
+            lease = _lease(host, master_container)
+            require(
+                NESTED_CASE_ID,
+                isinstance(lease.get("holder_pid"), int),
+                f"{master_container} published no holder pid, so its session could not be lost",
+            )
+            host.podman.exec(
+                master_container, ["kill", "-TERM", str(lease["holder_pid"])], check=False,
+            )
+            stopped = wait_until(
+                lambda: not replay.check_alive(),
+                HOLDER_STOP_TIMEOUT_SECONDS,
+                f"{NESTED_CASE_ID}: the runner still reports both holder sessions alive after "
+                f"{master_container} terminated its own",
+            )
+            require(
+                NESTED_CASE_ID,
+                stopped,
+                "the runner did not notice its own holder session ending, so a replayed lease "
+                "would be tried against a lock nobody holds",
+            )
+            require(
+                NESTED_CASE_ID,
+                not _validate_lease(host, master_container, replayed_token),
+                "the product's own validator still accepts the lease of a terminated holder",
+            )
+            lost_rejected = True
+            replay.release()
+
+            successor = RemotePairLock(master, worker, run_id="podman-lock-nested-after")
+            require(
+                NESTED_CASE_ID,
+                successor.acquire(),
+                f"the pair could not be reacquired after the loss: {successor.last_error}",
+            )
+            try:
+                replayed_run, replayed_output = drive(
+                    stdin_text=f"GOWAVE_LEASE: {replayed_token}\n"
+                )
+                require(
+                    NESTED_CASE_ID,
+                    marker not in replayed_output,
+                    "a lease replayed from a terminated holder was accepted by a command",
+                )
+                require(
+                    NESTED_CASE_ID,
+                    CLI_STALE_SENTENCE in replayed_output,
+                    f"a replayed lease was refused with {replayed_output.strip()[-600:]!r} "
+                    f"rather than {CLI_STALE_SENTENCE!r}",
+                )
+                require(
+                    NESTED_CASE_ID,
+                    replayed_run.returncode != 0,
+                    "a command handed a replayed lease exited 0",
+                )
+            finally:
+                successor.release()
+    finally:
+        host.podman.exec(
+            master_container, ["bash", "-c", f"rm -f {NESTED_TOKEN_FILE}"], check=False,
+            timeout=SSH_TIMEOUT_SECONDS,
+        )
+
+    return {
+        "child_command": " ".join(child),
+        "bare_refusal": CLI_HELD_SENTENCE if CLI_HELD_SENTENCE in bare_output else "",
+        "env_lease_accepted": accepted_env,
+        "stdin_lease_accepted": accepted_stdin,
+        "accepted_marker": marker,
+        "lease_unchanged": lease_unchanged,
+        "host_unchanged": host_unchanged,
+        "holder_session_survived": holder_survived,
+        "stale_lease_refusal": CLI_STALE_SENTENCE if CLI_STALE_SENTENCE in stale_output else "",
+        "lost_lease_rejected": lost_rejected,
+        "replayed_lease_refusal": (
+            CLI_STALE_SENTENCE if CLI_STALE_SENTENCE in replayed_output else ""
+        ),
     }

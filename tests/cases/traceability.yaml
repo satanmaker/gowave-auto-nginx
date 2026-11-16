@@ -523,9 +523,9 @@ cases_by_requirement:
       What the delta spec states about all eight is the parity sentence itself,
       a Podman case for every container-reproducible live scenario
   - requirement: Live scenario parity
-    cases: [MN-LOCK, MN-LOCK-LOSS, MN-LOCK-PATH]
+    cases: [MN-LOCK, MN-LOCK-LOSS, MN-LOCK-PATH, MN-LOCK-CLI, MN-LOCK-NESTED]
     reason: >-
-      all three serve the same parity sentence for the two live requirements the
+      all five serve the same parity sentence for the two live requirements the
       delta spec writes no scenario about: the pair-wide lock a run holds over
       both hosts, and the one lock every management entry point has to take.
       MN-LOCK is the exclusivity sentence — a second runner is refused before
@@ -547,7 +547,47 @@ cases_by_requirement:
       directory that is itself a symlink, are each refused with the host address
       and the object named, the object is then found untouched and the pair-wide
       lock still free — each shape read on the host that was refused, and both
-      hosts cleared first so the refusal cannot be the other host's leftover
+      hosts cleared first so the refusal cannot be the other host's leftover.
+      MN-LOCK-CLI is the other half of that requirement, the commands rather than
+      the path: the shipped `install`, `node add`, `node rollback`,
+      `node reapply`, `domain-change`, `channel`, `uninstall` and
+      `backup restore` are run against the holder and each has to print the
+      lock's own sentence instead of the sentence it prints once it is past the
+      lock, exit nonzero, leave every file it could rewrite at its digest, leave
+      the protocol's two files alone and leave the holder's session alive, so a
+      command with a private lock or none at all cannot pass; the Worker's own
+      canonical file is read too, and its `remote_payload`/`remote_rollback`
+      half is named as not driven because a valid Worker lease would reinstall
+      it. MN-LOCK-NESTED is the re-entrancy sentence: the run's own lease is
+      accepted in both transports the product supports — the environment and the
+      `GOWAVE_LEASE:` stdin line — while a child with no lease is refused, and
+      acceptance is proved with the parent's session alive, the lease
+      byte-identical, the host's digests unchanged and the lock still held, so
+      "the child ran" cannot be "the child took a lock the parent had dropped";
+      a lease from a released holder and one replayed from a terminated holder
+      are then refused as invalid or stale with a nonzero exit, and the
+      terminated holder's token is refused by the product's own validator
+  - requirement: Live scenario parity
+    cases: [RUNID-01, RESUME-01]
+    reason: >-
+      both serve the same parity sentence for the durable-run-state requirement
+      the delta spec writes no scenario about. RUNID-01 is the artifact-root
+      sentence: every hostile run id the requirement names — `..`, a separator,
+      an encoded separator, NUL, dot only, empty, a leading dash, more than 64
+      characters and a symlinked component — is refused by the product's own
+      validator with the rule it broke and with the root unchanged, the accepted
+      shapes resolve to a directory named strictly below that root that
+      validation does not create, and the runner's own source order places the
+      validation before the directory and before the SSH client. RESUME-01 is
+      the partial-mode sentence: the record is written by the product's writer at
+      mode 0600 and read by its own reader, the gate accepts a phase whose
+      prerequisites passed and refuses another run id, commit or non-secret
+      identity, a phase that already has a terminal result, and every phase whose
+      prerequisite is not PASS with a sentence naming the reason, teardown is
+      refused without both baselines, the baseline comparison reports drift on a
+      host that grew a GoWave directory, started listening on a required port or
+      lost a required tool while tolerating the fields no gate reads, and the
+      runner re-collects that baseline before it copies the repository
 
 # What the published report has to cover, one declaration at a time. A plain
 # path is met by any behaviour that quotes it; `every_value` makes every element

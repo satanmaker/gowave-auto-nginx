@@ -29,7 +29,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TESTS_DIR))
 
-from tools.podman_e2e import aio, budget, ingress, lock_cases, matrix, mtls, multi_node, panel_surface, topology  # noqa: E402
+from tools.podman_e2e import aio, budget, ingress, lock_cases, matrix, mtls, multi_node, panel_surface, runstate_cases, topology  # noqa: E402
 from tools.podman_e2e.runner import Case, CaseBlocked  # noqa: E402
 from test_podman_aio import (  # noqa: E402
     BROKEN_TAIL, VISION_OTHER_SHA, VISION_ROUTED_SHA, nginx_probe, vision_answer,
@@ -1657,6 +1657,20 @@ class TestMultiNodeSuite(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.podman = _StubPodman(Path(self.tmp.name))
 
+    def assertSequence(self, ids, expected):
+        """``expected`` appears consecutively and in this order, wherever it sits.
+
+        The guards below are about ordering — one case reading what the previous
+        one wrote — not about an offset. A guard written as ``ids[20:23]`` fails
+        for an insertion that changed no ordering at all, which is exactly what
+        importing the live scenarios does, so the block is located instead of
+        counted.
+        """
+        for start in range(len(ids) - len(expected) + 1):
+            if ids[start:start + len(expected)] == list(expected):
+                return
+        self.fail(f"{list(expected)} does not appear consecutively in {ids}")
+
     def test_the_suite_starts_with_the_install_and_then_provisions_the_worker(self):
         suite = multi_node.cases(self.podman)
         self.assertIsInstance(suite[0], Case)
@@ -1672,9 +1686,10 @@ class TestMultiNodeSuite(unittest.TestCase):
         # both containers, and the Worker carries a python3 only once the
         # provisioning above has run there.
         self.assertEqual(
-            [case.id for case in suite][5:8],
+            [case.id for case in suite][5:10],
             [lock_cases.LOCK_CASE_ID, lock_cases.LOCK_LOSS_CASE_ID,
-             lock_cases.LOCK_PATH_CASE_ID],
+             lock_cases.LOCK_PATH_CASE_ID, lock_cases.CLI_CASE_ID,
+             lock_cases.NESTED_CASE_ID],
         )
         self.assertEqual({case.topology for case in suite}, {"multi-node"})
 
@@ -1691,20 +1706,21 @@ class TestMultiNodeSuite(unittest.TestCase):
 
     def test_the_mtls_cases_follow_the_verifier_then_the_negative_controls(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[8:16], [f"MTLS-0{number}" for number in range(1, 9)])
+        self.assertSequence(ids, [f"MTLS-0{number}" for number in range(1, 9)])
 
     def test_the_management_denial_pair_follows_the_control_plane_proof(self):
         # 5.8: an untrusted vantage and the allowed one are measured after the
         # Master's mTLS path is proven, so a refusal can be told from an outage.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[16:18], ["FW-01", "FW-02"])
+        self.assertSequence(ids, [f"MTLS-0{number}" for number in range(1, 9)]
+                            + ["FW-01", "FW-02"])
 
     def test_the_master_access_case_follows_the_denial_pair(self):
         # 6.6: FW-03 asks the same question of the Master's own rules that the
         # pair above asked of the Worker's, so it reads them while the cluster
         # is healthy and before the cases that only observe the Panel.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[18], multi_node.MASTER_ACCESS_CASE_ID)
+        self.assertSequence(ids, ["FW-01", "FW-02", multi_node.MASTER_ACCESS_CASE_ID])
         self.assertLess(ids.index(multi_node.MASTER_ACCESS_CASE_ID), ids.index("CLUS-01"))
         suite = {case.id: case for case in multi_node.cases(self.podman)}
         self.assertEqual(suite[multi_node.MASTER_ACCESS_CASE_ID].timeout_seconds,
@@ -1716,7 +1732,8 @@ class TestMultiNodeSuite(unittest.TestCase):
         # while both roles are healthy, so a later change to either install cannot
         # be read as an IPv6 effect.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[19], multi_node.IPV6_CASE_ID)
+        self.assertSequence(ids, ["FW-02", multi_node.MASTER_ACCESS_CASE_ID,
+                                  multi_node.IPV6_CASE_ID])
         self.assertLess(ids.index(multi_node.MASTER_ACCESS_CASE_ID),
                         ids.index(multi_node.IPV6_CASE_ID))
         self.assertLess(ids.index(multi_node.IPV6_CASE_ID), ids.index("CLUS-01"))
@@ -1727,36 +1744,41 @@ class TestMultiNodeSuite(unittest.TestCase):
 
     def test_the_cluster_audit_follows_the_control_plane_proof(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[20:23], ["CLUS-01", "CLUS-02", "CLUS-03"])
+        self.assertSequence(ids, [multi_node.IPV6_CASE_ID,
+                                  "CLUS-01", "CLUS-02", "CLUS-03"])
 
     def test_the_worker_state_audit_follows_the_cluster_audit(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[23:25], ["WRK-05", "WRK-06"])
+        self.assertSequence(ids, ["CLUS-01", "CLUS-02", "CLUS-03", "WRK-05", "WRK-06"])
 
     def test_the_vision_independence_case_follows_the_worker_config(self):
         # 5.10: the per-node Vision proof reads the config WRK-06 has just
         # compared, so it runs once that assignment is established and before any
         # data plane traffic.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[23:26], ["WRK-05", "WRK-06", multi_node.VISION_CASE_ID])
+        self.assertSequence(ids, ["WRK-05", "WRK-06", multi_node.VISION_CASE_ID])
 
     def test_the_data_plane_cases_follow_the_worker_audit(self):
         # 5.7: a payload has to traverse the Worker too, so the matrix tuples of
         # both nodes run once the Worker's own config is applied.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[26], "MN-DP-master-REALITY-xray")
-        self.assertEqual(ids[33], "MN-DP-master-TROJAN-GRPC-mihomo")
-        self.assertEqual(ids[34], "MN-DP-worker-REALITY-xray")
-        self.assertEqual(ids[41], "MN-DP-worker-TROJAN-GRPC-mihomo")
+        start = ids.index("MN-DP-master-REALITY-xray")
+        self.assertEqual(ids[start - 1], multi_node.VISION_CASE_ID)
+        self.assertEqual(ids[start + 7], "MN-DP-master-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[start + 8], "MN-DP-worker-REALITY-xray")
+        self.assertEqual(ids[start + 15], "MN-DP-worker-TROJAN-GRPC-mihomo")
 
     def test_the_budget_case_is_declared_last(self):
         # It reads this topology's deadline and the clock two hosts spent, so no
         # case may close the report behind it. It starts no container and reads no
-        # cluster, which is why it is also the only case VIS-06 — which leaves the
-        # cluster incomplete on purpose — may be followed by.
+        # cluster, which is why the three cases after VIS-06 — which leaves the
+        # cluster incomplete on purpose — are the two that read the run's own
+        # record and this one.
         suite = multi_node.cases(self.podman)
-        self.assertEqual([case.id for case in suite][-2:],
-                         [multi_node.VIS_COMPENSATION_CASE_ID, budget.BUDGET_CASE_ID])
+        self.assertEqual([case.id for case in suite][-4:],
+                         [multi_node.VIS_COMPENSATION_CASE_ID,
+                          runstate_cases.RUN_ID_CASE_ID,
+                          runstate_cases.RESUME_CASE_ID, budget.BUDGET_CASE_ID])
         self.assertEqual(suite[-1].topology, "multi-node")
 
     def test_every_node_contributes_its_own_matrix_tuples(self):
@@ -1841,14 +1863,20 @@ class TestMultiNodeSuite(unittest.TestCase):
         # Master, so it closes the install-facing run instead of reading what they
         # left behind. 9.2's VIS-06 follows it because it needs that Worker whole
         # before it provisions a second node onto it and observes the compensation
-        # that tears it down. GATE-BUDGET, which starts no container, is the one
-        # case after them: the clock it reads is the whole run's.
+        # that tears it down. The three cases after them start no container: the
+        # run's own record is read from the state it wrote, and GATE-BUDGET reads
+        # the clock of the whole run.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(
-            ids[-6:-1],
+        self.assertSequence(
+            ids,
             [multi_node.REVOCATION_CASE_ID, multi_node.OUTAGE_CASE_ID,
              multi_node.RESTART_CASE_ID, multi_node.ACME80_CASE_ID,
              multi_node.VIS_COMPENSATION_CASE_ID],
+        )
+        self.assertEqual(
+            ids[-3:],
+            [runstate_cases.RUN_ID_CASE_ID, runstate_cases.RESUME_CASE_ID,
+             budget.BUDGET_CASE_ID],
         )
 
     def test_the_incomplete_compensation_case_follows_the_worker_reprovision(self):

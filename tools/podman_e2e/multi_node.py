@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
     acme_fixture, aio, argv_probe, budget, denial, ingress, lock_cases, matrix as matrix_data,
-    mtls, preflight_cases, status, teardown, topology, vision as vision_policy,
+    mtls, preflight_cases, runstate_cases, status, teardown, topology, vision as vision_policy,
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
@@ -8261,6 +8261,15 @@ def cases(
         Case(lock_cases.LOCK_PATH_CASE_ID, "multi-node",
              lambda context: lock_cases.case_lock_path(product),
              timeout_seconds=LOCK_PATH_TIMEOUT_SECONDS),
+        # The lock's other side: the shipped commands an operator would run on
+        # these hosts, each refused by the same canonical path, and the nested
+        # command the run itself is allowed to hand its own lease to.
+        Case(lock_cases.CLI_CASE_ID, "multi-node",
+             lambda context: lock_cases.case_cli_entry_points(product),
+             timeout_seconds=LOCK_PATH_TIMEOUT_SECONDS),
+        Case(lock_cases.NESTED_CASE_ID, "multi-node",
+             lambda context: lock_cases.case_nested_lease(product),
+             timeout_seconds=LOCK_PATH_TIMEOUT_SECONDS),
         Case("MTLS-01", "multi-node", lambda context: case_mtls_verifier(product),
              timeout_seconds=MTLS_TIMEOUT_SECONDS),
         Case("MTLS-02", "multi-node", lambda context: case_mtls_http_classification(product),
@@ -8480,6 +8489,15 @@ def cases(
         Case(VIS_COMPENSATION_CASE_ID, "multi-node",
              lambda context: case_vision_incomplete_compensation(product),
              timeout_seconds=NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
+        # The run's own record, read without a host and without a clock: a run id
+        # names a directory below the artifact root or nothing, and a partial
+        # phase resumes only the run that wrote the state it was handed. Both call
+        # the product's own helpers, so they read neither the cluster nor the
+        # names ACME80 installed.
+        Case(runstate_cases.RUN_ID_CASE_ID, "multi-node",
+             runstate_cases.case_run_id_root, timeout_seconds=120),
+        Case(runstate_cases.RESUME_CASE_ID, "multi-node",
+             runstate_cases.case_resume_gate, timeout_seconds=120),
         # Last: the deadline it proves is this topology's own, and the elapsed
         # clock it reads is the two hosts' install and transfer, not a single
         # container's. It starts no container and reads no cluster, so it cannot

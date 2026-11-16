@@ -23,6 +23,14 @@ What is not covered here is the container itself: ``_pair`` — the SSH bootstra
 into Master and Worker — is replaced, and the cases' own absolute paths are
 translated on the way to the temporary directory and back. That contour is proven
 by the live Podman run, not by this suite.
+
+``MN-LOCK-CLI``/``MN-LOCK-NESTED`` run the shipped commands inside a live host,
+so they are not driven here either: doing that would execute the real
+``gowave-auto.sh`` as an unprivileged process. What is held here is what the live
+run relies on being right — the eight entry points and the marker each one prints
+after it took the lock, the sentence behind the restore's archive check, and the
+command the case hands ``podman exec`` (a lease read from a file by the child's
+own shell, never spliced into ``argv``).
 """
 import contextlib
 import json
@@ -42,6 +50,8 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+import yaml  # noqa: E402
+
 from tools.live_vps import deployment, preflight  # noqa: E402
 from tools.live_vps.runstate import (  # noqa: E402
     MUTATING_PHASES,
@@ -55,6 +65,17 @@ CASES = {
     lock_cases.LOCK_LOSS_CASE_ID: lock_cases.case_lock_loss,
     lock_cases.LOCK_PATH_CASE_ID: lock_cases.case_lock_path,
 }
+
+#: The two cases that run the shipped commands inside a live host. They are not
+#: driven from this suite — doing so would execute the real ``gowave-auto.sh`` as
+#: an unprivileged process and let it start package work before its refusal — but
+#: their registration and the table they drive are readable here.
+CLI_CASES = {
+    lock_cases.CLI_CASE_ID: lock_cases.case_cli_entry_points,
+    lock_cases.NESTED_CASE_ID: lock_cases.case_nested_lease,
+}
+
+ALL_CASES = {**CASES, **CLI_CASES}
 
 MASTER_NAME = "master-1"
 WORKER_NAME = "worker-1"
@@ -1080,12 +1101,219 @@ class TestWorkerLeasePlumbing(unittest.TestCase):
             _assert_payload_forwarding(damaged)
 
 
+def _function_body(path: Path, name: str) -> str:
+    """A top-level bash function, from its definition line to its closing brace."""
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    for start, line in enumerate(lines):
+        if line.rstrip("\n") == f"{name}() {{":
+            break
+    else:
+        raise AssertionError(f"{path.name} defines no {name}()")
+    for end in range(start + 1, len(lines)):
+        if lines[end].rstrip("\n") == "}":
+            return "".join(lines[start:end + 1])
+    raise AssertionError(f"{name}() in {path.name} never closes")
+
+
+def _lock_call_offsets(text: str):
+    """Where each mutation-lock acquisition sits in a bash script.
+
+    The ``acquire_lock()`` definition and the one line of its body are skipped: a
+    call site is what an entry point runs, and counting the wrapper would let the
+    first assertion below be satisfied by a script that takes the lock nowhere.
+    """
+    wrapper = text.find("acquire_lock() {")
+    wrapper_end = text.find("\n}", wrapper) if wrapper >= 0 else -1
+    offsets = []
+    position = 0
+    for line in text.splitlines(keepends=True):
+        inside_wrapper = 0 <= wrapper <= position <= wrapper_end
+        stripped = line.strip()
+        if not inside_wrapper:
+            for name in ("acquire_lock", "acquire_mutation_lock"):
+                if stripped == name or stripped.startswith(f"{name} "):
+                    offsets.append(position)
+                    break
+        position += len(line)
+    return offsets
+
+
+#: Each management entry point the case drives, the script that prints its
+#: marker, and the source text that composes the marker. A sentence printed
+#: before the script took the lock would be a refusal about something else, so
+#: the test below reads the order rather than the case's own prose.
+ENTRY_POINT_SOURCES = {
+    "install": ("gowave-auto.sh", [
+        ("Invalid DNS hostname: invalid", "Invalid DNS hostname: {domain}"),
+    ]),
+    "node add": ("gowave-auto.sh", [
+        ("Usage: gowave-auto.sh node add", "Usage: gowave-auto.sh node add"),
+    ]),
+    "node rollback": ("gowave-auto.sh", [
+        ("Usage: gowave-auto.sh node rollback", "Usage: gowave-auto.sh node rollback"),
+    ]),
+    "node reapply": ("gowave-auto.sh", [
+        ("Usage: gowave-auto.sh node reapply", "Usage: gowave-auto.sh node reapply"),
+    ]),
+    "domain-change": ("gowave-auto.sh", [
+        ("Usage: gowave-auto.sh domain-change", "Usage: gowave-auto.sh domain-change"),
+    ]),
+    "channel": ("modules/recovery.sh", [
+        ("GoWave is already on channel", "GoWave is already on channel '$target_channel'."),
+        ("Error: /opt/gowave/.env not found", "Error: $env_file not found"),
+    ]),
+    "uninstall": ("gowave-auto.sh", [
+        ("WARNING: This will remove GoWave Auto NGINX managed components.",
+         "WARNING: This will remove GoWave Auto NGINX managed components."),
+    ]),
+    "backup restore": ("assets/backup/gowave-backup.sh", [
+        ("==> Initiating Restore from", "==> Initiating Restore from"),
+    ]),
+}
+
+#: The commands as an operator spells them. The case exists to prove the shipped
+#: CLI is refused by the lock, so the spelling is part of what it claims.
+ENTRY_POINT_ARGV = {
+    "install": ["install", "invalid", "invalid", "ops@example.com"],
+    "node add": ["node", "add"],
+    "node rollback": ["node", "rollback"],
+    "node reapply": ["node", "reapply"],
+    "domain-change": ["domain-change"],
+    "channel": ["channel", "stable"],
+    "uninstall": ["uninstall"],
+    "backup restore": ["restore", lock_cases.INVALID_ARCHIVE],
+}
+
+
+class RecordingPodman:
+    """A transport that records the command instead of running it."""
+
+    def __init__(self):
+        self.calls = []
+
+    def exec(self, name, argv, check=True, input_text=None, timeout=None):
+        self.calls.append({
+            "container": name, "argv": list(argv), "check": check,
+            "input_text": input_text, "timeout": timeout,
+        })
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+class TestCliEntryPointTable(unittest.TestCase):
+    """The eight entry points, their spelling, and the lock each marker follows."""
+
+    def test_the_table_names_eight_distinct_entry_points_in_order(self):
+        entries = lock_cases._entry_points("stable")
+        self.assertEqual([entry["label"] for entry in entries],
+                         list(ENTRY_POINT_ARGV))
+        self.assertEqual(len({entry["marker"] for entry in entries}), len(entries))
+        for entry in entries:
+            with self.subTest(label=entry["label"]):
+                self.assertEqual(entry["argv"], ENTRY_POINT_ARGV[entry["label"]])
+                self.assertTrue(entry["marker"])
+
+    def test_the_channel_entry_point_reads_the_hosts_own_channel(self):
+        installed = {entry["label"]: entry for entry in lock_cases._entry_points("dev")}
+        self.assertEqual(installed["channel"]["argv"], ["channel", "dev"])
+        self.assertEqual(installed["channel"]["marker"],
+                         "GoWave is already on channel 'dev'.")
+        bare = {entry["label"]: entry for entry in lock_cases._entry_points(None)}
+        self.assertEqual(bare["channel"]["argv"], ["channel", "stable"])
+        self.assertEqual(bare["channel"]["marker"], "Error: /opt/gowave/.env not found")
+
+    def test_every_marker_is_printed_after_a_lock_call_in_its_script(self):
+        for label, (relative, pairs) in ENTRY_POINT_SOURCES.items():
+            text = (REPO_ROOT / relative).read_text(encoding="utf-8")
+            calls = _lock_call_offsets(text)
+            with self.subTest(label=label):
+                self.assertTrue(calls, f"{relative} takes the mutation lock nowhere")
+                for _marker, source_text in pairs:
+                    with self.subTest(label=label, source=source_text):
+                        found = text.find(source_text)
+                        self.assertGreaterEqual(
+                            found, 0,
+                            f"{relative} no longer prints {source_text!r}",
+                        )
+                        before = [offset for offset in calls if offset < found]
+                        self.assertTrue(
+                            before,
+                            f"{relative} prints {source_text!r} before it takes the lock "
+                            "anywhere, so the refusal would be about something else",
+                        )
+
+    def test_the_markers_the_case_waits_for_are_the_ones_the_scripts_print(self):
+        printed = set()
+        for channel in ("stable", None):
+            printed.update(entry["marker"] for entry in lock_cases._entry_points(channel))
+        composed = {marker for _relative, pairs in ENTRY_POINT_SOURCES.values()
+                    for marker, _source in pairs}
+        # The installed-channel marker interpolates the host's channel, so the
+        # table above pins only its stable instance; compare the whole sentence.
+        printed = {marker for marker in printed
+                   if not marker.startswith("GoWave is already on channel")}
+        self.assertEqual(sorted(printed - composed), [])
+
+    def test_the_restore_checks_its_archive_before_it_takes_the_lock(self):
+        # The case names a garbage file rather than a missing one: a missing
+        # archive is refused before the lock, and the marker this case waits for
+        # would never be printed, so the refusal could not be attributed to the
+        # lock at all.
+        body = _function_body(
+            REPO_ROOT / "assets" / "backup" / "gowave-backup.sh", "cmd_restore")
+        check_at = body.find("Archive $archive not found")
+        lock_at = body.find("acquire_mutation_lock")
+        marker_at = body.find("==> Initiating Restore from")
+        self.assertGreaterEqual(check_at, 0)
+        self.assertGreaterEqual(lock_at, 0)
+        self.assertGreaterEqual(marker_at, 0)
+        self.assertLess(check_at, lock_at)
+        self.assertLess(lock_at, marker_at)
+
+
+class TestCliCommandConstruction(unittest.TestCase):
+    """How the case spells the command it hands ``podman exec``."""
+
+    def run_cli(self, argv, **arguments):
+        podman = RecordingPodman()
+        lock_cases._run_cli(
+            types.SimpleNamespace(podman=podman), MASTER_NAME, list(argv), **arguments)
+        self.assertEqual(len(podman.calls), 1)
+        return podman.calls[0]
+
+    def test_a_lease_is_read_by_the_child_shell_and_never_spliced_into_argv(self):
+        call = self.run_cli(["domain-change"], token_file=lock_cases.NESTED_TOKEN_FILE)
+        self.assertEqual(call["argv"][:2], ["bash", "-c"])
+        self.assertEqual(len(call["argv"]), 3, "the command grew an argument beside bash -c")
+        command = call["argv"][2]
+        self.assertIn(
+            f'GOWAVE_LEASE_TOKEN="$(cat {lock_cases.NESTED_TOKEN_FILE})"', command)
+        self.assertTrue(command.startswith("cd /repo && "))
+        self.assertIn("exec bash ./gowave-auto.sh domain-change", command)
+        self.assertTrue(command.endswith("</dev/null"))
+
+    def test_a_lease_fed_on_stdin_keeps_stdin_attached(self):
+        call = self.run_cli(["domain-change"], stdin_text="GOWAVE_LEASE: token\n")
+        self.assertNotIn("</dev/null", call["argv"][2])
+        self.assertEqual(call["input_text"], "GOWAVE_LEASE: token\n")
+
+    def test_a_command_with_no_stdin_of_its_own_reads_from_dev_null(self):
+        call = self.run_cli(["uninstall"])
+        self.assertTrue(call["argv"][2].endswith("</dev/null"))
+        self.assertIsNone(call["input_text"])
+
+    def test_an_argument_with_a_space_or_a_dollar_is_passed_as_one_word(self):
+        call = self.run_cli(["install", "a b", "$(id)"])
+        command = call["argv"][2]
+        self.assertIn("'a b'", command)
+        self.assertIn("'$(id)'", command)
+
+
 class TestLockRegistration(unittest.TestCase):
-    """The three ids are registered, catalogued, evidenced and mapped."""
+    """The five ids are registered, catalogued, evidenced and mapped."""
 
     def test_each_id_is_registered_on_the_multi_node_contour_only(self):
         registry = catalog.driver_registry()
-        for case_id, function in CASES.items():
+        for case_id, function in ALL_CASES.items():
             with self.subTest(case_id=case_id):
                 self.assertIn(case_id, registry)
                 self.assertEqual(set(registry[case_id]), {"multi-node"})
@@ -1104,7 +1332,7 @@ class TestLockRegistration(unittest.TestCase):
         stub = types.SimpleNamespace(context=types.SimpleNamespace(topology="multi-node"))
         suite = {case.id: case for case in multi_node.cases(stub)}
         context = types.SimpleNamespace(topology="multi-node")
-        for case_id, function in CASES.items():
+        for case_id, function in ALL_CASES.items():
             with self.subTest(case_id=case_id):
                 received = []
                 with mock.patch.object(
@@ -1123,10 +1351,21 @@ class TestLockRegistration(unittest.TestCase):
     def test_the_catalog_entry_is_what_the_registry_derives(self):
         registry = catalog.driver_registry()
         entries = {entry["id"]: entry for entry in catalog.load_catalog()["cases"]}
-        for case_id in CASES:
+        for case_id in ALL_CASES:
             with self.subTest(case_id=case_id):
                 self.assertEqual(entries[case_id]["driver_status"], "implemented")
                 self.assertEqual(entries[case_id]["drivers"], registry[case_id])
 
     def test_every_case_is_named_by_exactly_one_behavior(self):
         self.assertEqual(catalog.coverage_audit(catalog.load_catalog()), [])
+
+    def test_every_id_is_mapped_to_a_requirement(self):
+        table = yaml.safe_load(
+            (REPO_ROOT / "tests" / "cases" / "traceability.yaml").read_text(encoding="utf-8"))
+        mapped = set()
+        for row in table["requirements"]:
+            for scenario in row["scenarios"]:
+                mapped.update(scenario.get("cases") or [])
+        for entry in table.get("cases_by_requirement") or []:
+            mapped.update(entry.get("cases") or [])
+        self.assertEqual(sorted(set(ALL_CASES) - mapped), [])
