@@ -4275,6 +4275,7 @@ cases:
       - objects_untouched
       - shape_sentences
       - shapes_refused
+      - shapes_skipped
       case: MN-LOCK-PATH
   promotion_target: null
 - id: STATE-01
@@ -6259,6 +6260,7 @@ cases:
       - objects_untouched
       - shape_sentences
       - shapes_refused
+      - shapes_skipped
   promotion_target: Shared Mutation Lock Across All Management Entry Points
 - id: PODNET-MASTER-ADDR
   requirement: Podman-only Master address selection for Worker provisioning
