@@ -8232,22 +8232,6 @@ def cases(
     suite = [
         Case(INSTALL_CASE_ID, "multi-node", lambda context: product.install(),
              timeout_seconds=aio.INSTALL_TIMEOUT_SECONDS),
-        # Immediately after the install, because the pair-wide lock is what every
-        # later mutating command on these two hosts competes for: the cases drive
-        # the product's own lock over real SSH into the containers the install
-        # just provisioned, so they need the hosts and nothing the cases below do
-        # to them. `MN-LOCK-PATH` replaces the canonical lock path for the length
-        # of one acquisition and restores it, and `MN-LOCK-LOSS` terminates its
-        # own holder, so neither is run beside another case.
-        Case(lock_cases.LOCK_CASE_ID, "multi-node",
-             lambda context: lock_cases.case_pair_lock(product),
-             timeout_seconds=LOCK_TIMEOUT_SECONDS),
-        Case(lock_cases.LOCK_LOSS_CASE_ID, "multi-node",
-             lambda context: lock_cases.case_lock_loss(product),
-             timeout_seconds=LOCK_TIMEOUT_SECONDS),
-        Case(lock_cases.LOCK_PATH_CASE_ID, "multi-node",
-             lambda context: lock_cases.case_lock_path(product),
-             timeout_seconds=LOCK_PATH_TIMEOUT_SECONDS),
         # The trust the provisioning path depends on is proven before that path
         # runs: a wrong pin and a rotated host key must both stop the controller.
         Case(SSH_KEY_CASE_ID, "multi-node", lambda context: case_ssh_host_key(product),
@@ -8260,6 +8244,23 @@ def cases(
              timeout_seconds=argv_probe.FIXTURE_TIMEOUT_SECONDS + argv_probe.SCAN_TIMEOUT_SECONDS),
         Case(MASTER_ADDRESS_CASE_ID, "multi-node", lambda context: case_master_address(product),
              timeout_seconds=300),
+        # The pair-wide lock every mutating command on these two hosts competes
+        # for. The holder is the product's own program, started over real SSH into
+        # both containers, so the case needs a python3 on each of them: the Master
+        # gets one from its install and the Worker from `node add` above, which is
+        # why these run after the provisioning instead of beside it.
+        # `MN-LOCK-PATH` replaces the canonical lock path for the length of one
+        # acquisition and restores it, and `MN-LOCK-LOSS` terminates its own
+        # holder, so neither is run beside another case.
+        Case(lock_cases.LOCK_CASE_ID, "multi-node",
+             lambda context: lock_cases.case_pair_lock(product),
+             timeout_seconds=LOCK_TIMEOUT_SECONDS),
+        Case(lock_cases.LOCK_LOSS_CASE_ID, "multi-node",
+             lambda context: lock_cases.case_lock_loss(product),
+             timeout_seconds=LOCK_TIMEOUT_SECONDS),
+        Case(lock_cases.LOCK_PATH_CASE_ID, "multi-node",
+             lambda context: lock_cases.case_lock_path(product),
+             timeout_seconds=LOCK_PATH_TIMEOUT_SECONDS),
         Case("MTLS-01", "multi-node", lambda context: case_mtls_verifier(product),
              timeout_seconds=MTLS_TIMEOUT_SECONDS),
         Case("MTLS-02", "multi-node", lambda context: case_mtls_http_classification(product),

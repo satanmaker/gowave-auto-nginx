@@ -185,6 +185,25 @@ class LocalPodman:
         )
 
 
+class StubbornSSH(LocalSSH):
+    """A session whose remote holder cannot be reached by a signal to the client.
+
+    ``ssh`` starts the holder on the other side of a channel, so terminating or
+    killing the client reaches nothing on that side. The holder here is the
+    shim's detached child for the same reason, which leaves the session — EOF on
+    the pipe — as the only way to free the lock.
+    """
+
+    SHIM = (
+        "import subprocess, sys\n"
+        "child = subprocess.Popen(sys.argv[1:], stdin=0, start_new_session=True)\n"
+        "raise SystemExit(child.wait())\n"
+    )
+
+    def _build_ssh_cmd(self, remote_cmd: str):
+        return [sys.executable, "-c", self.SHIM, *super()._build_ssh_cmd(remote_cmd)]
+
+
 def _relocate(script: str, sandbox: Sandbox) -> str:
     """Point a holder program at ``sandbox`` while it keeps speaking production paths.
 
@@ -225,9 +244,16 @@ class HolderCase:
 
     def _stop_holders(self):
         for process in self._holders:
-            if process.poll() is None:
+            if process.poll() is None and process.stdin is not None:
+                # The holder ends when its session does, so the sweep closes the
+                # session before it resorts to a signal.
+                with contextlib.suppress(OSError, ValueError):
+                    process.stdin.close()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
                 process.kill()
-            process.wait()
+                process.wait()
         # A holder started by the product itself (``RemotePairLock``) is not in the
         # list above, and a case that was damaged mid-flight never reached the
         # release that would have ended it. The sandbox path is in every holder's
@@ -242,9 +268,11 @@ class HolderCase:
 
     def start_holder(self, sandbox=None, run_id="run-1", host=MASTER_ADDRESS):
         sandbox = sandbox or self.sandbox
+        # stdin stays open for as long as the session would: the holder releases
+        # its flock on EOF, so a DEVNULL here would end it before the case read it.
         process = subprocess.Popen(
             [sys.executable, "-c", _holder_script(sandbox, run_id, host)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True,
         )
         self._holders.append(process)
@@ -290,6 +318,17 @@ class TestLockHolderProgram(HolderCase, unittest.TestCase):
         process.terminate()
         process.wait(timeout=60)
         self.assertTrue(_lock_is_free(self.lock_file), "the kernel lock outlived its holder")
+
+    def test_a_holder_ends_when_the_session_that_started_it_does(self):
+        # The kernel releases the flock when the holder dies, and a local `kill`
+        # cannot reach a process on the other side of an SSH channel. The holder
+        # therefore watches its own stdin, and closing it is the session ending.
+        process = self.start_holder(run_id="run-session")
+        self.published_token(process)
+        self.assertFalse(_lock_is_free(self.lock_file), "the holder did not take the lock")
+        process.stdin.close()
+        self.assertEqual(process.wait(timeout=60), 0, "the holder did not end on EOF")
+        self.assertTrue(_lock_is_free(self.lock_file), "the kernel lock outlived its session")
 
     def test_a_symlink_is_refused_and_left_a_symlink(self):
         os.symlink("/tmp/gowave-lock-target", self.lock_file)
@@ -423,6 +462,29 @@ class TestPairLockOverLocalHolders(HolderCase, unittest.TestCase):
         self.assertTrue(_lock_is_free(self.sandboxes[WORKER_NAME].lock_file))
         self.assertFalse(lock.check_alive())
         self.assertEqual(lock.lease_tokens, {})
+
+    def test_release_frees_a_holder_that_survives_a_terminated_client(self):
+        # What ssh does: terminating the local client leaves the remote holder
+        # running, so a release that only signals the client frees nothing and
+        # the host stays locked for every later run.
+        clients = {
+            address: StubbornSSH(address, self.sandboxes[name])
+            for address, name in (
+                (MASTER_ADDRESS, MASTER_NAME), (WORKER_ADDRESS, WORKER_NAME),
+            )
+        }
+        lock = preflight.RemotePairLock(
+            clients[MASTER_ADDRESS], clients[WORKER_ADDRESS], run_id="stubborn",
+        )
+        self.addCleanup(lock.release)
+        self.assertTrue(lock.acquire(), lock.last_error)
+        self.assertFalse(_lock_is_free(self.sandboxes[MASTER_NAME].lock_file))
+        lock.release()
+        self.assertTrue(
+            _lock_is_free(self.sandboxes[MASTER_NAME].lock_file),
+            "the release signalled the client and not the holder, so the host stayed locked",
+        )
+        self.assertTrue(_lock_is_free(self.sandboxes[WORKER_NAME].lock_file))
 
 
 #: A holder that owns the lock and writes the lease the validator reads, without

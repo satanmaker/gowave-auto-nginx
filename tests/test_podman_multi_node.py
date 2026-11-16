@@ -1660,19 +1660,21 @@ class TestMultiNodeSuite(unittest.TestCase):
     def test_the_suite_starts_with_the_install_and_then_provisions_the_worker(self):
         suite = multi_node.cases(self.podman)
         self.assertIsInstance(suite[0], Case)
-        # The pair-wide lock cases read the hosts as the install left them, so
-        # they sit immediately behind it, before anything else mutates a host.
-        self.assertEqual(
-            [case.id for case in suite][:4],
-            [multi_node.INSTALL_CASE_ID, lock_cases.LOCK_CASE_ID,
-             lock_cases.LOCK_LOSS_CASE_ID, lock_cases.LOCK_PATH_CASE_ID],
-        )
         # The observer reads the trace the provisioning just wrote, so it sits
         # between the deployment and the cases that audit what it produced.
         self.assertEqual(
-            [case.id for case in suite][4:8],
-            [multi_node.SSH_KEY_CASE_ID, multi_node.NODE_ADD_CASE_ID,
-             multi_node.ARGV_OBSERVER_CASE_ID, multi_node.MASTER_ADDRESS_CASE_ID],
+            [case.id for case in suite][:5],
+            [multi_node.INSTALL_CASE_ID, multi_node.SSH_KEY_CASE_ID,
+             multi_node.NODE_ADD_CASE_ID, multi_node.ARGV_OBSERVER_CASE_ID,
+             multi_node.MASTER_ADDRESS_CASE_ID],
+        )
+        # The pair-wide lock cases start the product's own holder over SSH into
+        # both containers, and the Worker carries a python3 only once the
+        # provisioning above has run there.
+        self.assertEqual(
+            [case.id for case in suite][5:8],
+            [lock_cases.LOCK_CASE_ID, lock_cases.LOCK_LOSS_CASE_ID,
+             lock_cases.LOCK_PATH_CASE_ID],
         )
         self.assertEqual({case.topology for case in suite}, {"multi-node"})
 
