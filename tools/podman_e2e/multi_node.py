@@ -8239,11 +8239,14 @@ def cases(
         # to them. `MN-LOCK-PATH` replaces the canonical lock path for the length
         # of one acquisition and restores it, and `MN-LOCK-LOSS` terminates its
         # own holder, so neither is run beside another case.
-        Case(lock_cases.LOCK_CASE_ID, "multi-node", lock_cases.case_pair_lock,
+        Case(lock_cases.LOCK_CASE_ID, "multi-node",
+             lambda context: lock_cases.case_pair_lock(product),
              timeout_seconds=LOCK_TIMEOUT_SECONDS),
-        Case(lock_cases.LOCK_LOSS_CASE_ID, "multi-node", lock_cases.case_lock_loss,
+        Case(lock_cases.LOCK_LOSS_CASE_ID, "multi-node",
+             lambda context: lock_cases.case_lock_loss(product),
              timeout_seconds=LOCK_TIMEOUT_SECONDS),
-        Case(lock_cases.LOCK_PATH_CASE_ID, "multi-node", lock_cases.case_lock_path,
+        Case(lock_cases.LOCK_PATH_CASE_ID, "multi-node",
+             lambda context: lock_cases.case_lock_path(product),
              timeout_seconds=LOCK_PATH_TIMEOUT_SECONDS),
         # The trust the provisioning path depends on is proven before that path
         # runs: a wrong pin and a rotated host key must both stop the controller.
