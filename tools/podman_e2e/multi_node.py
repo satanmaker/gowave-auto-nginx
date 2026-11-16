@@ -30,8 +30,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
-    acme_fixture, aio, argv_probe, budget, denial, ingress, matrix as matrix_data, mtls,
-    preflight_cases, status, teardown, topology, vision as vision_policy,
+    acme_fixture, aio, argv_probe, budget, denial, ingress, lock_cases, matrix as matrix_data,
+    mtls, preflight_cases, status, teardown, topology, vision as vision_policy,
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
@@ -321,6 +321,11 @@ CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
 VISION_PROBE_TIMEOUT_SECONDS = 120
 SSH_TRUST_TIMEOUT_SECONDS = 240
+# The pair-wide lock cases open their own SSH sessions into both containers and
+# pay a refusal, a reacquisition or a repair per shape, so they are bounded by the
+# number of host round trips rather than by a service's readiness.
+LOCK_TIMEOUT_SECONDS = 600
+LOCK_PATH_TIMEOUT_SECONDS = 900
 # The transaction id only has to satisfy the product's own format; it names a
 # leftover snapshot the case plants on the Worker to observe a remote effect.
 SSH_ROTATION_TX_ID = "worker_install_sshkey_rotation"
@@ -8227,6 +8232,19 @@ def cases(
     suite = [
         Case(INSTALL_CASE_ID, "multi-node", lambda context: product.install(),
              timeout_seconds=aio.INSTALL_TIMEOUT_SECONDS),
+        # Immediately after the install, because the pair-wide lock is what every
+        # later mutating command on these two hosts competes for: the cases drive
+        # the product's own lock over real SSH into the containers the install
+        # just provisioned, so they need the hosts and nothing the cases below do
+        # to them. `MN-LOCK-PATH` replaces the canonical lock path for the length
+        # of one acquisition and restores it, and `MN-LOCK-LOSS` terminates its
+        # own holder, so neither is run beside another case.
+        Case(lock_cases.LOCK_CASE_ID, "multi-node", lock_cases.case_pair_lock,
+             timeout_seconds=LOCK_TIMEOUT_SECONDS),
+        Case(lock_cases.LOCK_LOSS_CASE_ID, "multi-node", lock_cases.case_lock_loss,
+             timeout_seconds=LOCK_TIMEOUT_SECONDS),
+        Case(lock_cases.LOCK_PATH_CASE_ID, "multi-node", lock_cases.case_lock_path,
+             timeout_seconds=LOCK_PATH_TIMEOUT_SECONDS),
         # The trust the provisioning path depends on is proven before that path
         # runs: a wrong pin and a rotated host key must both stop the controller.
         Case(SSH_KEY_CASE_ID, "multi-node", lambda context: case_ssh_host_key(product),

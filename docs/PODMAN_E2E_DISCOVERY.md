@@ -605,6 +605,40 @@ it stays green, which is the deliberate difference from the live runner's
 treatment of `SKIP`. A `SKIP` in this suite means a declared case did not execute,
 and the aggregate refuses it outright.
 
+### The pair-wide lock: one run, both hosts, and the lease that names them
+
+`openspec/specs/live-vps-e2e/spec.md` §Pair-Wide Run Locking and §Shared Mutation
+Lock Across All Management Entry Points state who may change a host: one run holds
+both hosts for as long as it runs, a session that loses its holder stops mutating
+instead of continuing unwatched, and a lock object that is not the regular file
+the runner created — a symlink, a directory, a FIFO, a group-readable file,
+another user's file — is refused before either host is modified rather than
+followed, replaced or removed. None of that needs a VPS: a container runs the same
+kernel that releases a `flock` when its holder dies, holds the same `/run/lock`
+path and serves the same `/proc`, so `tools/podman_e2e/lock_cases.py` starts the
+product's own lock-holder program (`LOCK_HOLDER_SCRIPT` in
+`tools/live_vps/preflight.py`) inside each host of the pair and drives the
+product's own `RemotePairLock` against it. What is real in these three cases is
+the `flock`, the mode-0600 lease file carrying run id, host, holder pid and token,
+the validator that reads it, and the `SIGTERM` that ends a holder the way a
+dropped connection does; what is not is the transport — the SSH client is replaced
+by one that runs the same command locally, and only the holder script's two
+filesystem anchors are rewritten, so every refusal still names production's
+`/run/lock`.
+
+| Live scenario | Container case | Where the two differ |
+| --- | --- | --- |
+| `A second Control Machine cannot acquire an occupied VPS` | `MN-LOCK` | Two runners and two hosts are four local processes on one machine, so "another Control Machine" is an address and a lease rather than a second computer: the intruder is refused with the held path named, keeps no lease of its own, and the owner's two leases are compared byte for byte across the attempt. The sentence's own clause — that a lock file's mere existence is not ownership — is why the case then releases the pair and requires a fresh holder to take both hosts with different tokens, and the product's `validate_mutation_lease` to accept the new lease while refusing the released one. |
+| `Loss of a remote lock-holder session fails closed` | `MN-LOCK-LOSS` | The loss is a `SIGTERM` to the holder's pid inside its container, which is what a dropped session leaves behind, and the pair is taken in address order so the surviving host is the second one: that is what makes the partial state observable. The case then reads the run's own gate — every mutating phase `INCOMPLETE` naming the phase and the lost lock, a read-only phase still reporting — and refuses to call a contender that wins the freed host and then releases it a resumed run. Reacquisition is proven by fresh tokens and the validator's refusal of the terminated holder's lease, not by a retry. |
+| `Unsafe remote lock path is rejected` | `MN-LOCK-PATH` | Five object shapes are created on a real host filesystem — symlink, directory, FIFO, mode 0644, another owner's file — plus a symlinked lock directory, and each is refused by a sentence naming the host address and the object, with the object found unchanged afterwards and the pair-wide lock still free. The ownership shape needs `CAP_CHOWN` and the evidence says which of the two happened, so a runner that cannot create the file does not report the refusal it never read. Both hosts are cleared before every shape, because a leftover object on the other host would answer the sentence this iteration is about. |
+
+**The entry-point half is not imported yet.** `MLOCK-01` (an ordinary
+`gowave-auto.sh` command refused while the run owns the host) and `MLOCK-02` (a
+run-bound lease on a nested command accepted while a second controller still
+cannot take either host) name the management entrypoints rather than the lock
+object, so they wait for the batch that drives those commands; the three cases
+above prove the protocol they rest on, not those sentences.
+
 ### Teardown: the policy a run ends in
 
 `openspec/specs/live-vps-e2e/spec.md` §Teardown Policy Enforcement is the one
@@ -627,13 +661,17 @@ all is a hook that ran as a program, and the record is how the case knows.
 | `Preserve policy after success or failure` | `GATE-TEARDOWN` | The case hands in two SSH clients that raise on any attribute read, so a policy that reconnects to collect diagnostics cannot produce `PASS`. The record it returns is asserted to carry the teardown status alone — this contour keeps the test outcome in its own `result.json`, so a teardown record that restated it would be the coupling the sentence refuses. |
 | `Snapshot restore hook configuration and protocol are validated` | `GATE-TEARDOWN` | Eleven refusals, each with its own message: four mandatory values, a relative path, a symlink, a directory, an absent file, a non-executable hook, a group-writable one and a malformed digest. The foreign-owned hook is probed only where the runner can create one, and the evidence says which of the two happened. The digest's second check is the tampering clause: the same configuration is accepted, the hook's bytes change, and execution refuses it. |
 | `Restore hook receives a versioned request and returns both restored resources` | `GATE-TEARDOWN` | The request is read out of the hook's own record rather than from a mock, so `schema_version`, `action`, `test_run_id` and the per-host objects are what the hook was handed. The replies that are not a restored host — no version, a later version, no host object, a host unrestored, an id the run did not ask for — are refused beside it. `RESTORE_TIMEOUT` is the bound the configuration declares: a hook that outlives a one-second bound is refused at one second. |
-| `Snapshot restore hook success requires baseline verification` | `GATE-TEARDOWN` | Two matching manifests report the comparison as `MATCHED` and the status as `INCOMPLETE`, never `PASS`, because the pair lock and the complete ownership comparison are still unimplemented; one differing field is `TEARDOWN_FAILED` and names the field. What the case cannot do is recollect the manifest from a restored host, so the two manifests are supplied to the product's own comparison rather than read over SSH. |
+| `Snapshot restore hook success requires baseline verification` | `GATE-TEARDOWN` | Two matching manifests report the comparison as `MATCHED` and the status as `INCOMPLETE`, never `PASS`, because the teardown phase does not reacquire the pair lock and the complete ownership comparison is still unimplemented; one differing field is `TEARDOWN_FAILED` and names the field. What the case cannot do is recollect the manifest from a restored host, so the two manifests are supplied to the product's own comparison rather than read over SSH. |
 | `Snapshot restore hook does not restore both hosts` | `GATE-TEARDOWN` | A nonzero exit, a non-JSON answer, JSON that is not an object, a call that outlives the bound, and a host that came back with the install still on it are each `TEARDOWN_FAILED`. The last clause writes the live reporter's `junit.xml` — the contour that owns this status — and requires the failure to appear as a JUnit `<error>` beside a passing acceptance case, so no reader of the report can take the run for green. |
 
-**Two scenarios of that requirement stay live-only.** `TD-05` is `partial`: its
-container half is the lock-pair ordering, and this suite holds no remote lock, so
-the hook protocol half is witnessed and the ordering half is not. `TD-06` needs a
-provider snapshot and a real reboot, which a container cannot produce.
+**Two scenarios of that requirement stay live-only.** `TD-05` is `partial`: the
+ordering it asks for after a restore — release every original holder, including a
+surviving one, then reacquire the pair in address order and refuse to hold half of
+it — is what `MN-LOCK` and `MN-LOCK-LOSS` now prove on their own, but the case
+that would join that ordering to a snapshot restore needs the hook's reboot to
+have happened, which a container cannot produce, so the scenario stays partial
+until a case drives the restored-host path. `TD-06` needs a provider snapshot and
+a real reboot for the same reason.
 `TEARDOWN_FAILED` is not in this suite's vocabulary for the same reason the
 report section gives: a container run has no teardown phase to name.
 
@@ -747,16 +785,16 @@ image.
 
 `tests/cases/catalog.yaml` defines each scenario once and stamps it with an
 `environment`, so the boundary between the contours is a checked field rather
-than a sentence in a document. The catalog holds 220 entries:
+than a sentence in a document. The catalog holds 223 entries:
 
 | Environment | Entries | Which contour answers it |
 | --- | ---: | --- |
-| `container` | 210 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
+| `container` | 213 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
 | `partial` | 8 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
 | `live-only` | 2 | Only the live suite. Every Podman run reports both as justified exclusions, and `tools/podman_e2e/catalog.py` refuses a catalog that lets one run here. |
 
 Of the 125 live scenarios projected into this catalog, 115 are container, 8 are
-partial and 2 are live-only; the other 95 entries are Podman-first cases with a
+partial and 2 are live-only; the other 98 entries are Podman-first cases with a
 promotion target, which `tests/cases/PARITY.md` lists separately.
 
 The ten entries that are not fully container-answerable are, by id: `PRE-04`,

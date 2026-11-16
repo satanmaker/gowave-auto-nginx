@@ -1104,6 +1104,10 @@ remote_payload() {
         printf 'export GOWAVE_ACME_TEST_CA_B64=%q\n' "${GOWAVE_ACME_TEST_CA_B64:-}"
         printf 'export GOWAVE_PODMAN_TEST_MODE=%q\n' "${GOWAVE_PODMAN_TEST_MODE:-0}"
         printf 'export ACME_TX_ID=%q\n' "${ACME_TX_ID:-}"
+        # The Worker's re-entrant lease belongs to this host's lock holder, which
+        # the dispatching Master holds; it is forwarded only as an export so the
+        # Worker's own management code can prove the caller owns its lock.
+        printf 'export GOWAVE_LEASE_TOKEN=%q\n' "${GOWAVE_WORKER_LEASE_TOKEN:-}"
         printf 'COVER_REALITY_B64=%q\n' "$cover_b64"
         printf 'COVER_REALITY_SHA256=%q\n' "$cover_sha256"
         # Secret strictly scoped, not exported globally
@@ -3193,6 +3197,9 @@ remote_rollback() {
         printf 'export REALITY_DOMAIN=%q\n' "$reality_domain"
         printf 'export VISION_DOMAIN=%q\n' "${VISION_DOMAIN:-}"
         printf 'export ACME_TX_ID=%q\n' "${ACME_TX_ID:-}"
+        # A rollback is a mutation too: the run that owns the Worker's lock passes
+        # its lease here, and a rollback started by anyone else still refuses.
+        printf 'export GOWAVE_LEASE_TOKEN=%q\n' "${GOWAVE_WORKER_LEASE_TOKEN:-}"
 
         cat <<'ROLLBACK_REMOTE_SCRIPT'
 set -Eeuo pipefail
@@ -3224,7 +3231,75 @@ validate_lock_path() {
     return 0
 }
 
+validate_mutation_lease() {
+    local candidate_token="$1"
+    local lease_file="${2:-$MUTATION_LEASE_FILE}"
+    local lock_file="${3:-$MUTATION_LOCK_FILE}"
+
+    python3 - "$candidate_token" "$lease_file" "$lock_file" <<'PY'
+import json
+import os
+import sys
+
+token, lease_path, lock_path = sys.argv[1:4]
+
+if not os.path.exists(lease_path):
+    sys.exit(1)
+
+if os.path.islink(lease_path):
+    sys.exit(1)
+
+st = os.stat(lease_path)
+if os.geteuid() == 0 and st.st_uid != 0:
+    sys.exit(1)
+
+try:
+    with open(lease_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+expected_token = data.get("lease_token", "")
+holder_pid = data.get("holder_pid")
+
+if not expected_token or expected_token != token:
+    sys.exit(1)
+
+if not holder_pid or not isinstance(holder_pid, int):
+    sys.exit(1)
+
+try:
+    os.kill(holder_pid, 0)
+except OSError:
+    sys.exit(1)
+
+fd_dir = f"/proc/{holder_pid}/fd"
+if os.path.exists(fd_dir):
+    try:
+        real_lock = os.path.realpath(lock_path)
+        has_fd = False
+        for fd in os.listdir(fd_dir):
+            try:
+                target = os.path.realpath(os.path.join(fd_dir, fd))
+                if target == real_lock:
+                    has_fd = True
+                    break
+            except Exception:
+                continue
+        if not has_fd:
+            sys.exit(1)
+    except Exception:
+        pass
+
+sys.exit(0)
+PY
+}
+
 acquire_mutation_lock() {
+    if [[ "${_MUTATION_LOCK_HELD:-0}" -eq 1 || "${_MUTATION_LEASE_VALIDATED:-0}" -eq 1 ]]; then
+        return 0
+    fi
+
     validate_lock_path "$MUTATION_LOCK_FILE" || return 1
     if [[ ! -e "$MUTATION_LOCK_FILE" ]]; then
         ( umask 0177; : > "$MUTATION_LOCK_FILE" ) 2>/dev/null || {
@@ -3241,11 +3316,24 @@ acquire_mutation_lock() {
         return 1
     }
     exec 9>>"$MUTATION_LOCK_FILE" || return 1
-    if ! flock -n 9; then
-        echo "Error: Another process currently holds the mutation lock ($MUTATION_LOCK_FILE)." >&2
+    if flock -n 9; then
+        _MUTATION_LOCK_HELD=1
+        return 0
+    fi
+
+    local candidate_token="${GOWAVE_LEASE_TOKEN:-}"
+    if [[ -n "$candidate_token" ]] \
+        && validate_mutation_lease "$candidate_token" "$MUTATION_LEASE_FILE" "$MUTATION_LOCK_FILE"; then
+        _MUTATION_LEASE_VALIDATED=1
+        return 0
+    fi
+    if [[ -n "$candidate_token" ]]; then
+        echo "Error: Invalid or stale mutation lock lease provided." >&2
         return 1
     fi
-    return 0
+
+    echo "Error: Another process currently holds the mutation lock ($MUTATION_LOCK_FILE)." >&2
+    return 1
 }
 
 acquire_mutation_lock || {

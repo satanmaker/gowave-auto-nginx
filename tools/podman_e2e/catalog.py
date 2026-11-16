@@ -455,6 +455,27 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
     },
     {
+        "id": "MN-LOCK",
+        "requirement": "Pair-Wide Run Locking",
+        "assertion": "While one runner holds both hosts, a second runner is refused before either host is modified with a sentence naming the held lock path, keeps no lease, and leaves the owner's published leases — run id, host address, live holder pid and token — exactly as they were; the lock file outlives its holder, so after the owner releases a fresh runner acquires both hosts with different tokens, the product's own `validate_mutation_lease` accepts the new holder's lease and refuses the released holder's, which is what distinguishes a held lock from a lock file that merely exists.",
+        "topology": ["multi-node"],
+        "promotion_target": "Pair-Wide Run Locking",
+    },
+    {
+        "id": "MN-LOCK-LOSS",
+        "requirement": "Pair-Wide Run Locking",
+        "assertion": "A lock-holder session lost on either host fails closed: the runner stops reporting the pair as held, gates every mutating phase as `INCOMPLETE` with a refusal naming the phase and the loss while a read-only phase is still allowed to report, a contender that wins the freed host releases it when the other host refuses instead of holding half the pair, and resumption is a reacquisition of both locks — a new token, the terminated holder's lease refused by the product's own validator, the reacquired one accepted.",
+        "topology": ["multi-node"],
+        "promotion_target": "Pair-Wide Run Locking",
+    },
+    {
+        "id": "MN-LOCK-PATH",
+        "requirement": "Shared Mutation Lock Across All Management Entry Points",
+        "assertion": "An unsafe lock path is refused rather than followed, replaced or removed: a lock file that is a symlink, a directory, a FIFO, a group- or world-accessible file, or a file owned by another user, and a lock directory that is a symlink, each stop the acquisition before either host is modified with a refusal naming that object; every refused object is still the object it was — same kind, mode, owner, inode and link target — the lock directory is a real directory again afterwards, and the same pair acquires both hosts once the path is restored.",
+        "topology": ["multi-node"],
+        "promotion_target": "Shared Mutation Lock Across All Management Entry Points",
+    },
+    {
         "id": "PODNET-MASTER-ADDR",
         "requirement": "Podman-only Master address selection for Worker provisioning",
         "assertion": "The real node add path uses the validated private Master address on the run-scoped network, Worker observes that source, and the override is rejected without the explicit opt-in or when the address is not assigned to Master.",
@@ -1457,6 +1478,20 @@ LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     # live reporter writes that status as a JUnit error beside a passing case, so
     # no reader of the report can take the run for green.
     "TD-08": {"aio": "GATE-TEARDOWN", "multi-node": "GATE-TEARDOWN"},
+    # The pair-wide lock is a kernel `flock` held by a session on each host, so
+    # the case drives the product's own `RemotePairLock` over real SSH into the
+    # two containers: an occupied pair is a refusal that names the lock, and the
+    # lock file that outlives its holder is not ownership.
+    "LOCK-01": {"multi-node": "MN-LOCK"},
+    # The lost session is the holder's own process, terminated inside the host as
+    # a dropped connection ends it. What the case reads is the runner's verdict
+    # afterwards — a gate on every mutating phase, and resumption as reacquisition
+    # rather than a retry.
+    "LOCK-02": {"multi-node": "MN-LOCK-LOSS"},
+    # Every shape the sentence names is planted at the canonical path in both
+    # hosts and refused there, with the object left exactly as it was: the case
+    # reads `lstat` before and after each refusal rather than the exit status.
+    "MLOCK-03": {"multi-node": "MN-LOCK-PATH"},
     # Vision is two optional domains. Three of its scenarios are one node's own
     # configuration, which is `MN-VISION`'s question: the Master-only and the
     # Worker-only combinations ask it of each field in turn, and the disabled

@@ -29,7 +29,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TESTS_DIR))
 
-from tools.podman_e2e import aio, budget, ingress, matrix, mtls, multi_node, panel_surface, topology  # noqa: E402
+from tools.podman_e2e import aio, budget, ingress, lock_cases, matrix, mtls, multi_node, panel_surface, topology  # noqa: E402
 from tools.podman_e2e.runner import Case, CaseBlocked  # noqa: E402
 from test_podman_aio import (  # noqa: E402
     BROKEN_TAIL, VISION_OTHER_SHA, VISION_ROUTED_SHA, nginx_probe, vision_answer,
@@ -1660,13 +1660,19 @@ class TestMultiNodeSuite(unittest.TestCase):
     def test_the_suite_starts_with_the_install_and_then_provisions_the_worker(self):
         suite = multi_node.cases(self.podman)
         self.assertIsInstance(suite[0], Case)
+        # The pair-wide lock cases read the hosts as the install left them, so
+        # they sit immediately behind it, before anything else mutates a host.
+        self.assertEqual(
+            [case.id for case in suite][:4],
+            [multi_node.INSTALL_CASE_ID, lock_cases.LOCK_CASE_ID,
+             lock_cases.LOCK_LOSS_CASE_ID, lock_cases.LOCK_PATH_CASE_ID],
+        )
         # The observer reads the trace the provisioning just wrote, so it sits
         # between the deployment and the cases that audit what it produced.
         self.assertEqual(
-            [case.id for case in suite][:5],
-            [multi_node.INSTALL_CASE_ID, multi_node.SSH_KEY_CASE_ID,
-             multi_node.NODE_ADD_CASE_ID, multi_node.ARGV_OBSERVER_CASE_ID,
-             multi_node.MASTER_ADDRESS_CASE_ID],
+            [case.id for case in suite][4:8],
+            [multi_node.SSH_KEY_CASE_ID, multi_node.NODE_ADD_CASE_ID,
+             multi_node.ARGV_OBSERVER_CASE_ID, multi_node.MASTER_ADDRESS_CASE_ID],
         )
         self.assertEqual({case.topology for case in suite}, {"multi-node"})
 
@@ -1683,20 +1689,20 @@ class TestMultiNodeSuite(unittest.TestCase):
 
     def test_the_mtls_cases_follow_the_verifier_then_the_negative_controls(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[5:13], [f"MTLS-0{number}" for number in range(1, 9)])
+        self.assertEqual(ids[8:16], [f"MTLS-0{number}" for number in range(1, 9)])
 
     def test_the_management_denial_pair_follows_the_control_plane_proof(self):
         # 5.8: an untrusted vantage and the allowed one are measured after the
         # Master's mTLS path is proven, so a refusal can be told from an outage.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[13:15], ["FW-01", "FW-02"])
+        self.assertEqual(ids[16:18], ["FW-01", "FW-02"])
 
     def test_the_master_access_case_follows_the_denial_pair(self):
         # 6.6: FW-03 asks the same question of the Master's own rules that the
         # pair above asked of the Worker's, so it reads them while the cluster
         # is healthy and before the cases that only observe the Panel.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[15], multi_node.MASTER_ACCESS_CASE_ID)
+        self.assertEqual(ids[18], multi_node.MASTER_ACCESS_CASE_ID)
         self.assertLess(ids.index(multi_node.MASTER_ACCESS_CASE_ID), ids.index("CLUS-01"))
         suite = {case.id: case for case in multi_node.cases(self.podman)}
         self.assertEqual(suite[multi_node.MASTER_ACCESS_CASE_ID].timeout_seconds,
@@ -1708,7 +1714,7 @@ class TestMultiNodeSuite(unittest.TestCase):
         # while both roles are healthy, so a later change to either install cannot
         # be read as an IPv6 effect.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[16], multi_node.IPV6_CASE_ID)
+        self.assertEqual(ids[19], multi_node.IPV6_CASE_ID)
         self.assertLess(ids.index(multi_node.MASTER_ACCESS_CASE_ID),
                         ids.index(multi_node.IPV6_CASE_ID))
         self.assertLess(ids.index(multi_node.IPV6_CASE_ID), ids.index("CLUS-01"))
@@ -1719,27 +1725,27 @@ class TestMultiNodeSuite(unittest.TestCase):
 
     def test_the_cluster_audit_follows_the_control_plane_proof(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[17:20], ["CLUS-01", "CLUS-02", "CLUS-03"])
+        self.assertEqual(ids[20:23], ["CLUS-01", "CLUS-02", "CLUS-03"])
 
     def test_the_worker_state_audit_follows_the_cluster_audit(self):
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[20:22], ["WRK-05", "WRK-06"])
+        self.assertEqual(ids[23:25], ["WRK-05", "WRK-06"])
 
     def test_the_vision_independence_case_follows_the_worker_config(self):
         # 5.10: the per-node Vision proof reads the config WRK-06 has just
         # compared, so it runs once that assignment is established and before any
         # data plane traffic.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[20:23], ["WRK-05", "WRK-06", multi_node.VISION_CASE_ID])
+        self.assertEqual(ids[23:26], ["WRK-05", "WRK-06", multi_node.VISION_CASE_ID])
 
     def test_the_data_plane_cases_follow_the_worker_audit(self):
         # 5.7: a payload has to traverse the Worker too, so the matrix tuples of
         # both nodes run once the Worker's own config is applied.
         ids = [case.id for case in multi_node.cases(self.podman)]
-        self.assertEqual(ids[23], "MN-DP-master-REALITY-xray")
-        self.assertEqual(ids[30], "MN-DP-master-TROJAN-GRPC-mihomo")
-        self.assertEqual(ids[31], "MN-DP-worker-REALITY-xray")
-        self.assertEqual(ids[38], "MN-DP-worker-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[26], "MN-DP-master-REALITY-xray")
+        self.assertEqual(ids[33], "MN-DP-master-TROJAN-GRPC-mihomo")
+        self.assertEqual(ids[34], "MN-DP-worker-REALITY-xray")
+        self.assertEqual(ids[41], "MN-DP-worker-TROJAN-GRPC-mihomo")
 
     def test_the_budget_case_is_declared_last(self):
         # It reads this topology's deadline and the clock two hosts spent, so no

@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -299,6 +300,84 @@ class LocalLock:
             self._fd = None
 
 
+#: The program each lock-holder session runs on its host. It owns the kernel
+#: lock for as long as its session lives and publishes the lease that the host's
+#: own management commands accept as re-entrant authority. It is sent to
+#: ``python3 -c`` as one shell-quoted word on the pinned SSH channel, so the
+#: token, the run identity, and every path stay out of argv on both ends.
+#:
+#: A refusal is a sentence on stderr rather than a bare exit status: the caller
+#: has to report which object was rejected, and a lock path that is a symlink, a
+#: FIFO, a directory, another user's file, or a world-writable file is a
+#: different answer for the operator. Nothing here follows a link, replaces an
+#: object, or unlinks one: the holder only opens what the path already names and
+#: exits.
+LOCK_HOLDER_SCRIPT = r"""
+import errno, fcntl, json, os, secrets, stat, sys, time
+
+RUN_ID = %r
+HOST = %r
+LOCK_DIR = "/run/lock"
+LOCK_NAME = "gowave-managed-mutation.lock"
+LEASE_NAME = "gowave-mutation-lease.json"
+LOCK_PATH = LOCK_DIR + "/" + LOCK_NAME
+
+
+def refuse(reason):
+    sys.stderr.write("LOCK_REFUSED: " + reason + "\n")
+    sys.stderr.flush()
+    raise SystemExit(3)
+
+
+try:
+    os.makedirs(LOCK_DIR, exist_ok=True)
+    dir_fd = os.open(LOCK_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+except OSError:
+    refuse("the lock directory " + LOCK_DIR + " is a symlink or not a directory")
+
+try:
+    fd = os.open(LOCK_NAME, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+except OSError as error:
+    # `O_NOFOLLOW` answers a link with ELOOP and a directory with EISDIR, and an
+    # operator told only that "opening failed" cannot tell which object the path
+    # turned into. The refusal names it; nothing is followed, replaced or removed.
+    if error.errno == errno.ELOOP:
+        refuse("the lock file " + LOCK_PATH + " is a symlink")
+    if error.errno == errno.EISDIR:
+        refuse("the lock file " + LOCK_PATH + " is a directory")
+    refuse("the lock file " + LOCK_PATH + " cannot be opened without following a link: " + (error.strerror or "refused"))
+
+info = os.fstat(fd)
+if not stat.S_ISREG(info.st_mode):
+    refuse("the lock file " + LOCK_PATH + " is not a regular file")
+if info.st_uid != os.geteuid():
+    refuse("the lock file " + LOCK_PATH + " is not owned by the runner")
+if stat.S_IMODE(info.st_mode) & 0o077:
+    refuse("the lock file " + LOCK_PATH + " grants group or other access")
+
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    refuse("another process holds " + LOCK_PATH)
+
+token = secrets.token_hex(32)
+lease = json.dumps({"run_id": RUN_ID, "host": HOST, "holder_pid": os.getpid(), "lease_token": token})
+try:
+    lease_fd = os.open(LEASE_NAME, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+except OSError:
+    refuse("the lease file " + LOCK_DIR + "/" + LEASE_NAME + " cannot be written without following a link")
+os.write(lease_fd, lease.encode("utf-8"))
+os.fsync(lease_fd)
+os.close(lease_fd)
+
+sys.stdout.write("LEASE_TOKEN:" + token + "\n")
+sys.stdout.flush()
+
+while True:
+    time.sleep(1)
+"""
+
+
 class RemotePairLock:
     """Authoritative remote locks on Master and Worker held over dedicated SSH sessions.
     Acquires locks in deterministic host address order and generates re-entrant leases.
@@ -311,25 +390,15 @@ class RemotePairLock:
         self.run_id = run_id
         self._procs: List[subprocess.Popen] = []
         self.lease_tokens: Dict[str, str] = {}
+        #: Why the last acquisition failed, in the holder's own words.
+        self.last_error: str = ""
 
     def acquire(self, timeout: int = 15) -> bool:
-        lock_path = "/run/lock/gowave-managed-mutation.lock"
-        lease_path = "/run/lock/gowave-mutation-lease.json"
+        """Take the kernel lock on both hosts, in address order, or take neither."""
+        self.last_error = ""
         for client in self.clients:
-            holder_py = (
-                "import fcntl, json, os, secrets, sys, time; "
-                "os.makedirs('/run/lock', exist_ok=True); "
-                f"lock_path = '{lock_path}'; lease_path = '{lease_path}'; "
-                "fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600); "
-                "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); "
-                "tok = secrets.token_hex(32); "
-                f"data = {{'run_id': '{self.run_id}', 'host': '{client.host}', 'holder_pid': os.getpid(), 'lease_token': tok}}; "
-                "with open(lease_path, 'w', encoding='utf-8') as f: json.dump(data, f); "
-                "os.chmod(lease_path, 0o600); "
-                "print('LEASE_TOKEN:' + tok, flush=True); "
-                "while True: time.sleep(1)"
-            )
-            cmd = client._build_ssh_cmd(f"python3 -c \"{holder_py}\"")
+            script = LOCK_HOLDER_SCRIPT % (self.run_id, client.host)
+            cmd = client._build_ssh_cmd(f"python3 -c {shlex.quote(script)}")
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -338,25 +407,42 @@ class RemotePairLock:
                     stderr=subprocess.PIPE,
                     text=True,
                 )
-                self._procs.append(proc)
-                # Read lease token line from holder stdout
-                line = proc.stdout.readline().strip() if proc.stdout else ""
-                if line.startswith("LEASE_TOKEN:"):
-                    self.lease_tokens[client.host] = line.split(":", 1)[1]
-                else:
-                    # Session exited or failed to acquire lock
-                    self.release()
-                    return False
-            except Exception:
+            except OSError as error:
+                self.last_error = f"the lock holder for {client.host} could not start: {error}"
                 self.release()
                 return False
+            self._procs.append(proc)
+            # The holder publishes the lease before it settles into holding; a
+            # session that exits instead says why on stderr.
+            line = proc.stdout.readline().strip() if proc.stdout else ""
+            if line.startswith("LEASE_TOKEN:"):
+                self.lease_tokens[client.host] = line.split(":", 1)[1]
+                continue
+            self.last_error = self._refusal(client, proc, timeout)
+            self.release()
+            return False
         return True
 
+    @staticmethod
+    def _refusal(client: SSHClient, proc: "subprocess.Popen[str]", timeout: int) -> str:
+        """The holder's own reason, so a refusal names the object it rejected."""
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        detail = (proc.stderr.read() or "").strip() if proc.stderr is not None else ""
+        for line in detail.splitlines():
+            if line.startswith("LOCK_REFUSED:"):
+                return f"{client.host}: {line.split(':', 1)[1].strip()}"
+        return f"{client.host}: {detail or 'the lock holder exited without publishing a lease'}"
+
     def check_alive(self) -> bool:
-        for p in self._procs:
-            if p.poll() is not None:
-                return False
-        return True
+        """Both holder sessions are still running; a released pair is not held."""
+        return (
+            len(self._procs) == len(self.clients)
+            and all(proc.poll() is None for proc in self._procs)
+        )
 
     def release(self) -> None:
         for p in self._procs:

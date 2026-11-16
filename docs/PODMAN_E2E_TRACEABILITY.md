@@ -73,6 +73,7 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Live scenario parity | `AIO-PKT-02`, `MN-PKT-03`, `AIO-NEG-PIN`, `GATE-TEARDOWN` |
 | Live scenario parity | `VIS-CONFIG`, `VIS-GATE`, `VIS-05`, `VIS-06` |
 | Live scenario parity | `PRE-01`, `PRE-02`, `PRE-03`, `PRE-05`, `PRE-06`, `ADDR-01`, `ADDR-02`, `ADDR-03` |
+| Live scenario parity | `MN-LOCK`, `MN-LOCK-LOSS`, `MN-LOCK-PATH` |
 
 ## Named behaviours
 
