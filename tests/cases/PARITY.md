@@ -101,6 +101,10 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **MN-LOCK** — promotion target: Pair-Wide Run Locking
 - **MN-LOCK-LOSS** — promotion target: Pair-Wide Run Locking
 - **MN-LOCK-PATH** — promotion target: Shared Mutation Lock Across All Management Entry Points
+- **MN-LOCK-CLI** — promotion target: Shared Mutation Lock Across All Management Entry Points
+- **MN-LOCK-NESTED** — promotion target: Shared Mutation Lock Across All Management Entry Points
+- **RUNID-01** — promotion target: Durable Run State for Partial CLI Modes
+- **RESUME-01** — promotion target: Durable Run State for Partial CLI Modes
 - **PODNET-MASTER-ADDR** — promotion target: Distributed Worker VPS Deployment Verification
 - **WRK-06** — promotion target: Distributed Worker VPS Deployment Verification
 - **ACME-REJECT-ARB** — promotion target: Global Certbot Deploy Hook Ownership

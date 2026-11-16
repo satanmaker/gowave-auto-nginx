@@ -35,7 +35,13 @@ from live_vps.preflight import (
     LocalLock,
     RemotePairLock,
 )
-from live_vps.runstate import pair_lock_gate
+from live_vps.runstate import (
+    RunIdRejected,
+    artifact_path,
+    baseline_drift,
+    pair_lock_gate,
+    resume_gate,
+)
 from live_vps.deployment import (
     prepare_master_repository,
     ensure_strace_on_master,
@@ -275,23 +281,12 @@ def main() -> int:
     artifact_root = (REPO_ROOT / "artifacts" / "live-vps").resolve()
     artifact_root.mkdir(parents=True, exist_ok=True)
 
-    def artifact_path_for(run_id_value: str) -> Path:
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", run_id_value) or run_id_value in (".", ".."):
-            raise ValueError("run-id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63} and must not be '.' or '..'")
-        candidate = artifact_root / run_id_value
-        if candidate.is_symlink():
-            raise ValueError("run-id artifact path must not be a symlink")
-        resolved = candidate.resolve(strict=False)
-        if not resolved.is_relative_to(artifact_root):
-            raise ValueError("run-id artifact path escapes artifacts/live-vps")
-        return candidate
-
     is_fresh_run = args.mode in ("full", "preflight")
     if is_fresh_run:
         run_id = args.run_id or f"run-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         try:
-            artifact_dir = artifact_path_for(run_id)
-        except ValueError as e:
+            artifact_dir = artifact_path(artifact_root, run_id)
+        except RunIdRejected as e:
             print(f"Error: {e}", file=sys.stderr)
             return 1
         if artifact_dir.exists():
@@ -317,8 +312,8 @@ def main() -> int:
             return 1
         run_id = args.run_id
         try:
-            artifact_dir = artifact_path_for(run_id)
-        except Exception as e:
+            artifact_dir = artifact_path(artifact_root, run_id)
+        except RunIdRejected as e:
             print(f"Error loading run state: {e}", file=sys.stderr)
             return 1
         # The saved state is read below, once this runner holds both remote
@@ -412,17 +407,15 @@ def main() -> int:
             except Exception as e:
                 print(f"Error loading run state: {e}", file=sys.stderr)
                 return 1
-            if state.get("test_run_id") != run_id:
-                print("Error: run-id does not match persisted state identity", file=sys.stderr)
-                return 1
-            if state.get("repository_commit") != head_commit:
-                print(f"Error: State repository commit mismatch: {state.get('repository_commit')} != {head_commit}", file=sys.stderr)
-                return 1
-            if state.get("config_fingerprint", {}) != build_config_fingerprint(config):
-                print("Error: Non-secret configuration identity mismatch with run state", file=sys.stderr)
-                return 1
-            if state.get("results", {}).get(args.mode, {}).get("status") in ("PASS", "FAIL", "INCOMPLETE", "TEARDOWN_FAILED"):
-                print(f"Error: phase '{args.mode}' already has a terminal result; refusing implicit destructive rerun", file=sys.stderr)
+            verdict = resume_gate(
+                state,
+                run_id=run_id,
+                commit=head_commit,
+                config_fingerprint=build_config_fingerprint(config),
+                phase=args.mode,
+            )
+            if not verdict.ok:
+                print(f"Error: {verdict.error}", file=sys.stderr)
                 return 1
 
         def lock_lost(phase: str) -> bool:
@@ -501,6 +494,23 @@ def main() -> int:
 
             if lock_lost("install"):
                 return 2
+
+            # The preflight snapshot was taken before either lock, so a host
+            # another actor touched in between would be installed over on the
+            # strength of a verdict about a host that no longer exists. Both
+            # baselines are re-collected here, while this runner holds both locks,
+            # and the install stops before its first remote write on any drift.
+            drift = baseline_drift(
+                state.get("results", {}).get("preflight", {}),
+                collect_remote_baseline(master_ssh),
+                collect_remote_baseline(worker_ssh),
+                vision_enabled=bool(config.master_vision_domain) or bool(config.worker_vision_domain),
+            )
+            if drift:
+                state["results"]["install"] = {"status": "FAIL", "error": drift}
+                save_run_state(artifact_dir, state)
+                print(f"Error: {drift}", file=sys.stderr)
+                return 1
 
             prep_ok = prepare_master_repository(master_ssh, REPO_ROOT)
             if not prep_ok:

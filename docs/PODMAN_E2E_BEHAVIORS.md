@@ -13,7 +13,7 @@ behaviour with no case, a behaviour covered only on its happy path, an
 area the delta spec names but no entry covers, and a case no behaviour
 names (an orphan) or two behaviours claim.
 
-Behaviours: 37 across 9 areas, naming 223 of 223 catalog cases.
+Behaviours: 37 across 9 areas, naming 227 of 227 catalog cases.
 
 | Area | Behaviours | Cases | Error-path cases |
 |---|---:|---:|---:|
@@ -24,7 +24,7 @@ Behaviours: 37 across 9 areas, naming 223 of 223 catalog cases.
 | decoy | 2 | 7 | 2 |
 | tls-dns-acme | 5 | 7 | 9 |
 | network-policy | 2 | 6 | 6 |
-| lifecycle | 7 | 22 | 17 |
+| lifecycle | 7 | 23 | 20 |
 | failure-injection | 2 | 10 | 7 |
 
 ## installation
@@ -97,8 +97,8 @@ Behaviours: 37 across 9 areas, naming 223 of 223 catalog cases.
 | A channel switch is a snapshot, a rewrite and a restart that can be undone | aio | pre-push | `AIO-CHANNEL-NOOP`, `AIO-CHANNEL-DEV` | `AIO-CHANNEL-ROLLBACK` |
 | Panel and Worker archives restore on the roles that wrote them | multi-node | pre-push | `MN-BACKUP`, `MN-BACKUP-VOL`, `MN-RESTORE` | `MN-BACKUP-BAD` |
 | Teardown is a validated policy, not a side effect | aio, multi-node | pre-push | `TD-02`, `TD-03`, `TD-04`, `TD-05`, `TD-06`, `TD-07`, `GATE-TEARDOWN` | `TD-01`, `TD-08` |
-| A run holds both hosts exclusively for its whole duration | multi-node | pre-push | `MN-LOCK`, `MLOCK-02` | `MN-LOCK-LOSS`, `MN-LOCK-PATH`, `LOCK-01`, `LOCK-02`, `MLOCK-01`, `MLOCK-03` |
-| Diagnostics land in a run-owned root with the secrets removed | aio, multi-node | pre-push | `RED-01`, `RED-02` | `STATE-01`, `STATE-02` |
+| A run holds both hosts exclusively for its whole duration | multi-node | pre-push | `MN-LOCK`, `MLOCK-02`, `MN-LOCK-NESTED` | `MN-LOCK-LOSS`, `MN-LOCK-PATH`, `MN-LOCK-CLI`, `LOCK-01`, `LOCK-02`, `MLOCK-01`, `MLOCK-03` |
+| Diagnostics land in a run-owned root with the secrets removed | aio, multi-node | pre-push | `RED-01`, `RED-02` | `STATE-01`, `STATE-02`, `RUNID-01`, `RESUME-01` |
 | An overall PASS is never reported for a run that lost a case | aio, multi-node | pre-push | `RES-03`, `GATE-STATUS` | `RES-01`, `RES-02`, `DP-15` |
 | The acceptance gate blocks a change it cannot prove | aio, multi-node | pre-push | `GATE-PREPUSH`, `GATE-BUDGET`, `GATE-COVERAGE`, `GATE-DIVERGENCE` | `NEG-07`, `NEG-08` |
 

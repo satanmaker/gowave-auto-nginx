@@ -476,6 +476,34 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Shared Mutation Lock Across All Management Entry Points",
     },
     {
+        "id": "MN-LOCK-CLI",
+        "requirement": "Shared Mutation Lock Across All Management Entry Points",
+        "assertion": "While the run holds both hosts, the shipped management commands — `install`, `node add`, `node rollback`, `node reapply`, `domain-change`, `channel`, `uninstall` and `backup restore` — each exit nonzero with the lock's own sentence naming the canonical path and without printing the sentence they print once they are past the lock, so a command that kept a private lock or took none could not pass; the Master's environment, state, NGINX configuration and unit files keep their digests, `/run/lock` still holds exactly the protocol's two files, the holder's own session survives every refusal, and the Worker's canonical lock file is the one the run holds.",
+        "topology": ["multi-node"],
+        "promotion_target": "Shared Mutation Lock Across All Management Entry Points",
+    },
+    {
+        "id": "MN-LOCK-NESTED",
+        "requirement": "Shared Mutation Lock Across All Management Entry Points",
+        "assertion": "A child command handed the run's own lease is accepted in both transports the product supports — the environment and the `GOWAVE_LEASE:` stdin line — while a child with no lease is refused by the lock, the parent's holder session is still alive afterwards, the published lease is byte-identical, the host's digests are unchanged and the lock is still held; a lease from a released holder and a lease replayed from a terminated holder are both refused as invalid or stale with a nonzero exit, and the terminated holder's token is rejected by the product's own validator.",
+        "topology": ["multi-node"],
+        "promotion_target": "Shared Mutation Lock Across All Management Entry Points",
+    },
+    {
+        "id": "RUNID-01",
+        "requirement": "Durable Run State for Partial CLI Modes",
+        "assertion": "A run id containing `..`, a path separator, an encoded separator, a NUL byte, only dots, an empty string, a leading dash, more than 64 characters, or naming a symlinked component is refused by the product's own validator with the rule it broke before any directory is created, while the printed shape, one character, 64 characters and names with dots and dashes are accepted and resolve to a directory named strictly below the artifact root that validation does not create; the CLI's own source order places that validation before it creates the artifact directory and before it opens an SSH client.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Durable Run State for Partial CLI Modes",
+    },
+    {
+        "id": "RESUME-01",
+        "requirement": "Durable Run State for Partial CLI Modes",
+        "assertion": "A run state written by the product's own writer at mode 0600 is read back by its own reader, and the resume gate accepts a phase whose prerequisites all reported PASS while refusing another run id, another repository commit, another non-secret configuration identity, a phase that already has a terminal result, and each phase whose prerequisite is not PASS, each with a sentence naming the reason; teardown is refused without both preflight baselines; the baseline comparison reports drift on a host that grew a GoWave directory, started listening on a required port or lost a required tool, tolerates the volatile fields no gate reads, and the runner re-collects it before it copies the repository to the Master.",
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Durable Run State for Partial CLI Modes",
+    },
+    {
         "id": "PODNET-MASTER-ADDR",
         "requirement": "Podman-only Master address selection for Worker provisioning",
         "assertion": "The real node add path uses the validated private Master address on the run-scoped network, Worker observes that source, and the override is rejected without the explicit opt-in or when the address is not assigned to Master.",
@@ -1492,6 +1520,28 @@ LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     # hosts and refused there, with the object left exactly as it was: the case
     # reads `lstat` before and after each refusal rather than the exit status.
     "MLOCK-03": {"multi-node": "MN-LOCK-PATH"},
+    # The commands, not the lock: the shipped `gowave-auto.sh` and
+    # `gowave-backup.sh` entry points are run against the holder and each has to
+    # print the lock's own refusal instead of its own post-lock sentence, with the
+    # host's digests and the protocol's files unchanged. The Worker half of the
+    # sentence is named as not driven — a valid Worker lease would reinstall it.
+    "MLOCK-01": {"multi-node": "MN-LOCK-CLI"},
+    # The lease the run hands its own child, in both transports it supports, and
+    # the three ways it must stop authorizing: released, terminated, replayed.
+    # Acceptance is asserted with the parent's session still alive and its lease
+    # byte-identical, so "the child ran" cannot be "the child took a dropped lock".
+    "MLOCK-02": {"multi-node": "MN-LOCK-NESTED"},
+    # The run id is handed to the product's own validator against a real artifact
+    # root: every hostile shape is refused with the rule it broke, the accepted
+    # shapes resolve to a directory named below that root, and the runner's source
+    # order proves it asked before it created a directory or opened an SSH client.
+    "STATE-01": {"aio": "RUNID-01", "multi-node": "RUNID-01"},
+    # The record is written by the product's own writer at mode 0600 and read back
+    # by its own reader: a phase resumes only its own run, commit and non-secret
+    # identity, a terminal phase is not repeated, prerequisites are read, and the
+    # baseline is re-collected under both locks before the first remote write —
+    # with the volatile fields tolerated because no gate reads them.
+    "STATE-02": {"aio": "RESUME-01", "multi-node": "RESUME-01"},
     # Vision is two optional domains. Three of its scenarios are one node's own
     # configuration, which is `MN-VISION`'s question: the Master-only and the
     # Worker-only combinations ask it of each field in turn, and the disabled

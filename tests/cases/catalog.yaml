@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 98
-  total: 223
+  podman_first: 102
+  total: 227
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -4214,8 +4214,22 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: lock_cases:case_cli_entry_points
+      evidence:
+      - channel_target
+      - entry_points
+      - exit_codes
+      - holder_session_survived
+      - host_unchanged
+      - lock_files
+      - lock_files_unchanged
+      - post_lock_markers_absent
+      - refusals
+      - worker_lock_held
+      case: MN-LOCK-CLI
   promotion_target: null
 - id: MLOCK-02
   requirement: Shared Mutation Lock Across All Management Entry Points
@@ -4240,8 +4254,23 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: lock_cases:case_nested_lease
+      evidence:
+      - accepted_marker
+      - bare_refusal
+      - child_command
+      - env_lease_accepted
+      - holder_session_survived
+      - host_unchanged
+      - lease_unchanged
+      - lost_lease_rejected
+      - replayed_lease_refusal
+      - stale_lease_refusal
+      - stdin_lease_accepted
+      case: MN-LOCK-NESTED
   promotion_target: null
 - id: MLOCK-03
   requirement: Shared Mutation Lock Across All Management Entry Points
@@ -4298,8 +4327,30 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: runstate_cases:case_run_id_root
+      evidence:
+      - accepted_ids
+      - accepted_max_length
+      - refusals
+      - rejected_ids
+      - root_entries_unchanged
+      - validated_before_mkdir
+      - validated_before_ssh_client
+      case: RUNID-01
+    multi-node:
+      driver: runstate_cases:case_run_id_root
+      evidence:
+      - accepted_ids
+      - accepted_max_length
+      - refusals
+      - rejected_ids
+      - root_entries_unchanged
+      - validated_before_mkdir
+      - validated_before_ssh_client
+      case: RUNID-01
   promotion_target: null
 - id: STATE-02
   requirement: Durable Run State for Partial CLI Modes
@@ -4337,8 +4388,34 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: runstate_cases:case_resume_gate
+      evidence:
+      - accepted_phases
+      - drift_checked_before_repository_copy
+      - master_port_drift
+      - missing_tool_drift
+      - refusals
+      - refused_phases
+      - state_mode
+      - volatile_fields_tolerated
+      - worker_drift
+      case: RESUME-01
+    multi-node:
+      driver: runstate_cases:case_resume_gate
+      evidence:
+      - accepted_phases
+      - drift_checked_before_repository_copy
+      - master_port_drift
+      - missing_tool_drift
+      - refusals
+      - refused_phases
+      - state_mode
+      - volatile_fields_tolerated
+      - worker_drift
+      case: RESUME-01
   promotion_target: null
 - id: RED-01
   requirement: Redacted Diagnostic Artifact Collection
@@ -6262,6 +6339,162 @@ cases:
       - shapes_refused
       - shapes_skipped
   promotion_target: Shared Mutation Lock Across All Management Entry Points
+- id: MN-LOCK-CLI
+  requirement: Shared Mutation Lock Across All Management Entry Points
+  live_scenario: null
+  assertion: While the run holds both hosts, the shipped management commands — `install`, `node add`,
+    `node rollback`, `node reapply`, `domain-change`, `channel`, `uninstall` and `backup restore` — each
+    exit nonzero with the lock's own sentence naming the canonical path and without printing the sentence
+    they print once they are past the lock, so a command that kept a private lock or took none could not
+    pass; the Master's environment, state, NGINX configuration and unit files keep their digests, `/run/lock`
+    still holds exactly the protocol's two files, the holder's own session survives every refusal, and
+    the Worker's canonical lock file is the one the run holds.
+  assertion_sha256: 5f7c1e94123ff6eabd508eb370879165fdbd91fe50bebbf4a203cf379e7c75fd
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: lock_cases:case_cli_entry_points
+      evidence:
+      - channel_target
+      - entry_points
+      - exit_codes
+      - holder_session_survived
+      - host_unchanged
+      - lock_files
+      - lock_files_unchanged
+      - post_lock_markers_absent
+      - refusals
+      - worker_lock_held
+  promotion_target: Shared Mutation Lock Across All Management Entry Points
+- id: MN-LOCK-NESTED
+  requirement: Shared Mutation Lock Across All Management Entry Points
+  live_scenario: null
+  assertion: A child command handed the run's own lease is accepted in both transports the product supports
+    — the environment and the `GOWAVE_LEASE:` stdin line — while a child with no lease is refused by the
+    lock, the parent's holder session is still alive afterwards, the published lease is byte-identical,
+    the host's digests are unchanged and the lock is still held; a lease from a released holder and a
+    lease replayed from a terminated holder are both refused as invalid or stale with a nonzero exit,
+    and the terminated holder's token is rejected by the product's own validator.
+  assertion_sha256: 751f3b1774667fe4df8934c30a4ec3dbfc86a0ab2d9a5e39d02b2dfcbd02110c
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: lock_cases:case_nested_lease
+      evidence:
+      - accepted_marker
+      - bare_refusal
+      - child_command
+      - env_lease_accepted
+      - holder_session_survived
+      - host_unchanged
+      - lease_unchanged
+      - lost_lease_rejected
+      - replayed_lease_refusal
+      - stale_lease_refusal
+      - stdin_lease_accepted
+  promotion_target: Shared Mutation Lock Across All Management Entry Points
+- id: RUNID-01
+  requirement: Durable Run State for Partial CLI Modes
+  live_scenario: null
+  assertion: A run id containing `..`, a path separator, an encoded separator, a NUL byte, only dots,
+    an empty string, a leading dash, more than 64 characters, or naming a symlinked component is refused
+    by the product's own validator with the rule it broke before any directory is created, while the printed
+    shape, one character, 64 characters and names with dots and dashes are accepted and resolve to a directory
+    named strictly below the artifact root that validation does not create; the CLI's own source order
+    places that validation before it creates the artifact directory and before it opens an SSH client.
+  assertion_sha256: 3b576e093dcfea7bb5ad66cd5a976ecff2804af3d745b6fc825317eb2030d7c4
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: runstate_cases:case_run_id_root
+      evidence:
+      - accepted_ids
+      - accepted_max_length
+      - refusals
+      - rejected_ids
+      - root_entries_unchanged
+      - validated_before_mkdir
+      - validated_before_ssh_client
+    multi-node:
+      driver: runstate_cases:case_run_id_root
+      evidence:
+      - accepted_ids
+      - accepted_max_length
+      - refusals
+      - rejected_ids
+      - root_entries_unchanged
+      - validated_before_mkdir
+      - validated_before_ssh_client
+  promotion_target: Durable Run State for Partial CLI Modes
+- id: RESUME-01
+  requirement: Durable Run State for Partial CLI Modes
+  live_scenario: null
+  assertion: A run state written by the product's own writer at mode 0600 is read back by its own reader,
+    and the resume gate accepts a phase whose prerequisites all reported PASS while refusing another run
+    id, another repository commit, another non-secret configuration identity, a phase that already has
+    a terminal result, and each phase whose prerequisite is not PASS, each with a sentence naming the
+    reason; teardown is refused without both preflight baselines; the baseline comparison reports drift
+    on a host that grew a GoWave directory, started listening on a required port or lost a required tool,
+    tolerates the volatile fields no gate reads, and the runner re-collects it before it copies the repository
+    to the Master.
+  assertion_sha256: e666547c3962e2b0305fe101d7da1b239032154200744bd2a39df73fce3a4b07
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: runstate_cases:case_resume_gate
+      evidence:
+      - accepted_phases
+      - drift_checked_before_repository_copy
+      - master_port_drift
+      - missing_tool_drift
+      - refusals
+      - refused_phases
+      - state_mode
+      - volatile_fields_tolerated
+      - worker_drift
+    multi-node:
+      driver: runstate_cases:case_resume_gate
+      evidence:
+      - accepted_phases
+      - drift_checked_before_repository_copy
+      - master_port_drift
+      - missing_tool_drift
+      - refusals
+      - refused_phases
+      - state_mode
+      - volatile_fields_tolerated
+      - worker_drift
+  promotion_target: Durable Run State for Partial CLI Modes
 - id: PODNET-MASTER-ADDR
   requirement: Podman-only Master address selection for Worker provisioning
   live_scenario: null

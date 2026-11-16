@@ -30,6 +30,7 @@ from . import (
     matrix,
     panel_surface,
     preflight_cases,
+    runstate_cases,
     status,
     teardown,
     topology,
@@ -8478,6 +8479,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
              preflight_cases.case_distinct_domains, timeout_seconds=120),
         Case(preflight_cases.ROOT_IDENTITY_CASE_ID, "aio",
              preflight_cases.case_root_identity, timeout_seconds=120),
+        # The run's own record, read without a host: a run id names a directory
+        # below the artifact root or nothing, and a partial phase resumes only the
+        # run that wrote the state it was handed. Both call the product's own
+        # helpers, so the cases start no container and read no clock.
+        Case(runstate_cases.RUN_ID_CASE_ID, "aio",
+             runstate_cases.case_run_id_root, timeout_seconds=120),
+        Case(runstate_cases.RESUME_CASE_ID, "aio",
+             runstate_cases.case_resume_gate, timeout_seconds=120),
         # Last, because the deadline it proves is the one the whole run spent: the
         # case reads the elapsed wall clock and the enforced budget, then produces
         # an exhausted run of the real runner and reads its report. A suite that
