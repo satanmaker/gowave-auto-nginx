@@ -5916,10 +5916,14 @@ def second_node_address_script(address: str) -> str:
     The prefix length is read from that interface rather than assumed, and the
     address is printed back from the kernel: a write that never landed would
     otherwise surface as the product's own "connection refused" much later.
+
+    The ``read`` line ends its fields with a newline on purpose: bash's ``read``
+    returns 1 at EOF without a delimiter, and under ``set -e`` that would end the
+    script with the variables already assigned and no message at all.
     """
     return (
         "set -Eeuo pipefail\n"
-        "read -r dev cidr < <(ip -4 -o addr show scope global | awk 'NR==1{printf \"%s %s\", $2, $4}')\n"
+        "read -r dev cidr < <(ip -4 -o addr show scope global | awk 'NR==1{printf \"%s %s\\n\", $2, $4}')\n"
         f"ip addr add '{address}'/\"${{cidr#*/}}\" dev \"$dev\"\n"
         "ip -4 -o addr show dev \"$dev\"\n"
     )
