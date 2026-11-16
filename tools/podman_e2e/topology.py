@@ -75,6 +75,11 @@ ENGINE_CLIENT_OFFSET = 41
 # control and data-plane addresses: sharing the Master's would make the run
 # unable to tell which node a payload actually left from.
 WORKER_OFFSET = 11
+# The Panel keys a node record by its address (`uniqueIndex` on `nodes.address`),
+# so a second node that has to reach the same host needs a second address on it.
+# This one is an alias of the Worker's own interface, added by the case that
+# needs it: the host is one, the records the Panel holds are two.
+SECOND_NODE_OFFSET = 12
 UNTRUSTED_OFFSET = 44
 
 DNS_PORT = 53
@@ -226,6 +231,10 @@ class NetworkPlan:
     @property
     def worker_ip(self) -> str:
         return self._address(WORKER_OFFSET)
+
+    @property
+    def second_node_ip(self) -> str:
+        return self._address(SECOND_NODE_OFFSET)
 
     @property
     def data_worker_ip(self) -> str:
@@ -1501,6 +1510,32 @@ class MultiNodeTopology(AioTopology):
             "known_hosts_entry": f"{self.plan.worker_ip}",
             "master_key_fingerprint": self._key_fingerprint(public_key),
         }
+
+    def pin_worker_address(self, address: str) -> str:
+        """Pin the Worker's own host key under a second address on the Master.
+
+        A second node record reaches the same host through its own address, and
+        the operator's rule that a key is verified out of band and pinned before
+        use applies to that address too. The key is the one already read from the
+        Worker's filesystem, so nothing is learned from the new address itself.
+        """
+        if not getattr(self, "_worker_host_key", ""):
+            raise TopologyError("the Worker host key has not been read yet")
+        entry = f"{address} {self._worker_host_key}\n"
+        self.podman.exec(
+            self.target_name,
+            ["bash", "-c", "umask 077; mkdir -p /root/.ssh; cat >> /root/.ssh/known_hosts"],
+            input_text=entry,
+            timeout=120,
+        )
+        pinned = self.podman.exec(
+            self.target_name, ["cat", "/root/.ssh/known_hosts"], check=False,
+        ).stdout
+        if self._key_blob(self._worker_host_key) not in pinned:
+            raise TopologyError(
+                f"the Worker host key did not land in {self.target_name}:/root/.ssh/known_hosts"
+            )
+        return entry.strip()
 
     @staticmethod
     def _key_fingerprint(public_key: str) -> str:

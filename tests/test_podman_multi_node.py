@@ -324,6 +324,21 @@ class TestWorkerTrustPin(unittest.TestCase):
         self.assertIn("known_hosts", str(caught.exception))
         self.assertIn(host.target_name, str(caught.exception))
 
+    def test_a_second_address_is_pinned_under_the_key_already_read(self):
+        host = self.host()
+        host.pin_worker_trust()
+        entry = host.pin_worker_address(host.plan.second_node_ip)
+        pinned = host.podman.files[(host.target_name, "/root/.ssh/known_hosts")]
+        self.assertIn(f"{host.plan.second_node_ip} ", pinned)
+        self.assertIn(topology.MultiNodeTopology._key_blob(WORKER_HOST_KEY), pinned)
+        self.assertTrue(entry.startswith(host.plan.second_node_ip))
+
+    def test_an_address_pinned_before_the_key_is_read_is_refused_by_name(self):
+        host = self.host()
+        with self.assertRaises(topology.TopologyError) as caught:
+            host.pin_worker_address(host.plan.second_node_ip)
+        self.assertIn("host key has not been read", str(caught.exception))
+
 
 class TestPodmanExecAttachesStdin(unittest.TestCase):
     """Delivery over stdin only happens when ``podman exec`` is handed ``-i``."""
@@ -6991,6 +7006,10 @@ class _CompensationHost:
     def write_dns_zone(self, data):
         self.dns_zone_file().write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
 
+    def pin_worker_address(self, address):
+        self.pinned = address
+        return f"{address} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIworkerkey"
+
 
 def compensation_cluster(host):
     """A fresh Panel cluster: the Master, the Worker, and the node left behind."""
@@ -7003,7 +7022,7 @@ def compensation_cluster(host):
                 {"name": topology.WORKER_NODE_NAME, "address": str(host.plan.worker_ip),
                  "port": multi_node.NODE_PORT, "connected": True},
                 {"name": multi_node.SECOND_WORKER_NODE_NAME,
-                 "address": str(host.plan.worker_ip), "port": multi_node.NODE_PORT,
+                 "address": str(host.plan.second_node_ip), "port": multi_node.NODE_PORT,
                  "connected": True},
             ],
         },
@@ -7031,10 +7050,16 @@ class _CompensationPodman:
         self.host = host
         self.scripts = []
         self.resolution = {
-            multi_node.SECOND_WORKER_DOMAIN: [str(host.plan.worker_ip)],
-            multi_node.SECOND_WORKER_REALITY_DOMAIN: [str(host.plan.worker_ip)],
+            multi_node.SECOND_WORKER_DOMAIN: [str(host.plan.second_node_ip)],
+            multi_node.SECOND_WORKER_REALITY_DOMAIN: [str(host.plan.second_node_ip)],
             multi_node.SECOND_WORKER_VISION_DOMAIN: ["gaierror"],
         }
+        self.address = subprocess.CompletedProcess(
+            ["bash"], 0,
+            f"2: eth0    inet {host.plan.worker_ip}/24 scope global eth0\n"
+            f"2: eth0    inet {host.plan.second_node_ip}/24 scope global secondary eth0\n",
+            "",
+        )
         self.watcher_start = subprocess.CompletedProcess(["bash"], 0, "watcher_pid=4242\n", "")
         self.add = subprocess.CompletedProcess(
             ["bash"], 1, self.attempt_stdout(), self.attempt_stderr(),
@@ -7078,6 +7103,8 @@ class _CompensationPodman:
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
         self.scripts.append((name, script))
+        if "ip addr add" in script:
+            return self.address
         if "getaddrinfo" in script:
             body = json.dumps(self.resolution)
         elif "setsid python3" in script:
@@ -7161,15 +7188,42 @@ class TestVisionCompensationCase(unittest.TestCase):
         self.assertEqual(len(commands), 1, "the case dispatched something else as well")
         self.assertIn(f"'{multi_node.SECOND_WORKER_NODE_NAME}'", commands[0])
         self.assertIn(f"--vision-domain '{multi_node.SECOND_WORKER_VISION_DOMAIN}'", commands[0])
-        self.assertIn(str(self.host.plan.worker_ip), commands[0])
+        self.assertIn(f"'{self.host.plan.second_node_ip}'", commands[0])
+        self.assertNotIn(f"'{self.host.plan.worker_ip}'", commands[0])
+
+    def test_the_second_record_reaches_the_worker_through_its_own_address(self):
+        evidence, product = self.run_case()
+        address = str(self.host.plan.second_node_ip)
+        aliases = [(name, script) for name, script in product.podman.scripts
+                   if "ip addr add" in script]
+        self.assertEqual(len(aliases), 1, "the case did not add exactly one address")
+        name, script = aliases[0]
+        self.assertEqual(name, self.host.worker_name,
+                         "the alias was added somewhere other than the Worker")
+        self.assertIn(f"'{address}'", script)
+        # The prefix length comes from the interface that already carries the
+        # Worker, so the alias lands in the same subnet without being assumed.
+        self.assertIn("ip -4 -o addr show scope global", script)
+        self.assertIn("${cidr#*/}", script)
+        self.assertEqual(self.host.pinned, address,
+                         "the address the case asked the operator to trust was not pinned")
+        self.assertEqual(evidence["node_address"], address)
+        self.assertTrue(evidence["address_pinned"].startswith(address))
 
     def test_the_zone_the_case_writes_answers_for_the_node_and_not_for_its_vision(self):
         self.run_case()
         zone = json.loads(self.host.dns_zone_file().read_text(encoding="utf-8"))
         records = zone["records"]
         self.assertEqual(records[multi_node.SECOND_WORKER_DOMAIN]["A"],
-                         [str(self.host.plan.worker_ip)])
+                         [str(self.host.plan.second_node_ip)])
         self.assertNotIn(multi_node.SECOND_WORKER_VISION_DOMAIN, records)
+
+    def test_the_case_fails_when_the_worker_does_not_hold_the_second_address(self):
+        self.podman.address = subprocess.CompletedProcess(
+            ["bash"], 0, f"2: eth0    inet {self.host.plan.worker_ip}/24 scope global eth0\n",
+            "",
+        )
+        self.damage("does not hold the second address")
 
     def test_the_case_fails_when_the_attempt_exits_zero(self):
         self.podman.add = subprocess.CompletedProcess(
@@ -7269,7 +7323,7 @@ class TestVisionCompensationCase(unittest.TestCase):
 
     def test_the_case_fails_when_the_vision_name_resolves_to_the_worker(self):
         self.podman.resolution[multi_node.SECOND_WORKER_VISION_DOMAIN] = [
-            str(self.host.plan.worker_ip),
+            str(self.host.plan.second_node_ip),
         ]
         self.damage("would have validated")
 
