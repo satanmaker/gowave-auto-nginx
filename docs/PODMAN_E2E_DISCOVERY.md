@@ -673,14 +673,16 @@ Panel that declared the wrong count cannot both be true.
 | `Worker-only Vision configuration` | `MN-VISION` | The same case in the combination where only the Worker was configured, which is the one that fails if the two nodes' fields are read from one switch. |
 | `Both Vision domains are configured` | `NGX-04` | The route, the decoy and the fallback are read per host, and the endpoint arithmetic is asserted beside them: five inbounds and five published hosts per node, ten in all, and the matrix's runtime count as that total times its clients. |
 | `Vision domains are unique` | `VIS-CONFIG` | Four accepted combinations — neither, Master only, Worker only, both — and eight duplicate classes refused, each naming what collided: the two Vision names equal, a Vision name repeating any of the four mandatory names, the two nodes' Vision names equal to each other's mandatory names, and the same name in two letter cases. The runner itself is run on the same duplicate and has to exit reporting a configuration error without creating a run directory, because that is what "before SSH or remote modification" means where there is no remote yet. |
+| `Vision certificate failure aborts the relevant host installation` | `VIS-05` | The fault is a second install of the host the first one already provisioned, asking for a name the fixture resolver answers with `NXDOMAIN`: HTTP-01 cannot validate, so the Vision stage is the one that fails. The install exits nonzero and prints the lineage rollback line rather than a `CRITICAL` one, and the digests of the Panel and REALITY lineages, the deploy hook and its ownership record, the stream map, the HTTP vhost, the `9444` fallback vhost and the bootstrap vhost are identical before and after — so the rollback deleted nothing it did not create, and the failed name is mentioned nowhere under the NGINX tree. The install the later cases read is untouched because the fault runs on a host that is already installed. |
 | `Vision disabled preserves the four-inbound topology` | `MN-VISION` | The absent branch of the same case: with both fields empty each node declares exactly four inbounds and four hosts, holds no certificate for the name, routes nothing and has no vhost, so a node that kept its neighbour's contour fails. |
 | `Vision port gate applies only to the Vision-enabled host` | `VIS-GATE` | Which host is refused is read from the runner's own decision over two manifests. With both hosts holding `8444` and `9444` the configured one is refused naming the port and the unconfigured one is accepted, the reverse holds for the other combination, and a run in which only the unconfigured host holds them reports `PASS` — the clause a gate widened to the whole run would fail. The exempt host is still held to the default port set, so it is refused when it holds `443`. |
 
-**Two scenarios of that requirement stay live-only.** `VIS-05` needs the ACME
-server to refuse a name the installer has already committed to, and the install
-this contour runs is the fixture every later case reads: a host left rolled back
-would poison the run rather than prove the rollback. `VIS-06` needs that rollback
-to fail as well, which is a second injection on top of the first.
+**One scenario of that requirement stays live-only.** `VIS-06` needs the
+compensation itself to fail while the certificate stage is failing, which is a
+second injection on top of the first: the case has to damage the rollback it is
+asserting, and then read the reporting of an incomplete compensation rather than
+a clean one. That seam is not in the contour yet, so the scenario is named here
+and counted rather than claimed.
 
 ### What is declared but not driven
 

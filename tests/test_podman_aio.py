@@ -292,11 +292,19 @@ class StubHost:
         self.target_name = target_name
         self.panel_domain = panel_domain
         self.reality_domain = aio.REALITY_DOMAIN
+        self.vision_domain = None
         self.client_reports = []
         self.client_calls = []
+        self.install_attempts = []
+        self.install_reports = []
 
     def install_environment(self):
         return {"GOWAVE_ACME_TEST_CA_FILE": "/fixtures/ca/acme-trust.pem"}
+
+    def install_vision_failure(self, vision_domain):
+        """The install the Vision-failure case runs: same command, another name."""
+        self.install_attempts.append(vision_domain)
+        return self.install_reports.pop(0)
 
     def client_http(self, url, **kwargs):
         self.client_calls.append({"url": url, **kwargs})
@@ -843,10 +851,215 @@ class TestNegativeCases(unittest.TestCase):
 
     def test_the_host_scripts_the_negative_cases_run_are_valid_bash(self):
         for script in (aio.FOREIGN_LISTENER_SCRIPT, aio.ACME_FAIL_CLOSED_SCRIPT,
-                       aio.INSTALLER_PIN_SCRIPT):
+                       aio.INSTALLER_PIN_SCRIPT,
+                       aio.vision_failure_inventory(StubHost(), aio.VISION_FAILURE_DOMAIN)):
             result = subprocess.run(["bash", "-n"], input=script, text=True,
                                     capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class TestVisionFailureCase(unittest.TestCase):
+    """VIS-05: the failed Vision stage reports a rollback and leaves no side effect.
+
+    The case compares two inventories of the same host around one install attempt,
+    so each guard is proven by damaging exactly the field it reads: a lineage that
+    changed, a hook that moved, a name that appeared in the tree, an attempt that
+    reported success, and a report that called itself incomplete.
+    """
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def inventory(self, **overrides) -> str:
+        facts = {
+            "lineage_panel": "a" * 64,
+            "lineage_reality": "b" * 64,
+            "lineage_vision": "absent",
+            "failed_lineage": "absent",
+            "deploy_hook": "c" * 64,
+            "ownership_record": "d" * 64,
+            "stream_config": "e" * 64,
+            "http_vhost": "f" * 64,
+            "vision_fallback": "absent",
+            "bootstrap_vhost": "absent",
+            "failed_domain_mentions": "0",
+            "nginx_active": "active",
+            "nginx_test": "0",
+        }
+        facts.update(overrides)
+        return "".join(f"{key}={value}\n" for key, value in facts.items())
+
+    def surface(self, **overrides) -> str:
+        counts = {"nodes": 1, "profiles": 1, "squads": 1, "hosts": 4}
+        counts.update(overrides)
+        return json.dumps({
+            "login": {"status": 200},
+            "surface": {area: {"count": count} for area, count in counts.items()},
+        })
+
+    def attempt(self, stdout=None, returncode=1) -> topology.InstallOutcome:
+        if stdout is None:
+            stdout = (
+                f"Acquiring Let's Encrypt TLS certificate for VLESS Vision "
+                f"({aio.VISION_FAILURE_DOMAIN})...\n"
+                "ACME certificate lineage rollback completed successfully.\n"
+            )
+        return topology.InstallOutcome(returncode, stdout, "", 5.0, "install")
+
+    def run_case(self, *, before=None, after=None, attempt=None,
+                 surface_before=None, surface_after=None, client=None):
+        product, _ = installed_product(self.context, [
+            (self.inventory() if before is None else before, 0),
+            (self.surface() if surface_before is None else surface_before, 0),
+            (self.inventory() if after is None else after, 0),
+            (self.surface() if surface_after is None else surface_after, 0),
+            ("login=200 api=200\n", 0),
+        ])
+        product.host.install_reports = [self.attempt() if attempt is None else attempt]
+        product.host.client_reports = [client or {
+            "url": f"{aio.PUBLIC_PANEL}/", "returncode": 0, "stdout": "{}", "stderr": "",
+            "probe": {"status": 200},
+        }]
+        return aio.case_vision_certificate_failure(product), product
+
+    def damage(self, fragment: str, **kwargs) -> None:
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(**kwargs)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_the_stage_fails_and_the_host_is_left_as_it_was_found(self):
+        evidence, product = self.run_case()
+        self.assertEqual(evidence["attempt_returncode"], 1)
+        self.assertEqual(evidence["vision_stage"], "reached")
+        self.assertEqual(evidence["rollback"], "complete")
+        self.assertEqual(evidence["failed_lineage"], "absent")
+        self.assertTrue(evidence["lineage_panel"])
+        self.assertTrue(evidence["lineage_reality"])
+        self.assertTrue(evidence["deploy_hook"])
+        self.assertEqual(evidence["failed_domain_mentions"], "0")
+        self.assertEqual(evidence["bootstrap_vhost"], "absent")
+        self.assertEqual(evidence["public_panel"], 200)
+        self.assertEqual(product.host.install_attempts, [aio.VISION_FAILURE_DOMAIN])
+
+    def test_the_case_fails_when_the_attempt_exits_zero(self):
+        self.damage("exited 0", attempt=self.attempt(returncode=0))
+
+    def test_the_case_fails_when_the_failure_came_from_another_stage(self):
+        self.damage("never reached the Vision certificate stage", attempt=self.attempt(
+            stdout="Error: Failed to activate bootstrap ACME NGINX configuration; "
+                   "rolling back certificate lineages.\n"
+                   "ACME certificate lineage rollback completed successfully.\n",
+        ))
+
+    def test_the_case_fails_when_the_rollback_is_not_reported_complete(self):
+        self.damage("did not report a complete lineage rollback", attempt=self.attempt(
+            stdout=f"Acquiring Let's Encrypt TLS certificate for VLESS Vision "
+                   f"({aio.VISION_FAILURE_DOMAIN})...\n",
+        ))
+
+    def test_the_case_fails_when_the_report_calls_itself_incomplete(self):
+        self.damage("reported an incomplete rollback", attempt=self.attempt(
+            stdout=f"Acquiring Let's Encrypt TLS certificate for VLESS Vision "
+                   f"({aio.VISION_FAILURE_DOMAIN})...\n"
+                   "ACME certificate lineage rollback completed successfully.\n"
+                   "CRITICAL: ACME rollback incomplete; certificate lineage or deploy-hook "
+                   "restoration failed. Recovery snapshot retained for operator intervention.\n",
+        ))
+
+    def test_the_case_fails_when_the_host_had_no_lineage_to_preserve(self):
+        self.damage("carries no Panel lineage",
+                    before=self.inventory(lineage_panel="absent"))
+
+    def test_the_case_fails_when_the_failed_name_already_has_a_lineage(self):
+        self.damage("already has a lineage", before=self.inventory(failed_lineage="present"))
+
+    def test_the_case_fails_when_the_host_had_no_deploy_hook(self):
+        self.damage("owes nothing to restore", before=self.inventory(deploy_hook="absent"))
+
+    def test_the_case_fails_when_nginx_was_not_active_before_the_attempt(self):
+        self.damage("NGINX reports 'inactive' before the failed attempt",
+                    before=self.inventory(nginx_active="inactive"))
+
+    def test_the_case_fails_when_a_pre_existing_lineage_changed(self):
+        self.damage("changed the pre-existing panel certificate lineage",
+                    after=self.inventory(lineage_panel="1" * 64))
+
+    def test_the_case_fails_when_the_reality_lineage_was_deleted(self):
+        self.damage("changed the pre-existing reality certificate lineage",
+                    after=self.inventory(lineage_reality="absent"))
+
+    def test_the_case_fails_when_the_configured_vision_lineage_changed(self):
+        self.damage("changed the pre-existing vision certificate lineage",
+                    before=self.inventory(lineage_vision="2" * 64),
+                    after=self.inventory(lineage_vision="3" * 64))
+
+    def test_the_case_fails_when_the_failed_name_got_a_lineage(self):
+        self.damage("left a certificate lineage for",
+                    after=self.inventory(failed_lineage="present"))
+
+    def test_the_case_fails_when_the_deploy_hook_changed(self):
+        self.damage("changed or removed the managed deploy hook",
+                    after=self.inventory(deploy_hook="4" * 64))
+
+    def test_the_case_fails_when_the_ownership_record_was_rewritten(self):
+        self.damage("rewrote the deploy-hook ownership record",
+                    after=self.inventory(ownership_record="5" * 64))
+
+    def test_the_case_fails_when_the_stream_map_was_rewritten(self):
+        self.damage("rewrote the stream SNI map",
+                    after=self.inventory(stream_config="6" * 64))
+
+    def test_the_case_fails_when_the_http_vhost_was_rewritten(self):
+        self.damage("rewrote the HTTP vhost", after=self.inventory(http_vhost="7" * 64))
+
+    def test_the_case_fails_when_the_failed_name_appears_in_the_nginx_tree(self):
+        self.damage("reference(s) to", after=self.inventory(failed_domain_mentions="2"))
+
+    def test_the_case_fails_when_a_fallback_vhost_appeared(self):
+        self.damage("created or removed the 9444 fallback vhost",
+                    after=self.inventory(vision_fallback="present"))
+
+    def test_the_case_fails_when_a_bootstrap_vhost_was_left_behind(self):
+        self.damage("left a bootstrap ACME vhost behind",
+                    after=self.inventory(bootstrap_vhost="present"))
+
+    def test_the_case_fails_when_nginx_is_left_inactive(self):
+        self.damage("NGINX reports 'inactive' after the failed attempt",
+                    after=self.inventory(nginx_active="inactive"))
+
+    def test_the_case_fails_when_the_configuration_no_longer_loads(self):
+        self.damage("does not pass `nginx -t` after the failed attempt",
+                    after=self.inventory(nginx_test="1"))
+
+    def test_the_case_fails_when_the_panel_inventory_changed(self):
+        self.damage("changed the Panel's hosts inventory",
+                    surface_after=self.surface(hosts=5))
+
+    def test_the_case_fails_when_the_public_surface_stopped_answering(self):
+        self.damage("public surface stopped answering", client={
+            "url": f"{aio.PUBLIC_PANEL}/", "returncode": 7, "stdout": "",
+            "stderr": "connection refused", "probe": {"error": "connection refused"},
+        })
+
+    def test_the_case_fails_when_the_panel_api_stopped_answering(self):
+        product_queue = [
+            (self.inventory(), 0),
+            (self.surface(), 0),
+            (self.inventory(), 0),
+            (self.surface(), 0),
+            ("login=503 api=503\n", 0),
+        ]
+        product, _ = installed_product(self.context, product_queue)
+        product.host.install_reports = [self.attempt()]
+        product.host.client_reports = [{
+            "url": f"{aio.PUBLIC_PANEL}/", "returncode": 0, "stdout": "{}", "stderr": "",
+            "probe": {"status": 200},
+        }]
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_vision_certificate_failure(product)
+        self.assertIn("Panel's own API stopped answering", str(caught.exception))
 
 
 class TestInstalledVersionCases(unittest.TestCase):

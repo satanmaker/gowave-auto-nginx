@@ -1477,13 +1477,16 @@ LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     # files and reads them back: four accepted combinations, eight duplicate
     # classes, and the runner's own exit before any host is read.
     "VIS-04": {"aio": "VIS-CONFIG", "multi-node": "VIS-CONFIG"},
-    # **VIS-05 and VIS-06 stay live-only.** A certificate failure that aborts the
-    # install and rolls the host back needs the ACME server to refuse a name the
-    # installer already committed to, and this contour's install is the fixture
-    # every later case reads — a host left rolled back poisons the run instead of
-    # proving the rollback. Reporting an incomplete compensation instead of hiding
-    # it needs a rollback that itself fails, which is a second injection on top of
-    # the first.
+    # A certificate failure has to abort the attempt and roll the host back.
+    # `VIS-05` is its own driver under its own id: it asks for a Vision domain the
+    # fixture resolver answers with NXDOMAIN, on the host the install already
+    # provisioned, so the Vision stage is the one that fails — and it fails after
+    # the Panel and REALITY lineages are already in place, which is what gives the
+    # rollback something to preserve and the case digests to compare instead of
+    # the installer's own account of itself.
+    # **VIS-06 stays live-only.** Reporting an incomplete compensation instead of
+    # hiding it needs a rollback that itself fails, which is a second injection on
+    # top of the first.
     # Which host owes the Vision ports is decided before anything is contacted, and
     # both contours read the same eligibility decision, so `VIS-GATE` asks it of
     # both: the configured host is refused and the unconfigured one is not, and a

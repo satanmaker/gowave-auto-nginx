@@ -979,7 +979,7 @@ class TestTeardownPolicyContract(unittest.TestCase):
             undriven,
             "every scenario of the requirement is now driven; the page still says otherwise",
         )
-        stated = re.search(r"(\w+) scenarios? of that requirement stay live-only", self.prose)
+        stated = re.search(r"(\w+) scenarios? of that requirement stay(?:s)? live-only", self.prose)
         self.assertIsNotNone(
             stated, "the page does not say how much of the requirement stays live-only",
         )
@@ -1025,7 +1025,7 @@ class TestTeardownPolicyContract(unittest.TestCase):
             self.damaged(retargeted).test_each_row_cites_the_case_the_catalog_maps_to_that_scenario()
 
         miscounted = re.sub(
-            r"\w+( scenarios? of that requirement stay live-only)",
+            r"\w+( scenarios? of that requirement stay(?:s)? live-only)",
             r"seven\1", section, count=1,
         )
         self.assertNotEqual(miscounted, section, "the sentence this probe damages is not there")
@@ -1071,10 +1071,16 @@ def vision_product_cases() -> set:
 
 
 def vision_driver_cases(entry) -> set:
+    """The cases the catalog drives the scenario with, in either of its two shapes.
+
+    A scenario witnessed by a different case names it in `case`; a scenario whose
+    own id is the case names nothing, and reading the fact alone reported `VIS-05`
+    as undriven while the catalog ran it — so the page could keep calling it
+    live-only. `catalog.py` resolves the same fallback for the same reason.
+    """
     return {
-        str(facts.get("case"))
+        str(facts.get("case") or entry["id"])
         for facts in (entry.get("drivers") or {}).values()
-        if facts.get("case")
     }
 
 
@@ -1197,7 +1203,7 @@ class TestVisionContract(unittest.TestCase):
             undriven,
             "every scenario of the requirement is now driven; the page still says otherwise",
         )
-        stated = re.search(r"(\w+) scenarios? of that requirement stay live-only", self.prose)
+        stated = re.search(r"(\w+) scenarios? of that requirement stay(?:s)? live-only", self.prose)
         self.assertIsNotNone(
             stated, "the page does not say how much of the requirement stays live-only",
         )
@@ -1243,14 +1249,14 @@ class TestVisionContract(unittest.TestCase):
             self.damaged(retargeted).test_each_row_cites_the_case_the_catalog_maps_to_that_scenario()
 
         miscounted = re.sub(
-            r"\w+( scenarios? of that requirement stay live-only)",
+            r"\w+( scenarios? of that requirement stay(?:s)? live-only)",
             r"seven\1", section, count=1,
         )
         self.assertNotEqual(miscounted, section, "the sentence this probe damages is not there")
         with self.assertRaises(AssertionError):
             self.damaged(miscounted).test_the_scenarios_left_to_the_live_runner_are_named_and_counted()
 
-        unnamed = re.sub(r"`VIS-05`", "`VIS-XX`", section, count=1)
+        unnamed = re.sub(r"`VIS-06`", "`VIS-XX`", section, count=1)
         self.assertNotEqual(unnamed, section, "the sentence this probe damages is not there")
         with self.assertRaises(AssertionError):
             self.damaged(unnamed).test_the_scenarios_left_to_the_live_runner_are_named_and_counted()
