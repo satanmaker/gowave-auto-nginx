@@ -209,9 +209,11 @@ ACME_NEW_REALITY_DOMAIN = "reality2.testbed.internal"
 #
 # It is a *second* node, addressed to the Worker the run already provisioned,
 # because `state.json` refuses a name it has registered and because the payload
-# it re-streams is the same operator path a new Worker takes. The case is placed
-# after every case that reads a healthy cluster: the Worker it fails is torn down
-# by the very compensation being observed.
+# it re-streams is the same operator path a new Worker takes. The Panel keys a
+# node by its address, so the second record reaches the same host through an
+# alias the case adds to the Worker's interface. The case is placed after every
+# case that reads a healthy cluster: the Worker it fails is torn down by the very
+# compensation being observed.
 VIS_COMPENSATION_CASE_ID = "VIS-06"
 SECOND_WORKER_NODE_NAME = "worker-2"
 SECOND_WORKER_DOMAIN = "worker-two.testbed.internal"
@@ -5906,12 +5908,29 @@ printf 'nginx_test=%s\n' "$(nginx -t >/dev/null 2>&1 && echo 0 || echo 1)"
 """
 
 
+def second_node_address_script(address: str) -> str:
+    """Give the Worker a second address of its own, and report what it holds.
+
+    The Panel refuses two node records with one address, so the second record
+    reaches the Worker through an alias on the interface that already carries it.
+    The prefix length is read from that interface rather than assumed, and the
+    address is printed back from the kernel: a write that never landed would
+    otherwise surface as the product's own "connection refused" much later.
+    """
+    return (
+        "set -Eeuo pipefail\n"
+        "read -r dev cidr < <(ip -4 -o addr show scope global | awk 'NR==1{printf \"%s %s\", $2, $4}')\n"
+        f"ip addr add '{address}'/\"${{cidr#*/}}\" dev \"$dev\"\n"
+        "ip -4 -o addr show dev \"$dev\"\n"
+    )
+
+
 def second_worker_add_script(host: topology.MultiNodeTopology) -> str:
     """The operator's own ``node add``, addressed to a second node on the Worker."""
     return (
         f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node add "
         f"--vision-domain '{SECOND_WORKER_VISION_DOMAIN}' "
-        f"'{SECOND_WORKER_NODE_NAME}' '{host.plan.worker_ip}' "
+        f"'{SECOND_WORKER_NODE_NAME}' '{host.plan.second_node_ip}' "
         f"'{SECOND_WORKER_DOMAIN}' '{SECOND_WORKER_REALITY_DOMAIN}'"
     )
 
@@ -5957,6 +5976,11 @@ def case_vision_incomplete_compensation(product: MultiNodeProduct) -> Dict[str, 
     ``NODE_ADD_VERIFYING``, so ``rollback_provisioning`` cannot enumerate what
     the transaction created and refuses to delete anything.
 
+    The second record needs an address of its own, because the Panel holds one
+    node per address: the case adds an alias to the Worker's interface and pins
+    the Worker's existing host key under it, so both records reach the same host
+    over the same key.
+
     What is asserted is the reporting, in the order the scenario states it: the
     remote failure that starts compensation is named, both rollback results are
     printed -- the remote one as success, the API one as refused -- the refusal
@@ -5974,21 +5998,39 @@ def case_vision_incomplete_compensation(product: MultiNodeProduct) -> Dict[str, 
     case_id = VIS_COMPENSATION_CASE_ID
     host = product.require_worker()
     master = host.target_name
+    node_address = host.plan.second_node_ip
     evidence = {
         "node_name": SECOND_WORKER_NODE_NAME,
+        "node_address": str(node_address),
         "worker_ip": str(host.plan.worker_ip),
         "worker_domain": SECOND_WORKER_DOMAIN,
         "worker_reality_domain": SECOND_WORKER_REALITY_DOMAIN,
         "vision_domain": SECOND_WORKER_VISION_DOMAIN,
     }
 
-    # The second node's own names answer with the Worker, so the bootstrap vhost
-    # this transaction creates can validate them; the Vision name has no record,
-    # so the stage that is supposed to fail cannot succeed.
+    # The Panel keys a node by its address, so the second record needs an address
+    # the first one does not already hold. It is an alias on the Worker's own
+    # interface: one host, two records, and the key the operator pinned is the
+    # same key under both addresses.
+    addressed = product.podman.exec_bash(
+        host.worker_name, second_node_address_script(node_address), check=False, timeout=120,
+    )
+    require(
+        case_id,
+        addressed.returncode == 0 and node_address in (addressed.stdout or ""),
+        f"the Worker does not hold the second address {node_address} the Panel record "
+        f"needs (exit {addressed.returncode}): "
+        f"{(addressed.stderr or addressed.stdout or '').strip()[-600:]}",
+    )
+    evidence["address_pinned"] = host.pin_worker_address(node_address)
+
+    # The second node's own names answer with that address, so the bootstrap
+    # vhost this transaction creates can validate them; the Vision name has no
+    # record, so the stage that is supposed to fail cannot succeed.
     zone = json.loads(host.dns_zone_file().read_text(encoding="utf-8"))
     records = zone.setdefault("records", {})
-    records[SECOND_WORKER_DOMAIN] = {"A": [str(host.plan.worker_ip)]}
-    records[SECOND_WORKER_REALITY_DOMAIN] = {"A": [str(host.plan.worker_ip)]}
+    records[SECOND_WORKER_DOMAIN] = {"A": [str(node_address)]}
+    records[SECOND_WORKER_REALITY_DOMAIN] = {"A": [str(node_address)]}
     records.pop(SECOND_WORKER_VISION_DOMAIN, None)
     host.write_dns_zone(zone)
 
@@ -5999,13 +6041,13 @@ def case_vision_incomplete_compensation(product: MultiNodeProduct) -> Dict[str, 
     evidence["resolved"] = resolution
     require(
         case_id,
-        str(host.plan.worker_ip) in (resolution.get(SECOND_WORKER_DOMAIN) or []),
+        str(node_address) in (resolution.get(SECOND_WORKER_DOMAIN) or []),
         f"the Worker's own name {SECOND_WORKER_DOMAIN} does not answer with "
-        f"{host.plan.worker_ip}: {resolution.get(SECOND_WORKER_DOMAIN)!r}",
+        f"{node_address}: {resolution.get(SECOND_WORKER_DOMAIN)!r}",
     )
     require(
         case_id,
-        str(host.plan.worker_ip) not in (resolution.get(SECOND_WORKER_VISION_DOMAIN) or []),
+        str(node_address) not in (resolution.get(SECOND_WORKER_VISION_DOMAIN) or []),
         f"the Vision name {SECOND_WORKER_VISION_DOMAIN} answers with the Worker address, "
         "so the stage this case needs to fail would have validated",
     )
@@ -6143,9 +6185,9 @@ def case_vision_incomplete_compensation(product: MultiNodeProduct) -> Dict[str, 
     )
     require(
         case_id,
-        (node.get("address"), node.get("port")) == (str(host.plan.worker_ip), NODE_PORT),
+        (node.get("address"), node.get("port")) == (str(node_address), NODE_PORT),
         f"the Panel lists {SECOND_WORKER_NODE_NAME} at {node.get('address')!r}:"
-        f"{node.get('port')!r} instead of {host.plan.worker_ip}:{NODE_PORT}",
+        f"{node.get('port')!r} instead of {node_address}:{NODE_PORT}",
     )
     hosts = [
         record for record in (cluster.get("hosts") or {}).get("records") or []

@@ -650,10 +650,12 @@ cases:
     multi-node:
       driver: multi_node:case_vision_incomplete_compensation
       evidence:
+      - address_pinned
       - attempt_returncode
       - attempt_seconds
       - command
       - journal
+      - node_address
       - node_name
       - panel
       - resolved
