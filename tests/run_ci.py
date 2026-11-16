@@ -217,6 +217,7 @@ SUITES = {
         "test_podman_lock_cases.TestRunStateGate",
         "test_podman_lock_cases.TestLockDrivers",
         "test_podman_lock_cases.TestCaseGuards",
+        "test_podman_lock_cases.TestOwnershipShapeCapability",
         "test_podman_lock_cases.TestWorkerLeasePlumbing",
         "test_podman_lock_cases.TestLockRegistration",
         "test_podman_vision.TestVisionConfigCase",

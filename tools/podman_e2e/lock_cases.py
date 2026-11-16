@@ -263,6 +263,42 @@ def _clear_shape(host: Any, container: str) -> None:
     )
 
 
+#: Whether the holder gets past its own `open` on the object. The probe repeats
+#: that open exactly — the directory by descriptor, the name with `O_CREAT` and
+#: `O_NOFOLLOW` — because the question is not what the file's mode says but which
+#: check refuses it first. With `fs.protected_regular=2` and a sticky, world
+#: writable `/run/lock`, the kernel refuses `O_CREAT` on a file another user owns
+#: (measured: EACCES) one check before the mode and owner sentences, so the shape
+#: would prove that a foreign object is refused rather than that ownership is what
+#: refused it. The same directory under 0775 produces the owner sentence, which is
+#: why the case measures instead of assuming either contour.
+_OPEN_PROBE = (
+    "import os, sys\n"
+    "try:\n"
+    "    dir_fd = os.open(os.path.dirname(sys.argv[1]),\n"
+    "                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)\n"
+    "    fd = os.open(os.path.basename(sys.argv[1]),\n"
+    "                 os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)\n"
+    "except OSError:\n"
+    "    print('REFUSED')\n"
+    "else:\n"
+    "    os.close(fd)\n"
+    "    print('OPENED')\n"
+)
+
+
+def ownership_shape_reachable(host: Any, container: str) -> bool:
+    """Whether the ownership shape reaches the holder's ownership check here."""
+    record = _object(host, container)
+    if record.get("kind") != "regular":
+        return False
+    output = host.podman.exec(
+        container, ["python3", "-c", _OPEN_PROBE, LOCK_PATH], check=False,
+        timeout=SSH_TIMEOUT_SECONDS,
+    ).stdout
+    return output.strip() == "OPENED"
+
+
 def case_pair_lock(product: Any) -> Dict[str, Any]:
     """LOCK-01: an occupied pair refuses a second runner, and existence is not ownership."""
     host = _topology(product)
@@ -538,6 +574,7 @@ def case_lock_path(product: Any) -> Dict[str, Any]:
     containers = _containers(host)
     refused: Dict[str, str] = {}
     untouched: Dict[str, bool] = {}
+    skipped: List[str] = []
     with _pair(host) as (master, worker):
         shapes = (
             ("a symlink", f"the lock file {LOCK_PATH} is a symlink"),
@@ -555,6 +592,16 @@ def case_lock_path(product: Any) -> Dict[str, Any]:
                     for other in containers:
                         _clear_shape(host, other)
                     if not _write_shape(host, container, shape):
+                        skipped.append(f"{shape} on {container}: the host could not write it")
+                        continue
+                    if (
+                        shape == "a file owned by another user"
+                        and not ownership_shape_reachable(host, container)
+                    ):
+                        skipped.append(
+                            f"{shape} on {container}: the holder's own open refuses the "
+                            "object, so it never reads the owner"
+                        )
                         continue
                     before = _object(host, container)
                     attempt = RemotePairLock(master, worker, run_id="podman-lock-shape")
@@ -646,6 +693,10 @@ def case_lock_path(product: Any) -> Dict[str, Any]:
     return {
         "shapes_refused": len(refused),
         "shape_sentences": json.dumps(refused, sort_keys=True),
+        # A shape this contour cannot express counts as neither proved nor broken,
+        # so it is listed by name: the evidence has to show what was left out and
+        # why, rather than let a smaller `shapes_refused` read as a full sweep.
+        "shapes_skipped": json.dumps(sorted(skipped)),
         "objects_untouched": all(untouched.values()),
         "directory_symlink_refusal": directory_refusals[0] if directory_refusals else "",
         "directory_restored": True,

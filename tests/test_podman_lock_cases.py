@@ -796,6 +796,90 @@ class TestCaseGuards(CaseHarness, HolderCase, unittest.TestCase):
         )
 
 
+class TestOwnershipShapeCapability(CaseHarness, HolderCase, unittest.TestCase):
+    """Whether the ownership shape can reach the check it is supposed to prove.
+
+    With `fs.protected_regular=2` and a sticky, world-writable `/run/lock`, the
+    holder's `open` refuses another user's file before it reads the owner, so the
+    case would be reading a different sentence than the one it names. The probe
+    repeats the holder's own open, and the evidence names the shapes it left out
+    instead of counting them as refused.
+    """
+
+    def test_an_object_the_holder_can_open_reaches_the_ownership_check(self):
+        self.lock_file.write_text("", encoding="utf-8")
+        self.lock_file.chmod(0o600)
+        self.assertTrue(lock_cases.ownership_shape_reachable(self.host, MASTER_NAME))
+
+    def test_the_probe_opens_the_object_the_way_the_holder_does(self):
+        # The probe predicts which check refuses the object, so it is only right
+        # while it repeats the holder's own open: a holder that stops asking for
+        # `O_CREAT`, or opens the directory differently, moves the sentence the
+        # case reads without moving the decision that skipped it.
+        holder = preflight.LOCK_HOLDER_SCRIPT
+        for token in (
+            "os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW",
+            "os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW",
+        ):
+            with self.subTest(token=token):
+                self.assertEqual(holder.count(token), 1, f"the holder does not open with {token!r}")
+                self.assertEqual(
+                    lock_cases._OPEN_PROBE.count(token), 1,
+                    f"the probe does not open with {token!r}, so it answers a different "
+                    "question than the one the holder's open answers",
+                )
+
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "root opens any object, so an unreadable one cannot be expressed here",
+    )
+    def test_an_object_the_runner_cannot_open_is_not_reachable(self):
+        self.lock_file.write_text("", encoding="utf-8")
+        self.lock_file.chmod(0o000)
+        self.assertFalse(
+            lock_cases.ownership_shape_reachable(self.host, MASTER_NAME),
+            "the probe reports an unopenable object as reachable, so the ownership shape "
+            "would be asserted against a refusal that names the open instead",
+        )
+
+    def test_a_non_regular_object_is_never_reachable(self):
+        self.lock_file.mkdir()
+        self.assertFalse(lock_cases.ownership_shape_reachable(self.host, MASTER_NAME))
+
+    def test_a_shape_the_contour_cannot_express_is_named_not_counted(self):
+        writing = lock_cases._write_shape
+
+        def write(host, container, shape):
+            # A regular, runner-owned file stands in for the foreign object: the
+            # contours that can write the real shape skip it later, at the probe,
+            # so the contract under test is the same on both.
+            if shape != "a file owned by another user":
+                return writing(host, container, shape)
+            sandbox = self.sandboxes[container]
+            sandbox.lock_file.write_text("", encoding="utf-8")
+            sandbox.lock_file.chmod(0o600)
+            return True
+
+        with mock.patch.object(lock_cases, "_write_shape", write), mock.patch.object(
+            lock_cases, "ownership_shape_reachable", lambda *_args: False,
+        ):
+            facts = CASES[lock_cases.LOCK_PATH_CASE_ID](self.product)
+
+        skipped = json.loads(facts["shapes_skipped"])
+        self.assertTrue(
+            any("a file owned by another user" in entry for entry in skipped),
+            f"the skipped ownership shape is not named in {skipped!r}: a smaller count of "
+            "refusals would then read as a full sweep",
+        )
+        self.assertEqual(
+            facts["shapes_refused"], 8,
+            "a shape that was never exercised was counted as refused",
+        )
+        self.assertNotIn(
+            "a file owned by another user", json.loads(facts["shape_sentences"]),
+        )
+
+
 # ------------------------------------------------------------------- the plumbing
 
 
