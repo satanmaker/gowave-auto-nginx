@@ -1060,10 +1060,16 @@ class AioTopology:
             "DEBIAN_FRONTEND": "noninteractive",
         }
 
-    def install_script(self) -> str:
+    def install_script(self, vision_domain: Optional[str] = None) -> str:
+        """The operator's install command, optionally asking for another Vision domain.
+
+        ``None`` keeps the domain this topology was built with; a case that has to
+        make the Vision stage fail passes the name it wants attempted instead.
+        """
+        domain = self.vision_domain if vision_domain is None else vision_domain
         arguments = [self.panel_domain, self.reality_domain, self.admin_email]
-        if self.vision_domain:
-            arguments.append(self.vision_domain)
+        if domain:
+            arguments.append(domain)
         quoted = " ".join(f"'{value}'" for value in arguments)
         return f"bash {REPO_IN_CONTAINER}/gowave-auto.sh install {quoted}"
 
@@ -1080,8 +1086,17 @@ class AioTopology:
         """
         return self._install("aio-reinstall")
 
-    def _install(self, evidence_prefix: str) -> InstallOutcome:
-        script = self.install_script()
+    def install_vision_failure(self, vision_domain: str) -> InstallOutcome:
+        """Run the install once more asking for a Vision domain that cannot be issued.
+
+        The same operator command under its own evidence prefix: a failed attempt
+        is evidence in its own right, and it must not overwrite the log of the run
+        that installed the host.
+        """
+        return self._install("aio-vision-failure", vision_domain)
+
+    def _install(self, evidence_prefix: str, vision_domain: Optional[str] = None) -> InstallOutcome:
+        script = self.install_script(vision_domain)
         started = time.monotonic()
         proc = self.podman.exec_bash(
             self.target_name, script, check=False, timeout=INSTALL_TIMEOUT_SECONDS,

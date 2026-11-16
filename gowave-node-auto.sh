@@ -874,6 +874,41 @@ rollback_managed_deploy_hook() {
     local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
     if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
         if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            # A repeated install finds the hook an earlier transaction installed
+            # and this transaction never touched. The ownership records name that
+            # earlier transaction, so a hook that still hashes to what they
+            # recorded is provably the product's own and there is nothing here to
+            # undo: refusing would report an incomplete rollback, and demand
+            # manual recovery, for a failure that left no side effect behind.
+            if python3 - "$hook_file" "$recovery_root" <<'PY'
+import hashlib, json, os, sys
+hook, root = sys.argv[1], sys.argv[2]
+try:
+    with open(hook, "rb") as stream:
+        digest = hashlib.sha256(stream.read()).hexdigest()
+except OSError:
+    sys.exit(1)
+records = [os.path.join(root, "deploy-hook-ownership.json")]
+try:
+    records += [os.path.join(root, name, "deploy-hook-manifest.json")
+                for name in sorted(os.listdir(root))]
+except OSError:
+    pass
+for record in records:
+    try:
+        with open(record, encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        continue
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        continue
+    if data.get("path") == hook and data.get("sha256") == digest:
+        sys.exit(0)
+sys.exit(1)
+PY
+            then
+                return 0
+            fi
             echo "Error: Deploy hook exists without an ownership manifest; refusing to claim rollback succeeded." >&2
             return 1
         fi
@@ -1937,6 +1972,41 @@ rollback_managed_deploy_hook() {
     local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
     if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
         if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            # A repeated install finds the hook an earlier transaction installed
+            # and this transaction never touched. The ownership records name that
+            # earlier transaction, so a hook that still hashes to what they
+            # recorded is provably the product's own and there is nothing here to
+            # undo: refusing would report an incomplete rollback, and demand
+            # manual recovery, for a failure that left no side effect behind.
+            if python3 - "$hook_file" "$recovery_root" <<'PY'
+import hashlib, json, os, sys
+hook, root = sys.argv[1], sys.argv[2]
+try:
+    with open(hook, "rb") as stream:
+        digest = hashlib.sha256(stream.read()).hexdigest()
+except OSError:
+    sys.exit(1)
+records = [os.path.join(root, "deploy-hook-ownership.json")]
+try:
+    records += [os.path.join(root, name, "deploy-hook-manifest.json")
+                for name in sorted(os.listdir(root))]
+except OSError:
+    pass
+for record in records:
+    try:
+        with open(record, encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        continue
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        continue
+    if data.get("path") == hook and data.get("sha256") == digest:
+        sys.exit(0)
+sys.exit(1)
+PY
+            then
+                return 0
+            fi
             echo "Error: Deploy hook exists without an ownership manifest; refusing to claim rollback succeeded." >&2
             return 1
         fi
@@ -3192,6 +3262,41 @@ rollback_managed_deploy_hook() {
     local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
     if [[ ! -e "$manifest" && ! -L "$manifest" ]]; then
         if [[ -e "$hook_file" || -L "$hook_file" ]]; then
+            # A repeated install finds the hook an earlier transaction installed
+            # and this transaction never touched. The ownership records name that
+            # earlier transaction, so a hook that still hashes to what they
+            # recorded is provably the product's own and there is nothing here to
+            # undo: refusing would report an incomplete rollback, and demand
+            # manual recovery, for a failure that left no side effect behind.
+            if python3 - "$hook_file" "$recovery_root" <<'PY'
+import hashlib, json, os, sys
+hook, root = sys.argv[1], sys.argv[2]
+try:
+    with open(hook, "rb") as stream:
+        digest = hashlib.sha256(stream.read()).hexdigest()
+except OSError:
+    sys.exit(1)
+records = [os.path.join(root, "deploy-hook-ownership.json")]
+try:
+    records += [os.path.join(root, name, "deploy-hook-manifest.json")
+                for name in sorted(os.listdir(root))]
+except OSError:
+    pass
+for record in records:
+    try:
+        with open(record, encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        continue
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        continue
+    if data.get("path") == hook and data.get("sha256") == digest:
+        sys.exit(0)
+sys.exit(1)
+PY
+            then
+                return 0
+            fi
             echo "Error: Deploy hook exists without an ownership manifest; refusing to claim rollback succeeded." >&2
             return 1
         fi

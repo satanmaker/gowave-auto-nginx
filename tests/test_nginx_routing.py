@@ -857,6 +857,37 @@ class TestNginxRouting(unittest.TestCase):
             self.assertIn("digest mismatch", res_rollback.stderr)
             self.assertTrue(hook_file.is_file())
 
+    def test_deploy_hook_rollback_accepts_a_prior_transactions_hook(self):
+        """A failed repeat install owes nothing: the hook is the one it already had."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            hook_file = tmp / "renewal-hooks" / "deploy" / "gowave-nginx.sh"
+            rec_dir = tmp / "recovery"
+
+            first = f'source "{NGINX_SH}" && install_managed_deploy_hook "install_1" "{hook_file}" "{rec_dir}"'
+            res_first = subprocess.run(["bash", "-c", first], capture_output=True, text=True)
+            self.assertEqual(res_first.returncode, 0, res_first.stderr)
+            installed = hook_file.read_bytes()
+
+            # The repeat install fails before it touches the hook, so its own
+            # transaction never wrote a manifest. Refusing here would report an
+            # incomplete rollback for a failure that left no side effect behind.
+            cmd_rollback = f'source "{NGINX_SH}" && rollback_managed_deploy_hook "install_2" "{hook_file}" "{rec_dir}"'
+            res_rollback = subprocess.run(["bash", "-c", cmd_rollback], capture_output=True, text=True)
+            self.assertEqual(res_rollback.returncode, 0, res_rollback.stderr)
+            self.assertEqual(hook_file.read_bytes(), installed)
+            self.assertTrue((rec_dir / "deploy-hook-ownership.json").is_file())
+
+            # The recognition is by recorded digest, not by path: a hook nobody
+            # recorded stays a refusal under the same transaction id.
+            foreign = tmp / "unmanaged" / "gowave-nginx.sh"
+            foreign.parent.mkdir(parents=True)
+            foreign.write_text("#!/bin/sh\necho foreign\n")
+            cmd_foreign = f'source "{NGINX_SH}" && rollback_managed_deploy_hook "install_2" "{foreign}" "{rec_dir}"'
+            res_foreign = subprocess.run(["bash", "-c", cmd_foreign], capture_output=True, text=True)
+            self.assertNotEqual(res_foreign.returncode, 0)
+            self.assertIn("exists without an ownership manifest", res_foreign.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

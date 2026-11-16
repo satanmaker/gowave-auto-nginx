@@ -3930,6 +3930,191 @@ def case_public_dependency(product: AioProduct) -> Dict[str, Any]:
     }
 
 
+VISION_FAILURE_CASE_ID = "VIS-05"
+# A name inside the fixture zone that the zone deliberately does not answer: the
+# install asks the ACME fixture to validate it, the fixture answers NXDOMAIN, and
+# the Vision stage that owns the name is the one that fails. Nothing else in the
+# attempt differs from the install that already succeeded on this host.
+VISION_FAILURE_DOMAIN = "vision-failed.testbed.internal"
+# The failed attempt repeats the operator's install, so it runs the same stages
+# and gets the same hang ceiling rather than a shorter one that would read a slow
+# package step as a defect.
+VISION_FAILURE_TIMEOUT_SECONDS = INSTALL_TIMEOUT_SECONDS
+
+
+def vision_failure_inventory(host: Any, domain: str) -> str:
+    """The files a failed Vision stage must leave exactly as it found them.
+
+    Every value is a digest or a single word, because the case compares two runs
+    of this script and a prose answer cannot be compared. The lineages are the
+    certificate material the rollback has to preserve, the deploy hook and its
+    ownership record are the two files the ACME stage owns, and the NGINX digests
+    are the tree a half-applied Vision route would show up in.
+    """
+    lineages = [("panel", host.panel_domain), ("reality", host.reality_domain)]
+    if host.vision_domain:
+        lineages.append(("vision", host.vision_domain))
+    script = [
+        "set -uo pipefail",
+        "digest_of() {",
+        '    if [[ -f "$1" ]]; then sha256sum -- "$1" | cut -d" " -f1; else printf absent; fi',
+        "}",
+        "lineage_digest() {",
+        '    local live="/etc/letsencrypt/live/$1"',
+        '    if [[ -f "$live/fullchain.pem" && -f "$live/privkey.pem" ]]; then',
+        '        cat "$live/fullchain.pem" "$live/privkey.pem" | sha256sum | cut -d" " -f1',
+        "    else",
+        "        printf absent",
+        "    fi",
+        "}",
+    ]
+    for role, name in lineages:
+        script.append(f'echo "lineage_{role}=$(lineage_digest {shlex.quote(name)})"')
+    failed = shlex.quote(domain)
+    script += [
+        f"if [[ -e /etc/letsencrypt/renewal/{domain}.conf"
+        f" || -d /etc/letsencrypt/live/{domain} || -d /etc/letsencrypt/archive/{domain} ]]; then",
+        '    echo "failed_lineage=present"',
+        "else",
+        '    echo "failed_lineage=absent"',
+        "fi",
+        'echo "deploy_hook=$(digest_of /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh)"',
+        'echo "ownership_record=$(digest_of /var/lib/gowave-auto-nginx/recovery/deploy-hook-ownership.json)"',
+        'echo "stream_config=$(digest_of /etc/nginx/stream-enabled/gowave-stream.conf)"',
+        'echo "http_vhost=$(digest_of /etc/nginx/conf.d/gowave-http.conf)"',
+        'if [[ -e /etc/nginx/conf.d/gowave-vision-fallback.conf ]]; then',
+        '    echo "vision_fallback=present"',
+        "else",
+        '    echo "vision_fallback=absent"',
+        "fi",
+        'if [[ -e /etc/nginx/conf.d/00-bootstrap-acme.conf ]]; then',
+        '    echo "bootstrap_vhost=present"',
+        "else",
+        '    echo "bootstrap_vhost=absent"',
+        "fi",
+        f'echo "failed_domain_mentions=$(grep -rF -- {failed} /etc/nginx/stream-enabled'
+        ' /etc/nginx/conf.d 2>/dev/null | wc -l)"',
+        'echo "nginx_active=$(systemctl is-active nginx 2>/dev/null || true)"',
+        'if nginx -t -q >/dev/null 2>&1; then echo "nginx_test=0"; else echo "nginx_test=1"; fi',
+    ]
+    return "\n".join(script) + "\n"
+
+
+def vision_failure_facts(product: AioProduct, host: Any, domain: str) -> Dict[str, str]:
+    result = product.host_script(vision_failure_inventory(host, domain))
+    require(VISION_FAILURE_CASE_ID, result.returncode == 0,
+            f"the Vision-failure inventory probe exited {result.returncode}: "
+            f"{(result.stderr or result.stdout or '').strip()[-800:]}")
+    return _parse_key_values(result.stdout or "")
+
+
+def case_vision_certificate_failure(product: AioProduct) -> Dict[str, Any]:
+    """VIS-05: a Vision certificate failure aborts the attempt and leaves nothing behind.
+
+    The attempt is the operator's own install command, repeated on a host that
+    already carries the product, asking for a Vision domain the fixture resolver
+    deliberately does not answer. That puts the failure in the Vision stage — the
+    sentence this case is about — and it puts the failure after the Panel and
+    REALITY lineages were already in place, so a rollback that deleted them shows
+    up as a changed digest instead of as a file nobody expected to find.
+
+    Both halves are asserted. The stage has to fail: a nonzero exit whose last
+    word is the Vision acquisition, followed by a rollback that reports itself
+    complete. And it has to leave nothing advertising the endpoint: no lineage for
+    the failed name, no deploy-hook or ownership change, no NGINX file rewritten,
+    no bootstrap vhost left behind, no Panel inventory change, and the Panel still
+    answering the request the failed attempt did not take down.
+    """
+    host = product.require_installed()
+    before = vision_failure_facts(product, host, VISION_FAILURE_DOMAIN)
+    require(VISION_FAILURE_CASE_ID, before.get("lineage_panel") not in (None, "", "absent"),
+            f"the installed host carries no Panel lineage for the rollback to preserve: "
+            f"{before.get('lineage_panel')!r}")
+    require(VISION_FAILURE_CASE_ID, before.get("lineage_reality") not in (None, "", "absent"),
+            "the installed host carries no REALITY lineage for the rollback to preserve")
+    require(VISION_FAILURE_CASE_ID, before.get("failed_lineage") == "absent",
+            f"the host already has a lineage for {VISION_FAILURE_DOMAIN}, so a rollback could not "
+            "be told from an attempt that never issued anything")
+    require(VISION_FAILURE_CASE_ID, before.get("deploy_hook") not in (None, "", "absent"),
+            "the host carries no managed deploy hook, so the ACME stage owes nothing to restore")
+    require(VISION_FAILURE_CASE_ID, before.get("nginx_active") == "active",
+            f"NGINX reports {before.get('nginx_active')!r} before the failed attempt")
+    baseline = (_panel_facts(product, VISION_FAILURE_CASE_ID, "surface") or {}).get("surface") or {}
+
+    attempt = host.install_vision_failure(VISION_FAILURE_DOMAIN)
+    output = f"{attempt.stdout}\n{attempt.stderr}"
+    require(VISION_FAILURE_CASE_ID, not attempt.ok,
+            f"the install asking for a Vision domain that cannot be validated exited 0:\n"
+            f"{attempt.tail(4000)}")
+    require(VISION_FAILURE_CASE_ID,
+            f"Acquiring Let's Encrypt TLS certificate for VLESS Vision ({VISION_FAILURE_DOMAIN})"
+            in output,
+            "the attempt never reached the Vision certificate stage, so the failure measured here "
+            f"is not the one this case is about:\n{attempt.tail(4000)}")
+    require(VISION_FAILURE_CASE_ID, "ACME certificate lineage rollback completed successfully." in output,
+            "the failed Vision stage did not report a complete lineage rollback:\n"
+            + attempt.tail(4000))
+    require(VISION_FAILURE_CASE_ID, "CRITICAL: ACME rollback incomplete" not in output,
+            "the failed Vision stage reported an incomplete rollback, so a side effect of the "
+            f"attempt survived it:\n{attempt.tail(4000)}")
+
+    after = vision_failure_facts(product, host, VISION_FAILURE_DOMAIN)
+    for role in ("panel", "reality", "vision"):
+        was, now = before.get(f"lineage_{role}"), after.get(f"lineage_{role}")
+        require(VISION_FAILURE_CASE_ID, was == now,
+                f"the rollback changed the pre-existing {role} certificate lineage: {was} -> {now}")
+    require(VISION_FAILURE_CASE_ID, after.get("failed_lineage") == "absent",
+            f"the failed attempt left a certificate lineage for {VISION_FAILURE_DOMAIN}")
+    require(VISION_FAILURE_CASE_ID, after.get("deploy_hook") == before.get("deploy_hook"),
+            "the failed attempt changed or removed the managed deploy hook")
+    require(VISION_FAILURE_CASE_ID, after.get("ownership_record") == before.get("ownership_record"),
+            "the failed attempt rewrote the deploy-hook ownership record")
+    require(VISION_FAILURE_CASE_ID, after.get("stream_config") == before.get("stream_config"),
+            "the failed attempt rewrote the stream SNI map")
+    require(VISION_FAILURE_CASE_ID, after.get("http_vhost") == before.get("http_vhost"),
+            "the failed attempt rewrote the HTTP vhost")
+    require(VISION_FAILURE_CASE_ID, after.get("failed_domain_mentions") in ("0", 0),
+            f"the failed attempt left {after.get('failed_domain_mentions')!r} reference(s) to "
+            f"{VISION_FAILURE_DOMAIN} in the NGINX tree")
+    require(VISION_FAILURE_CASE_ID, after.get("vision_fallback") == before.get("vision_fallback"),
+            "the failed attempt created or removed the 9444 fallback vhost")
+    require(VISION_FAILURE_CASE_ID, after.get("bootstrap_vhost") == before.get("bootstrap_vhost"),
+            "the failed attempt left a bootstrap ACME vhost behind")
+    require(VISION_FAILURE_CASE_ID, after.get("nginx_active") == "active",
+            f"NGINX reports {after.get('nginx_active')!r} after the failed attempt")
+    require(VISION_FAILURE_CASE_ID, after.get("nginx_test") == "0",
+            "the configuration in force does not pass `nginx -t` after the failed attempt")
+
+    current = (_panel_facts(product, VISION_FAILURE_CASE_ID, "surface") or {}).get("surface") or {}
+    for area in ("nodes", "profiles", "squads", "hosts"):
+        was = (baseline.get(area) or {}).get("count")
+        now = (current.get(area) or {}).get("count")
+        require(VISION_FAILURE_CASE_ID, was == now,
+                f"the failed attempt changed the Panel's {area} inventory: {was} -> {now}")
+
+    public = host.client_http(f"{PUBLIC_PANEL}/", expect_status=200, timeout=30)
+    require(VISION_FAILURE_CASE_ID, public["returncode"] == 0,
+            "the Panel's public surface stopped answering after the failed attempt: "
+            f"{public['probe'].get('error')}")
+    loopback = _parse_key_values(product.host_script(panel_probe_script()).stdout or "")
+    require(VISION_FAILURE_CASE_ID, loopback.get("login") == "200",
+            f"the Panel's own API stopped answering after the failed attempt: "
+            f"login {loopback.get('login')!r}")
+    return {
+        "attempt_returncode": attempt.returncode,
+        "attempt_seconds": round(attempt.duration, 1),
+        "vision_stage": "reached",
+        "rollback": "complete",
+        "failed_lineage": after.get("failed_lineage"),
+        "lineage_panel": after.get("lineage_panel") == before.get("lineage_panel"),
+        "lineage_reality": after.get("lineage_reality") == before.get("lineage_reality"),
+        "deploy_hook": after.get("deploy_hook") == before.get("deploy_hook"),
+        "failed_domain_mentions": after.get("failed_domain_mentions"),
+        "bootstrap_vhost": after.get("bootstrap_vhost"),
+        "public_panel": public["probe"].get("status"),
+    }
+
+
 def nginx_config_facts(
     podman: Any, container: str, case_id: str, mode: str, primary_domain: str,
     timeout: int = NGX_CONFIG_PROBE_TIMEOUT_SECONDS,
@@ -8233,6 +8418,11 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case("AIO-NEG-PIN", "aio", lambda context: case_installer_pin(product), timeout_seconds=300),
         Case("AIO-NEG-DEP", "aio", lambda context: case_public_dependency(product),
              timeout_seconds=RECOVERY_TIMEOUT_SECONDS + 300),
+        # Beside the other failure paths, and before the channel cases: it runs a
+        # second install that is meant to fail, so it must never be measured
+        # across a switch and must never be the case a switch is measured across.
+        Case(VISION_FAILURE_CASE_ID, "aio", lambda context: case_vision_certificate_failure(product),
+             timeout_seconds=VISION_FAILURE_TIMEOUT_SECONDS),
         # The channel cases come last because a switch restarts the Panel, and an
         # earlier case must never be measured across one. Their own order is the
         # contract: the same-channel no-op is proven before anything mutates the

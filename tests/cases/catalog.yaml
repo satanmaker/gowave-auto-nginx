@@ -607,8 +607,22 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_vision_certificate_failure
+      evidence:
+      - attempt_returncode
+      - attempt_seconds
+      - bootstrap_vhost
+      - deploy_hook
+      - failed_domain_mentions
+      - failed_lineage
+      - lineage_panel
+      - lineage_reality
+      - public_panel
+      - rollback
+      - vision_stage
   promotion_target: null
 - id: VIS-06
   requirement: Independent Optional Vision Domains

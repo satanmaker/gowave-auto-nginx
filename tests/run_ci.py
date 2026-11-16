@@ -51,6 +51,7 @@ SUITES = {
         "test_podman_aio.TestRestartCase",
         "test_podman_aio.TestIdempotentCase",
         "test_podman_aio.TestNegativeCases",
+        "test_podman_aio.TestVisionFailureCase",
         "test_podman_aio.TestFaultCases",
         "test_podman_aio.TestBackupStoreFullCase",
         "test_podman_aio.TestNginxConfigCase",
