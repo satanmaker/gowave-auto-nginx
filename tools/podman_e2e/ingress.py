@@ -74,20 +74,28 @@ class Host:
 
 
 def listener_port(inbound: Dict[str, Any]) -> int:
-    """The public port the inbound's listener is declared on, from the matrix.
+    """The port a client dials for this inbound, read from its Host record.
 
-    The matrix is where a tuple's transport is stated, so the port the capture
-    filters on is read from the same declaration the product was installed from:
-    a manifest that moves an inbound to another port moves the filter with it
-    instead of leaving the filter pointing at a port nothing uses.
+    The matrix states two ports for a tuple and they are not the same fact. Its
+    ``listener`` is the port the inbound's own core binds — Vision terminates TLS
+    on 8443 inside the node — while ``host_record.port`` is what the Host record
+    publishes and a client dials, which is 443 for every tuple because NGINX
+    demultiplexes the stream by SNI. A capture filtered on the listener would
+    watch a port no client touches and report an empty account for a request
+    that arrived, so the port is read from the record the client was issued; a
+    tuple that publishes none is refused rather than guessed at from its
+    listener, because guessing is what turns a measured request into a silent
+    one.
     """
-    declared = str(inbound.get("listener") or "")
-    port = declared.partition("/")[0].strip()
+    record = inbound.get("host_record")
+    published = record.get("port") if isinstance(record, dict) else None
+    port = str(published if published is not None else "").strip()
     if not port.isdigit() or not 1 <= int(port) <= 65535:
         raise IngressUnavailable(
             "no_endpoint_port",
-            f"the inbound {inbound.get('id')!r} declares listener {declared!r}, so the capture "
-            "has no destination port to filter on",
+            f"the inbound {inbound.get('id')!r} publishes host_record.port {published!r} and "
+            f"declares listener {inbound.get('listener')!r}, so the capture has no destination "
+            "port to filter on",
         )
     return int(port)
 
