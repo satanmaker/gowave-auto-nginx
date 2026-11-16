@@ -2903,10 +2903,16 @@ compensate_remote_worker() {
     # 1. Stop and remove GoWave Node and Xray systemd services
     if [[ "${_NODE_SERVICE_CONFIGURED:-0}" -eq 1 ]] || systemctl list-unit-files gowave-node.service 2>/dev/null | grep -q gowave-node; then
         echo "[ROLLBACK] Stopping and disabling gowave-node.service and drop-ins..." >&2
-        systemctl stop gowave-node.service 2>/dev/null || rollback_failed=1
-        systemctl disable gowave-node.service 2>/dev/null || rollback_failed=1
-        systemctl stop xray.service 2>/dev/null || rollback_failed=1
-        systemctl disable xray.service 2>/dev/null || rollback_failed=1
+        # Xray is supervised by gowave-node in this product and the upstream
+        # installer may leave no unit of its own, so an absent unit is a clean
+        # host rather than a failed cleanup: only a unit that exists is stopped.
+        for unit in gowave-node.service xray.service; do
+            if systemctl list-unit-files "$unit" --no-legend 2>/dev/null | grep -q "^$unit" ||
+                systemctl is-active --quiet "$unit" 2>/dev/null; then
+                systemctl stop "$unit" 2>/dev/null || rollback_failed=1
+                systemctl disable "$unit" 2>/dev/null || rollback_failed=1
+            fi
+        done
         rm -rf /etc/systemd/system/gowave-node.service.d || rollback_failed=1
         rm -f /etc/systemd/system/gowave-node.service /etc/systemd/system/remnanode.service || rollback_failed=1
         systemctl daemon-reload 2>/dev/null || rollback_failed=1
@@ -3424,9 +3430,10 @@ try:
         raise ValueError("certificate metadata must be strings")
     if existed and (not serial or not fingerprint):
         raise ValueError("pre-existing lineage snapshot lacks certificate identity")
-    print("1" if existed else "0")
-    print(serial)
-    print(fingerprint)
+    # One tab-separated line: a lineage that did not exist before has an empty
+    # serial and fingerprint, and two blank lines would collapse under the
+    # command substitution, leaving the reader one field where it expects three.
+    print("\t".join(("1" if existed else "0", serial, fingerprint)))
 except Exception as exc:
     print(f"Invalid ACME lineage manifest: {type(exc).__name__}", file=sys.stderr)
     sys.exit(1)
@@ -3437,15 +3444,11 @@ PY
     }
 
     local existed serial fingerprint
-    local -a manifest_fields=()
-    mapfile -t manifest_fields <<< "$manifest_data"
-    if [[ "${#manifest_fields[@]}" -ne 3 ]]; then
+    if ! IFS=$'\t' read -r existed serial fingerprint <<< "$manifest_data" ||
+        [[ "$manifest_data" != *$'\t'*$'\t'* ]]; then
         echo "Error: ACME lineage manifest has an invalid field count for $domain." >&2
         return 1
     fi
-    existed="${manifest_fields[0]}"
-    serial="${manifest_fields[1]}"
-    fingerprint="${manifest_fields[2]}"
 
     local renewal_conf="${letsencrypt_root}/renewal/${domain}.conf"
     local live_dir="${letsencrypt_root}/live/${domain}"
