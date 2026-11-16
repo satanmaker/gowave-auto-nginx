@@ -910,6 +910,32 @@ class TestLockRegistration(unittest.TestCase):
                     f"lock_cases:{function.__name__}",
                 )
 
+    def test_each_registered_case_is_handed_the_product_not_the_run_context(self):
+        # The runner calls ``case.run(context)``, while a driver needs the two
+        # hosts. Every other Multi-Node case closes over its product in a lambda
+        # for that reason; a raw function reference would be handed the run
+        # context and fail at the first host attribute instead of here.
+        from tools.podman_e2e import multi_node
+
+        stub = types.SimpleNamespace(context=types.SimpleNamespace(topology="multi-node"))
+        suite = {case.id: case for case in multi_node.cases(stub)}
+        context = types.SimpleNamespace(topology="multi-node")
+        for case_id, function in CASES.items():
+            with self.subTest(case_id=case_id):
+                received = []
+                with mock.patch.object(
+                    lock_cases, function.__name__,
+                    lambda product: received.append(product) or {},
+                ):
+                    suite[case_id].run(context)
+                self.assertEqual(len(received), 1, f"{case_id} did not call its driver once")
+                self.assertIsNot(
+                    received[0], context,
+                    f"{case_id} handed its driver the run context, which has no "
+                    "containers to drive",
+                )
+                self.assertIsInstance(received[0], multi_node.MultiNodeProduct)
+
     def test_the_catalog_entry_is_what_the_registry_derives(self):
         registry = catalog.driver_registry()
         entries = {entry["id"]: entry for entry in catalog.load_catalog()["cases"]}
