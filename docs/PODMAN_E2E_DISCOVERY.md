@@ -605,6 +605,25 @@ it stays green, which is the deliberate difference from the live runner's
 treatment of `SKIP`. A `SKIP` in this suite means a declared case did not execute,
 and the aggregate refuses it outright.
 
+### The negative suite: the four sentences a container cannot own
+
+`openspec/specs/live-vps-e2e/spec.md` §Negative Scenario and Fault Injection
+Tests states a fifteen-row fault matrix and then two sentences about the suite
+that runs it. The rows are witnessed one case per sentence — `PRE-01`, `PRE-02`,
+`PRE-03`, `PRE-05`, `ADDR-01`, `AIO-NEG-ACME`, `NGX-05`, `MN-OUTAGE`,
+`SUB-UA-ABSENT`, `MTLS-04` and `MN-BACKUP-BAD` among them, with the rows still
+without a driver named by `python3 -m tools.podman_e2e.catalog gaps`. What no run
+can own is the conjunction over the rows, and the live reporter's negative phase
+and its `INCOMPLETE` verdict for a skip: those four entries are `partial`, and
+this table states where the halves differ.
+
+| Live scenario | Container case | Where the two differ |
+| --- | --- | --- |
+| `Matrix of fifteen fault scenarios verified (NEG-01..NEG-15)` | none — one case per row, as the rows land | The container witnesses each row where its fault happens and records the boundary it stopped at. "All 15 scenarios terminate at their designated boundaries" is a statement about the suite's case list, which `catalog gaps` and the divergence tables audit; no single case can read its siblings' verdicts. |
+| `Preflight, lifecycle, and protocol scenarios verified (NEG-01..NEG-10)` | none — the ten rows' own cases | The ten rows are driven the same way, including the timeout bounds `MN-OUTAGE` records as `offline_seconds` and `control_plane_seconds`. The conjunction over them, and "within configured timeouts" as a whole-suite claim, are properties of the run rather than of one case. |
+| `Negative suite PASS requires all fifteen scenarios to pass` | `GATE-STATUS` | The case drives the real `Runner` over declared ids and requires a non-PASS to keep the aggregate off `PASS`, naming each failing id. The live sentence names a `negative_tests` field, and the `NOT_RUN` and `PARTIAL` states, that this report does not have; and where it asks a skip to be `INCOMPLETE`, this aggregate turns a skipped declared case into `FAIL`. |
+| `Negative suite cannot be silently skipped for a passing run` | `GATE-STATUS` | The case requires that a declared case recorded `SKIP` beside a passing one cannot be green, which is the load-bearing half. The negative phase the sentence names, and its `INCOMPLETE` verdict, are live-only: this suite has no switch that disables a phase, and its aggregate is deliberately stricter than the live reporter. |
+
 ### The pair-wide lock: one run, both hosts, and the lease that names them
 
 `openspec/specs/live-vps-e2e/spec.md` §Pair-Wide Run Locking and §Shared Mutation
@@ -789,20 +808,20 @@ than a sentence in a document. The catalog holds 227 entries:
 
 | Environment | Entries | Which contour answers it |
 | --- | ---: | --- |
-| `container` | 217 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
-| `partial` | 8 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
+| `container` | 213 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
+| `partial` | 12 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
 | `live-only` | 2 | Only the live suite. Every Podman run reports both as justified exclusions, and `tools/podman_e2e/catalog.py` refuses a catalog that lets one run here. |
 
-Of the 125 live scenarios projected into this catalog, 115 are container, 8 are
+Of the 125 live scenarios projected into this catalog, 111 are container, 12 are
 partial and 2 are live-only; the other 102 entries are Podman-first cases with a
 promotion target, which `tests/cases/PARITY.md` lists separately.
 
-The ten entries that are not fully container-answerable are, by id: `PRE-04`,
-`FW-03`, `DP-09`, `DP-10`, `DP-11`, `TD-05`, `BOOT-01`, `BOOT-02` (partial) and
-`TD-06`, `LOCAL-02` (live-only). Their reasons are not restated here:
-`tests/cases/PARITY.md` is regenerated from the catalog, and the guard on this
-page compares both lists, so an id that changes section in the catalog has to
-change here as well.
+The fourteen entries that are not fully container-answerable are, by id:
+`PRE-04`, `FW-03`, `DP-09`, `DP-10`, `DP-11`, `TD-05`, `BOOT-01`, `BOOT-02`,
+`NEG-01`, `NEG-04`, `NEG-07`, `NEG-08` (partial) and `TD-06`, `LOCAL-02`
+(live-only). Their reasons are not restated here: `tests/cases/PARITY.md` is
+regenerated from the catalog, and the guard on this page compares both lists, so
+an id that changes section in the catalog has to change here as well.
 
 The QEMU contour answers a question none of those entries ask: whether the
 units the product writes survive a real cold boot under a genuine systemd PID 1.

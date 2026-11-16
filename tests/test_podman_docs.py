@@ -1770,9 +1770,9 @@ class TestContourBoundary(unittest.TestCase):
     """Podman, QEMU and Live VPS each answer a different question.
 
     Every catalog entry carries an `environment`, so the boundary is data, not
-    prose. This class recomputes the counts and the ten non-container ids from
-    the catalog and from the generated `tests/cases/PARITY.md`, and refuses a
-    page or a design note that quotes a different set. The QEMU contour is read
+    prose. This class recomputes the counts and the fourteen non-container ids
+    from the catalog and from the generated `tests/cases/PARITY.md`, and refuses
+    a page or a design note that quotes a different set. The QEMU contour is read
     from its own script: if it ever gained an installer call or a catalog id,
     the claim that it checks the units without exercising the product would be
     false.
@@ -1786,7 +1786,7 @@ class TestContourBoundary(unittest.TestCase):
         for case in catalog["cases"]:
             environments[case["environment"]] = environments.get(case["environment"], 0) + 1
         self.assertEqual(len(catalog["cases"]), 227, "the catalog changed size; the page quotes its total")
-        self.assertEqual(environments, {"container": 217, "partial": 8, "live-only": 2})
+        self.assertEqual(environments, {"container": 213, "partial": 12, "live-only": 2})
         self.assertIn(f"The catalog holds {len(catalog['cases'])} entries",
                       " ".join(boundary_section().split()),
                       "the page states a total the catalog does not have")
@@ -1838,8 +1838,8 @@ class TestContourBoundary(unittest.TestCase):
         self.assertEqual(named & catalogued, expected["partial"] | expected["live-only"],
                          "the page names a case id that is not on the boundary, or omits one that is")
         total = len(expected["partial"]) + len(expected["live-only"])
-        self.assertEqual(total, 10)
-        self.assertIn("The ten entries that are not fully container-answerable",
+        self.assertEqual(total, 14)
+        self.assertIn("The fourteen entries that are not fully container-answerable",
                       " ".join(page.split()),
                       "the page stopped counting the boundary entries")
 
