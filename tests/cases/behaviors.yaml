@@ -433,12 +433,17 @@ behaviors:
     area: lifecycle
     description: >-
       A runner-owned nested command keeps exclusivity through its lease, a
-      second control machine cannot acquire an occupied host, a lost lock-holder
-      session fails closed, and an unsafe lock path is refused before mutation.
+      second control machine cannot acquire an occupied host and is refused with
+      the path it was refused on while the owner's published leases stay
+      untouched, a lost lock-holder session fails closed and gates every
+      mutating phase as INCOMPLETE while a read-only phase may still report, and
+      an unsafe lock path — a link, a directory, a FIFO, a broad mode or another
+      owner — is refused before either host is modified rather than followed,
+      replaced or removed.
     topology: [multi-node]
     gate: pre-push
-    cases: [MLOCK-02]
-    error_paths: [LOCK-01, LOCK-02, MLOCK-01, MLOCK-03]
+    cases: [MN-LOCK, MLOCK-02]
+    error_paths: [MN-LOCK-LOSS, MN-LOCK-PATH, LOCK-01, LOCK-02, MLOCK-01, MLOCK-03]
 
   - name: Diagnostics land in a run-owned root with the secrets removed
     area: lifecycle

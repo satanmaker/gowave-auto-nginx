@@ -522,6 +522,32 @@ cases_by_requirement:
       `_bootstrap_one` — the order being read from both modules' own source.
       What the delta spec states about all eight is the parity sentence itself,
       a Podman case for every container-reproducible live scenario
+  - requirement: Live scenario parity
+    cases: [MN-LOCK, MN-LOCK-LOSS, MN-LOCK-PATH]
+    reason: >-
+      all three serve the same parity sentence for the two live requirements the
+      delta spec writes no scenario about: the pair-wide lock a run holds over
+      both hosts, and the one lock every management entry point has to take.
+      MN-LOCK is the exclusivity sentence — a second runner is refused before
+      either host is modified, by a sentence naming the held lock path, keeps no
+      lease, and leaves the owner's published leases exactly as they were, run id
+      and holder pid and token alike; the lock file outlives its holder, so once
+      the owner releases a fresh runner takes both hosts with different tokens
+      and the product's own `validate_mutation_lease` accepts the new holder's
+      lease while refusing the released one. MN-LOCK-LOSS is the fail-closed
+      sentence: one session's holder is terminated inside the host as a dropped
+      connection ends it, the runner stops reporting both sessions alive, every
+      mutating phase is then gated `INCOMPLETE` naming the lost lock while a
+      read-only phase still reports, a contender that wins the freed host
+      releases it when the other refuses so no run holds half the pair, and
+      resuming means reacquiring both locks and revalidating the saved state
+      rather than trying again. MN-LOCK-PATH is the refusal-before-mutation
+      sentence of the entry-point requirement: a lock file that is a symlink, a
+      directory, a FIFO, group-readable or owned by another user, and a lock
+      directory that is itself a symlink, are each refused with the host address
+      and the object named, the object is then found untouched and the pair-wide
+      lock still free — each shape read on the host that was refused, and both
+      hosts cleared first so the refusal cannot be the other host's leftover
 
 # What the published report has to cover, one declaration at a time. A plain
 # path is met by any behaviour that quotes it; `every_value` makes every element

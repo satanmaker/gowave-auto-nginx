@@ -902,11 +902,13 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
                 GOWAVE_NODE_INSTALLER_COMMIT="${GOWAVE_NODE_INSTALLER_COMMIT:-}" \
                 GOWAVE_NODE_INSTALLER_SHA256="${GOWAVE_NODE_INSTALLER_SHA256:-}" \
                 VISION_DOMAIN="$vision_domain" \
+                GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
                 SSH_KNOWN_HOSTS="$known_hosts" "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
                 echo "Remote Worker deployment failed; rolling back Worker host configuration and Panel API entities." >&2
                 local rollback_failed=0
                 if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
                     VISION_DOMAIN="$vision_domain" \
+                    GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
                     "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
                     echo "CRITICAL: Remote Worker host rollback failed; manual inspection required." >&2
                     rollback_failed=1
@@ -942,6 +944,7 @@ write_journal_atomically('$JOURNAL_FILE', jdata)
                 local rollback_failed=0
                 if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
                     VISION_DOMAIN="$vision_domain" \
+                    GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
                     "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
                     echo "CRITICAL: Remote Worker rollback after commit-record failure was incomplete." >&2
                     rollback_failed=1
@@ -1020,6 +1023,7 @@ for n in data.get('nodes', []):
             local node_port=3002
             PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
                 VISION_DOMAIN="$vision_domain" \
+                GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
                 "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"
             ;;
         reapply)
@@ -1140,6 +1144,7 @@ PY
                 GOWAVE_NODE_INSTALLER_COMMIT="${GOWAVE_NODE_INSTALLER_COMMIT:-}" \
                 GOWAVE_NODE_INSTALLER_SHA256="${GOWAVE_NODE_INSTALLER_SHA256:-}" \
                 VISION_DOMAIN="$vision_domain" \
+                GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
                 SSH_KNOWN_HOSTS="$known_hosts" "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
                 echo "Error: re-applying Worker '$name' failed; its Panel registration is unchanged." >&2
                 return 1

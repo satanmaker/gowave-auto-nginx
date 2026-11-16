@@ -7,8 +7,8 @@ counts:
   container: 115
   partial: 8
   live_only: 2
-  podman_first: 95
-  total: 220
+  podman_first: 98
+  total: 223
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -4135,8 +4135,21 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: lock_cases:case_pair_lock
+      evidence:
+      - intruder_leases
+      - intruder_refusal
+      - lease_after_refusal
+      - live_lease_accepted
+      - lock_file_after_release
+      - owner_leases
+      - owner_run_id
+      - reacquired_leases
+      - stale_lease_rejected
+      case: MN-LOCK
   promotion_target: null
 - id: LOCK-02
   requirement: Pair-Wide Run Locking
@@ -4161,8 +4174,22 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: lock_cases:case_lock_loss
+      evidence:
+      - contender_refusal
+      - live_lease_accepted
+      - lost_lease_rejected
+      - mutating_gate_error
+      - mutating_gate_status
+      - reacquired_leases
+      - read_only_gate_ok
+      - released_partial_acquisition
+      - session_loss_detected
+      - terminated_holder
+      case: MN-LOCK-LOSS
   promotion_target: null
 - id: MLOCK-01
   requirement: Shared Mutation Lock Across All Management Entry Points
@@ -4237,8 +4264,18 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: lock_cases:case_lock_path
+      evidence:
+      - control_acquired
+      - directory_restored
+      - directory_symlink_refusal
+      - objects_untouched
+      - shape_sentences
+      - shapes_refused
+      case: MN-LOCK-PATH
   promotion_target: null
 - id: STATE-01
   requirement: Durable Run State for Partial CLI Modes
@@ -6129,6 +6166,100 @@ cases:
       evidence:
       - roles
   promotion_target: Signal-Safe and Verifiable Transaction Compensation
+- id: MN-LOCK
+  requirement: Pair-Wide Run Locking
+  live_scenario: null
+  assertion: While one runner holds both hosts, a second runner is refused before either host is modified
+    with a sentence naming the held lock path, keeps no lease, and leaves the owner's published leases
+    — run id, host address, live holder pid and token — exactly as they were; the lock file outlives its
+    holder, so after the owner releases a fresh runner acquires both hosts with different tokens, the
+    product's own `validate_mutation_lease` accepts the new holder's lease and refuses the released holder's,
+    which is what distinguishes a held lock from a lock file that merely exists.
+  assertion_sha256: 367612c54ebb8b6a3cf3eb5b54e456ab8c3f5fa10947f7f3eeead00dc835a654
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: lock_cases:case_pair_lock
+      evidence:
+      - intruder_leases
+      - intruder_refusal
+      - lease_after_refusal
+      - live_lease_accepted
+      - lock_file_after_release
+      - owner_leases
+      - owner_run_id
+      - reacquired_leases
+      - stale_lease_rejected
+  promotion_target: Pair-Wide Run Locking
+- id: MN-LOCK-LOSS
+  requirement: Pair-Wide Run Locking
+  live_scenario: null
+  assertion: 'A lock-holder session lost on either host fails closed: the runner stops reporting the pair
+    as held, gates every mutating phase as `INCOMPLETE` with a refusal naming the phase and the loss while
+    a read-only phase is still allowed to report, a contender that wins the freed host releases it when
+    the other host refuses instead of holding half the pair, and resumption is a reacquisition of both
+    locks — a new token, the terminated holder''s lease refused by the product''s own validator, the reacquired
+    one accepted.'
+  assertion_sha256: ac10f3d275543c4a65575eb09e5c509b89c87d6a638a6a4239c08b3d7d345300
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: lock_cases:case_lock_loss
+      evidence:
+      - contender_refusal
+      - live_lease_accepted
+      - lost_lease_rejected
+      - mutating_gate_error
+      - mutating_gate_status
+      - reacquired_leases
+      - read_only_gate_ok
+      - released_partial_acquisition
+      - session_loss_detected
+      - terminated_holder
+  promotion_target: Pair-Wide Run Locking
+- id: MN-LOCK-PATH
+  requirement: Shared Mutation Lock Across All Management Entry Points
+  live_scenario: null
+  assertion: 'An unsafe lock path is refused rather than followed, replaced or removed: a lock file that
+    is a symlink, a directory, a FIFO, a group- or world-accessible file, or a file owned by another user,
+    and a lock directory that is a symlink, each stop the acquisition before either host is modified with
+    a refusal naming that object; every refused object is still the object it was — same kind, mode, owner,
+    inode and link target — the lock directory is a real directory again afterwards, and the same pair
+    acquires both hosts once the path is restored.'
+  assertion_sha256: bd2f253e7c1c87de9abf6369576b196a03ff199249b0667afc87492c44bf2d8f
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: lock_cases:case_lock_path
+      evidence:
+      - control_acquired
+      - directory_restored
+      - directory_symlink_refusal
+      - objects_untouched
+      - shape_sentences
+      - shapes_refused
+  promotion_target: Shared Mutation Lock Across All Management Entry Points
 - id: PODNET-MASTER-ADDR
   requirement: Podman-only Master address selection for Worker provisioning
   live_scenario: null

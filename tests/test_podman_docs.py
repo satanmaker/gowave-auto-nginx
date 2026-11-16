@@ -1785,8 +1785,8 @@ class TestContourBoundary(unittest.TestCase):
         environments = {}
         for case in catalog["cases"]:
             environments[case["environment"]] = environments.get(case["environment"], 0) + 1
-        self.assertEqual(len(catalog["cases"]), 220, "the catalog changed size; the page quotes its total")
-        self.assertEqual(environments, {"container": 210, "partial": 8, "live-only": 2})
+        self.assertEqual(len(catalog["cases"]), 223, "the catalog changed size; the page quotes its total")
+        self.assertEqual(environments, {"container": 213, "partial": 8, "live-only": 2})
         rows = [line for line in boundary_section().splitlines() if line.startswith("| `")]
         self.assertEqual(len(rows), 3, "the environment table gained or lost a row")
         for environment, expected in environments.items():

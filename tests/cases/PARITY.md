@@ -98,6 +98,9 @@ Live scenarios: 125 — container 115, partial 8, live-only 2.
 - **MN-BACKUP-VOL** — promotion target: Signal-Safe and Verifiable Transaction Compensation
 - **MN-BACKUP-BAD** — promotion target: Signal-Safe and Verifiable Transaction Compensation
 - **MN-RESTORE** — promotion target: Signal-Safe and Verifiable Transaction Compensation
+- **MN-LOCK** — promotion target: Pair-Wide Run Locking
+- **MN-LOCK-LOSS** — promotion target: Pair-Wide Run Locking
+- **MN-LOCK-PATH** — promotion target: Shared Mutation Lock Across All Management Entry Points
 - **PODNET-MASTER-ADDR** — promotion target: Distributed Worker VPS Deployment Verification
 - **WRK-06** — promotion target: Distributed Worker VPS Deployment Verification
 - **ACME-REJECT-ARB** — promotion target: Global Certbot Deploy Hook Ownership

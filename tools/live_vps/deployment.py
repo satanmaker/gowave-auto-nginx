@@ -322,6 +322,7 @@ def deploy_worker(
     config: LiveVPSConfig,
     target_dir: str = "/opt/gowave-auto-nginx",
     lease_token: Optional[str] = None,
+    worker_lease_token: Optional[str] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Deploy Worker node from Master VPS under Master-side strace argv observer."""
     # Ensure strace on Master and run acceptance fixtures
@@ -381,14 +382,34 @@ def deploy_worker(
         config.worker_ip, config.worker_domain, config.worker_reality_domain,
         config.worker_ssh_user, str(config.worker_ssh_port),
     ])
+    # The Master holds one lease and the Worker another: each host's management
+    # command validates against the lock holder on its own host. The Master's
+    # lease rides stdin, which is already used for it, so the Worker's token is
+    # staged in a root-only file on the Master and read into a distinct variable
+    # — never into argv, where the strace observer would record it, and never
+    # into GOWAVE_LEASE_TOKEN, which the Master's own lock would try to validate.
+    worker_lease_prefix = ""
+    if worker_lease_token:
+        stage = master_ssh.run(
+            "umask 077 && cat > /run/live_vps_worker_lease && chmod 0600 /run/live_vps_worker_lease",
+            input_data=worker_lease_token,
+        )
+        if not stage.ok:
+            return False, {"error": "Failed staging the Worker mutation lease on Master", "status": "INCOMPLETE"}
+        worker_lease_prefix = 'GOWAVE_WORKER_LEASE_TOKEN="$(cat /run/live_vps_worker_lease)" '
+
     node_add_cmd = (
-        f"{env_vars}\nstrace -f -v -s {shlex.quote(strace_limit)} "
+        f"{env_vars}\n{worker_lease_prefix}strace -f -v -s {shlex.quote(strace_limit)} "
         "-e trace=execve,execveat -o /run/live_vps_strace/worker_dispatch.trace "
         + " ".join(shlex.quote(str(value)) for value in node_add_args)
     )
 
     input_data = f"GOWAVE_LEASE: {lease_token}\n" if lease_token else None
-    r = master_ssh.run(node_add_cmd, input_data=input_data, timeout=600)
+    try:
+        r = master_ssh.run(node_add_cmd, input_data=input_data, timeout=600)
+    finally:
+        if worker_lease_token:
+            master_ssh.run("rm -f /run/live_vps_worker_lease")
 
     # Parse strace on Master VPS directly without exfiltrating envp
     parse_script = r"""
