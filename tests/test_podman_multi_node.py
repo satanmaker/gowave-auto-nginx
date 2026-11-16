@@ -7210,6 +7210,46 @@ class TestVisionCompensationCase(unittest.TestCase):
         self.assertEqual(evidence["node_address"], address)
         self.assertTrue(evidence["address_pinned"].startswith(address))
 
+    def test_the_rendered_address_command_adds_the_alias_and_reports_it(self):
+        """The script is run by bash against a stand-in ``ip``, not read as text.
+
+        ``read`` under ``set -e`` is exactly the kind of line that looks right and
+        ends the script early, so the rendered command is executed against a fake
+        kernel tool and its own exit status and output are the assertion.
+        """
+        bin_dir = Path(self.tmp.name) / "bin"
+        bin_dir.mkdir()
+        log = Path(self.tmp.name) / "ip.log"
+        alias = str(self.host.plan.second_node_ip)
+        worker = str(self.host.plan.worker_ip)
+        (bin_dir / "ip").write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf \'%s\\n\' "$*" >> {log}\n'
+            'case "$*" in\n'
+            '  "-4 -o addr show scope global")\n'
+            f'    printf \'2: eth0    inet {worker}/24 scope global eth0\\n\'\n'
+            "    printf '3: eth1    inet 203.0.114.11/24 scope global eth1\\n'\n"
+            "    ;;\n"
+            '  "addr add "*) ;;\n'
+            '  "-4 -o addr show dev eth0")\n'
+            f'    printf \'2: eth0    inet {worker}/24 scope global eth0\\n\'\n'
+            f'    printf \'2: eth0    inet {alias}/24 scope global secondary eth0\\n\'\n'
+            "    ;;\n"
+            "  *) exit 64 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        (bin_dir / "ip").chmod(0o755)
+        completed = subprocess.run(
+            ["bash", "-c", multi_node.second_node_address_script(alias)],
+            capture_output=True, text=True, timeout=60,
+            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn(f"addr add {alias}/24 dev eth0", log.read_text(encoding="utf-8"))
+        self.assertIn(alias, completed.stdout)
+        self.assertIn(worker, completed.stdout)
+
     def test_the_zone_the_case_writes_answers_for_the_node_and_not_for_its_vision(self):
         self.run_case()
         zone = json.loads(self.host.dns_zone_file().read_text(encoding="utf-8"))
