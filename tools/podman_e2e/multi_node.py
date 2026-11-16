@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
     acme_fixture, aio, argv_probe, budget, denial, ingress, matrix as matrix_data, mtls,
-    status, teardown, topology, vision as vision_policy,
+    preflight_cases, status, teardown, topology, vision as vision_policy,
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
@@ -8410,6 +8410,28 @@ def cases(
              timeout_seconds=120),
         Case(vision_policy.GATE_CASE_ID, "multi-node", vision_policy.case_port_gate,
              timeout_seconds=120),
+        # The eight questions a run decides before it may touch a VPS, read here
+        # for the reason the single-node contour reads them: none starts a
+        # container, and the cluster this contour has already installed is not an
+        # input to any of them. They run before the lifecycle cases, which fault
+        # the Worker, so a resolver pair that cannot bind :53 is reported as the
+        # host's own state rather than as damage those cases caused.
+        Case(preflight_cases.SSH_TRUST_CASE_ID, "multi-node", preflight_cases.case_ssh_trust,
+             timeout_seconds=120),
+        Case(preflight_cases.DNS_MISMATCH_CASE_ID, "multi-node",
+             preflight_cases.case_dns_address_mismatch, timeout_seconds=240),
+        Case(preflight_cases.AAAA_WITHOUT_IPV6_CASE_ID, "multi-node",
+             preflight_cases.case_aaaa_rejected_without_ipv6, timeout_seconds=240),
+        Case(preflight_cases.AAAA_WITH_IPV6_CASE_ID, "multi-node",
+             preflight_cases.case_aaaa_verified_with_ipv6, timeout_seconds=240),
+        Case(preflight_cases.AAAA_BYPASS_CASE_ID, "multi-node",
+             preflight_cases.case_aaaa_cannot_bypass, timeout_seconds=240),
+        Case(preflight_cases.DISTINCT_TARGETS_CASE_ID, "multi-node",
+             preflight_cases.case_distinct_targets, timeout_seconds=120),
+        Case(preflight_cases.DISTINCT_DOMAINS_CASE_ID, "multi-node",
+             preflight_cases.case_distinct_domains, timeout_seconds=120),
+        Case(preflight_cases.ROOT_IDENTITY_CASE_ID, "multi-node",
+             preflight_cases.case_root_identity, timeout_seconds=120),
         # The lifecycle cases run last: they revoke a client and fault the
         # Worker's own unit, so nothing that observes a healthy cluster may run
         # after them and no earlier case may be blamed for their state.

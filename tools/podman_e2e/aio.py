@@ -29,6 +29,7 @@ from . import (
     ingress,
     matrix,
     panel_surface,
+    preflight_cases,
     status,
     teardown,
     topology,
@@ -8455,6 +8456,28 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case(vision_policy.CONFIG_CASE_ID, "aio", vision_policy.case_config_contract,
              timeout_seconds=120),
         Case(vision_policy.GATE_CASE_ID, "aio", vision_policy.case_port_gate, timeout_seconds=120),
+        # The eight questions a run decides before it may touch a VPS: two hosts
+        # on two addresses, four names that are pairwise distinct, two host keys,
+        # and the resolvers that answer for those names. None starts a container,
+        # and they run here rather than after the install because the DNS pair
+        # binds :53 on loopback: a host that already serves it is reported before
+        # anything is deployed, not as a verdict about a running cluster.
+        Case(preflight_cases.SSH_TRUST_CASE_ID, "aio", preflight_cases.case_ssh_trust,
+             timeout_seconds=120),
+        Case(preflight_cases.DNS_MISMATCH_CASE_ID, "aio",
+             preflight_cases.case_dns_address_mismatch, timeout_seconds=240),
+        Case(preflight_cases.AAAA_WITHOUT_IPV6_CASE_ID, "aio",
+             preflight_cases.case_aaaa_rejected_without_ipv6, timeout_seconds=240),
+        Case(preflight_cases.AAAA_WITH_IPV6_CASE_ID, "aio",
+             preflight_cases.case_aaaa_verified_with_ipv6, timeout_seconds=240),
+        Case(preflight_cases.AAAA_BYPASS_CASE_ID, "aio",
+             preflight_cases.case_aaaa_cannot_bypass, timeout_seconds=240),
+        Case(preflight_cases.DISTINCT_TARGETS_CASE_ID, "aio",
+             preflight_cases.case_distinct_targets, timeout_seconds=120),
+        Case(preflight_cases.DISTINCT_DOMAINS_CASE_ID, "aio",
+             preflight_cases.case_distinct_domains, timeout_seconds=120),
+        Case(preflight_cases.ROOT_IDENTITY_CASE_ID, "aio",
+             preflight_cases.case_root_identity, timeout_seconds=120),
         # Last, because the deadline it proves is the one the whole run spent: the
         # case reads the elapsed wall clock and the enforced budget, then produces
         # an exhausted run of the real runner and reads its report. A suite that

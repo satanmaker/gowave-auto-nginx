@@ -225,8 +225,28 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: preflight_cases:case_ssh_trust
+      evidence:
+      - accepted_pinned_key
+      - empty_refusal
+      - host_named
+      - known_hosts_named
+      - known_hosts_unchanged
+      - refusal
+      - trust_before_remote_read
+    multi-node:
+      driver: preflight_cases:case_ssh_trust
+      evidence:
+      - accepted_pinned_key
+      - empty_refusal
+      - host_named
+      - known_hosts_named
+      - known_hosts_unchanged
+      - refusal
+      - trust_before_remote_read
   promotion_target: null
 - id: PRE-02
   requirement: Preflight SSH Trust and DNS Verification
@@ -246,8 +266,30 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: preflight_cases:case_dns_address_mismatch
+      evidence:
+      - correct_status
+      - failed_checks
+      - mismatch_domain
+      - mismatch_error
+      - mismatch_expected
+      - mismatch_published
+      - mismatch_resolvers
+      - preflight_status
+    multi-node:
+      driver: preflight_cases:case_dns_address_mismatch
+      evidence:
+      - correct_status
+      - failed_checks
+      - mismatch_domain
+      - mismatch_error
+      - mismatch_expected
+      - mismatch_published
+      - mismatch_resolvers
+      - preflight_status
   promotion_target: null
 - id: PRE-03
   requirement: Preflight SSH Trust and DNS Verification
@@ -268,8 +310,26 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: preflight_cases:case_aaaa_rejected_without_ipv6
+      evidence:
+      - accepted_domains
+      - accepted_without_aaaa
+      - failed_checks
+      - published_address
+      - refusal
+      - rejected_status
+    multi-node:
+      driver: preflight_cases:case_aaaa_rejected_without_ipv6
+      evidence:
+      - accepted_domains
+      - accepted_without_aaaa
+      - failed_checks
+      - published_address
+      - refusal
+      - rejected_status
   promotion_target: null
 - id: PRE-04
   requirement: Preflight SSH Trust and DNS Verification
@@ -318,8 +378,28 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: preflight_cases:case_aaaa_verified_with_ipv6
+      evidence:
+      - accepted_domains
+      - configured_master_ipv6
+      - configured_worker_ipv6
+      - missing_refusal
+      - wrong_address
+      - wrong_refusal
+      - wrong_status
+    multi-node:
+      driver: preflight_cases:case_aaaa_verified_with_ipv6
+      evidence:
+      - accepted_domains
+      - configured_master_ipv6
+      - configured_worker_ipv6
+      - missing_refusal
+      - wrong_address
+      - wrong_refusal
+      - wrong_status
   promotion_target: null
 - id: PRE-06
   requirement: Preflight SSH Trust and DNS Verification
@@ -348,8 +428,32 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: preflight_cases:case_aaaa_cannot_bypass
+      evidence:
+      - conflicting_address
+      - disabled_refusal
+      - enabled_refusal
+      - enabled_status
+      - failed_checks
+      - firewall_commands
+      - firewall_without_ipv6_status
+      - vision_domain
+      - vision_published_aaaa
+    multi-node:
+      driver: preflight_cases:case_aaaa_cannot_bypass
+      evidence:
+      - conflicting_address
+      - disabled_refusal
+      - enabled_refusal
+      - enabled_status
+      - failed_checks
+      - firewall_commands
+      - firewall_without_ipv6_status
+      - vision_domain
+      - vision_published_aaaa
   promotion_target: null
 - id: ADDR-01
   requirement: Target Address, Domain, and SSH Identity Safety
@@ -370,8 +474,26 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: preflight_cases:case_distinct_targets
+      evidence:
+      - accepted_worker
+      - duplicate_refusal
+      - duplicate_with_port_refusal
+      - operator_validated_before_bootstrap
+      - validated_before_lock
+      - validated_before_ssh_client
+    multi-node:
+      driver: preflight_cases:case_distinct_targets
+      evidence:
+      - accepted_worker
+      - duplicate_refusal
+      - duplicate_with_port_refusal
+      - operator_validated_before_bootstrap
+      - validated_before_lock
+      - validated_before_ssh_client
   promotion_target: null
 - id: ADDR-02
   requirement: Target Address, Domain, and SSH Identity Safety
@@ -391,8 +513,28 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: preflight_cases:case_distinct_domains
+      evidence:
+      - accepted_domains
+      - case_folded_refusal
+      - cross_role_refusal
+      - master_pair_refusal
+      - refusals
+      - validated_before_ssh_client
+      - vision_refusal
+    multi-node:
+      driver: preflight_cases:case_distinct_domains
+      evidence:
+      - accepted_domains
+      - case_folded_refusal
+      - cross_role_refusal
+      - master_pair_refusal
+      - refusals
+      - validated_before_ssh_client
+      - vision_refusal
   promotion_target: null
 - id: ADDR-03
   requirement: Target Address, Domain, and SSH Identity Safety
@@ -416,8 +558,24 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: preflight_cases:case_root_identity
+      evidence:
+      - default_master_user
+      - default_worker_user
+      - master_refusal
+      - refused_before_lock
+      - worker_refusal
+    multi-node:
+      driver: preflight_cases:case_root_identity
+      evidence:
+      - default_master_user
+      - default_worker_user
+      - master_refusal
+      - refused_before_lock
+      - worker_refusal
   promotion_target: null
 - id: VIS-01
   requirement: Independent Optional Vision Domains

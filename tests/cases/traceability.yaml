@@ -489,6 +489,39 @@ cases_by_requirement:
       VERIFYING, so the API rollback refuses to enumerate — and what the case
       reads is the aggregate CRITICAL line and the retained journal naming that
       refusal, never a clean compensation reported as PASS
+  - requirement: Live scenario parity
+    cases: [PRE-01, PRE-02, PRE-03, PRE-05, PRE-06, ADDR-01, ADDR-02, ADDR-03]
+    reason: >-
+      all eight serve the same parity sentence for the two sentences every run
+      decides before it touches a host: what it trusts, and what it calls its
+      targets. PRE-01 is the trust sentence — one host's key pinned and the
+      other's absent, refused by name with the file that was read, the
+      known_hosts byte count unchanged so the refusal is known to be a read and
+      not a scan that appended the host it was asked to verify, an empty file
+      refused with its own words, and the same check accepting the pinned key so
+      the refusal is the pin and not a check that always fails; the ordering is
+      read from the runner's own source, because a refusal that arrives after a
+      remote baseline was collected has already used the key. PRE-02, PRE-03,
+      PRE-05 and PRE-06 are the DNS sentence, answered by two real fixture
+      resolvers on loopback because preflight refuses fewer than two independent
+      resolvers: a name publishing another address fails with the domain, both
+      addresses and both resolvers in the message and `PASS` when the same name
+      is corrected, so the verdict is attributable; an unexpected AAAA fails
+      while ENABLE_IPV6=false and the same names are accepted without it; with
+      IPv6 on, every name's AAAA must be the configured address, a missing one
+      is a missing record rather than a correct one, and a wrong one is named;
+      and PRE-06 is the bypass clause — a configured Vision name's AAAA is held
+      to the same rule, two resolvers disagreeing about it fail the run instead
+      of being read as the union of their answers, and a firewall verification
+      handed no IPv6 target is `INCOMPLETE` rather than `PASS`. ADDR-01, ADDR-02
+      and ADDR-03 are the identity sentence: one address cannot be both hosts
+      even when a second SSH port makes them look like two, the four mandatory
+      names are pairwise unique under case folding, a non-root account is
+      refused with no sudo path, and each refusal is shown to arrive before the
+      local lock, before an SSH client, and before the operator's first
+      `_bootstrap_one` — the order being read from both modules' own source.
+      What the delta spec states about all eight is the parity sentence itself,
+      a Podman case for every container-reproducible live scenario
 
 # What the published report has to cover, one declaration at a time. A plain
 # path is met by any behaviour that quotes it; `every_value` makes every element
