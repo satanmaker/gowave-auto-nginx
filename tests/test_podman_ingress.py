@@ -108,17 +108,43 @@ def fake_hosts(*roles):
 
 
 class TestListenerPort(unittest.TestCase):
-    """The filter names the port the matrix declares, or nothing at all."""
+    """The filter names the port a client dials, or nothing at all."""
 
-    def test_every_matrix_inbound_yields_the_port_it_declares(self):
+    def test_every_matrix_inbound_is_captured_on_the_port_its_host_record_publishes(self):
         candidates = matrix.load()["inbounds"]
         self.assertTrue(candidates)
         for candidate in candidates:
-            declared = int(str(candidate["listener"]).partition("/")[0])
+            published = int(candidate["host_record"]["port"])
             self.assertEqual(
-                ingress.listener_port(candidate), declared,
-                f"{candidate.get('id')} declares {candidate['listener']}",
+                ingress.listener_port(candidate), published,
+                f"{candidate.get('id')} publishes {candidate['host_record']['port']}",
             )
+        self.assertEqual(
+            {int(candidate["host_record"]["port"]) for candidate in candidates}, {443},
+            "every Host record is dialled through NGINX on 443",
+        )
+
+    def test_the_published_port_clause_fails_when_the_internal_listener_is_read(self):
+        # The damage this guard exists for: Vision's own listener is 8443 inside
+        # the node, and a client reaches the tuple on 443 through the stream
+        # demultiplexer. A capture on the internal port is empty for a request
+        # that arrived, which is the account the evaluate() branch must refuse to
+        # read as a pass — so the derivation is what keeps the verdict possible.
+        vision = next(candidate for candidate in matrix.load()["inbounds"] if candidate["id"] == "VISION")
+        internal = int(str(vision["listener"]).partition("/")[0])
+        published = int(vision["host_record"]["port"])
+        self.assertNotEqual(internal, published, "the Vision tuple binds the port a client dials")
+        self.assertEqual(ingress.listener_port(vision), published)
+        damaged = Measurement(
+            port=internal,
+            intended="local",
+            client=CLIENT,
+            addresses={"local": CLIENT},
+            captures={"local": {"captured": 0, "sources": {}, "stopped_by": "harness", "drops": 0}},
+        )
+        facts = ingress.evaluate(damaged)
+        self.assertEqual(facts["verdict"], ingress.INCOMPLETE)
+        self.assertIn(f"captured nothing on port {internal}", facts["reason"])
 
     def test_a_listener_that_names_no_port_is_refused_rather_than_guessed(self):
         with self.assertRaises(IngressUnavailable) as caught:
@@ -129,6 +155,13 @@ class TestListenerPort(unittest.TestCase):
         with self.assertRaises(IngressUnavailable) as caught:
             ingress.listener_port({"id": "X"})
         self.assertEqual(caught.exception.code, "no_endpoint_port")
+
+    def test_a_tuple_that_publishes_no_port_is_refused_instead_of_read_from_its_listener(self):
+        with self.assertRaises(IngressUnavailable) as caught:
+            ingress.listener_port({"id": "X", "listener": "8443/tcp", "host_record": {"port": None}})
+        self.assertEqual(caught.exception.code, "no_endpoint_port")
+        self.assertIn("publishes host_record.port None", str(caught.exception))
+        self.assertIn("declares listener '8443/tcp'", str(caught.exception))
 
 
 class TestProbePersistsNothing(unittest.TestCase):
