@@ -144,6 +144,7 @@ SUITES = {
         "test_podman_multi_node.TestMasterAccessCase",
         "test_podman_multi_node.TestIpv6PolicyCase",
         "test_podman_multi_node.TestPacketWrongHostCase",
+        "test_podman_multi_node.TestVisionCompensationCase",
         "test_podman_denial.TestDenialParsers",
         "test_podman_denial.TestDenialClassification",
         "test_podman_denial.TestManagementDenialCase",

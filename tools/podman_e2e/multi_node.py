@@ -196,6 +196,59 @@ ACME_CHALLENGE_TOKEN = "gowave-e2e-http01-token"
 # product's resolution precondition and certbot's HTTP-01 both still hold.
 ACME_NEW_PANEL_DOMAIN = "panel2.testbed.internal"
 ACME_NEW_REALITY_DOMAIN = "reality2.testbed.internal"
+
+# VIS-06: a compensation that could not finish is reported, not called clean.
+#
+# The scenario needs two faults at once: a Vision provisioning stage that fails,
+# and the Panel-side rollback of that same transaction that fails too. The first
+# is a Vision name the fixture resolver answers with NXDOMAIN, which is how
+# VIS-05 fails a host's own stage. The second is the product's own durable
+# ledger: once the transaction is at NODE_ADD_VERIFYING the actions it recorded
+# are removed from the journal, so `rollback_provisioning` refuses to delete
+# what it can no longer enumerate and leaves the journal asking for an operator.
+#
+# It is a *second* node, addressed to the Worker the run already provisioned,
+# because `state.json` refuses a name it has registered and because the payload
+# it re-streams is the same operator path a new Worker takes. The case is placed
+# after every case that reads a healthy cluster: the Worker it fails is torn down
+# by the very compensation being observed.
+VIS_COMPENSATION_CASE_ID = "VIS-06"
+SECOND_WORKER_NODE_NAME = "worker-2"
+SECOND_WORKER_DOMAIN = "worker-two.testbed.internal"
+SECOND_WORKER_REALITY_DOMAIN = "worker-two-reality.testbed.internal"
+# Asked for and never answered: the name sits inside the fixture zone's suffix
+# with no record behind it, so HTTP-01 cannot validate it and the stage that runs
+# last on the Worker is the one that fails.
+SECOND_WORKER_VISION_DOMAIN = "worker-two-vision.testbed.internal"
+NODE_ADD_RECOVERY_ROOT = "/var/lib/gowave-auto-nginx/recovery"
+NODE_ADD_JOURNAL = f"{NODE_ADD_RECOVERY_ROOT}/journal.json"
+NODE_ADD_STATE = "/var/lib/gowave-auto-nginx/state.json"
+# The injection is a detached process on the Master rather than an argument or a
+# stream: the dispatch stays the product's own command.
+LEDGER_WATCH_PATH = "/root/gowave-e2e-ledger-watch.py"
+LEDGER_WATCH_LOG = "/root/gowave-e2e-ledger-watch.log"
+LEDGER_WATCH_SECONDS = 1800
+# The refusal `rollback_provisioning` prints when it cannot enumerate the actions
+# of a transaction that had already started mutating the API.
+LEDGER_REFUSAL = (
+    "Transaction entered APPLYING/VERIFYING without a durable action ledger; "
+    "API side effects may exist and automatic rollback is unsafe."
+)
+VISION_STAGE_LINE = (
+    f"Acquiring Let's Encrypt TLS certificate for Vision ({SECOND_WORKER_VISION_DOMAIN})..."
+)
+REMOTE_FAILURE_LINE = (
+    "Remote Worker deployment failed; rolling back Worker host configuration "
+    "and Panel API entities."
+)
+REMOTE_CRITICAL = "CRITICAL: Remote Worker host rollback failed; manual inspection required."
+API_CRITICAL = "CRITICAL: API rollback incomplete; recovery journal requires operator attention."
+AGGREGATE_CRITICAL = (
+    f"CRITICAL: Rollback failed for Worker '{SECOND_WORKER_NODE_NAME}'; "
+    "recovery journal retained."
+)
+SUCCESS_LINE = f"Worker '{SECOND_WORKER_NODE_NAME}' successfully added and deployed."
+
 # Both archive types are separate contracts and both are unencrypted and
 # secret-bearing, so this case records what each archive carries -- member paths,
 # declared checksums, environment key names and where private keys sit -- and
@@ -5741,6 +5794,386 @@ def case_acme80(product: MultiNodeProduct) -> Dict[str, Any]:
     return evidence
 
 
+# ------------------------------------------------- VIS-06: incomplete compensation
+# The resolver is asked from the Master, because that is the host whose own
+# `node add` precondition and whose certbot both read it: an answer observed
+# anywhere else would not be the one the failing stage sees.
+NAME_RESOLUTION_SCRIPT = r"""
+import json, socket, sys
+
+
+def answer(name):
+    try:
+        return sorted({item[4][0] for item in socket.getaddrinfo(name, None)})
+    except OSError as error:
+        return [type(error).__name__]
+
+
+names = sys.argv[1:]
+print(json.dumps({name: answer(name) for name in names}, sort_keys=True))
+"""
+
+# Detached, so the dispatch below is the product's own command with no wrapper
+# around it. It writes the journal the way the product does -- a synced sibling
+# renamed over the file -- and only ever removes the ledger, so what the product
+# then refuses to do is refused because its own record is incomplete.
+LEDGER_WATCH_SCRIPT = r"""
+import json, os, sys, time
+
+path, seconds = sys.argv[1], float(sys.argv[2])
+deadline = time.monotonic() + seconds
+
+
+def rewrite(data):
+    temporary = path + ".e2e"
+    handle = os.open(
+        temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+    )
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    directory = os.open(os.path.dirname(path), os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+while time.monotonic() < deadline:
+    try:
+        with open(path, encoding="utf-8") as stream:
+            data = json.load(stream)
+    except (OSError, ValueError):
+        time.sleep(0.05)
+        continue
+    if data.get("op") == "node_add" and data.get("state") == "NODE_ADD_VERIFYING":
+        if not data.get("entities"):
+            print("the ledger was already empty at NODE_ADD_VERIFYING", flush=True)
+            raise SystemExit(1)
+        data["entities"] = {}
+        rewrite(data)
+        print("emptied the ledger for " + str(data.get("node_name")), flush=True)
+        raise SystemExit(0)
+    time.sleep(0.05)
+print("the journal never reached NODE_ADD_VERIFYING", file=sys.stderr, flush=True)
+raise SystemExit(2)
+"""
+
+JOURNAL_FACTS_SCRIPT = r"""
+import json, os, sys
+
+journal_path, state_path, watch_log = sys.argv[1:]
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, ValueError) as error:
+        return {"unreadable": type(error).__name__}
+
+
+journal = read_json(journal_path)
+state = read_json(state_path)
+try:
+    with open(watch_log, encoding="utf-8") as stream:
+        watcher = stream.read().strip()
+except OSError as error:
+    watcher = "unreadable: " + type(error).__name__
+print(json.dumps({
+    "journal": journal,
+    "journal_present": os.path.isfile(journal_path),
+    "state_nodes": [
+        str(node.get("name") or "") for node in (state.get("nodes") or [])
+        if isinstance(node, dict)
+    ],
+    "watcher_log": watcher[-800:],
+}, sort_keys=True))
+"""
+
+# What the compensation left on the Worker itself. Recorded rather than asserted:
+# the scenario is about the report, and a rollback that removed exactly what the
+# failed transaction created is VIS-05's subject, not this one's.
+WORKER_AFTERMATH_SCRIPT = r"""
+printf 'service=%s\n' "$(systemctl is-active gowave-node.service 2>/dev/null || true)"
+printf 'install_root=%s\n' "$([ -d /opt/gowave-node ] && echo present || echo absent)"
+printf 'acme_vhost=%s\n' "$([ -f /etc/nginx/conf.d/00-worker-acme-challenge.conf ] && echo present || echo absent)"
+printf 'worker_vhost=%s\n' "$([ -f /etc/nginx/conf.d/gowave-worker-https.conf ] && echo present || echo absent)"
+printf 'stream_map=%s\n' "$([ -f /etc/nginx/stream-enabled/gowave-worker-stream.conf ] && echo present || echo absent)"
+printf 'nginx_test=%s\n' "$(nginx -t >/dev/null 2>&1 && echo 0 || echo 1)"
+"""
+
+
+def second_worker_add_script(host: topology.MultiNodeTopology) -> str:
+    """The operator's own ``node add``, addressed to a second node on the Worker."""
+    return (
+        f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node add "
+        f"--vision-domain '{SECOND_WORKER_VISION_DOMAIN}' "
+        f"'{SECOND_WORKER_NODE_NAME}' '{host.plan.worker_ip}' "
+        f"'{SECOND_WORKER_DOMAIN}' '{SECOND_WORKER_REALITY_DOMAIN}'"
+    )
+
+
+def ledger_watch_start_script() -> str:
+    """Install the journal watcher on the Master and leave it running detached."""
+    return (
+        f"cat > {LEDGER_WATCH_PATH} <<'PY'\n{LEDGER_WATCH_SCRIPT}\nPY\n"
+        f"chmod 0600 {LEDGER_WATCH_PATH}\n"
+        f"rm -f {LEDGER_WATCH_LOG}\n"
+        f"setsid python3 {LEDGER_WATCH_PATH} {NODE_ADD_JOURNAL} {LEDGER_WATCH_SECONDS} "
+        f"</dev/null >{LEDGER_WATCH_LOG} 2>&1 &\n"
+        'printf \'watcher_pid=%s\\n\' "$!"\n'
+    )
+
+
+def journal_facts_command() -> str:
+    """Read the transaction's own record, the state file, and the watcher's log."""
+    arguments = " ".join(
+        shlex.quote(path) for path in (NODE_ADD_JOURNAL, NODE_ADD_STATE, LEDGER_WATCH_LOG)
+    )
+    return f"python3 - {arguments} <<'PY'\n{JOURNAL_FACTS_SCRIPT}\nPY"
+
+
+def name_resolution_command() -> str:
+    arguments = " ".join(
+        shlex.quote(name) for name in (
+            SECOND_WORKER_DOMAIN, SECOND_WORKER_REALITY_DOMAIN, SECOND_WORKER_VISION_DOMAIN,
+        )
+    )
+    return f"python3 - {arguments} <<'PY'\n{NAME_RESOLUTION_SCRIPT}\nPY"
+
+
+def case_vision_incomplete_compensation(product: MultiNodeProduct) -> Dict[str, Any]:
+    """VIS-06: a compensation that could not finish is reported, not called clean.
+
+    Two faults are injected, and neither is in the code under test. The first is
+    the product's own failure path: a second Worker provisioning asks for a
+    Vision name the fixture resolver answers with NXDOMAIN, so the stage that
+    runs last fails after that node's own and REALITY lineages exist. The second
+    damages the record the compensation reads: a detached watcher on the Master
+    empties the transaction's action ledger once it reaches
+    ``NODE_ADD_VERIFYING``, so ``rollback_provisioning`` cannot enumerate what
+    the transaction created and refuses to delete anything.
+
+    What is asserted is the reporting, in the order the scenario states it: the
+    remote failure that starts compensation is named, both rollback results are
+    printed -- the remote one as success, the API one as refused -- the refusal
+    is not suppressed, the aggregate line says the rollback failed and the
+    journal was retained, the success line is absent, the retained journal
+    records ``NODE_ADD_ROLLBACK_REQUIRED`` with that refusal as its reason, and
+    the Panel still holds the node whose cleanup was refused, which is what makes
+    the incomplete claim true rather than cautious.
+
+    Not exercised: the branch where the *remote* rollback is the one that fails.
+    Faulting SSH between the dispatch and its compensation is not a seam this
+    contour has, so the case proves the aggregate line over one failing result
+    and names the other as succeeded.
+    """
+    case_id = VIS_COMPENSATION_CASE_ID
+    host = product.require_worker()
+    master = host.target_name
+    evidence = {
+        "node_name": SECOND_WORKER_NODE_NAME,
+        "worker_ip": str(host.plan.worker_ip),
+        "worker_domain": SECOND_WORKER_DOMAIN,
+        "worker_reality_domain": SECOND_WORKER_REALITY_DOMAIN,
+        "vision_domain": SECOND_WORKER_VISION_DOMAIN,
+    }
+
+    # The second node's own names answer with the Worker, so the bootstrap vhost
+    # this transaction creates can validate them; the Vision name has no record,
+    # so the stage that is supposed to fail cannot succeed.
+    zone = json.loads(host.dns_zone_file().read_text(encoding="utf-8"))
+    records = zone.setdefault("records", {})
+    records[SECOND_WORKER_DOMAIN] = {"A": [str(host.plan.worker_ip)]}
+    records[SECOND_WORKER_REALITY_DOMAIN] = {"A": [str(host.plan.worker_ip)]}
+    records.pop(SECOND_WORKER_VISION_DOMAIN, None)
+    host.write_dns_zone(zone)
+
+    resolution = aio.probe_json(
+        case_id, "the Master's answer for the second node's names",
+        product.podman.exec_bash(master, name_resolution_command(), check=False, timeout=120),
+    )
+    evidence["resolved"] = resolution
+    require(
+        case_id,
+        str(host.plan.worker_ip) in (resolution.get(SECOND_WORKER_DOMAIN) or []),
+        f"the Worker's own name {SECOND_WORKER_DOMAIN} does not answer with "
+        f"{host.plan.worker_ip}: {resolution.get(SECOND_WORKER_DOMAIN)!r}",
+    )
+    require(
+        case_id,
+        str(host.plan.worker_ip) not in (resolution.get(SECOND_WORKER_VISION_DOMAIN) or []),
+        f"the Vision name {SECOND_WORKER_VISION_DOMAIN} answers with the Worker address, "
+        "so the stage this case needs to fail would have validated",
+    )
+
+    started = product.podman.exec_bash(
+        master, ledger_watch_start_script(), check=False, timeout=120,
+    )
+    require(
+        case_id,
+        started.returncode == 0 and "watcher_pid=" in (started.stdout or ""),
+        f"the ledger watcher could not be started on the Master "
+        f"(exit {started.returncode}): {(started.stderr or started.stdout or '').strip()[-600:]}",
+    )
+    evidence["watcher_start"] = (started.stdout or "").strip()
+
+    command = second_worker_add_script(host)
+    started_at = time.monotonic()
+    attempt = product.podman.exec_bash(
+        master, command, check=False, timeout=NODE_ADD_TIMEOUT_SECONDS,
+    )
+    elapsed = time.monotonic() - started_at
+    stdout, stderr = attempt.stdout or "", attempt.stderr or ""
+    output = stdout + "\n" + stderr
+    product.context.evidence_text("mn-node-add-vision-incomplete.stdout.log", stdout)
+    product.context.evidence_text("mn-node-add-vision-incomplete.stderr.log", stderr)
+    evidence["command"] = command.strip()
+    evidence["attempt_returncode"] = attempt.returncode
+    evidence["attempt_seconds"] = round(elapsed, 1)
+
+    require(
+        case_id,
+        attempt.returncode != 0,
+        f"the second Worker provisioning exited 0, so there was no failure to "
+        f"compensate:\n{output.strip()[-1500:]}",
+    )
+    require(
+        case_id,
+        VISION_STAGE_LINE in output,
+        f"the failure never reached the Vision certificate stage on the Worker, so this "
+        f"case observed a different failure:\n{output.strip()[-1500:]}",
+    )
+    require(
+        case_id,
+        REMOTE_FAILURE_LINE in output,
+        f"the operator did not report the remote failure that starts compensation:\n"
+        f"{output.strip()[-1500:]}",
+    )
+    require(
+        case_id,
+        LEDGER_REFUSAL in output,
+        f"the API rollback's own refusal is missing from the report, so the reason the "
+        f"compensation could not complete was suppressed:\n{output.strip()[-1500:]}",
+    )
+    require(
+        case_id,
+        API_CRITICAL in output,
+        f"the incomplete API rollback was not reported as a CRITICAL result:\n"
+        f"{output.strip()[-1500:]}",
+    )
+    require(
+        case_id,
+        REMOTE_CRITICAL not in output,
+        "the compensating rollback reports the Worker host as failed as well, so this run "
+        f"cannot attribute the incomplete result to the API side:\n{output.strip()[-1500:]}",
+    )
+    require(
+        case_id,
+        AGGREGATE_CRITICAL in output,
+        f"the aggregate result of both rollbacks was not reported, so a failed "
+        f"compensation would read as a clean one:\n{output.strip()[-1500:]}",
+    )
+    require(
+        case_id,
+        SUCCESS_LINE not in output,
+        f"the product reports the Worker as added and deployed after a compensation that "
+        f"did not complete:\n{output.strip()[-1500:]}",
+    )
+
+    facts = aio.probe_json(
+        case_id, "the Master's recovery journal and installation state",
+        product.podman.exec_bash(master, journal_facts_command(), check=False, timeout=120),
+    )
+    journal = facts.get("journal") or {}
+    evidence["journal"] = {
+        "state": journal.get("state"),
+        "op": journal.get("op"),
+        "transaction_id": journal.get("transaction_id"),
+        "node_name": journal.get("node_name"),
+        "rollback_error": journal.get("rollback_error"),
+        "entities": journal.get("entities"),
+        "present": facts.get("journal_present"),
+    }
+    evidence["state_nodes"] = facts.get("state_nodes")
+    evidence["watcher_log"] = facts.get("watcher_log")
+    require(
+        case_id,
+        facts.get("journal_present") is True,
+        "the recovery journal was removed, so the incomplete transaction is not retained "
+        f"for an operator: {facts.get('journal')!r}",
+    )
+    require(
+        case_id,
+        journal.get("state") == "NODE_ADD_ROLLBACK_REQUIRED",
+        f"the retained journal records {journal.get('state')!r} instead of "
+        "NODE_ADD_ROLLBACK_REQUIRED, so the run's status was not recorded as incomplete",
+    )
+    require(
+        case_id,
+        journal.get("rollback_error") == LEDGER_REFUSAL,
+        f"the retained journal does not carry the refusal as its reason: "
+        f"{journal.get('rollback_error')!r}",
+    )
+    require(
+        case_id,
+        journal.get("node_name") == SECOND_WORKER_NODE_NAME,
+        f"the retained journal names {journal.get('node_name')!r} instead of "
+        f"{SECOND_WORKER_NODE_NAME!r}",
+    )
+    require(
+        case_id,
+        not journal.get("entities"),
+        "the ledger the watcher emptied is back in the journal, so the refusal this case "
+        f"observes was produced by something else: {journal.get('entities')!r}",
+    )
+
+    cluster = product.cluster_facts(case_id)
+    nodes = (cluster.get("nodes") or {}).get("records") or []
+    node = panel_node(cluster, SECOND_WORKER_NODE_NAME, case_id)
+    names = sorted(str(record.get("name") or "") for record in nodes)
+    require(
+        case_id,
+        len(nodes) == 3,
+        f"the Panel lists {len(nodes)} nodes ({names}) instead of the Master, the Worker "
+        "and the node whose cleanup was refused",
+    )
+    require(
+        case_id,
+        (node.get("address"), node.get("port")) == (str(host.plan.worker_ip), NODE_PORT),
+        f"the Panel lists {SECOND_WORKER_NODE_NAME} at {node.get('address')!r}:"
+        f"{node.get('port')!r} instead of {host.plan.worker_ip}:{NODE_PORT}",
+    )
+    hosts = [
+        record for record in (cluster.get("hosts") or {}).get("records") or []
+        if str(record.get("address") or "") in (SECOND_WORKER_DOMAIN, SECOND_WORKER_REALITY_DOMAIN)
+    ]
+    evidence["panel"] = {
+        "nodes": names,
+        "node_address": node.get("address"),
+        "node_connected": node.get("connected"),
+        "hosts": [
+            {"address": record.get("address"), "sni": record.get("sni")} for record in hosts
+        ],
+    }
+
+    aftermath = product.podman.exec_bash(
+        host.worker_name, WORKER_AFTERMATH_SCRIPT, check=False, timeout=120,
+    )
+    evidence["worker_aftermath"] = parse_key_value_fields(worker_aftermath_text(aftermath))
+    return evidence
+
+
+def worker_aftermath_text(result: Any) -> str:
+    """The Worker probe's own lines; a probe that could not run says so."""
+    if result.returncode != 0:
+        return "probe=failed\n" + str(result.stderr or result.stdout or "").strip()[-400:]
+    return result.stdout or ""
+
+
 def backup_script(type_name: str) -> str:
     """The operator's own backup command for one archive type."""
     return (
@@ -7949,10 +8382,18 @@ def cases(
         # nothing after it may be blamed for the domains it installs.
         Case(ACME80_CASE_ID, "multi-node", lambda context: case_acme80(product),
              timeout_seconds=ACME80_TIMEOUT_SECONDS),
-        # Last, and the only case ACME80 may be followed by: the deadline it proves
-        # is this topology's own, and the elapsed clock it reads is the two hosts'
-        # install and transfer, not a single container's. It starts no container, so
-        # it cannot be blamed for the names ACME80 installed.
+        # The last case that provisions anything, and the only one that
+        # deliberately leaves the cluster incomplete: the Worker it provisions is
+        # torn down by the very compensation this case observes. It therefore
+        # runs after ACME80, which needs that Worker whole, and nothing that reads
+        # a healthy cluster may follow it.
+        Case(VIS_COMPENSATION_CASE_ID, "multi-node",
+             lambda context: case_vision_incomplete_compensation(product),
+             timeout_seconds=NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
+        # Last: the deadline it proves is this topology's own, and the elapsed
+        # clock it reads is the two hosts' install and transfer, not a single
+        # container's. It starts no container and reads no cluster, so it cannot
+        # be blamed for the names ACME80 installed or for the compensation above.
         Case(budget.BUDGET_CASE_ID, "multi-node", budget.case_budget, timeout_seconds=120),
     ])
     return suite

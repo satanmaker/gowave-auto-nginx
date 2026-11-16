@@ -1103,8 +1103,8 @@ class TestVisionContract(unittest.TestCase):
     the page is held from both sides: every scenario the catalog drives has a row
     citing that case, every row names a scenario the requirement states, and the
     two policy cases the requirement owns — the parser's matrix and the per-host
-    gate — are cited too. The scenarios left to the live runner are counted and
-    named, so a driver that starts or stops covering one has to move the page.
+    gate — are cited too. Nothing of the requirement may be left to the live
+    runner, so a driver that stops covering one has to add a row or fail here.
     """
 
     def setUp(self):
@@ -1195,28 +1195,27 @@ class TestVisionContract(unittest.TestCase):
                     "a policy case the page says both contours read is driven by fewer",
                 )
 
-    def test_the_scenarios_left_to_the_live_runner_are_named_and_counted(self):
+    def test_no_scenario_of_the_requirement_is_left_to_the_live_runner(self):
+        """VIS-06 closed the last one, so the page may not count any.
+
+        The scenario that stayed live-only needed two faults at once — a Vision
+        stage that fails and a compensation that cannot finish — and both seams
+        are in the contour now. The claim the page has to carry is therefore the
+        absence: no scenario of the requirement without a driver, and no sentence
+        saying how many are left, because a count of zero is not a claim the page
+        gets to keep.
+        """
         undriven = sorted(
             entry["id"] for entry in self.entries.values() if not vision_driver_cases(entry)
         )
-        self.assertTrue(
-            undriven,
-            "every scenario of the requirement is now driven; the page still says otherwise",
-        )
-        stated = re.search(r"(\w+) scenarios? of that requirement stay(?:s)? live-only", self.prose)
-        self.assertIsNotNone(
-            stated, "the page does not say how much of the requirement stays live-only",
-        )
         self.assertEqual(
-            stated.group(1).lower(), NUMBER_WORDS.get(len(undriven), str(len(undriven))),
-            f"the catalog leaves {len(undriven)} scenarios undriven and the page says "
-            f"{stated.group(1)!r}",
+            undriven, [],
+            f"the catalog leaves these scenarios of the requirement undriven: {undriven}",
         )
-        for case_id in undriven:
-            self.assertIn(
-                f"`{case_id}`", self.prose,
-                f"the page leaves {case_id} undriven without naming it",
-            )
+        self.assertIsNone(
+            re.search(r"\w+ scenarios? of that requirement stay(?:s)? live-only", self.prose),
+            "the page still says part of the requirement stays live-only",
+        )
 
     def test_each_guard_fails_on_its_own_damage(self):
         section = vision_section()
@@ -1225,20 +1224,12 @@ class TestVisionContract(unittest.TestCase):
             if vision_driver_cases(self.entries[vision_row_scenario(row)])
         )
         driven = vision_row_scenario(driven)
-        undriven = next(
-            entry["live_scenario"] for entry in self.entries.values()
-            if not vision_driver_cases(entry)
-        )
 
         lost = "\n".join(
             line for line in section.splitlines() if not line.startswith(f"| `{driven}`")
         )
         with self.assertRaises(AssertionError):
             self.damaged(lost).test_every_driven_scenario_has_a_row_citing_the_case()
-
-        claimed = f"{section}\n| `{undriven}` | `VIS-GATE` | invented |\n"
-        with self.assertRaises(AssertionError):
-            self.damaged(claimed).test_every_driven_scenario_has_a_row_citing_the_case()
 
         needle = f"| `{driven}` | `{sorted(vision_driver_cases(self.entries[driven]))[0]}`"
         self.assertEqual(
@@ -1248,18 +1239,13 @@ class TestVisionContract(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.damaged(retargeted).test_each_row_cites_the_case_the_catalog_maps_to_that_scenario()
 
-        miscounted = re.sub(
-            r"\w+( scenarios? of that requirement stay(?:s)? live-only)",
-            r"seven\1", section, count=1,
+        self.assertNotIn(
+            "stays live-only", section,
+            "the page already counts the undriven scenarios this probe adds back",
         )
-        self.assertNotEqual(miscounted, section, "the sentence this probe damages is not there")
+        counted = f"{section}\n**One scenario of that requirement stays live-only.**\n"
         with self.assertRaises(AssertionError):
-            self.damaged(miscounted).test_the_scenarios_left_to_the_live_runner_are_named_and_counted()
-
-        unnamed = re.sub(r"`VIS-06`", "`VIS-XX`", section, count=1)
-        self.assertNotEqual(unnamed, section, "the sentence this probe damages is not there")
-        with self.assertRaises(AssertionError):
-            self.damaged(unnamed).test_the_scenarios_left_to_the_live_runner_are_named_and_counted()
+            self.damaged(counted).test_no_scenario_of_the_requirement_is_left_to_the_live_runner()
 
 
 SHARED_CONTRACT_HEADING = "## The contracts both contours assert, and the one owner each has"
