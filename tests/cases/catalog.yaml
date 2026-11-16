@@ -645,8 +645,26 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_vision_incomplete_compensation
+      evidence:
+      - attempt_returncode
+      - attempt_seconds
+      - command
+      - journal
+      - node_name
+      - panel
+      - resolved
+      - state_nodes
+      - vision_domain
+      - watcher_log
+      - watcher_start
+      - worker_aftermath
+      - worker_domain
+      - worker_ip
+      - worker_reality_domain
   promotion_target: null
 - id: VIS-07
   requirement: Independent Optional Vision Domains

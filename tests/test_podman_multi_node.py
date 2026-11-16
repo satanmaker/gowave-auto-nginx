@@ -1712,12 +1712,12 @@ class TestMultiNodeSuite(unittest.TestCase):
 
     def test_the_budget_case_is_declared_last(self):
         # It reads this topology's deadline and the clock two hosts spent, so no
-        # case may close the report behind it. It starts no container, which is why
-        # it is also the only case ACME80 — which installs its own names — may be
-        # followed by.
+        # case may close the report behind it. It starts no container and reads no
+        # cluster, which is why it is also the only case VIS-06 — which leaves the
+        # cluster incomplete on purpose — may be followed by.
         suite = multi_node.cases(self.podman)
         self.assertEqual([case.id for case in suite][-2:],
-                         [multi_node.ACME80_CASE_ID, budget.BUDGET_CASE_ID])
+                         [multi_node.VIS_COMPENSATION_CASE_ID, budget.BUDGET_CASE_ID])
         self.assertEqual(suite[-1].topology, "multi-node")
 
     def test_every_node_contributes_its_own_matrix_tuples(self):
@@ -1800,13 +1800,32 @@ class TestMultiNodeSuite(unittest.TestCase):
         # cluster under the suite, so nothing that observes a healthy cluster may
         # run after them. 6.12 then re-provisions that Worker and renames the
         # Master, so it closes the install-facing run instead of reading what they
-        # left behind. GATE-BUDGET, which starts no container, is the one case after
-        # it: the clock it reads is the whole run's.
+        # left behind. 9.2's VIS-06 follows it because it needs that Worker whole
+        # before it provisions a second node onto it and observes the compensation
+        # that tears it down. GATE-BUDGET, which starts no container, is the one
+        # case after them: the clock it reads is the whole run's.
         ids = [case.id for case in multi_node.cases(self.podman)]
         self.assertEqual(
-            ids[-5:-1],
+            ids[-6:-1],
             [multi_node.REVOCATION_CASE_ID, multi_node.OUTAGE_CASE_ID,
-             multi_node.RESTART_CASE_ID, multi_node.ACME80_CASE_ID],
+             multi_node.RESTART_CASE_ID, multi_node.ACME80_CASE_ID,
+             multi_node.VIS_COMPENSATION_CASE_ID],
+        )
+
+    def test_the_incomplete_compensation_case_follows_the_worker_reprovision(self):
+        # 9.2 VIS-06: the case provisions a second node onto the Worker and lets
+        # the failed compensation tear it down, so it may not run before ACME80 —
+        # which needs that Worker whole — and nothing that reads a healthy cluster
+        # may run after it.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertEqual(ids.index(multi_node.VIS_COMPENSATION_CASE_ID),
+                         ids.index(multi_node.ACME80_CASE_ID) + 1)
+        self.assertEqual(ids[-1], budget.BUDGET_CASE_ID)
+        suite = {case.id: case for case in multi_node.cases(self.podman)}
+        self.assertEqual(suite[multi_node.VIS_COMPENSATION_CASE_ID].topology, "multi-node")
+        self.assertEqual(
+            suite[multi_node.VIS_COMPENSATION_CASE_ID].timeout_seconds,
+            multi_node.NODE_ADD_TIMEOUT_SECONDS + multi_node.NODE_HEALTH_TIMEOUT_SECONDS,
         )
 
     def test_the_nginx_configuration_case_precedes_the_lifecycle_cases(self):
@@ -6938,6 +6957,327 @@ class TestPacketWrongHostCase(unittest.TestCase):
         )
         self.assertLess(ids.index(multi_node.MATRIX_CASE_ID),
                         ids.index(multi_node.PKT_WRONG_HOST_CASE_ID))
+
+
+class _CompensationContext:
+    """The run context the case hands its two attempt logs to."""
+
+    def __init__(self, root):
+        self.run_id = "podman-multi-node-test-00000000"
+        self.secret_dir = Path(root)
+        self.evidence = {}
+
+    def evidence_text(self, name, text):
+        self.evidence[name] = text
+        return self.secret_dir / name
+
+
+class _CompensationHost:
+    """The Worker the case addresses, with the fixture zone it steers."""
+
+    def __init__(self, root):
+        self.plan = topology.allocate_plan([])
+        self.target_name = "master-test"
+        self.worker_name = "worker-test"
+        self.dns_dir = Path(root) / "dns"
+        self.dns_dir.mkdir(parents=True, exist_ok=True)
+        self.dns_zone_file().write_text(
+            json.dumps({"ttl": 300, "records": {}}), encoding="utf-8",
+        )
+
+    def dns_zone_file(self):
+        return self.dns_dir / topology.DNS_ZONE_NAME
+
+    def write_dns_zone(self, data):
+        self.dns_zone_file().write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+
+
+def compensation_cluster(host):
+    """A fresh Panel cluster: the Master, the Worker, and the node left behind."""
+    return {
+        "nodes": {
+            "status": 200,
+            "records": [
+                {"name": multi_node.LOCAL_NODE_NAME, "address": "127.0.0.1",
+                 "port": multi_node.NODE_PORT, "connected": True},
+                {"name": topology.WORKER_NODE_NAME, "address": str(host.plan.worker_ip),
+                 "port": multi_node.NODE_PORT, "connected": True},
+                {"name": multi_node.SECOND_WORKER_NODE_NAME,
+                 "address": str(host.plan.worker_ip), "port": multi_node.NODE_PORT,
+                 "connected": True},
+            ],
+        },
+        "hosts": {
+            "status": 200,
+            "records": [
+                {"address": multi_node.SECOND_WORKER_DOMAIN, "sni": ""},
+                {"address": multi_node.SECOND_WORKER_REALITY_DOMAIN,
+                 "sni": multi_node.SECOND_WORKER_REALITY_DOMAIN},
+            ],
+        },
+    }
+
+
+class _CompensationPodman:
+    """Answers the probes the incomplete-compensation case makes, by marker.
+
+    Each answer is replaceable, so a test damages exactly the field its guard
+    reads: the resolver's reply, the watcher's start, the operator's output, the
+    journal it left behind, or the Worker's own aftermath.
+    """
+
+    def __init__(self, root, host):
+        self.context = _CompensationContext(root)
+        self.host = host
+        self.scripts = []
+        self.resolution = {
+            multi_node.SECOND_WORKER_DOMAIN: [str(host.plan.worker_ip)],
+            multi_node.SECOND_WORKER_REALITY_DOMAIN: [str(host.plan.worker_ip)],
+            multi_node.SECOND_WORKER_VISION_DOMAIN: ["gaierror"],
+        }
+        self.watcher_start = subprocess.CompletedProcess(["bash"], 0, "watcher_pid=4242\n", "")
+        self.add = subprocess.CompletedProcess(
+            ["bash"], 1, self.attempt_stdout(), self.attempt_stderr(),
+        )
+        self.facts = {
+            "journal": {
+                "op": "node_add",
+                "state": "NODE_ADD_ROLLBACK_REQUIRED",
+                "transaction_id": f"node_add_{multi_node.SECOND_WORKER_NODE_NAME}",
+                "node_name": multi_node.SECOND_WORKER_NODE_NAME,
+                "rollback_error": multi_node.LEDGER_REFUSAL,
+                "entities": {},
+            },
+            "journal_present": True,
+            "state_nodes": [multi_node.LOCAL_NODE_NAME, topology.WORKER_NODE_NAME,
+                            multi_node.SECOND_WORKER_NODE_NAME],
+            "watcher_log": f"emptied the ledger for {multi_node.SECOND_WORKER_NODE_NAME}",
+        }
+        self.aftermath = (
+            "service=inactive\ninstall_root=absent\nacme_vhost=absent\n"
+            "worker_vhost=absent\nstream_map=absent\nnginx_test=0\n"
+        )
+
+    @staticmethod
+    def attempt_stdout():
+        return (
+            f"{multi_node.VISION_STAGE_LINE}\n"
+            "[ROLLBACK] Remote worker deployment failed (exit code: 1). Initiating "
+            "automated compensating rollback...\n"
+            "ACME certificate lineage rollback completed successfully.\n"
+        )
+
+    @staticmethod
+    def attempt_stderr():
+        return (
+            f"{multi_node.REMOTE_FAILURE_LINE}\n"
+            f"{multi_node.LEDGER_REFUSAL}\n"
+            f"{multi_node.API_CRITICAL}\n"
+            f"{multi_node.AGGREGATE_CRITICAL}\n"
+        )
+
+    def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
+        self.scripts.append((name, script))
+        if "getaddrinfo" in script:
+            body = json.dumps(self.resolution)
+        elif "setsid python3" in script:
+            return self.watcher_start
+        elif "gowave-auto.sh node add" in script:
+            return self.add
+        elif "journal_present" in script:
+            body = json.dumps(self.facts)
+        elif "printf 'service=" in script:
+            body = self.aftermath
+        else:  # pragma: no cover - a probe this case does not make
+            body = "{}"
+        return subprocess.CompletedProcess(["bash", "-lc", script], 0, body, "")
+
+
+class _CompensationProduct:
+    """The real case's product, with only the two host-facing reads replaced."""
+
+    def __init__(self, podman, host, cluster=None):
+        self.podman = podman
+        self.context = podman.context
+        self.host = host
+        self.cluster = compensation_cluster(host) if cluster is None else cluster
+
+    def require_worker(self):
+        return self.host
+
+    def cluster_facts(self, case_id):
+        return self.cluster
+
+
+class TestVisionCompensationCase(unittest.TestCase):
+    """VIS-06: an incomplete compensation is reported, not hidden.
+
+    The case reads six answers -- the resolver, the watcher's start, the
+    operator's output, the retained journal, the Panel and the Worker -- so each
+    guard is proven by damaging exactly the answer it reads, and the happy path
+    proves that nothing else was needed to pass.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.host = _CompensationHost(self.tmp.name)
+        self.podman = _CompensationPodman(self.tmp.name, self.host)
+
+    def run_case(self, cluster=None):
+        product = _CompensationProduct(self.podman, self.host, cluster=cluster)
+        return multi_node.case_vision_incomplete_compensation(product), product
+
+    def damage(self, fragment, cluster=None):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(cluster=cluster)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_the_failed_compensation_is_reported_and_the_journal_is_retained(self):
+        evidence, product = self.run_case()
+        self.assertEqual(evidence["attempt_returncode"], 1)
+        self.assertEqual(evidence["node_name"], multi_node.SECOND_WORKER_NODE_NAME)
+        self.assertEqual(evidence["journal"]["state"], "NODE_ADD_ROLLBACK_REQUIRED")
+        self.assertEqual(evidence["journal"]["rollback_error"], multi_node.LEDGER_REFUSAL)
+        self.assertEqual(evidence["journal"]["entities"], {})
+        self.assertEqual(evidence["panel"]["nodes"], sorted([
+            multi_node.LOCAL_NODE_NAME, topology.WORKER_NODE_NAME,
+            multi_node.SECOND_WORKER_NODE_NAME,
+        ]))
+        self.assertEqual(evidence["worker_aftermath"]["service"], "inactive")
+        self.assertEqual(evidence["watcher_log"],
+                         f"emptied the ledger for {multi_node.SECOND_WORKER_NODE_NAME}")
+        # The attempt's own two streams are handed back as evidence, not summarised.
+        self.assertEqual(
+            sorted(product.context.evidence),
+            ["mn-node-add-vision-incomplete.stderr.log",
+             "mn-node-add-vision-incomplete.stdout.log"],
+        )
+
+    def test_the_case_asks_the_operator_for_a_second_node_on_the_worker(self):
+        _evidence, product = self.run_case()
+        commands = [script for _name, script in product.podman.scripts
+                    if "gowave-auto.sh node add" in script]
+        self.assertEqual(len(commands), 1, "the case dispatched something else as well")
+        self.assertIn(f"'{multi_node.SECOND_WORKER_NODE_NAME}'", commands[0])
+        self.assertIn(f"--vision-domain '{multi_node.SECOND_WORKER_VISION_DOMAIN}'", commands[0])
+        self.assertIn(str(self.host.plan.worker_ip), commands[0])
+
+    def test_the_zone_the_case_writes_answers_for_the_node_and_not_for_its_vision(self):
+        self.run_case()
+        zone = json.loads(self.host.dns_zone_file().read_text(encoding="utf-8"))
+        records = zone["records"]
+        self.assertEqual(records[multi_node.SECOND_WORKER_DOMAIN]["A"],
+                         [str(self.host.plan.worker_ip)])
+        self.assertNotIn(multi_node.SECOND_WORKER_VISION_DOMAIN, records)
+
+    def test_the_case_fails_when_the_attempt_exits_zero(self):
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 0, self.podman.attempt_stdout(), self.podman.attempt_stderr(),
+        )
+        self.damage("exited 0")
+
+    def test_the_case_fails_when_the_failure_came_from_another_stage(self):
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 1, "Fatal: upstream installer failed with exit code 1\n",
+            f"{multi_node.REMOTE_FAILURE_LINE}\n",
+        )
+        self.damage("never reached the Vision certificate stage")
+
+    def test_the_case_fails_when_the_remote_failure_is_not_reported(self):
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 1, self.podman.attempt_stdout(), "",
+        )
+        self.damage("did not report the remote failure")
+
+    def test_the_case_fails_when_the_rollback_refusal_is_suppressed(self):
+        stderr = self.podman.attempt_stderr().replace(
+            f"{multi_node.LEDGER_REFUSAL}\n", "",
+        )
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 1, self.podman.attempt_stdout(), stderr,
+        )
+        self.damage("was suppressed")
+
+    def test_the_case_fails_when_the_incomplete_api_rollback_is_not_reported(self):
+        stderr = self.podman.attempt_stderr().replace(f"{multi_node.API_CRITICAL}\n", "")
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 1, self.podman.attempt_stdout(), stderr,
+        )
+        self.damage("not reported as a CRITICAL result")
+
+    def test_the_case_fails_when_the_remote_host_is_also_reported_as_failed(self):
+        stderr = self.podman.attempt_stderr() + f"{multi_node.REMOTE_CRITICAL}\n"
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 1, self.podman.attempt_stdout(), stderr,
+        )
+        self.damage("cannot attribute the incomplete result")
+
+    def test_the_case_fails_when_the_aggregate_result_is_missing(self):
+        stderr = self.podman.attempt_stderr().replace(
+            f"{multi_node.AGGREGATE_CRITICAL}\n", "",
+        )
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 1, self.podman.attempt_stdout(), stderr,
+        )
+        self.damage("aggregate result of both rollbacks was not reported")
+
+    def test_the_case_fails_when_the_product_calls_the_node_deployed(self):
+        stderr = self.podman.attempt_stderr() + f"{multi_node.SUCCESS_LINE}\n"
+        self.podman.add = subprocess.CompletedProcess(
+            ["bash"], 1, self.podman.attempt_stdout(), stderr,
+        )
+        self.damage("reports the Worker as added and deployed")
+
+    def test_the_case_fails_when_the_journal_was_removed(self):
+        self.podman.facts["journal_present"] = False
+        self.damage("was removed, so the incomplete transaction is not retained")
+
+    def test_the_case_fails_when_the_journal_does_not_ask_for_an_operator(self):
+        self.podman.facts["journal"]["state"] = "NODE_ADD_ROLLED_BACK"
+        self.damage("instead of NODE_ADD_ROLLBACK_REQUIRED")
+
+    def test_the_case_fails_when_the_journal_names_no_reason(self):
+        self.podman.facts["journal"]["rollback_error"] = ""
+        self.damage("does not carry the refusal as its reason")
+
+    def test_the_case_fails_when_the_journal_names_another_node(self):
+        self.podman.facts["journal"]["node_name"] = topology.WORKER_NODE_NAME
+        self.damage("the retained journal names")
+
+    def test_the_case_fails_when_the_ledger_it_emptied_is_back(self):
+        self.podman.facts["journal"]["entities"] = [
+            {"type": "node", "action": "created", "uuid": "uuid-digest"},
+        ]
+        self.damage("the ledger the watcher emptied is back")
+
+    def test_the_case_fails_when_the_panel_no_longer_lists_the_node(self):
+        cluster = compensation_cluster(self.host)
+        cluster["nodes"]["records"] = [
+            record for record in cluster["nodes"]["records"]
+            if record["name"] != multi_node.SECOND_WORKER_NODE_NAME
+        ]
+        self.damage("lists no node named", cluster=cluster)
+
+    def test_the_case_fails_when_the_panel_lists_another_count(self):
+        cluster = compensation_cluster(self.host)
+        cluster["nodes"]["records"].append({
+            "name": "worker-3", "address": str(self.host.plan.worker_ip),
+            "port": multi_node.NODE_PORT, "connected": False,
+        })
+        self.damage("instead of the Master, the Worker", cluster=cluster)
+
+    def test_the_case_fails_when_the_vision_name_resolves_to_the_worker(self):
+        self.podman.resolution[multi_node.SECOND_WORKER_VISION_DOMAIN] = [
+            str(self.host.plan.worker_ip),
+        ]
+        self.damage("would have validated")
+
+    def test_the_case_fails_when_the_watcher_never_started(self):
+        self.podman.watcher_start = subprocess.CompletedProcess(
+            ["bash"], 1, "", "setsid: not found",
+        )
+        self.damage("could not be started on the Master")
 
 
 if __name__ == "__main__":
