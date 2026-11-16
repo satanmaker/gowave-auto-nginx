@@ -282,7 +282,10 @@ class TestNodeIntegration(unittest.TestCase):
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
         self.assertIn("compensate_remote_worker", worker_script)
         self.assertIn("trap 'exit_code=$?; compensate_remote_worker \"$exit_code\"; exit \"$exit_code\"' ERR", worker_script)
-        self.assertIn("systemctl stop gowave-node.service", worker_script)
+        # Both units are cleaned up by name from a loop that skips a unit the host
+        # does not have, so the assertion names the loop rather than one stop line.
+        self.assertIn("for unit in gowave-node.service xray.service; do", worker_script)
+        self.assertIn('systemctl stop "$unit" 2>/dev/null || rollback_failed=1', worker_script)
         self.assertIn("rm -rf /etc/systemd/system/gowave-node.service.d", worker_script)
         self.assertIn("certbot delete --cert-name \"$WORKER_DOMAIN\"", worker_script)
         self.assertIn("swapoff /swapfile", worker_script)
@@ -1075,6 +1078,114 @@ class TestNodeIntegration(unittest.TestCase):
             self.assertTrue(restored_privkey.is_symlink())
             self.assertEqual(restored_fullchain.resolve(), (letsencrypt / "archive" / domain / "cert1.pem").resolve())
             self.assertEqual(restored_privkey.resolve(), (letsencrypt / "archive" / domain / "privkey1.pem").resolve())
+
+    def test_standalone_acme_restore_removes_a_lineage_that_did_not_exist_before(self):
+        """A snapshot of an absent lineage restores to "absent", not to a refused rollback."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        remote_start = worker_script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
+        function_start = worker_script.index("restore_acme_lineage() {", remote_start)
+        lock_at = worker_script.index("\nacquire_mutation_lock\n", function_start)
+        function_end = worker_script.rindex("\n}", function_start, lock_at) + 2
+        restore_function = worker_script[function_start:function_end]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            recovery = root / "recovery"
+            letsencrypt = root / "letsencrypt"
+            domain = "worker-two.example.com"
+            snap_dir = recovery / "txn-1" / "acme" / domain
+            snap_dir.mkdir(parents=True)
+            # The snapshot writer records an absent lineage with an empty serial
+            # and fingerprint, which is what the live rollback reads back.
+            (snap_dir / "lineage-manifest.json").write_text(json.dumps({
+                "domain": domain,
+                "existed_before": False,
+                "serial": "",
+                "fingerprint": "",
+            }))
+            renewal_dir = letsencrypt / "renewal"
+            live_dir = letsencrypt / "live" / domain
+            archive_dir = letsencrypt / "archive" / domain
+            renewal_dir.mkdir(parents=True)
+            live_dir.mkdir(parents=True)
+            archive_dir.mkdir(parents=True)
+            renewal = renewal_dir / f"{domain}.conf"
+            renewal.write_text("transaction-created renewal configuration")
+            (live_dir / "fullchain.pem").write_text("transaction-created live certificate")
+            (archive_dir / "cert1.pem").write_text("transaction-created archived certificate")
+
+            command = (
+                restore_function
+                + "\nrestore_acme_lineage "
+                + '"txn-1" "'
+                + domain
+                + '" "'
+                + str(recovery)
+                + '" "'
+                + str(letsencrypt)
+                + '"'
+            )
+            result = subprocess.run(["bash", "-c", command], capture_output=True, text=True)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("invalid field count", result.stderr)
+            self.assertFalse(renewal.exists(), "the transaction's own renewal configuration survived")
+            self.assertFalse(live_dir.exists(), "the transaction's own live directory survived")
+            self.assertFalse(archive_dir.exists(), "the transaction's own archive survived")
+
+    def test_worker_rollback_treats_an_absent_unit_as_clean_and_a_failed_stop_as_incomplete(self):
+        """Xray is supervised by gowave-node, so a host without xray.service is clean."""
+        worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
+        payload_start = worker_script.index("cat <<'RUNNER_FUNCS'")
+        function_start = worker_script.index("compensate_remote_worker() {", payload_start)
+        loop_start = worker_script.index("        for unit in gowave-node.service xray.service; do", function_start)
+        loop_end = worker_script.index("\n        done\n", loop_start) + len("\n        done\n")
+        loop = worker_script[loop_start:loop_end]
+
+        def run_loop(stop_status):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                bin_dir = Path(tmpdir) / "bin"
+                bin_dir.mkdir()
+                systemctl = bin_dir / "systemctl"
+                # The stub owns the same unit table the host would: gowave-node is
+                # installed, xray is not, and stopping a unit that is not installed
+                # fails the way systemd fails it.
+                systemctl.write_text(f"""#!/bin/sh
+installed="gowave-node.service"
+case "$1" in
+    list-unit-files)
+        for unit in $installed; do
+            [ "$unit" = "$2" ] && echo "$2"
+        done
+        exit 0
+        ;;
+    is-active)
+        exit 3
+        ;;
+    stop|disable)
+        for unit in $installed; do
+            [ "$unit" = "$2" ] && exit {stop_status}
+        done
+        echo "Unit $2 not loaded." >&2
+        exit 5
+        ;;
+esac
+exit 0
+""")
+                systemctl.chmod(0o755)
+                script = "set -Eeuo pipefail\nrollback_failed=0\n" + loop + '\necho "rollback_failed=$rollback_failed"\n'
+                env = os.environ.copy()
+                env["PATH"] = f"{bin_dir}:{env['PATH']}"
+                return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env)
+
+        clean = run_loop(0)
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        self.assertIn("rollback_failed=0", clean.stdout,
+                      "an absent xray.service was counted as a failed cleanup")
+
+        failed = run_loop(1)
+        self.assertIn("rollback_failed=1", failed.stdout,
+                      "a unit that exists and cannot be stopped was not reported")
 
     def test_worker_remote_payload_serializes_acme_server(self):
         with tempfile.TemporaryDirectory() as tmpdir:
