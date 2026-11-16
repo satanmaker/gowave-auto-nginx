@@ -879,6 +879,44 @@ class TestOwnershipShapeCapability(CaseHarness, HolderCase, unittest.TestCase):
             "a file owned by another user", json.loads(facts["shape_sentences"]),
         )
 
+    def test_a_directory_that_cannot_be_moved_aside_is_named_not_asserted(self):
+        # `/run/lock` is a mount point inside a systemd container, so `mv` answers
+        # EBUSY, and no host that mounts its lock directory can be handed the
+        # symlinked-directory sentence. The case names that instead of failing on
+        # a sentence nothing on that host can produce.
+        original = self.podman.exec
+
+        def refuse_move(name, argv, check=True, input_text=None, timeout=None):
+            if any("lock.case" in str(part) and "mv " in str(part) for part in argv):
+                return types.SimpleNamespace(
+                    returncode=1, stdout="",
+                    stderr="mv: cannot move '/run/lock' to '/run/lock.case': Device or resource busy",
+                )
+            return original(name, argv, check=check, input_text=input_text, timeout=timeout)
+
+        with mock.patch.object(self.podman, "exec", refuse_move):
+            facts = CASES[lock_cases.LOCK_PATH_CASE_ID](self.product)
+
+        skipped = json.loads(facts["shapes_skipped"])
+        self.assertTrue(
+            any(entry.startswith(f"a symlinked lock directory on {MASTER_NAME}:")
+                and "Device or resource busy" in entry for entry in skipped),
+            f"the unmovable lock directory is not named in {skipped!r}",
+        )
+        self.assertEqual(
+            facts["directory_symlink_refusal"], "",
+            "a directory the host could not replace was reported as refused",
+        )
+        self.assertTrue(
+            facts["directory_restored"],
+            "a host that was never touched is reported as damaged",
+        )
+        for sandbox in self.sandboxes.values():
+            self.assertTrue(
+                sandbox.lock_dir.is_dir() and not sandbox.lock_dir.is_symlink(),
+                "the lock directory is not the real directory it started as",
+            )
+
 
 # ------------------------------------------------------------------- the plumbing
 

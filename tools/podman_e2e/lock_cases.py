@@ -263,6 +263,25 @@ def _clear_shape(host: Any, container: str) -> None:
     )
 
 
+def _move_aside(host: Any, container: str) -> str:
+    """Move the lock directory aside, or say why this host cannot.
+
+    An empty answer means the real directory is now ``/run/lock.case`` and the
+    caller owns putting it back; anything else leaves the host untouched and is
+    the sentence the evidence carries.
+    """
+    result = host.podman.exec(
+        container,
+        ["bash", "-c",
+         f"test -d {LOCK_DIR} && test ! -L {LOCK_DIR} && "
+         f"mv {LOCK_DIR} {LOCK_DIR}.case"],
+        check=False, timeout=SSH_TIMEOUT_SECONDS,
+    )
+    if result.returncode == 0:
+        return ""
+    return result.stderr.strip() or "the directory could not be moved aside"
+
+
 #: Whether the holder gets past its own `open` on the object. The probe repeats
 #: that open exactly — the directory by descriptor, the name with `O_CREAT` and
 #: `O_NOFOLLOW` — because the question is not what the file's mode says but which
@@ -639,14 +658,19 @@ def case_lock_path(product: Any) -> Dict[str, Any]:
         # real directory it started with.
         directory_refusals: List[str] = []
         for container in containers:
-            host.podman.exec(
-                container,
-                ["bash", "-c",
-                 f"test -d {LOCK_DIR} && test ! -L {LOCK_DIR} && "
-                 f"mv {LOCK_DIR} {LOCK_DIR}.case && ln -s {LOCK_DIR}.case {LOCK_DIR}"],
-                timeout=SSH_TIMEOUT_SECONDS,
-            )
+            reason = _move_aside(host, container)
+            if reason:
+                # `/run/lock` is a mount point on a systemd host, and a mount point
+                # cannot be renamed: the shape is not one this host has, so it is
+                # named rather than asserted against a sentence nothing can produce.
+                skipped.append(f"a symlinked lock directory on {container}: {reason}")
+                continue
             try:
+                host.podman.exec(
+                    container,
+                    ["bash", "-c", f"ln -s {LOCK_DIR}.case {LOCK_DIR}"],
+                    timeout=SSH_TIMEOUT_SECONDS,
+                )
                 attempt = RemotePairLock(master, worker, run_id="podman-lock-directory")
                 acquired = attempt.acquire()
                 attempt.release()
