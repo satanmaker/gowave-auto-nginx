@@ -56,6 +56,12 @@ gowave_vhost_names() {
 '''
 
 _OPERATOR = r'''
+echo "== operating system =="
+uname -a 2>&1
+cat /etc/os-release 2>&1
+echo "== package versions =="
+dpkg-query -W -f='${binary:Package}=${Version}\n' 2>/dev/null |
+    grep -Ei '^(nginx|gowave|xray|certbot|ufw|fail2ban)' 2>&1
 echo "== operator identity =="
 id 2>&1
 echo "== root home =="

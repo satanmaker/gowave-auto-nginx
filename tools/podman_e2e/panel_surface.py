@@ -23,6 +23,8 @@ type, a byte count, and the transport header.
         --edge-base https://panel.testbed.internal --ca /fixtures/ca/acme-trust.pem
     python3 /repo/tools/podman_e2e/panel_surface.py --scope channel --step capture --payload-dir /payloads
     python3 /repo/tools/podman_e2e/panel_surface.py --scope auth-negative
+    python3 /repo/tools/podman_e2e/panel_surface.py --scope api-client \
+        --edge-base https://panel.testbed.internal --ca /fixtures/ca/acme-trust.pem
 """
 from __future__ import annotations
 
@@ -879,6 +881,115 @@ def auth_negative(panel: Panel) -> Dict[str, Any]:
     return facts
 
 
+# ------------------------------------------------------------- Panel API client
+# The two files that carry the controller's HTTP contract with the Panel: the
+# client the live run drives, and the transport it is built on. A trust bypass
+# added to either would make every other check here meaningless, so the probe
+# reads them rather than trusting that nobody would.
+API_CLIENT_SOURCES = ("tools/live_vps/panel_api.py", "modules/api_client.py")
+API_CLIENT_BYPASS_TOKENS = (
+    "allowInsecure",
+    "verify=False",
+    "_create_unverified_context",
+    "check_hostname = False",
+    "CERT_NONE",
+)
+
+
+def api_client_bypass_tokens(repo_root: Path) -> List[str]:
+    """Every trust bypass that appears in the two files carrying the client.
+
+    Read from ``repo_root`` rather than from the module's own location, so the
+    caller decides which tree is the subject and a test can point at one that
+    holds a bypass.
+    """
+    return [
+        f"{relative}: {token}"
+        for relative in API_CLIENT_SOURCES
+        for token in API_CLIENT_BYPASS_TOKENS
+        if token in (repo_root / relative).read_text(encoding="utf-8")
+    ]
+
+
+def api_client_trust(edge_base: str, ca_file: str, credentials: Path) -> Dict[str, Any]:
+    """Drive the controller's own Panel client against the real Panel over HTTPS.
+
+    The subject is ``tools/live_vps/panel_api.py``, so the probe imports that
+    class and calls it the way the live controller does instead of re-encoding
+    its behaviour: a build that stopped loading the run bundle, that turned
+    hostname checking off, or that replaced the configured timeout with a
+    literal moves the facts printed here.
+
+    Trust is read from three sides. ``bundle_login`` proves the bundle is
+    sufficient; ``empty_store_login`` proves a context with no anchor is not, so
+    the success above came from the bundle rather than from an implicit store;
+    ``system_store_login`` is reported but not decided here, because an image may
+    legitimately point the default store at the run's CA through
+    ``SSL_CERT_FILE`` and that is the environment's property, not the client's.
+    ``hostname_mismatch_login`` asks the same bundle to accept an address the
+    certificate does not name.
+
+    Every value is a status, a count, a class name or a boolean. The username and
+    the password are read from the root-only file and never printed; the
+    refusals report the exception class, which the client has already reduced to
+    "tls verification error" without the hostname or the certificate.
+    """
+    import sys
+
+    parsed = urllib.parse.urlsplit(edge_base)
+    domain = parsed.hostname or ""
+    if parsed.scheme != "https" or not domain:
+        raise SystemExit(f"--edge-base must be an https URL naming the Panel, got {edge_base!r}")
+    # The client is given the authority, not the bare host: an edge base that
+    # names a port has to be reached on that port, and dropping it would make
+    # every refusal below a connection error instead of a trust decision.
+    authority = f"{domain}:{parsed.port}" if parsed.port else domain
+    other_address = f"127.0.0.1:{parsed.port}" if parsed.port else "127.0.0.1"
+    tools_dir = Path(__file__).resolve().parents[1]
+    if str(tools_dir) not in sys.path:
+        sys.path.insert(0, str(tools_dir))
+    from live_vps.panel_api import E2EPanelClient, configured_api_timeout
+
+    username, password = read_credentials(credentials)
+    bundle = ssl.create_default_context(cafile=ca_file)
+    facts: Dict[str, Any] = {
+        "verify_mode": bundle.verify_mode.name,
+        "hostname_verification": bundle.check_hostname,
+        "timeout_configured": configured_api_timeout(),
+    }
+
+    def refusal(client: Any) -> str:
+        """The class of the refusal, or ``accepted`` when the client got through."""
+        try:
+            client.login(username, password)
+            client.get_nodes()
+        except Exception as error:  # noqa: BLE001 - the class is the fact
+            return type(error).__name__
+        return "accepted"
+
+    trusted = E2EPanelClient(authority, bundle)
+    facts["timeout_used"] = trusted.timeout
+    facts["bundle_login"] = refusal(trusted)
+    facts["nodes"] = len(trusted.get_nodes()) if facts["bundle_login"] == "accepted" else 0
+
+    empty = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    facts["empty_store_login"] = refusal(E2EPanelClient(authority, empty))
+    facts["hostname_mismatch_login"] = refusal(E2EPanelClient(other_address, bundle))
+    facts["system_store_login"] = refusal(
+        E2EPanelClient(authority, ssl.create_default_context())
+    )
+
+    # A caller that omits every optional argument: it must still construct, and
+    # it must inherit the configured bound rather than a second literal.
+    default_client = E2EPanelClient(authority)
+    facts["production_default_timeout"] = default_client.timeout
+    facts["production_default_context"] = default_client.ssl_context is None
+
+    repo_root = Path(__file__).resolve().parents[2]
+    facts["bypass_tokens"] = api_client_bypass_tokens(repo_root)
+    return facts
+
+
 # ------------------------------------------------------------------ revocation
 REVOKE_DIRECTORY = "revoke"
 REVOKE_STATE_NAME = "state.json"
@@ -1314,7 +1425,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--scope",
         choices=(
             "surface", "cluster", "lifecycle", "subscriptions",
-            "ua-absent", "ua-blank", "revoke", "restore", "channel", "auth-negative", "all",
+            "ua-absent", "ua-blank", "revoke", "restore", "channel", "auth-negative",
+            "api-client", "all",
         ),
         default="all",
     )
@@ -1346,9 +1458,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.scope == "api-client":
+        # This scope asks about the controller's HTTPS client, which builds its
+        # own contexts and reads the same credentials file, so the loopback
+        # ``login`` fact every other scope starts with would be a second subject
+        # answering for the first one's trust.
+        facts: Dict[str, Any] = {
+            "api_client": api_client_trust(args.edge_base, args.ca, Path(args.credentials)),
+        }
+        print(json.dumps(facts, sort_keys=True))
+        return 0
+
     username, password = read_credentials(Path(args.credentials))
     panel = Panel(args.panel_url)
-    facts: Dict[str, Any] = {"login": login(panel, username, password)}
+    facts = {"login": login(panel, username, password)}
     if args.scope in ("surface", "all"):
         facts["surface"] = surface(panel)
     if args.scope == "cluster":

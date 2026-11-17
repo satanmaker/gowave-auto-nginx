@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -535,6 +536,36 @@ def auth_negative_facts(overrides=None):
                 name: {"status": 401, "error": "Unauthorized"}
                 for name in AUTH_NEGATIVE_VARIANTS
             },
+        }
+    }
+    for path, value in (overrides or {}).items():
+        target = facts
+        *parents, leaf = path.split(".")
+        for name in parents:
+            target = target[name]
+        target[leaf] = value
+    return json.dumps(facts)
+
+
+def api_client_facts(overrides=None):
+    """`api-client` probe output for the happy path, with single facts replaceable."""
+    facts = {
+        "api_client": {
+            "verify_mode": "CERT_REQUIRED",
+            "hostname_verification": True,
+            "timeout_configured": aio.PANEL_API_CLIENT_TIMEOUT_SECONDS,
+            "timeout_used": aio.PANEL_API_CLIENT_TIMEOUT_SECONDS,
+            "bundle_login": "accepted",
+            "nodes": 2,
+            # The two refusals the case decides are reported as class names, so
+            # the fixture uses two different ones: a case that compared the pair
+            # to a single expected class would pass here only by accident.
+            "empty_store_login": "GoWaveAPIError",
+            "hostname_mismatch_login": "SSLCertVerificationError",
+            "system_store_login": "GoWaveAPIError",
+            "production_default_timeout": aio.PANEL_API_CLIENT_TIMEOUT_SECONDS,
+            "production_default_context": True,
+            "bypass_tokens": [],
         }
     }
     for path, value in (overrides or {}).items():
@@ -2396,6 +2427,261 @@ class TestPanelAuthNegativeProbe(unittest.TestCase):
         self.assertEqual(self.server.decisions.count("signature"), 3)
         self.assertNotIn("expiry", self.server.decisions)
         self.assertNotIn("record", self.server.decisions)
+
+
+class TestPanelApiClientCase(unittest.TestCase):
+    """APIC-01: the controller's client trusts the run bundle and nothing else."""
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def run_case(self, **overrides):
+        product, podman = probe_product(self.context, api_client_facts(overrides))
+        return aio.case_panel_api_client_trust(product), podman
+
+    def reject(self, *expected, **overrides):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(**overrides)
+        for fragment in expected:
+            self.assertIn(fragment, str(caught.exception))
+
+    def test_the_probe_is_driven_with_the_run_bundle_and_a_non_default_bound(self):
+        evidence, podman = self.run_case()
+        self.assertEqual(len(podman.scripts), 1)
+        script = podman.scripts[0]
+        self.assertIn("--scope api-client", script)
+        self.assertIn(f"--edge-base https://{aio.PANEL_DOMAIN}", script)
+        self.assertIn(f"{topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}", script)
+        # The bound is neither the client's nor the parser's default, so a
+        # literal left in place would disagree with it instead of agreeing.
+        self.assertIn(f"API_TIMEOUT={aio.PANEL_API_CLIENT_TIMEOUT_SECONDS}", script)
+        self.assertNotEqual(aio.PANEL_API_CLIENT_TIMEOUT_SECONDS, 15)
+        self.assertEqual(evidence["verify_mode"], "CERT_REQUIRED")
+        self.assertTrue(evidence["hostname_verification"])
+        self.assertEqual(evidence["bundle_login"], "accepted")
+        self.assertEqual(evidence["nodes"], 2)
+        self.assertEqual(evidence["request_timeout_configured"],
+                         aio.PANEL_API_CLIENT_TIMEOUT_SECONDS)
+        self.assertEqual(evidence["request_timeout_used"],
+                         aio.PANEL_API_CLIENT_TIMEOUT_SECONDS)
+        self.assertEqual(evidence["production_default_timeout"],
+                         aio.PANEL_API_CLIENT_TIMEOUT_SECONDS)
+        self.assertTrue(evidence["production_default_context"])
+        self.assertEqual(evidence["bypass_tokens"], 0)
+
+    def test_a_context_that_does_not_verify_is_not_the_run_bundle(self):
+        self.reject("verifies in 'CERT_NONE' instead of CERT_REQUIRED",
+                    **{"api_client.verify_mode": "CERT_NONE"})
+
+    def test_a_context_that_does_not_check_the_hostname_fails_the_case(self):
+        self.reject("does not check the hostname", **{"api_client.hostname_verification": False})
+
+    def test_a_client_that_cannot_log_in_through_the_bundle_fails_the_case(self):
+        self.reject("could not log in through the run bundle", **{"api_client.bundle_login": "GoWaveAPIError"})
+
+    def test_a_response_that_is_not_a_node_list_fails_the_case(self):
+        self.reject("nodes instead of a list", **{"api_client.nodes": -1})
+
+    def test_a_login_through_an_empty_store_makes_the_bundle_prove_nothing(self):
+        self.reject("logged in through a context with no trust anchor",
+                    **{"api_client.empty_store_login": "accepted"})
+
+    def test_a_hostname_the_certificate_does_not_name_must_be_refused(self):
+        self.reject("accepted a certificate that names a different host",
+                    **{"api_client.hostname_mismatch_login": "accepted"})
+
+    def test_a_client_with_its_own_literal_timeout_fails_the_case(self):
+        self.reject("used a 15 second bound", **{"api_client.timeout_used": 15})
+
+    def test_a_parser_that_ignores_api_timeout_fails_the_case(self):
+        self.reject("API_TIMEOUT parsed as 15", **{"api_client.timeout_configured": 15})
+
+    def test_a_default_caller_that_does_not_inherit_the_bound_fails_the_case(self):
+        self.reject("did not inherit API_TIMEOUT",
+                    **{"api_client.production_default_timeout": 15})
+
+    def test_a_default_caller_that_supplies_its_own_context_fails_the_case(self):
+        self.reject("did not get the default one", **{"api_client.production_default_context": False})
+
+    def test_a_trust_bypass_in_either_source_fails_the_case(self):
+        self.reject("a trust bypass reached the shipped sources",
+                    **{"api_client.bypass_tokens": ["tools/live_vps/panel_api.py: verify=False"]})
+
+    def test_a_probe_that_exits_nonzero_fails_the_case(self):
+        product, _ = probe_product(self.context, '{"api_client": {}}', returncode=1)
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_panel_api_client_trust(product)
+        self.assertIn("the Panel API client probe exited 1", str(caught.exception))
+
+    def test_the_case_runs_beside_the_refusal_case_on_a_healthy_panel(self):
+        suite = aio.cases(ScriptedPodman(self.context, []))
+        cases = {case.id: case for case in suite}
+        self.assertIn(aio.PANEL_API_CLIENT_CASE_ID, cases)
+        self.assertEqual(cases[aio.PANEL_API_CLIENT_CASE_ID].topology, "aio")
+        self.assertEqual(cases[aio.PANEL_API_CLIENT_CASE_ID].timeout_seconds, 300)
+        ids = [case.id for case in suite]
+        self.assertLess(ids.index(aio.AUTH_NEGATIVE_CASE_ID),
+                        ids.index(aio.PANEL_API_CLIENT_CASE_ID))
+        self.assertLess(ids.index(aio.PANEL_API_CLIENT_CASE_ID), ids.index("AIO-CLIENT"))
+
+
+class TestPanelApiClientProbe(unittest.TestCase):
+    """The probe against a real TLS listener serving a certificate it must trust."""
+
+    PASSWORD = "pw-do-not-print"
+    TOKEN = "stub-token-not-a-secret-value"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.ca = self.root / "ca.pem"
+        key = self.root / "server.key"
+        self._openssl(
+            "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key), "-out", str(self.ca), "-days", "1",
+            "-subj", "/CN=localhost",
+            "-addext", "subjectAltName=DNS:localhost",
+        )
+        self.credentials = self.root / "credentials"
+        self.credentials.write_text(
+            f"ADMIN_USERNAME=admin\nADMIN_PASSWORD={self.PASSWORD}\n", encoding="utf-8"
+        )
+        self.credentials.chmod(0o600)
+        self.server = self._start_stub(self.ca, key)
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+
+    def _openssl(self, *arguments):
+        result = subprocess.run(
+            ["openssl", *arguments], capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def _start_stub(self, cert, key):
+        """A Panel that answers login and ``/api/nodes`` once the caller is past TLS."""
+        password, token = self.PASSWORD, self.TOKEN
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _send(self, status, body):
+                raw = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if self.path != "/api/auth/login":
+                    return self._send(404, {"message": "not found"})
+                if body.get("password") != password:
+                    return self._send(401, {"error": "Unauthorized"})
+                return self._send(200, {"response": {"accessToken": token}})
+
+            def do_GET(self):
+                if self.path != "/api/nodes":
+                    return self._send(404, {"message": "not found"})
+                if not (self.headers.get("Authorization") or "").startswith("Bearer "):
+                    return self._send(401, {"error": "Unauthorized"})
+                return self._send(200, {"response": [{"uuid": "node-uuid", "isConnected": True}]})
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(str(cert), str(key))
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server
+
+    def edge_base(self, host="localhost"):
+        return f"https://{host}:{self.server.server_address[1]}"
+
+    def run_probe(self, edge_base=None, timeout=7):
+        stdout = io.StringIO()
+        argv = [
+            "--scope", "api-client",
+            "--edge-base", edge_base or self.edge_base(),
+            "--ca", str(self.ca),
+            "--credentials", str(self.credentials),
+        ]
+        with mock.patch.dict(os.environ, {"API_TIMEOUT": str(timeout)}), \
+                redirect_stdout(stdout):
+            code = panel_surface.main(argv)
+        self.assertEqual(code, 0)
+        output = stdout.getvalue()
+        self.assertNotIn(self.PASSWORD, output)
+        self.assertNotIn(self.TOKEN, output)
+        return json.loads(output)
+
+    def test_the_bundle_logs_in_and_an_anchorless_context_does_not(self):
+        facts = self.run_probe()["api_client"]
+        self.assertEqual(facts["verify_mode"], "CERT_REQUIRED")
+        self.assertTrue(facts["hostname_verification"])
+        self.assertEqual(facts["bundle_login"], "accepted")
+        self.assertEqual(facts["nodes"], 1)
+        self.assertNotEqual(facts["empty_store_login"], "accepted")
+
+    def test_the_same_bundle_does_not_accept_an_address_the_certificate_omits(self):
+        facts = self.run_probe()["api_client"]
+        self.assertNotEqual(facts["hostname_mismatch_login"], "accepted")
+
+    def test_an_empty_store_is_not_the_system_store_that_trusts_the_run_ca(self):
+        # The live host may point its default store at the run's CA through
+        # `SSL_CERT_FILE`, which the case names as the environment's property
+        # rather than the client's. A probe that used `create_default_context`
+        # where it promises a context with no anchor would then report that
+        # trust as its own, so with the variable set the empty-store login must
+        # still be refused while the system-store login is reported as accepted.
+        with mock.patch.dict(os.environ, {"SSL_CERT_FILE": str(self.ca)}):
+            facts = self.run_probe()["api_client"]
+        self.assertEqual(facts["system_store_login"], "accepted")
+        self.assertNotEqual(facts["empty_store_login"], "accepted")
+
+    def test_the_configured_bound_reaches_the_client_and_the_default_one(self):
+        facts = self.run_probe(timeout=7)["api_client"]
+        self.assertEqual(facts["timeout_configured"], 7)
+        self.assertEqual(facts["timeout_used"], 7)
+        self.assertEqual(facts["production_default_timeout"], 7)
+        self.assertTrue(facts["production_default_context"])
+
+    def test_the_scope_does_not_log_in_to_the_loopback_api_first(self):
+        # Every other scope starts with that fact; this one must not, or the
+        # plaintext loopback answer would be read as the HTTPS client's trust.
+        facts = self.run_probe()
+        self.assertEqual(sorted(facts), ["api_client"])
+
+    def test_a_plaintext_edge_base_is_refused_before_any_client_is_built(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.run_probe(edge_base="http://localhost:3000")
+        self.assertIn("must be an https URL naming the Panel", str(caught.exception))
+
+    def test_the_shipped_tree_carries_no_bypass(self):
+        from tools.podman_e2e import panel_surface as surface
+
+        root = Path(__file__).resolve().parents[1]
+        self.assertEqual(surface.api_client_bypass_tokens(root), [])
+
+    def test_a_bypass_added_to_either_source_is_reported_by_name(self):
+        from tools.podman_e2e import panel_surface as surface
+
+        for relative in surface.API_CLIENT_SOURCES:
+            with self.subTest(source=relative):
+                for name in surface.API_CLIENT_SOURCES:
+                    (self.root / name).parent.mkdir(parents=True, exist_ok=True)
+                    (self.root / name).write_text("clean\n", encoding="utf-8")
+                (self.root / relative).write_text(
+                    "client = build(verify=False)\n", encoding="utf-8"
+                )
+                self.assertEqual(surface.api_client_bypass_tokens(self.root),
+                                 [f"{relative}: verify=False"])
 
 
 class TestPanelEnvValue(unittest.TestCase):
@@ -5195,6 +5481,271 @@ class TestPacketEvidenceCase(unittest.TestCase):
         )
         self.assertLess(ids.index("AIO-MATRIX"), ids.index(aio.PKT_INCOMPLETE_CASE_ID))
 
+
+
+DUMP_PASSWORD = "e2e-admin-password-0123456789"
+DUMP_TOKEN = "e2e-scoped-token-0123456789"
+# The dump a careless diagnostic takes: the stat line the product's own hardening
+# reads, then the file exactly as the installer wrote it. The field names come
+# from the module under test, so this fixture cannot drift from the fields the
+# case withholds.
+CREDENTIALS_DUMP = (
+    "mode=600\n"
+    "owner=0\n"
+    "type=regular file\n"
+    "--file--\n"
+    "# GoWave Auto NGINX Administrative Credentials\n"
+    "# Generated at 2026-11-17T09:00:00Z\n"
+    "PANEL_URL=https://panel.testbed.internal\n"
+    f"{aio.CREDENTIAL_FIELDS[0]}=admin\n"
+    f"{aio.CREDENTIAL_FIELDS[1]}={DUMP_PASSWORD}\n"
+    f"{aio.CREDENTIAL_FIELDS[2]}={DUMP_TOKEN}\n"
+)
+
+
+class TestRedactedCredentialsCase(unittest.TestCase):
+    """RED-01: the credentials file reaches an artifact as names, never values."""
+
+    def setUp(self):
+        from tools.live_vps.redaction import clear_secrets
+
+        clear_secrets()
+        self.addCleanup(clear_secrets)
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def run_case(self, dump=CREDENTIALS_DUMP, returncode=0):
+        product, _ = installed_product(self.context, [(dump, returncode)])
+        return aio.case_redacted_credentials(product)
+
+    def reject(self, *expected, **kwargs):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(**kwargs)
+        message = str(caught.exception)
+        # A refusal names the field or the file, never the value: a case that
+        # quoted what it was withholding would leak it into result.json.
+        self.assertNotIn(DUMP_PASSWORD, message)
+        self.assertNotIn(DUMP_TOKEN, message)
+        for fragment in expected:
+            self.assertIn(fragment, message)
+
+    def test_the_names_survive_and_both_values_are_redacted(self):
+        evidence = self.run_case()
+        self.assertEqual(evidence["file_mode"], "600")
+        self.assertEqual(evidence["file_owner"], "0")
+        self.assertEqual(evidence["file_type"], "regular file")
+        self.assertEqual(evidence["credential_fields"], ",".join(aio.CREDENTIAL_FIELDS))
+        self.assertEqual(evidence["redacted_markers"], 2)
+        self.assertEqual(evidence["audit_offences"], 0)
+        self.assertGreaterEqual(evidence["audited_files"], 1)
+        written = (
+            self.context.artifact_dir / "evidence" / "diagnostics" / aio.REDACTION_CASE_ID
+            / "credentials.txt"
+        ).read_text(encoding="utf-8")
+        for name in aio.CREDENTIAL_FIELDS:
+            self.assertIn(name, written)
+        for secret in (DUMP_PASSWORD, DUMP_TOKEN):
+            self.assertNotIn(secret, written)
+        self.assertEqual(written.count("[REDACTED]"), 2)
+        for secret in (DUMP_PASSWORD, DUMP_TOKEN):
+            self.assertNotIn(secret, json.dumps(evidence))
+
+    def test_a_file_anyone_could_read_fails_before_its_contents_are_withheld(self):
+        self.reject("is mode '644', not 600", dump=CREDENTIALS_DUMP.replace("mode=600", "mode=644"))
+
+    def test_a_symlink_is_not_the_file_the_installer_wrote(self):
+        self.reject("'symbolic link', not a regular file",
+                    dump=CREDENTIALS_DUMP.replace("type=regular file", "type=symbolic link"))
+
+    def test_a_missing_field_is_named_and_its_value_is_not(self):
+        dump = "".join(
+            line for line in CREDENTIALS_DUMP.splitlines(True)
+            if not line.startswith(f"{aio.CREDENTIAL_FIELDS[2]}=")
+        )
+        self.reject(f"does not name {aio.CREDENTIAL_FIELDS[2]}", dump=dump)
+
+    def test_an_unreadable_file_fails_with_the_probe_code(self):
+        self.reject("the credentials probe exited 3", dump="unreadable\n", returncode=3)
+
+    def test_a_writer_that_does_not_redact_is_caught(self):
+        class Unredacted:
+            def __init__(self, artifact_dir):
+                self.artifact_dir = artifact_dir
+
+            def evidence_text(self, name, text):
+                path = self.artifact_dir / "evidence" / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+                return path
+
+        product, _ = installed_product(self.context, [(CREDENTIALS_DUMP, 0)])
+        product.context = Unredacted(self.context.artifact_dir)
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_redacted_credentials(product)
+        self.assertIn("kept the credentials text unchanged", str(caught.exception))
+
+    def test_a_sibling_artifact_that_still_holds_the_password_fails_the_case(self):
+        leak = self.context.artifact_dir / "evidence" / "leak.txt"
+        leak.parent.mkdir(parents=True, exist_ok=True)
+        leak.write_text(f"password={DUMP_PASSWORD}\n", encoding="utf-8")
+        self.reject("artifacts that change when redacted: evidence/leak.txt")
+
+    def test_both_halves_are_registered_before_the_channel_switch(self):
+        suite = aio.cases(ScriptedPodman(self.context, []))
+        cases = {case.id: case for case in suite}
+        ids = [case.id for case in suite]
+        self.assertEqual(cases[aio.REDACTION_CASE_ID].topology, "aio")
+        self.assertEqual(cases[aio.DIAGNOSTICS_CASE_ID].topology, "aio")
+        self.assertEqual(cases[aio.DIAGNOSTICS_CASE_ID].timeout_seconds,
+                         aio.DIAGNOSTICS_TIMEOUT_SECONDS)
+        self.assertLess(ids.index(aio.REDACTION_CASE_ID), ids.index(aio.DIAGNOSTICS_CASE_ID))
+        self.assertLess(ids.index(aio.DIAGNOSTICS_CASE_ID), ids.index(aio.CHANNEL_NOOP_CASE_ID))
+
+
+# What each area probe prints on a healthy host, keyed by a fragment of the probe
+# that asks for it. Every value is the tool's own text, because the case asks for
+# the words the tool prints rather than for words the harness could invent.
+BUNDLE_AREA_OUTPUT = {
+    "== operating system ==": (
+        "Linux aio-1 6.8.0-45-generic #45-Ubuntu SMP x86_64 GNU/Linux\n"
+        'NAME="Ubuntu"\nVERSION_ID="24.04"\nID=ubuntu\n'
+        "nginx=1.24.0-2ubuntu7.3\nfail2ban=1.0.2-3ubuntu0.1\n"
+    ),
+    "is-active: ": "gowave\nis-active: active\nis-enabled: enabled\nActiveState=active\n",
+    'journalctl -q -u "$unit"': (
+        "2026-11-17T09:00:00+0000 aio-1 systemd[1]: Started GoWave Panel.\n"
+    ),
+    "ss -ltnup": (
+        "LISTEN 0 511 0.0.0.0:443 0.0.0.0:*\n"
+        "-P INPUT ACCEPT\nStatus: active\n"
+    ),
+    "openssl x509": (
+        "subject=CN = panel.testbed.internal\nnotAfter=Feb 15 10:00:00 2027 GMT\n"
+    ),
+    "resolvectl status": "Link 2 (eth0): panel.testbed.internal\n",
+    "== client engines ==": "xray 26.11.9\n",
+    "nginx -t": (
+        "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok\n"
+        "nginx: configuration file /etc/nginx/nginx.conf test is successful\n"
+    ),
+}
+
+
+class BundlePodman:
+    """Podman stub whose probes answer per area, so the bundle is a real bundle."""
+
+    def __init__(self, context, override=None, raising=None):
+        self.context = context
+        self.override = override or {}
+        self.raising = raising or {}
+        self.scripts = []
+
+    def run_containers(self):
+        return [{"name": "aio-1", "state": "running"}]
+
+    def exec_bash(self, name, script, check=False, timeout=0):
+        self.scripts.append(script)
+        if name in self.raising:
+            raise self.raising[name]
+        for marker, output in {**BUNDLE_AREA_OUTPUT, **self.override}.items():
+            if marker in script:
+                return subprocess.CompletedProcess(["bash", "-lc", script], 0, output, "")
+        return subprocess.CompletedProcess(["bash", "-lc", script], 0, "unknown probe", "")
+
+
+class TestDiagnosticArtifactsCase(unittest.TestCase):
+    """RED-02: the bundle a failure leaves behind carries the fields it names."""
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def run_case(self, **overrides):
+        product = aio.AioProduct(BundlePodman(self.context, override=overrides))
+        return aio.case_diagnostic_artifacts(product)
+
+    def reject(self, *expected, **overrides):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(**overrides)
+        for fragment in expected:
+            self.assertIn(fragment, str(caught.exception))
+
+    def read(self, area):
+        return (
+            self.context.artifact_dir / "evidence" / "diagnostics" / aio.DIAGNOSTICS_CASE_ID
+            / f"{area}.txt"
+        ).read_text(encoding="utf-8")
+
+    def test_every_area_carries_the_field_the_requirement_names(self):
+        evidence = self.run_case()
+        self.assertEqual(evidence["files"], len(aio.diagnostics.AREAS) + 1)
+        self.assertEqual(evidence["required_fields"], len(aio.DIAGNOSTIC_REQUIRED_FIELDS))
+        self.assertEqual(evidence["private_key_files"], 0)
+        self.assertEqual(evidence["file_mode"], "0600")
+        self.assertTrue(evidence["bundle_seconds"].endswith("s"))
+        for area in (item.name for item in aio.diagnostics.AREAS):
+            self.assertIn("[bundle complete: 1 container(s) probed]", self.read(area))
+
+    def test_a_bundle_without_the_kernel_line_is_refused(self):
+        self.reject("the operator file does not carry the kernel",
+                    **{"== operating system ==": 'NAME="Ubuntu"\nID=ubuntu\nVERSION_ID="24.04"\n'})
+
+    def test_a_bundle_without_an_installed_package_version_is_refused(self):
+        self.reject("the operator file does not carry the package version",
+                    **{"== operating system ==": "Linux aio-1 6.8.0 x86_64\nID=ubuntu\n"
+                                                   'VERSION_ID="24.04"\n'})
+
+    def test_a_bundle_without_a_unit_state_is_refused(self):
+        self.reject("the service file does not carry the unit state",
+                    **{"is-active: ": "gowave\nunknown\n"})
+
+    def test_a_bundle_without_a_firewall_verdict_is_refused(self):
+        self.reject("the network file does not carry the firewall verdict",
+                    **{"ss -ltnup": "LISTEN 0 511 0.0.0.0:443 0.0.0.0:*\n-P INPUT ACCEPT\n"})
+
+    def test_a_bundle_without_certificate_metadata_is_refused(self):
+        self.reject("the tls file does not carry the certificate subject",
+                    **{"openssl x509": "notAfter=Feb 15 10:00:00 2027 GMT\n"})
+
+    def test_a_bundle_without_the_vhost_test_verdict_is_refused(self):
+        self.reject("the endpoint file does not carry the vhost test verdict",
+                    **{"nginx -t": "nginx: the configuration file /etc/nginx/nginx.conf "
+                                   "syntax is ok\n"})
+
+    def test_private_key_material_in_the_bundle_fails_the_case(self):
+        self.reject("tls.txt carries private key material",
+                    **{"openssl x509": "-----BEGIN PRIVATE KEY-----\nMIIE\n"
+                                       "subject=CN = panel.testbed.internal\n"
+                                       "notAfter=Feb 15 10:00:00 2027 GMT\n"})
+
+    def test_a_bundle_written_world_readable_fails_the_case(self):
+        class WorldReadable:
+            def __init__(self, inner):
+                self.inner = inner
+                self.artifact_dir = inner.artifact_dir
+                self.topology = inner.topology
+
+            def evidence_text(self, name, text):
+                path = self.inner.evidence_text(name, text)
+                path.chmod(0o644)
+                return path
+
+        product = aio.AioProduct(BundlePodman(self.context))
+        product.context = WorldReadable(self.context)
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_diagnostic_artifacts(product)
+        self.assertIn("is mode 0o644, not 0o600", str(caught.exception))
+
+    def test_a_probe_that_cannot_run_is_reported_rather_than_passing_empty(self):
+        product = aio.AioProduct(BundlePodman(
+            self.context, raising={"aio-1": TimeoutError("podman exec did not answer")},
+        ))
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_diagnostic_artifacts(product)
+        self.assertIn("the operator file does not carry the kernel", str(caught.exception))
+        self.assertIn("[probe could not run: TimeoutError", self.read("operator"))
 
 
 if __name__ == "__main__":

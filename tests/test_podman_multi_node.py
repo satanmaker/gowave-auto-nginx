@@ -1864,6 +1864,17 @@ class TestMultiNodeSuite(unittest.TestCase):
         self.assertEqual(suite[multi_node.EGRESS_CASE_ID].timeout_seconds,
                          multi_node.EGRESS_TIMEOUT_SECONDS)
 
+    def test_the_panel_client_trust_case_reads_the_master_beside_the_refusal_case(self):
+        # APIC-01 asks the controller's own HTTPS client about the Panel the
+        # refusal case has just proven is serving, and both run on the healthy
+        # pair before the lifecycle cases restart it.
+        ids = [case.id for case in multi_node.cases(self.podman)]
+        self.assertSequence(ids, [aio.AUTH_NEGATIVE_CASE_ID, aio.PANEL_API_CLIENT_CASE_ID,
+                                  aio.REDACTION_CASE_ID])
+        suite = {case.id: case for case in multi_node.cases(self.podman)}
+        self.assertEqual(suite[aio.PANEL_API_CLIENT_CASE_ID].topology, "multi-node")
+        self.assertEqual(suite[aio.PANEL_API_CLIENT_CASE_ID].timeout_seconds, 300)
+
     def test_the_lifecycle_cases_run_last_because_they_fault_the_worker(self):
         # 5.9: revocation and the Worker's own stop/start/restart change the
         # cluster under the suite, so nothing that observes a healthy cluster may

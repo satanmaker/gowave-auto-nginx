@@ -8674,6 +8674,24 @@ def cases(
         Case(aio.AUTH_NEGATIVE_CASE_ID, "multi-node",
              lambda context: aio.case_panel_auth_negative(product.master),
              timeout_seconds=300),
+        # The controller reaches the Master's Panel over the same public name and
+        # the same run bundle whichever contour installed it, so the client's
+        # trust is asked here too rather than only where the Panel was installed
+        # beside its Node.
+        Case(aio.PANEL_API_CLIENT_CASE_ID, "multi-node",
+             lambda context: aio.case_panel_api_client_trust(product.master),
+             timeout_seconds=300),
+        # The redaction contract is one filter and one writer, so the Master asks
+        # the same two questions the All-in-One contour asks: its credentials file
+        # reaches an artifact as names only, and the bundle covers every container
+        # this run owns — the Workers included — because the collector discovers
+        # them from the run label rather than from the products.
+        Case(aio.REDACTION_CASE_ID, "multi-node",
+             lambda context: aio.case_redacted_credentials(product.master),
+             timeout_seconds=300),
+        Case(aio.DIAGNOSTICS_CASE_ID, "multi-node",
+             lambda context: aio.case_diagnostic_artifacts(product.master),
+             timeout_seconds=aio.DIAGNOSTICS_TIMEOUT_SECONDS),
         # Beside it and before the lifecycle cases: the teardown policy a cluster
         # run ends in is decided by a configuration file and a hook, not by the
         # cluster, so the case reads it here rather than after the cases that

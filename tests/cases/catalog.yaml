@@ -1717,8 +1717,38 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_panel_api_client_trust
+      evidence:
+      - bundle_login
+      - bypass_tokens
+      - empty_store_login
+      - hostname_mismatch_login
+      - hostname_verification
+      - nodes
+      - production_default_context
+      - production_default_timeout
+      - request_timeout_configured
+      - request_timeout_used
+      - system_store_login
+      - verify_mode
+    multi-node:
+      driver: aio:case_panel_api_client_trust
+      evidence:
+      - bundle_login
+      - bypass_tokens
+      - empty_store_login
+      - hostname_mismatch_login
+      - hostname_verification
+      - nodes
+      - production_default_context
+      - production_default_timeout
+      - request_timeout_configured
+      - request_timeout_used
+      - system_store_login
+      - verify_mode
   promotion_target: null
 - id: CLUS-01
   requirement: Panel API Cluster Structure Audit
@@ -4487,8 +4517,28 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_redacted_credentials
+      evidence:
+      - audit_offences
+      - audited_files
+      - credential_fields
+      - file_mode
+      - file_owner
+      - file_type
+      - redacted_markers
+    multi-node:
+      driver: aio:case_redacted_credentials
+      evidence:
+      - audit_offences
+      - audited_files
+      - credential_fields
+      - file_mode
+      - file_owner
+      - file_type
+      - redacted_markers
   promotion_target: null
 - id: RED-02
   requirement: Redacted Diagnostic Artifact Collection
@@ -4515,8 +4565,26 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_diagnostic_artifacts
+      evidence:
+      - areas
+      - bundle_seconds
+      - file_mode
+      - files
+      - private_key_files
+      - required_fields
+    multi-node:
+      driver: aio:case_diagnostic_artifacts
+      evidence:
+      - areas
+      - bundle_seconds
+      - file_mode
+      - files
+      - private_key_files
+      - required_fields
   promotion_target: null
 - id: RES-01
   requirement: Result Status Semantics

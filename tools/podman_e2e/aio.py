@@ -26,6 +26,7 @@ from . import (
     budget,
     client_image,
     client_trust,
+    diagnostics,
     ingress,
     matrix,
     panel_surface,
@@ -40,11 +41,15 @@ from . import (
     vision as vision_policy,
 )
 from .podman import wait_until
-from .runner import Case, CaseBlocked, CaseIncomplete, require
+from .runner import Case, CaseBlocked, CaseIncomplete, PASS, CaseResult, redaction_audit, require
 # One version rule for both contours: the live runner interrogates the same three
 # binaries over SSH, and a second copy would let the two disagree about what a
 # pin means.
 from tools.live_vps.versions import output_matches_expected_version, version_token
+# The redaction contract is one filter, so both contours register into the same
+# registry: a secret the case registered is redacted from every artifact the run
+# writes afterwards, wherever it was written.
+from tools.live_vps.redaction import register_secret
 
 INSTALL_CASE_ID = "AIO-INSTALL"
 
@@ -93,6 +98,25 @@ SUBSCRIPTION_PROBE_SCRIPT = topology.SUBSCRIPTION_PROBE_SCRIPT
 # is the same question on both contours — a Master serves the Panel — so the
 # Multi-Node suite registers this same id against its Master product.
 AUTH_NEGATIVE_CASE_ID = "AIO-AUTH-NEG"
+# The controller's own Panel client, driven over the Panel's public name. The
+# bound is deliberately a value neither the client nor the parser defaults to,
+# so "the client used API_TIMEOUT" is a measurement rather than a coincidence.
+PANEL_API_CLIENT_CASE_ID = "APIC-01"
+PANEL_API_CLIENT_TIMEOUT_SECONDS = 7
+# The two halves of the redaction contract. Both ask a question about the
+# harness rather than about the product, so both are answerable wherever the
+# product ran: the credentials file exists on every role the installer touched,
+# and the diagnostic bundle reads whichever containers the run owns.
+REDACTION_CASE_ID = "RED-01"
+DIAGNOSTICS_CASE_ID = "RED-02"
+# The bundle's own budget is 90 s; the case's deadline is what a wedged host
+# costs on top of it, so a probe that hangs is reported inside the bundle rather
+# than as a case that never finished.
+DIAGNOSTICS_TIMEOUT_SECONDS = 300
+# The fields the credentials file names. The installer writes the two secrets
+# and the scoped token; the case withholds every value and keeps the names.
+CREDENTIAL_FIELDS = ("ADMIN_USERNAME", "ADMIN_PASSWORD", "SCOPED_API_TOKEN")
+CREDENTIAL_SECRET_FIELDS = ("ADMIN_PASSWORD", "SCOPED_API_TOKEN")
 
 # What each YAML representation is expected to carry, per the shipped generators.
 # GenerateMihomo skips only kcp, so Mihomo receives one proxy per inbound.
@@ -2510,6 +2534,265 @@ def case_panel_auth_negative(product: AioProduct) -> Dict[str, Any]:
             }
             for name in ("expired", "forged", "unsigned", "unknown-admin")
         },
+    }
+
+
+def case_panel_api_client_trust(product: AioProduct) -> Dict[str, Any]:
+    """APIC-01: the controller's Panel client trusts the run bundle and nothing else.
+
+    Four clauses, one probe. The bundle logs in over the Panel's public name —
+    and a context with no anchor at all is refused, so the success came from
+    that file rather than from a store the image happened to carry. The same
+    bundle naming an address the certificate does not carry is refused, which is
+    hostname verification being on rather than being configured on. The bound is
+    set to a value neither the client nor the parser defaults to, so a literal
+    that happened to agree today would be caught rather than confirmed. And the
+    two sources are read for a bypass: an ``allowInsecure`` or a
+    ``check_hostname = False`` added to either makes the first three clauses
+    describe a client nobody ships.
+    """
+    host = product.require_installed()
+    ca_file = f"{topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}"
+    script = (
+        f"API_TIMEOUT={PANEL_API_CLIENT_TIMEOUT_SECONDS} python3 {PANEL_SURFACE_SCRIPT} "
+        f"--scope api-client --edge-base https://{host.panel_domain} --ca {ca_file}"
+    )
+    facts = product._probe_json(
+        PANEL_API_CLIENT_CASE_ID, "the Panel API client probe", product.host_script(script),
+    ).get("api_client") or {}
+
+    require(PANEL_API_CLIENT_CASE_ID, facts.get("verify_mode") == "CERT_REQUIRED",
+            f"the context built from the run bundle verifies in {facts.get('verify_mode')!r} "
+            "instead of CERT_REQUIRED")
+    require(PANEL_API_CLIENT_CASE_ID, facts.get("hostname_verification") is True,
+            "the context built from the run bundle does not check the hostname")
+    require(PANEL_API_CLIENT_CASE_ID, facts.get("bundle_login") == "accepted",
+            f"the client could not log in through the run bundle: it reported "
+            f"{facts.get('bundle_login')!r}")
+    require(PANEL_API_CLIENT_CASE_ID, facts.get("nodes", 0) >= 0,
+            f"the authenticated client read {facts.get('nodes')!r} nodes instead of a list")
+    require(PANEL_API_CLIENT_CASE_ID, facts.get("empty_store_login") != "accepted",
+            "the client logged in through a context with no trust anchor, so the bundle is not "
+            "what made the first login work")
+    require(PANEL_API_CLIENT_CASE_ID, facts.get("hostname_mismatch_login") != "accepted",
+            "the client accepted a certificate that names a different host, so hostname "
+            "verification is configured off")
+    require(PANEL_API_CLIENT_CASE_ID,
+            facts.get("timeout_used") == PANEL_API_CLIENT_TIMEOUT_SECONDS,
+            f"the client used a {facts.get('timeout_used')!r} second bound while API_TIMEOUT was "
+            f"{PANEL_API_CLIENT_TIMEOUT_SECONDS}")
+    require(PANEL_API_CLIENT_CASE_ID,
+            facts.get("timeout_configured") == PANEL_API_CLIENT_TIMEOUT_SECONDS,
+            f"API_TIMEOUT parsed as {facts.get('timeout_configured')!r} instead of "
+            f"{PANEL_API_CLIENT_TIMEOUT_SECONDS}, so the bound above was not the configured one")
+    require(PANEL_API_CLIENT_CASE_ID,
+            facts.get("production_default_timeout") == PANEL_API_CLIENT_TIMEOUT_SECONDS,
+            "a caller that omits the optional timeout did not inherit API_TIMEOUT: it got "
+            f"{facts.get('production_default_timeout')!r}")
+    require(PANEL_API_CLIENT_CASE_ID, facts.get("production_default_context") is True,
+            "a caller that omits the optional context did not get the default one")
+    require(PANEL_API_CLIENT_CASE_ID, not facts.get("bypass_tokens"),
+            "a trust bypass reached the shipped sources: " + ", ".join(facts.get("bypass_tokens") or []))
+    return {
+        "bundle_login": facts.get("bundle_login"),
+        "empty_store_login": facts.get("empty_store_login"),
+        "hostname_mismatch_login": facts.get("hostname_mismatch_login"),
+        "hostname_verification": facts.get("hostname_verification"),
+        "nodes": facts.get("nodes"),
+        "production_default_timeout": facts.get("production_default_timeout"),
+        "production_default_context": facts.get("production_default_context"),
+        "request_timeout_configured": facts.get("timeout_configured"),
+        "request_timeout_used": facts.get("timeout_used"),
+        "system_store_login": facts.get("system_store_login"),
+        "verify_mode": facts.get("verify_mode"),
+        "bypass_tokens": len(facts.get("bypass_tokens") or []),
+    }
+
+
+def credentials_probe_script() -> str:
+    """Print the credentials file the way a careless diagnostic dump would.
+
+    The accident this case exists for is one ``cat`` of the file: the operator's
+    administrator password in a bundle that gets copied off the host. So the
+    script prints exactly what such a dump prints — the stat line the product's
+    own hardening reads, then the file — and the case is the writer that has to
+    stand between the two.
+    """
+    return (
+        "set -u\n"
+        f"path={CREDENTIALS_FILE}\n"
+        'if [ ! -f "$path" ] || [ -L "$path" ]; then printf \'unreadable\\n\'; exit 3; fi\n'
+        "stat -c 'mode=%a' \"$path\"\n"
+        "stat -c 'owner=%u' \"$path\"\n"
+        "stat -c 'type=%F' \"$path\"\n"
+        "printf -- '--file--\\n'\n"
+        'cat -- "$path"\n'
+    )
+
+
+def case_redacted_credentials(product: AioProduct) -> Dict[str, Any]:
+    """RED-01: the credentials file reaches an artifact as names, never values.
+
+    The case reads the real file, registers both secret values with the run's own
+    filter, and writes the raw dump through the writer every artifact goes
+    through. Then it reads the tree back: the field names must survive, both
+    values must be `[REDACTED]`, and the run's own audit must call the whole
+    artifact directory a fixed point of the filter. A case that only inspected a
+    redacted string it built itself would prove nothing about the writer, and one
+    that trusted the writer without reading the file back would pass on a writer
+    that was never wired to the filter.
+    """
+    result = product.host_script(credentials_probe_script())
+    require(REDACTION_CASE_ID, result.returncode == 0,
+            f"the credentials probe exited {result.returncode}: "
+            f"{(result.stderr or '').strip()[-400:]}")
+    lines = (result.stdout or "").splitlines()
+    require(REDACTION_CASE_ID, "--file--" in lines,
+            "the credentials probe printed no file marker")
+    split_at = lines.index("--file--")
+    stat_fields = dict(
+        tuple(line.split("=", 1)) for line in lines[:split_at] if "=" in line
+    )
+    require(REDACTION_CASE_ID, stat_fields.get("mode"),
+            "the credentials probe printed no stat line for the file")
+    require(REDACTION_CASE_ID, stat_fields.get("type") == "regular file",
+            f"the credentials file is {stat_fields.get('type')!r}, not a regular file")
+    require(REDACTION_CASE_ID, stat_fields.get("mode") == "600",
+            f"the credentials file is mode {stat_fields.get('mode')!r}, not 600")
+    require(REDACTION_CASE_ID, stat_fields.get("owner") == "0",
+            f"the credentials file is owned by uid {stat_fields.get('owner')!r}, not root")
+
+    body = "\n".join(lines[split_at + 1:])
+    values: Dict[str, str] = {}
+    for line in body.splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name in CREDENTIAL_FIELDS:
+            values[name] = value.strip()
+    missing = [name for name in CREDENTIAL_FIELDS if not values.get(name)]
+    require(REDACTION_CASE_ID, not missing,
+            "the credentials file does not name " + ", ".join(missing)
+            + " (field names only; no value is reported)")
+
+    # From here the two secret values are registered with the run's filter and
+    # never printed: the raw dump goes through the writer, and the case reads
+    # back what the writer made of it.
+    for name in CREDENTIAL_SECRET_FIELDS:
+        register_secret(values[name])
+    path = product.context.evidence_text(
+        f"diagnostics/{REDACTION_CASE_ID}/credentials.txt", body
+    )
+    written = path.read_text(encoding="utf-8")
+    require(REDACTION_CASE_ID, "[REDACTED]" in written,
+            "the evidence writer kept the credentials text unchanged")
+    for name in CREDENTIAL_SECRET_FIELDS:
+        require(REDACTION_CASE_ID, values[name] not in written,
+                f"the {name} value survived the evidence writer")
+    require(REDACTION_CASE_ID, all(name in written for name in CREDENTIAL_FIELDS),
+            "the redacted copy does not name every field it withheld")
+
+    audit = redaction_audit(product.context.artifact_dir)
+    require(REDACTION_CASE_ID, not audit.get("offences"),
+            "artifacts that change when redacted: " + ", ".join(audit.get("offences") or []))
+    return {
+        "credential_fields": ",".join(CREDENTIAL_FIELDS),
+        "file_mode": stat_fields.get("mode"),
+        "file_owner": stat_fields.get("owner"),
+        "file_type": stat_fields.get("type"),
+        "redacted_markers": written.count("[REDACTED]"),
+        "audited_files": audit.get("files"),
+        "audit_offences": len(audit.get("offences") or []),
+    }
+
+
+# What the bundle must carry for RED-02 to be true, per area: (area, label, needles).
+# Every needle is text the tool on the host printed — the kernel line, the
+# distribution's own identifiers, the installed package version, a unit's state,
+# journalctl's output, a listener, the vhost test, ufw's verdict, iptables' chain
+# policy, and the served certificate's fields — so a bundle cannot satisfy this
+# table by being written by the harness itself. A tuple means any one of its
+# needles is enough: the journal and the firewall are read through the words the
+# tools use when they have nothing to report, because a container without a
+# journal is a fact the bundle must state rather than hide.
+DIAGNOSTIC_REQUIRED_FIELDS = (
+    ("operator", "kernel", ("Linux ",)),
+    ("operator", "distribution", ("ID=",)),
+    ("operator", "distribution version", ("VERSION_ID=",)),
+    ("operator", "package version", ("nginx=",)),
+    ("service", "unit state", ("is-active: active",)),
+    ("service", "unit enablement", ("is-enabled: enabled",)),
+    ("systemd", "journal", ("No entries", "systemd[")),
+    ("network", "listener", ("LISTEN",)),
+    ("network", "tls listener", (":443",)),
+    ("network", "firewall verdict", ("Status: active", "Status: inactive")),
+    ("network", "firewall rules", ("-P INPUT",)),
+    ("tls", "certificate subject", ("subject=",)),
+    ("tls", "certificate validity", ("notAfter=",)),
+    ("endpoint", "vhost test", ("syntax is ok",)),
+    ("endpoint", "vhost test verdict", ("test is successful",)),
+)
+
+
+def case_diagnostic_artifacts(product: AioProduct) -> Dict[str, Any]:
+    """RED-02: the bundle a failure would leave behind carries the safe fields.
+
+    A wedged host is read through this bundle and nothing else, so the case asks
+    the real collector for it on a healthy one: the same eight areas, the same
+    per-container probes, the same redaction, modes, truncation accounting and
+    index. Then it reads every file back and asks for the fields the requirement
+    names — the host's own OS, kernel and package versions, unit state, journal,
+    listeners, the vhost test, the firewall, and certificate metadata with no key
+    material.
+
+    Two clauses of the requirement are report-side and are not claimed here: API
+    object summaries and traffic results are carried by the evidence of the cases
+    that observed them, and per-case timings by ``result.json``, which the runner
+    writes after the last case. The bundle's own timing metric — the index's
+    duration — is read back below, and the report-side half is proven by the
+    runner's own tests rather than by a file that does not exist yet.
+    """
+    placeholder = CaseResult(DIAGNOSTICS_CASE_ID, product.context.topology, PASS)
+    written = diagnostics.collect(product.context, product.podman, placeholder)
+    bundle: Dict[str, str] = {}
+    for relative in written:
+        bundle[relative] = (product.context.artifact_dir / relative).read_text(encoding="utf-8")
+    expected = len(diagnostics.AREAS) + 1
+    require(DIAGNOSTICS_CASE_ID, len(bundle) == expected,
+            f"the collector wrote {len(bundle)} file(s), expected one per area plus an index "
+            f"({expected})")
+
+    prefix = f"evidence/diagnostics/{DIAGNOSTICS_CASE_ID}/"
+    for area, label, needles in DIAGNOSTIC_REQUIRED_FIELDS:
+        text = bundle.get(f"{prefix}{area}.txt", "")
+        require(DIAGNOSTICS_CASE_ID, any(needle in text for needle in needles),
+                f"the {area} file does not carry the {label} "
+                f"({' or '.join(repr(needle) for needle in needles)} is absent)")
+    for relative, text in bundle.items():
+        require(DIAGNOSTICS_CASE_ID, "PRIVATE KEY" not in text,
+                f"{relative} carries private key material")
+        if relative.endswith("index.txt"):
+            continue
+        require(DIAGNOSTICS_CASE_ID, "[bundle complete:" in text,
+                f"{relative} does not say whether it is complete")
+    for relative in bundle:
+        mode = (product.context.artifact_dir / relative).stat().st_mode & 0o777
+        require(DIAGNOSTICS_CASE_ID, mode == 0o600,
+                f"{relative} is mode {oct(mode)}, not 0o600")
+
+    index = bundle.get(f"{prefix}index.txt", "")
+    require(DIAGNOSTICS_CASE_ID, "duration:" in index, "the index carries no timing metric")
+    require(DIAGNOSTICS_CASE_ID, "not run: 0" in index,
+            "the index does not account for every probe it ran")
+    seconds = ""
+    for line in index.splitlines():
+        if line.startswith("duration:"):
+            seconds = line.split(":", 1)[1].strip()
+    return {
+        "files": len(bundle),
+        "areas": ",".join(area.name for area in diagnostics.AREAS),
+        "required_fields": len(DIAGNOSTIC_REQUIRED_FIELDS),
+        "bundle_seconds": seconds,
+        "file_mode": "0600",
+        "private_key_files": 0,
     }
 
 
@@ -8429,6 +8712,10 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # credentials it did not issue, and the one it did issue still reads.
         Case(AUTH_NEGATIVE_CASE_ID, "aio", lambda context: case_panel_auth_negative(product),
              timeout_seconds=300),
+        # The controller's client, not the probe's own HTTP: the same class the
+        # live run drives, pointed at this host's public name with the run bundle.
+        Case(PANEL_API_CLIENT_CASE_ID, "aio", lambda context: case_panel_api_client_trust(product),
+             timeout_seconds=300),
         Case("AIO-CLIENT", "aio", lambda context: case_client_lifecycle(product), timeout_seconds=300),
         Case("SUB-SERVED", "aio", lambda context: case_subscriptions(product), timeout_seconds=600),
         Case("SUB-UA-ABSENT", "aio", lambda context: case_user_agent_absent(product), timeout_seconds=300),
@@ -8484,6 +8771,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # across a switch and must never be the case a switch is measured across.
         Case(VISION_FAILURE_CASE_ID, "aio", lambda context: case_vision_certificate_failure(product),
              timeout_seconds=VISION_FAILURE_TIMEOUT_SECONDS),
+        # The two halves of the redaction contract read the host and the artifact
+        # tree, so they run here: after every mutating case has written the
+        # evidence they audit, and before the channel switch, whose dev build is
+        # not the host either case describes.
+        Case(REDACTION_CASE_ID, "aio", lambda context: case_redacted_credentials(product),
+             timeout_seconds=300),
+        Case(DIAGNOSTICS_CASE_ID, "aio", lambda context: case_diagnostic_artifacts(product),
+             timeout_seconds=DIAGNOSTICS_TIMEOUT_SECONDS),
         # The channel cases come last because a switch restarts the Panel, and an
         # earlier case must never be measured across one. Their own order is the
         # contract: the same-channel no-op is proven before anything mutates the

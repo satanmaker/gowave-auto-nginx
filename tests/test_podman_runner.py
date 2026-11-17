@@ -660,6 +660,21 @@ class TestPodmanDiagnosticsBundle(unittest.TestCase):
         self.assertNotIn(secret, text)
         self.assertIn("password=", text)
 
+    def test_the_operator_area_asks_for_the_hosts_own_identity(self):
+        """RED-02 names OS/kernel/version and package versions; the probe asks."""
+        script = next(area for area in self.diagnostics.AREAS if area.name == "operator").script
+        self.assertIn("uname -a", script)
+        self.assertIn("/etc/os-release", script)
+        self.assertIn("dpkg-query", script)
+        self.assertIn("${binary:Package}=${Version}", script)
+
+    def test_no_area_reads_private_key_material(self):
+        """RED-02 asks for certificate metadata without private keys; nobody asks for a key."""
+        for area in self.diagnostics.AREAS:
+            with self.subTest(area=area.name):
+                self.assertNotIn("privkey", area.script)
+                self.assertNotIn("PRIVATE KEY", area.script)
+
     def test_no_container_still_leaves_an_index(self):
         written = self.bundle(FakePodman([]))
         self.assertEqual(len(written), len(self.AREA_NAMES) + 1)
