@@ -75,6 +75,7 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Live scenario parity | `PRE-01`, `PRE-02`, `PRE-03`, `PRE-05`, `PRE-06`, `ADDR-01`, `ADDR-02`, `ADDR-03` |
 | Live scenario parity | `MN-LOCK`, `MN-LOCK-LOSS`, `MN-LOCK-PATH`, `MN-LOCK-CLI`, `MN-LOCK-NESTED` |
 | Live scenario parity | `RUNID-01`, `RESUME-01` |
+| Live scenario parity | `ENV-01`, `ENV-02`, `DP-12`, `DP-14`, `LOCAL-01` |
 | Live scenario parity | `AIO-AUTH-NEG`, `MN-DUP-ADD`, `RED-01`, `RED-02`, `APIC-01` |
 
 ## Named behaviours

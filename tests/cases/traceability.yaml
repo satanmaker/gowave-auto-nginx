@@ -589,6 +589,44 @@ cases_by_requirement:
       lost a required tool while tolerating the fields no gate reads, and the
       runner re-collects that baseline before it copies the repository
   - requirement: Live scenario parity
+    cases: [ENV-01, ENV-02, DP-12, DP-14, LOCAL-01]
+    reason: >-
+      all five serve the same parity sentence for four live sentences whose
+      subjects are files and verdicts rather than a running pair. ENV-01 and
+      ENV-02 are the disposable-environment gate: a container built from the
+      run's own pinned image, given the two target-side tools the gate's own
+      refusal asks for, passes `check_disposable_gate` with its ten-key manifest
+      recorded and `evaluate_preflight_eligibility` reporting PASS while a
+      sentinel file and the package count are byte-identical before and after,
+      so the inspection is a read and not a repair; the same host then
+      accumulates one contamination at a time — an existing `/opt/gowave`, a
+      running unit, a listener on 443 made by the host's own sshd, a hidden
+      `tcpdump` — and each step is refused by the gate's own sentence,
+      cumulatively, with the verdict FAIL, the four reasons recorded verbatim in
+      `master_gate_errors` and `worker_gate_errors`, the contaminated objects
+      still in place, and the runner's own source order placing the halt before
+      its first remote write. DP-12 is the production-trust sentence: the
+      production bundle is the Control Machine's own public roots byte for byte,
+      carries no Staging marker and no pinned Staging name, while the Staging
+      bundle carries the four pinned roots and their marker; a pinned root
+      verifies against the bundle that holds it and is refused by the production
+      one with `openssl` as the only trust source, a public root verifies against
+      production, the context built from it requires a certificate and a host
+      name, and an unknown mode is refused rather than guessed. DP-14 is the
+      skipped-traffic sentence: with `TEST_TRAFFIC_VERIFICATION` off, and with
+      one case recorded SKIP, the suite's verdict is INCOMPLETE at both ends of
+      the 8/10 range where those same cases pass with it on; the JUnit document
+      a CI reader sees carries the skip and the traffic phase as an error,
+      `result.json` records INCOMPLETE at mode 0600, the container aggregate
+      turns a declared SKIP into FAIL, and the runner's own phase aggregation is
+      quoted from its source because it is inline in `run_e2e` and has no
+      callable seam. LOCAL-01 is the CI-credential sentence: the workflow that
+      claims it declares read-only repository permission, interpolates no
+      `secrets.` expression, runs in no Environment, installs the repository's
+      own dependency file in one step and runs the discovery this case then runs
+      with nothing a credential could arrive in — no `GOWAVE_*`, no agent
+      socket, an empty home directory — which passes in seconds
+  - requirement: Live scenario parity
     cases: [AIO-AUTH-NEG, MN-DUP-ADD, RED-01, RED-02, APIC-01]
     reason: >-
       all five serve the same parity sentence for rows of the live matrix the
