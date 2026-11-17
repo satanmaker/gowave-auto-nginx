@@ -13,6 +13,15 @@
   and runs `systemctl restart gowave.service` (`selfupdate.go:129`); it touches no NGINX, Certbot or `.env`.
 - Our install already restarts `gowave.service` immediately after `configure_panel_systemd`
   (`gowave-auto.sh:435-439`), and `uninstall` removes managed units in one list (`gowave-auto.sh:1327-1333`).
+- The published dashboard archive is packed with `tar -czf gowave-frontend.tar.gz -C dist .`
+  (`.github/workflows/release.yml:45`), so its root holds the files; upstream installs them into `frontend/dist`
+  and the Panel resolves `./frontend/dist` before `./dist` (`server.go:419`).
+- `download_panel_release` instead extracts into `frontend/` and creates `dist -> frontend`
+  (`modules/panel.sh:202-204`). The upstream service policy refuses any symlink among
+  `gowave-server`, `gowave-server.bak`, `frontend`, `dist`, `static` (`serviceunit/install.sh:57-67`), and both
+  `install.sh --update` and `update apply` run that policy (`install.sh:684`, `selfupdate.go:128-133`). Measured
+  2026-11-17 on a host installed by this project: `install.sh --update --stable` aborted with
+  `Refusing a symlinked /opt/gowave/dist` after replacing the binary, before the restart.
 - Static unit contracts live in `tests/test_systemd_runner.py::TestSystemdRunner`.
 
 ## Goals / Non-Goals
@@ -34,6 +43,20 @@
 - Changing the upstream `update apply` implementation.
 
 ## Decisions
+
+### D0. Install the dashboard into `frontend/dist` and drop the `dist` symlink
+
+`download_panel_release` extracts the archive into a staging directory and renames it to
+`<install-dir>/frontend/dist`, replacing any previous `frontend/dist`; it no longer creates `<install-dir>/dist`,
+and on a reinstall it removes that path if it is a symlink. The Panel already prefers `./frontend/dist`
+(`server.go:419`), so the served dashboard is unchanged while the install layout becomes the one the upstream
+policy accepts.
+
+*Alternatives:* (a) keep the symlink and stop calling the upstream helper — rejected: it makes the native
+`--update` path abort mid-update on every host this project installs, and that path is a product requirement;
+(b) point `dist` at a real directory copy — rejected: duplicates the dashboard and leaves two roots to keep in
+sync; (c) extract into `frontend/` and move the files into `frontend/dist` — rejected: the staging rename is the
+same operation with one failure window instead of two.
 
 ### D1. Author the two helper units in `configure_panel_systemd`
 
@@ -95,6 +118,9 @@ Adding methods to an existing class keeps the suite registry unchanged.
   Design states this explicitly so nobody later reads a UI update as transaction-protected.
 - **Existing hosts gain the helper only on reinstall** → until then the endpoint keeps answering 409; there is no
   half-configured state where the helper exists without the runtime directory.
+- **The layout fix also runs on reinstall** → the same reinstall removes the legacy `dist` symlink, so a host that
+  was left mid-update by the upstream command (new binary and `frontend/dist` in place, process still old, symlink
+  still present) becomes consistent without a second operation.
 - **Name collision if the operator ever runs the upstream installer on this host** → upstream writes the same two
   unit names with the same contract; our uninstall still removes them, so ownership does not silently move.
 - **Restarting the panel to pick up `RuntimeDirectory`** → the install already restarts it in the same step, so no
@@ -102,9 +128,12 @@ Adding methods to an existing class keeps the suite registry unchanged.
 
 ## Migration Plan
 
-1. Re-run `gowave-auto.sh install` on an installed host: the unit gains the runtime-directory directives, the two
-   helper units appear and the path unit is started after the panel restart.
-2. Verify: `systemctl status gowave-update.path`, `ls -ld /run/gowave`, and `POST /api/system/system/update`
-   no longer returns the "helper is not installed" refusal.
+1. Re-run `gowave-auto.sh install` on an installed host: the dashboard moves to `frontend/dist`, the legacy
+   `dist` symlink is removed, the unit gains the runtime-directory directives, the two helper units appear and the
+   path unit is started after the panel restart.
+2. Verify: `ls -l /opt/gowave/dist` reports "No such file or directory", `ls /opt/gowave/frontend/dist/index.html`
+   exists, `systemctl status gowave-update.path`, `ls -ld /run/gowave`, and `POST /api/system/system/update` no
+   longer returns the "helper is not installed" refusal.
 3. Rollback: remove the two unit files, drop the three `RuntimeDirectory*` lines, `daemon-reload`, restart
-   `gowave.service`. The Panel returns to the current 409 behaviour with no data change.
+   `gowave.service`. The Panel returns to the current 409 behaviour with no data change; the layout change is not
+   rolled back, because the previous symlinked layout is what the upstream policy rejects.
