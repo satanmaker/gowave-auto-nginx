@@ -251,6 +251,8 @@ SUITES = {
         "test_podman_hook_ownership.TestHookOwnershipRegistration",
         "test_podman_hook_ownership.TestHookOwnershipCase",
         "test_podman_hook_ownership.TestHookOwnershipDamage",
+        "test_podman_hook_ownership.TestHookShapeCase",
+        "test_podman_hook_ownership.TestHookShapeDamage",
         "test_podman_transaction_recovery.TestTransactionRecoveryRegistration",
         "test_podman_transaction_recovery.TestTransactionRecoveryCase",
         "test_podman_transaction_recovery.TestTransactionRecoveryDamage",

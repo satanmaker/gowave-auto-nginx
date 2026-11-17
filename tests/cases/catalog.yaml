@@ -3693,8 +3693,50 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: hook_ownership:case_preexisting_hook_is_never_adopted
+      evidence:
+      - directory_refused
+      - directory_still_a_directory
+      - edited_file_bytes_intact
+      - edited_file_refused
+      - fifo_refused
+      - fifo_still_a_fifo
+      - hook_directory_symlink_refused
+      - manifest_for_another_path_refused
+      - no_manifest_published_on_refusal
+      - recorded_file_adopted
+      - refusal_names_the_unmanaged_resource
+      - symlink_foreign_refused
+      - symlink_foreign_target_intact
+      - symlink_matching_refused
+      - symlink_target_intact
+      - unmanaged_file_intact
+      - unmanaged_file_refused
+      - unreadable_manifest_refused
+    multi-node:
+      driver: hook_ownership:case_preexisting_hook_is_never_adopted
+      evidence:
+      - directory_refused
+      - directory_still_a_directory
+      - edited_file_bytes_intact
+      - edited_file_refused
+      - fifo_refused
+      - fifo_still_a_fifo
+      - hook_directory_symlink_refused
+      - manifest_for_another_path_refused
+      - no_manifest_published_on_refusal
+      - recorded_file_adopted
+      - refusal_names_the_unmanaged_resource
+      - symlink_foreign_refused
+      - symlink_foreign_target_intact
+      - symlink_matching_refused
+      - symlink_target_intact
+      - unmanaged_file_intact
+      - unmanaged_file_refused
+      - unreadable_manifest_refused
   promotion_target: null
 - id: HOOK-02
   requirement: Global Certbot Deploy Hook Ownership
