@@ -28,6 +28,7 @@ from . import (
     client_trust,
     diagnostics,
     environment_gate,
+    hook_ownership,
     ingress,
     matrix,
     operator_access,
@@ -38,6 +39,7 @@ from . import (
     status,
     teardown,
     topology,
+    transaction_recovery,
     traffic_probe,
     trust_bundle,
     # ``cases()`` takes a ``vision`` boolean, so the module is imported under a
@@ -8888,6 +8890,19 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
              timeout_seconds=300),
         Case(operator_access.FALLBACK_CASE_ID, "aio",
              lambda context: operator_access.case_failed_bootstrap_falls_back_to_timer(
+                 product, context),
+             timeout_seconds=300),
+        # The Certbot deploy hook the transaction writes into the target: the
+        # shell functions are driven in a temporary tree, so the ownership
+        # manifest, the digest and the teardown verdicts are the product's own.
+        Case(hook_ownership.CASE_ID, "aio",
+             lambda context: hook_ownership.case_hook_is_removed_only_while_the_journal_owns_it(
+                 product, context),
+             timeout_seconds=300),
+        # The journal an interrupted switch leaves behind, and the boot recovery
+        # that reads it: both the writer and the shell recovery are the product's.
+        Case(transaction_recovery.CASE_ID, "aio",
+             lambda context: transaction_recovery.case_interrupted_mutation_leaves_a_validated_journal(
                  product, context),
              timeout_seconds=300),
         # Last, because the deadline it proves is the one the whole run spent: the

@@ -30,9 +30,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
-    acme_fixture, aio, argv_probe, budget, denial, environment_gate, ingress, local_ci,
+    acme_fixture, aio, argv_probe, budget, denial, environment_gate, hook_ownership,
+    ingress, local_ci,
     lock_cases, matrix as matrix_data, mtls, operator_access, preflight_cases, runstate_cases,
-    skip_policy, status, teardown, topology, trust_bundle, vision as vision_policy,
+    skip_policy, status, teardown, topology, transaction_recovery, trust_bundle, vision as vision_policy,
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
@@ -8808,6 +8809,19 @@ def cases(
              timeout_seconds=300),
         Case(operator_access.FALLBACK_CASE_ID, "multi-node",
              lambda context: operator_access.case_failed_bootstrap_falls_back_to_timer(
+                 product, context),
+             timeout_seconds=300),
+        # The deploy hook of whichever target the transaction wrote, driven the
+        # same way on both hosts: the manifest, the digest and the teardown
+        # verdicts are the product's, and no cluster is involved.
+        Case(hook_ownership.CASE_ID, "multi-node",
+             lambda context: hook_ownership.case_hook_is_removed_only_while_the_journal_owns_it(
+                 product, context),
+             timeout_seconds=300),
+        # The same journal and the same boot recovery as the All-in-One: the
+        # recovery is per host, so both contours read one implementation.
+        Case(transaction_recovery.CASE_ID, "multi-node",
+             lambda context: transaction_recovery.case_interrupted_mutation_leaves_a_validated_journal(
                  product, context),
              timeout_seconds=300),
         # Last: the deadline it proves is this topology's own, and the elapsed
