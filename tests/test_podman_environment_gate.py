@@ -58,6 +58,7 @@ EXPECTED_REFUSALS = {
     ("ENV-01", "baseline-mutates"): "reading the baseline changed the host",
     ("ENV-01", "occupied-port"): "already listens on the required ports",
     ("ENV-01", "tools-missing"): "a host the case just gave both target tools reports",
+    ("ENV-01", "binaries-not-installed"): "the case could not put",
     ("ENV-01", "no-listeners"): "the host reports no listening port at all",
     ("ENV-01", "manifest-short"): "the baseline manifest has no",
     ("ENV-01", "preflight-fails"): "preflight reported",
@@ -91,6 +92,8 @@ class GateModel:
         self.services = []
         self.listeners = [22]
         self.tools = {"tcpdump": "ok", "timeout": "ok"}
+        #: What ``command -v`` answers on the container after the case's install.
+        self.binaries = {command: "ok" for command in environment_gate.GATE_COMMANDS}
         #: Bumped by a baseline read that is not read-only; the sentinel is read
         #: through it, so a mutation is visible without modelling a filesystem.
         self.generation = 0
@@ -174,7 +177,9 @@ class HostPodman:
             port = environment_gate._PROBE_PORT
             return self._result(f"{str(port in model.listeners and 1 or 0)}\n")
         if "for t in" in script:
-            return self._result("".join(f"{tool}=ok\n" for tool in environment_gate.GATE_TOOLS))
+            return self._result("".join(
+                f"{command}={model.binaries.get(command, 'ok')}\n"
+                for command in environment_gate.GATE_COMMANDS))
         raise AssertionError(f"unmodelled exec: {argv!r}")
 
 
@@ -280,6 +285,9 @@ def _damages(hosts):
                 environment_gate, "collect_remote_baseline",
                 baseline(tools={"tcpdump": "missing", "timeout": "ok"})),
         ],
+        ("ENV-01", "binaries-not-installed"): [
+            Seed(binaries={"tcpdump": "ok", "ss": "missing"}),
+        ],
         ("ENV-01", "no-listeners"): [
             mock.patch.object(
                 environment_gate, "collect_remote_baseline", baseline(ports=[])),
@@ -362,10 +370,7 @@ def run_case(case_id, topology="aio", damage=None):
     for patcher in patchers:
         patcher.start()
     try:
-        with mock.patch.object(environment_gate, "_gate_host", _fake_gate_host), \
-                mock.patch.object(environment_gate, "_install_gate_tools", lambda host, _id: {
-                    tool: "ok" for tool in environment_gate.GATE_TOOLS
-                }):
+        with mock.patch.object(environment_gate, "_gate_host", _fake_gate_host):
             return CASES[case_id](product, SimpleNamespace(topology=topology)), None
     except AssertionError as error:
         return None, str(error)
@@ -589,6 +594,9 @@ class TestEnvironmentGateDamage(unittest.TestCase):
 
     def test_a_manifest_that_contradicts_the_tools_the_case_installed_is_refused(self):
         self.assert_refused("ENV-01", "tools-missing")
+
+    def test_an_install_that_left_a_binary_off_the_host_is_refused(self):
+        self.assert_refused("ENV-01", "binaries-not-installed")
 
     def test_an_empty_listener_table_is_refused_rather_than_read_as_absent(self):
         self.assert_refused("ENV-01", "no-listeners")
