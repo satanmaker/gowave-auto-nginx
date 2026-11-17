@@ -73,8 +73,36 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: environment_gate:case_clean_baseline_passes_gate
+      evidence:
+      - address
+      - baseline_read_is_read_only
+      - distribution
+      - gate_disqualifications
+      - installation_proceeded
+      - listening_ports
+      - manifest_keys
+      - occupied_required_ports
+      - preflight_status
+      - required_tools
+      - vision_gate_disqualifications
+    multi-node:
+      driver: environment_gate:case_clean_baseline_passes_gate
+      evidence:
+      - address
+      - baseline_read_is_read_only
+      - distribution
+      - gate_disqualifications
+      - installation_proceeded
+      - listening_ports
+      - manifest_keys
+      - occupied_required_ports
+      - preflight_status
+      - required_tools
+      - vision_gate_disqualifications
   promotion_target: null
 - id: ENV-02
   requirement: Disposable Environment Gate
@@ -99,8 +127,40 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: environment_gate:case_contaminated_host_is_refused
+      evidence:
+      - address
+      - baseline_read_is_read_only
+      - contamination_preserved
+      - control_disqualifications
+      - directory_refusal
+      - distribution
+      - halts_before_first_write
+      - port_refusal
+      - preflight_status
+      - recorded_gate_errors
+      - refusal_count
+      - service_refusal
+      - tool_refusal
+    multi-node:
+      driver: environment_gate:case_contaminated_host_is_refused
+      evidence:
+      - address
+      - baseline_read_is_read_only
+      - contamination_preserved
+      - control_disqualifications
+      - directory_refusal
+      - distribution
+      - halts_before_first_write
+      - port_refusal
+      - preflight_status
+      - recorded_gate_errors
+      - refusal_count
+      - service_refusal
+      - tool_refusal
   promotion_target: null
 - id: OWN-01
   requirement: Complete Mutation-Target Baseline and Resource Ownership
@@ -3139,8 +3199,44 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: trust_bundle:case_production_bundle_excludes_staging
+      evidence:
+      - check_hostname
+      - pinned_root_names
+      - pinned_roots
+      - production_bytes
+      - public_bundle
+      - public_root_subject
+      - public_root_trusted
+      - staging_bytes
+      - staging_marker_in_production
+      - staging_refusal
+      - staging_root
+      - staging_root_trusted_by_production
+      - staging_root_trusted_by_staging
+      - unknown_mode_refusal
+      - verify_mode
+    multi-node:
+      driver: trust_bundle:case_production_bundle_excludes_staging
+      evidence:
+      - check_hostname
+      - pinned_root_names
+      - pinned_roots
+      - production_bytes
+      - public_bundle
+      - public_root_subject
+      - public_root_trusted
+      - staging_bytes
+      - staging_marker_in_production
+      - staging_refusal
+      - staging_root
+      - staging_root_trusted_by_production
+      - staging_root_trusted_by_staging
+      - unknown_mode_refusal
+      - verify_mode
   promotion_target: null
 - id: DP-13
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -3195,8 +3291,38 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: skip_policy:case_skipped_traffic_is_never_pass
+      evidence:
+      - case_counts
+      - container_skip_aggregate
+      - junit_case_child
+      - junit_failures
+      - junit_phase_child
+      - junit_skipped
+      - result_overall
+      - runner_reads_its_own_switch
+      - runner_skip_branch_quoted
+      - skip_case_status
+      - switch_off_status
+      - switch_on_status
+    multi-node:
+      driver: skip_policy:case_skipped_traffic_is_never_pass
+      evidence:
+      - case_counts
+      - container_skip_aggregate
+      - junit_case_child
+      - junit_failures
+      - junit_phase_child
+      - junit_skipped
+      - result_overall
+      - runner_reads_its_own_switch
+      - runner_skip_branch_quoted
+      - skip_case_status
+      - switch_off_status
+      - switch_on_status
   promotion_target: null
 - id: DP-15
   requirement: Data Plane E2E Traffic Through All VPN Endpoints
@@ -5140,8 +5266,21 @@ cases:
   topology:
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: local_ci:case_ci_needs_no_credentials
+      evidence:
+      - credential_variables_inherited
+      - environment_gated
+      - job
+      - permissions
+      - requirements
+      - secrets_references
+      - suite_exit
+      - suite_ok
+      - suite_summary
+      - workflow
   promotion_target: null
 - id: LOCAL-02
   requirement: Local-only live VPS credential handling

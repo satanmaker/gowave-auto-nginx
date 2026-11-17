@@ -27,15 +27,18 @@ from . import (
     client_image,
     client_trust,
     diagnostics,
+    environment_gate,
     ingress,
     matrix,
     panel_surface,
     preflight_cases,
     runstate_cases,
+    skip_policy,
     status,
     teardown,
     topology,
     traffic_probe,
+    trust_bundle,
     # ``cases()`` takes a ``vision`` boolean, so the module is imported under a
     # name the parameter cannot shadow.
     vision as vision_policy,
@@ -8841,6 +8844,23 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
              runstate_cases.case_run_id_root, timeout_seconds=120),
         Case(runstate_cases.RESUME_CASE_ID, "aio",
              runstate_cases.case_resume_gate, timeout_seconds=120),
+        # The gate a run decides about a host before it may install on it, and the
+        # two trust questions a payload is read through. The environment cases
+        # start their own clean container from the run's own image, so they run
+        # after the install that built it and after every case that could have
+        # changed the image; the other three start nothing.
+        Case(environment_gate.CLEAN_CASE_ID, "aio",
+             lambda context: environment_gate.case_clean_baseline_passes_gate(product, context),
+             timeout_seconds=environment_gate.GATE_CASE_TIMEOUT_SECONDS),
+        Case(environment_gate.CONTAMINATED_CASE_ID, "aio",
+             lambda context: environment_gate.case_contaminated_host_is_refused(product, context),
+             timeout_seconds=environment_gate.GATE_CASE_TIMEOUT_SECONDS),
+        Case(trust_bundle.DP12_CASE_ID, "aio",
+             lambda context: trust_bundle.case_production_bundle_excludes_staging(product, context),
+             timeout_seconds=180),
+        Case(skip_policy.DP14_CASE_ID, "aio",
+             lambda context: skip_policy.case_skipped_traffic_is_never_pass(product, context),
+             timeout_seconds=180),
         # Last, because the deadline it proves is the one the whole run spent: the
         # case reads the elapsed wall clock and the enforced budget, then produces
         # an exhausted run of the real runner and reads its report. A suite that

@@ -30,8 +30,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
-    acme_fixture, aio, argv_probe, budget, denial, ingress, lock_cases, matrix as matrix_data,
-    mtls, preflight_cases, runstate_cases, status, teardown, topology, vision as vision_policy,
+    acme_fixture, aio, argv_probe, budget, denial, environment_gate, ingress, local_ci,
+    lock_cases, matrix as matrix_data, mtls, preflight_cases, runstate_cases, skip_policy,
+    status, teardown, topology, trust_bundle, vision as vision_policy,
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
@@ -8762,6 +8763,26 @@ def cases(
              runstate_cases.case_run_id_root, timeout_seconds=120),
         Case(runstate_cases.RESUME_CASE_ID, "multi-node",
              runstate_cases.case_resume_gate, timeout_seconds=120),
+        # Read here because none of them touches the cluster the case above left
+        # incomplete: the two environment cases start their own clean container
+        # from the run's own image and network, the trust case reads the product's
+        # bundle builder, the skip case reads a policy, and the CI case runs the
+        # repository's own unit discovery. Nothing below may read a healthy pair.
+        Case(environment_gate.CLEAN_CASE_ID, "multi-node",
+             lambda context: environment_gate.case_clean_baseline_passes_gate(product, context),
+             timeout_seconds=environment_gate.GATE_CASE_TIMEOUT_SECONDS),
+        Case(environment_gate.CONTAMINATED_CASE_ID, "multi-node",
+             lambda context: environment_gate.case_contaminated_host_is_refused(product, context),
+             timeout_seconds=environment_gate.GATE_CASE_TIMEOUT_SECONDS),
+        Case(trust_bundle.DP12_CASE_ID, "multi-node",
+             lambda context: trust_bundle.case_production_bundle_excludes_staging(product, context),
+             timeout_seconds=180),
+        Case(skip_policy.DP14_CASE_ID, "multi-node",
+             lambda context: skip_policy.case_skipped_traffic_is_never_pass(product, context),
+             timeout_seconds=180),
+        Case(local_ci.LOCAL_CASE_ID, "multi-node",
+             lambda context: local_ci.case_ci_needs_no_credentials(product, context),
+             timeout_seconds=local_ci.DISCOVERY_TIMEOUT_SECONDS + 60),
         # Last: the deadline it proves is this topology's own, and the elapsed
         # clock it reads is the two hosts' install and transfer, not a single
         # container's. It starts no container and reads no cluster, so it cannot
