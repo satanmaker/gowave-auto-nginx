@@ -32,7 +32,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from tools.podman_e2e import (
     acme_fixture, aio, argv_probe, budget, denial, environment_gate, hook_ownership,
     ingress, local_ci,
-    lock_cases, matrix as matrix_data, mtls, operator_access, preflight_cases, runstate_cases,
+    lock_cases, matrix as matrix_data, mtls, operator_access, preflight_cases, revocation,
+    runstate_cases,
     skip_policy, status, teardown, topology, transaction_recovery, trust_bundle, vision as vision_policy,
 )
 from tools.podman_e2e.podman import wait_until
@@ -8729,46 +8730,12 @@ def cases(
              preflight_cases.case_distinct_domains, timeout_seconds=120),
         Case(preflight_cases.ROOT_IDENTITY_CASE_ID, "multi-node",
              preflight_cases.case_root_identity, timeout_seconds=120),
-        # The lifecycle cases run last: they revoke a client and fault the
-        # Worker's own unit, so nothing that observes a healthy cluster may run
-        # after them and no earlier case may be blamed for their state.
-        Case(REVOCATION_CASE_ID, "multi-node",
-             lambda context: aio.case_revocation(
-                 product.master, REVOCATION_CASE_ID,
-                 expected_sources=product.expected_egress_sources(),
-             ),
-             timeout_seconds=aio.TUNNEL_READY_TIMEOUT_SECONDS + 2 * aio.TRAFFIC_TIMEOUT_SECONDS),
-        Case(OUTAGE_CASE_ID, "multi-node", lambda context: case_worker_outage(product),
-             timeout_seconds=OUTAGE_CASE_TIMEOUT_SECONDS),
-        Case(RESTART_CASE_ID, "multi-node", lambda context: case_worker_restart(product),
-             timeout_seconds=RESTART_CASE_TIMEOUT_SECONDS),
-        # This case re-provisions the Worker and then changes the Master's own
-        # names, so it runs after every case that reads the installed cluster:
-        # nothing after it may be blamed for the domains it installs.
-        Case(ACME80_CASE_ID, "multi-node", lambda context: case_acme80(product),
-             timeout_seconds=ACME80_TIMEOUT_SECONDS),
-        # The last case that provisions anything, and the only one that
-        # deliberately leaves the cluster incomplete: the Worker it provisions is
-        # torn down by the very compensation this case observes. It therefore
-        # runs after ACME80, which needs that Worker whole, and nothing that reads
-        # a healthy cluster may follow it.
-        Case(VIS_COMPENSATION_CASE_ID, "multi-node",
-             lambda context: case_vision_incomplete_compensation(product),
-             timeout_seconds=NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
-        # The run's own record, read without a host and without a clock: a run id
-        # names a directory below the artifact root or nothing, and a partial
-        # phase resumes only the run that wrote the state it was handed. Both call
-        # the product's own helpers, so they read neither the cluster nor the
-        # names ACME80 installed.
-        Case(runstate_cases.RUN_ID_CASE_ID, "multi-node",
-             runstate_cases.case_run_id_root, timeout_seconds=120),
-        Case(runstate_cases.RESUME_CASE_ID, "multi-node",
-             runstate_cases.case_resume_gate, timeout_seconds=120),
-        # Read here because none of them touches the cluster the case above left
-        # incomplete: the two environment cases start their own clean container
-        # from the run's own image and network, the trust case reads the product's
-        # bundle builder, the skip case reads a policy, and the CI case runs the
-        # repository's own unit discovery. Nothing below may read a healthy pair.
+        # None of these reads the cluster: the two environment cases start their
+        # own clean container from the run's own image and network, the trust case
+        # reads the product's bundle builder, the skip case reads a policy, the CI
+        # case runs the repository's own unit discovery, and the rest read files
+        # the controller would have written. They therefore run before the
+        # lifecycle cases below, which are the last to touch a healthy cluster.
         Case(environment_gate.CLEAN_CASE_ID, "multi-node",
              lambda context: environment_gate.case_clean_baseline_passes_gate(product, context),
              timeout_seconds=environment_gate.GATE_CASE_TIMEOUT_SECONDS),
@@ -8824,6 +8791,49 @@ def cases(
              lambda context: transaction_recovery.case_interrupted_mutation_leaves_a_validated_journal(
                  product, context),
              timeout_seconds=300),
+        # Revocation is per target, so the two hosts read one controller: the
+        # stuck host fails the run and the pass still records it.
+        Case(revocation.REV_01, "multi-node",
+             lambda context: revocation.case_revocation_succeeds(product, context),
+             timeout_seconds=300),
+        Case(revocation.REV_02, "multi-node",
+             lambda context: revocation.case_revocation_cannot_be_verified(product, context),
+             timeout_seconds=300),
+        # The lifecycle cases run last: they revoke a client and fault the
+        # Worker's own unit, so nothing that observes a healthy cluster may run
+        # after them and no earlier case may be blamed for their state.
+        Case(REVOCATION_CASE_ID, "multi-node",
+             lambda context: aio.case_revocation(
+                 product.master, REVOCATION_CASE_ID,
+                 expected_sources=product.expected_egress_sources(),
+             ),
+             timeout_seconds=aio.TUNNEL_READY_TIMEOUT_SECONDS + 2 * aio.TRAFFIC_TIMEOUT_SECONDS),
+        Case(OUTAGE_CASE_ID, "multi-node", lambda context: case_worker_outage(product),
+             timeout_seconds=OUTAGE_CASE_TIMEOUT_SECONDS),
+        Case(RESTART_CASE_ID, "multi-node", lambda context: case_worker_restart(product),
+             timeout_seconds=RESTART_CASE_TIMEOUT_SECONDS),
+        # This case re-provisions the Worker and then changes the Master's own
+        # names, so it runs after every case that reads the installed cluster:
+        # nothing after it may be blamed for the domains it installs.
+        Case(ACME80_CASE_ID, "multi-node", lambda context: case_acme80(product),
+             timeout_seconds=ACME80_TIMEOUT_SECONDS),
+        # The last case that provisions anything, and the only one that
+        # deliberately leaves the cluster incomplete: the Worker it provisions is
+        # torn down by the very compensation this case observes. It therefore
+        # runs after ACME80, which needs that Worker whole, and nothing that reads
+        # a healthy cluster may follow it.
+        Case(VIS_COMPENSATION_CASE_ID, "multi-node",
+             lambda context: case_vision_incomplete_compensation(product),
+             timeout_seconds=NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
+        # The run's own record, read without a host and without a clock: a run id
+        # names a directory below the artifact root or nothing, and a partial
+        # phase resumes only the run that wrote the state it was handed. Both call
+        # the product's own helpers, so they read neither the cluster nor the
+        # names ACME80 installed.
+        Case(runstate_cases.RUN_ID_CASE_ID, "multi-node",
+             runstate_cases.case_run_id_root, timeout_seconds=120),
+        Case(runstate_cases.RESUME_CASE_ID, "multi-node",
+             runstate_cases.case_resume_gate, timeout_seconds=120),
         # Last: the deadline it proves is this topology's own, and the elapsed
         # clock it reads is the two hosts' install and transfer, not a single
         # container's. It starts no container and reads no cluster, so it cannot

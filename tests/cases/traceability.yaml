@@ -699,6 +699,28 @@ cases_by_requirement:
       is taken before the journal is read and before it is validated, which is
       what makes the next mutation wait for the recovery.
   - requirement: Live scenario parity
+    cases: [REV-01, REV-02]
+    reason: >-
+      the two are the revocation sentence of the credential requirement, decided
+      by the controller the operator runs on this machine. `_cleanup_access`,
+      `_revoke_all`, `_cleanup_summary_message`, `_write_operator_only_report`
+      and `_refresh_report` are driven against a model of the SSH client that
+      answers the four probes the cleanup makes and records every command it is
+      sent, so REV-01 reads the whole pass rather than a claim: the client is
+      built from the control-machine key and the pinned `known_hosts`, the
+      remote revoke script is named and run, `authorized_keys` is searched for
+      the run's marker and the expiry timer is probed, and the sentinel body of
+      that key appears in no command and in no report, which is left at mode
+      0600 inside a 0700 directory. REV-02 walks every way the cleanup can fail
+      — the marker alone, the timer alone, both, a target whose revoke script is
+      missing, and a verification whose connection dies — and each one is
+      INCOMPLETE with the sentence that names what remains, the stuck host
+      fails the run even though the clean one passes, and `_refresh_report` on
+      an otherwise PASS run-state rewrites the overall result to INCOMPLETE and
+      records the cleanup under `operator_access_cleanup` while a passing
+      cleanup leaves the same state at PASS. The transport is a seam and the
+      host is a model: no SSH server answers, and neither case claims one does.
+  - requirement: Live scenario parity
     cases: [AIO-AUTH-NEG, MN-DUP-ADD, RED-01, RED-02, APIC-01]
     reason: >-
       all five serve the same parity sentence for rows of the live matrix the

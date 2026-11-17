@@ -97,8 +97,8 @@ def _restore_hook(directory: Path) -> SimpleNamespace:
         restore_hook_path=str(path),
         restore_hook_sha256=_sha256(path),
         restore_timeout=30,
-        master_ip="45.13.20.10",
-        worker_ip="91.203.40.20",
+        master_ip="192.0.2.10",
+        worker_ip="198.51.100.20",
     )
 
 
