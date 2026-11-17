@@ -7,8 +7,8 @@ counts:
   container: 111
   partial: 12
   live_only: 2
-  podman_first: 102
-  total: 227
+  podman_first: 104
+  total: 229
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -3315,8 +3315,21 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_duplicate_add
+      evidence:
+      - inventory
+      - inventory_unchanged
+      - journal_state
+      - journal_unchanged
+      - refusal
+      - returncode
+      - state_addresses
+      - state_nodes
+      - state_unchanged
+      case: MN-DUP-ADD
   promotion_target: null
 - id: NEG-03
   requirement: Negative Scenario and Fault Injection Tests
@@ -3398,8 +3411,16 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_backup_rejected
+      evidence:
+      - control
+      - master_state
+      - node_refused
+      - refused
+      case: MN-BACKUP-BAD
   promotion_target: null
 - id: NEG-06
   requirement: Negative Scenario and Fault Injection Tests
@@ -3422,8 +3443,24 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_panel_auth_negative
+      evidence:
+      - control_after
+      - control_before
+      - refusals
+      - signing_key_present
+      case: AIO-AUTH-NEG
+    multi-node:
+      driver: aio:case_panel_auth_negative
+      evidence:
+      - control_after
+      - control_before
+      - refusals
+      - signing_key_present
+      case: AIO-AUTH-NEG
   promotion_target: null
 - id: NEG-07
   requirement: Negative Scenario and Fault Injection Tests
@@ -7143,6 +7180,72 @@ cases:
       - argv_observer_trace_removed
       - argv_observer_truncated
   promotion_target: Distributed Worker VPS Deployment Verification
+- id: AIO-AUTH-NEG
+  requirement: Failure injection and recovery
+  live_scenario: null
+  assertion: 'The Panel''s own gate refuses four credentials it did not issue — an expired token signed
+    with the Panel''s real secret, a token signed with a foreign key, an unsigned `alg: none` token, and
+    a correctly signed token naming an administrator record that does not exist — each answered 401 with
+    the middleware''s own `Unauthorized` body and no traceback, while the token the documented login issued
+    still reads the same route before and after; the signing key is read from the Panel''s environment
+    and never printed, and the issued token''s payload names an `ADMIN` subject.'
+  assertion_sha256: a1599e75d627ddb983bb733d4d635328bf45994fe282a94d08da659a4ba3d097
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_panel_auth_negative
+      evidence:
+      - control_after
+      - control_before
+      - refusals
+      - signing_key_present
+    multi-node:
+      driver: aio:case_panel_auth_negative
+      evidence:
+      - control_after
+      - control_before
+      - refusals
+      - signing_key_present
+  promotion_target: Negative Scenario and Fault Injection Tests
+- id: MN-DUP-ADD
+  requirement: Failure injection and recovery
+  live_scenario: null
+  assertion: The operator's `gowave-auto.sh node add` run a second time for the Worker it already registered
+    exits nonzero with the existing-name refusal and no traceback, and the state file's bytes, the committed
+    recovery journal's bytes and the Panel's node, profile, squad, host and token inventory are what they
+    were before the attempt, so the refusal came from `state.json` before the Panel client was constructed
+    rather than after a partial registration.
+  assertion_sha256: 135e4f50e262ec56decbf56ac7aae490fdbdb731905efce010eab25e17bb1d1b
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_duplicate_add
+      evidence:
+      - inventory
+      - inventory_unchanged
+      - journal_state
+      - journal_unchanged
+      - refusal
+      - returncode
+      - state_addresses
+      - state_nodes
+      - state_unchanged
+  promotion_target: Negative Scenario and Fault Injection Tests
 - id: AIO-DP-REALITY-xray
   requirement: Real client data-plane verification
   live_scenario: null

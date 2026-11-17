@@ -13,11 +13,11 @@ behaviour with no case, a behaviour covered only on its happy path, an
 area the delta spec names but no entry covers, and a case no behaviour
 names (an orphan) or two behaviours claim.
 
-Behaviours: 37 across 9 areas, naming 227 of 227 catalog cases.
+Behaviours: 37 across 9 areas, naming 229 of 229 catalog cases.
 
 | Area | Behaviours | Cases | Error-path cases |
 |---|---:|---:|---:|
-| installation | 5 | 16 | 6 |
+| installation | 5 | 17 | 6 |
 | provisioning | 8 | 27 | 16 |
 | subscription-representations | 1 | 6 | 3 |
 | data-plane | 5 | 45 | 11 |
@@ -25,7 +25,7 @@ Behaviours: 37 across 9 areas, naming 227 of 227 catalog cases.
 | tls-dns-acme | 5 | 7 | 9 |
 | network-policy | 2 | 6 | 6 |
 | lifecycle | 7 | 23 | 20 |
-| failure-injection | 2 | 10 | 7 |
+| failure-injection | 2 | 11 | 7 |
 
 ## installation
 
@@ -34,7 +34,7 @@ Behaviours: 37 across 9 areas, naming 227 of 227 catalog cases.
 | A disposable host is accepted or refused before it is touched | aio, multi-node | pre-push | `ENV-01`, `VIS-GATE` | `ENV-02` |
 | The documented All-in-One install provisions the Panel and its node | aio | pre-push | `AIO-INSTALL`, `AIO-PACKAGES` | `AIO-NEG-PORT` |
 | The installed host keeps serving across a restart and a repeated install | aio, multi-node | pre-push | `AIO-01`, `AIO-02`, `AIO-03`, `AIO-04`, `AIO-05`, `AIO-RESTART`, `AIO-IDEMPOTENT` | `AIO-NEG-DEP` |
-| The Panel API answers its documented caller and refuses the rest | aio, multi-node | pre-push | `AIO-AUTH`, `AIO-CLIENT`, `APIC-01` | `NEG-06` |
+| The Panel API answers its documented caller and refuses the rest | aio, multi-node | pre-push | `AIO-AUTH`, `AIO-CLIENT`, `APIC-01`, `AIO-AUTH-NEG` | `NEG-06` |
 | Every installed component reports its exact pinned version | aio, multi-node | pre-push | `VER-01`, `VER-03` | `VER-02`, `AIO-NEG-PIN` |
 
 ## provisioning
@@ -106,5 +106,5 @@ Behaviours: 37 across 9 areas, naming 227 of 227 catalog cases.
 
 | Behaviour | Topologies | Gate | Cases | Error paths |
 |---|---|---|---|---|
-| Every injected fault is survived or reported without collateral damage | aio, multi-node | pre-push | `NEG-01`, `AIO-FAULT-DISK`, `AIO-FAULT-PANEL`, `AIO-FAULT-XRAY`, `AIO-FAULT-LATENCY`, `MN-OUTAGE`, `MN-RESTART`, `MN-SSH-DOWN` | `NEG-02`, `NEG-03`, `NEG-04`, `NEG-05` |
+| Every injected fault is survived or reported without collateral damage | aio, multi-node | pre-push | `NEG-01`, `AIO-FAULT-DISK`, `AIO-FAULT-PANEL`, `AIO-FAULT-XRAY`, `AIO-FAULT-LATENCY`, `MN-OUTAGE`, `MN-RESTART`, `MN-SSH-DOWN`, `MN-DUP-ADD` | `NEG-02`, `NEG-03`, `NEG-04`, `NEG-05` |
 | An interrupted mutation stays recoverable and its compensation is honest | aio, multi-node | pre-push | `AIO-INTERRUPT`, `HOOK-03` | `TXN-01`, `TXN-02`, `TXN-03` |

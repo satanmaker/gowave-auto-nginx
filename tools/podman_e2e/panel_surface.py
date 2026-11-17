@@ -22,22 +22,26 @@ type, a byte count, and the transport header.
     python3 /repo/tools/podman_e2e/panel_surface.py --scope subscriptions --payload-dir /payloads \
         --edge-base https://panel.testbed.internal --ca /fixtures/ca/acme-trust.pem
     python3 /repo/tools/podman_e2e/panel_surface.py --scope channel --step capture --payload-dir /payloads
+    python3 /repo/tools/podman_e2e/panel_surface.py --scope auth-negative
 """
 from __future__ import annotations
 
 import argparse
 import base64
 import hashlib
+import hmac
 import http.client
 import json
 import os
 import secrets
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+from uuid import uuid4
 
 CREDENTIALS_FILE = "/root/gowave-credentials.txt"
 PANEL_URL = "http://127.0.0.1:3000"
@@ -764,6 +768,117 @@ def lifecycle(panel: Panel) -> Dict[str, Any]:
     return facts
 
 
+# -------------------------------------------------------------- auth negative
+# The Panel's gate is three clauses in one function: an HS256 signature over its
+# own `APP_SECRET`, an expiry the middleware declares required, and the
+# administrator record the claims name. A case that sent one broken token would
+# only witness whichever clause the Panel happens to check first, so each
+# variant below is a faithful copy of the real token that fails exactly one.
+AUTH_EXPIRED_SECONDS = 3600
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def token_claims(token: str) -> Dict[str, Any]:
+    """The payload a token carries, read without being trusted.
+
+    The probe signs its own tokens, so it reads the Panel's one to learn which
+    administrator the credential names; nothing from it is printed beyond a
+    boolean, and no signature is ever taken as valid here.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {}
+    padded = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+        value = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _hs256_token(claims: Dict[str, Any], secret: str) -> str:
+    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    body = _b64url(json.dumps(claims, separators=(",", ":")).encode())
+    signing_input = f"{header}.{body}".encode("ascii")
+    signature = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    return f"{header}.{body}.{_b64url(signature)}"
+
+
+def _unsigned_token(claims: Dict[str, Any]) -> str:
+    header = _b64url(json.dumps({"alg": "none", "typ": "JWT"}, separators=(",", ":")).encode())
+    body = _b64url(json.dumps(claims, separators=(",", ":")).encode())
+    return f"{header}.{body}."
+
+
+def env_value(name: str, path: str | None = None) -> str:
+    """One value from a product environment file, read and never echoed."""
+    file = Path(path or PRODUCT_ENV_FILES[0])
+    if not file.is_file():
+        return ""
+    for line in file.read_text(encoding="utf-8", errors="replace").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == name:
+            return value.strip().strip("'\"")
+    return ""
+
+
+def auth_negative(panel: Panel) -> Dict[str, Any]:
+    """The four credentials the Panel must refuse, and the one it must still serve.
+
+    ``expired`` carries the Panel's own signature and dies of its ``exp``,
+    ``forged`` carries a future ``exp`` and dies of its signature, ``unsigned``
+    declares ``alg: none``, and ``unknown-admin`` is signed and unexpired but
+    names an administrator the database does not hold. The real token reads the
+    same route before and after, so a Panel that refused everything would fail
+    the control rather than pass the refusals.
+    """
+    facts: Dict[str, Any] = {}
+    real = panel.token
+    claims = token_claims(real)
+    facts["claims_present"] = bool(claims)
+    facts["role"] = str(claims.get("role") or "")
+    secret = env_value("APP_SECRET")
+    facts["signing_key_present"] = len(secret) >= 32
+    now = int(time.time())
+    faithful = {
+        "uuid": str(claims.get("uuid") or ""),
+        "username": str(claims.get("username") or ""),
+        "role": "ADMIN",
+    }
+    variants = {
+        "expired": _hs256_token(
+            {**faithful, "iat": now - 2 * AUTH_EXPIRED_SECONDS, "exp": now - AUTH_EXPIRED_SECONDS},
+            secret,
+        ),
+        "forged": _hs256_token(
+            {**faithful, "iat": now, "exp": now + AUTH_EXPIRED_SECONDS},
+            secrets.token_urlsafe(32),
+        ),
+        "unsigned": _unsigned_token(
+            {**faithful, "iat": now, "exp": now + AUTH_EXPIRED_SECONDS},
+        ),
+        "unknown-admin": _hs256_token(
+            {**faithful, "uuid": str(uuid4()), "iat": now, "exp": now + AUTH_EXPIRED_SECONDS},
+            secret,
+        ),
+    }
+    facts["control_before"] = Panel(panel.base_url, token=real).call("GET", "/api/nodes")[0]
+    facts["refusals"] = {}
+    for name, token in variants.items():
+        status, body = Panel(panel.base_url, token=token).call("GET", "/api/nodes")
+        error = payload(body)
+        facts["refusals"][name] = {
+            "status": status,
+            "error": str(error.get("error") or "") if isinstance(error, dict) else "",
+        }
+    facts["control_after"] = Panel(panel.base_url, token=real).call("GET", "/api/nodes")[0]
+    return facts
+
+
 # ------------------------------------------------------------------ revocation
 REVOKE_DIRECTORY = "revoke"
 REVOKE_STATE_NAME = "state.json"
@@ -1199,7 +1314,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--scope",
         choices=(
             "surface", "cluster", "lifecycle", "subscriptions",
-            "ua-absent", "ua-blank", "revoke", "restore", "channel", "all",
+            "ua-absent", "ua-blank", "revoke", "restore", "channel", "auth-negative", "all",
         ),
         default="all",
     )
@@ -1278,6 +1393,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.step not in steps:
             raise SystemExit("the channel scope needs --step capture or --step verify")
         facts["channel"] = steps[args.step](panel, directory)
+    if args.scope == "auth-negative":
+        facts["auth_negative"] = auth_negative(panel)
     print(json.dumps(facts, sort_keys=True))
     return 0
 

@@ -69,7 +69,7 @@ behaviors:
       scoped CA, and an anonymous, forged or expired credential is refused.
     topology: [aio, multi-node]
     gate: pre-push
-    cases: [AIO-AUTH, AIO-CLIENT, APIC-01]
+    cases: [AIO-AUTH, AIO-CLIENT, APIC-01, AIO-AUTH-NEG]
     error_paths: [NEG-06]
 
   - name: Every installed component reports its exact pinned version
@@ -493,7 +493,7 @@ behaviors:
       forged credentials are refused without mutation.
     topology: [aio, multi-node]
     gate: pre-push
-    cases: [NEG-01, AIO-FAULT-DISK, AIO-FAULT-PANEL, AIO-FAULT-XRAY, AIO-FAULT-LATENCY, MN-OUTAGE, MN-RESTART, MN-SSH-DOWN]
+    cases: [NEG-01, AIO-FAULT-DISK, AIO-FAULT-PANEL, AIO-FAULT-XRAY, AIO-FAULT-LATENCY, MN-OUTAGE, MN-RESTART, MN-SSH-DOWN, MN-DUP-ADD]
     error_paths: [NEG-02, NEG-03, NEG-04, NEG-05]
 
   - name: An interrupted mutation stays recoverable and its compensation is honest
