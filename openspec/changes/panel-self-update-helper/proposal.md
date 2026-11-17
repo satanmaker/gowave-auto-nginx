@@ -11,8 +11,18 @@ The operator therefore loses the standard way to update the Panel from the UI, a
 offers is one the project bans. Both units are small, root-only and independent of NGINX, certificates and the
 Panel's unit: installing them ourselves restores the standard path without adopting anything else upstream.
 
+The units alone are not enough. On 2026-11-17 the native `install.sh --update --stable` aborted on a host installed
+by this project with `Refusing a symlinked /opt/gowave/dist`: `modules/panel.sh` extracts the dashboard into
+`frontend/` and compensates with `dist -> frontend`, while the upstream service policy refuses a symlinked
+`gowave-server`, `frontend`, `dist` or `static`. `update apply` runs the same policy check before restarting, so an
+in-panel update would fail the same way even with both units installed. The dashboard must therefore be installed
+in the upstream layout, `frontend/dist`, which also removes the need for the symlink.
+
 ## What Changes
 
+- `download_panel_release` extracts the dashboard archive into `<install-dir>/frontend/dist` (the layout the
+  release archive and the Panel's static lookup expect), stops creating the `dist -> frontend` symlink, and
+  removes that symlink from a host installed by an earlier version.
 - `gowave.service` gains `RuntimeDirectory=gowave`, `RuntimeDirectoryMode=0700` and
   `RuntimeDirectoryPreserve=yes`, so systemd creates `/run/gowave` for the unprivileged Panel and the Panel can
   write its `update-request` file there.
@@ -44,10 +54,12 @@ None.
 
 ## Impact
 
-- `modules/panel.sh` — `configure_panel_systemd` (base unit template plus two new unit files and their enable
-  list).
+- `modules/panel.sh` — `download_panel_release` (dashboard layout, symlink removal) and
+  `configure_panel_systemd` (base unit template plus two new unit files and their enable list).
 - `gowave-auto.sh` — `cmd_uninstall` unit stop/disable/removal lists.
 - `tests/test_systemd_runner.py` — static contract assertions on the emitted units and the uninstall list.
+- `tests/test_panel_deployment.py` — the release fixture now packs the dashboard the way the published archive
+  does, and the install assertions pin `frontend/dist` and the absence of a `dist` symlink.
 - `openspec/specs/lifecycle-management/spec.md` — the modified requirement and its scenarios.
-- Operators: the Panel's own update endpoint starts working after a reinstall; no new ports, no new packages,
-  no NGINX or certificate changes.
+- Operators: the Panel's own update endpoint starts working after a reinstall, and the upstream `--update` path
+  stops aborting on the install layout; no new ports, no new packages, no NGINX or certificate changes.

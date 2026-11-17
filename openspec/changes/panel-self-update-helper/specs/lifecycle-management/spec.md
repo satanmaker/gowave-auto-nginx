@@ -2,6 +2,32 @@
 
 ## ADDED Requirements
 
+### Requirement: Installation layout accepted by the Panel updater
+
+The installer SHALL place the Panel dashboard at `<install-dir>/frontend/dist` and MUST NOT leave a symlink at
+`<install-dir>/dist`, so that the layout check performed by either update path accepts the installation.
+
+#### Scenario: Fresh installation uses the updater's layout
+
+- **GIVEN** a clean supported host
+- **WHEN** `gowave-auto.sh install` completes
+- **THEN** `<install-dir>/frontend/dist/index.html` exists, `<install-dir>/dist` does not exist, and neither
+  `<install-dir>/frontend` nor `<install-dir>/dist` is a symlink
+
+#### Scenario: Reinstall removes the legacy dashboard symlink
+
+- **GIVEN** a host installed by an earlier version where `<install-dir>/dist` is a symlink to `frontend`
+- **WHEN** `gowave-auto.sh install` runs again
+- **THEN** the symlink is removed, the dashboard is served from `frontend/dist`, and no other file in the install
+  directory is removed
+
+#### Scenario: An updater's layout check accepts the installation
+
+- **GIVEN** an installed host
+- **WHEN** a Panel updater validates the install layout before replacing code, whether that is the upstream
+  service policy or `update apply`
+- **THEN** the check passes instead of refusing a symlinked install entry
+
 ### Requirement: Project-owned in-panel update helper
 
 The installer SHALL provision the Panel's root-side update helper itself instead of relying on the upstream

@@ -1,5 +1,22 @@
 # Tasks
 
+## 0. Upstream-compatible dashboard layout
+
+- [ ] 0.1 Extract the dashboard into `<install-dir>/frontend/dist` through a staging rename and stop creating
+  `<install-dir>/dist` in `download_panel_release` (`modules/panel.sh`); the release archive holds the files at its
+  root (`release.yml:45`), so the old extraction left them in `frontend/` and only the symlink made them reachable.
+  Verify: `bash -n modules/panel.sh`, `grep -c 'ln -sfn' modules/panel.sh` returns 0.
+- [ ] 0.2 Remove a legacy `<install-dir>/dist` symlink on reinstall, and leave the path alone when it is a real
+  directory or a regular file. Verify: a test in `tests/test_panel_deployment.py` covers the migration with a
+  pre-created symlink and a pre-created directory.
+- [ ] 0.3 Make the release fixture in `tests/test_panel_deployment.py` pack the dashboard the way
+  `.github/workflows/release.yml:45` does (`tar -czf ... -C dist .`), assert `frontend/dist/index.html`, and assert
+  that `<install-dir>/dist` does not exist. Verify: `python3 tests/test_panel_deployment.py` passes, and the same
+  test against the pre-change `panel.sh` fails on the `frontend/dist` assertion.
+- [ ] 0.4 Prove the layout on a real host: reinstall on the disposable VM, then run the upstream
+  `install.sh --update` and confirm it reaches the restart instead of `Refusing a symlinked /opt/gowave/dist`.
+  Verify: the command's exit status and the panel's `wait_healthy` line in the log are recorded here.
+
 ## 1. Unit templates and the runtime directory
 
 - [ ] 1.1 Add `RuntimeDirectory=gowave`, `RuntimeDirectoryMode=0700` and `RuntimeDirectoryPreserve=yes` to the
