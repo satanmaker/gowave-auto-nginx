@@ -75,7 +75,13 @@ MANIFEST_KEYS = (
 #: the one the gate reads, so a second copy cannot drift from the sentence.
 REQUIRED_PORTS = tuple(REQUIRED_PORTS_DEFAULT)
 
+#: The packages the gate's own refusal asks the operator to install.
 GATE_TOOLS = ("tcpdump", "iproute2")
+
+#: What those packages put on ``$PATH``. ``iproute2`` is a package name, not a
+#: command, so a probe over the install list reports it missing however well the
+#: install went and the tool clause is never reached.
+GATE_COMMANDS = ("tcpdump", "ss")
 
 #: What the case installs, and the one sentence the gate itself asks for.
 _INSTALL_TOOLS = (
@@ -222,12 +228,12 @@ def _gate_host(product: Any, case_id: str, label: str) -> Iterator[_GateHost]:
 
 
 def _install_gate_tools(host: _GateHost, case_id: str) -> Dict[str, str]:
-    """Install the two target-side tools and report what the host now answers."""
+    """Install the two target-side packages and report what the host now answers."""
     host.podman.exec_bash(host.name, _INSTALL_TOOLS, timeout=TOOLS_TIMEOUT_SECONDS)
     probe = host.podman.exec(
         host.name,
         ["bash", "-c",
-         "for t in " + " ".join(GATE_TOOLS) + "; do "
+         "for t in " + " ".join(GATE_COMMANDS) + "; do "
          'if command -v "$t" >/dev/null 2>&1; then echo "$t=ok"; else echo "$t=missing"; fi; '
          "done"],
         timeout=SSH_TIMEOUT_SECONDS,
@@ -237,9 +243,9 @@ def _install_gate_tools(host: _GateHost, case_id: str) -> Dict[str, str]:
     )
     require(
         case_id,
-        all(tools.get(tool) == "ok" for tool in GATE_TOOLS),
-        f"the case could not put {GATE_TOOLS} on the host ({tools}), so neither sentence "
-        "about the gate could be decided",
+        all(tools.get(command) == "ok" for command in GATE_COMMANDS),
+        f"the case could not put {GATE_COMMANDS} on the host after installing "
+        f"{GATE_TOOLS} ({tools}), so neither sentence about the gate could be decided",
     )
     return tools
 
@@ -395,7 +401,8 @@ def case_clean_baseline_passes_gate(product: Any, context: Any) -> Dict[str, Any
         "distribution": host.distribution,
         "address": host.address,
         "manifest_keys": ",".join(MANIFEST_KEYS),
-        "required_tools": ",".join(f"{tool}=ok" for tool in GATE_TOOLS),
+        "required_tools": ",".join(
+            f"{tool}={state}" for tool, state in manifest["required_tools"].items()),
         "listening_ports": ",".join(str(port) for port in manifest["listening_ports"]),
         "occupied_required_ports": ",".join(str(port) for port in occupied),
         "gate_disqualifications": len(disqualifications),
