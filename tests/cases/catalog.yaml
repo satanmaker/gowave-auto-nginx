@@ -5099,8 +5099,30 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: operator_access:case_domain_input_is_validated_before_network
+      evidence:
+      - bootstraps_before_validation
+      - connections_before_validation
+      - invalid_exit_code
+      - refusal_reasons
+      - rejected_classes
+      - valid_input_bootstraps
+      - valid_input_connections
+      - validation_precedes_bootstrap
+    multi-node:
+      driver: operator_access:case_domain_input_is_validated_before_network
+      evidence:
+      - bootstraps_before_validation
+      - connections_before_validation
+      - invalid_exit_code
+      - refusal_reasons
+      - rejected_classes
+      - valid_input_bootstraps
+      - valid_input_connections
+      - validation_precedes_bootstrap
   promotion_target: null
 - id: OP-02
   requirement: Local interactive operator entrypoint
@@ -5122,8 +5144,36 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: operator_access:case_password_is_hidden_and_unpersisted
+      evidence:
+      - argv_mentions
+      - auth_calls
+      - authenticated
+      - environment_mentions
+      - ephemeral_key_mode
+      - key_installed
+      - password_cleared_after_auth
+      - password_reads
+      - prompt_names_hidden
+      - runtime_files_mentioning
+      - stdout_mentions
+    multi-node:
+      driver: operator_access:case_password_is_hidden_and_unpersisted
+      evidence:
+      - argv_mentions
+      - auth_calls
+      - authenticated
+      - environment_mentions
+      - ephemeral_key_mode
+      - key_installed
+      - password_cleared_after_auth
+      - password_reads
+      - prompt_names_hidden
+      - runtime_files_mentioning
+      - stdout_mentions
   promotion_target: null
 - id: SSHID-01
   requirement: Out-of-band SSH host identity verification
@@ -5144,8 +5194,32 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: operator_access:case_confirmed_host_key_is_pinned
+      evidence:
+      - fingerprint_confirmed
+      - key_installed
+      - known_hosts_host
+      - known_hosts_key_type
+      - known_hosts_lines
+      - known_hosts_matches_observed_key
+      - known_hosts_mode
+      - password_authentication_proceeded
+      - timer_state_at_bootstrap
+    multi-node:
+      driver: operator_access:case_confirmed_host_key_is_pinned
+      evidence:
+      - fingerprint_confirmed
+      - key_installed
+      - known_hosts_host
+      - known_hosts_key_type
+      - known_hosts_lines
+      - known_hosts_matches_observed_key
+      - known_hosts_mode
+      - password_authentication_proceeded
+      - timer_state_at_bootstrap
   promotion_target: null
 - id: SSHID-02
   requirement: Out-of-band SSH host identity verification
@@ -5163,8 +5237,28 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: operator_access:case_unconfirmed_host_key_aborts
+      evidence:
+      - authorized_keys_unchanged
+      - known_hosts_written
+      - password_reads
+      - refusal
+      - remote_commands
+      - remote_writes
+      - timers_armed
+    multi-node:
+      driver: operator_access:case_unconfirmed_host_key_aborts
+      evidence:
+      - authorized_keys_unchanged
+      - known_hosts_written
+      - password_reads
+      - refusal
+      - remote_commands
+      - remote_writes
+      - timers_armed
   promotion_target: null
 - id: TSSH-01
   requirement: Temporary SSH access with remote expiry
@@ -5184,8 +5278,36 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: operator_access:case_temporary_key_is_bounded
+      evidence:
+      - authorized_keys_lines
+      - authorized_keys_mode
+      - existing_entry_preserved
+      - expiry_deadline_utc
+      - temporary_entries
+      - temporary_entry_restricted
+      - timer_armed_before_key
+      - timer_on_active_sec
+      - timer_persistent
+      - timer_state_at_bootstrap
+      - timer_unit_written
+    multi-node:
+      driver: operator_access:case_temporary_key_is_bounded
+      evidence:
+      - authorized_keys_lines
+      - authorized_keys_mode
+      - existing_entry_preserved
+      - expiry_deadline_utc
+      - temporary_entries
+      - temporary_entry_restricted
+      - timer_armed_before_key
+      - timer_on_active_sec
+      - timer_persistent
+      - timer_state_at_bootstrap
+      - timer_unit_written
   promotion_target: null
 - id: TSSH-02
   requirement: Temporary SSH access with remote expiry
@@ -5205,8 +5327,30 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: operator_access:case_failed_bootstrap_falls_back_to_timer
+      evidence:
+      - cleanup_attempts
+      - cleanup_verified
+      - existing_entry_preserved
+      - failure
+      - key_installed
+      - timer_state
+      - timers_still_armed
+      - warning_names_the_timer
+    multi-node:
+      driver: operator_access:case_failed_bootstrap_falls_back_to_timer
+      evidence:
+      - cleanup_attempts
+      - cleanup_verified
+      - existing_entry_preserved
+      - failure
+      - key_installed
+      - timer_state
+      - timers_still_armed
+      - warning_names_the_timer
   promotion_target: null
 - id: REV-01
   requirement: Immediate credential revocation gates overall status

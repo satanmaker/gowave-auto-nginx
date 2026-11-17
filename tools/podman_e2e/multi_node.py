@@ -31,8 +31,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
     acme_fixture, aio, argv_probe, budget, denial, environment_gate, ingress, local_ci,
-    lock_cases, matrix as matrix_data, mtls, preflight_cases, runstate_cases, skip_policy,
-    status, teardown, topology, trust_bundle, vision as vision_policy,
+    lock_cases, matrix as matrix_data, mtls, operator_access, preflight_cases, runstate_cases,
+    skip_policy, status, teardown, topology, trust_bundle, vision as vision_policy,
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
@@ -8783,6 +8783,33 @@ def cases(
         Case(local_ci.LOCAL_CASE_ID, "multi-node",
              lambda context: local_ci.case_ci_needs_no_credentials(product, context),
              timeout_seconds=local_ci.DISCOVERY_TIMEOUT_SECONDS + 60),
+        # The operator's own controller, read whole. It dials nothing and starts
+        # nothing: the transport is a model of a host, so the sequence the six
+        # sentences describe is the thing under test rather than a remote's word.
+        Case(operator_access.OP_CASE_ID, "multi-node",
+             lambda context: operator_access.case_domain_input_is_validated_before_network(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.PASSWORD_CASE_ID, "multi-node",
+             lambda context: operator_access.case_password_is_hidden_and_unpersisted(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.SSHID_CONFIRMED_CASE_ID, "multi-node",
+             lambda context: operator_access.case_confirmed_host_key_is_pinned(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.SSHID_DECLINED_CASE_ID, "multi-node",
+             lambda context: operator_access.case_unconfirmed_host_key_aborts(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.BOUNDED_CASE_ID, "multi-node",
+             lambda context: operator_access.case_temporary_key_is_bounded(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.FALLBACK_CASE_ID, "multi-node",
+             lambda context: operator_access.case_failed_bootstrap_falls_back_to_timer(
+                 product, context),
+             timeout_seconds=300),
         # Last: the deadline it proves is this topology's own, and the elapsed
         # clock it reads is the two hosts' install and transfer, not a single
         # container's. It starts no container and reads no cluster, so it cannot
