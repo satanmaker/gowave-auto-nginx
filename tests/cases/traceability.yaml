@@ -589,10 +589,10 @@ cases_by_requirement:
       lost a required tool while tolerating the fields no gate reads, and the
       runner re-collects that baseline before it copies the repository
   - requirement: Live scenario parity
-    cases: [AIO-AUTH-NEG, MN-DUP-ADD]
+    cases: [AIO-AUTH-NEG, MN-DUP-ADD, RED-01, RED-02, APIC-01]
     reason: >-
-      both serve the same parity sentence for two rows of the live negative
-      matrix the delta spec writes no scenario about. AIO-AUTH-NEG is the
+      all five serve the same parity sentence for rows of the live matrix the
+      delta spec writes no scenario about. AIO-AUTH-NEG is the
       forged-credential row: four tokens copied from the one the documented
       login issued each fail exactly one clause of the Panel's own gate — an
       expired token signed with the Panel's real secret, a token signed with a
@@ -609,7 +609,36 @@ cases_by_requirement:
       refusal from a second record that was created and then cleaned up. The
       third row of that group, a corrupted database inside an otherwise valid
       archive, is a variant of `MN-BACKUP-BAD` and is traced through the backup
-      scenario rather than as a case of its own
+      scenario rather than as a case of its own. RED-01 and RED-02 are the two
+      rows of the live redaction requirement, which the delta spec also states
+      without a scenario: RED-01 reads the operator's own credentials file,
+      registers both secret values with the run's filter and writes the raw dump
+      through the writer every artifact goes through, then reads the tree back —
+      the field names survive, both values are `[REDACTED]`, and the run's own
+      audit finds no file that changes when redacted, so a sibling artifact
+      still holding a secret fails this case instead of being published. RED-02
+      asks the real failure collector for its bundle on a healthy host and reads
+      every area file back: the host's own kernel, distribution and installed
+      package version, the unit state, journalctl's output, a listener, the
+      vhost test, ufw's verdict and iptables' chain policy, and the served
+      certificate's subject and validity — with no private key material and
+      every file at 0600. The report-side half of that clause — API object
+      summaries, traffic results and per-case timings — is carried by
+      `result.json`, which the runner writes after the last case, so the case
+      names it as not claimed here rather than reading a file that does not
+      exist yet. APIC-01 is the bounded-client row: the controller's own
+      `E2EPanelClient` logs in and lists nodes against the Panel's public name
+      with the run's bundle, which is what makes the bundle the thing that
+      carried the login, while a context with no anchor at all and the same
+      bundle pointed at `127.0.0.1` are both refused — the second being
+      hostname verification rather than a store the image happened to have.
+      `API_TIMEOUT` is set to a value neither the client nor the parser defaults
+      to and read back from both, and a caller that omits every optional
+      argument still inherits that bound and the default context, so
+      "production callers keep their behaviour" is measured rather than
+      assumed. The two shipped sources are then read for a bypass token, so an
+      `allowInsecure` or a disabled hostname check added to either makes the
+      other clauses describe a client nobody ships
 
 # What the published report has to cover, one declaration at a time. A plain
 # path is met by any behaviour that quotes it; `every_value` makes every element
