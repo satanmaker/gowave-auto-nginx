@@ -30,6 +30,7 @@ from . import (
     environment_gate,
     ingress,
     matrix,
+    operator_access,
     panel_surface,
     preflight_cases,
     runstate_cases,
@@ -8861,6 +8862,34 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case(skip_policy.DP14_CASE_ID, "aio",
              lambda context: skip_policy.case_skipped_traffic_is_never_pass(product, context),
              timeout_seconds=180),
+        # The controller the operator runs on this machine, read whole: its input
+        # gate before any socket exists, the one call its password is allowed in,
+        # the host key it pins, and the bounded access it installs. None of these
+        # starts a container, so they sit beside the other file-shaped cases.
+        Case(operator_access.OP_CASE_ID, "aio",
+             lambda context: operator_access.case_domain_input_is_validated_before_network(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.PASSWORD_CASE_ID, "aio",
+             lambda context: operator_access.case_password_is_hidden_and_unpersisted(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.SSHID_CONFIRMED_CASE_ID, "aio",
+             lambda context: operator_access.case_confirmed_host_key_is_pinned(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.SSHID_DECLINED_CASE_ID, "aio",
+             lambda context: operator_access.case_unconfirmed_host_key_aborts(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.BOUNDED_CASE_ID, "aio",
+             lambda context: operator_access.case_temporary_key_is_bounded(
+                 product, context),
+             timeout_seconds=300),
+        Case(operator_access.FALLBACK_CASE_ID, "aio",
+             lambda context: operator_access.case_failed_bootstrap_falls_back_to_timer(
+                 product, context),
+             timeout_seconds=300),
         # Last, because the deadline it proves is the one the whole run spent: the
         # case reads the elapsed wall clock and the enforced budget, then produces
         # an exhausted run of the real runner and reads its report. A suite that

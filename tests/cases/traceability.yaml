@@ -627,6 +627,38 @@ cases_by_requirement:
       with nothing a credential could arrive in — no `GOWAVE_*`, no agent
       socket, an empty home directory — which passes in seconds
   - requirement: Live scenario parity
+    cases: [OP-01, OP-02, SSHID-01, SSHID-02, TSSH-01, TSSH-02]
+    reason: >-
+      all six serve the same parity sentence for the four live sentences about
+      the operator's own controller rather than about a running pair. OP-01 is
+      the input-gate sentence: the controller is driven with thirteen scripted
+      answers and one field changed at a time, and each of the four invalid
+      classes the sentence names — an unparsable address, a Vision domain that
+      duplicates a panel domain, a malformed FQDN, a non-root SSH account — is
+      refused by the strict parser with its own sentence while
+      `socket.create_connection` is never called and no bootstrap is reached;
+      the fully valid input then reaches exactly one bootstrap, and the source
+      order places `load_config` before the first `_bootstrap_one` call, so the
+      order is carried by a call site rather than by a comment. OP-02 is the
+      password sentence: `_bootstrap_one` reads it through one `getpass` prompt
+      whose text says hidden, hands it to exactly one `auth_password` call, and
+      drops it before the first byte reaches the host, so it appears in no
+      child's argv, in no environment variable, in no file under the runtime
+      directory and in none of the controller's own output, while the ephemeral
+      private key it does write is mode 0600. SSHID-01 and SSHID-02 are the
+      host-key pair: a matching fingerprint lets password authentication
+      proceed and pins the exact key the controller observed into a mode-0600
+      `known_hosts` file, while a mismatched one aborts with the controller's
+      own refusal, reads no password, writes no file, sends no command, arms no
+      timer and leaves `authorized_keys` byte-identical. TSSH-01 and TSSH-02 are
+      the temporary-access pair: the provider's existing `authorized_keys` entry
+      survives beside exactly one `restrict ssh-ed25519` entry carrying the
+      revocation marker, a persistent `OnActiveSec=2h` timer unit is written and
+      armed before the entry is moved into place, and a bootstrap that fails
+      after that point sends one cleanup attempt whose unverified outcome is
+      reported with the timer named as the remaining bound — the timer still
+      armed, the key never installed, the existing entry untouched
+  - requirement: Live scenario parity
     cases: [AIO-AUTH-NEG, MN-DUP-ADD, RED-01, RED-02, APIC-01]
     reason: >-
       all five serve the same parity sentence for rows of the live matrix the
