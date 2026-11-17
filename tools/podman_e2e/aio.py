@@ -89,6 +89,10 @@ PANEL_DOMAIN = topology.PANEL_DOMAIN
 REALITY_DOMAIN = topology.REALITY_DOMAIN
 PANEL_SURFACE_SCRIPT = "/repo/tools/podman_e2e/panel_surface.py"
 SUBSCRIPTION_PROBE_SCRIPT = topology.SUBSCRIPTION_PROBE_SCRIPT
+# The Panel's own gate, read from the four credentials it must refuse. The case
+# is the same question on both contours — a Master serves the Panel — so the
+# Multi-Node suite registers this same id against its Master product.
+AUTH_NEGATIVE_CASE_ID = "AIO-AUTH-NEG"
 
 # What each YAML representation is expected to carry, per the shipped generators.
 # GenerateMihomo skips only kcp, so Mihomo receives one proxy per inbound.
@@ -2455,6 +2459,57 @@ def case_panel_auth(product: AioProduct) -> Dict[str, Any]:
         "host_fingerprints": ",".join(hosts.get("fingerprints") or []),
         "host_security_layers": ",".join(hosts.get("security_layers") or []),
         "default_user_short_uuid_length": default_user.get("short_uuid_length"),
+    }
+
+
+def case_panel_auth_negative(product: AioProduct) -> Dict[str, Any]:
+    """AIO-AUTH-NEG: the Panel refuses what it did not issue, and keeps serving.
+
+    The four credentials are one sentence each in the middleware: a token the
+    Panel did not sign, one that was signed and has expired, one that declares
+    no signature at all, and one whose signature and expiry are both good but
+    whose `uuid` names no administrator. A case that only sent garbage would
+    pass on the first clause alone, so every variant is a copy of the real token
+    that fails exactly one — and the real token reads the same route before and
+    after, which is what makes "refused" different from "refuses everything".
+    """
+    facts = panel_probe(product, AUTH_NEGATIVE_CASE_ID, "auth-negative")
+    negative = facts.get("auth_negative") or {}
+    require(AUTH_NEGATIVE_CASE_ID, negative.get("claims_present"),
+            "the token the Panel issued carries no readable claims, so the variants "
+            "could not be faithful copies of it")
+    require(AUTH_NEGATIVE_CASE_ID, negative.get("role") == "ADMIN",
+            f"the issued token names the role {negative.get('role')!r} instead of ADMIN")
+    require(AUTH_NEGATIVE_CASE_ID, negative.get("signing_key_present"),
+            "APP_SECRET is absent or shorter than the Panel's own 32-character floor, so the "
+            "expired variant would not carry the Panel's signature")
+    require(AUTH_NEGATIVE_CASE_ID, negative.get("control_before") == 200,
+            f"the issued token read /api/nodes as {negative.get('control_before')!r} "
+            "before the refusals, so a refusal below would prove nothing")
+    refusals = negative.get("refusals") or {}
+    for name in ("expired", "forged", "unsigned", "unknown-admin"):
+        entry = refusals.get(name) or {}
+        require(AUTH_NEGATIVE_CASE_ID, entry.get("status") == 401,
+                f"the {name} token read /api/nodes as {entry.get('status')!r} instead of "
+                f"being refused with 401")
+        require(AUTH_NEGATIVE_CASE_ID, entry.get("error") == "Unauthorized",
+                f"the {name} token was refused with {entry.get('error')!r} instead of "
+                "the Panel's own Unauthorized body")
+    require(AUTH_NEGATIVE_CASE_ID, negative.get("control_after") == 200,
+            f"the issued token read /api/nodes as {negative.get('control_after')!r} after the "
+            "refusals, so the Panel stopped serving the credential it issued")
+    return {
+        "control_before": negative.get("control_before"),
+        "control_after": negative.get("control_after"),
+        "signing_key_present": negative.get("signing_key_present"),
+        "refusals": {
+            name: {
+                "status": (refusals.get(name) or {}).get("status"),
+                "error": (refusals.get(name) or {}).get("error"),
+                "verdict": "PASS",
+            }
+            for name in ("expired", "forged", "unsigned", "unknown-admin")
+        },
     }
 
 
@@ -8370,6 +8425,10 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case(ACME_OUTAGE_CASE_ID, "aio", lambda context: case_acme_outage(product),
              timeout_seconds=ACME_OUTAGE_TIMEOUT_SECONDS),
         Case("AIO-AUTH", "aio", lambda context: case_panel_auth(product), timeout_seconds=300),
+        # Beside it and before any traffic: the same Panel is asked for four
+        # credentials it did not issue, and the one it did issue still reads.
+        Case(AUTH_NEGATIVE_CASE_ID, "aio", lambda context: case_panel_auth_negative(product),
+             timeout_seconds=300),
         Case("AIO-CLIENT", "aio", lambda context: case_client_lifecycle(product), timeout_seconds=300),
         Case("SUB-SERVED", "aio", lambda context: case_subscriptions(product), timeout_seconds=600),
         Case("SUB-UA-ABSENT", "aio", lambda context: case_user_agent_absent(product), timeout_seconds=300),

@@ -127,6 +127,8 @@ Live scenarios: 125 — container 111, partial 12, live-only 2.
 - **VIS-CONFIG** — promotion target: Independent Optional Vision Domains
 - **VIS-GATE** — promotion target: Independent Optional Vision Domains
 - **MN-ARGV-OBSERVER** — promotion target: Distributed Worker VPS Deployment Verification
+- **AIO-AUTH-NEG** — promotion target: Negative Scenario and Fault Injection Tests
+- **MN-DUP-ADD** — promotion target: Negative Scenario and Fault Injection Tests
 - **AIO-DP-REALITY-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-REALITY-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-XHTTP-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints

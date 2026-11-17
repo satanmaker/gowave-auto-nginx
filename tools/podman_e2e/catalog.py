@@ -649,6 +649,37 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "topology": ["multi-node"],
         "promotion_target": "Distributed Worker VPS Deployment Verification",
     },
+    {
+        "id": "AIO-AUTH-NEG",
+        "requirement": "Failure injection and recovery",
+        "assertion": (
+            "The Panel's own gate refuses four credentials it did not issue — an "
+            "expired token signed with the Panel's real secret, a token signed with a "
+            "foreign key, an unsigned `alg: none` token, and a correctly signed token "
+            "naming an administrator record that does not exist — each answered 401 "
+            "with the middleware's own `Unauthorized` body and no traceback, while the "
+            "token the documented login issued still reads the same route before and "
+            "after; the signing key is read from the Panel's environment and never "
+            "printed, and the issued token's payload names an `ADMIN` subject."
+        ),
+        "topology": ["aio", "multi-node"],
+        "promotion_target": "Negative Scenario and Fault Injection Tests",
+    },
+    {
+        "id": "MN-DUP-ADD",
+        "requirement": "Failure injection and recovery",
+        "assertion": (
+            "The operator's `gowave-auto.sh node add` run a second time for the Worker "
+            "it already registered exits nonzero with the existing-name refusal and no "
+            "traceback, and the state file's bytes, the committed recovery journal's "
+            "bytes and the Panel's node, profile, squad, host and token inventory are "
+            "what they were before the attempt, so the refusal came from `state.json` "
+            "before the Panel client was constructed rather than after a partial "
+            "registration."
+        ),
+        "topology": ["multi-node"],
+        "promotion_target": "Negative Scenario and Fault Injection Tests",
+    },
 ]
 
 SCENARIO_RE = re.compile(r"^#### Scenario:\s*(.+?)\s*$")
@@ -1585,6 +1616,28 @@ LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     # both: the configured host is refused and the unconfigured one is not, and a
     # host exempt from 8444/9444 is still evaluated against the default set.
     "VIS-08": {"aio": "VIS-GATE", "multi-node": "VIS-GATE"},
+    # A Panel credential is refused by three clauses — the signature over the
+    # Panel's own `APP_SECRET`, the `exp` the middleware declares required, and
+    # the administrator record it names — and `AIO-AUTH-NEG` sends four tokens
+    # that are copies of the real one and each fail exactly one clause, then
+    # reads the same route with the real token before and after. The Panel is the
+    # Master's on both contours, so one case answers for both.
+    "NEG-06": {"aio": "AIO-AUTH-NEG", "multi-node": "AIO-AUTH-NEG"},
+    # The duplicate is refused from `state.json` before the Panel client exists,
+    # which is a fact about the Master's own registration record: `MN-DUP-ADD`
+    # runs the operator's verb a second time over a committed pair and reads the
+    # journal, the state file and the Panel inventory on both sides of it. The
+    # registration it duplicates is `node add`, which only a cluster performs —
+    # the All-in-One install registers its local node inside the same transaction
+    # and never exposes a second dispatch for a duplicate to collide with.
+    "NEG-02": {"multi-node": "MN-DUP-ADD"},
+    # Two corruptions of one archive: a container that does not read and a
+    # database that does not open. `MN-BACKUP-BAD` writes one broken archive per
+    # promise and asks the product's restore to refuse each before it mutates a
+    # live file; the database variant carries a manifest that names the digest of
+    # what it actually ships, so the integrity check the product runs on its
+    # staged copy is the only gate left.
+    "NEG-05": {"multi-node": "MN-BACKUP-BAD"},
 }
 
 

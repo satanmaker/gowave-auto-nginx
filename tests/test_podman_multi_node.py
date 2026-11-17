@@ -10,6 +10,7 @@ defect into a harness failure — or worse, a wrong node into a passing case.
 """
 import base64
 import contextlib
+import copy
 import hashlib
 import io
 import json
@@ -1674,23 +1675,30 @@ class TestMultiNodeSuite(unittest.TestCase):
     def test_the_suite_starts_with_the_install_and_then_provisions_the_worker(self):
         suite = multi_node.cases(self.podman)
         self.assertIsInstance(suite[0], Case)
-        # The observer reads the trace the provisioning just wrote, so it sits
-        # between the deployment and the cases that audit what it produced.
-        self.assertEqual(
-            [case.id for case in suite][:5],
-            [multi_node.INSTALL_CASE_ID, multi_node.SSH_KEY_CASE_ID,
-             multi_node.NODE_ADD_CASE_ID, multi_node.ARGV_OBSERVER_CASE_ID,
-             multi_node.MASTER_ADDRESS_CASE_ID],
-        )
+        ids = [case.id for case in suite]
+        self.assertEqual(ids[0], multi_node.INSTALL_CASE_ID, "the install is the first case")
+        # The observer reads the trace the provisioning just wrote, and the
+        # duplicate-add case re-runs the very verb that trace recorded, so both
+        # sit between the deployment and the cases that audit what it produced.
+        # Each step is named rather than counted: a case imported between two of
+        # them changes no ordering, and this guard is about ordering.
+        for earlier, later in (
+            (multi_node.INSTALL_CASE_ID, multi_node.SSH_KEY_CASE_ID),
+            (multi_node.SSH_KEY_CASE_ID, multi_node.NODE_ADD_CASE_ID),
+            (multi_node.NODE_ADD_CASE_ID, multi_node.ARGV_OBSERVER_CASE_ID),
+            (multi_node.ARGV_OBSERVER_CASE_ID, multi_node.DUPLICATE_ADD_CASE_ID),
+            (multi_node.DUPLICATE_ADD_CASE_ID, multi_node.MASTER_ADDRESS_CASE_ID),
+        ):
+            with self.subTest(order=f"{earlier} before {later}"):
+                self.assertLess(ids.index(earlier), ids.index(later))
         # The pair-wide lock cases start the product's own holder over SSH into
         # both containers, and the Worker carries a python3 only once the
         # provisioning above has run there.
-        self.assertEqual(
-            [case.id for case in suite][5:10],
-            [lock_cases.LOCK_CASE_ID, lock_cases.LOCK_LOSS_CASE_ID,
-             lock_cases.LOCK_PATH_CASE_ID, lock_cases.CLI_CASE_ID,
-             lock_cases.NESTED_CASE_ID],
-        )
+        self.assertSequence(ids, [
+            lock_cases.LOCK_CASE_ID, lock_cases.LOCK_LOSS_CASE_ID,
+            lock_cases.LOCK_PATH_CASE_ID, lock_cases.CLI_CASE_ID,
+            lock_cases.NESTED_CASE_ID,
+        ])
         self.assertEqual({case.topology for case in suite}, {"multi-node"})
 
     def test_every_case_declares_a_positive_timeout(self):
@@ -6040,6 +6048,10 @@ _REJECT_MESSAGES = {
     "no-database": "Validation Error: Archive of type 'panel' is missing its required "
                    "member: opt/gowave/gowave.db",
     "wrong-type": "Validation Error: Backup type mismatch: expected panel, got node",
+    # The refusal NEG-12 turns on: the archive passed every container check and
+    # the product's own staged-copy check rejects the database it carries.
+    "sqlite": "Pre-restore check failed: staged database integrity check returned: "
+              "error: database disk image is malformed",
     "node-truncated": "Validation Error: Archive is not a readable Format v1 tar.gz: "
                       "unexpected end of data",
 }
@@ -6177,10 +6189,13 @@ class TestBackupRejectCase(unittest.TestCase):
         self.assertEqual(sorted(refused), sorted(name for name, _ in multi_node.REJECT_VARIANTS))
         for name, entry in refused.items():
             self.assertNotEqual(entry["returncode"], 0)
-            self.assertIn("Validation Error:", entry["message"])
+            # Every variant but the database one is refused by the archive
+            # validator; that one reaches the product's own integrity check.
+            self.assertRegex(entry["message"], "Validation Error:|Pre-restore check failed:")
             self.assertEqual(entry["state"]["db"], "b" * 64)
         self.assertIn("required member: opt/gowave/gowave.db", refused["no-database"]["message"])
         self.assertIn("Checksum mismatch", refused["checksum"]["message"])
+        self.assertIn("database integrity check", refused["sqlite"]["message"])
         self.assertEqual(evidence["master_state"]["snapshots"], "0")
         self.assertEqual(evidence["node_refused"]["returncode"], 1)
         self.assertEqual(evidence["control"]["panel"],
@@ -6219,6 +6234,25 @@ class TestBackupRejectCase(unittest.TestCase):
             manifest = json.loads(tar.extractfile("meta.json").read())
         self.assertNotIn("files/opt/gowave/gowave.db", names)
         self.assertNotIn("opt/gowave/gowave.db", [entry["path"] for entry in manifest["files"]])
+
+    def test_the_database_variant_passes_every_container_check(self):
+        """The corruption has to be in the bytes, not in the archive around them."""
+        self.run_case()
+        with tarfile.open(self.store / "rejected-sqlite.tar.gz", "r:gz") as tar:
+            names = tar.getnames()
+            manifest = json.loads(tar.extractfile("meta.json").read())
+            carried = tar.extractfile(multi_node.REJECT_DATABASE_MEMBER).read()
+        with tarfile.open(self.panel, "r:gz") as tar:
+            original = tar.extractfile(multi_node.REJECT_DATABASE_MEMBER).read()
+        self.assertIn(multi_node.REJECT_DATABASE_MEMBER, names)
+        self.assertIn("meta.json", names)
+        self.assertLess(len(carried), len(original))
+        # Still a SQLite file by its own header, so the product reads it as a
+        # database and refuses it as a malformed one rather than as not-a-database.
+        self.assertTrue(carried.startswith(b"SQLite format 3\x00"))
+        declared = next(entry["sha256"] for entry in manifest["files"]
+                        if entry["path"] == multi_node.REJECT_DATABASE_PATH)
+        self.assertEqual(declared, hashlib.sha256(carried).hexdigest())
 
     def test_an_archive_the_product_applies_fails_the_case(self):
         with self.assertRaises(AssertionError) as caught:
@@ -6281,6 +6315,195 @@ class TestBackupRejectCase(unittest.TestCase):
                         ids.index(multi_node.REJECT_CASE_ID))
         self.assertLess(ids.index(multi_node.REJECT_CASE_ID),
                         ids.index(multi_node.RESTORE_CASE_ID))
+
+
+_DUPLICATE_STATE = {
+    "state_digest": "1" * 64,
+    "journal_digest": "2" * 64,
+    "journal_state": "NODE_ADD_COMMITTED",
+    "journal_node_name": topology.WORKER_NODE_NAME,
+    "state_nodes": ["local-node", topology.WORKER_NODE_NAME],
+    "state_addresses": ["10.0.0.1", "10.0.0.2"],
+}
+
+_DUPLICATE_SURFACE = {
+    "nodes": {
+        "count": 2,
+        "connected_count": 2,
+        "inbound_count": 6,
+        "inbound_digest": "d" * 64,
+        "names": ["local-node", topology.WORKER_NODE_NAME],
+        "endpoints": ["10.0.0.1:3002", "10.0.0.2:3002"],
+        "connected": {"local-node": True, topology.WORKER_NODE_NAME: True},
+    },
+    "profiles": {"count": 2, "inbound_digest": "e" * 64},
+    "squads": {"count": 1, "mvp_inbound_digest": "f" * 64},
+    "hosts": {"count": 7, "inbound_digest": "a" * 64, "fingerprints": ["chrome"]},
+    "tokens": {"count": 1},
+}
+
+
+class _DuplicatePodman:
+    """The Master's registration record and the operator's second `node add`."""
+
+    def __init__(self, record=None, returncode=1,
+                 output=f"Worker name is already registered in state.json: "
+                        f"{topology.WORKER_NODE_NAME}\n",
+                 mutate=None, on_attempt=None):
+        self.record = dict(record or _DUPLICATE_STATE)
+        self.returncode = returncode
+        self.output = output
+        self.mutate = mutate
+        self.on_attempt = on_attempt
+        self.attempts = []
+
+    def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
+        if "state_digest" in script:
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], 0, json.dumps(self.record), "")
+        if "gowave-auto.sh node add" in script:
+            self.attempts.append((container, script))
+            if self.mutate == "state":
+                self.record["state_digest"] = "9" * 64
+            elif self.mutate == "journal":
+                self.record["journal_digest"] = "9" * 64
+            if self.on_attempt is not None:
+                self.on_attempt()
+            return subprocess.CompletedProcess(
+                ["bash", "-lc"], self.returncode, self.output, "")
+        raise AssertionError(f"unexpected script in {container}: {script[:120]}")
+
+
+class _DuplicateHost:
+    target_name = "aio-master"
+
+    def node_add_script(self):
+        return (
+            f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node add "
+            f"'{topology.WORKER_NODE_NAME}' '10.0.0.2' "
+            "'worker.testbed.internal' 'reality.testbed.internal'"
+        )
+
+
+class _DuplicateProduct:
+    def __init__(self, podman, surface):
+        self.podman = podman
+        self.surface = surface
+        self.host = _DuplicateHost()
+
+    def require_worker(self):
+        return self.host
+
+    def panel_surface(self, case_id):
+        return {"surface": self.surface}
+
+
+class TestDuplicateAddCase(unittest.TestCase):
+    """MN-DUP-ADD: the second registration is refused before anything is mutated."""
+
+    def setUp(self):
+        self.surface = copy.deepcopy(_DUPLICATE_SURFACE)
+
+    def run_case(self, record=None, **kwargs):
+        podman = _DuplicatePodman(
+            record=dict(record or copy.deepcopy(_DUPLICATE_STATE)), **kwargs)
+        return multi_node.case_duplicate_add(_DuplicateProduct(podman, self.surface)), podman
+
+    def test_it_refuses_the_operator_command_and_reads_both_sides(self):
+        evidence, podman = self.run_case()
+        self.assertEqual(len(podman.attempts), 1)
+        container, script = podman.attempts[0]
+        self.assertEqual(container, _DuplicateHost.target_name)
+        self.assertIn("gowave-auto.sh node add", script)
+        self.assertIn(topology.WORKER_NODE_NAME, script)
+        self.assertEqual(evidence["refusal"], multi_node.DUPLICATE_ADD_REFUSAL)
+        self.assertEqual(evidence["journal_state"], "NODE_ADD_COMMITTED")
+        self.assertTrue(evidence["state_unchanged"])
+        self.assertTrue(evidence["journal_unchanged"])
+        self.assertTrue(evidence["inventory_unchanged"])
+
+    def test_the_record_probe_reads_the_product_own_files(self):
+        script = multi_node.duplicate_add_state_command()
+        self.assertIn(multi_node.NODE_ADD_STATE, script)
+        self.assertIn(multi_node.NODE_ADD_JOURNAL, script)
+        for field in ("state_digest", "journal_digest", "journal_state", "state_nodes"):
+            self.assertIn(field, script)
+
+    def test_the_inventory_leaves_out_the_connection_flag(self):
+        inventory = multi_node.panel_inventory(_DUPLICATE_SURFACE)
+        self.assertEqual(inventory["node_count"], 2)
+        self.assertNotIn("connected", inventory)
+        self.assertNotIn("connected_count", inventory)
+        flapped = copy.deepcopy(_DUPLICATE_SURFACE)
+        flapped["nodes"]["connected"][topology.WORKER_NODE_NAME] = False
+        flapped["nodes"]["connected_count"] = 1
+        self.assertEqual(multi_node.panel_inventory(flapped), inventory)
+
+    def test_a_duplicate_that_is_accepted_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(returncode=0, output="Worker 'worker-1' successfully added and deployed.\n")
+        self.assertIn("exited 0", str(caught.exception))
+
+    def test_a_refusal_without_the_existing_name_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(output="Error: could not resolve the Panel address.\n")
+        self.assertIn("without naming the existing record", str(caught.exception))
+
+    def test_a_traceback_instead_of_the_refusal_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(output=f"{multi_node.DUPLICATE_ADD_REFUSAL}: "
+                                 f"{topology.WORKER_NODE_NAME}\n"
+                                 "Traceback (most recent call last):\n"
+                                 "KeyError: 'nodes'\n")
+        self.assertIn("crashed instead of being refused", str(caught.exception))
+
+    def test_a_refusal_that_rewrites_state_json_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(mutate="state")
+        self.assertIn("rewrote state.json", str(caught.exception))
+
+    def test_a_refusal_that_rewrites_the_journal_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(mutate="journal")
+        self.assertIn("rewrote the recovery journal", str(caught.exception))
+
+    def test_a_refusal_that_creates_a_panel_record_fails_the_case(self):
+        def add_a_node():
+            self.surface["nodes"]["count"] = 3
+
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(on_attempt=add_a_node)
+        self.assertIn("changed the Panel inventory", str(caught.exception))
+
+    def test_a_pair_without_a_committed_journal_fails_the_case(self):
+        record = dict(_DUPLICATE_STATE, journal_state="NODE_ADD_VERIFYING")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(record=record)
+        self.assertIn("no completed registration", str(caught.exception))
+
+    def test_a_journal_naming_another_node_fails_the_case(self):
+        record = dict(_DUPLICATE_STATE, journal_node_name="worker-9")
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(record=record)
+        self.assertIn("instead of", str(caught.exception))
+
+    def test_a_state_file_without_the_worker_fails_the_case(self):
+        record = dict(_DUPLICATE_STATE, state_nodes=["local-node"])
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(record=record)
+        self.assertIn("refused for the wrong reason", str(caught.exception))
+
+    def test_the_case_runs_after_the_observer_and_before_the_locks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            suite = multi_node.cases(_StubPodman(Path(directory)))
+        ids = [case.id for case in suite]
+        case = suite[ids.index(multi_node.DUPLICATE_ADD_CASE_ID)]
+        self.assertEqual(case.topology, "multi-node")
+        self.assertEqual(case.timeout_seconds, multi_node.DUPLICATE_ADD_CASE_TIMEOUT_SECONDS)
+        self.assertLess(ids.index(multi_node.ARGV_OBSERVER_CASE_ID),
+                        ids.index(multi_node.DUPLICATE_ADD_CASE_ID))
+        self.assertLess(ids.index(multi_node.DUPLICATE_ADD_CASE_ID),
+                        ids.index(lock_cases.LOCK_CASE_ID))
 
 
 _RESTORE_REPRESENTATIONS = ("base64", "xray-json", "mihomo", "clash", "singbox")

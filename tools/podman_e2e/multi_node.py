@@ -307,8 +307,16 @@ ARTIFACT_ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz")
 REJECT_CASE_ID = "MN-BACKUP-BAD"
 REJECT_CASE_TIMEOUT_SECONDS = 1800
 REJECT_COMMAND_TIMEOUT_SECONDS = 300
-# Each variant breaks exactly one promise of the format, so the case can name
-# the promise that was broken rather than "some error happened".
+# The database the archive carries, and the line the product's own preflight
+# prints when the copy it staged is not the database it claims to be.
+REJECT_DATABASE_MEMBER = "files/opt/gowave/gowave.db"
+REJECT_DATABASE_PATH = "opt/gowave/gowave.db"
+REJECT_INTEGRITY_PREFIX = "Pre-restore check failed: staged database integrity check returned:"
+# Each variant breaks exactly one promise the format makes, so the case can name
+# the promise that was broken rather than "some error happened". The last one
+# breaks a promise about the content rather than the container: the archive is
+# well formed and its manifest names the digest of what it carries, so the only
+# gate left is the database the restore would apply.
 REJECT_VARIANTS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("truncated", ("not a readable Format v1 tar.gz", "could not be read back")),
     ("garbage", ("not a readable Format v1 tar.gz",)),
@@ -316,6 +324,7 @@ REJECT_VARIANTS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("incomplete", ("Missing archive member declared in meta.json: opt/gowave/.env",)),
     ("no-database", ("missing its required member: opt/gowave/gowave.db",)),
     ("wrong-type", ("Backup type mismatch",)),
+    ("sqlite", (REJECT_INTEGRITY_PREFIX,)),
 )
 CLUSTER_TIMEOUT_SECONDS = 300
 WORKER_STATE_TIMEOUT_SECONDS = 300
@@ -392,6 +401,17 @@ LOCAL_NODE_NAME = "local-node"
 NODE_ADD_TIMEOUT_SECONDS = topology.NODE_ADD_TIMEOUT_SECONDS
 NODE_HEALTH_TIMEOUT_SECONDS = 600
 NODE_HEALTH_INTERVAL_SECONDS = 5
+
+# A duplicate registration is refused from `state.json` before the Panel client is
+# constructed, so the case is one more `node add` against a pair that is already
+# committed: the bound covers the operator's command reaching its own first check,
+# not a Worker install.
+DUPLICATE_ADD_CASE_ID = "MN-DUP-ADD"
+DUPLICATE_ADD_TIMEOUT_SECONDS = 300
+# Two file reads and two Panel reads surround the refused command, each bounded
+# by the probe's own timeout rather than by the deployment's.
+DUPLICATE_ADD_CASE_TIMEOUT_SECONDS = 900
+DUPLICATE_ADD_REFUSAL = "Worker name is already registered in state.json"
 
 NODE_PORT = 3002
 
@@ -2227,6 +2247,187 @@ def case_argv_observer(product: MultiNodeProduct) -> Dict[str, Any]:
         "argv_observer_errors": verdict.get("errors", []),
     }
     return evidence
+
+
+DUPLICATE_ADD_STATE_SCRIPT = r"""
+import hashlib, json, sys
+
+state_path, journal_path = sys.argv[1:]
+
+
+def digest(path):
+    try:
+        with open(path, "rb") as stream:
+            return hashlib.sha256(stream.read()).hexdigest()
+    except OSError as error:
+        return "unreadable: " + type(error).__name__
+
+
+def read(path):
+    try:
+        with open(path, encoding="utf-8") as stream:
+            return json.load(stream)
+    except (OSError, ValueError) as error:
+        return {"unreadable": type(error).__name__}
+
+
+state = read(state_path)
+journal = read(journal_path)
+print(json.dumps({
+    "state_digest": digest(state_path),
+    "journal_digest": digest(journal_path),
+    "journal_state": journal.get("state"),
+    "journal_node_name": journal.get("node_name"),
+    "state_nodes": sorted(
+        str(node.get("name") or "") for node in (state.get("nodes") or [])
+        if isinstance(node, dict)
+    ),
+    "state_addresses": sorted(
+        str(node.get("address") or "") for node in (state.get("nodes") or [])
+        if isinstance(node, dict)
+    ),
+}, sort_keys=True))
+"""
+
+
+def duplicate_add_state_command() -> str:
+    """The two files a registration owns, read as bytes and as their node list."""
+    arguments = " ".join(shlex.quote(path) for path in (NODE_ADD_STATE, NODE_ADD_JOURNAL))
+    return f"python3 - {arguments} <<'PY'\n{DUPLICATE_ADD_STATE_SCRIPT}\nPY"
+
+
+def panel_inventory(surface: Dict[str, Any]) -> Dict[str, Any]:
+    """The Panel's inventory as a duplicate registration would extend it.
+
+    A second record would add a node, a profile, the hosts that publish its
+    inbounds and possibly an inbound to the managed squad, so those are read by
+    count and by digest. The connection flag is left out on purpose: it belongs to
+    the running node, not to the inventory, and it can change between two reads of
+    a healthy pair.
+    """
+    nodes = surface.get("nodes") or {}
+    profiles = surface.get("profiles") or {}
+    squads = surface.get("squads") or {}
+    hosts = surface.get("hosts") or {}
+    tokens = surface.get("tokens") or {}
+    return {
+        "node_count": nodes.get("count"),
+        "node_names": nodes.get("names"),
+        "node_endpoints": nodes.get("endpoints"),
+        "node_inbound_count": nodes.get("inbound_count"),
+        "node_inbound_digest": nodes.get("inbound_digest"),
+        "profile_count": profiles.get("count"),
+        "profile_inbound_digest": profiles.get("inbound_digest"),
+        "squad_count": squads.get("count"),
+        "squad_inbound_digest": squads.get("mvp_inbound_digest"),
+        "host_count": hosts.get("count"),
+        "host_inbound_digest": hosts.get("inbound_digest"),
+        "host_fingerprints": hosts.get("fingerprints"),
+        "token_count": tokens.get("count"),
+    }
+
+
+def case_duplicate_add(product: MultiNodeProduct) -> Dict[str, Any]:
+    """NEG-14: a second registration of the Worker is refused before any mutation.
+
+    The order is the assertion. The product reads ``state.json`` and refuses the
+    name before it constructs ``GoWaveClient``, so nothing a registration would
+    rewrite can have moved: the journal the first registration committed, the
+    state file that names the Worker, and the Panel inventory that record extends
+    are all read before and after the attempt, and a refusal that had reached the
+    client would show up in at least one of them.
+
+    The command is the operator's own verb with the operator's own arguments --
+    the same script the registration ran -- rather than a harness copy of the
+    check, so the case cannot pass on a rule the product does not ship.
+    """
+    case_id = DUPLICATE_ADD_CASE_ID
+    host = product.require_worker()
+    master = host.target_name
+    before = aio.probe_json(
+        case_id, "the Master's registration record",
+        product.podman.exec_bash(master, duplicate_add_state_command(), check=False, timeout=120),
+    )
+    require(
+        case_id,
+        before.get("journal_state") == "NODE_ADD_COMMITTED",
+        f"the recovery journal is {before.get('journal_state')!r} rather than "
+        "NODE_ADD_COMMITTED, so this pair has no completed registration for a "
+        "duplicate to be refused against",
+    )
+    require(
+        case_id,
+        before.get("journal_node_name") == topology.WORKER_NODE_NAME,
+        f"the committed journal names {before.get('journal_node_name')!r} instead of "
+        f"the Worker {topology.WORKER_NODE_NAME!r}",
+    )
+    require(
+        case_id,
+        topology.WORKER_NODE_NAME in (before.get("state_nodes") or []),
+        f"state.json names {before.get('state_nodes')}, and none of them is "
+        f"{topology.WORKER_NODE_NAME!r}, so the duplicate would be refused for the "
+        "wrong reason",
+    )
+    before_inventory = panel_inventory(product.panel_surface(case_id).get("surface") or {})
+
+    # The duplicate is not `host.node_add()`: that helper resets the Master-side
+    # argv trace the observer case scans, and this attempt must not touch it.
+    attempt = product.podman.exec_bash(
+        master, host.node_add_script(), check=False, timeout=DUPLICATE_ADD_TIMEOUT_SECONDS,
+    )
+    output = (attempt.stdout or "") + (attempt.stderr or "")
+    require(
+        case_id,
+        attempt.returncode != 0,
+        f"the second registration of {topology.WORKER_NODE_NAME!r} exited 0, so the "
+        f"duplicate was accepted: {output.strip()[-600:]}",
+    )
+    require(
+        case_id,
+        DUPLICATE_ADD_REFUSAL in output,
+        f"the second registration was refused without naming the existing record "
+        f"({DUPLICATE_ADD_REFUSAL!r}): {output.strip()[-600:]}",
+    )
+    require(
+        case_id,
+        "Traceback" not in output,
+        f"the second registration crashed instead of being refused: {output.strip()[-600:]}",
+    )
+
+    after = aio.probe_json(
+        case_id, "the Master's registration record after the duplicate",
+        product.podman.exec_bash(master, duplicate_add_state_command(), check=False, timeout=120),
+    )
+    require(
+        case_id,
+        after.get("state_digest") == before.get("state_digest"),
+        "the refused duplicate rewrote state.json: it was "
+        f"{before.get('state_nodes')} and is now {after.get('state_nodes')}",
+    )
+    require(
+        case_id,
+        after.get("journal_digest") == before.get("journal_digest"),
+        f"the refused duplicate rewrote the recovery journal, which was "
+        f"{before.get('journal_state')!r} and is now {after.get('journal_state')!r}",
+    )
+    after_inventory = panel_inventory(product.panel_surface(case_id).get("surface") or {})
+    require(
+        case_id,
+        after_inventory == before_inventory,
+        f"the refused duplicate changed the Panel inventory: it was {before_inventory} "
+        f"and is now {after_inventory}",
+    )
+    return {
+        "refusal": DUPLICATE_ADD_REFUSAL,
+        "returncode": attempt.returncode,
+        "journal_state": after.get("journal_state"),
+        "state_nodes": after.get("state_nodes"),
+        "state_addresses": after.get("state_addresses"),
+        "inventory": after_inventory,
+        "state_unchanged": True,
+        "journal_unchanged": True,
+        "inventory_unchanged": True,
+    }
 
 
 def case_master_address(product: MultiNodeProduct) -> Dict[str, Any]:
@@ -6496,12 +6697,16 @@ def rewrite_archive(
     drop: Sequence[str] = (),
     replace: Optional[Dict[str, bytes]] = None,
     manifest_drop: Sequence[str] = (),
+    rehash: Sequence[str] = (),
 ) -> Path:
     """Copy a real archive while breaking exactly one thing about it.
 
     Members keep their type, mode and link target, so the only difference the
     validator can see is the one the case asked for: a removed member, a rewritten
     payload under an unchanged checksum, or a manifest that no longer declares it.
+    ``rehash`` is the other direction — the payload is rewritten and the manifest
+    is made to agree with it, which leaves the corruption for whatever reads the
+    content instead of the container.
     """
     replaced = dict(replace or {})
     dropped = set(drop)
@@ -6522,6 +6727,14 @@ def rewrite_archive(
             entry for entry in manifest.get("files") or []
             if entry.get("path") not in set(manifest_drop)
         ]
+    for entry in manifest.get("files") or []:
+        path = entry.get("path")
+        if path not in set(rehash):
+            continue
+        payload = replaced.get(f"files/{path}")
+        if payload is None:
+            raise AssertionError(f"{path} is asked to be rehashed without being replaced")
+        entry["sha256"] = hashlib.sha256(payload).hexdigest()
     with tarfile.open(target, "w:gz") as dst:
         for member in members:
             clean = member.name[2:] if member.name.startswith("./") else member.name
@@ -6579,6 +6792,25 @@ def rejected_archives(
     wrong_type.write_bytes(node_source.read_bytes())
     wrong_type.chmod(0o600)
     created["wrong-type"] = wrong_type
+
+    # NEG-12's corruption is the one the manifest cannot catch: the archive is
+    # well formed, the member is still a SQLite file with its header intact, and
+    # the manifest names the digest of exactly these bytes. Half a database keeps
+    # the format readable and fails `PRAGMA integrity_check` with
+    # `database disk image is malformed`, so the refusal has to come from the
+    # product's own check of the copy it staged.
+    with tarfile.open(panel_source, "r:gz") as panel_tar:
+        member = panel_tar.extractfile(REJECT_DATABASE_MEMBER)
+        if member is None:
+            raise AssertionError(
+                f"{panel_source} carries no regular {REJECT_DATABASE_MEMBER} to corrupt"
+            )
+        database = member.read()
+    created["sqlite"] = rewrite_archive(
+        panel_source, store / "rejected-sqlite.tar.gz",
+        replace={REJECT_DATABASE_MEMBER: database[: max(1, len(database) // 2)]},
+        rehash=(REJECT_DATABASE_PATH,),
+    )
     return created
 
 
@@ -6588,10 +6820,11 @@ def case_backup_rejected(product: MultiNodeProduct) -> Dict[str, Any]:
     A restore of a corrupt archive must not be a partial restore. Each variant below
     breaks exactly one promise the format makes — the stream reads, the manifest
     names every member, the manifest's checksums hold, the mandatory member is
-    there, the archive is the type it is applied as — and each attempt has to be
-    refused with a message naming that promise while the Master's service, its
-    NGINX, its database, its environment and the recovery snapshot count stay
-    exactly as they were.
+    there, the archive is the type it is applied as, and the database it carries is
+    the database the product can still open — and each attempt has to be refused
+    with a message naming that promise while the Master's service, its NGINX, its
+    database, its environment and the recovery snapshot count stay exactly as they
+    were.
     """
     case_id = REJECT_CASE_ID
     host = product.require_worker()
@@ -8242,6 +8475,12 @@ def cases(
         # proves the observer can see a sentinel whole, and removes the file.
         Case(ARGV_OBSERVER_CASE_ID, "multi-node", lambda context: case_argv_observer(product),
              timeout_seconds=argv_probe.FIXTURE_TIMEOUT_SECONDS + argv_probe.SCAN_TIMEOUT_SECONDS),
+        # The registration above is committed, so the same verb run again is the
+        # duplicate the product must refuse from `state.json` alone. It runs here,
+        # before the lock cases take the canonical path and before anything that
+        # rewrites the journal, so "unchanged" is read against a healthy pair.
+        Case(DUPLICATE_ADD_CASE_ID, "multi-node", lambda context: case_duplicate_add(product),
+             timeout_seconds=DUPLICATE_ADD_CASE_TIMEOUT_SECONDS),
         Case(MASTER_ADDRESS_CASE_ID, "multi-node", lambda context: case_master_address(product),
              timeout_seconds=300),
         # The pair-wide lock every mutating command on these two hosts competes
@@ -8428,6 +8667,13 @@ def cases(
         # configuration changes.
         Case(status.STATUS_CASE_ID, "multi-node", status.case_status_semantics,
              timeout_seconds=120),
+        # The Panel this contour installed is the same Panel the All-in-One
+        # contour asks, so the case is one body read from the Master: four
+        # credentials it did not issue are refused and its own still reads. It
+        # mutates nothing, so it runs beside the other reads of a healthy pair.
+        Case(aio.AUTH_NEGATIVE_CASE_ID, "multi-node",
+             lambda context: aio.case_panel_auth_negative(product.master),
+             timeout_seconds=300),
         # Beside it and before the lifecycle cases: the teardown policy a cluster
         # run ends in is decided by a configuration file and a hook, not by the
         # cluster, so the case reads it here rather than after the cases that

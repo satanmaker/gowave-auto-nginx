@@ -249,14 +249,14 @@ to a generator. The five representations are declared once, in
 `tests/cases/matrix.yaml`: `base64` at `/api/sub/{shortUuid}`, `xray-json` at
 `/v2ray-json`, `mihomo` at `/mihomo`, `clash` at `/clash` and `singbox` at
 `/singbox`. The probe carries the client family and User-Agent for each
-(`tools/podman_e2e/panel_surface.py:84`-`88`); `SUB-B64` is the case that checks
+(`tools/podman_e2e/panel_surface.py:88`-`92`); `SUB-B64` is the case that checks
 the base64 list an Xray-family client imports.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| subscription | `GET /api/sub/{shortUuid}` | `internal/server/server.go:522` | `tools/podman_e2e/panel_surface.py:84` `base64` |
+| subscription | `GET /api/sub/{shortUuid}` | `internal/server/server.go:522` | `tools/podman_e2e/panel_surface.py:88` `base64` |
 | subscription | `GET /api/sub/{shortUuid}/info` | `internal/server/server.go:523` | none — coverage gap |
-| subscription | `GET /api/sub/{shortUuid}/{clientType}` | `internal/server/server.go:524` | `tools/podman_e2e/panel_surface.py:85` `xray-json` |
+| subscription | `GET /api/sub/{shortUuid}/{clientType}` | `internal/server/server.go:524` | `tools/podman_e2e/panel_surface.py:89` `xray-json` |
 
 The path segment is not free-form: `handleOverrideClientType`
 (`internal/subscription/srr.go:165`) switches on `stash`, `singbox`, `mihomo`,
@@ -282,7 +282,7 @@ client that sends an empty one are different requests.
 
 That policy is why `SUB-SERVED` asks every representation a second time with
 `curl/8.5.0`, a header that names no client family
-(`tools/podman_e2e/panel_surface.py:79`). It has to be served, and with the same
+(`tools/podman_e2e/panel_surface.py:83`). It has to be served, and with the same
 bytes: a refusal would mean the Panel requires a format rather than a header,
 and different bytes would mean the header selects the representation and the
 family headers were carrying the assertion. Neither is true of the pinned Panel,
@@ -320,7 +320,7 @@ stays `null`, so the client's Host header follows the dialled address.
 The manifest's `clients` block says which pinned binary imports which
 representation; this table says what the case that fetches it actually does with
 the body. The order is the order the probe fetches them in
-(`tools/podman_e2e/panel_surface.py:84`-`88`), and
+(`tools/podman_e2e/panel_surface.py:88`-`92`), and
 `TestSubscriptionFamilyInventory` reads every cell back against
 `tests/cases/matrix.yaml`, that tuple and `tests/cases/catalog.yaml`, so a
 representation added to the manifest without a row — or a row naming an engine
@@ -804,16 +804,16 @@ image.
 
 `tests/cases/catalog.yaml` defines each scenario once and stamps it with an
 `environment`, so the boundary between the contours is a checked field rather
-than a sentence in a document. The catalog holds 227 entries:
+than a sentence in a document. The catalog holds 229 entries:
 
 | Environment | Entries | Which contour answers it |
 | --- | ---: | --- |
-| `container` | 213 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
+| `container` | 215 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
 | `partial` | 12 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
 | `live-only` | 2 | Only the live suite. Every Podman run reports both as justified exclusions, and `tools/podman_e2e/catalog.py` refuses a catalog that lets one run here. |
 
 Of the 125 live scenarios projected into this catalog, 111 are container, 12 are
-partial and 2 are live-only; the other 102 entries are Podman-first cases with a
+partial and 2 are live-only; the other 104 entries are Podman-first cases with a
 promotion target, which `tests/cases/PARITY.md` lists separately.
 
 The fourteen entries that are not fully container-answerable are, by id:

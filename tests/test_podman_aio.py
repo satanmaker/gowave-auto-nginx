@@ -519,6 +519,33 @@ def probe_product(context, facts, returncode=0):
     return product, podman
 
 
+AUTH_NEGATIVE_VARIANTS = ("expired", "forged", "unsigned", "unknown-admin")
+
+
+def auth_negative_facts(overrides=None):
+    """`auth-negative` probe output for the happy path, with single facts replaceable."""
+    facts = {
+        "auth_negative": {
+            "claims_present": True,
+            "role": "ADMIN",
+            "signing_key_present": True,
+            "control_before": 200,
+            "control_after": 200,
+            "refusals": {
+                name: {"status": 401, "error": "Unauthorized"}
+                for name in AUTH_NEGATIVE_VARIANTS
+            },
+        }
+    }
+    for path, value in (overrides or {}).items():
+        target = facts
+        *parents, leaf = path.split(".")
+        for name in parents:
+            target = target[name]
+        target[leaf] = value
+    return json.dumps(facts)
+
+
 TLS_CA_DIGEST = "a" * 64
 TLS_CA_CHAIN_ERROR = (
     "Error: The port 443 listener did not prove TLS for panel.testbed.internal.\n"
@@ -2143,6 +2170,259 @@ class TestPanelSurfaceProbe(unittest.TestCase):
         self.assertEqual(facts["login"]["status"], 401)
         self.assertFalse(facts["login"]["token_present"])
         self.assertEqual(facts["surface"]["nodes"]["status"], 401)
+
+
+class TestPanelAuthNegativeCase(unittest.TestCase):
+    """AIO-AUTH-NEG: four credentials the Panel did not issue, and one it did."""
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def run_case(self, **overrides):
+        product, podman = probe_product(self.context, auth_negative_facts(overrides))
+        return aio.case_panel_auth_negative(product), podman
+
+    def reject(self, *expected, **overrides):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(**overrides)
+        for fragment in expected:
+            self.assertIn(fragment, str(caught.exception))
+
+    def test_every_variant_is_refused_and_the_issued_token_still_reads(self):
+        evidence, podman = self.run_case()
+        self.assertEqual(len(podman.scripts), 1)
+        self.assertIn("--scope auth-negative", podman.scripts[0])
+        self.assertEqual(evidence["control_before"], 200)
+        self.assertEqual(evidence["control_after"], 200)
+        self.assertTrue(evidence["signing_key_present"])
+        self.assertEqual(sorted(evidence["refusals"]), sorted(AUTH_NEGATIVE_VARIANTS))
+        for name, entry in evidence["refusals"].items():
+            self.assertEqual((entry["status"], entry["error"]), (401, "Unauthorized"), name)
+            self.assertEqual(entry["verdict"], "PASS", name)
+
+    def test_an_unreadable_issued_token_fails_before_anything_is_minted(self):
+        self.reject("carries no readable claims", **{"auth_negative.claims_present": False})
+
+    def test_a_non_administrator_token_cannot_be_copied_faithfully(self):
+        self.reject("instead of ADMIN", **{"auth_negative.role": "USER"})
+
+    def test_a_missing_or_short_signing_key_fails_the_expired_variant(self):
+        self.reject("32-character floor", **{"auth_negative.signing_key_present": False})
+
+    def test_a_control_that_fails_before_the_refusals_makes_them_prove_nothing(self):
+        self.reject("before the refusals", **{"auth_negative.control_before": 401})
+
+    def test_a_panel_that_stops_serving_the_issued_token_fails(self):
+        self.reject("stopped serving the credential it issued",
+                    **{"auth_negative.control_after": 500})
+
+    def test_a_variant_the_panel_serves_fails_the_case(self):
+        for name in AUTH_NEGATIVE_VARIANTS:
+            with self.subTest(variant=name):
+                self.reject(f"the {name} token read /api/nodes as 200 instead of being refused "
+                            "with 401", **{f"auth_negative.refusals.{name}.status": 200})
+
+    def test_a_variant_missing_from_the_probe_fails_the_case(self):
+        for name in AUTH_NEGATIVE_VARIANTS:
+            with self.subTest(variant=name):
+                self.reject(f"the {name} token read /api/nodes as None",
+                            **{f"auth_negative.refusals.{name}": {}})
+
+    def test_a_refusal_with_another_body_fails_the_case(self):
+        for name in AUTH_NEGATIVE_VARIANTS:
+            with self.subTest(variant=name):
+                self.reject("instead of the Panel's own Unauthorized body",
+                            **{f"auth_negative.refusals.{name}.error": "Forbidden"})
+
+    def test_a_probe_that_exits_nonzero_fails_the_case(self):
+        product, _ = probe_product(self.context, '{"auth_negative": {}}', returncode=1)
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_panel_auth_negative(product)
+        self.assertIn("the Panel probe exited 1", str(caught.exception))
+
+    def test_the_case_is_registered_beside_the_auth_case_and_before_any_traffic(self):
+        cases = {case.id: case for case in aio.cases(ScriptedPodman(self.context, []))}
+        self.assertIn(aio.AUTH_NEGATIVE_CASE_ID, cases)
+        self.assertEqual(cases[aio.AUTH_NEGATIVE_CASE_ID].topology, "aio")
+        self.assertEqual(cases[aio.AUTH_NEGATIVE_CASE_ID].timeout_seconds, 300)
+        ids = [case.id for case in aio.cases(ScriptedPodman(self.context, []))]
+        self.assertLess(ids.index("AIO-AUTH"), ids.index(aio.AUTH_NEGATIVE_CASE_ID))
+        self.assertLess(ids.index(aio.AUTH_NEGATIVE_CASE_ID), ids.index("AIO-CLIENT"))
+
+
+class TestPanelAuthNegativeProbe(unittest.TestCase):
+    """The probe against a stub gate shaped like the Panel's three clauses."""
+
+    SECRET = "4f1c" * 16
+    ADMIN_UUID = "0b8f6f3c-9a1e-4f57-8a1c-2d5f0d6a1c11"
+    PASSWORD = "pw-do-not-print"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        now = int(datetime.now(timezone.utc).timestamp())
+        self.token = panel_surface._hs256_token(
+            {"uuid": self.ADMIN_UUID, "username": "admin", "role": "ADMIN",
+             "iat": now, "exp": now + 900},
+            self.SECRET,
+        )
+        env = root / "gowave.env"
+        env.write_text(f"APP_SECRET='{self.SECRET}'\n", encoding="utf-8")
+        patcher = mock.patch.object(panel_surface, "PRODUCT_ENV_FILES", (str(env),))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.credentials = root / "credentials"
+        self.credentials.write_text(
+            f"ADMIN_USERNAME=admin\nADMIN_PASSWORD={self.PASSWORD}\n", encoding="utf-8"
+        )
+        self.credentials.chmod(0o600)
+        self.server = self._start_stub()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+
+    def _start_stub(self):
+        """A gate that refuses on the clause the probe's variant was built to break."""
+        decisions = []
+        admin_uuid, secret, password, token = (
+            self.ADMIN_UUID, self.SECRET, self.PASSWORD, self.token,
+        )
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _send(self, status, body):
+                raw = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                if self.path != "/api/auth/login":
+                    return self._send(404, {"message": "not found"})
+                if body.get("password") != password:
+                    decisions.append("login-refused")
+                    return self._send(401, {"error": "Unauthorized"})
+                decisions.append("login")
+                return self._send(200, {"response": {"accessToken": token,
+                                                     "tokenType": "Bearer"}})
+
+            def do_GET(self):
+                if self.path != "/api/nodes":
+                    return self._send(404, {"message": "not found"})
+                header = self.headers.get("Authorization") or ""
+                presented = header[len("Bearer "):] if header.startswith("Bearer ") else ""
+                clause = self._refusal(presented)
+                decisions.append(clause)
+                if clause:
+                    return self._send(401, {"error": "Unauthorized"})
+                return self._send(200, {"response": [{"uuid": "node-uuid", "isConnected": True}]})
+
+            def _refusal(self, presented):
+                parts = presented.split(".")
+                if len(parts) != 3 or not parts[2]:
+                    return "no-signature"
+                claims = panel_surface.token_claims(presented)
+                if not claims:
+                    return "claims"
+                if panel_surface._hs256_token(claims, secret) != presented:
+                    return "signature"
+                expiry = claims.get("exp")
+                now = int(datetime.now(timezone.utc).timestamp())
+                if not isinstance(expiry, (int, float)) or expiry <= now:
+                    return "expiry"
+                if str(claims.get("uuid") or "") != admin_uuid:
+                    return "record"
+                return ""
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.decisions = decisions
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server
+
+    def run_probe(self):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = panel_surface.main([
+                "--scope", "auth-negative",
+                "--panel-url", f"http://127.0.0.1:{self.server.server_address[1]}",
+                "--credentials", str(self.credentials),
+            ])
+        self.assertEqual(code, 0)
+        output = stdout.getvalue()
+        self.assertNotIn(self.PASSWORD, output)
+        self.assertNotIn(self.token, output)
+        self.assertNotIn(self.SECRET, output)
+        return json.loads(output)
+
+    def test_each_variant_dies_of_the_clause_it_was_built_to_break(self):
+        facts = self.run_probe()["auth_negative"]
+        self.assertEqual(self.server.decisions, [
+            "login", "", "expiry", "signature", "no-signature", "record", "",
+        ])
+        self.assertEqual(facts["refusals"]["expired"]["status"], 401)
+        self.assertEqual(facts["refusals"]["forged"]["status"], 401)
+        self.assertEqual(facts["refusals"]["unsigned"]["status"], 401)
+        self.assertEqual(facts["refusals"]["unknown-admin"]["status"], 401)
+        self.assertEqual(
+            [entry["error"] for entry in facts["refusals"].values()],
+            ["Unauthorized"] * len(AUTH_NEGATIVE_VARIANTS),
+        )
+
+    def test_the_issued_token_reads_before_and_after_the_refusals(self):
+        facts = self.run_probe()["auth_negative"]
+        self.assertTrue(facts["claims_present"])
+        self.assertEqual(facts["role"], "ADMIN")
+        self.assertTrue(facts["signing_key_present"])
+        self.assertEqual((facts["control_before"], facts["control_after"]), (200, 200))
+        self.assertEqual(self.server.decisions[0], "login")
+        self.assertEqual((self.server.decisions[1], self.server.decisions[-1]), ("", ""))
+
+    def test_an_absent_secret_is_reported_rather_than_used(self):
+        with mock.patch.object(panel_surface, "PRODUCT_ENV_FILES", ("/nonexistent.env",)):
+            facts = self.run_probe()["auth_negative"]
+        self.assertFalse(facts["signing_key_present"])
+        # Every signed variant now dies of its signature instead of the clause it
+        # was built to break, which is what the case's own `signing_key_present`
+        # require is there to refuse before the refusals are believed.
+        self.assertEqual(self.server.decisions.count("signature"), 3)
+        self.assertNotIn("expiry", self.server.decisions)
+        self.assertNotIn("record", self.server.decisions)
+
+
+class TestPanelEnvValue(unittest.TestCase):
+    """`APP_SECRET` is read from the product's own file, quotes and all."""
+
+    def read(self, text, name="APP_SECRET"):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / "gowave.env"
+            env.write_text(text, encoding="utf-8")
+            return panel_surface.env_value(name, str(env))
+
+    def test_a_double_quoted_value_is_unwrapped(self):
+        self.assertEqual(self.read('APP_SECRET="a-secret"\n'), "a-secret")
+
+    def test_a_single_quoted_value_with_padding_is_unwrapped(self):
+        self.assertEqual(self.read("  APP_SECRET = 'a-secret'  \n"), "a-secret")
+
+    def test_a_missing_key_or_file_is_empty_rather_than_an_error(self):
+        self.assertEqual(self.read("OTHER=1\n"), "")
+        self.assertEqual(panel_surface.env_value("APP_SECRET", "/nonexistent.env"), "")
+
+    def test_the_default_path_is_the_product_file_read_at_call_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / "gowave.env"
+            env.write_text("APP_SECRET=a-secret\n", encoding="utf-8")
+            with mock.patch.object(panel_surface, "PRODUCT_ENV_FILES", (str(env),)):
+                self.assertEqual(panel_surface.env_value("APP_SECRET"), "a-secret")
 
 
 PLAN = topology.NetworkPlan(subnet="203.0.114.0/24")

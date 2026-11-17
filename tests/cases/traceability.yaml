@@ -588,6 +588,28 @@ cases_by_requirement:
       host that grew a GoWave directory, started listening on a required port or
       lost a required tool while tolerating the fields no gate reads, and the
       runner re-collects that baseline before it copies the repository
+  - requirement: Live scenario parity
+    cases: [AIO-AUTH-NEG, MN-DUP-ADD]
+    reason: >-
+      both serve the same parity sentence for two rows of the live negative
+      matrix the delta spec writes no scenario about. AIO-AUTH-NEG is the
+      forged-credential row: four tokens copied from the one the documented
+      login issued each fail exactly one clause of the Panel's own gate — an
+      expired token signed with the Panel's real secret, a token signed with a
+      foreign key, an unsigned `alg: none` token, and a correctly signed token
+      naming an administrator record that does not exist — and every one is
+      answered 401 with the middleware's `Unauthorized` body while the issued
+      token still reads the same route before and after, so neither the refusal
+      nor the control can be a route that simply stopped answering.
+      MN-DUP-ADD is the duplicate-registration row: the operator's own
+      `node add`, run a second time for the Worker it already registered, exits
+      nonzero with the existing-name refusal before the Panel client is
+      constructed, and the state file's bytes, the committed journal's bytes and
+      the Panel inventory are what they were, which is what distinguishes a
+      refusal from a second record that was created and then cleaned up. The
+      third row of that group, a corrupted database inside an otherwise valid
+      archive, is a variant of `MN-BACKUP-BAD` and is traced through the backup
+      scenario rather than as a case of its own
 
 # What the published report has to cover, one declaration at a time. A plain
 # path is met by any behaviour that quotes it; `every_value` makes every element
