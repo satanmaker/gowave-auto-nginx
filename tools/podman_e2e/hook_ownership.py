@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -34,6 +35,7 @@ from unittest import mock
 from tools.live_vps import teardown
 
 CASE_ID = "HOOK-02"
+HOOK_01 = "HOOK-01"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 NGINX_MODULE = REPO_ROOT / "modules" / "nginx.sh"
@@ -244,6 +246,221 @@ def case_hook_is_removed_only_while_the_journal_owns_it(
             refused.append("the unimplemented ownership comparison is not named")
         if refused:
             raise AssertionError("HOOK-02: " + "; ".join(refused))
+        return evidence
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _kind(path: Path) -> str:
+    """What is actually at the path, without following a symlink to ask."""
+    if path.is_symlink():
+        return "symlink"
+    if path.is_dir():
+        return "directory"
+    if path.exists():
+        mode = path.stat().st_mode
+        if stat.S_ISFIFO(mode):
+            return "fifo"
+        if stat.S_ISREG(mode):
+            return "file"
+    return "absent"
+
+
+def _manifest(recovery: Path, transaction_id: str, hook: Path, digest: str,
+              recorded_path: str = "") -> None:
+    """The manifest a transaction of ours would have left behind."""
+    directory = recovery / transaction_id
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "deploy-hook-manifest.json").write_text(json.dumps({
+        "transaction_id": transaction_id,
+        "path": recorded_path or str(hook),
+        "created_by_tx": True,
+        "sha256": digest,
+    }), encoding="utf-8")
+
+
+def case_preexisting_hook_is_never_adopted(
+    context: Any, run: Any
+) -> Dict[str, Any]:
+    """A hook already at the managed path is refused whatever shape it takes.
+
+    The manifest says a transaction created a hook at this path. It cannot say
+    that what now sits there is that hook, so every shape but the recorded file
+    itself is refused, and each shape is read back to prove the refusal wrote
+    nothing and removed nothing.
+    """
+    workdir = Path(tempfile.mkdtemp(prefix="gowave-hook-01-"))
+    try:
+        root = workdir / "renewal-hooks" / "deploy"
+        root.mkdir(parents=True)
+        recovery = workdir / "recovery"
+        payload = workdir / "payload.sh"
+        payload.write_text("#!/bin/sh\necho gowave\n", encoding="utf-8")
+        payload_digest = _sha256(payload)
+
+        # A symlink to bytes the manifest does record: the bytes match, the
+        # object is not the file the transaction wrote.
+        recorded = root / "recorded.sh"
+        recorded.write_bytes(payload.read_bytes())
+        linked = root / "linked.sh"
+        linked.symlink_to(recorded)
+        _manifest(recovery, "tx-linked", linked, payload_digest)
+        linked_target = os.readlink(linked)
+        linked_check = _call(
+            "verify_deploy_hook_preflight", str(linked), "tx-linked", str(recovery))
+        linked_intact = (
+            linked.is_symlink()
+            and os.readlink(linked) == linked_target
+            and _sha256(recorded) == payload_digest
+        )
+
+        # A symlink to a provider's own file, with no manifest at all.
+        provider = workdir / "provider.sh"
+        provider.write_text("#!/bin/sh\necho provider-owned\n", encoding="utf-8")
+        provider_digest = _sha256(provider)
+        foreign_link = root / "foreign-link.sh"
+        foreign_link.symlink_to(provider)
+        foreign_check = _call(
+            "verify_deploy_hook_preflight", str(foreign_link), "", str(recovery))
+        foreign_intact = (
+            foreign_link.is_symlink() and _sha256(provider) == provider_digest)
+
+        # A directory where the hook belongs, with a manifest naming it.
+        directory_hook = root / "directory.sh"
+        directory_hook.mkdir()
+        _manifest(recovery, "tx-directory", directory_hook, payload_digest)
+        directory_check = _call(
+            "verify_deploy_hook_preflight", str(directory_hook), "tx-directory", str(recovery))
+        directory_intact = directory_hook.is_dir()
+
+        # A FIFO where the hook belongs: nothing may even try to hash it.
+        fifo_hook = root / "fifo.sh"
+        os.mkfifo(fifo_hook)
+        fifo_check = _call(
+            "verify_deploy_hook_preflight", str(fifo_hook), "", str(recovery))
+        fifo_intact = _kind(fifo_hook) == "fifo"
+
+        # A regular file edited after the manifest recorded other bytes.
+        edited = root / "edited.sh"
+        edited.write_text("#!/bin/sh\necho edited-after-record\n", encoding="utf-8")
+        edited_digest = _sha256(edited)
+        _manifest(recovery, "tx-edited", edited, payload_digest)
+        edited_check = _call(
+            "verify_deploy_hook_preflight", str(edited), "tx-edited", str(recovery))
+        edited_intact = _sha256(edited) == edited_digest
+
+        # A manifest that records the bytes but names another path.
+        elsewhere = root / "elsewhere.sh"
+        elsewhere.write_bytes(payload.read_bytes())
+        _manifest(recovery, "tx-elsewhere", elsewhere, payload_digest,
+                  recorded_path=str(root / "some-other.sh"))
+        elsewhere_check = _call(
+            "verify_deploy_hook_preflight", str(elsewhere), "tx-elsewhere", str(recovery))
+
+        # A manifest that cannot be read at all. The verification fails, and a
+        # failed verification is a refusal rather than an adoption.
+        unreadable = root / "unreadable.sh"
+        unreadable.write_bytes(payload.read_bytes())
+        unreadable_manifest = recovery / "tx-unreadable" / "deploy-hook-manifest.json"
+        unreadable_manifest.parent.mkdir(parents=True, exist_ok=True)
+        unreadable_manifest.write_text("{not json", encoding="utf-8")
+        unreadable_check = _call(
+            "verify_deploy_hook_preflight", str(unreadable), "tx-unreadable", str(recovery))
+
+        # The positive control: the file the manifest names and recorded.
+        adopted = root / "adopted.sh"
+        adopted.write_bytes(payload.read_bytes())
+        _manifest(recovery, "tx-adopted", adopted, _sha256(adopted))
+        adopted_check = _call(
+            "verify_deploy_hook_preflight", str(adopted), "tx-adopted", str(recovery))
+
+        # A provider's own regular file with no transaction: refused, unchanged
+        # in bytes, mode and ownership, and no manifest published by refusing.
+        unmanaged = root / "unmanaged.sh"
+        unmanaged.write_text("#!/bin/sh\necho unmanaged\n", encoding="utf-8")
+        os.chmod(unmanaged, 0o640)
+        unmanaged_digest = _sha256(unmanaged)
+        before = unmanaged.stat()
+        manifests_before = len(list(recovery.rglob("deploy-hook-manifest.json")))
+        unmanaged_check = _call(
+            "verify_deploy_hook_preflight", str(unmanaged), "", str(recovery))
+        after = unmanaged.stat()
+        manifests_after = len(list(recovery.rglob("deploy-hook-manifest.json")))
+        unmanaged_intact = (
+            _sha256(unmanaged) == unmanaged_digest
+            and stat.S_IMODE(after.st_mode) == stat.S_IMODE(before.st_mode) == 0o640
+            and (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
+        )
+
+        # The hook's own directory being a symlink is refused before any write.
+        real_directory = workdir / "real-hook-directory"
+        real_directory.mkdir()
+        linked_root = workdir / "linked-hook-directory"
+        linked_root.symlink_to(real_directory)
+        linked_dir_check = _call(
+            "verify_deploy_hook_preflight",
+            str(linked_root / "gowave-nginx.sh"), "", str(recovery))
+
+        evidence = {
+            "symlink_matching_refused": linked_check.returncode != 0,
+            "symlink_target_intact": linked_intact,
+            "symlink_foreign_refused": foreign_check.returncode != 0,
+            "symlink_foreign_target_intact": foreign_intact,
+            "directory_refused": directory_check.returncode != 0,
+            "directory_still_a_directory": directory_intact,
+            "fifo_refused": fifo_check.returncode != 0,
+            "fifo_still_a_fifo": fifo_intact,
+            "edited_file_refused": edited_check.returncode != 0,
+            "edited_file_bytes_intact": edited_intact,
+            "manifest_for_another_path_refused": elsewhere_check.returncode != 0,
+            "unreadable_manifest_refused": unreadable_check.returncode != 0,
+            "recorded_file_adopted": adopted_check.returncode == 0,
+            "unmanaged_file_refused": unmanaged_check.returncode != 0,
+            "unmanaged_file_intact": unmanaged_intact,
+            "refusal_names_the_unmanaged_resource":
+                "overwrite unmanaged host resource" in unmanaged_check.stderr,
+            "hook_directory_symlink_refused": linked_dir_check.returncode != 0,
+            "no_manifest_published_on_refusal": manifests_before == manifests_after,
+        }
+        refused: List[str] = []
+        if not evidence["symlink_matching_refused"]:
+            refused.append("a symlink to the recorded bytes was adopted as the hook")
+        if not evidence["symlink_target_intact"]:
+            refused.append("the refusal changed the symlink or the file it points at")
+        if not evidence["symlink_foreign_refused"]:
+            refused.append("a symlink to a provider's file was adopted as the hook")
+        if not evidence["symlink_foreign_target_intact"]:
+            refused.append("the provider's file did not survive the refusal")
+        if not evidence["directory_refused"]:
+            refused.append("a directory at the hook path was adopted")
+        if not evidence["directory_still_a_directory"]:
+            refused.append("the directory at the hook path did not survive")
+        if not evidence["fifo_refused"]:
+            refused.append("a FIFO at the hook path was adopted")
+        if not evidence["fifo_still_a_fifo"]:
+            refused.append("the FIFO at the hook path did not survive")
+        if not evidence["edited_file_refused"]:
+            refused.append("a file edited after the manifest was adopted")
+        if not evidence["edited_file_bytes_intact"]:
+            refused.append("the edited file was rewritten by the refusal")
+        if not evidence["manifest_for_another_path_refused"]:
+            refused.append("a manifest naming another path adopted this hook")
+        if not evidence["unreadable_manifest_refused"]:
+            refused.append("an unreadable manifest was read as ownership")
+        if not evidence["recorded_file_adopted"]:
+            refused.append("the file the manifest records was not recognised")
+        if not evidence["unmanaged_file_refused"]:
+            refused.append("an unmanaged hook was accepted")
+        if not evidence["unmanaged_file_intact"]:
+            refused.append("the unmanaged hook's bytes, mode or owner changed")
+        if not evidence["refusal_names_the_unmanaged_resource"]:
+            refused.append("the refusal does not name the unmanaged resource")
+        if not evidence["hook_directory_symlink_refused"]:
+            refused.append("a symlinked hook directory was accepted")
+        if not evidence["no_manifest_published_on_refusal"]:
+            refused.append("a refusal published a manifest")
+        if refused:
+            raise AssertionError("HOOK-01: " + "; ".join(refused))
         return evidence
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

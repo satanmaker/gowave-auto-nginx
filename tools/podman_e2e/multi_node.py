@@ -8785,6 +8785,12 @@ def cases(
              lambda context: hook_ownership.case_hook_is_removed_only_while_the_journal_owns_it(
                  product, context),
              timeout_seconds=300),
+        # The shape of whatever already sits at the managed hook path, on either
+        # target: the preflight is one shell function, so both hosts read it.
+        Case(hook_ownership.HOOK_01, "multi-node",
+             lambda context: hook_ownership.case_preexisting_hook_is_never_adopted(
+                 product, context),
+             timeout_seconds=300),
         # The same journal and the same boot recovery as the All-in-One: the
         # recovery is per host, so both contours read one implementation.
         Case(transaction_recovery.CASE_ID, "multi-node",

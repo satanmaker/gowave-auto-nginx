@@ -699,6 +699,27 @@ cases_by_requirement:
       is taken before the journal is read and before it is validated, which is
       what makes the next mutation wait for the recovery.
   - requirement: Live scenario parity
+    cases: [HOOK-01]
+    reason: >-
+      HOOK-01 is the shape half of the same sentence: a manifest records that a
+      transaction created a hook at the managed path, not that what now sits
+      there is that hook. `verify_deploy_hook_preflight` from `modules/nginx.sh`
+      is sourced in a temporary tree and asked about eight shapes at that path --
+      a symlink whose target holds the recorded bytes, a symlink to a provider's
+      own file, a directory, a FIFO, a file edited after its manifest, a file
+      the manifest names under a different path, a manifest that cannot be
+      parsed at all, and a hook directory that is itself a symlink -- and each
+      one is refused, with the symlink still pointing where it did, the
+      target's bytes unchanged, the directory still a directory and the FIFO
+      still a FIFO afterwards. The unmanaged regular file is the clause read in
+      full: it is refused with the sentence that names the unmanaged host
+      resource, and its bytes, its 0640 mode and its owner are unchanged while
+      the count of manifests under the recovery root is the same before and
+      after. The positive control is the file the manifest names and whose
+      digest it records, which is adopted, so the refusals are not a
+      preflight that refuses everything. No host is touched and no install runs;
+      the case reads the exit status and what the preflight left on disk.
+  - requirement: Live scenario parity
     cases: [REV-01, REV-02]
     reason: >-
       the two are the revocation sentence of the credential requirement, decided

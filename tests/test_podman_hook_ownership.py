@@ -5,6 +5,13 @@
 ``tools/live_vps/teardown.py``, so the case drives them in a temporary tree and
 reads back the manifest, the ownership record and the digests they wrote.
 
+``HOOK-01`` drives the same preflight over what is already at the managed path —
+a symlink whose bytes match the manifest, a symlink to a provider's file, a
+directory, a FIFO, a file edited after its manifest, a file the manifest names
+under another path, and a manifest that cannot be read at all — because a
+manifest records that a transaction created a hook, not that what now sits there
+is that hook.
+
 Each clause is damaged on its own — a preflight that accepts an unowned hook, a
 manifest that does not record the transaction as the creator, a rollback that
 ignores the digest, a rollback that leaves the ownership record behind, a
@@ -26,7 +33,10 @@ from tools.podman_e2e import catalog, hook_ownership  # noqa: E402
 
 TOPOLOGIES = ("aio", "multi-node")
 
-CASES = {hook_ownership.CASE_ID: hook_ownership.case_hook_is_removed_only_while_the_journal_owns_it}
+CASES = {
+    hook_ownership.CASE_ID: hook_ownership.case_hook_is_removed_only_while_the_journal_owns_it,
+    hook_ownership.HOOK_01: hook_ownership.case_preexisting_hook_is_never_adopted,
+}
 
 #: What each damage is meant to make the case say, so a probe that went red on an
 #: unrelated assertion is not read as a held clause.
@@ -38,6 +48,15 @@ EXPECTED_REFUSALS = {
     "preserve-adds-a-baseline-field": "rather than the message, policy and status it owns",
     "preserve-claims-a-restored-baseline": "PRESERVE claimed a baseline it never compared",
     "snapshot-claims-pass": "instead of INCOMPLETE",
+}
+
+EXPECTED_HOOK01_REFUSALS = {
+    "manifest-adopts-a-symlink": "a symlink to the recorded bytes was adopted as the hook",
+    "manifest-adopts-any-bytes": "a file edited after the manifest was adopted",
+    "manifest-adopts-another-path": "a manifest naming another path adopted this hook",
+    "manifest-failure-means-adopted": "an unreadable manifest was read as ownership",
+    "preflight-accepts-any-existing-path": "an unmanaged hook was accepted",
+    "preflight-accepts-a-symlinked-directory": "a symlinked hook directory was accepted",
 }
 
 _REAL_MODULE = hook_ownership.NGINX_MODULE
@@ -98,7 +117,76 @@ def _teardown_that(workdir, **overrides):
     return patched
 
 
-def _damages(workdir):
+def _hook_shape_damages(workdir):
+    """One clause of the shape preflight edited per probe."""
+    return {
+        "manifest-adopts-a-symlink": [
+            mock.patch.object(
+                hook_ownership, "NGINX_MODULE",
+                _rewritten(
+                    workdir,
+                    'if [[ -f "$manifest" && ! -L "$manifest" && -f "$hook_file" '
+                    '&& ! -L "$hook_file" ]]; then',
+                    'if [[ -f "$manifest" && ! -L "$manifest" && -f "$hook_file" ]]; then',
+                    1,
+                )),
+        ],
+        "manifest-adopts-any-bytes": [
+            mock.patch.object(
+                hook_ownership, "NGINX_MODULE",
+                _rewritten(
+                    workdir,
+                    'd.get("sha256")==s else "0"',
+                    'True else "0"',
+                    1,
+                )),
+        ],
+        "manifest-adopts-another-path": [
+            mock.patch.object(
+                hook_ownership, "NGINX_MODULE",
+                _rewritten(
+                    workdir,
+                    'd.get("path")==h and d.get("sha256")==s',
+                    'd.get("sha256")==s',
+                    1,
+                )),
+        ],
+        "manifest-failure-means-adopted": [
+            mock.patch.object(
+                hook_ownership, "NGINX_MODULE",
+                _rewritten(
+                    workdir,
+                    '2>/dev/null || echo "0")',
+                    '2>/dev/null || echo "1")',
+                    1,
+                )),
+        ],
+        "preflight-accepts-any-existing-path": [
+            mock.patch.object(
+                hook_ownership, "NGINX_MODULE",
+                _rewritten(
+                    workdir,
+                    'if [[ -e "$hook_file" ]] || [[ -L "$hook_file" ]]; then',
+                    "if false; then",
+                    1,
+                )),
+        ],
+        "preflight-accepts-a-symlinked-directory": [
+            mock.patch.object(
+                hook_ownership, "NGINX_MODULE",
+                _rewritten(
+                    workdir,
+                    'if [[ -e "$hook_dir" && -L "$hook_dir" ]]; then',
+                    "if false; then",
+                    1,
+                )),
+        ],
+    }
+
+
+def _damages(workdir, case_id=hook_ownership.CASE_ID):
+    if case_id == hook_ownership.HOOK_01:
+        return _hook_shape_damages(workdir)
     return {
         "preflight-accepts-unowned": [
             mock.patch.object(hook_ownership, "NGINX_MODULE",
@@ -136,7 +224,7 @@ def _damages(workdir):
 
 def run_case(case_id, damage=None, workdir=None):
     """Run the case, optionally with one damaged behaviour; return (facts, refusal)."""
-    patchers = _damages(workdir)[damage] if damage else []
+    patchers = _damages(workdir, case_id)[damage] if damage else []
     for patcher in patchers:
         patcher.start()
     try:
@@ -267,6 +355,80 @@ class TestHookOwnershipDamage(unittest.TestCase):
 
     def test_a_snapshot_verdict_of_pass_is_refused(self):
         self.assert_refused("snapshot-claims-pass")
+
+
+class TestHookShapeCase(unittest.TestCase):
+    """Every shape at the managed path is refused and left as it was found."""
+
+    def test_no_shape_but_the_recorded_file_is_adopted(self):
+        facts, refusal = run_case(hook_ownership.HOOK_01)
+        self.assertIsNone(refusal)
+        for clause in (
+            "symlink_matching_refused",
+            "symlink_foreign_refused",
+            "directory_refused",
+            "fifo_refused",
+            "edited_file_refused",
+            "manifest_for_another_path_refused",
+            "unreadable_manifest_refused",
+            "unmanaged_file_refused",
+            "hook_directory_symlink_refused",
+        ):
+            with self.subTest(clause=clause):
+                self.assertTrue(facts[clause], clause)
+        self.assertTrue(facts["recorded_file_adopted"])
+
+    def test_every_refused_shape_survives_with_its_bytes_and_metadata(self):
+        facts, refusal = run_case(hook_ownership.HOOK_01)
+        self.assertIsNone(refusal)
+        for clause in (
+            "symlink_target_intact",
+            "symlink_foreign_target_intact",
+            "directory_still_a_directory",
+            "fifo_still_a_fifo",
+            "edited_file_bytes_intact",
+            "unmanaged_file_intact",
+            "no_manifest_published_on_refusal",
+        ):
+            with self.subTest(clause=clause):
+                self.assertTrue(facts[clause], clause)
+
+    def test_the_refusal_names_the_unmanaged_resource(self):
+        facts, refusal = run_case(hook_ownership.HOOK_01)
+        self.assertIsNone(refusal)
+        self.assertTrue(facts["refusal_names_the_unmanaged_resource"])
+
+
+class TestHookShapeDamage(unittest.TestCase):
+    """Each shape clause is damaged on its own and the case refuses for that reason."""
+
+    def setUp(self):
+        self._directory = tempfile.TemporaryDirectory(prefix="gowave-hook-shape-")
+        self.addCleanup(self._directory.cleanup)
+        self.workdir = Path(self._directory.name)
+
+    def assert_refused(self, damage):
+        _, refusal = run_case(hook_ownership.HOOK_01, damage=damage, workdir=self.workdir)
+        self.assertIsNotNone(refusal, f"{damage} did not make HOOK-01 refuse")
+        self.assertIn(EXPECTED_HOOK01_REFUSALS[damage], refusal)
+
+    def test_a_manifest_that_adopts_a_symlink_is_refused(self):
+        self.assert_refused("manifest-adopts-a-symlink")
+
+    def test_a_manifest_that_adopts_any_bytes_is_refused(self):
+        self.assert_refused("manifest-adopts-any-bytes")
+
+    def test_a_manifest_that_adopts_another_path_is_refused(self):
+        self.assert_refused("manifest-adopts-another-path")
+
+    def test_a_verification_whose_failure_adopts_is_refused(self):
+        self.assert_refused("manifest-failure-means-adopted")
+
+    def test_a_preflight_that_accepts_any_existing_path_is_refused(self):
+        self.assert_refused("preflight-accepts-any-existing-path")
+
+    def test_a_preflight_that_accepts_a_symlinked_directory_is_refused(self):
+        self.assert_refused("preflight-accepts-a-symlinked-directory")
 
 
 if __name__ == "__main__":

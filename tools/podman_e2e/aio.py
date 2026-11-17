@@ -8900,6 +8900,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
              lambda context: hook_ownership.case_hook_is_removed_only_while_the_journal_owns_it(
                  product, context),
              timeout_seconds=300),
+        # What is already at the managed hook path, whatever shape it takes: the
+        # preflight is driven over a symlink, a directory, a FIFO and a file
+        # edited after its manifest, and each refusal is read back for what it
+        # left behind.
+        Case(hook_ownership.HOOK_01, "aio",
+             lambda context: hook_ownership.case_preexisting_hook_is_never_adopted(
+                 product, context),
+             timeout_seconds=300),
         # The journal an interrupted switch leaves behind, and the boot recovery
         # that reads it: both the writer and the shell recovery are the product's.
         Case(transaction_recovery.CASE_ID, "aio",

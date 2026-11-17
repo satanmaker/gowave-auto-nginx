@@ -646,9 +646,14 @@ verify_deploy_hook_preflight() {
     if [[ -e "$hook_file" ]] || [[ -L "$hook_file" ]]; then
         if [[ -n "$transaction_id" ]]; then
             local manifest="${recovery_root}/${transaction_id}/deploy-hook-manifest.json"
-            if [[ -f "$manifest" ]]; then
+            # The manifest records that a transaction created a hook at this path;
+            # it does not say that what now sits there is that hook. A symlink, a
+            # directory or a FIFO is never adopted on the strength of the manifest
+            # alone, and neither is a file whose bytes or path differ from the
+            # recorded ones.
+            if [[ -f "$manifest" && ! -L "$manifest" && -f "$hook_file" && ! -L "$hook_file" ]]; then
                 local owned
-                owned=$(python3 -c "import json; print('1' if json.load(open('$manifest')).get('created_by_tx') else '0')" 2>/dev/null || echo "0")
+                owned=$(python3 -c 'import hashlib,json,sys; m,h=sys.argv[1:3]; d=json.load(open(m,"r",encoding="utf-8")); s=hashlib.sha256(open(h,"rb").read()).hexdigest(); print("1" if d.get("created_by_tx") is True and d.get("path")==h and d.get("sha256")==s else "0")' "$manifest" "$hook_file" 2>/dev/null || echo "0")
                 if [[ "$owned" == "1" ]]; then
                     return 0
                 fi
