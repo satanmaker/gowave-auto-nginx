@@ -3716,8 +3716,60 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: hook_ownership:case_hook_is_removed_only_while_the_journal_owns_it
+      evidence:
+      - edited_hook_preserved
+      - install_exit
+      - manifest_created_by_tx
+      - manifest_digest_matches_the_hook
+      - manifest_names_the_hook
+      - manifests_before_any_install
+      - owned_hook_removed
+      - ownership_record_cleared
+      - ownership_record_present
+      - preserve_claims_restored_baseline
+      - preserve_fields
+      - preserve_message
+      - preserve_status
+      - refusal_names_the_unmanaged_resource
+      - repeat_install_exit
+      - rollback_of_edited_hook_refused
+      - snapshot_baseline_comparison
+      - snapshot_hook_status
+      - snapshot_ownership_comparison
+      - snapshot_pair_lock_reacquisition
+      - snapshot_status
+      - unowned_hook_refused
+      - unowned_hook_unchanged
+    multi-node:
+      driver: hook_ownership:case_hook_is_removed_only_while_the_journal_owns_it
+      evidence:
+      - edited_hook_preserved
+      - install_exit
+      - manifest_created_by_tx
+      - manifest_digest_matches_the_hook
+      - manifest_names_the_hook
+      - manifests_before_any_install
+      - owned_hook_removed
+      - ownership_record_cleared
+      - ownership_record_present
+      - preserve_claims_restored_baseline
+      - preserve_fields
+      - preserve_message
+      - preserve_status
+      - refusal_names_the_unmanaged_resource
+      - repeat_install_exit
+      - rollback_of_edited_hook_refused
+      - snapshot_baseline_comparison
+      - snapshot_hook_status
+      - snapshot_ownership_comparison
+      - snapshot_pair_lock_reacquisition
+      - snapshot_status
+      - unowned_hook_refused
+      - unowned_hook_unchanged
   promotion_target: null
 - id: HOOK-03
   requirement: Global Certbot Deploy Hook Ownership
@@ -3812,8 +3864,56 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: transaction_recovery:case_interrupted_mutation_leaves_a_validated_journal
+      evidence:
+      - absent_journal_exit
+      - invalid_journal_left_state
+      - invalid_journal_names_validation
+      - invalid_journal_refused
+      - journal_mode
+      - journal_names_the_snapshot
+      - journal_write_leaves_no_temp
+      - lock_precedes_validation
+      - mid_switch_journal_validated
+      - missing_snapshot_left_state
+      - missing_snapshot_names_the_risk
+      - missing_snapshot_refused
+      - outside_root_left_state
+      - outside_root_names_the_root
+      - outside_root_refused
+      - recovered_state
+      - recovery_exit
+      - recovery_names_the_state_it_found
+      - recovery_takes_the_mutation_lock
+      - rollback_delegate_called
+      - validation_refusal
+    multi-node:
+      driver: transaction_recovery:case_interrupted_mutation_leaves_a_validated_journal
+      evidence:
+      - absent_journal_exit
+      - invalid_journal_left_state
+      - invalid_journal_names_validation
+      - invalid_journal_refused
+      - journal_mode
+      - journal_names_the_snapshot
+      - journal_write_leaves_no_temp
+      - lock_precedes_validation
+      - mid_switch_journal_validated
+      - missing_snapshot_left_state
+      - missing_snapshot_names_the_risk
+      - missing_snapshot_refused
+      - outside_root_left_state
+      - outside_root_names_the_root
+      - outside_root_refused
+      - recovered_state
+      - recovery_exit
+      - recovery_names_the_state_it_found
+      - recovery_takes_the_mutation_lock
+      - rollback_delegate_called
+      - validation_refusal
   promotion_target: null
 - id: TXN-03
   requirement: Signal-Safe and Verifiable Transaction Compensation

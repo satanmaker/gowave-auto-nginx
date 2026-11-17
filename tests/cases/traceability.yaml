@@ -659,6 +659,46 @@ cases_by_requirement:
       reported with the timer named as the remaining bound — the timer still
       armed, the key never installed, the existing entry untouched
   - requirement: Live scenario parity
+    cases: [HOOK-02]
+    reason: >-
+      HOOK-02 is the deploy-hook sentence of the ownership requirement, and it
+      is driven rather than quoted: `modules/nginx.sh` is sourced in a temporary
+      tree so `verify_deploy_hook_preflight`, `install_managed_deploy_hook` and
+      `rollback_managed_deploy_hook` answer with the manifest, the ownership
+      record and the digest they actually write. A hook the installation did not
+      write is refused with the sentence that names the unmanaged resource, its
+      bytes and the recovery root are unchanged and no manifest exists
+      afterwards; the product's own hook is then installed with
+      `created_by_tx` true, the recorded path and the digest the file has, and a
+      repeated install recognises it instead of refusing; a hook edited after
+      installation is preserved with the rollback refusing, and an untouched one
+      is removed together with the ownership record that named it. The teardown
+      half is `tools/live_vps/teardown.py`: `PRESERVE` answers with exactly its
+      message, policy and status and claims no baseline it never compared, while
+      the snapshot path — driven with a real executable restore hook and two
+      matching captured baselines — reports `INCOMPLETE` with the pair-lock and
+      ownership comparisons named as not implemented rather than claiming PASS.
+  - requirement: Live scenario parity
+    cases: [TXN-02]
+    reason: >-
+      TXN-02 is the journal sentence of the transactional requirement, driven on
+      both halves of the product. The journal half is `modules/recovery.py`: a
+      mid-switch journal written by the product's own atomic writer is validated
+      by its validator, is left at mode 0600 with no temporary sibling behind and
+      still names the snapshot it took when read back, while a journal whose
+      state does not belong to its operation is refused by the validator. The
+      boot half is `recover_boot_files` from `modules/recovery.sh`, sourced in a
+      temporary tree with the mutation lock and the file rollback stubbed: a
+      recoverable journal is named by the state it reports, reaches the rollback
+      of the snapshot the journal names and is left in `ROLLED_BACK`; a snapshot
+      the journal names but the disk does not hold, a snapshot outside
+      `RECOVERY_DIR`, and a journal that fails validation are each refused with
+      the sentence that says what is refused, and each refusal leaves the journal
+      exactly as it found it; a host with no journal reports nothing to recover.
+      The ordering clause is read from the function's own body: the mutation lock
+      is taken before the journal is read and before it is validated, which is
+      what makes the next mutation wait for the recovery.
+  - requirement: Live scenario parity
     cases: [AIO-AUTH-NEG, MN-DUP-ADD, RED-01, RED-02, APIC-01]
     reason: >-
       all five serve the same parity sentence for rows of the live matrix the
