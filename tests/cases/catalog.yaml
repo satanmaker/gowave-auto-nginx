@@ -5468,8 +5468,44 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: revocation:case_revocation_succeeds
+      evidence:
+      - cleanup_message
+      - cleanup_reported_pass
+      - client_keyed_on_the_control_machine_file
+      - client_pinned_the_known_hosts_file
+      - key_material_left_the_control_machine
+      - key_recorded_absent
+      - marker_probed
+      - report_carries_key_material
+      - report_directory_mode
+      - report_mode
+      - report_records_the_cleanup
+      - revoke_script_named
+      - revoke_script_ran
+      - timer_probed
+      - timer_recorded_inactive
+    multi-node:
+      driver: revocation:case_revocation_succeeds
+      evidence:
+      - cleanup_message
+      - cleanup_reported_pass
+      - client_keyed_on_the_control_machine_file
+      - client_pinned_the_known_hosts_file
+      - key_material_left_the_control_machine
+      - key_recorded_absent
+      - marker_probed
+      - report_carries_key_material
+      - report_directory_mode
+      - report_mode
+      - report_records_the_cleanup
+      - revoke_script_named
+      - revoke_script_ran
+      - timer_probed
+      - timer_recorded_inactive
   promotion_target: null
 - id: REV-02
   requirement: Immediate credential revocation gates overall status
@@ -5491,8 +5527,56 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: revocation:case_revocation_cannot_be_verified
+      evidence:
+      - absent_script_recorded
+      - absent_script_reported_failure
+      - both_present_names_both
+      - both_present_reported_failure
+      - clean_host_key_recorded_absent
+      - clean_host_reported_pass
+      - failed_run_records_the_cleanup
+      - failed_target_status
+      - key_only_names_the_timer_fallback
+      - key_only_reported_failure
+      - overall_with_failed_cleanup
+      - overall_with_passed_cleanup
+      - revoke_all_overall
+      - revoke_all_reports_every_target
+      - revoke_all_walks_targets_in_reverse
+      - summary_names_the_stuck_host
+      - summary_without_a_failure_claims_removal
+      - timer_only_names_the_removed_key
+      - timer_only_reported_failure
+      - timer_still_armed_recorded
+      - unverifiable_connection_raised
+    multi-node:
+      driver: revocation:case_revocation_cannot_be_verified
+      evidence:
+      - absent_script_recorded
+      - absent_script_reported_failure
+      - both_present_names_both
+      - both_present_reported_failure
+      - clean_host_key_recorded_absent
+      - clean_host_reported_pass
+      - failed_run_records_the_cleanup
+      - failed_target_status
+      - key_only_names_the_timer_fallback
+      - key_only_reported_failure
+      - overall_with_failed_cleanup
+      - overall_with_passed_cleanup
+      - revoke_all_overall
+      - revoke_all_reports_every_target
+      - revoke_all_walks_targets_in_reverse
+      - summary_names_the_stuck_host
+      - summary_without_a_failure_claims_removal
+      - timer_only_names_the_removed_key
+      - timer_only_reported_failure
+      - timer_still_armed_recorded
+      - unverifiable_connection_raised
   promotion_target: null
 - id: LOCAL-01
   requirement: Local-only live VPS credential handling

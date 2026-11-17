@@ -34,6 +34,7 @@ from . import (
     operator_access,
     panel_surface,
     preflight_cases,
+    revocation,
     runstate_cases,
     skip_policy,
     status,
@@ -8904,6 +8905,15 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case(transaction_recovery.CASE_ID, "aio",
              lambda context: transaction_recovery.case_interrupted_mutation_leaves_a_validated_journal(
                  product, context),
+             timeout_seconds=300),
+        # The end of the same transaction: the temporary key is revoked on the
+        # target, and a revocation that cannot be verified turns the run
+        # INCOMPLETE. The transport is a seam, so no socket is opened.
+        Case(revocation.REV_01, "aio",
+             lambda context: revocation.case_revocation_succeeds(product, context),
+             timeout_seconds=300),
+        Case(revocation.REV_02, "aio",
+             lambda context: revocation.case_revocation_cannot_be_verified(product, context),
              timeout_seconds=300),
         # Last, because the deadline it proves is the one the whole run spent: the
         # case reads the elapsed wall clock and the enforced budget, then produces
