@@ -539,6 +539,9 @@ class TestNodeIntegration(unittest.TestCase):
                 declaration.write_text("# configured by the distribution\nIPV6=yes\n")
                 exports = (
                     "kernel_has_ipv6() { return %d; }\n"
+                    # The before-image is taken by a helper outside this slice; the
+                    # subject here is the IPv6 branch the function renders.
+                    "record_firewall_before_image() { return 0; }\n"
                     'export PANEL_IP="10.89.0.10"\nexport SSH_PORT=22\nexport NODE_PORT=3002\n'
                     % decision
                 )
@@ -711,7 +714,7 @@ class TestNodeIntegration(unittest.TestCase):
         remote_end = worker_script.index("\nROLLBACK_REMOTE_SCRIPT", remote_start)
         rollback_script = worker_script[remote_start:remote_end]
         acme_start = rollback_script.index("# 3. Clean ACME certificates")
-        acme_end = rollback_script.index("# 4. Remove UFW rules", acme_start)
+        acme_end = rollback_script.index("# 4. Restore the UFW before-image", acme_start)
         acme_cleanup = rollback_script[acme_start:acme_end]
         self.assertIn('restore_acme_lineage "$ACME_TX_ID" "$WORKER_DOMAIN"', acme_cleanup)
         self.assertIn("ACME_TX_ID missing; preserving unknown certificate lineage", acme_cleanup)

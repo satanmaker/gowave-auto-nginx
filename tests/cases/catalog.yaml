@@ -314,8 +314,54 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: firewall_image:case_panel_firewall_policy_is_preserved
+      evidence:
+      - capture_mutates_nothing
+      - existing_image_refused
+      - image_is_per_transaction
+      - image_keeps_ipv4_dump
+      - image_keeps_ipv6_dump
+      - image_keeps_rule_text
+      - image_keeps_ufw_config
+      - image_mode_is_private
+      - image_names_default_policies
+      - image_names_enabled_state
+      - inactive_baseline_captured
+      - missing_image_refused
+      - read_back_compares_the_rules
+      - restore_is_idempotent
+      - restore_returns_active_state
+      - restore_returns_default_policies
+      - restore_returns_foreign_rule
+      - restore_returns_inactive_state
+      - restore_returns_ufw_config
+      - unrestorable_baseline_refused
+    multi-node:
+      driver: firewall_image:case_worker_firewall_policy_is_preserved
+      evidence:
+      - capture_mutates_nothing
+      - existing_image_refused
+      - image_is_per_transaction
+      - image_keeps_ipv4_dump
+      - image_keeps_ipv6_dump
+      - image_keeps_rule_text
+      - image_keeps_ufw_config
+      - image_mode_is_private
+      - image_names_default_policies
+      - image_names_enabled_state
+      - inactive_baseline_captured
+      - missing_image_refused
+      - read_back_compares_the_rules
+      - restore_is_idempotent
+      - restore_returns_active_state
+      - restore_returns_default_policies
+      - restore_returns_foreign_rule
+      - restore_returns_inactive_state
+      - restore_returns_ufw_config
+      - unrestorable_baseline_refused
   promotion_target: null
 - id: OWN-04
   requirement: Complete Mutation-Target Baseline and Resource Ownership

@@ -33,6 +33,7 @@ from tools.podman_e2e import (
     acme_fixture, aio, argv_probe, budget, denial, environment_gate, hook_ownership,
     ingress, local_ci,
     lock_cases, matrix as matrix_data, mtls, operator_access, ownership,
+    firewall_image,
     ownership_targets,
     preflight_cases, revocation,
     runstate_cases,
@@ -8806,6 +8807,13 @@ def cases(
         # refused before the first managed path is touched.
         Case(ownership_targets.CASE_ID, "multi-node",
              lambda context: ownership_targets.case_worker_mutation_targets_are_not_adopted(
+                 product, context),
+             timeout_seconds=300),
+        # The firewall the Worker payload reconfigures: the before-image and the
+        # restore run on the Worker with ufw and iptables answered by shims, so
+        # the same policy comes back with the transaction that changed it.
+        Case(firewall_image.CASE_ID, "multi-node",
+             lambda context: firewall_image.case_worker_firewall_policy_is_preserved(
                  product, context),
              timeout_seconds=300),
         # The same journal and the same boot recovery as the All-in-One: the
