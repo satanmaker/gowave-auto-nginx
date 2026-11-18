@@ -160,7 +160,19 @@ def _damage_source(damage):
             2,
         )
     if damage == "record-is-world-readable":
-        return _rewritten(source, "    os.fchmod(handle, 0o600)", "    os.fchmod(handle, 0o644)", 2)
+        # Anchored on the record's own temporary sibling: the transaction journal
+        # writes its file with the same fchmod, and a bare anchor would damage
+        # both writers.
+        return _rewritten(
+            source,
+            'handle, temporary = tempfile.mkstemp(dir=directory, prefix=".worker-ownership.", suffix=".tmp")\n'
+            "try:\n"
+            "    os.fchmod(handle, 0o600)\n",
+            'handle, temporary = tempfile.mkstemp(dir=directory, prefix=".worker-ownership.", suffix=".tmp")\n'
+            "try:\n"
+            "    os.fchmod(handle, 0o644)\n",
+            2,
+        )
     if damage == "preflight-ignores-the-link-target":
         return _rewritten(
             source,
