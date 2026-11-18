@@ -220,11 +220,18 @@ class TestOwnershipTargetsCase(unittest.TestCase):
                 self.assertEqual(
                     sorted(facts), registry[ownership_targets.CASE_ID][name]["evidence"])
 
-    def test_the_guard_keeps_both_payload_copies_in_step(self):
+    def test_the_guard_keeps_every_payload_copy_in_step(self):
+        # Two copies in the payload, plus a third for each helper the standalone
+        # rollback script calls: it is streamed on its own, so it cannot reach
+        # the payload's definitions and has to carry its own.
         body = ownership_targets.WORKER_INSTALLER.read_text(encoding="utf-8")
+        start = body.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
+        rollback = body[start:body.index("\nROLLBACK_REMOTE_SCRIPT\n", start)]
         for signature in ownership_targets._FUNCTION_SIGNATURES:
             with self.subTest(function=signature):
-                self.assertEqual(body.count("\n" + signature), 2, signature)
+                carried = rollback.count("\n" + signature)
+                self.assertIn(carried, (0, 1), signature)
+                self.assertEqual(body.count("\n" + signature), 2 + carried, signature)
 
     def test_the_guard_runs_before_the_first_managed_path(self):
         body = ownership_targets.WORKER_INSTALLER.read_text(encoding="utf-8")

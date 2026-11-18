@@ -386,8 +386,52 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: mutation_baseline:case_panel_mutation_targets_are_restored
+      evidence:
+      - capture_mutates_nothing
+      - changed_created_path_preserved
+      - corrupted_copy_preserved
+      - created_paths_removed
+      - existing_image_refused
+      - image_calls_no_present_path_absent
+      - image_is_per_transaction
+      - image_keeps_pre_existing_bytes
+      - image_keeps_pre_existing_directory
+      - image_keeps_pre_existing_link
+      - image_keeps_pre_existing_metadata
+      - image_mode_is_private
+      - image_names_every_target
+      - incomplete_is_reported
+      - missing_image_preserves_everything
+      - pre_existing_file_restored
+      - pre_existing_link_restored
+      - pre_existing_metadata_restored
+      - unrecorded_paths_preserved
+    multi-node:
+      driver: mutation_baseline:case_worker_mutation_targets_are_restored
+      evidence:
+      - capture_mutates_nothing
+      - changed_created_path_preserved
+      - corrupted_copy_preserved
+      - created_paths_removed
+      - existing_image_refused
+      - image_calls_no_present_path_absent
+      - image_is_per_transaction
+      - image_keeps_pre_existing_bytes
+      - image_keeps_pre_existing_directory
+      - image_keeps_pre_existing_link
+      - image_keeps_pre_existing_metadata
+      - image_mode_is_private
+      - image_names_every_target
+      - incomplete_is_reported
+      - missing_image_preserves_everything
+      - pre_existing_file_restored
+      - pre_existing_link_restored
+      - pre_existing_metadata_restored
+      - unrecorded_paths_preserved
   promotion_target: null
 - id: PRE-01
   requirement: Preflight SSH Trust and DNS Verification

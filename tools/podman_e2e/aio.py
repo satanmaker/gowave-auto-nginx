@@ -34,6 +34,7 @@ from . import (
     operator_access,
     ownership,
     firewall_image,
+    mutation_baseline,
     ownership_targets,
     panel_surface,
     preflight_cases,
@@ -8931,6 +8932,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # and the enabled state come back together.
         Case(firewall_image.CASE_ID, "aio",
              lambda context: firewall_image.case_panel_firewall_policy_is_preserved(
+                 product, context),
+             timeout_seconds=300),
+        # The paths this transaction writes: a pre-existing object comes back
+        # from the before-image, a created one is removed only while the
+        # ownership record still proves it, and anything else is preserved with
+        # the cleanup reported incomplete rather than claimed as a rollback.
+        Case(mutation_baseline.CASE_ID, "aio",
+             lambda context: mutation_baseline.case_panel_mutation_targets_are_restored(
                  product, context),
              timeout_seconds=300),
         # The journal an interrupted switch leaves behind, and the boot recovery

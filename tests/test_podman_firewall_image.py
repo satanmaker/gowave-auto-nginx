@@ -151,10 +151,14 @@ def _damage_source(damage):
             IMAGE_COPIES,
         )
     if damage == "capture-overwrites-an-existing-image":
+        # The Worker-targets capture refuses an existing image with the same
+        # line, so the anchor names the firewall's own sentence.
         return _rewritten(
             source,
-            "    if os.path.lexists(image):\n",
-            "    if False:\n",
+            '    if os.path.lexists(image):\n'
+            '        fail("Firewall before-image " + image + " already exists; refusing to overwrite the state it holds.")\n',
+            '    if False:\n'
+            '        fail("Firewall before-image " + image + " already exists; refusing to overwrite the state it holds.")\n',
             IMAGE_COPIES,
         )
     if damage == "capture-refuses-an-inactive-baseline":

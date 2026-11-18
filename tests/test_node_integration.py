@@ -286,7 +286,11 @@ class TestNodeIntegration(unittest.TestCase):
         # does not have, so the assertion names the loop rather than one stop line.
         self.assertIn("for unit in gowave-node.service xray.service; do", worker_script)
         self.assertIn('systemctl stop "$unit" 2>/dev/null || rollback_failed=1', worker_script)
-        self.assertIn("rm -rf /etc/systemd/system/gowave-node.service.d", worker_script)
+        # The service directory is no longer removed by a blanket rm: it comes
+        # back from the transaction's before-image, so a path this install did
+        # not write is not deleted by a rollback that never owned it.
+        self.assertIn("restore_worker_targets_before_image || rollback_failed=1", worker_script)
+        self.assertNotIn("rm -rf /etc/systemd/system/gowave-node.service.d", worker_script)
         self.assertIn("certbot delete --cert-name \"$WORKER_DOMAIN\"", worker_script)
         self.assertIn("swapoff /swapfile", worker_script)
         self.assertIn("ufw delete allow proto tcp from \"$PANEL_IP\"", worker_script)
@@ -315,8 +319,12 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertNotIn(f"rm -f {vhost}", body)
         self.assertIn("return 301 https://\\$host\\$request_uri;", body)
 
+        inventory_start = payload.index("worker_mutation_targets() {")
+        inventory_end = payload.index("\n}\n", inventory_start) + len("\n}\n")
+        self.assertIn(vhost, payload[inventory_start:inventory_end])
         rollback_start = payload.index("compensate_remote_worker() {")
-        self.assertIn(vhost, payload[rollback_start:])
+        self.assertIn("restore_worker_targets_before_image || rollback_failed=1",
+                      payload[rollback_start:])
 
         uninstall_start = script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")
         uninstall = script[uninstall_start:script.index("\nROLLBACK_REMOTE_SCRIPT", uninstall_start)]

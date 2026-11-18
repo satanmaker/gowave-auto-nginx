@@ -384,7 +384,13 @@ vision_domain=vision.example.test
         end = node_script.index("\n}\n", start) + len("\n}\n")
         compensation = node_script[start:end]
 
-        self.assertIn("/etc/nginx/conf.d/gowave-worker-vision-fallback.conf", compensation)
+        # The fallback is inventoried with the rest of the paths this install
+        # writes, so the compensation removes it only through the before-image.
+        inventory_start = node_script.index("worker_mutation_targets() {")
+        inventory_end = node_script.index("\n}\n", inventory_start) + len("\n}\n")
+        self.assertIn("/etc/nginx/conf.d/gowave-worker-vision-fallback.conf",
+                      node_script[inventory_start:inventory_end])
+        self.assertIn("restore_worker_targets_before_image || rollback_failed=1", compensation)
         self.assertIn('if [[ -n "${VISION_DOMAIN:-}" ]]; then', compensation)
         self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN"', compensation)
     def test_case_matrix_counts_match_independent_vision_topologies(self):

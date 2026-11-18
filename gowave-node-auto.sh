@@ -726,14 +726,17 @@ WORKER_TARGETS
 }
 
 worker_ownership_record() {
-    printf '%s\n' "${1:-/var/lib/gowave-auto-nginx}/worker-install-ownership.json"
+    local base="${1:-/var/lib/gowave-auto-nginx}"
+    # "/" is the host itself, where the state root is the product's own.
+    [[ "$base" == "/" ]] && base="/var/lib/gowave-auto-nginx"
+    printf '%s\n' "$base/worker-install-ownership.json"
 }
 
 verify_worker_mutation_targets_preflight() {
     # The root and the record are arguments so a test can drive this guard over
     # a directory it owns; the install passes neither and gets the host.
     local root="${1:-/}"
-    local record="${2:-$(worker_ownership_record)}"
+    local record="${2:-$(worker_ownership_record "$root")}"
     local targets
     targets=$(worker_mutation_targets)
     python3 - "$root" "$record" "$targets" <<'WORKER_PREFLIGHT_PY'
@@ -819,7 +822,7 @@ WORKER_PREFLIGHT_PY
 
 record_worker_mutation_targets() {
     local root="${1:-/}"
-    local record="${2:-$(worker_ownership_record)}"
+    local record="${2:-$(worker_ownership_record "$root")}"
     local targets
     targets=$(worker_mutation_targets)
     python3 - "$root" "$record" "$targets" <<'WORKER_RECORD_PY'
@@ -1155,6 +1158,299 @@ record_firewall_before_image() {
 
 restore_firewall_before_image() {
     firewall_image restore "${1:-/}" "${2:-$(firewall_before_image)}"
+}
+
+worker_targets_before_image() {
+    # Per transaction, beside the ACME snapshot and the firewall image: what
+    # every inventoried path held before this transaction touched it. The
+    # recovery root is removed by remote_finalize after a verified install, so
+    # a successful run leaves no image behind and a failed one keeps exactly
+    # the one its rollback needs.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-${ACME_TX_ID:-}}"
+    if [[ -z "$transaction" ]]; then
+        printf '%s\n' "$root/worker-targets-before-image"
+        return 0
+    fi
+    printf '%s\n' "$root/recovery/$transaction/worker-targets-before-image"
+}
+
+worker_targets_image() {
+    # The state of every inventoried path before this transaction wrote it, and
+    # the way back to that state. A created path is removed only while it is
+    # still what this install wrote — the ownership record is the proof — and a
+    # pre-existing path is put back with its content and metadata. Anything
+    # changed after the write, or that no record can prove, is preserved with
+    # the cleanup reported incomplete. The payload carries this text twice and
+    # the rollback script once; a test refuses the tree if the copies drift.
+    local action="${1:-}"
+    local root="${2:-/}"
+    local image="${3:-$(worker_targets_before_image)}"
+    local record="${4:-$(worker_ownership_record "$root")}"
+    case "$action" in
+        capture|restore) ;;
+        *)
+            echo "Error: worker_targets_image needs capture or restore, not '$action'." >&2
+            return 2
+            ;;
+    esac
+    local targets
+    targets=$(worker_mutation_targets)
+    python3 - "$root" "$image" "$action" "$record" "$targets" <<'WORKER_TARGETS_PY'
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+root, image, action, record, listed = sys.argv[1:6]
+targets = [line.strip() for line in listed.splitlines() if line.strip()]
+MANIFEST = os.path.join(image, "manifest.json")
+preserved = []
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def fail(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def keep(path, why):
+    preserved.append(path)
+    print("Error: Preserving " + path + ": " + why + "; cleanup is incomplete.", file=sys.stderr)
+
+
+def write_atomic(path, payload, mode):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".worker-targets.", suffix=".tmp")
+    try:
+        os.fchmod(handle, mode)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def describe(path):
+    # What sits at the path now, in the same words the ownership record uses.
+    if os.path.islink(path):
+        return {"kind": "symlink", "target": os.readlink(path)}
+    if os.path.isdir(path):
+        return {"kind": "directory"}
+    if os.path.isfile(path):
+        return {"kind": "file", "sha256": digest(path)}
+    return None
+
+
+def record_entries():
+    # The record of what this transaction wrote, or None when there is nothing
+    # an operator can be asked to trust.
+    if not os.path.lexists(record):
+        return None
+    if os.path.islink(record) or not os.path.isfile(record):
+        return None
+    try:
+        with open(record, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        return None
+    entries = data.get("targets")
+    return entries if isinstance(entries, dict) else None
+
+
+def capture():
+    if os.path.lexists(image):
+        fail("Worker targets before-image " + image + " already exists; refusing to overwrite the state it holds.")
+    os.makedirs(image, mode=0o700, exist_ok=True)
+    data = {"created_by_tx": True, "targets": {}}
+    try:
+        for target in targets:
+            path = under(target)
+            if not os.path.lexists(path):
+                data["targets"][target] = {"state": "absent"}
+                continue
+            if os.path.islink(path):
+                data["targets"][target] = {"state": "symlink", "target": os.readlink(path)}
+                continue
+            if os.path.isdir(path):
+                data["targets"][target] = {"state": "directory"}
+                continue
+            if not os.path.isfile(path):
+                fail(
+                    "Worker target " + path + " is not a regular file; refusing to record a state this install "
+                    "cannot restore."
+                )
+            with open(path, "rb") as stream:
+                payload = stream.read()
+            copy = "file-" + hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+            write_atomic(os.path.join(image, copy), payload, 0o600)
+            state = os.stat(path)
+            data["targets"][target] = {
+                "state": "file",
+                "copy": copy,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "mode": state.st_mode & 0o7777,
+                "owner": [state.st_uid, state.st_gid],
+            }
+        document = (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8")
+        write_atomic(MANIFEST, document, 0o600)
+    except BaseException:
+        shutil.rmtree(image, ignore_errors=True)
+        raise
+
+
+def remove_created(path, entry):
+    # A path that did not exist before: remove it only while it is what we wrote.
+    current = describe(path)
+    if current is None:
+        keep(path, "its state cannot be read")
+        return
+    if not isinstance(entry, dict) or entry != current:
+        keep(path, "it changed after this transaction wrote it")
+        return
+    try:
+        if current["kind"] == "directory":
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    except OSError as error:
+        keep(path, "it could not be removed: " + str(error))
+
+
+def restore_pre_existing(path, entry):
+    # A path that was here before: put back its recorded content and metadata.
+    state = entry.get("state")
+    if state == "symlink":
+        try:
+            if os.path.lexists(path):
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.unlink(path)
+            os.symlink(entry.get("target") or "", path)
+        except OSError as error:
+            keep(path, "the link could not be restored: " + str(error))
+            return
+        if not os.path.islink(path) or os.readlink(path) != entry.get("target"):
+            keep(path, "the restored link does not read back as the before-image")
+        return
+    if state == "directory":
+        try:
+            if not os.path.isdir(path) or os.path.islink(path):
+                if os.path.lexists(path):
+                    os.unlink(path)
+                os.makedirs(path, mode=0o755, exist_ok=True)
+        except OSError as error:
+            keep(path, "the directory could not be restored: " + str(error))
+        return
+    if state != "file":
+        keep(path, "the before-image names no state this install can restore")
+        return
+    copy = os.path.join(image, str(entry.get("copy") or ""))
+    if not os.path.isfile(copy) or os.path.islink(copy):
+        keep(path, "its before-image copy is missing")
+        return
+    with open(copy, "rb") as stream:
+        payload = stream.read()
+    if hashlib.sha256(payload).hexdigest() != entry.get("sha256"):
+        keep(path, "its before-image copy changed after it was written")
+        return
+    try:
+        if os.path.islink(path):
+            os.unlink(path)
+        elif os.path.isdir(path):
+            shutil.rmtree(path)
+        write_atomic(path, payload, int(entry.get("mode") or 0o644))
+        owner = entry.get("owner") or [0, 0]
+        os.chown(path, int(owner[0]), int(owner[1]))
+    except OSError as error:
+        keep(path, "it could not be restored: " + str(error))
+        return
+    if digest(path) != entry.get("sha256"):
+        keep(path, "the restored file does not read back as the before-image")
+
+
+def restore():
+    if not os.path.isfile(MANIFEST) or os.path.islink(MANIFEST):
+        fail("No Worker targets before-image at " + image + "; preserving every path this install wrote.")
+    try:
+        with open(MANIFEST, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        fail(
+            "Worker targets before-image " + MANIFEST + " is not readable JSON; preserving every path this "
+            "install wrote."
+        )
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        fail("Worker targets before-image " + MANIFEST + " does not claim this product created it.")
+    recorded = data.get("targets")
+    if not isinstance(recorded, dict):
+        fail("Worker targets before-image " + MANIFEST + " names no targets.")
+    entries = record_entries()
+    for target in targets:
+        path = under(target)
+        if not os.path.lexists(path):
+            continue
+        entry = recorded.get(target)
+        if not isinstance(entry, dict):
+            keep(path, "the before-image does not name it")
+            continue
+        if entry.get("state") == "absent":
+            if entries is None:
+                keep(path, "no ownership record proves this transaction wrote it")
+                continue
+            remove_created(path, entries.get(target))
+        else:
+            restore_pre_existing(path, entry)
+    if preserved:
+        print(
+            "Error: " + str(len(preserved)) + " Worker path(s) preserved, so the cleanup is incomplete: "
+            + ", ".join(preserved),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+if action == "capture":
+    capture()
+else:
+    restore()
+WORKER_TARGETS_PY
+}
+
+record_worker_targets_before_image() {
+    worker_targets_image capture "${1:-/}" "${2:-$(worker_targets_before_image)}"
+}
+
+restore_worker_targets_before_image() {
+    worker_targets_image restore "${1:-/}" "${2:-$(worker_targets_before_image)}"
 }
 
 install_managed_deploy_hook() {
@@ -2288,14 +2584,17 @@ WORKER_TARGETS
 }
 
 worker_ownership_record() {
-    printf '%s\n' "${1:-/var/lib/gowave-auto-nginx}/worker-install-ownership.json"
+    local base="${1:-/var/lib/gowave-auto-nginx}"
+    # "/" is the host itself, where the state root is the product's own.
+    [[ "$base" == "/" ]] && base="/var/lib/gowave-auto-nginx"
+    printf '%s\n' "$base/worker-install-ownership.json"
 }
 
 verify_worker_mutation_targets_preflight() {
     # The root and the record are arguments so a test can drive this guard over
     # a directory it owns; the install passes neither and gets the host.
     local root="${1:-/}"
-    local record="${2:-$(worker_ownership_record)}"
+    local record="${2:-$(worker_ownership_record "$root")}"
     local targets
     targets=$(worker_mutation_targets)
     python3 - "$root" "$record" "$targets" <<'WORKER_PREFLIGHT_PY'
@@ -2381,7 +2680,7 @@ WORKER_PREFLIGHT_PY
 
 record_worker_mutation_targets() {
     local root="${1:-/}"
-    local record="${2:-$(worker_ownership_record)}"
+    local record="${2:-$(worker_ownership_record "$root")}"
     local targets
     targets=$(worker_mutation_targets)
     python3 - "$root" "$record" "$targets" <<'WORKER_RECORD_PY'
@@ -2717,6 +3016,299 @@ record_firewall_before_image() {
 
 restore_firewall_before_image() {
     firewall_image restore "${1:-/}" "${2:-$(firewall_before_image)}"
+}
+
+worker_targets_before_image() {
+    # Per transaction, beside the ACME snapshot and the firewall image: what
+    # every inventoried path held before this transaction touched it. The
+    # recovery root is removed by remote_finalize after a verified install, so
+    # a successful run leaves no image behind and a failed one keeps exactly
+    # the one its rollback needs.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-${ACME_TX_ID:-}}"
+    if [[ -z "$transaction" ]]; then
+        printf '%s\n' "$root/worker-targets-before-image"
+        return 0
+    fi
+    printf '%s\n' "$root/recovery/$transaction/worker-targets-before-image"
+}
+
+worker_targets_image() {
+    # The state of every inventoried path before this transaction wrote it, and
+    # the way back to that state. A created path is removed only while it is
+    # still what this install wrote — the ownership record is the proof — and a
+    # pre-existing path is put back with its content and metadata. Anything
+    # changed after the write, or that no record can prove, is preserved with
+    # the cleanup reported incomplete. The payload carries this text twice and
+    # the rollback script once; a test refuses the tree if the copies drift.
+    local action="${1:-}"
+    local root="${2:-/}"
+    local image="${3:-$(worker_targets_before_image)}"
+    local record="${4:-$(worker_ownership_record "$root")}"
+    case "$action" in
+        capture|restore) ;;
+        *)
+            echo "Error: worker_targets_image needs capture or restore, not '$action'." >&2
+            return 2
+            ;;
+    esac
+    local targets
+    targets=$(worker_mutation_targets)
+    python3 - "$root" "$image" "$action" "$record" "$targets" <<'WORKER_TARGETS_PY'
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+root, image, action, record, listed = sys.argv[1:6]
+targets = [line.strip() for line in listed.splitlines() if line.strip()]
+MANIFEST = os.path.join(image, "manifest.json")
+preserved = []
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def fail(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def keep(path, why):
+    preserved.append(path)
+    print("Error: Preserving " + path + ": " + why + "; cleanup is incomplete.", file=sys.stderr)
+
+
+def write_atomic(path, payload, mode):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".worker-targets.", suffix=".tmp")
+    try:
+        os.fchmod(handle, mode)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def describe(path):
+    # What sits at the path now, in the same words the ownership record uses.
+    if os.path.islink(path):
+        return {"kind": "symlink", "target": os.readlink(path)}
+    if os.path.isdir(path):
+        return {"kind": "directory"}
+    if os.path.isfile(path):
+        return {"kind": "file", "sha256": digest(path)}
+    return None
+
+
+def record_entries():
+    # The record of what this transaction wrote, or None when there is nothing
+    # an operator can be asked to trust.
+    if not os.path.lexists(record):
+        return None
+    if os.path.islink(record) or not os.path.isfile(record):
+        return None
+    try:
+        with open(record, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        return None
+    entries = data.get("targets")
+    return entries if isinstance(entries, dict) else None
+
+
+def capture():
+    if os.path.lexists(image):
+        fail("Worker targets before-image " + image + " already exists; refusing to overwrite the state it holds.")
+    os.makedirs(image, mode=0o700, exist_ok=True)
+    data = {"created_by_tx": True, "targets": {}}
+    try:
+        for target in targets:
+            path = under(target)
+            if not os.path.lexists(path):
+                data["targets"][target] = {"state": "absent"}
+                continue
+            if os.path.islink(path):
+                data["targets"][target] = {"state": "symlink", "target": os.readlink(path)}
+                continue
+            if os.path.isdir(path):
+                data["targets"][target] = {"state": "directory"}
+                continue
+            if not os.path.isfile(path):
+                fail(
+                    "Worker target " + path + " is not a regular file; refusing to record a state this install "
+                    "cannot restore."
+                )
+            with open(path, "rb") as stream:
+                payload = stream.read()
+            copy = "file-" + hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+            write_atomic(os.path.join(image, copy), payload, 0o600)
+            state = os.stat(path)
+            data["targets"][target] = {
+                "state": "file",
+                "copy": copy,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "mode": state.st_mode & 0o7777,
+                "owner": [state.st_uid, state.st_gid],
+            }
+        document = (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8")
+        write_atomic(MANIFEST, document, 0o600)
+    except BaseException:
+        shutil.rmtree(image, ignore_errors=True)
+        raise
+
+
+def remove_created(path, entry):
+    # A path that did not exist before: remove it only while it is what we wrote.
+    current = describe(path)
+    if current is None:
+        keep(path, "its state cannot be read")
+        return
+    if not isinstance(entry, dict) or entry != current:
+        keep(path, "it changed after this transaction wrote it")
+        return
+    try:
+        if current["kind"] == "directory":
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    except OSError as error:
+        keep(path, "it could not be removed: " + str(error))
+
+
+def restore_pre_existing(path, entry):
+    # A path that was here before: put back its recorded content and metadata.
+    state = entry.get("state")
+    if state == "symlink":
+        try:
+            if os.path.lexists(path):
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.unlink(path)
+            os.symlink(entry.get("target") or "", path)
+        except OSError as error:
+            keep(path, "the link could not be restored: " + str(error))
+            return
+        if not os.path.islink(path) or os.readlink(path) != entry.get("target"):
+            keep(path, "the restored link does not read back as the before-image")
+        return
+    if state == "directory":
+        try:
+            if not os.path.isdir(path) or os.path.islink(path):
+                if os.path.lexists(path):
+                    os.unlink(path)
+                os.makedirs(path, mode=0o755, exist_ok=True)
+        except OSError as error:
+            keep(path, "the directory could not be restored: " + str(error))
+        return
+    if state != "file":
+        keep(path, "the before-image names no state this install can restore")
+        return
+    copy = os.path.join(image, str(entry.get("copy") or ""))
+    if not os.path.isfile(copy) or os.path.islink(copy):
+        keep(path, "its before-image copy is missing")
+        return
+    with open(copy, "rb") as stream:
+        payload = stream.read()
+    if hashlib.sha256(payload).hexdigest() != entry.get("sha256"):
+        keep(path, "its before-image copy changed after it was written")
+        return
+    try:
+        if os.path.islink(path):
+            os.unlink(path)
+        elif os.path.isdir(path):
+            shutil.rmtree(path)
+        write_atomic(path, payload, int(entry.get("mode") or 0o644))
+        owner = entry.get("owner") or [0, 0]
+        os.chown(path, int(owner[0]), int(owner[1]))
+    except OSError as error:
+        keep(path, "it could not be restored: " + str(error))
+        return
+    if digest(path) != entry.get("sha256"):
+        keep(path, "the restored file does not read back as the before-image")
+
+
+def restore():
+    if not os.path.isfile(MANIFEST) or os.path.islink(MANIFEST):
+        fail("No Worker targets before-image at " + image + "; preserving every path this install wrote.")
+    try:
+        with open(MANIFEST, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        fail(
+            "Worker targets before-image " + MANIFEST + " is not readable JSON; preserving every path this "
+            "install wrote."
+        )
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        fail("Worker targets before-image " + MANIFEST + " does not claim this product created it.")
+    recorded = data.get("targets")
+    if not isinstance(recorded, dict):
+        fail("Worker targets before-image " + MANIFEST + " names no targets.")
+    entries = record_entries()
+    for target in targets:
+        path = under(target)
+        if not os.path.lexists(path):
+            continue
+        entry = recorded.get(target)
+        if not isinstance(entry, dict):
+            keep(path, "the before-image does not name it")
+            continue
+        if entry.get("state") == "absent":
+            if entries is None:
+                keep(path, "no ownership record proves this transaction wrote it")
+                continue
+            remove_created(path, entries.get(target))
+        else:
+            restore_pre_existing(path, entry)
+    if preserved:
+        print(
+            "Error: " + str(len(preserved)) + " Worker path(s) preserved, so the cleanup is incomplete: "
+            + ", ".join(preserved),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+if action == "capture":
+    capture()
+else:
+    restore()
+WORKER_TARGETS_PY
+}
+
+record_worker_targets_before_image() {
+    worker_targets_image capture "${1:-/}" "${2:-$(worker_targets_before_image)}"
+}
+
+restore_worker_targets_before_image() {
+    worker_targets_image restore "${1:-/}" "${2:-$(worker_targets_before_image)}"
 }
 
 install_managed_deploy_hook() {
@@ -3864,19 +4456,20 @@ compensate_remote_worker() {
                 systemctl disable "$unit" 2>/dev/null || rollback_failed=1
             fi
         done
-        rm -rf /etc/systemd/system/gowave-node.service.d || rollback_failed=1
-        rm -f /etc/systemd/system/gowave-node.service /etc/systemd/system/remnanode.service || rollback_failed=1
         systemctl daemon-reload 2>/dev/null || rollback_failed=1
-        rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode || rollback_failed=1
-        rm -f /usr/local/bin/gowave-node /usr/local/bin/xray || rollback_failed=1
     fi
+
+    # The inventoried paths come back from the transaction's before-image, and
+    # only from it: a path that did not exist is removed only while the ownership
+    # record still matches it, a path that was here is restored with its content
+    # and metadata, and one changed afterwards is preserved with the cleanup
+    # reported incomplete.
+    restore_worker_targets_before_image || rollback_failed=1
 
     # 2. Revert NGINX and ACME bootstrap
     if [[ "${_NGINX_CONFIGS_CREATED:-0}" -eq 1 ]] || [[ "${_NGINX_BOOTSTRAP_CREATED:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Cleaning up worker NGINX virtual hosts and stream routing..." >&2
-        rm -f /etc/nginx/conf.d/00-worker-acme-challenge.conf /etc/nginx/conf.d/00-bootstrap-worker-acme.conf /etc/nginx/conf.d/gowave-worker-https.conf /etc/nginx/conf.d/gowave-worker-decoy.conf /etc/nginx/conf.d/gowave-worker-vision-fallback.conf /etc/nginx/stream-enabled/gowave-worker-stream.conf || rollback_failed=1
         rollback_managed_deploy_hook "${_ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || rollback_failed=1
-        rm -rf /var/www/gowave-acme || rollback_failed=1
         if [[ "${_STREAM_INCLUDE_ADDED:-0}" -eq 1 ]]; then
             sed -i '\#stream { include /etc/nginx/stream-enabled/\*\.conf; }#d' /etc/nginx/nginx.conf 2>/dev/null || rollback_failed=1
         fi
@@ -3890,7 +4483,6 @@ compensate_remote_worker() {
     # 3. Clean Cover Reality decoy site
     if [[ "${_COVER_UNPACKED:-0}" -eq 1 ]]; then
         echo "[ROLLBACK] Removing cover decoy site assets..." >&2
-        rm -rf /var/www/gowave-auto-nginx/cover-reality || rollback_failed=1
         if [[ -d /var/www/gowave-auto-nginx ]]; then
             rmdir /var/www/gowave-auto-nginx 2>/dev/null || rollback_failed=1
         fi
@@ -4078,6 +4670,12 @@ main() {
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
         snapshot_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN"
     fi
+    # What those inventoried paths held before this transaction writes them: the
+    # rollback restores a pre-existing object from these bytes, removes a created
+    # one only while the ownership record still matches it, and preserves
+    # anything it cannot prove.
+    record_worker_targets_before_image \
+        "/" "$(worker_targets_before_image "/var/lib/gowave-auto-nginx" "$_ACME_TX_ID")" || return 1
 
     setup_system_prereqs </dev/null
     configure_host_security </dev/null
@@ -4575,6 +5173,329 @@ fi
 acquire_mutation_lock
 echo "Executing worker compensation teardown..." >&2
 
+worker_mutation_targets() {
+    # The paths this install creates and its rollback removes. A path that is
+    # already here is only touched when the ownership record names it.
+    cat <<'WORKER_TARGETS'
+/etc/systemd/system/gowave-node.service
+/etc/systemd/system/gowave-node.service.d
+/etc/systemd/system/remnanode.service
+/opt/gowave-node
+/run/gowave-node
+/opt/remnanode
+/usr/local/bin/gowave-node
+/usr/local/bin/xray
+/etc/nginx/conf.d/00-worker-acme-challenge.conf
+/etc/nginx/conf.d/00-bootstrap-worker-acme.conf
+/etc/nginx/conf.d/gowave-worker-https.conf
+/etc/nginx/conf.d/gowave-worker-decoy.conf
+/etc/nginx/conf.d/gowave-worker-vision-fallback.conf
+/etc/nginx/stream-enabled/gowave-worker-stream.conf
+/var/www/gowave-acme
+/var/www/gowave-auto-nginx/cover-reality
+WORKER_TARGETS
+}
+
+worker_ownership_record() {
+    local base="${1:-/var/lib/gowave-auto-nginx}"
+    # "/" is the host itself, where the state root is the product's own.
+    [[ "$base" == "/" ]] && base="/var/lib/gowave-auto-nginx"
+    printf '%s\n' "$base/worker-install-ownership.json"
+}
+
+worker_targets_before_image() {
+    # Per transaction, beside the ACME snapshot and the firewall image: what
+    # every inventoried path held before this transaction touched it. The
+    # recovery root is removed by remote_finalize after a verified install, so
+    # a successful run leaves no image behind and a failed one keeps exactly
+    # the one its rollback needs.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-${ACME_TX_ID:-}}"
+    if [[ -z "$transaction" ]]; then
+        printf '%s\n' "$root/worker-targets-before-image"
+        return 0
+    fi
+    printf '%s\n' "$root/recovery/$transaction/worker-targets-before-image"
+}
+
+worker_targets_image() {
+    # The state of every inventoried path before this transaction wrote it, and
+    # the way back to that state. A created path is removed only while it is
+    # still what this install wrote — the ownership record is the proof — and a
+    # pre-existing path is put back with its content and metadata. Anything
+    # changed after the write, or that no record can prove, is preserved with
+    # the cleanup reported incomplete. The payload carries this text twice and
+    # the rollback script once; a test refuses the tree if the copies drift.
+    local action="${1:-}"
+    local root="${2:-/}"
+    local image="${3:-$(worker_targets_before_image)}"
+    local record="${4:-$(worker_ownership_record "$root")}"
+    case "$action" in
+        capture|restore) ;;
+        *)
+            echo "Error: worker_targets_image needs capture or restore, not '$action'." >&2
+            return 2
+            ;;
+    esac
+    local targets
+    targets=$(worker_mutation_targets)
+    python3 - "$root" "$image" "$action" "$record" "$targets" <<'WORKER_TARGETS_PY'
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+root, image, action, record, listed = sys.argv[1:6]
+targets = [line.strip() for line in listed.splitlines() if line.strip()]
+MANIFEST = os.path.join(image, "manifest.json")
+preserved = []
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def fail(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def keep(path, why):
+    preserved.append(path)
+    print("Error: Preserving " + path + ": " + why + "; cleanup is incomplete.", file=sys.stderr)
+
+
+def write_atomic(path, payload, mode):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".worker-targets.", suffix=".tmp")
+    try:
+        os.fchmod(handle, mode)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def describe(path):
+    # What sits at the path now, in the same words the ownership record uses.
+    if os.path.islink(path):
+        return {"kind": "symlink", "target": os.readlink(path)}
+    if os.path.isdir(path):
+        return {"kind": "directory"}
+    if os.path.isfile(path):
+        return {"kind": "file", "sha256": digest(path)}
+    return None
+
+
+def record_entries():
+    # The record of what this transaction wrote, or None when there is nothing
+    # an operator can be asked to trust.
+    if not os.path.lexists(record):
+        return None
+    if os.path.islink(record) or not os.path.isfile(record):
+        return None
+    try:
+        with open(record, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        return None
+    entries = data.get("targets")
+    return entries if isinstance(entries, dict) else None
+
+
+def capture():
+    if os.path.lexists(image):
+        fail("Worker targets before-image " + image + " already exists; refusing to overwrite the state it holds.")
+    os.makedirs(image, mode=0o700, exist_ok=True)
+    data = {"created_by_tx": True, "targets": {}}
+    try:
+        for target in targets:
+            path = under(target)
+            if not os.path.lexists(path):
+                data["targets"][target] = {"state": "absent"}
+                continue
+            if os.path.islink(path):
+                data["targets"][target] = {"state": "symlink", "target": os.readlink(path)}
+                continue
+            if os.path.isdir(path):
+                data["targets"][target] = {"state": "directory"}
+                continue
+            if not os.path.isfile(path):
+                fail(
+                    "Worker target " + path + " is not a regular file; refusing to record a state this install "
+                    "cannot restore."
+                )
+            with open(path, "rb") as stream:
+                payload = stream.read()
+            copy = "file-" + hashlib.sha256(target.encode("utf-8")).hexdigest()[:16]
+            write_atomic(os.path.join(image, copy), payload, 0o600)
+            state = os.stat(path)
+            data["targets"][target] = {
+                "state": "file",
+                "copy": copy,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "mode": state.st_mode & 0o7777,
+                "owner": [state.st_uid, state.st_gid],
+            }
+        document = (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8")
+        write_atomic(MANIFEST, document, 0o600)
+    except BaseException:
+        shutil.rmtree(image, ignore_errors=True)
+        raise
+
+
+def remove_created(path, entry):
+    # A path that did not exist before: remove it only while it is what we wrote.
+    current = describe(path)
+    if current is None:
+        keep(path, "its state cannot be read")
+        return
+    if not isinstance(entry, dict) or entry != current:
+        keep(path, "it changed after this transaction wrote it")
+        return
+    try:
+        if current["kind"] == "directory":
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    except OSError as error:
+        keep(path, "it could not be removed: " + str(error))
+
+
+def restore_pre_existing(path, entry):
+    # A path that was here before: put back its recorded content and metadata.
+    state = entry.get("state")
+    if state == "symlink":
+        try:
+            if os.path.lexists(path):
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.unlink(path)
+            os.symlink(entry.get("target") or "", path)
+        except OSError as error:
+            keep(path, "the link could not be restored: " + str(error))
+            return
+        if not os.path.islink(path) or os.readlink(path) != entry.get("target"):
+            keep(path, "the restored link does not read back as the before-image")
+        return
+    if state == "directory":
+        try:
+            if not os.path.isdir(path) or os.path.islink(path):
+                if os.path.lexists(path):
+                    os.unlink(path)
+                os.makedirs(path, mode=0o755, exist_ok=True)
+        except OSError as error:
+            keep(path, "the directory could not be restored: " + str(error))
+        return
+    if state != "file":
+        keep(path, "the before-image names no state this install can restore")
+        return
+    copy = os.path.join(image, str(entry.get("copy") or ""))
+    if not os.path.isfile(copy) or os.path.islink(copy):
+        keep(path, "its before-image copy is missing")
+        return
+    with open(copy, "rb") as stream:
+        payload = stream.read()
+    if hashlib.sha256(payload).hexdigest() != entry.get("sha256"):
+        keep(path, "its before-image copy changed after it was written")
+        return
+    try:
+        if os.path.islink(path):
+            os.unlink(path)
+        elif os.path.isdir(path):
+            shutil.rmtree(path)
+        write_atomic(path, payload, int(entry.get("mode") or 0o644))
+        owner = entry.get("owner") or [0, 0]
+        os.chown(path, int(owner[0]), int(owner[1]))
+    except OSError as error:
+        keep(path, "it could not be restored: " + str(error))
+        return
+    if digest(path) != entry.get("sha256"):
+        keep(path, "the restored file does not read back as the before-image")
+
+
+def restore():
+    if not os.path.isfile(MANIFEST) or os.path.islink(MANIFEST):
+        fail("No Worker targets before-image at " + image + "; preserving every path this install wrote.")
+    try:
+        with open(MANIFEST, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        fail(
+            "Worker targets before-image " + MANIFEST + " is not readable JSON; preserving every path this "
+            "install wrote."
+        )
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        fail("Worker targets before-image " + MANIFEST + " does not claim this product created it.")
+    recorded = data.get("targets")
+    if not isinstance(recorded, dict):
+        fail("Worker targets before-image " + MANIFEST + " names no targets.")
+    entries = record_entries()
+    for target in targets:
+        path = under(target)
+        if not os.path.lexists(path):
+            continue
+        entry = recorded.get(target)
+        if not isinstance(entry, dict):
+            keep(path, "the before-image does not name it")
+            continue
+        if entry.get("state") == "absent":
+            if entries is None:
+                keep(path, "no ownership record proves this transaction wrote it")
+                continue
+            remove_created(path, entries.get(target))
+        else:
+            restore_pre_existing(path, entry)
+    if preserved:
+        print(
+            "Error: " + str(len(preserved)) + " Worker path(s) preserved, so the cleanup is incomplete: "
+            + ", ".join(preserved),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+if action == "capture":
+    capture()
+else:
+    restore()
+WORKER_TARGETS_PY
+}
+
+record_worker_targets_before_image() {
+    worker_targets_image capture "${1:-/}" "${2:-$(worker_targets_before_image)}"
+}
+
+restore_worker_targets_before_image() {
+    worker_targets_image restore "${1:-/}" "${2:-$(worker_targets_before_image)}"
+}
+
 rollback_failed=0
 
 # 1. Stop and disable systemd services that are actually installed or active.
@@ -4585,16 +5506,15 @@ for unit in gowave-node.service xray.service; do
         systemctl disable "$unit" 2>/dev/null || rollback_failed=1
     fi
 done
-rm -rf /etc/systemd/system/gowave-node.service.d || rollback_failed=1
-rm -f /etc/systemd/system/gowave-node.service /etc/systemd/system/remnanode.service || rollback_failed=1
+# Every inventoried path comes back from the transaction's before-image: a path
+# that did not exist is removed only while the ownership record still matches it,
+# a path that was here is restored with its content and metadata, and one changed
+# afterwards is preserved with the cleanup reported incomplete.
+restore_worker_targets_before_image || rollback_failed=1
 systemctl daemon-reload 2>/dev/null || rollback_failed=1
-rm -rf /opt/gowave-node /run/gowave-node /opt/remnanode || rollback_failed=1
-rm -f /usr/local/bin/gowave-node /usr/local/bin/xray || rollback_failed=1
 
 # 2. Remove NGINX worker configs
-rm -f /etc/nginx/conf.d/00-worker-acme-challenge.conf /etc/nginx/conf.d/00-bootstrap-worker-acme.conf /etc/nginx/conf.d/gowave-worker-https.conf /etc/nginx/conf.d/gowave-worker-decoy.conf /etc/nginx/conf.d/gowave-worker-vision-fallback.conf /etc/nginx/stream-enabled/gowave-worker-stream.conf || rollback_failed=1
 rollback_managed_deploy_hook "${ACME_TX_ID:-}" "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" 2>/dev/null || rollback_failed=1
-rm -rf /var/www/gowave-acme /var/www/gowave-auto-nginx/cover-reality || rollback_failed=1
 if [[ -d /var/www/gowave-auto-nginx ]]; then
     rmdir /var/www/gowave-auto-nginx 2>/dev/null || true
 fi
