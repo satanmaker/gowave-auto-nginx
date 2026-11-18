@@ -841,6 +841,43 @@ cases_by_requirement:
       functions' verdict and the bytes they leave on disk; the live run remains
       the source of truth for the paths a real Worker carries.
   - requirement: Live scenario parity
+    cases: [HOOK-03]
+    reason: >-
+      HOOK-03 is the sentence that makes a Worker run recoverable after the
+      process cannot clean up after itself: a deployment terminated by SIGKILL,
+      a kernel panic or a power loss leaves its transaction journal behind, and
+      the next authenticated entrypoint reconciles it before it writes anything
+      of its own. The journal is `worker_transaction_journal` and
+      `worker_journal_action` in `gowave-node-auto.sh`: one writer for the
+      states this product knows, written at mode 0600 through a temporary
+      sibling and a rename with the file and its directory synced, refusing a
+      journal that cannot be read back, that names another transaction, or that
+      would reopen a transaction already installed. The install writes
+      `started` after its before-image exists and before `setup_system_prereqs`
+      touches the first path, marks it `installed` once
+      `record_worker_mutation_targets` has verified what it wrote, and the
+      standalone rollback reconciles every other transaction under the mutation
+      lock while skipping the one it was invoked for. The reader restores a
+      `started` transaction from its own Worker and firewall before-images and
+      releases its directory; a transaction that installed but was never
+      finalized, one whose before-image cannot be restored, and one whose
+      journal cannot be read back all keep their directory and make the new
+      operation fail, so a half-written host is never built upon. The case
+      drives the shipped functions over a scratch root and reads back sixteen
+      facts: the journal is per transaction, names the transaction it belongs
+      to and starts in `started`, is mode 0600, the verified end marks it
+      installed, a later run cannot reopen it, an installed journal is retained
+      with its install untouched, a pre-existing path comes back from the
+      before-image, the reconciled directory is released and a second reconcile
+      is a no-op, a journal with nothing written under it is released, a created
+      path no record proves is preserved with the transaction retained and the
+      incomplete outcome reported, an unreadable journal and a before-image that
+      changed after it was taken both refuse rather than release, the firewall
+      before-image is consulted, and the rollback entrypoint skips its own
+      transaction. What the container proves is the functions' verdict and the
+      bytes they leave on disk; the live run remains the source of truth for the
+      host a real Worker carries.
+  - requirement: Live scenario parity
     cases: [HOOK-01]
     reason: >-
       HOOK-01 is the shape half of the same sentence: a manifest records that a

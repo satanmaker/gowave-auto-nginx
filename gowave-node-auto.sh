@@ -1449,6 +1449,206 @@ record_worker_targets_before_image() {
     worker_targets_image capture "${1:-/}" "${2:-$(worker_targets_before_image)}"
 }
 
+worker_transaction_journal() {
+    # One journal per transaction, beside the ACME snapshot and the two
+    # before-images. It is the only record of a run that was killed before it
+    # could finish: the next entrypoint reads it and knows what that run had
+    # already begun to change.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-}"
+    [[ "$root" == "/" ]] && root="/var/lib/gowave-auto-nginx"
+    printf '%s\n' "${root%/}/recovery/${transaction}/transaction-journal.json"
+}
+
+worker_journal_action() {
+    # One writer for the journal, so the install, the reconcile and the rollback
+    # all read the same bytes back. "started" is written before the first
+    # mutation, "installed" once every mutation has been verified, and a
+    # transaction that never reached "installed" is the one a later entrypoint
+    # has to reconcile.
+    local action="$1"
+    local journal="$2"
+    local transaction="$3"
+    local journal_state="${4:-}"
+    python3 - "$action" "$journal" "$transaction" "$journal_state" <<'JOURNAL_PY'
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+
+action, journal, transaction, journal_state = sys.argv[1:5]
+STATES = ("started", "installed")
+
+
+def refuse(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read():
+    if os.path.islink(journal) or not os.path.isfile(journal):
+        refuse("Worker transaction journal " + journal + " is not a regular file.")
+    try:
+        with open(journal, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        refuse("Worker transaction journal " + journal + " is not readable JSON.")
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        refuse("Worker transaction journal " + journal + " is not a journal this product wrote.")
+    if data.get("transaction") != transaction:
+        refuse(
+            "Worker transaction journal " + journal + " records "
+            + json.dumps(data.get("transaction")) + ", not " + json.dumps(transaction) + "."
+        )
+    if data.get("state") not in STATES:
+        refuse("Worker transaction journal " + journal + " records no state this product knows.")
+    return data
+
+
+def store(state):
+    # An installed transaction is closed: rewriting it as started would let a
+    # later run undo an install that already verified every path it wrote.
+    if state == "started" and os.path.lexists(journal) and read().get("state") == "installed":
+        refuse("Worker transaction journal " + journal + " is already installed; refusing to reopen it.")
+    directory = os.path.dirname(journal)
+    if os.path.islink(directory):
+        refuse("Worker transaction directory " + directory + " is a symlink.")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    document = {
+        "schema": 1,
+        "transaction": transaction,
+        "state": state,
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".transaction-journal.", suffix=".tmp")
+    try:
+        os.fchmod(handle, 0o600)
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(document, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, journal)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def remove():
+    # The directory goes only while it is strictly below the recovery root it was
+    # found in, so a transaction name can never name its way out of that root.
+    recovery_root = os.path.realpath(os.path.dirname(os.path.dirname(journal)))
+    transaction_dir = os.path.realpath(os.path.dirname(journal))
+    if recovery_root == os.sep or not transaction_dir.startswith(recovery_root + os.sep):
+        refuse("Worker transaction directory " + transaction_dir + " is not below " + recovery_root + ".")
+    if os.path.islink(os.path.dirname(journal)):
+        refuse("Worker transaction directory " + os.path.dirname(journal) + " is a symlink.")
+    if not os.path.isdir(transaction_dir):
+        refuse("Worker transaction directory " + transaction_dir + " is not a directory.")
+    shutil.rmtree(transaction_dir)
+
+
+if action == "write":
+    if journal_state not in STATES:
+        refuse("Unknown Worker transaction state " + json.dumps(journal_state) + ".")
+    store(journal_state)
+elif action == "mark":
+    if journal_state not in STATES:
+        refuse("Unknown Worker transaction state " + json.dumps(journal_state) + ".")
+    if not os.path.lexists(journal):
+        raise SystemExit(0)
+    read()
+    store(journal_state)
+elif action == "state":
+    print(read().get("state"))
+elif action == "remove":
+    read()
+    remove()
+else:
+    refuse("Unknown Worker transaction journal action " + json.dumps(action) + ".")
+JOURNAL_PY
+}
+
+record_worker_transaction_journal() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    if [[ ! "$transaction" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
+        echo "Error: A Worker transaction journal needs a valid transaction ID." >&2
+        return 1
+    fi
+    worker_journal_action write "$(worker_transaction_journal "$root" "$transaction")" "$transaction" started
+}
+
+mark_worker_transaction_state() {
+    local transaction_state="${1:-}"
+    local transaction="${2:-}"
+    local root="${3:-/var/lib/gowave-auto-nginx}"
+    worker_journal_action mark "$(worker_transaction_journal "$root" "$transaction")" "$transaction" "$transaction_state"
+}
+
+reconcile_worker_transaction_journals() {
+    # Every entrypoint pays for the previous run's crash before it writes
+    # anything of its own. A transaction that never reached "installed" is
+    # restored from its own before-images and its directory is released; a
+    # transaction this product cannot restore, or that already installed but
+    # was never finalized, keeps its journal and the new operation is refused,
+    # so a half-written host is never built upon. The state root is where the
+    # journals live and the host root is where the inventoried paths sit; the
+    # two differ only for a test that owns a scratch tree.
+    local skip="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local host_root="${3:-/}"
+    local journal transaction transaction_dir state failed=0
+    [[ "$root" == "/" ]] && root="/var/lib/gowave-auto-nginx"
+    local recovery_root="${root%/}/recovery"
+    [[ -d "$recovery_root" ]] || return 0
+    for journal in "$recovery_root"/*/transaction-journal.json; do
+        [[ -e "$journal" ]] || continue
+        transaction_dir="$(dirname "$journal")"
+        transaction="$(basename "$transaction_dir")"
+        [[ -n "$skip" && "$transaction" == "$skip" ]] && continue
+        if ! state="$(worker_journal_action state "$journal" "$transaction")"; then
+            echo "Error: Uncommitted Worker transaction $transaction cannot be read back; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if [[ "$state" != "started" ]]; then
+            echo "Error: Worker transaction $transaction is '$state' and was never finalized; refusing to start a new install and retaining $transaction_dir. Finalize or roll it back first." >&2
+            failed=1
+            continue
+        fi
+        if [[ -d "$transaction_dir/worker-targets-before-image" ]] &&
+            ! restore_worker_targets_before_image "$host_root" "$transaction_dir/worker-targets-before-image"; then
+            echo "Error: Worker transaction $transaction could not be restored to its Worker before-image; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if [[ -d "$transaction_dir/firewall-before-image" ]] &&
+            ! restore_firewall_before_image "$host_root" "$transaction_dir/firewall-before-image"; then
+            echo "Error: Worker transaction $transaction could not be restored to its firewall before-image; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if ! worker_journal_action remove "$journal" "$transaction"; then
+            echo "Error: Worker transaction $transaction was restored but its journal could not be released; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        echo "Reconciled uncommitted Worker transaction $transaction from its before-images." >&2
+    done
+    return "$failed"
+}
+
 restore_worker_targets_before_image() {
     worker_targets_image restore "${1:-/}" "${2:-$(worker_targets_before_image)}"
 }
@@ -3307,6 +3507,206 @@ record_worker_targets_before_image() {
     worker_targets_image capture "${1:-/}" "${2:-$(worker_targets_before_image)}"
 }
 
+worker_transaction_journal() {
+    # One journal per transaction, beside the ACME snapshot and the two
+    # before-images. It is the only record of a run that was killed before it
+    # could finish: the next entrypoint reads it and knows what that run had
+    # already begun to change.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-}"
+    [[ "$root" == "/" ]] && root="/var/lib/gowave-auto-nginx"
+    printf '%s\n' "${root%/}/recovery/${transaction}/transaction-journal.json"
+}
+
+worker_journal_action() {
+    # One writer for the journal, so the install, the reconcile and the rollback
+    # all read the same bytes back. "started" is written before the first
+    # mutation, "installed" once every mutation has been verified, and a
+    # transaction that never reached "installed" is the one a later entrypoint
+    # has to reconcile.
+    local action="$1"
+    local journal="$2"
+    local transaction="$3"
+    local journal_state="${4:-}"
+    python3 - "$action" "$journal" "$transaction" "$journal_state" <<'JOURNAL_PY'
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+
+action, journal, transaction, journal_state = sys.argv[1:5]
+STATES = ("started", "installed")
+
+
+def refuse(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read():
+    if os.path.islink(journal) or not os.path.isfile(journal):
+        refuse("Worker transaction journal " + journal + " is not a regular file.")
+    try:
+        with open(journal, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        refuse("Worker transaction journal " + journal + " is not readable JSON.")
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        refuse("Worker transaction journal " + journal + " is not a journal this product wrote.")
+    if data.get("transaction") != transaction:
+        refuse(
+            "Worker transaction journal " + journal + " records "
+            + json.dumps(data.get("transaction")) + ", not " + json.dumps(transaction) + "."
+        )
+    if data.get("state") not in STATES:
+        refuse("Worker transaction journal " + journal + " records no state this product knows.")
+    return data
+
+
+def store(state):
+    # An installed transaction is closed: rewriting it as started would let a
+    # later run undo an install that already verified every path it wrote.
+    if state == "started" and os.path.lexists(journal) and read().get("state") == "installed":
+        refuse("Worker transaction journal " + journal + " is already installed; refusing to reopen it.")
+    directory = os.path.dirname(journal)
+    if os.path.islink(directory):
+        refuse("Worker transaction directory " + directory + " is a symlink.")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    document = {
+        "schema": 1,
+        "transaction": transaction,
+        "state": state,
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".transaction-journal.", suffix=".tmp")
+    try:
+        os.fchmod(handle, 0o600)
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(document, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, journal)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def remove():
+    # The directory goes only while it is strictly below the recovery root it was
+    # found in, so a transaction name can never name its way out of that root.
+    recovery_root = os.path.realpath(os.path.dirname(os.path.dirname(journal)))
+    transaction_dir = os.path.realpath(os.path.dirname(journal))
+    if recovery_root == os.sep or not transaction_dir.startswith(recovery_root + os.sep):
+        refuse("Worker transaction directory " + transaction_dir + " is not below " + recovery_root + ".")
+    if os.path.islink(os.path.dirname(journal)):
+        refuse("Worker transaction directory " + os.path.dirname(journal) + " is a symlink.")
+    if not os.path.isdir(transaction_dir):
+        refuse("Worker transaction directory " + transaction_dir + " is not a directory.")
+    shutil.rmtree(transaction_dir)
+
+
+if action == "write":
+    if journal_state not in STATES:
+        refuse("Unknown Worker transaction state " + json.dumps(journal_state) + ".")
+    store(journal_state)
+elif action == "mark":
+    if journal_state not in STATES:
+        refuse("Unknown Worker transaction state " + json.dumps(journal_state) + ".")
+    if not os.path.lexists(journal):
+        raise SystemExit(0)
+    read()
+    store(journal_state)
+elif action == "state":
+    print(read().get("state"))
+elif action == "remove":
+    read()
+    remove()
+else:
+    refuse("Unknown Worker transaction journal action " + json.dumps(action) + ".")
+JOURNAL_PY
+}
+
+record_worker_transaction_journal() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    if [[ ! "$transaction" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
+        echo "Error: A Worker transaction journal needs a valid transaction ID." >&2
+        return 1
+    fi
+    worker_journal_action write "$(worker_transaction_journal "$root" "$transaction")" "$transaction" started
+}
+
+mark_worker_transaction_state() {
+    local transaction_state="${1:-}"
+    local transaction="${2:-}"
+    local root="${3:-/var/lib/gowave-auto-nginx}"
+    worker_journal_action mark "$(worker_transaction_journal "$root" "$transaction")" "$transaction" "$transaction_state"
+}
+
+reconcile_worker_transaction_journals() {
+    # Every entrypoint pays for the previous run's crash before it writes
+    # anything of its own. A transaction that never reached "installed" is
+    # restored from its own before-images and its directory is released; a
+    # transaction this product cannot restore, or that already installed but
+    # was never finalized, keeps its journal and the new operation is refused,
+    # so a half-written host is never built upon. The state root is where the
+    # journals live and the host root is where the inventoried paths sit; the
+    # two differ only for a test that owns a scratch tree.
+    local skip="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local host_root="${3:-/}"
+    local journal transaction transaction_dir state failed=0
+    [[ "$root" == "/" ]] && root="/var/lib/gowave-auto-nginx"
+    local recovery_root="${root%/}/recovery"
+    [[ -d "$recovery_root" ]] || return 0
+    for journal in "$recovery_root"/*/transaction-journal.json; do
+        [[ -e "$journal" ]] || continue
+        transaction_dir="$(dirname "$journal")"
+        transaction="$(basename "$transaction_dir")"
+        [[ -n "$skip" && "$transaction" == "$skip" ]] && continue
+        if ! state="$(worker_journal_action state "$journal" "$transaction")"; then
+            echo "Error: Uncommitted Worker transaction $transaction cannot be read back; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if [[ "$state" != "started" ]]; then
+            echo "Error: Worker transaction $transaction is '$state' and was never finalized; refusing to start a new install and retaining $transaction_dir. Finalize or roll it back first." >&2
+            failed=1
+            continue
+        fi
+        if [[ -d "$transaction_dir/worker-targets-before-image" ]] &&
+            ! restore_worker_targets_before_image "$host_root" "$transaction_dir/worker-targets-before-image"; then
+            echo "Error: Worker transaction $transaction could not be restored to its Worker before-image; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if [[ -d "$transaction_dir/firewall-before-image" ]] &&
+            ! restore_firewall_before_image "$host_root" "$transaction_dir/firewall-before-image"; then
+            echo "Error: Worker transaction $transaction could not be restored to its firewall before-image; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if ! worker_journal_action remove "$journal" "$transaction"; then
+            echo "Error: Worker transaction $transaction was restored but its journal could not be released; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        echo "Reconciled uncommitted Worker transaction $transaction from its before-images." >&2
+    done
+    return "$failed"
+}
+
 restore_worker_targets_before_image() {
     worker_targets_image restore "${1:-/}" "${2:-$(worker_targets_before_image)}"
 }
@@ -4443,6 +4843,16 @@ compensate_remote_worker() {
     local rollback_failed=0
     echo "[ROLLBACK] Remote worker deployment failed (exit code: $exit_code). Initiating automated compensating rollback..." >&2
 
+    # The before-image is the first thing this run captures and the
+    # only thing a rollback restores from. Without it nothing this run
+    # wrote can be proven and undone, so the refusal that stopped the
+    # run is the whole outcome and the steps below have nothing to do.
+    if [[ -z "${_ACME_TX_ID:-}" ]] ||
+        [[ ! -d "$(worker_targets_before_image "/var/lib/gowave-auto-nginx" "$_ACME_TX_ID")" ]]; then
+        echo "[ROLLBACK] No Worker before-image was captured; nothing to compensate." >&2
+        return "$exit_code"
+    fi
+
     # 1. Stop and remove GoWave Node and Xray systemd services
     if [[ "${_NODE_SERVICE_CONFIGURED:-0}" -eq 1 ]] || systemctl list-unit-files gowave-node.service 2>/dev/null | grep -q gowave-node; then
         echo "[ROLLBACK] Stopping and disabling gowave-node.service and drop-ins..." >&2
@@ -4665,6 +5075,10 @@ main() {
         echo "Error: Invalid Worker ACME transaction ID." >&2
         exit 1
     fi
+    # A run that was killed before it could finish left its journal
+    # behind: it is reconciled here, before this run records a
+    # transaction of its own.
+    reconcile_worker_transaction_journals || return 1
     snapshot_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN"
     snapshot_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN"
     if [[ -n "${VISION_DOMAIN:-}" ]]; then
@@ -4676,6 +5090,11 @@ main() {
     # anything it cannot prove.
     record_worker_targets_before_image \
         "/" "$(worker_targets_before_image "/var/lib/gowave-auto-nginx" "$_ACME_TX_ID")" || return 1
+
+    # Recorded after the before-image and before the first mutation: a
+    # run that dies from here on leaves a journal a later entrypoint can
+    # act on.
+    record_worker_transaction_journal "$_ACME_TX_ID" || return 1
 
     setup_system_prereqs </dev/null
     configure_host_security </dev/null
@@ -4698,6 +5117,11 @@ main() {
     # instead of refusing them, and a rollback can tell them apart from a host
     # object that was already here.
     record_worker_mutation_targets
+
+    # The journal's last word from this side: every path this run wrote
+    # has been verified, so a later entrypoint finds a transaction to
+    # finalize rather than one to undo.
+    mark_worker_transaction_state installed "$_ACME_TX_ID" || return 1
 
     # Disable ERR compensation trap on verified success
     trap - ERR
@@ -5492,11 +5916,216 @@ record_worker_targets_before_image() {
     worker_targets_image capture "${1:-/}" "${2:-$(worker_targets_before_image)}"
 }
 
+worker_transaction_journal() {
+    # One journal per transaction, beside the ACME snapshot and the two
+    # before-images. It is the only record of a run that was killed before it
+    # could finish: the next entrypoint reads it and knows what that run had
+    # already begun to change.
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-}"
+    [[ "$root" == "/" ]] && root="/var/lib/gowave-auto-nginx"
+    printf '%s\n' "${root%/}/recovery/${transaction}/transaction-journal.json"
+}
+
+worker_journal_action() {
+    # One writer for the journal, so the install, the reconcile and the rollback
+    # all read the same bytes back. "started" is written before the first
+    # mutation, "installed" once every mutation has been verified, and a
+    # transaction that never reached "installed" is the one a later entrypoint
+    # has to reconcile.
+    local action="$1"
+    local journal="$2"
+    local transaction="$3"
+    local journal_state="${4:-}"
+    python3 - "$action" "$journal" "$transaction" "$journal_state" <<'JOURNAL_PY'
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+
+action, journal, transaction, journal_state = sys.argv[1:5]
+STATES = ("started", "installed")
+
+
+def refuse(message):
+    print("Error: " + message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read():
+    if os.path.islink(journal) or not os.path.isfile(journal):
+        refuse("Worker transaction journal " + journal + " is not a regular file.")
+    try:
+        with open(journal, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        refuse("Worker transaction journal " + journal + " is not readable JSON.")
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        refuse("Worker transaction journal " + journal + " is not a journal this product wrote.")
+    if data.get("transaction") != transaction:
+        refuse(
+            "Worker transaction journal " + journal + " records "
+            + json.dumps(data.get("transaction")) + ", not " + json.dumps(transaction) + "."
+        )
+    if data.get("state") not in STATES:
+        refuse("Worker transaction journal " + journal + " records no state this product knows.")
+    return data
+
+
+def store(state):
+    # An installed transaction is closed: rewriting it as started would let a
+    # later run undo an install that already verified every path it wrote.
+    if state == "started" and os.path.lexists(journal) and read().get("state") == "installed":
+        refuse("Worker transaction journal " + journal + " is already installed; refusing to reopen it.")
+    directory = os.path.dirname(journal)
+    if os.path.islink(directory):
+        refuse("Worker transaction directory " + directory + " is a symlink.")
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    document = {
+        "schema": 1,
+        "transaction": transaction,
+        "state": state,
+        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".transaction-journal.", suffix=".tmp")
+    try:
+        os.fchmod(handle, 0o600)
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(document, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, journal)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    directory_handle = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_handle)
+    finally:
+        os.close(directory_handle)
+
+
+def remove():
+    # The directory goes only while it is strictly below the recovery root it was
+    # found in, so a transaction name can never name its way out of that root.
+    recovery_root = os.path.realpath(os.path.dirname(os.path.dirname(journal)))
+    transaction_dir = os.path.realpath(os.path.dirname(journal))
+    if recovery_root == os.sep or not transaction_dir.startswith(recovery_root + os.sep):
+        refuse("Worker transaction directory " + transaction_dir + " is not below " + recovery_root + ".")
+    if os.path.islink(os.path.dirname(journal)):
+        refuse("Worker transaction directory " + os.path.dirname(journal) + " is a symlink.")
+    if not os.path.isdir(transaction_dir):
+        refuse("Worker transaction directory " + transaction_dir + " is not a directory.")
+    shutil.rmtree(transaction_dir)
+
+
+if action == "write":
+    if journal_state not in STATES:
+        refuse("Unknown Worker transaction state " + json.dumps(journal_state) + ".")
+    store(journal_state)
+elif action == "mark":
+    if journal_state not in STATES:
+        refuse("Unknown Worker transaction state " + json.dumps(journal_state) + ".")
+    if not os.path.lexists(journal):
+        raise SystemExit(0)
+    read()
+    store(journal_state)
+elif action == "state":
+    print(read().get("state"))
+elif action == "remove":
+    read()
+    remove()
+else:
+    refuse("Unknown Worker transaction journal action " + json.dumps(action) + ".")
+JOURNAL_PY
+}
+
+record_worker_transaction_journal() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    if [[ ! "$transaction" =~ ^worker_install_[A-Za-z0-9._-]{1,100}$ ]]; then
+        echo "Error: A Worker transaction journal needs a valid transaction ID." >&2
+        return 1
+    fi
+    worker_journal_action write "$(worker_transaction_journal "$root" "$transaction")" "$transaction" started
+}
+
+mark_worker_transaction_state() {
+    local transaction_state="${1:-}"
+    local transaction="${2:-}"
+    local root="${3:-/var/lib/gowave-auto-nginx}"
+    worker_journal_action mark "$(worker_transaction_journal "$root" "$transaction")" "$transaction" "$transaction_state"
+}
+
+reconcile_worker_transaction_journals() {
+    # Every entrypoint pays for the previous run's crash before it writes
+    # anything of its own. A transaction that never reached "installed" is
+    # restored from its own before-images and its directory is released; a
+    # transaction this product cannot restore, or that already installed but
+    # was never finalized, keeps its journal and the new operation is refused,
+    # so a half-written host is never built upon. The state root is where the
+    # journals live and the host root is where the inventoried paths sit; the
+    # two differ only for a test that owns a scratch tree.
+    local skip="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local host_root="${3:-/}"
+    local journal transaction transaction_dir state failed=0
+    [[ "$root" == "/" ]] && root="/var/lib/gowave-auto-nginx"
+    local recovery_root="${root%/}/recovery"
+    [[ -d "$recovery_root" ]] || return 0
+    for journal in "$recovery_root"/*/transaction-journal.json; do
+        [[ -e "$journal" ]] || continue
+        transaction_dir="$(dirname "$journal")"
+        transaction="$(basename "$transaction_dir")"
+        [[ -n "$skip" && "$transaction" == "$skip" ]] && continue
+        if ! state="$(worker_journal_action state "$journal" "$transaction")"; then
+            echo "Error: Uncommitted Worker transaction $transaction cannot be read back; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if [[ "$state" != "started" ]]; then
+            echo "Error: Worker transaction $transaction is '$state' and was never finalized; refusing to start a new install and retaining $transaction_dir. Finalize or roll it back first." >&2
+            failed=1
+            continue
+        fi
+        if [[ -d "$transaction_dir/worker-targets-before-image" ]] &&
+            ! restore_worker_targets_before_image "$host_root" "$transaction_dir/worker-targets-before-image"; then
+            echo "Error: Worker transaction $transaction could not be restored to its Worker before-image; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if [[ -d "$transaction_dir/firewall-before-image" ]] &&
+            ! restore_firewall_before_image "$host_root" "$transaction_dir/firewall-before-image"; then
+            echo "Error: Worker transaction $transaction could not be restored to its firewall before-image; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        if ! worker_journal_action remove "$journal" "$transaction"; then
+            echo "Error: Worker transaction $transaction was restored but its journal could not be released; refusing to start a new install and retaining $transaction_dir." >&2
+            failed=1
+            continue
+        fi
+        echo "Reconciled uncommitted Worker transaction $transaction from its before-images." >&2
+    done
+    return "$failed"
+}
+
 restore_worker_targets_before_image() {
     worker_targets_image restore "${1:-/}" "${2:-$(worker_targets_before_image)}"
 }
 
 rollback_failed=0
+
+# A previous run that was killed before it could finish left its
+# journal behind: it is reconciled under this lock, before this
+# entrypoint accepts work of its own.
+reconcile_worker_transaction_journals "${ACME_TX_ID:-}" || rollback_failed=1
 
 # 1. Stop and disable systemd services that are actually installed or active.
 for unit in gowave-node.service xray.service; do

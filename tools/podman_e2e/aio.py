@@ -47,6 +47,7 @@ from . import (
     transaction_recovery,
     traffic_probe,
     trust_bundle,
+    worker_journal,
     # ``cases()`` takes a ``vision`` boolean, so the module is imported under a
     # name the parameter cannot shadow.
     vision as vision_policy,
@@ -8940,6 +8941,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # the cleanup reported incomplete rather than claimed as a rollback.
         Case(mutation_baseline.CASE_ID, "aio",
              lambda context: mutation_baseline.case_panel_mutation_targets_are_restored(
+                 product, context),
+             timeout_seconds=300),
+        # The journal an interrupted Worker install leaves behind: the writer,
+        # the mark that closes it and the reconcile the next entrypoint runs are
+        # all the product's, driven over a scratch root, so a run killed before
+        # its before-image was restored is discovered rather than built upon.
+        Case(worker_journal.CASE_ID, "aio",
+             lambda context: worker_journal.case_panel_journal_is_reconciled(
                  product, context),
              timeout_seconds=300),
         # The journal an interrupted switch leaves behind, and the boot recovery

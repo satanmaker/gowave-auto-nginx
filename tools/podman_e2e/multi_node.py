@@ -37,7 +37,8 @@ from tools.podman_e2e import (
     ownership_targets,
     preflight_cases, revocation,
     runstate_cases,
-    skip_policy, status, teardown, topology, transaction_recovery, trust_bundle, vision as vision_policy,
+    skip_policy, status, teardown, topology, transaction_recovery, trust_bundle,
+    vision as vision_policy, worker_journal,
 )
 from tools.podman_e2e.podman import wait_until
 from tools.podman_e2e.runner import Case, CaseBlocked, CaseIncomplete, require
@@ -8820,6 +8821,13 @@ def cases(
         # ownership record and its restore, over the same real tree.
         Case(mutation_baseline.CASE_ID, "multi-node",
              lambda context: mutation_baseline.case_worker_mutation_targets_are_restored(
+                 product, context),
+             timeout_seconds=300),
+        # The same journal on the Worker: the install that was killed leaves the
+        # record, and the reconcile restores from the before-image or refuses and
+        # retains it — one implementation read by both entrypoints.
+        Case(worker_journal.CASE_ID, "multi-node",
+             lambda context: worker_journal.case_worker_journal_is_reconciled(
                  product, context),
              timeout_seconds=300),
         # The same journal and the same boot recovery as the All-in-One: the

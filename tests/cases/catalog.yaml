@@ -4000,8 +4000,46 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: worker_journal:case_panel_journal_is_reconciled
+      evidence:
+      - cleanup_reported_incomplete
+      - failed_restore_retains_the_journal
+      - firewall_image_is_consulted
+      - installed_journal_retained
+      - journal_is_per_transaction
+      - journal_mode_is_private
+      - journal_names_the_transaction
+      - journal_released_after_reconcile
+      - mark_records_installed
+      - nothing_written_is_reconciled
+      - own_transaction_skipped
+      - pre_existing_path_restored
+      - reopen_is_refused
+      - second_reconcile_is_a_no_op
+      - unprovable_created_path_retained
+      - unreadable_journal_refused
+    multi-node:
+      driver: worker_journal:case_worker_journal_is_reconciled
+      evidence:
+      - cleanup_reported_incomplete
+      - failed_restore_retains_the_journal
+      - firewall_image_is_consulted
+      - installed_journal_retained
+      - journal_is_per_transaction
+      - journal_mode_is_private
+      - journal_names_the_transaction
+      - journal_released_after_reconcile
+      - mark_records_installed
+      - nothing_written_is_reconciled
+      - own_transaction_skipped
+      - pre_existing_path_restored
+      - reopen_is_refused
+      - second_reconcile_is_a_no_op
+      - unprovable_created_path_retained
+      - unreadable_journal_refused
   promotion_target: null
 - id: HOOK-04
   requirement: Global Certbot Deploy Hook Ownership
