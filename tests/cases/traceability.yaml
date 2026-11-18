@@ -762,6 +762,48 @@ cases_by_requirement:
       binaries, links and webroot, so the next install refuses and names the
       first path it cannot prove rather than overwriting it.
   - requirement: Live scenario parity
+    cases: [OWN-03]
+    reason: >-
+      OWN-03 is the firewall half of the same sentence: a host whose UFW is
+      active, or holds rules and default policies the operator set, must come
+      back from an injected failure with every original rule, every default
+      policy and the enabled state -- not with the four rules this install adds
+      deleted from whatever is left. The before-image is `firewall_image
+      capture` inside the payload's `configure_firewall`, taken before the first
+      `ufw default`, `ufw allow` or `ufw --force enable` runs; the way back is
+      `firewall_image restore`, which the compensating rollback and the
+      standalone rollback both call. The image lives in the transaction's own
+      recovery directory and holds the enabled state, the three default
+      policies, the rule text, the IPv4 and IPv6 kernel dumps and the seven UFW
+      configuration files it may rewrite, each copy at mode 0600 with its digest
+      and its owner, and a baseline it cannot read back is refused before
+      anything is mutated. The case drives the four shipped functions over a
+      scratch root whose `ufw`, `iptables-save`, `ip6tables-save`,
+      `iptables-restore` and `ip6tables-restore` are shims that keep the state
+      in files, and reads back twenty facts: the image is per transaction,
+      taking it changes nothing, it names the enabled state, the three policies,
+      the rule text, both dumps and the configuration it rewrote, a second
+      capture is refused rather than overwriting the first, a firewall that was
+      off is captured as off rather than refused, a restore with no image is
+      refused rather than guessing, the read-back compares the rules and not the
+      counters and the timestamp a dump carries, and an install whose baseline
+      cannot be read is refused and leaves no half image behind. The injected
+      failure is the install's own sequence -- `user.rules` rewritten with its
+      two rules, the operator's permissive incoming policy set to deny, UFW
+      enabled -- and the restore returns the active state, the rule that lived
+      only in the kernel dump and therefore in no file UFW reloads, the
+      operator's own policy and the original `/etc/default/ufw`, and a second
+      restore leaves the same firewall; the other direction starts from an
+      inactive UFW, whose `ufw status verbose` prints no default policy line at
+      all and whose rules live only in the kernel, and ends inactive with them
+      back. The read-back is the product's own: `ufw status verbose` must
+      match the image byte for byte, and `iptables-save` must return the same
+      rules once the timestamp and the counters it prints are set aside -- they
+      move by themselves, and a restore zeroes them -- so a partial restore is a
+      refusal and not a report. The kernel is not the
+      subject and no host is touched: no install runs, and the container proves
+      the functions' verdict and the bytes they leave on disk.
+  - requirement: Live scenario parity
     cases: [HOOK-01]
     reason: >-
       HOOK-01 is the shape half of the same sentence: a manifest records that a

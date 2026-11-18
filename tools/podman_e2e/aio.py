@@ -33,6 +33,7 @@ from . import (
     matrix,
     operator_access,
     ownership,
+    firewall_image,
     ownership_targets,
     panel_surface,
     preflight_cases,
@@ -8922,6 +8923,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # refused before anything is touched.
         Case(ownership_targets.CASE_ID, "aio",
              lambda context: ownership_targets.case_panel_mutation_targets_are_not_adopted(
+                 product, context),
+             timeout_seconds=300),
+        # The firewall this install reconfigures: the before-image and the
+        # restore are the product's, driven over a scratch root with ufw and
+        # iptables answered by shims, so an operator rule, the default policies
+        # and the enabled state come back together.
+        Case(firewall_image.CASE_ID, "aio",
+             lambda context: firewall_image.case_panel_firewall_policy_is_preserved(
                  product, context),
              timeout_seconds=300),
         # The journal an interrupted switch leaves behind, and the boot recovery
