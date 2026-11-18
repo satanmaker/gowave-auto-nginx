@@ -33,6 +33,7 @@ from tools.podman_e2e import (
     acme_fixture, aio, argv_probe, budget, denial, environment_gate, hook_ownership,
     ingress, local_ci,
     lock_cases, matrix as matrix_data, mtls, operator_access, ownership,
+    ownership_targets,
     preflight_cases, revocation,
     runstate_cases,
     skip_policy, status, teardown, topology, transaction_recovery, trust_bundle, vision as vision_policy,
@@ -8798,6 +8799,14 @@ def cases(
         # this run created is marked for the rollback to remove.
         Case(ownership.CASE_ID, "multi-node",
              lambda context: ownership.case_worker_sysctl_is_not_adopted(product, context),
+             timeout_seconds=300),
+        # The Worker paths this install would remove on rollback: the payload's
+        # preflight runs here, on the host an install would run it on, so a unit
+        # file, a binary directory and a symlink this install did not write are
+        # refused before the first managed path is touched.
+        Case(ownership_targets.CASE_ID, "multi-node",
+             lambda context: ownership_targets.case_worker_mutation_targets_are_not_adopted(
+                 product, context),
              timeout_seconds=300),
         # The same journal and the same boot recovery as the All-in-One: the
         # recovery is per host, so both contours read one implementation.

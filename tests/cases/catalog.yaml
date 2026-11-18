@@ -244,8 +244,52 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: ownership_targets:case_panel_mutation_targets_are_not_adopted
+      evidence:
+      - changed_digest_named
+      - changed_digest_refused
+      - empty_root_accepted
+      - foreign_bytes_intact
+      - foreign_dir_refused
+      - foreign_mode_intact
+      - foreign_refused
+      - nothing_created_before_refusal
+      - record_adopts_own_paths
+      - record_mode_is_private
+      - record_names_the_file
+      - recorded_symlink_adopted
+      - recorded_symlink_kept
+      - refusal_names_the_path
+      - repointed_symlink_named
+      - repointed_symlink_refused
+      - symlink_intact
+      - symlink_refused
+      - unclaimed_record_refused
+    multi-node:
+      driver: ownership_targets:case_worker_mutation_targets_are_not_adopted
+      evidence:
+      - changed_digest_named
+      - changed_digest_refused
+      - empty_root_accepted
+      - foreign_bytes_intact
+      - foreign_dir_refused
+      - foreign_mode_intact
+      - foreign_refused
+      - nothing_created_before_refusal
+      - record_adopts_own_paths
+      - record_mode_is_private
+      - record_names_the_file
+      - recorded_symlink_adopted
+      - recorded_symlink_kept
+      - refusal_names_the_path
+      - repointed_symlink_named
+      - repointed_symlink_refused
+      - symlink_intact
+      - symlink_refused
+      - unclaimed_record_refused
   promotion_target: null
 - id: OWN-03
   requirement: Complete Mutation-Target Baseline and Resource Ownership

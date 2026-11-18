@@ -33,6 +33,7 @@ from . import (
     matrix,
     operator_access,
     ownership,
+    ownership_targets,
     panel_surface,
     preflight_cases,
     revocation,
@@ -8914,6 +8915,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # file and a symlink are refused rather than truncated.
         Case(ownership.CASE_ID, "aio",
              lambda context: ownership.case_panel_sysctl_is_not_adopted(product, context),
+             timeout_seconds=300),
+        # The Worker paths this install would remove on rollback: the shipped
+        # preflight and its record are driven over a scratch root, so a unit
+        # file, a binary directory and a symlink this install did not write are
+        # refused before anything is touched.
+        Case(ownership_targets.CASE_ID, "aio",
+             lambda context: ownership_targets.case_panel_mutation_targets_are_not_adopted(
+                 product, context),
              timeout_seconds=300),
         # The journal an interrupted switch leaves behind, and the boot recovery
         # that reads it: both the writer and the shell recovery are the product's.

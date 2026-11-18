@@ -727,6 +727,41 @@ cases_by_requirement:
       `modprobe`, `systemctl` and `swapon` answer from shims, so no host is
       touched and no install runs.
   - requirement: Live scenario parity
+    cases: [OWN-02]
+    reason: >-
+      OWN-02 is the container half of the live requirement's scenario "Existing
+      Worker service or binary paths are not removed": a systemd unit, drop-in,
+      binary or managed webroot that already exists is not a rollback target
+      unless a complete ownership record proves it belongs to this run. The
+      guard is `verify_worker_mutation_targets_preflight` in the payload
+      `gowave-node-auto.sh` streams to the host, and its writer is
+      `record_worker_mutation_targets`, which records every managed path this
+      install left behind with the digest of each file and the target of each
+      link it wrote, at mode 0600. The guard
+      runs in `main` after the deploy-hook preflight and before the first
+      managed path is touched -- before `setup_system_prereqs`,
+      `configure_host_security`, `configure_firewall`, `unpack_cover_reality`,
+      `configure_edge_nginx` and the upstream installer -- so a refusal leaves
+      the host as it was. The case drives both shipped functions over a scratch
+      root and reads back nineteen facts: a unit file another tool wrote is
+      refused with the path named and keeps its bytes and its mode, a directory
+      at a managed binary path is refused, a symlink is refused even when its
+      target holds the very bytes the record names and stays a link, the guard
+      writes no record on its way out, the record this install wrote adopts its
+      own files and names them, a recorded file whose bytes changed is refused
+      with its path named, a record that does not claim this product created
+      anything is refused rather than trusted, a root with none of the
+      managed paths is accepted, and the link the upstream installer writes into
+      `/usr/local/bin` is adopted by the target the record names, stays that
+      link, and is refused once it is re-pointed elsewhere. What the container
+      proves is the guard's
+      verdict and the bytes it leaves on disk; the live run remains the source
+      of truth for the paths a real Worker carries before the first remote
+      mutation. The record is the upgrade boundary this batch discloses: a host
+      installed before the record existed has no record to adopt its unit,
+      binaries, links and webroot, so the next install refuses and names the
+      first path it cannot prove rather than overwriting it.
+  - requirement: Live scenario parity
     cases: [HOOK-01]
     reason: >-
       HOOK-01 is the shape half of the same sentence: a manifest records that a
