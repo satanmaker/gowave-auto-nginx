@@ -41,6 +41,7 @@ from . import (
     preflight_cases,
     revocation,
     runstate_cases,
+    signal_compensation,
     skip_policy,
     status,
     teardown,
@@ -8958,6 +8959,13 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # instead of being called clean.
         Case(package_residual.CASE_ID, "aio",
              lambda context: package_residual.case_panel_package_residuals(
+                 product, context),
+             timeout_seconds=300),
+        # The payload's own signal block, driven over a scratch host root: one
+        # compensation per interruption, the before-image put back and verified,
+        # the journal left for the next entrypoint and a nonzero exit.
+        Case(signal_compensation.CASE_ID, "aio",
+             lambda context: signal_compensation.case_panel_signal_is_compensated_once(
                  product, context),
              timeout_seconds=300),
         # The journal an interrupted switch leaves behind, and the boot recovery

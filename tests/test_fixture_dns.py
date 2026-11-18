@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DNS_SERVER = REPO_ROOT / "tests" / "fixtures" / "dns_server.py"
@@ -54,6 +55,12 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+#: How many ports a start may try. The probe closes the socket it bound, so
+#: another process can take the number before the fixture binds it; the retry is
+#: what turns that race into a start rather than a red suite.
+START_ATTEMPTS = 5
+
+
 class DnsFixture:
     def __init__(self, zone: dict, extra_args=None, log_path=None) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -61,19 +68,29 @@ class DnsFixture:
         self.zone_path = root / "dns-zone.json"
         self.log_path = Path(log_path) if log_path else root / "dns-queries.jsonl"
         self.zone_path.write_text(json.dumps(zone), encoding="utf-8")
-        self.port = free_port()
-        self.process = subprocess.Popen(
-            [
-                sys.executable, str(DNS_SERVER),
-                "--listen", "127.0.0.1",
-                "--port", str(self.port),
-                "--zone", str(self.zone_path),
-                "--log", str(self.log_path),
-                *(extra_args or ()),
-            ],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        self._wait_ready()
+        for attempt in range(1, START_ATTEMPTS + 1):
+            self.port = free_port()
+            self.process = subprocess.Popen(
+                [
+                    sys.executable, str(DNS_SERVER),
+                    "--listen", "127.0.0.1",
+                    "--port", str(self.port),
+                    "--zone", str(self.zone_path),
+                    "--log", str(self.log_path),
+                    *(extra_args or ()),
+                ],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                self._wait_ready()
+                return
+            except RuntimeError as error:
+                lost_the_port = "Address already in use" in str(error)
+                if self.process.poll() is None:
+                    self.process.kill()
+                self.process.wait(timeout=10)
+                if not lost_the_port or attempt == START_ATTEMPTS:
+                    raise
 
     def _wait_ready(self) -> None:
         deadline = time.monotonic() + 10
@@ -247,6 +264,36 @@ class TestDnsFixture(unittest.TestCase):
         _, _, answers = fixture.query("worker.testbed.internal")
         self.assertEqual(answers[0]["value"], "10.89.0.12")
         self.assertEqual(answers[0]["ttl"], 60)
+
+    def test_a_port_taken_between_the_probe_and_the_bind_is_retried(self):
+        """The start survives the race that `free_port` cannot close itself."""
+        taken = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        taken.bind(("127.0.0.1", 0))
+        self.addCleanup(taken.close)
+        occupied = taken.getsockname()[1]
+        ports = iter([occupied] + [free_port() for _ in range(START_ATTEMPTS)])
+
+        with mock.patch.object(sys.modules[__name__], "free_port", lambda: next(ports)):
+            fixture = self.fixture()
+        self.assertNotEqual(fixture.port, occupied)
+        _, rcode, answers = fixture.query("panel.testbed.internal", TYPE_A)
+        self.assertEqual(rcode, 0)
+        self.assertEqual(answers[0]["value"], "10.89.0.10")
+
+    def test_a_start_that_fails_for_another_reason_is_not_retried(self):
+        """Five silent attempts would turn a broken fixture into a slow red."""
+        original = free_port
+        probes = []
+
+        def counted() -> int:
+            port = original()
+            probes.append(port)
+            return port
+
+        with mock.patch.object(sys.modules[__name__], "free_port", counted):
+            with self.assertRaisesRegex(RuntimeError, "usage|unrecognized|error"):
+                DnsFixture(BASE_ZONE, extra_args=("--no-such-option",))
+        self.assertEqual(len(probes), 1)
 
 
 if __name__ == "__main__":

@@ -302,8 +302,9 @@ class TestWorkerJournalCase(unittest.TestCase):
         call = 'reconcile_worker_transaction_journals "${ACME_TX_ID:-}" || rollback_failed=1\n'
         self.assertEqual(body.count(call), 1)
         self.assertLess(body.index("rollback_failed=0\n"), body.index(call))
-        # The rollback script's own restore comes after the call: the first
-        # occurrence of the restore belongs to the payload's compensation.
+        # The rollback script reconciles before it restores, and it restores
+        # unconditionally: the script is run on the host it rolls back, so it is
+        # the one caller with no host root to carry.
         after = body.index(call)
         self.assertLess(
             after,

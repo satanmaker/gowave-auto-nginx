@@ -4124,8 +4124,40 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: signal_compensation:case_panel_signal_is_compensated_once
+      evidence:
+      - compensation_restored_the_before_image
+      - compensation_restored_the_mode
+      - compensation_runs_exactly_once
+      - failed_restore_is_reported_incomplete
+      - hup_handler_runs_compensation
+      - int_handler_runs_compensation
+      - interruption_state_is_persisted
+      - journal_survives_every_signal
+      - no_mutation_after_the_signal
+      - restored_state_is_verified
+      - signal_exit_is_nonzero
+      - temp_files_are_cleaned
+      - term_handler_runs_compensation
+    multi-node:
+      driver: signal_compensation:case_worker_signal_is_compensated_once
+      evidence:
+      - compensation_restored_the_before_image
+      - compensation_restored_the_mode
+      - compensation_runs_exactly_once
+      - failed_restore_is_reported_incomplete
+      - hup_handler_runs_compensation
+      - int_handler_runs_compensation
+      - interruption_state_is_persisted
+      - journal_survives_every_signal
+      - no_mutation_after_the_signal
+      - restored_state_is_verified
+      - signal_exit_is_nonzero
+      - temp_files_are_cleaned
+      - term_handler_runs_compensation
   promotion_target: null
 - id: TXN-02
   requirement: Signal-Safe and Verifiable Transaction Compensation

@@ -38,6 +38,7 @@ from tools.podman_e2e import (
     package_residual,
     preflight_cases, revocation,
     runstate_cases,
+    signal_compensation,
     skip_policy, status, teardown, topology, transaction_recovery, trust_bundle,
     vision as vision_policy, worker_journal,
 )
@@ -8835,6 +8836,13 @@ def cases(
         # delta, read by the same teardown report the Master's run hands them to.
         Case(package_residual.CASE_ID, "multi-node",
              lambda context: package_residual.case_worker_package_residuals(
+                 product, context),
+             timeout_seconds=300),
+        # The same signal block on the Worker, driven over a scratch host root:
+        # one compensation per interruption, the before-image put back and
+        # verified, the journal left for the next entrypoint and a nonzero exit.
+        Case(signal_compensation.CASE_ID, "multi-node",
+             lambda context: signal_compensation.case_worker_signal_is_compensated_once(
                  product, context),
              timeout_seconds=300),
         # The same journal and the same boot recovery as the All-in-One: the

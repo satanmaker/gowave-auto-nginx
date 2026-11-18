@@ -390,7 +390,11 @@ vision_domain=vision.example.test
         inventory_end = node_script.index("\n}\n", inventory_start) + len("\n}\n")
         self.assertIn("/etc/nginx/conf.d/gowave-worker-vision-fallback.conf",
                       node_script[inventory_start:inventory_end])
-        self.assertIn("restore_worker_targets_before_image || rollback_failed=1", compensation)
+        self.assertIn('restore_worker_targets_before_image \\\n'
+                      '        "$host_root" "$(worker_targets_before_image "$state_root" '
+                      '"$_ACME_TX_ID")" ||\n'
+                      '        rollback_failed=1\n',
+                      compensation)
         self.assertIn('if [[ -n "${VISION_DOMAIN:-}" ]]; then', compensation)
         self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN"', compensation)
     def test_case_matrix_counts_match_independent_vision_topologies(self):
