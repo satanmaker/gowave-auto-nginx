@@ -948,15 +948,21 @@ PAYLOAD_EXPORT = """printf 'export GOWAVE_LEASE_TOKEN=%q\\n' "${GOWAVE_WORKER_LE
 
 
 def _assert_dispatch_forwarding(text):
-    """Every dispatch carries the Worker's own transit variable, five of five."""
+    """Every dispatch carries the Worker's own transit variable, four lines for five dispatches.
+
+    Four lines rather than five since the two node-add failure paths stopped
+    calling ``remote_rollback`` themselves and share ``finalize_failed_node_add``:
+    one line still serves both of them, and the total stays pinned so a further
+    way to ask the Worker to act cannot appear without a lease line of its own.
+    """
     lines = text.splitlines()
     exports = [index for index, line in enumerate(lines) if line.strip() == LEASE_FORWARDING.strip()]
     dispatches = [index for index, line in enumerate(lines) if DISPATCH.search(line)]
-    if len(exports) != 5 or len(dispatches) != 5:
+    if len(exports) != 4 or len(dispatches) != 4:
         raise AssertionError(
             f"{len(exports)} lease-forwarding lines for {len(dispatches)} dispatches, and there "
-            "are five dispatches: a rollback or deploy started without the Worker's lease can "
-            "only be refused by the Worker's own lock"
+            "are four dispatches over five ways the Worker is asked to act: a rollback or deploy "
+            "started without the Worker's lease can only be refused by the Worker's own lock"
         )
     for export, dispatch in zip(exports, dispatches):
         if dispatch != export + 1:

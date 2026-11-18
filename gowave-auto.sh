@@ -639,6 +639,67 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
     cmd_user_links default-user
 }
 
+# Compensate a failed `node add` on both sides and record what each one reached.
+#
+# The Panel API rollback is the writer that finalizes the journal as
+# NODE_ADD_ROLLED_BACK, and it runs on the Master while the Worker restore runs
+# on another host: a Worker failure discovered after the API side succeeded would
+# otherwise leave a transaction recorded as rolled back over a host that was
+# never put back. Both sides are attempted, both verdicts are written into the
+# journal by modules.recovery, and the operation is reported INCOMPLETE unless
+# both sides verified. The caller's panel_ip, panel_ipv6, node_port,
+# vision_domain and known_hosts are read from the enclosing scope.
+finalize_failed_node_add() {
+    local name="$1"
+    local ip="$2"
+    local ssh_port="$3"
+    local worker_domain="$4"
+    local reality_domain="$5"
+    local ssh_user="$6"
+    local acme_tx_id="$7"
+    local worker_status="INCOMPLETE"
+    local api_status="INCOMPLETE"
+
+    if ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
+        VISION_DOMAIN="$vision_domain" \
+        GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
+        "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
+        worker_status="ROLLED_BACK"
+    else
+        echo "CRITICAL: Remote Worker host rollback failed; manual inspection required." >&2
+    fi
+
+    if PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from modules.api_client import rollback_provisioning
+import sys
+sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE') else 1)
+"; then
+        api_status="ROLLED_BACK"
+    else
+        echo "CRITICAL: API rollback incomplete; recovery journal requires operator attention." >&2
+    fi
+
+    if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$JOURNAL_FILE" "$worker_status" "$api_status" <<'PY'
+from modules.recovery import record_rollback_sides
+import sys
+
+journal_path, worker_status, api_status = sys.argv[1:]
+record_rollback_sides(journal_path, worker_status, api_status)
+PY
+    then
+        echo "CRITICAL: the rollback outcome for Worker '$name' could not be recorded; the recovery journal was not rewritten." >&2
+        return 1
+    fi
+
+    if [[ "$worker_status" != "ROLLED_BACK" || "$api_status" != "ROLLED_BACK" ]]; then
+        echo "CRITICAL: Node add '$name' is INCOMPLETE: Worker $worker_status, Panel API $api_status; both sides recorded in $JOURNAL_FILE." >&2
+        echo "CRITICAL: Rollback failed for Worker '$name'; recovery journal retained." >&2
+        return 1
+    fi
+    echo "Node add '$name' rolled back: Worker and Panel API both verified." >&2
+    return 0
+}
+
 cmd_node() {
     local subcmd="${1:-}"
     shift || true
@@ -905,25 +966,8 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
                 GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
                 SSH_KNOWN_HOSTS="$known_hosts" "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
                 echo "Remote Worker deployment failed; rolling back Worker host configuration and Panel API entities." >&2
-                local rollback_failed=0
-                if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
-                    VISION_DOMAIN="$vision_domain" \
-                    GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
-                    "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
-                    echo "CRITICAL: Remote Worker host rollback failed; manual inspection required." >&2
-                    rollback_failed=1
-                fi
-                if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
-from modules.api_client import rollback_provisioning
-import sys
-sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE') else 1)
-"; then
-                    echo "CRITICAL: API rollback incomplete; recovery journal requires operator attention." >&2
-                    rollback_failed=1
-                fi
-                if (( rollback_failed != 0 )); then
-                    echo "CRITICAL: Rollback failed for Worker '$name'; recovery journal retained." >&2
-                fi
+                finalize_failed_node_add "$name" "$ip" "$ssh_port" \
+                    "$worker_domain" "$reality_domain" "$ssh_user" "$acme_tx_id" || true
                 return 1
             fi
 
@@ -941,25 +985,8 @@ jdata['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 write_journal_atomically('$JOURNAL_FILE', jdata)
 "; then
                 echo "CRITICAL: Worker deployment succeeded but the commit journal could not be persisted; compensating both sides." >&2
-                local rollback_failed=0
-                if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
-                    VISION_DOMAIN="$vision_domain" \
-                    GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
-                    "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
-                    echo "CRITICAL: Remote Worker rollback after commit-record failure was incomplete." >&2
-                    rollback_failed=1
-                fi
-                if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
-from modules.api_client import rollback_provisioning
-import sys
-sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE') else 1)
-"; then
-                    echo "CRITICAL: API rollback after commit-record failure was incomplete." >&2
-                    rollback_failed=1
-                fi
-                if (( rollback_failed != 0 )); then
-                    echo "CRITICAL: Worker '$name' requires manual recovery; journal retained." >&2
-                fi
+                finalize_failed_node_add "$name" "$ip" "$ssh_port" \
+                    "$worker_domain" "$reality_domain" "$ssh_user" "$acme_tx_id" || true
                 return 1
             fi
             if ! ACME_TX_ID="$acme_tx_id" SSH_KNOWN_HOSTS="$known_hosts" \

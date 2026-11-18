@@ -4252,8 +4252,36 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: rollback_sides:case_worker_and_api_rollback_are_both_required
+      evidence:
+      - api_refusal_survives_the_record
+      - api_verified_worker_incomplete_is_incomplete
+      - both_sides_are_recorded
+      - both_verified_is_rolled_back
+      - complete_is_reported
+      - incomplete_is_reported
+      - records_retained_on_incomplete
+      - rollback_refusal_retained
+      - worker_attempted_with_the_transaction
+      - worker_side_attempted
+      - worker_verified_api_incomplete_is_incomplete
+    multi-node:
+      driver: rollback_sides:case_worker_and_api_rollback_are_both_required
+      evidence:
+      - api_refusal_survives_the_record
+      - api_verified_worker_incomplete_is_incomplete
+      - both_sides_are_recorded
+      - both_verified_is_rolled_back
+      - complete_is_reported
+      - incomplete_is_reported
+      - records_retained_on_incomplete
+      - rollback_refusal_retained
+      - worker_attempted_with_the_transaction
+      - worker_side_attempted
+      - worker_verified_api_incomplete_is_incomplete
   promotion_target: null
 - id: TD-01
   requirement: Teardown Policy Enforcement

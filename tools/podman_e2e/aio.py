@@ -40,6 +40,7 @@ from . import (
     panel_surface,
     preflight_cases,
     revocation,
+    rollback_sides,
     runstate_cases,
     signal_compensation,
     skip_policy,
@@ -8972,6 +8973,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # that reads it: both the writer and the shell recovery are the product's.
         Case(transaction_recovery.CASE_ID, "aio",
              lambda context: transaction_recovery.case_interrupted_mutation_leaves_a_validated_journal(
+                 product, context),
+             timeout_seconds=300),
+        # The end of that transaction: both compensation sides are recorded, and
+        # a transaction is only rolled back once the Worker host and the Panel API
+        # have each verified. The Worker is a stub script, the API is the
+        # product's own rollback over a journal this case wrote.
+        Case(rollback_sides.CASE_ID, "aio",
+             lambda context: rollback_sides.case_worker_and_api_rollback_are_both_required(
                  product, context),
              timeout_seconds=300),
         # The end of the same transaction: the temporary key is revoked on the

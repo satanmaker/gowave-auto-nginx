@@ -733,6 +733,30 @@ cases_by_requirement:
       is taken before the journal is read and before it is validated, which is
       what makes the next mutation wait for the recovery.
   - requirement: Live scenario parity
+    cases: [TXN-03]
+    reason: >-
+      TXN-03 is the two-sided sentence of the transactional requirement: a failed
+      `node add` whose Worker restore and Panel rollback disagree is reported
+      INCOMPLETE and is not recorded as rolled back until both sides verify.
+      `tools/podman_e2e/rollback_sides.py` slices the shipped
+      `finalize_failed_node_add` out of `gowave-auto.sh` and runs it over a
+      scratch tree. The Worker side is a stub `$SCRIPT_DIR/gowave-node-auto.sh`
+      that records the transaction it was given and exits with the scenario's
+      status — the seam the product already has, because the Worker rollback is
+      a separate process on another host — and the API side is the product's own
+      `rollback_provisioning` reading a journal this case wrote with the
+      product's own atomic writer. Three runs decide the sentence: a
+      `NODE_ADD_PREPARED` journal with no entities is a verified API side, and a
+      `NODE_ADD_APPLYING` journal without a durable action ledger is the refusal
+      that same function records. Each side failing while the other succeeds
+      leaves the journal in `NODE_ADD_ROLLBACK_REQUIRED` with `rollback_sides`
+      naming both verdicts, the aggregate refusal an operator reads, and the
+      API's own refusal still in the record; both sides verified is the only run
+      that reaches `NODE_ADD_ROLLED_BACK`. That the API writer cannot hide a
+      later Worker failure is the clause the product failed before this case:
+      the API rollback finalized a clean rollback itself, so the journal said
+      ROLLED_BACK over a host that was never put back.
+  - requirement: Live scenario parity
     cases: [OWN-01]
     reason: >-
       OWN-01 is the container half of the live requirement's scenario "Existing
