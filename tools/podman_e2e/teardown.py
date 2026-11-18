@@ -290,9 +290,36 @@ def case_teardown_policy(context: RunContext) -> Dict[str, Any]:
             "changes nothing cannot fail on the run it preserved"
         )
         assert untouched["policy"] == "PRESERVE", f"PRESERVE recorded the policy {untouched['policy']!r}"
-        assert set(untouched) == {"status", "policy", "message"}, (
+        assert set(untouched) == {
+            "status", "policy", "message", "residual_state",
+            "restored_baseline", "clean_baseline_eligible",
+        }, (
             f"the PRESERVE record carries {sorted(untouched)}: a teardown record that restates "
             "the test outcome makes a preserved host look like a verdict about the run"
+        )
+        # TD-02b: a preserved host is not a clean baseline. The packages the run
+        # installed stay installed, the record says it did not restore the
+        # baseline, and the host is not eligible for another clean-baseline run.
+        assert untouched["restored_baseline"] is False, (
+            f"PRESERVE reported restored_baseline={untouched['restored_baseline']!r}: "
+            "a policy that changes nothing cannot have restored an OS baseline"
+        )
+        assert untouched["clean_baseline_eligible"] is False, (
+            "PRESERVE called the host eligible for another clean-baseline run, so the next "
+            "run would measure a host this one already changed"
+        )
+        residual = untouched["residual_state"]
+        assert residual["retained"] is True, (
+            f"PRESERVE reported retained={residual.get('retained')!r}: the state it kept is "
+            "residual by definition"
+        )
+        assert residual["packages"]["inventory"] == "unrecorded", (
+            "a teardown handed no package record claimed to know the package change: "
+            f"it reported {residual['packages']}"
+        )
+        assert "not eligible for another clean-baseline run" in untouched["message"], (
+            f"the PRESERVE message {untouched['message']!r} does not say the host may not be "
+            "used as a clean baseline again"
         )
 
         # TD-03: every declared precondition of RESTORE_SNAPSHOT fails preflight, and

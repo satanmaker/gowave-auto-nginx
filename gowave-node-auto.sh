@@ -1649,6 +1649,99 @@ reconcile_worker_transaction_journals() {
     return "$failed"
 }
 
+# --- package change record -------------------------------------------------
+# HOOK-04: a rollback restores the paths this run wrote, never the packages it
+# installed. What the package manager changed is therefore recorded while the
+# transaction still knows it, so a preserved host can be reported as carrying
+# residual state instead of being called clean.
+
+worker_package_record_dir() {
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-}"
+    printf '%s\n' "${root%/}/recovery/${transaction}"
+}
+
+worker_package_inventory() {
+    # One `package<TAB>version` line per installed package, sorted, so two runs
+    # of the same host agree byte for byte and a diff of them is the package
+    # change a transaction caused.
+    if ! command -v dpkg-query >/dev/null 2>&1; then
+        return 1
+    fi
+    dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null | LC_ALL=C sort
+}
+
+record_worker_package_baseline() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local directory file temporary
+    directory="$(worker_package_record_dir "$root" "$transaction")"
+    if [[ ! -d "$directory" ]]; then
+        echo "Error: The transaction directory $directory is absent, so a package baseline would not belong to a journal." >&2
+        return 1
+    fi
+    file="$directory/packages-before.txt"
+    temporary="$(mktemp "$directory/.packages-before.XXXXXX")" || return 1
+    if worker_package_inventory >"$temporary" && [[ -s "$temporary" ]]; then
+        :
+    else
+        # A host whose package manager cannot answer is not a host with no
+        # packages; the baseline says what it could not learn.
+        printf '%s\n' "#unavailable" >"$temporary"
+    fi
+    if ! chmod 0600 -- "$temporary" || ! sync "$temporary" ||
+        ! mv -f -- "$temporary" "$file" || ! sync "$directory"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+record_worker_package_changes() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local directory before after changes temporary
+    directory="$(worker_package_record_dir "$root" "$transaction")"
+    before="$directory/packages-before.txt"
+    if [[ ! -f "$before" ]]; then
+        echo "Error: The package baseline for $transaction is absent, so the package changes it caused cannot be stated." >&2
+        return 1
+    fi
+    after="$(mktemp "$directory/.packages-after.XXXXXX")" || return 1
+    if worker_package_inventory >"$after" && [[ -s "$after" ]]; then
+        :
+    else
+        printf '%s\n' "#unavailable" >"$after"
+    fi
+    changes="$(mktemp "$directory/.package-changes.XXXXXX")" || {
+        rm -f -- "$after"
+        return 1
+    }
+    if [[ "$(head -n 1 "$before")" == "#unavailable" ]] ||
+        [[ "$(head -n 1 "$after")" == "#unavailable" ]]; then
+        printf '%s\n' "#gowave-package-changes/v1" "#unavailable" >"$changes"
+    else
+        {
+            printf '%s\n' "#gowave-package-changes/v1"
+            awk -F'\t' '
+                FNR == NR { before[$1] = $2; next }
+                { after[$1] = $2 }
+                END {
+                    for (name in after) {
+                        if (!(name in before)) print "installed\t" name "\t" after[name]
+                        else if (before[name] != after[name]) print "upgraded\t" name "\t" before[name] "\t" after[name]
+                    }
+                    for (name in before) if (!(name in after)) print "removed\t" name "\t" before[name]
+                }
+            ' "$before" "$after" | LC_ALL=C sort
+        } >"$changes"
+    fi
+    rm -f -- "$after"
+    if ! chmod 0600 -- "$changes" || ! sync "$changes" ||
+        ! mv -f -- "$changes" "$directory/package-changes.tsv" || ! sync "$directory"; then
+        rm -f -- "$changes"
+        return 1
+    fi
+}
 restore_worker_targets_before_image() {
     worker_targets_image restore "${1:-/}" "${2:-$(worker_targets_before_image)}"
 }
@@ -3707,6 +3800,99 @@ reconcile_worker_transaction_journals() {
     return "$failed"
 }
 
+# --- package change record -------------------------------------------------
+# HOOK-04: a rollback restores the paths this run wrote, never the packages it
+# installed. What the package manager changed is therefore recorded while the
+# transaction still knows it, so a preserved host can be reported as carrying
+# residual state instead of being called clean.
+
+worker_package_record_dir() {
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-}"
+    printf '%s\n' "${root%/}/recovery/${transaction}"
+}
+
+worker_package_inventory() {
+    # One `package<TAB>version` line per installed package, sorted, so two runs
+    # of the same host agree byte for byte and a diff of them is the package
+    # change a transaction caused.
+    if ! command -v dpkg-query >/dev/null 2>&1; then
+        return 1
+    fi
+    dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null | LC_ALL=C sort
+}
+
+record_worker_package_baseline() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local directory file temporary
+    directory="$(worker_package_record_dir "$root" "$transaction")"
+    if [[ ! -d "$directory" ]]; then
+        echo "Error: The transaction directory $directory is absent, so a package baseline would not belong to a journal." >&2
+        return 1
+    fi
+    file="$directory/packages-before.txt"
+    temporary="$(mktemp "$directory/.packages-before.XXXXXX")" || return 1
+    if worker_package_inventory >"$temporary" && [[ -s "$temporary" ]]; then
+        :
+    else
+        # A host whose package manager cannot answer is not a host with no
+        # packages; the baseline says what it could not learn.
+        printf '%s\n' "#unavailable" >"$temporary"
+    fi
+    if ! chmod 0600 -- "$temporary" || ! sync "$temporary" ||
+        ! mv -f -- "$temporary" "$file" || ! sync "$directory"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+record_worker_package_changes() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local directory before after changes temporary
+    directory="$(worker_package_record_dir "$root" "$transaction")"
+    before="$directory/packages-before.txt"
+    if [[ ! -f "$before" ]]; then
+        echo "Error: The package baseline for $transaction is absent, so the package changes it caused cannot be stated." >&2
+        return 1
+    fi
+    after="$(mktemp "$directory/.packages-after.XXXXXX")" || return 1
+    if worker_package_inventory >"$after" && [[ -s "$after" ]]; then
+        :
+    else
+        printf '%s\n' "#unavailable" >"$after"
+    fi
+    changes="$(mktemp "$directory/.package-changes.XXXXXX")" || {
+        rm -f -- "$after"
+        return 1
+    }
+    if [[ "$(head -n 1 "$before")" == "#unavailable" ]] ||
+        [[ "$(head -n 1 "$after")" == "#unavailable" ]]; then
+        printf '%s\n' "#gowave-package-changes/v1" "#unavailable" >"$changes"
+    else
+        {
+            printf '%s\n' "#gowave-package-changes/v1"
+            awk -F'\t' '
+                FNR == NR { before[$1] = $2; next }
+                { after[$1] = $2 }
+                END {
+                    for (name in after) {
+                        if (!(name in before)) print "installed\t" name "\t" after[name]
+                        else if (before[name] != after[name]) print "upgraded\t" name "\t" before[name] "\t" after[name]
+                    }
+                    for (name in before) if (!(name in after)) print "removed\t" name "\t" before[name]
+                }
+            ' "$before" "$after" | LC_ALL=C sort
+        } >"$changes"
+    fi
+    rm -f -- "$after"
+    if ! chmod 0600 -- "$changes" || ! sync "$changes" ||
+        ! mv -f -- "$changes" "$directory/package-changes.tsv" || ! sync "$directory"; then
+        rm -f -- "$changes"
+        return 1
+    fi
+}
 restore_worker_targets_before_image() {
     worker_targets_image restore "${1:-/}" "${2:-$(worker_targets_before_image)}"
 }
@@ -4853,6 +5039,12 @@ compensate_remote_worker() {
         return "$exit_code"
     fi
 
+    # A rollback puts the paths back and leaves the packages installed. The
+    # delta is recorded here, before the paths are restored, so the teardown
+    # report can name the residue instead of calling the host clean.
+    record_worker_package_changes "$_ACME_TX_ID" ||
+        echo "[ROLLBACK] The package changes this transaction caused could not be recorded; they stay on the host unrecorded." >&2
+
     # 1. Stop and remove GoWave Node and Xray systemd services
     if [[ "${_NODE_SERVICE_CONFIGURED:-0}" -eq 1 ]] || systemctl list-unit-files gowave-node.service 2>/dev/null | grep -q gowave-node; then
         echo "[ROLLBACK] Stopping and disabling gowave-node.service and drop-ins..." >&2
@@ -5096,6 +5288,11 @@ main() {
     # act on.
     record_worker_transaction_journal "$_ACME_TX_ID" || return 1
 
+    # The package inventory this run starts from, captured while the journal's
+    # directory is still the only thing written: what the package manager
+    # changes from here on is this transaction's residue, and a rollback
+    # cannot undo it.
+    record_worker_package_baseline "$_ACME_TX_ID" || return 1
     setup_system_prereqs </dev/null
     configure_host_security </dev/null
     configure_firewall </dev/null
@@ -5112,6 +5309,10 @@ main() {
     printf '%s' "$_NODE_SECRET_KEY" | python3 /tmp/gowave-verify-node-mtls.py --host 127.0.0.1 --port "$NODE_PORT" --mode crypto-only
     nginx -t
     systemctl is-active --quiet nginx
+
+    # Every package-mutating step is behind us, so the delta between the
+    # baseline and the host now is what this run left installed.
+    record_worker_package_changes "$_ACME_TX_ID" || return 1
 
     # What this install now owns: the next run adopts these paths by digest
     # instead of refusing them, and a rollback can tell them apart from a host
@@ -6116,6 +6317,99 @@ reconcile_worker_transaction_journals() {
     return "$failed"
 }
 
+# --- package change record -------------------------------------------------
+# HOOK-04: a rollback restores the paths this run wrote, never the packages it
+# installed. What the package manager changed is therefore recorded while the
+# transaction still knows it, so a preserved host can be reported as carrying
+# residual state instead of being called clean.
+
+worker_package_record_dir() {
+    local root="${1:-/var/lib/gowave-auto-nginx}"
+    local transaction="${2:-}"
+    printf '%s\n' "${root%/}/recovery/${transaction}"
+}
+
+worker_package_inventory() {
+    # One `package<TAB>version` line per installed package, sorted, so two runs
+    # of the same host agree byte for byte and a diff of them is the package
+    # change a transaction caused.
+    if ! command -v dpkg-query >/dev/null 2>&1; then
+        return 1
+    fi
+    dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null | LC_ALL=C sort
+}
+
+record_worker_package_baseline() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local directory file temporary
+    directory="$(worker_package_record_dir "$root" "$transaction")"
+    if [[ ! -d "$directory" ]]; then
+        echo "Error: The transaction directory $directory is absent, so a package baseline would not belong to a journal." >&2
+        return 1
+    fi
+    file="$directory/packages-before.txt"
+    temporary="$(mktemp "$directory/.packages-before.XXXXXX")" || return 1
+    if worker_package_inventory >"$temporary" && [[ -s "$temporary" ]]; then
+        :
+    else
+        # A host whose package manager cannot answer is not a host with no
+        # packages; the baseline says what it could not learn.
+        printf '%s\n' "#unavailable" >"$temporary"
+    fi
+    if ! chmod 0600 -- "$temporary" || ! sync "$temporary" ||
+        ! mv -f -- "$temporary" "$file" || ! sync "$directory"; then
+        rm -f -- "$temporary"
+        return 1
+    fi
+}
+
+record_worker_package_changes() {
+    local transaction="${1:-}"
+    local root="${2:-/var/lib/gowave-auto-nginx}"
+    local directory before after changes temporary
+    directory="$(worker_package_record_dir "$root" "$transaction")"
+    before="$directory/packages-before.txt"
+    if [[ ! -f "$before" ]]; then
+        echo "Error: The package baseline for $transaction is absent, so the package changes it caused cannot be stated." >&2
+        return 1
+    fi
+    after="$(mktemp "$directory/.packages-after.XXXXXX")" || return 1
+    if worker_package_inventory >"$after" && [[ -s "$after" ]]; then
+        :
+    else
+        printf '%s\n' "#unavailable" >"$after"
+    fi
+    changes="$(mktemp "$directory/.package-changes.XXXXXX")" || {
+        rm -f -- "$after"
+        return 1
+    }
+    if [[ "$(head -n 1 "$before")" == "#unavailable" ]] ||
+        [[ "$(head -n 1 "$after")" == "#unavailable" ]]; then
+        printf '%s\n' "#gowave-package-changes/v1" "#unavailable" >"$changes"
+    else
+        {
+            printf '%s\n' "#gowave-package-changes/v1"
+            awk -F'\t' '
+                FNR == NR { before[$1] = $2; next }
+                { after[$1] = $2 }
+                END {
+                    for (name in after) {
+                        if (!(name in before)) print "installed\t" name "\t" after[name]
+                        else if (before[name] != after[name]) print "upgraded\t" name "\t" before[name] "\t" after[name]
+                    }
+                    for (name in before) if (!(name in after)) print "removed\t" name "\t" before[name]
+                }
+            ' "$before" "$after" | LC_ALL=C sort
+        } >"$changes"
+    fi
+    rm -f -- "$after"
+    if ! chmod 0600 -- "$changes" || ! sync "$changes" ||
+        ! mv -f -- "$changes" "$directory/package-changes.tsv" || ! sync "$directory"; then
+        rm -f -- "$changes"
+        return 1
+    fi
+}
 restore_worker_targets_before_image() {
     worker_targets_image restore "${1:-/}" "${2:-$(worker_targets_before_image)}"
 }

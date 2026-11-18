@@ -84,6 +84,7 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Live scenario parity | `OWN-03` |
 | Live scenario parity | `OWN-04` |
 | Live scenario parity | `HOOK-03` |
+| Live scenario parity | `HOOK-04` |
 | Live scenario parity | `HOOK-01` |
 | Live scenario parity | `REV-01`, `REV-02` |
 | Live scenario parity | `AIO-AUTH-NEG`, `MN-DUP-ADD`, `RED-01`, `RED-02`, `APIC-01` |

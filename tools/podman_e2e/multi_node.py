@@ -35,6 +35,7 @@ from tools.podman_e2e import (
     lock_cases, matrix as matrix_data, mtls, operator_access, ownership,
     firewall_image, mutation_baseline,
     ownership_targets,
+    package_residual,
     preflight_cases, revocation,
     runstate_cases,
     skip_policy, status, teardown, topology, transaction_recovery, trust_bundle,
@@ -8828,6 +8829,12 @@ def cases(
         # retains it — one implementation read by both entrypoints.
         Case(worker_journal.CASE_ID, "multi-node",
              lambda context: worker_journal.case_worker_journal_is_reconciled(
+                 product, context),
+             timeout_seconds=300),
+        # The same package record on the Worker: the payload's own baseline and
+        # delta, read by the same teardown report the Master's run hands them to.
+        Case(package_residual.CASE_ID, "multi-node",
+             lambda context: package_residual.case_worker_package_residuals(
                  product, context),
              timeout_seconds=300),
         # The same journal and the same boot recovery as the All-in-One: the

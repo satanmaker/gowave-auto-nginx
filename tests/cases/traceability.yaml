@@ -674,7 +674,9 @@ cases_by_requirement:
       installation is preserved with the rollback refusing, and an untouched one
       is removed together with the ownership record that named it. The teardown
       half is `tools/live_vps/teardown.py`: `PRESERVE` answers with exactly its
-      message, policy and status and claims no baseline it never compared, while
+      status, policy, message, residual state and two baseline denials — a
+      restored baseline and a clean-baseline eligibility, both false — and
+      claims no baseline it never compared, while
       the snapshot path — driven with a real executable restore hook and two
       matching captured baselines — reports `INCOMPLETE` with the pair-lock and
       ownership comparisons named as not implemented rather than claiming PASS.
@@ -877,6 +879,41 @@ cases_by_requirement:
       transaction. What the container proves is the functions' verdict and the
       bytes they leave on disk; the live run remains the source of truth for the
       host a real Worker carries.
+  - requirement: Live scenario parity
+    cases: [HOOK-04]
+    reason: >-
+      HOOK-04 is the other half of a rollback: compensation restores the paths
+      the transaction wrote and never the packages it installed, so a host
+      restored through PRESERVE carries package residue that the report has to
+      name. What the package manager changed is therefore recorded while the
+      transaction still knows it: `record_worker_package_baseline` captures a
+      sorted `package<TAB>version` inventory into the transaction's own
+      recovery directory after the journal exists and before
+      `setup_system_prereqs` can install anything, and
+      `record_worker_package_changes` diffs it against the host once every
+      package-mutating step is behind the run — and again in the compensation,
+      before the paths are put back. Both files are written through a temporary
+      sibling with a fsync and a rename, at mode 0600; a package manager that
+      cannot answer writes `#unavailable` instead of an empty inventory, and a
+      baseline outside a journal directory or a delta without a baseline is
+      refused rather than invented. The report is the shipped teardown:
+      `read_package_changes` parses that record and refuses a missing header, an
+      unknown kind, a short or long row, a field that is not a package name or
+      version, and `#unavailable` mixed with rows; `execute_teardown` under
+      PRESERVE returns the packages as `residual_state`, `restored_baseline`
+      and `clean_baseline_eligible` false, and a message naming the remedy,
+      while a teardown handed no record at all reports `inventory: unrecorded`
+      rather than "no changes". The case drives the shipped functions over a
+      scratch root with a stub package manager and hands the bytes the shell
+      wrote to the shipped reader and the shipped teardown, so it decides
+      sixteen facts: the baseline and the delta exist at mode 0600, the delta
+      states the installed, upgraded and removed package with the versions on
+      both sides, `#unavailable` is stated, both refusals hold, the record goes
+      with the transaction, PRESERVE reports the residue, denies a restored
+      baseline, denies eligibility and says `unrecorded` without a record, and
+      every malformed record is refused. What the container proves is the
+      record's shape and the report's verdict; whether a given host's dpkg
+      inventory is complete stays the live run's to say.
   - requirement: Live scenario parity
     cases: [HOOK-01]
     reason: >-

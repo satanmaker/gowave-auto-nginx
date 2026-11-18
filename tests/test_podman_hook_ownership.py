@@ -45,7 +45,8 @@ EXPECTED_REFUSALS = {
     "install-not-recorded": "the manifest does not record the transaction as the creator",
     "rollback-ignores-digest": "a hook edited after installation was not preserved",
     "record-outlives-the-hook": "the ownership record outlived the hook it named",
-    "preserve-adds-a-baseline-field": "rather than the message, policy and status it owns",
+    "preserve-adds-a-foreign-field":
+        "rather than the status, policy, message, residual state and two baseline denials it owns",
     "preserve-claims-a-restored-baseline": "PRESERVE claimed a baseline it never compared",
     "snapshot-claims-pass": "instead of INCOMPLETE",
 }
@@ -204,16 +205,13 @@ def _damages(workdir, case_id=hook_ownership.CASE_ID):
             mock.patch.object(hook_ownership, "NGINX_MODULE",
                               _rollback_that_keeps_the_record(workdir)),
         ],
-        "preserve-adds-a-baseline-field": [
+        "preserve-adds-a-foreign-field": [
             mock.patch.object(teardown, "execute_teardown",
-                              _teardown_that(workdir, PRESERVE={"restored_baseline": "MATCHED"})),
+                              _teardown_that(workdir, PRESERVE={"packages_restored": True})),
         ],
         "preserve-claims-a-restored-baseline": [
-            mock.patch.object(
-                teardown, "execute_teardown",
-                _teardown_that(
-                    workdir,
-                    PRESERVE={"message": "Both VPS restored to the captured baseline"})),
+            mock.patch.object(teardown, "execute_teardown",
+                              _teardown_that(workdir, PRESERVE={"restored_baseline": True})),
         ],
         "snapshot-claims-pass": [
             mock.patch.object(teardown, "execute_teardown",
@@ -314,8 +312,14 @@ class TestHookOwnershipCase(unittest.TestCase):
         facts, refusal = run_case(hook_ownership.CASE_ID)
         self.assertIsNone(refusal)
         self.assertEqual(facts["preserve_status"], "PASS")
-        self.assertEqual(facts["preserve_fields"], "message,policy,status")
+        self.assertEqual(
+            facts["preserve_fields"],
+            "clean_baseline_eligible,message,policy,residual_state,restored_baseline,status")
         self.assertFalse(facts["preserve_claims_restored_baseline"])
+        self.assertIn("not a restoration of the original OS baseline",
+                      facts["preserve_message"])
+        self.assertIn("not eligible for another clean-baseline run",
+                      facts["preserve_message"])
         self.assertEqual(facts["snapshot_status"], "INCOMPLETE")
         self.assertEqual(facts["snapshot_baseline_comparison"], "MATCHED")
         self.assertEqual(facts["snapshot_pair_lock_reacquisition"], "NOT_IMPLEMENTED")
@@ -348,7 +352,7 @@ class TestHookOwnershipDamage(unittest.TestCase):
         self.assert_refused("record-outlives-the-hook")
 
     def test_a_preserve_answer_with_an_extra_field_is_refused(self):
-        self.assert_refused("preserve-adds-a-baseline-field")
+        self.assert_refused("preserve-adds-a-foreign-field")
 
     def test_a_preserve_answer_that_claims_a_baseline_is_refused(self):
         self.assert_refused("preserve-claims-a-restored-baseline")

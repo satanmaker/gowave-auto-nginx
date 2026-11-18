@@ -185,9 +185,9 @@ def case_hook_is_removed_only_while_the_journal_owns_it(
             "ownership_record_cleared": record_cleared,
             "preserve_status": preserve.get("status"),
             "preserve_fields": ",".join(sorted(preserve)),
-            "preserve_claims_restored_baseline": any(
-                "baseline" in str(value).lower() or "restored" in str(value).lower()
-                for key, value in preserve.items() if key != "policy"),
+            # The record may name the baseline only to deny restoring it; what
+            # it may not do is claim a restoration that never happened.
+            "preserve_claims_restored_baseline": bool(preserve.get("restored_baseline")),
             "preserve_message": preserve.get("message"),
             "snapshot_status": snapshot.get("status"),
             "snapshot_hook_status": snapshot.get("hook_status"),
@@ -226,10 +226,11 @@ def case_hook_is_removed_only_while_the_journal_owns_it(
             refused.append("the ownership record outlived the hook it named")
         if evidence["preserve_status"] != "PASS":
             refused.append("PRESERVE did not report a preserved host")
-        if evidence["preserve_fields"] != "message,policy,status":
+        if evidence["preserve_fields"] != (
+                "clean_baseline_eligible,message,policy,residual_state,restored_baseline,status"):
             refused.append(
                 f"PRESERVE answered with {evidence['preserve_fields']} rather than "
-                "the message, policy and status it owns")
+                "the status, policy, message, residual state and two baseline denials it owns")
         if evidence["preserve_claims_restored_baseline"]:
             refused.append("PRESERVE claimed a baseline it never compared")
         if evidence["snapshot_status"] != "INCOMPLETE":
