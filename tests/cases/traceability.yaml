@@ -757,6 +757,30 @@ cases_by_requirement:
       the API rollback finalized a clean rollback itself, so the journal said
       ROLLED_BACK over a host that was never put back.
   - requirement: Live scenario parity
+    cases: [NEG-03]
+    reason: >-
+      NEG-03 is the container half of the live scenario "Partial SSH deployment
+      leaves no false COMMITTED journal state": what the Master records when the
+      transport to a Worker it has already registered never answers. The
+      operator's own `node add` runs on the installed Master, addressed to an
+      address whose sshd is absent and whose host key the case pinned first, so
+      the product registers the node with the Panel, writes the transaction
+      journal, appends the node to `state.json` and only then dials. What the
+      case reads is the Master's own recovery: the journal is left in
+      `NODE_ADD_ROLLBACK_REQUIRED` with its action ledger intact and both
+      compensation sides recorded -- the Worker side INCOMPLETE because nothing
+      on the far end answered, the Panel API side ROLLED_BACK because the
+      product's own `rollback_provisioning` deleted the entities the transaction
+      created -- the product prints the INCOMPLETE sentence an operator acts on
+      and no success line, `state.json` matches the pre-dispatch snapshot apart
+      from its update timestamp, the Worker is gone from it, the Panel inventory
+      is back to its pre-attempt counts, and the mutation lock is free. What the
+      container does not prove is the far end: the remote payload never started,
+      so the Worker's own restore is HOOK-03's and TXN-01's subject and a drop in
+      the middle of the payload is the live run's. The case leaves the Master as
+      it found it -- journal removed, `state.json` restored, pin withdrawn -- so
+      the rest of the suite is not reading a half-finished transaction.
+  - requirement: Live scenario parity
     cases: [OWN-01]
     reason: >-
       OWN-01 is the container half of the live requirement's scenario "Existing

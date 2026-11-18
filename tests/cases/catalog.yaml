@@ -3681,8 +3681,70 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: negative_journal:case_partial_worker_install_leaves_no_committed_journal
+      evidence:
+      - add_returncode
+      - both_sides_recorded
+      - host_left_as_found
+      - journal_api_side
+      - journal_entries
+      - journal_is_this_transaction
+      - journal_keeps_the_action_ledger
+      - journal_never_committed
+      - journal_preexisting
+      - journal_requires_recovery
+      - journal_state
+      - journal_worker_side
+      - mutation_lock_free
+      - node_absent_from_state
+      - operator_reads_incomplete
+      - panel_entities_removed
+      - panel_inventory_after
+      - panel_inventory_before
+      - panel_readable_after
+      - panel_readable_before
+      - payload_not_deployed
+      - pin_reaches_the_product
+      - port_silent
+      - reached_the_registration
+      - refusal_line
+      - state_matches_snapshot
+      - state_mode_is_private
+      - transport_refused
+    multi-node:
+      driver: negative_journal:case_partial_worker_install_leaves_no_committed_journal
+      evidence:
+      - add_returncode
+      - both_sides_recorded
+      - host_left_as_found
+      - journal_api_side
+      - journal_entries
+      - journal_is_this_transaction
+      - journal_keeps_the_action_ledger
+      - journal_never_committed
+      - journal_preexisting
+      - journal_requires_recovery
+      - journal_state
+      - journal_worker_side
+      - mutation_lock_free
+      - node_absent_from_state
+      - operator_reads_incomplete
+      - panel_entities_removed
+      - panel_inventory_after
+      - panel_inventory_before
+      - panel_readable_after
+      - panel_readable_before
+      - payload_not_deployed
+      - pin_reaches_the_product
+      - port_silent
+      - reached_the_registration
+      - refusal_line
+      - state_matches_snapshot
+      - state_mode_is_private
+      - transport_refused
   promotion_target: null
 - id: NEG-04
   requirement: Negative Scenario and Fault Injection Tests
