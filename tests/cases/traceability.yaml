@@ -699,6 +699,34 @@ cases_by_requirement:
       is taken before the journal is read and before it is validated, which is
       what makes the next mutation wait for the recovery.
   - requirement: Live scenario parity
+    cases: [OWN-01]
+    reason: >-
+      OWN-01 is the container half of the live requirement's scenario "Existing
+      Worker system configuration is not overwritten": the Worker configuration
+      MUST NOT truncate `/etc/sysctl.d/99-gowave-node.conf` when it did not write
+      it, and later treat it as transaction-created. Two writers can truncate
+      that path -- the panel's `configure_bbr_and_mtu` in `modules/security.sh`,
+      which owns `/etc/sysctl.d/99-gowave.conf`, and the worker's
+      `configure_host_security` in the payload `gowave-node-auto.sh` streams to
+      the host. Each is run as the product runs it, on the host that carries it:
+      the AIO contour sources the panel module in the container it installed, the
+      multi-node contour runs the worker's writer on the worker container. Each
+      writer is handed a path and asked about five states -- a file another tool
+      wrote, an empty file, a symlink to the product's own lines, a file of
+      nothing but those lines, and no file at all -- and the case reads back the
+      exit status, the bytes, the mode and the `_SYSCTL_CREATED_BY_US` verdict
+      the function leaves behind. The unmanaged file keeps its bytes and its
+      mode, the refusal names the path it refused, an empty file and a symlink
+      are refused rather than adopted on the strength of what they contain, the
+      product's own earlier file is rewritten in place without being recorded as
+      created by this run, and only a path that did not exist is created, marked
+      and removable by a rollback. What the container proves is the writer's own
+      decision and the bytes it leaves on disk; the live run remains the source
+      of truth for the baseline inspection that rejects or snapshots a real host
+      before the first remote mutation. The kernel is not the subject: `sysctl`,
+      `modprobe`, `systemctl` and `swapon` answer from shims, so no host is
+      touched and no install runs.
+  - requirement: Live scenario parity
     cases: [HOOK-01]
     reason: >-
       HOOK-01 is the shape half of the same sentence: a manifest records that a

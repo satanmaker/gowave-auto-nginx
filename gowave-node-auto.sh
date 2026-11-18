@@ -2207,11 +2207,28 @@ configure_worker_dot() {
 
 configure_host_security() {
     # Keep MTU/file-limit tuning independent from optional BBR support.
-    mkdir -p /etc/sysctl.d
-    if [[ ! -e /etc/sysctl.d/99-gowave-node.conf ]]; then
+    local sysctl_conf="${1:-/etc/sysctl.d/99-gowave-node.conf}"
+    mkdir -p "$(dirname "$sysctl_conf")"
+    # A file this install did not write is not its to truncate: only our own
+    # marker plus our own lines is adopted, and a symlink is never written through.
+    if [[ -e "$sysctl_conf" || -L "$sysctl_conf" ]]; then
+        if [[ -L "$sysctl_conf" ]] ||
+            ! grep -qxF '# Managed by GoWave Auto NGINX' "$sysctl_conf" ||
+            grep -qvxF -e '# Managed by GoWave Auto NGINX' \
+                -e 'net.ipv4.tcp_mtu_probing = 1' \
+                -e 'fs.file-max = 1048576' \
+                -e 'net.core.default_qdisc = fq' \
+                -e 'net.ipv4.tcp_congestion_control = bbr' "$sysctl_conf"; then
+            echo "Error: Pre-existing unmanaged sysctl configuration at $sysctl_conf. Refusing to overwrite unmanaged host resource." >&2
+            _SYSCTL_CREATED_BY_US=0
+            return 1
+        fi
+    else
         _SYSCTL_CREATED_BY_US=1
     fi
     modprobe tcp_bbr 2>/dev/null || true
+    local sysctl_tmp
+    sysctl_tmp=$(mktemp "${sysctl_conf}.gowave.XXXXXX") || return 1
     {
         echo "# Managed by GoWave Auto NGINX"
         echo "net.ipv4.tcp_mtu_probing = 1"
@@ -2222,8 +2239,12 @@ configure_host_security() {
         else
             echo "Warning: BBR is unavailable in this kernel; retaining the system congestion-control default." >&2
         fi
-    } > /etc/sysctl.d/99-gowave-node.conf
-    sysctl -p /etc/sysctl.d/99-gowave-node.conf
+    } > "$sysctl_tmp" || { rm -f "$sysctl_tmp"; return 1; }
+    chmod 0644 "$sysctl_tmp" || { rm -f "$sysctl_tmp"; return 1; }
+    sync "$sysctl_tmp" 2>/dev/null || true
+    mv -f "$sysctl_tmp" "$sysctl_conf" || { rm -f "$sysctl_tmp"; return 1; }
+    sync "$(dirname "$sysctl_conf")" 2>/dev/null || true
+    sysctl -p "$sysctl_conf"
 
     # Allocate swap only on small-memory hosts. Do not persist a failed swapon.
     local mem_kb fs_type swap_tmp
@@ -3719,7 +3740,10 @@ if command -v ufw >/dev/null 2>&1; then
     fi
 fi
 # 5. Clean sysctl, project-owned DNS drop-in and scratch
-rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1
+if [[ -f /etc/sysctl.d/99-gowave-node.conf ]] &&
+    grep -qxF '# Managed by GoWave Auto NGINX' /etc/sysctl.d/99-gowave-node.conf; then
+    rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1
+fi
 if [[ -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf ]] &&
     grep -qF 'Managed by GoWave Auto NGINX: VPS Security' /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf; then
     rm -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf || rollback_failed=1

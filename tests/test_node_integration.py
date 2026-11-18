@@ -359,7 +359,22 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn(') || {', rollback_script)
         self.assertIn("nginx -t >/dev/null 2>&1", rollback_script)
         self.assertIn('systemctl reload nginx 2>/dev/null || rollback_failed=1', rollback_script)
-        self.assertIn('rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1', rollback_script)
+        # A file the install did not write is not removed by its rollback: the
+        # drop-in goes only when it carries the marker that says this install
+        # wrote it, and never on an unguarded ``rm -f``.
+        self.assertIn(
+            "if [[ -f /etc/sysctl.d/99-gowave-node.conf ]] &&\n"
+            "    grep -qxF '# Managed by GoWave Auto NGINX' "
+            "/etc/sysctl.d/99-gowave-node.conf; then\n"
+            "    rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1\n"
+            "fi\n",
+            rollback_script,
+        )
+        self.assertNotIn(
+            "# 5. Clean sysctl, project-owned DNS drop-in and scratch\n"
+            "rm -f /etc/sysctl.d/99-gowave-node.conf || rollback_failed=1\n",
+            rollback_script,
+        )
         self.assertIn('sysctl --system 2>/dev/null || rollback_failed=1', rollback_script)
         self.assertIn("one or more cleanup or restoration operations failed", rollback_script)
         self.assertIn('ufw status numbered 2>/dev/null', rollback_script)
