@@ -702,6 +702,186 @@ verify_deploy_hook_preflight() {
     return 0
 }
 
+worker_mutation_targets() {
+    # The paths this install creates and its rollback removes. A path that is
+    # already here is only touched when the ownership record names it.
+    cat <<'WORKER_TARGETS'
+/etc/systemd/system/gowave-node.service
+/etc/systemd/system/gowave-node.service.d
+/etc/systemd/system/remnanode.service
+/opt/gowave-node
+/run/gowave-node
+/opt/remnanode
+/usr/local/bin/gowave-node
+/usr/local/bin/xray
+/etc/nginx/conf.d/00-worker-acme-challenge.conf
+/etc/nginx/conf.d/00-bootstrap-worker-acme.conf
+/etc/nginx/conf.d/gowave-worker-https.conf
+/etc/nginx/conf.d/gowave-worker-decoy.conf
+/etc/nginx/conf.d/gowave-worker-vision-fallback.conf
+/etc/nginx/stream-enabled/gowave-worker-stream.conf
+/var/www/gowave-acme
+/var/www/gowave-auto-nginx/cover-reality
+WORKER_TARGETS
+}
+
+worker_ownership_record() {
+    printf '%s\n' "${1:-/var/lib/gowave-auto-nginx}/worker-install-ownership.json"
+}
+
+verify_worker_mutation_targets_preflight() {
+    # The root and the record are arguments so a test can drive this guard over
+    # a directory it owns; the install passes neither and gets the host.
+    local root="${1:-/}"
+    local record="${2:-$(worker_ownership_record)}"
+    local targets
+    targets=$(worker_mutation_targets)
+    python3 - "$root" "$record" "$targets" <<'WORKER_PREFLIGHT_PY'
+import hashlib
+import json
+import os
+import sys
+
+root, record, listed = sys.argv[1:4]
+targets = [line.strip() for line in listed.splitlines() if line.strip()]
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def refuse(path, what):
+    print(
+        "Error: Pre-existing unowned Worker " + what + " " + path + ". Refusing to "
+        "overwrite or remove an unmanaged host resource.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+recorded = {}
+if os.path.lexists(record):
+    if os.path.islink(record) or not os.path.isfile(record):
+        print("Error: Worker ownership record " + record + " is not a regular file.", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        with open(record, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        print("Error: Worker ownership record " + record + " is not readable JSON.", file=sys.stderr)
+        raise SystemExit(1)
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        print(
+            "Error: Worker ownership record " + record + " does not claim this product created anything.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    recorded = data.get("targets")
+    if not isinstance(recorded, dict):
+        print("Error: Worker ownership record " + record + " names no targets.", file=sys.stderr)
+        raise SystemExit(1)
+
+for target in targets:
+    path = under(target)
+    if not os.path.lexists(path):
+        continue
+    entry = recorded.get(target)
+    if os.path.islink(path):
+        # The upstream installer links the Worker binary into /usr/local/bin,
+        # so a link this install wrote is adopted by the target it recorded.
+        # Any other link stays foreign even when its target holds our bytes.
+        if isinstance(entry, dict) and entry.get("kind") == "symlink" and entry.get("target") == os.readlink(path):
+            continue
+        refuse(path, "path")
+    if os.path.isdir(path):
+        if isinstance(entry, dict) and entry.get("kind") == "directory":
+            continue
+        refuse(path, "directory")
+    if not os.path.isfile(path):
+        refuse(path, "path")
+    try:
+        current = digest(path)
+    except OSError:
+        current = ""
+    if current and isinstance(entry, dict) and entry.get("kind") == "file" and entry.get("sha256") == current:
+        continue
+    refuse(path, "file")
+WORKER_PREFLIGHT_PY
+}
+
+record_worker_mutation_targets() {
+    local root="${1:-/}"
+    local record="${2:-$(worker_ownership_record)}"
+    local targets
+    targets=$(worker_mutation_targets)
+    python3 - "$root" "$record" "$targets" <<'WORKER_RECORD_PY'
+import hashlib
+import json
+import os
+import sys
+import tempfile
+
+root, record, listed = sys.argv[1:4]
+targets = [line.strip() for line in listed.splitlines() if line.strip()]
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+data = {"created_by_tx": True, "targets": {}}
+for target in targets:
+    path = under(target)
+    if not os.path.lexists(path):
+        continue
+    if os.path.islink(path):
+        data["targets"][target] = {"kind": "symlink", "target": os.readlink(path)}
+    elif os.path.isdir(path):
+        data["targets"][target] = {"kind": "directory"}
+    elif os.path.isfile(path):
+        data["targets"][target] = {"kind": "file", "sha256": digest(path)}
+
+directory = os.path.dirname(record) or "."
+os.makedirs(directory, mode=0o700, exist_ok=True)
+handle, temporary = tempfile.mkstemp(dir=directory, prefix=".worker-ownership.", suffix=".tmp")
+try:
+    os.fchmod(handle, 0o600)
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, record)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    raise
+directory_handle = os.open(directory, os.O_RDONLY)
+try:
+    os.fsync(directory_handle)
+finally:
+    os.close(directory_handle)
+WORKER_RECORD_PY
+}
+
 install_managed_deploy_hook() {
     local transaction_id="$1"
     local hook_file="${2:-/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh}"
@@ -1807,6 +1987,186 @@ verify_deploy_hook_preflight() {
         return 1
     fi
     return 0
+}
+
+worker_mutation_targets() {
+    # The paths this install creates and its rollback removes. A path that is
+    # already here is only touched when the ownership record names it.
+    cat <<'WORKER_TARGETS'
+/etc/systemd/system/gowave-node.service
+/etc/systemd/system/gowave-node.service.d
+/etc/systemd/system/remnanode.service
+/opt/gowave-node
+/run/gowave-node
+/opt/remnanode
+/usr/local/bin/gowave-node
+/usr/local/bin/xray
+/etc/nginx/conf.d/00-worker-acme-challenge.conf
+/etc/nginx/conf.d/00-bootstrap-worker-acme.conf
+/etc/nginx/conf.d/gowave-worker-https.conf
+/etc/nginx/conf.d/gowave-worker-decoy.conf
+/etc/nginx/conf.d/gowave-worker-vision-fallback.conf
+/etc/nginx/stream-enabled/gowave-worker-stream.conf
+/var/www/gowave-acme
+/var/www/gowave-auto-nginx/cover-reality
+WORKER_TARGETS
+}
+
+worker_ownership_record() {
+    printf '%s\n' "${1:-/var/lib/gowave-auto-nginx}/worker-install-ownership.json"
+}
+
+verify_worker_mutation_targets_preflight() {
+    # The root and the record are arguments so a test can drive this guard over
+    # a directory it owns; the install passes neither and gets the host.
+    local root="${1:-/}"
+    local record="${2:-$(worker_ownership_record)}"
+    local targets
+    targets=$(worker_mutation_targets)
+    python3 - "$root" "$record" "$targets" <<'WORKER_PREFLIGHT_PY'
+import hashlib
+import json
+import os
+import sys
+
+root, record, listed = sys.argv[1:4]
+targets = [line.strip() for line in listed.splitlines() if line.strip()]
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+def refuse(path, what):
+    print(
+        "Error: Pre-existing unowned Worker " + what + " " + path + ". Refusing to "
+        "overwrite or remove an unmanaged host resource.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+recorded = {}
+if os.path.lexists(record):
+    if os.path.islink(record) or not os.path.isfile(record):
+        print("Error: Worker ownership record " + record + " is not a regular file.", file=sys.stderr)
+        raise SystemExit(1)
+    try:
+        with open(record, "r", encoding="utf-8") as stream:
+            data = json.load(stream)
+    except Exception:
+        print("Error: Worker ownership record " + record + " is not readable JSON.", file=sys.stderr)
+        raise SystemExit(1)
+    if not isinstance(data, dict) or data.get("created_by_tx") is not True:
+        print(
+            "Error: Worker ownership record " + record + " does not claim this product created anything.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    recorded = data.get("targets")
+    if not isinstance(recorded, dict):
+        print("Error: Worker ownership record " + record + " names no targets.", file=sys.stderr)
+        raise SystemExit(1)
+
+for target in targets:
+    path = under(target)
+    if not os.path.lexists(path):
+        continue
+    entry = recorded.get(target)
+    if os.path.islink(path):
+        # The upstream installer links the Worker binary into /usr/local/bin,
+        # so a link this install wrote is adopted by the target it recorded.
+        # Any other link stays foreign even when its target holds our bytes.
+        if isinstance(entry, dict) and entry.get("kind") == "symlink" and entry.get("target") == os.readlink(path):
+            continue
+        refuse(path, "path")
+    if os.path.isdir(path):
+        if isinstance(entry, dict) and entry.get("kind") == "directory":
+            continue
+        refuse(path, "directory")
+    if not os.path.isfile(path):
+        refuse(path, "path")
+    try:
+        current = digest(path)
+    except OSError:
+        current = ""
+    if current and isinstance(entry, dict) and entry.get("kind") == "file" and entry.get("sha256") == current:
+        continue
+    refuse(path, "file")
+WORKER_PREFLIGHT_PY
+}
+
+record_worker_mutation_targets() {
+    local root="${1:-/}"
+    local record="${2:-$(worker_ownership_record)}"
+    local targets
+    targets=$(worker_mutation_targets)
+    python3 - "$root" "$record" "$targets" <<'WORKER_RECORD_PY'
+import hashlib
+import json
+import os
+import sys
+import tempfile
+
+root, record, listed = sys.argv[1:4]
+targets = [line.strip() for line in listed.splitlines() if line.strip()]
+
+
+def under(path):
+    return path if root == "/" else os.path.join(root, path.lstrip("/"))
+
+
+def digest(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
+data = {"created_by_tx": True, "targets": {}}
+for target in targets:
+    path = under(target)
+    if not os.path.lexists(path):
+        continue
+    if os.path.islink(path):
+        data["targets"][target] = {"kind": "symlink", "target": os.readlink(path)}
+    elif os.path.isdir(path):
+        data["targets"][target] = {"kind": "directory"}
+    elif os.path.isfile(path):
+        data["targets"][target] = {"kind": "file", "sha256": digest(path)}
+
+directory = os.path.dirname(record) or "."
+os.makedirs(directory, mode=0o700, exist_ok=True)
+handle, temporary = tempfile.mkstemp(dir=directory, prefix=".worker-ownership.", suffix=".tmp")
+try:
+    os.fchmod(handle, 0o600)
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, record)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except OSError:
+        pass
+    raise
+directory_handle = os.open(directory, os.O_RDONLY)
+try:
+    os.fsync(directory_handle)
+finally:
+    os.close(directory_handle)
+WORKER_RECORD_PY
 }
 
 install_managed_deploy_hook() {
@@ -3148,6 +3508,9 @@ main() {
     bootstrap_early_tools </dev/null
     acquire_mutation_lock
     verify_deploy_hook_preflight "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" "${_ACME_TX_ID:-}" || return 1
+    # Before the first managed path is touched: a unit, a binary or a webroot
+    # this install did not write is not a rollback target.
+    verify_worker_mutation_targets_preflight || return 1
 
     validate_acme_server "${GOWAVE_ACME_SERVER:-}"
     local effective_acme_server="${GOWAVE_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
@@ -3184,6 +3547,11 @@ main() {
     printf '%s' "$_NODE_SECRET_KEY" | python3 /tmp/gowave-verify-node-mtls.py --host 127.0.0.1 --port "$NODE_PORT" --mode crypto-only
     nginx -t
     systemctl is-active --quiet nginx
+
+    # What this install now owns: the next run adopts these paths by digest
+    # instead of refusing them, and a rollback can tell them apart from a host
+    # object that was already here.
+    record_worker_mutation_targets
 
     # Disable ERR compensation trap on verified success
     trap - ERR
