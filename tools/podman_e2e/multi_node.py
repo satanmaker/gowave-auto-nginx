@@ -34,6 +34,7 @@ from tools.podman_e2e import (
     ingress, local_ci,
     lock_cases, matrix as matrix_data, mtls, operator_access, ownership,
     firewall_image, mutation_baseline,
+    negative_journal,
     ownership_targets,
     package_residual,
     preflight_cases, revocation,
@@ -8858,6 +8859,14 @@ def cases(
              lambda context: rollback_sides.case_worker_and_api_rollback_are_both_required(
                  product, context),
              timeout_seconds=300),
+        # The same transaction from the other end, and on the Master the cluster
+        # already owns: an unreachable address is registered and then recovered,
+        # and neither the cluster's node list nor its Panel inventory may keep a
+        # trace of the attempt afterwards.
+        Case(negative_journal.CASE_ID, "multi-node",
+             lambda context: negative_journal.case_partial_worker_install_leaves_no_committed_journal(
+                 product, context),
+             timeout_seconds=900),
         # Revocation is per target, so the two hosts read one controller: the
         # stuck host fails the run and the pass still records it.
         Case(revocation.REV_01, "multi-node",

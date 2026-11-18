@@ -35,6 +35,7 @@ from . import (
     ownership,
     firewall_image,
     mutation_baseline,
+    negative_journal,
     ownership_targets,
     package_residual,
     panel_surface,
@@ -8983,6 +8984,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
              lambda context: rollback_sides.case_worker_and_api_rollback_are_both_required(
                  product, context),
              timeout_seconds=300),
+        # The same transaction from the other end: the operator's own node add
+        # against an address whose sshd never answers. The Master registers, then
+        # recovers, and the case reads the journal, the state snapshot, the Panel
+        # inventory and the lock it was left with.
+        Case(negative_journal.CASE_ID, "aio",
+             lambda context: negative_journal.case_partial_worker_install_leaves_no_committed_journal(
+                 product, context),
+             timeout_seconds=900),
         # The end of the same transaction: the temporary key is revoked on the
         # target, and a revocation that cannot be verified turns the run
         # INCOMPLETE. The transport is a seam, so no socket is opened.
