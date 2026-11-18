@@ -4062,8 +4062,46 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: package_residual:case_panel_package_residuals
+      evidence:
+      - baseline_is_recorded
+      - baseline_mode_is_private
+      - baseline_refuses_outside_a_journal
+      - changes_are_recorded
+      - changes_mode_is_private
+      - changes_refuse_without_a_baseline
+      - installed_package_recorded
+      - malformed_record_is_refused
+      - preserve_denies_baseline_restoration
+      - preserve_reports_ineligibility
+      - preserve_reports_residual_packages
+      - preserve_without_a_record_says_unrecorded
+      - record_is_released_with_the_transaction
+      - removed_package_recorded
+      - unavailable_inventory_is_stated
+      - upgraded_package_recorded
+    multi-node:
+      driver: package_residual:case_worker_package_residuals
+      evidence:
+      - baseline_is_recorded
+      - baseline_mode_is_private
+      - baseline_refuses_outside_a_journal
+      - changes_are_recorded
+      - changes_mode_is_private
+      - changes_refuse_without_a_baseline
+      - installed_package_recorded
+      - malformed_record_is_refused
+      - preserve_denies_baseline_restoration
+      - preserve_reports_ineligibility
+      - preserve_reports_residual_packages
+      - preserve_without_a_record_says_unrecorded
+      - record_is_released_with_the_transaction
+      - removed_package_recorded
+      - unavailable_inventory_is_stated
+      - upgraded_package_recorded
   promotion_target: null
 - id: TXN-01
   requirement: Signal-Safe and Verifiable Transaction Compensation

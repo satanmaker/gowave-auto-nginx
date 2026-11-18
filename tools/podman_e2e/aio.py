@@ -36,6 +36,7 @@ from . import (
     firewall_image,
     mutation_baseline,
     ownership_targets,
+    package_residual,
     panel_surface,
     preflight_cases,
     revocation,
@@ -8949,6 +8950,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         # its before-image was restored is discovered rather than built upon.
         Case(worker_journal.CASE_ID, "aio",
              lambda context: worker_journal.case_panel_journal_is_reconciled(
+                 product, context),
+             timeout_seconds=300),
+        # What the packages that install pulled in left behind: the baseline is
+        # taken before the first package mutation and the delta once the
+        # transaction knows it is done, so a preserved host reports the residue
+        # instead of being called clean.
+        Case(package_residual.CASE_ID, "aio",
+             lambda context: package_residual.case_panel_package_residuals(
                  product, context),
              timeout_seconds=300),
         # The journal an interrupted switch leaves behind, and the boot recovery
