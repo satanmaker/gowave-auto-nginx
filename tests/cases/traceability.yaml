@@ -681,6 +681,38 @@ cases_by_requirement:
       matching captured baselines — reports `INCOMPLETE` with the pair-lock and
       ownership comparisons named as not implemented rather than claiming PASS.
   - requirement: Live scenario parity
+    cases: [TXN-01]
+    reason: >-
+      TXN-01 is the signal sentence of the transactional requirement, and it is
+      driven as the shipped bytes rather than quoted: `tools/podman_e2e/signal_compensation.py`
+      slices `handle_signal`, `handle_error`, `compensate_once`, the cleanup and
+      the five traps out of the payload `gowave-node-auto.sh` streams to a
+      Worker, renames the shipped `compensate_remote_worker` so a wrapper can
+      count its callers, and runs the block over a scratch host root whose two
+      roots — `WORKER_STATE_ROOT` and `WORKER_HOST_ROOT` — are the ones the
+      compensation itself takes. The interrupted deployment is a real
+      transaction: the before-image and the journal are written by the shipped
+      functions, one inventoried binary is mutated and its mode changed, and the
+      signal arrives while the run is between mutations. Four runs decide the
+      sentence — TERM, HUP and INT against a restorable before-image, and TERM
+      against one whose copy was altered after it was written, so the
+      verification clause is decided in both directions. What the case reads
+      back is the handlers' own report, the number of times the compensator ran,
+      the sentinel of the mutation the interrupted run must never reach, the
+      journal's state and mode, the bytes and the mode the restore left, the
+      restore's own preserved-path sentence, the exit status and the payload's
+      temp file. The service manager is stubbed because a rollback that stopped
+      `gowave-node.service` would take down the host the suite installed; every
+      other step of the compensation is the product's. Thirteen damages make the
+      case refuse for the clause it protects: a TERM, HUP or INT handler that
+      skips the compensator, a handler that compensates beside the guarded call,
+      a run whose signal and error traps both stop nothing, a journal that is
+      never written, a restore that skips pre-existing paths, one that writes a
+      fixed mode, one that trusts a write it did not read back, one that trusts
+      a copy changed after it was written, an interruption that exits zero, a
+      cleanup that keeps the payload's temp file, and a compensation that
+      removes the journal.
+  - requirement: Live scenario parity
     cases: [TXN-02]
     reason: >-
       TXN-02 is the journal sentence of the transactional requirement, driven on

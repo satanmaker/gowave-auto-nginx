@@ -256,7 +256,16 @@ class TestMutationBaselineCase(unittest.TestCase):
                       "    SECRET_KEY=\"$_NODE_SECRET_KEY\" run_upstream_node_installer </dev/null\n"):
             with self.subTest(mutation=later):
                 self.assertLess(capture, body.index(later))
-        self.assertEqual(body.count("restore_worker_targets_before_image || rollback_failed=1\n"), 2)
+        self.assertEqual(body.count("restore_worker_targets_before_image || rollback_failed=1\n"), 1)
+        # The compensator restores into the host root the transaction described,
+        # which is the host itself for a real run, and names the before-image
+        # from that same transaction; the standalone rollback script keeps its
+        # own unconditional call, so both rollbacks still restore.
+        self.assertEqual(
+            body.count('restore_worker_targets_before_image \\\n'
+                       '        "$host_root" "$(worker_targets_before_image "$state_root" '
+                       '"$_ACME_TX_ID")" ||\n'
+                       '        rollback_failed=1\n'), 1)
         self.assertNotIn("rm -rf /opt/gowave-node", body)
         self.assertNotIn("rm -f /usr/local/bin/gowave-node", body)
 

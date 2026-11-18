@@ -256,7 +256,10 @@ class TestOwnershipTargetsCase(unittest.TestCase):
             with self.subTest(mutation=later):
                 self.assertLess(guard, body.index(later))
         self.assertLess(guard, record)
-        self.assertLess(record, body.index("    trap - ERR\n"))
+        # The disarm the install reaches on success, not whichever `trap - ERR`
+        # the file happens to hold first: the signal block disarms its own.
+        self.assertLess(record, body.index(
+            "    # Disable ERR compensation trap on verified success\n"))
 
     def test_a_contour_without_a_worker_is_blocked_not_passed(self):
         product = _LocalProduct(worker=False)

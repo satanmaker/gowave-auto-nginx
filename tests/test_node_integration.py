@@ -281,7 +281,10 @@ class TestNodeIntegration(unittest.TestCase):
         """Worker deployment must include automated compensating rollback on error."""
         worker_script = (REPO_ROOT / "gowave-node-auto.sh").read_text()
         self.assertIn("compensate_remote_worker", worker_script)
-        self.assertIn("trap 'exit_code=$?; compensate_remote_worker \"$exit_code\"; exit \"$exit_code\"' ERR", worker_script)
+        # The ERR trap is the same guarded handler as a signal, because the
+        # compensator returns the exit code it was given: called straight from
+        # the trap it would re-enter and roll the host back twice.
+        self.assertIn("trap 'handle_error \"$?\"' ERR", worker_script)
         # Both units are cleaned up by name from a loop that skips a unit the host
         # does not have, so the assertion names the loop rather than one stop line.
         self.assertIn("for unit in gowave-node.service xray.service; do", worker_script)
@@ -289,7 +292,11 @@ class TestNodeIntegration(unittest.TestCase):
         # The service directory is no longer removed by a blanket rm: it comes
         # back from the transaction's before-image, so a path this install did
         # not write is not deleted by a rollback that never owned it.
-        self.assertIn("restore_worker_targets_before_image || rollback_failed=1", worker_script)
+        self.assertIn('restore_worker_targets_before_image \\\n'
+                      '        "$host_root" "$(worker_targets_before_image "$state_root" '
+                      '"$_ACME_TX_ID")" ||\n'
+                      '        rollback_failed=1\n',
+                      worker_script)
         self.assertNotIn("rm -rf /etc/systemd/system/gowave-node.service.d", worker_script)
         self.assertIn("certbot delete --cert-name \"$WORKER_DOMAIN\"", worker_script)
         self.assertIn("swapoff /swapfile", worker_script)
@@ -300,7 +307,11 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn('active_swaps=$(swapon --noheadings --raw --output NAME 2>/dev/null)', worker_script)
 
         self.assertNotIn("Compensating rollback completed on worker host.", worker_script)
-        self.assertIn('restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_failed=1', worker_script)
+        self.assertIn(
+            'restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" "$state_root/recovery" '
+            '"$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1',
+            worker_script,
+        )
 
     def test_worker_keeps_port_80_acme_vhost_for_renewal(self):
         """Worker port-80 ACME vhost must survive issuance; deleting it makes renewal 404."""
@@ -323,7 +334,10 @@ class TestNodeIntegration(unittest.TestCase):
         inventory_end = payload.index("\n}\n", inventory_start) + len("\n}\n")
         self.assertIn(vhost, payload[inventory_start:inventory_end])
         rollback_start = payload.index("compensate_remote_worker() {")
-        self.assertIn("restore_worker_targets_before_image || rollback_failed=1",
+        self.assertIn('restore_worker_targets_before_image \\\n'
+                      '        "$host_root" "$(worker_targets_before_image "$state_root" '
+                      '"$_ACME_TX_ID")" ||\n'
+                      '        rollback_failed=1\n',
                       payload[rollback_start:])
 
         uninstall_start = script.index("cat <<'ROLLBACK_REMOTE_SCRIPT'")

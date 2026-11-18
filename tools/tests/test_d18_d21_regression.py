@@ -301,13 +301,16 @@ class TestD18D21RegressionSuite(unittest.TestCase):
         self.assertIn("trap 'handle_signal HUP' HUP", node_script)
         self.assertIn("trap 'handle_signal INT' INT", node_script)
         self.assertIn("trap 'handle_signal TERM' TERM", node_script)
-        self.assertIn(
-            """trap 'exit_code=$?; compensate_remote_worker "$exit_code"; exit "$exit_code"' ERR""",
-            node_script,
-        )
+        # The ERR trap goes through the same guarded handler as a signal: the
+        # compensator returns the exit code it was given, so a trap that called
+        # it directly would run the rollback a second time over a host the first
+        # pass already restored.
+        self.assertIn("""trap 'handle_error "$?"' ERR""", node_script)
         self.assertIn("trap 'cleanup_temp_and_secrets' EXIT", node_script)
-        self.assertIn('if [[ "${_COMPENSATED:-0}" -eq 0 ]]; then', node_script)
-        self.assertIn("compensate_remote_worker", node_script)
+        # The guard short-circuits the second entrant, and the one call beside it
+        # is the only place the compensator is reached from this block.
+        self.assertIn('[[ "${_COMPENSATED:-0}" -eq 0 ]] || return 0', node_script)
+        self.assertEqual(node_script.count('compensate_remote_worker "$exit_code" ||'), 1)
 
     def test_d20_empty_applying_journal_requires_operator_recovery(self):
         """An empty APPLYING ledger is ambiguous and must not be reported as rolled back."""

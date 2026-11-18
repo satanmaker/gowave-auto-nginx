@@ -5029,12 +5029,21 @@ compensate_remote_worker() {
     local rollback_failed=0
     echo "[ROLLBACK] Remote worker deployment failed (exit code: $exit_code). Initiating automated compensating rollback..." >&2
 
+    # The state root is where this transaction recorded its before-images and
+    # its ACME snapshot, and the host root is the tree those records describe.
+    # Both are the host itself for a real run, and they are the same two things
+    # a reconcile of the same journal is given. The service manager, the firewall
+    # and the swap, sysctl and NGINX files belong to the host rather than to the
+    # record, and stay where they are.
+    local state_root="${WORKER_STATE_ROOT:-/var/lib/gowave-auto-nginx}"
+    local host_root="${WORKER_HOST_ROOT:-/}"
+
     # The before-image is the first thing this run captures and the
     # only thing a rollback restores from. Without it nothing this run
     # wrote can be proven and undone, so the refusal that stopped the
     # run is the whole outcome and the steps below have nothing to do.
     if [[ -z "${_ACME_TX_ID:-}" ]] ||
-        [[ ! -d "$(worker_targets_before_image "/var/lib/gowave-auto-nginx" "$_ACME_TX_ID")" ]]; then
+        [[ ! -d "$(worker_targets_before_image "$state_root" "$_ACME_TX_ID")" ]]; then
         echo "[ROLLBACK] No Worker before-image was captured; nothing to compensate." >&2
         return "$exit_code"
     fi
@@ -5042,7 +5051,7 @@ compensate_remote_worker() {
     # A rollback puts the paths back and leaves the packages installed. The
     # delta is recorded here, before the paths are restored, so the teardown
     # report can name the residue instead of calling the host clean.
-    record_worker_package_changes "$_ACME_TX_ID" ||
+    record_worker_package_changes "$_ACME_TX_ID" "$state_root" ||
         echo "[ROLLBACK] The package changes this transaction caused could not be recorded; they stay on the host unrecorded." >&2
 
     # 1. Stop and remove GoWave Node and Xray systemd services
@@ -5065,8 +5074,12 @@ compensate_remote_worker() {
     # only from it: a path that did not exist is removed only while the ownership
     # record still matches it, a path that was here is restored with its content
     # and metadata, and one changed afterwards is preserved with the cleanup
-    # reported incomplete.
-    restore_worker_targets_before_image || rollback_failed=1
+    # reported incomplete. The image is named from this transaction, as the
+    # capture named it: the ambient ACME_TX_ID is empty on a fresh install, so a
+    # default lookup would read an image no transaction wrote.
+    restore_worker_targets_before_image \
+        "$host_root" "$(worker_targets_before_image "$state_root" "$_ACME_TX_ID")" ||
+        rollback_failed=1
 
     # 2. Revert NGINX and ACME bootstrap
     if [[ "${_NGINX_CONFIGS_CREATED:-0}" -eq 1 ]] || [[ "${_NGINX_BOOTSTRAP_CREATED:-0}" -eq 1 ]]; then
@@ -5093,10 +5106,10 @@ compensate_remote_worker() {
     # 4. Revert ACME certificates
     if [[ -n "${_ACME_TX_ID:-}" ]]; then
         echo "[ROLLBACK] Restoring or cleaning up ACME certificates via snapshot..." >&2
-        restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" 2>/dev/null || rollback_failed=1
-        restore_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$_ACME_TX_ID" "$WORKER_DOMAIN" "$state_root/recovery" "$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$_ACME_TX_ID" "$REALITY_DOMAIN" "$state_root/recovery" "$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1
         if [[ -n "${VISION_DOMAIN:-}" ]]; then
-            restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN" 2>/dev/null || rollback_failed=1
+            restore_acme_lineage "$_ACME_TX_ID" "$VISION_DOMAIN" "$state_root/recovery" "$host_root/etc/letsencrypt" 2>/dev/null || rollback_failed=1
         fi
     else
         if [[ "${_ACME_WORKER_ISSUED:-0}" -eq 1 ]] && [[ -n "${WORKER_DOMAIN:-}" ]]; then
@@ -5218,22 +5231,31 @@ main() {
         unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64 SECURITY_HELPER_B64 GOWAVE_ACME_TEST_CA_B64 2>/dev/null || true
         rm -f /tmp/gowave-verify-node-mtls.py /tmp/gowave-managed-security.py /tmp/gowave-node-install-*.sh /run/gowave-acme-test-ca.pem 2>/dev/null || true
     }
+    compensate_once() {
+        # One compensation per run. A signal, a failing step and the EXIT trap
+        # all reach the same failure, and the compensator hands back the exit
+        # code it was given — so its nonzero return would re-enter the ERR trap
+        # and run the rollback a second time over a host the first pass already
+        # put back. The trap is disarmed before the rollback starts, and the
+        # flag closes the door for a signal that arrives while it runs.
+        local exit_code="${1:-1}"
+        [[ "${_COMPENSATED:-0}" -eq 0 ]] || return 0
+        _COMPENSATED=1
+        trap - ERR
+        compensate_remote_worker "$exit_code" ||
+            printf '[ROLLBACK] Compensation exited %s for exit code %s.\n' "$?" "$exit_code" >&2
+        return 0
+    }
     handle_signal() {
         local sig="$1"
         echo "Received signal $sig. Halting and invoking compensation..." >&2
-        if [[ "${_COMPENSATED:-0}" -eq 0 ]]; then
-            _COMPENSATED=1
-            compensate_remote_worker 128
-        fi
+        compensate_once 128
         cleanup_temp_and_secrets
         exit 128
     }
     handle_error() {
         local exit_code="${1:-1}"
-        if [[ "${_COMPENSATED:-0}" -eq 0 ]]; then
-            _COMPENSATED=1
-            compensate_remote_worker "$exit_code"
-        fi
+        compensate_once "$exit_code"
         cleanup_temp_and_secrets
         exit "$exit_code"
     }
@@ -5241,7 +5263,7 @@ main() {
     trap 'handle_signal HUP' HUP
     trap 'handle_signal INT' INT
     trap 'handle_signal TERM' TERM
-    trap 'exit_code=$?; compensate_remote_worker "$exit_code"; exit "$exit_code"' ERR
+    trap 'handle_error "$?"' ERR
     trap 'cleanup_temp_and_secrets' EXIT
 
     # Before the lease and the snapshots, not after: both are python3, and a

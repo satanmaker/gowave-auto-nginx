@@ -394,7 +394,7 @@ class TestPackageResidualCase(unittest.TestCase):
 
     def test_a_compensation_records_the_residue_before_it_restores_paths(self):
         body = package_residual.WORKER_INSTALLER.read_text(encoding="utf-8")
-        residue = '    record_worker_package_changes "$_ACME_TX_ID" ||\n'
+        residue = '    record_worker_package_changes "$_ACME_TX_ID" "$state_root" ||\n'
         self.assertEqual(body.count(residue), 1)
         recorded = body.index(residue)
         # A run refused before its first mutation captured no before-image, so
@@ -407,7 +407,10 @@ class TestPackageResidualCase(unittest.TestCase):
         self.assertLess(body.index("compensate_remote_worker() {"), recorded)
         self.assertLess(
             recorded,
-            body.index("    restore_worker_targets_before_image || rollback_failed=1\n", recorded),
+            body.index('    restore_worker_targets_before_image \\\n'
+                       '        "$host_root" "$(worker_targets_before_image "$state_root" '
+                       '"$_ACME_TX_ID")" ||\n'
+                       '        rollback_failed=1\n', recorded),
         )
         self.assertIn(
             "[ROLLBACK] The package changes this transaction caused could not be recorded",
