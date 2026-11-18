@@ -32,6 +32,7 @@ from . import (
     ingress,
     matrix,
     operator_access,
+    ownership,
     panel_surface,
     preflight_cases,
     revocation,
@@ -8907,6 +8908,12 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case(hook_ownership.HOOK_01, "aio",
              lambda context: hook_ownership.case_preexisting_hook_is_never_adopted(
                  product, context),
+             timeout_seconds=300),
+        # The sysctl file the panel writes: the shipped writer is run on this
+        # container against a path the case owns, so a foreign file, an empty
+        # file and a symlink are refused rather than truncated.
+        Case(ownership.CASE_ID, "aio",
+             lambda context: ownership.case_panel_sysctl_is_not_adopted(product, context),
              timeout_seconds=300),
         # The journal an interrupted switch leaves behind, and the boot recovery
         # that reads it: both the writer and the shell recovery are the product's.

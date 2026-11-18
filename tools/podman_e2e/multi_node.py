@@ -32,7 +32,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from tools.podman_e2e import (
     acme_fixture, aio, argv_probe, budget, denial, environment_gate, hook_ownership,
     ingress, local_ci,
-    lock_cases, matrix as matrix_data, mtls, operator_access, preflight_cases, revocation,
+    lock_cases, matrix as matrix_data, mtls, operator_access, ownership,
+    preflight_cases, revocation,
     runstate_cases,
     skip_policy, status, teardown, topology, transaction_recovery, trust_bundle, vision as vision_policy,
 )
@@ -8790,6 +8791,13 @@ def cases(
         Case(hook_ownership.HOOK_01, "multi-node",
              lambda context: hook_ownership.case_preexisting_hook_is_never_adopted(
                  product, context),
+             timeout_seconds=300),
+        # The Worker's own sysctl file: the payload's writer is run on the worker
+        # container against a path the case owns, so a foreign file, an empty
+        # file and a symlink are refused rather than truncated, and only a file
+        # this run created is marked for the rollback to remove.
+        Case(ownership.CASE_ID, "multi-node",
+             lambda context: ownership.case_worker_sysctl_is_not_adopted(product, context),
              timeout_seconds=300),
         # The same journal and the same boot recovery as the All-in-One: the
         # recovery is per host, so both contours read one implementation.

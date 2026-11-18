@@ -186,8 +186,41 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: ownership:case_panel_sysctl_is_not_adopted
+      evidence:
+      - absent_created
+      - absent_has_the_marker
+      - empty_refused
+      - foreign_bytes_intact
+      - foreign_mode_intact
+      - foreign_refused
+      - own_lines_adopted
+      - own_lines_keep_the_marker
+      - refusal_names_the_path
+      - symlink_refused
+      - symlink_still_a_symlink
+      - symlink_target_intact
+    multi-node:
+      driver: ownership:case_worker_sysctl_is_not_adopted
+      evidence:
+      - absent_created
+      - absent_has_the_marker
+      - absent_marked_created
+      - empty_refused
+      - foreign_bytes_intact
+      - foreign_mode_intact
+      - foreign_not_marked_created
+      - foreign_refused
+      - own_lines_adopted
+      - own_lines_keep_the_marker
+      - own_lines_not_marked_created
+      - refusal_names_the_path
+      - symlink_refused
+      - symlink_still_a_symlink
+      - symlink_target_intact
   promotion_target: null
 - id: OWN-02
   requirement: Complete Mutation-Target Baseline and Resource Ownership
