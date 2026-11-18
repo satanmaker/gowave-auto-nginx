@@ -37,6 +37,7 @@ from tools.podman_e2e import (
     ownership_targets,
     package_residual,
     preflight_cases, revocation,
+    rollback_sides,
     runstate_cases,
     signal_compensation,
     skip_policy, status, teardown, topology, transaction_recovery, trust_bundle,
@@ -8849,6 +8850,12 @@ def cases(
         # recovery is per host, so both contours read one implementation.
         Case(transaction_recovery.CASE_ID, "multi-node",
              lambda context: transaction_recovery.case_interrupted_mutation_leaves_a_validated_journal(
+                 product, context),
+             timeout_seconds=300),
+        # The same two-sided record on the Master: a Worker restore that failed
+        # and a Panel rollback that succeeded is not a rolled-back transaction.
+        Case(rollback_sides.CASE_ID, "multi-node",
+             lambda context: rollback_sides.case_worker_and_api_rollback_are_both_required(
                  product, context),
              timeout_seconds=300),
         # Revocation is per target, so the two hosts read one controller: the

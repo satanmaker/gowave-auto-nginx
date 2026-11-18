@@ -751,8 +751,14 @@ class TestNodeIntegration(unittest.TestCase):
         commit_block = worker_script[commit_start:commit_end]
         self.assertIn("if ! python3 -c", commit_block)
         self.assertIn('ACME_TX_ID="$acme_tx_id"', commit_block)
-        self.assertIn('remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"', commit_block)
-        self.assertIn("rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE')", commit_block)
+        # Both sides are compensated by the one finalizer the two failure paths
+        # share, so the block names that call and the finalizer holds the two
+        # compensations: a copy here would be a second place to forget a side.
+        self.assertIn('finalize_failed_node_add "$name" "$ip" "$ssh_port"', commit_block)
+        finalizer_start = worker_script.index("finalize_failed_node_add() {")
+        finalizer = worker_script[finalizer_start:worker_script.index("\ncmd_node() {", finalizer_start)]
+        self.assertIn('remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"', finalizer)
+        self.assertIn("rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE')", finalizer)
         self.assertIn("return 1", commit_block)
 
     def test_worker_acme_snapshot_is_retained_until_controller_commit(self):
