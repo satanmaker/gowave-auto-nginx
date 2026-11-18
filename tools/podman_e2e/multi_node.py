@@ -33,7 +33,7 @@ from tools.podman_e2e import (
     acme_fixture, aio, argv_probe, budget, denial, environment_gate, hook_ownership,
     ingress, local_ci,
     lock_cases, matrix as matrix_data, mtls, operator_access, ownership,
-    firewall_image,
+    firewall_image, mutation_baseline,
     ownership_targets,
     preflight_cases, revocation,
     runstate_cases,
@@ -8814,6 +8814,12 @@ def cases(
         # the same policy comes back with the transaction that changed it.
         Case(firewall_image.CASE_ID, "multi-node",
              lambda context: firewall_image.case_worker_firewall_policy_is_preserved(
+                 product, context),
+             timeout_seconds=300),
+        # The same baseline on the Worker: the payload's own before-image, its
+        # ownership record and its restore, over the same real tree.
+        Case(mutation_baseline.CASE_ID, "multi-node",
+             lambda context: mutation_baseline.case_worker_mutation_targets_are_restored(
                  product, context),
              timeout_seconds=300),
         # The same journal and the same boot recovery as the All-in-One: the

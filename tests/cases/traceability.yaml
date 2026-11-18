@@ -804,6 +804,43 @@ cases_by_requirement:
       subject and no host is touched: no install runs, and the container proves
       the functions' verdict and the bytes they leave on disk.
   - requirement: Live scenario parity
+    cases: [OWN-04]
+    reason: >-
+      OWN-04 is the aggregate of §Complete Mutation-Target Baseline and
+      Resource Ownership: after a later deployment step fails, every path the
+      transaction created is removed only while it is still what the install
+      wrote, every path that was here before is put back with its recorded
+      content and metadata, and anything changed afterwards -- or that no
+      record can prove -- is preserved with the cleanup reported incomplete
+      instead of a success reported for a rollback that left the host dirty.
+      The before-image is `worker_targets_image capture`, taken after the ACME
+      snapshot and before `setup_system_prereqs` mutates anything, and written
+      into the transaction's own recovery directory; the way back is
+      `worker_targets_image restore`, which the in-payload compensation and the
+      standalone rollback both call in place of the blanket `rm -rf` list that
+      used to name `/opt/gowave-node`, `/opt/remnanode`, the two binaries, the
+      six NGINX files and both webroots whether or not this transaction wrote
+      them. Each inventoried path is recorded as absent, as a file with its
+      bytes copied into the image at mode 0600 plus its mode, its owner and its
+      digest, as a symlink with its target, or as a directory, and the manifest
+      is written at mode 0600 after the copies. The record a created path is
+      compared against is the ownership record OWN-02 already ships, so a path
+      with no record behind it is preserved rather than removed. The case
+      drives the six shipped functions over a scratch root and reads back
+      nineteen facts: the image is per transaction, taking it changes nothing,
+      it names every inventoried path and calls none of them absent that is
+      there, it holds the pre-existing file's bytes and its mode and owner, the
+      link's target and the directory, a second capture is refused rather than
+      overwriting the first, a restore removes the created paths, restores the
+      pre-existing file's bytes, mode and link, preserves a created path that
+      was touched after the record was written, preserves every created path
+      when the record is gone, preserves everything and names the missing image
+      when there is none, refuses to write a before-image copy that changed
+      after it was taken, and reports the cleanup incomplete with a non-zero
+      exit whenever it preserved anything. What the container proves is the
+      functions' verdict and the bytes they leave on disk; the live run remains
+      the source of truth for the paths a real Worker carries.
+  - requirement: Live scenario parity
     cases: [HOOK-01]
     reason: >-
       HOOK-01 is the shape half of the same sentence: a manifest records that a
