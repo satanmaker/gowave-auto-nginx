@@ -271,15 +271,22 @@ class TestCollectPlan(unittest.TestCase):
         self.assertEqual(values["cert_count"], "3")
         self.assertEqual(nodes, [])
 
-    def test_panel_only_collects_no_vision_and_no_nodes(self):
+    def test_panel_only_collects_its_workers_and_no_panel_vision(self):
+        # A panel-only host runs no local node, so the workers are the whole
+        # traffic plane and the plan has to ask for them.
         verdict, values, nodes, _ = self._collect(
-            "en\n2\npanel.example.com\ncdn.example.com\nadmin@example.com\nn\ny\n"
+            "en\n2\npanel.example.com\ncdn.example.com\nadmin@example.com\n2\n"
+            "node1.example.com\ncdn1.example.com\nn\n"
+            "node2.example.com\ncdn2.example.com\ny\nvision2.example.com\nn\ny\n"
         )
         self.assertEqual(verdict, "CONFIRMED")
         self.assertEqual(values["variant"], "panel-only")
         self.assertEqual(values["vision"], "")
-        self.assertEqual(values["cert_count"], "2")
-        self.assertEqual(nodes, [])
+        self.assertEqual(values["cert_count"], "7")
+        self.assertEqual(
+            nodes,
+            ["node1.example.com|cdn1.example.com|", "node2.example.com|cdn2.example.com|vision2.example.com"],
+        )
 
     def test_multi_node_collects_every_worker_and_its_optional_vision(self):
         verdict, values, nodes, _ = self._collect(
