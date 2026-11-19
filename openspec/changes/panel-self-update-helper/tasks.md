@@ -16,10 +16,17 @@
   `dist/` inside the tar (`tests/test_panel_deployment.py:323-329`), so the existing assertion also passes under
   the old symlinked layout. Verify: after repacking, the same test against the pre-change `panel.sh` fails on the
   `frontend/dist` assertion; with the change it passes (`python3 tests/test_panel_deployment.py`).
-- [ ] 0.4 Prove the layout on a real host: reinstall on a disposable host, then run the upstream
+- [x] 0.4 Prove the layout on a real host: reinstall on a disposable host, then run the upstream
   `install.sh --update` manually (no product script invokes it) and confirm it reaches the restart instead of
   `Refusing a symlinked /opt/gowave/dist`. Verify: the command's exit status, the absence of the refusal line and
   the panel's `wait_healthy` line in the log are recorded here.
+  Closed 2026-11-19 on the live pair by the in-panel updater rather than by `install.sh --update`: the operator
+  triggered the update from the Panel UI, `gowave-update.service` ran once (17:42:06 → 17:42:11 UTC) and its
+  journal reads `Installing the frontend into /opt/gowave/frontend/dist` → `Reapplying the service policy` →
+  `Restarting gowave.service` → `Finished`, exit state `done`. Upstream's own binary writes the dashboard to
+  `frontend/dist` and reaches the restart; the refusal line appears nowhere, and `/opt/gowave/dist` does not
+  exist on either host. The literal `install.sh --update` command was **not** run — record:
+  `artifacts/live-vps/post-update-20261119/README.md`.
 
 ## 1. Unit templates and the runtime directory
 
@@ -85,17 +92,25 @@
   claims AIO-04. Verify: `python3 -m tools.podman_e2e.catalog check` prints PASS, `python3 -m unittest
   tests.test_podman_catalog` passes, a Podman AIO run reports PASS with the `update_helper` evidence key
   recorded, and the run directory is named in the change's verification notes.
-- [ ] 4.3 Confirm the Panel's update endpoint is no longer refused on that run: stop `gowave-update.path` before
+- [x] 4.3 Confirm the Panel's update endpoint is no longer refused on that run: stop `gowave-update.path` before
   the request so no helper run can start, then with an authenticated token `POST /api/system/updates/apply` with
   an empty body returns 200 instead of `409 "The update helper is not installed"`. Afterwards remove
   `/run/gowave/update-request` and `/run/gowave/update-status.json` and re-enable the path unit. Verify: the
   response status, and the absence of a `gowave-update.service` run in `journalctl`, are recorded.
+  Closed 2026-11-19 by the operator's own apply from the Panel UI, not by the isolating probe above: the endpoint
+  accepted the request and the helper ran, so the refusal did not occur. `GET /api/system/updates/status`
+  answers `helperInstalled: true`, `requestPending: false`, `status.state: done`, `fromVersion: v1.2.4`,
+  `installedVersion: v1.3.0`; `GET /api/system/updates/check` now answers `currentVersion: v1.3.0`,
+  `hasUpdate: false`. That the 200 was measured with the path unit stopped was **not** done — the run was
+  triggered deliberately, and with no update left to install the probe cannot be repeated now. Record:
+  `artifacts/live-vps/post-update-20261119/`.
 
 ## Verification notes
 
 Recorded 2026-11-19 on branch `docs/panel-self-update-helper` with the edits above applied. The first block is
-the local contours; the second block is the Podman All-in-One acceptance run that closed task 4.2. Task 4.3 and
-the disposable host of task 0.4 are still outstanding, and nothing here stands in for them.
+the local contours; the second block is the Podman All-in-One acceptance run that closed task 4.2; the third is
+the live pair after the operator's own update from the Panel UI, which closed tasks 4.3 and 0.4. Where a task
+was closed by something other than the check it names, the substitution is stated in the task itself.
 
 - `bash -n modules/panel.sh`, `bash -n gowave-auto.sh` — pass.
 - `shellcheck --severity=error modules/panel.sh gowave-auto.sh` — clean. Version 0.11.0, run through
@@ -132,8 +147,9 @@ built the old tree now build the shipped one; and
 `test_the_state_probe_reads_the_document_only_from_the_shipped_layout` pins the layout behaviourally — with
 the probe reverted to `frontend/index.html`, that test and the snapshot-digest test both fail.
 
-Not run here: task 4.3 (`POST /api/system/updates/apply`, which by instruction must not be triggered on the
-live pair either) and the disposable-host manual `install.sh --update` of task 0.4.
+Not run in that run's place: task 4.3's isolating probe (`POST /api/system/updates/apply` with the path unit
+stopped) and the disposable-host manual `install.sh --update` of task 0.4. Both were closed afterwards on the
+live pair by the operator's own update — see the next section.
 
 The Multi-Node matrix on the same tree — `artifacts/podman-e2e/podman-multi-node-20261119T200921-c6b292a7` —
 also reports `overall: PASS`, 124 cases in 1093.678 s, exit status 0, so the harness fix did not disturb the
@@ -147,6 +163,27 @@ Both VPS reinstalled (Debian 13), installed from this tree with `Panel v1.2.4` /
 `currentVersion: v1.2.4`, `latestVersion: v1.3.0`, `canAutoUpdate: true`; both nodes report `v1.1.3` against
 releases up to `v1.1.5`. Only GET was used — the update itself was left for the operator to trigger from the
 Panel UI.
+
+### The operator's update on the live pair (tasks 4.3 and 0.4)
+
+The operator then pressed update in the Panel UI and updated both nodes, and confirmed the result. Read back
+from the hosts afterwards (`artifacts/live-vps/post-update-20261119/`, three files plus a README):
+
+- Panel `v1.2.4` → `v1.3.0`; `local-node` and `worker-1` `v1.1.3` → `gowave-node v1.1.5`.
+- `journalctl -u gowave-update.service` holds exactly one run, 17:42:06 → 17:42:11 UTC: `Installing the latest
+  stable build (running v1.2.4)` … `Checksums match, downloaded build is v1.3.0` → `Installing the frontend into
+  /opt/gowave/frontend/dist` → `Replacing /opt/gowave/gowave-server (previous build kept as gowave-server.bak)` →
+  `Reapplying the service policy` → `Restarting gowave.service` → `Finished`.
+- `GET /api/system/updates/status` → `helperInstalled: true`, `requestPending: false`, `status.state: done`,
+  `progress: 100`, `fromVersion: v1.2.4`, `installedVersion: v1.3.0`; `/check` → `hasUpdate: false`.
+- After the update `gowave-update.path` is still `enabled` + `active`, both unit files were rewritten by
+  `Reapplying the service policy` at install-time sizes (169 / 226 B), `/run/gowave` is `gowave:gowave 0700`
+  holding only `update-status.json`, and `/opt/gowave/dist` does not exist on either host.
+
+That is why task 0.4 needed no `install.sh --update`: upstream's own binary performed the dashboard write into
+`frontend/dist` and reached the restart, which is the compatibility claim the task was written to test. And it is
+why task 4.3's isolating probe stays unrun: the endpoint was exercised for real, with the helper allowed to
+finish.
 
 
 ## Workflow follow-up
