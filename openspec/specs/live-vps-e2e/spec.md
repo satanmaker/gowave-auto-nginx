@@ -243,7 +243,7 @@ unambiguously pinned or verified, preflight SHALL terminate before installation.
 After running `gowave-auto.sh install` on the Master VPS, the runner SHALL verify: exit code 0; Panel binary
 version matches configuration; required systemd services are active; Panel and Node listeners are on correct
 ports; NGINX listens on port 443; TLS certificates exist with correct SAN and valid chain; a local mTLS health
-check succeeds; and `gowave-auto.sh health` returns `HEALTHY`.
+check succeeds; the Panel's own update helper is armed; and `gowave-auto.sh health` returns `HEALTHY`.
 
 #### Scenario: Panel service active and API ready
 
@@ -268,9 +268,12 @@ check succeeds; and `gowave-auto.sh health` returns `HEALTHY`.
 #### Scenario: Master services active and listeners correct
 
 - **GIVEN** `gowave-auto.sh install` completed with exit code 0
-- **WHEN** the runner checks systemd service status and port listeners on Master
+- **WHEN** the runner checks systemd service status, port listeners and the in-panel update helper on Master
 - **THEN** `gowave.service`, `gowave-node.service`, `nginx.service`, and `fail2ban.service` are all active;
-  Panel listens on `127.0.0.1:3000`, Node on `3002`, and NGINX publicly on `443`
+  Panel listens on `127.0.0.1:3000`, Node on `3002`, and NGINX publicly on `443`; both
+  `gowave-update.service` and `gowave-update.path` exist, the path unit is enabled and active over a
+  `/run/gowave` directory of mode `0700` owned by `gowave`, and no
+  `gowave.service.d/90-unprivileged.conf` exists before the first in-panel update
 
 #### Scenario: TLS certificate valid and shortUuid retrievable
 

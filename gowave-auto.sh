@@ -436,6 +436,9 @@ PY
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
         systemctl restart --no-ask-password gowave.service
         systemctl is-active --quiet gowave.service
+        # The path unit is armed only now, once the restart has created
+        # /run/gowave, so the watch never starts against a missing directory.
+        systemctl start --no-ask-password gowave-update.path
     fi
     verify_panel_startup 127.0.0.1 3000 30
     verify_public_tls_sni "$panel_domain"
@@ -1350,9 +1353,11 @@ cmd_uninstall() {
 
     # 1. Stop and disable systemd services
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
-        systemctl stop --no-ask-password gowave.service gowave-node.service 2>/dev/null || true
-        systemctl disable --no-ask-password gowave.service gowave-node.service gowave-recover.service gowave-recover-provision.service 2>/dev/null || true
-        rm -f /etc/systemd/system/gowave.service \
+        systemctl stop --no-ask-password gowave-update.path gowave-update.service gowave.service gowave-node.service 2>/dev/null || true
+        systemctl disable --no-ask-password gowave-update.path gowave-update.service gowave.service gowave-node.service gowave-recover.service gowave-recover-provision.service 2>/dev/null || true
+        rm -f /etc/systemd/system/gowave-update.path \
+              /etc/systemd/system/gowave-update.service \
+              /etc/systemd/system/gowave.service \
               /etc/systemd/system/gowave-node.service \
               /etc/systemd/system/gowave-recover.service \
               /etc/systemd/system/gowave-recover-provision.service \

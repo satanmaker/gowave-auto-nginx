@@ -37,7 +37,7 @@
 
 | Component | Target Version | Ubuntu 24.04 Status | Ubuntu 26.04 Status | Required Adaptations | Evidence & Code Source |
 |---|---|---|---|---|---|
-| **GoWave Panel** | `v1.2.4` (`6d2c357`) | `UPSTREAM_SUPPORTED` | `SOURCE_COMPATIBLE` | `GOWAVE_PROXY=external` in `.env`; `service install` drop-in. | `gowave/install.sh:48-66` (amd64/arm64 detection) |
+| **GoWave Panel** | `v1.2.4` (`6d2c357`) | `UPSTREAM_SUPPORTED` | `SOURCE_COMPATIBLE` | `GOWAVE_PROXY=external` in `.env`; base and update-helper units written by the installer, no `service install`. | `gowave/install.sh:48-66` (amd64/arm64 detection) |
 | **GoWave Node** | `v1.1.3` (`7b3514d`) | `UPSTREAM_SUPPORTED` | `SOURCE_COMPATIBLE` | Installed via upstream `gowave-node/install.sh`; wildcard `:3002` isolated by UFW. | `gowave-node/install.sh:82-97` (systemd detection) |
 | **Xray-Core (`rw-core`)** | `v25.x` | `UPSTREAM_SUPPORTED` | `SOURCE_COMPATIBLE` | Supervised directly by GoWave Node ProcessManager. | `gowave-node/internal/xray/process.go:51-94` |
 | **NGINX + Stream** | 1.24.0 (Noble) / 1.26+ (Resolute) | `ADAPTED` | `UPSTREAM_SUPPORTED` | **Ubuntu 24.04 adaptation**: Ubuntu 24.04 ships NGINX 1.24.0 (< 1.25.1), requiring legacy `listen ... ssl http2;` across both HTTPS (7443) and Decoy (9443) listeners. Directive `http2 on;` causes fatal syntax error on 1.24.0. Runtime `nginx -v` evaluation determines syntax. | Ubuntu 24.04 `nginx` package (1.24.0-2ubuntu7); `nginx.org/en/docs/http/ngx_http_v2_module.html` |

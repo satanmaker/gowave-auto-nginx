@@ -77,7 +77,10 @@ class TestImplementationRegistry(unittest.TestCase):
 
     def test_the_registry_names_the_driver_and_evidence_of_a_known_case(self):
         self.assertEqual(self.registry["AIO-04"]["aio"]["driver"], "aio:case_services")
-        self.assertEqual(self.registry["AIO-04"]["aio"]["evidence"], ["listeners", "units"])
+        self.assertEqual(
+            self.registry["AIO-04"]["aio"]["evidence"], ["listeners", "units", "update_helper"],
+            "the in-panel update helper probe is its own evidence key, not a clause of `units`",
+        )
         self.assertEqual(
             self.registry["AIO-INSTALL"]["aio"]["driver"], "aio:AioProduct.install",
             "a method-backed case must be recorded by the method it wraps",
