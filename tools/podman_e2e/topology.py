@@ -1166,6 +1166,47 @@ class AioTopology:
         return record
 
 
+@dataclass
+class PanelOnlyTopology(AioTopology):
+    """One disposable host running the Panel and the camouflage site, no traffic plane.
+
+    ``gowave-auto.sh install --panel-only`` deploys the Panel and the static
+    decoy and stops there: no GoWave Node, no Xray and no inbound listener. The
+    target, the resolver and the ACME fixtures are the All-in-One ones because
+    the operator command, the certificate lineage and the API are the same; what
+    differs is the command line, the role the archive volume is recorded under,
+    and the Vision domain, which this mode has nowhere to terminate.
+    """
+
+    target_role: str = "panel-only"
+
+    def __post_init__(self) -> None:
+        if self.vision_domain is not None:
+            raise ValueError(
+                "the Panel-only topology deploys no traffic plane, so it has no Vision domain"
+            )
+        super().__post_init__()
+        # The host is not an All-in-One one, and two topologies in one run
+        # directory must not share a container name.
+        self.target_name = self.context.resource_name("panel")
+
+    def install_script(self) -> str:
+        arguments = [self.panel_domain, self.reality_domain, self.admin_email]
+        quoted = " ".join(f"'{value}'" for value in arguments)
+        return f"bash {REPO_IN_CONTAINER}/gowave-auto.sh install --panel-only {quoted}"
+
+    def install(self) -> InstallOutcome:
+        return self._install("panel-only-install")
+
+    def reinstall(self) -> InstallOutcome:
+        return self._install("panel-only-reinstall")
+
+    def evidence(self, outcome: Optional[InstallOutcome] = None) -> Dict[str, Any]:
+        record = super().evidence(outcome)
+        record["installation_mode"] = "panel-only"
+        return record
+
+
 NODE_ADD_TIMEOUT_SECONDS = 5400
 WORKER_SSH_SETUP_SCRIPT = r"""
 set -eu

@@ -183,6 +183,20 @@ topologies:
     case_id_pattern: "MN-DP-{node}-{inbound}-{client}"
     runtime_budget_seconds: 4500
     gate: [pre-push, pr]
+  # The Panel and the static decoy on one host, with no traffic plane: no local
+  # node, no backend on 8443/8444 and no Vision inbound. It therefore owes no
+  # data-plane tuple — no case id pattern, no Vision combination and no positive
+  # count — and its own cases (host shape, API state, the squad a later node add
+  # creates) are declared by the suite rather than by this matrix. No tier gates
+  # it yet: the acceptance jobs run the two topologies above, so an empty gate
+  # list says so instead of claiming a check that does not exist.
+  panel-only:
+    nodes: []
+    vision_combinations: []
+    positive_case_counts: {}
+    case_id_pattern: ""
+    runtime_budget_seconds: 1800
+    gate: []
 
 runtime_budget:
   pre_push_total_seconds: 7200

@@ -9,7 +9,12 @@ whole stack updatable with transaction safety, crash recovery and rollback on ev
 
 ## What it delivers
 
-- **All-in-One deployment** — GoWave Panel + local GoWave Node on a single host, no port conflicts.
+- **Three deployment variants** — Panel-only (Panel and a static camouflage site, no traffic plane),
+  All-in-One (Panel + local GoWave Node on a single host, for trial and evaluation), and All-in-One plus
+  remote nodes onboarded over SSH.
+- **Interactive setup wizard** — an argument-less `install` on a terminal asks language (EN/RU), variant,
+  node count and every host name, validates the plan as DNS names, prints the certificate count, and only
+  then runs the same commands the positional path runs.
 - **NGINX Stream SNI demultiplexing on :443** with **REALITY loopback fallback** to static camouflage
   decoy sites: unrecognised traffic is dropped to the decoy, never proxied.
 - **Deterministic subscriptions** — per-user Xray JSON and Mihomo YAML with mandatory `User-Agent`
@@ -33,8 +38,62 @@ sudo ./gowave-auto.sh install vpn.example.com cdn.example.com acme@example.com
 sudo ./gowave-auto.sh node add worker-1 203.0.113.10 worker-1.example.com cdn.example.com
 ```
 
-Omitting arguments drops into interactive prompts. Administrative credentials are written to
-`/root/gowave-credentials.txt` (mode `0600`). See `./gowave-auto.sh help` for the full command surface.
+An argument-less `install` opens the setup wizard, which needs a terminal; without one it exits with the
+usage message that names the arguments. Administrative credentials are written to
+`/root/gowave-credentials.txt` (mode `0600`). Running `./gowave-auto.sh` with no arguments opens the menu
+and the command usage; `./gowave-auto.sh` with an unknown command prints the full command surface.
+
+## Deployment variants
+
+The three positional arguments are `<panel-domain> <camouflage-domain> <acme-email>`, with an optional
+fourth Vision domain:
+
+```bash
+# Panel-only: Panel and a static camouflage site; no local node, no traffic plane.
+sudo ./gowave-auto.sh install --panel-only vpn.example.com cdn.example.com acme@example.com
+
+# All-in-One: Panel plus a local GoWave Node on this host (trial and evaluation only).
+sudo ./gowave-auto.sh install vpn.example.com cdn.example.com acme@example.com
+
+# All-in-One with the optional Vision inbound on this host.
+sudo ./gowave-auto.sh install vpn.example.com cdn.example.com acme@example.com vision.example.com
+```
+
+All-in-One is recommended only for testing and familiarising yourself with the UI: a single host is both
+the control plane and the traffic plane, so it is not a production topology. A production deployment is
+Panel-only or All-in-One on the Panel host plus remote Workers, each onboarded with `node add`.
+
+## Remote node onboarding over temporary access
+
+The wizard onboards each Worker without leaving a standing key behind:
+
+- The Worker's Ed25519 host-key SHA-256 fingerprint is shown and must be typed in full; a mismatch refuses
+  the onboarding before any key is written.
+- Non-interactive inputs are `GOWAVE_SSH_FINGERPRINT` (the value the operator read from the Worker) and
+  `GOWAVE_SSH_PASSWORD_FILE` (a file with mode `0600`; a `0644` file is refused). The password is read
+  once and is never placed in a command line.
+- A systemd timer on the Worker removes the temporary `authorized_keys` entry within two hours. The same
+  entry is revoked at the end of `node add`, on success and on failure, and the timer is disabled and
+  deleted with it.
+
+## Domain and certificate policy
+
+Every host spends `2 + v_panel + 2N + k` certificates: the Panel name, the camouflage apex and `www`,
+each worker's panel and camouflage names, and each Vision domain. Let's Encrypt allows **50 certificates
+per registered domain per 7 days**, and that budget is shared by the whole cluster and by anything else
+on the registered domain. The preflight's node ceiling follows from that limit: **24** nodes with no
+Vision, **23** with Vision on the Panel host only, **16** with Vision everywhere under a Panel-only
+Panel, and **15** with Vision everywhere under an All-in-One Panel.
+
+Three limits are part of the policy, not implementation details:
+
+- **The remaining budget cannot be queried.** Let's Encrypt exposes no endpoint for it, so the preflight
+  counts only the plan in front of it and never claims a remaining figure.
+- **The apex and `www` camouflage certificate belongs to a single host.** A second host on the same
+  registered apex cannot serve that website; it can only run a decoy at its own subdomain.
+- **Wildcard is not a remedy for a shared domain.** Every host would order the identical
+  `[domain, *.domain]` identifier set, and the five-per-exact-set limit would cap a shared-domain cluster
+  at about five hosts per week — worse than the ceilings above.
 
 ## Safety model
 

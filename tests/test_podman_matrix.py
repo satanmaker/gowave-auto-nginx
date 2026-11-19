@@ -94,6 +94,27 @@ class TestProtocolMatrix(unittest.TestCase):
         self.assertEqual(matrix.combination("aio", vision=False), "disabled")
         self.assertEqual(matrix.combination("aio", vision=True), "enabled")
 
+    def test_the_panel_only_topology_declares_no_vision_and_no_data_plane(self):
+        # Panel-only deploys no traffic plane, so there is nothing to configure
+        # Vision on and no tuple to count: asking for either is a mistake, and a
+        # silent 0 would read as a topology that ran its cases.
+        self.assertEqual(matrix.combination(matrix.PANEL_ONLY), "none")
+        for vision, worker_vision in ((True, False), (False, True)):
+            with self.subTest(vision=vision, worker_vision=worker_vision):
+                with self.assertRaises(KeyError):
+                    matrix.combination(matrix.PANEL_ONLY, vision, worker_vision)
+        self.assertEqual(matrix.runtime_budget_seconds(self.data, matrix.PANEL_ONLY), 1800)
+        self.assertEqual(
+            self.data["topologies"][matrix.PANEL_ONLY]["positive_case_counts"], {},
+            "the mode owes no data-plane case, so it declares no count",
+        )
+        self.assertEqual(
+            self.data["topologies"][matrix.PANEL_ONLY]["gate"], [],
+            "a topology no tier runs must not claim a gate tier",
+        )
+        with self.assertRaises(KeyError):
+            matrix.positive_count(self.data, matrix.PANEL_ONLY)
+
     def test_an_unknown_inbound_is_reported_by_its_id(self):
         with self.assertRaises(KeyError) as caught:
             matrix.inbound(self.data, "HYSTERIA")

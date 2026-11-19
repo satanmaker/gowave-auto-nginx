@@ -50,8 +50,10 @@ configure_ufw() {
     ufw allow 80/tcp comment "HTTP ACME challenge" || true
     ufw allow 443/tcp comment "HTTPS and Xray Stream" || true
 
-    # 3. Handle Node port
-    if [[ "$is_worker" == "true" ]]; then
+    # 3. Handle Node port (a Panel-only host has none)
+    if [[ -z "$node_port" ]]; then
+        echo "UFW: No local Node port to isolate (Panel-only installation)."
+    elif [[ "$is_worker" == "true" ]]; then
         if [[ -n "$panel_ip" ]]; then
             echo "UFW: Whitelisting Central Panel IP $panel_ip for Node port $node_port/tcp..."
             ufw allow from "$panel_ip" to any port "$node_port" proto tcp comment "GoWave Panel control plane" || true

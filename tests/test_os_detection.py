@@ -152,10 +152,13 @@ class TestOSDetection(unittest.TestCase):
         """cmd_install validates arguments and probes the cover apex before prerequisites."""
         script = OPERATOR_PATH.read_text(encoding="utf-8")
         start = script.index("cmd_install() {")
-        body = script[start:start + 4000]
+        # The whole function, not a fixed character window: the window ended
+        # before the cover probe once the install-mode branches grew, and a
+        # guard that can no longer see the line it names is not a guard.
+        body = script[start:script.index("\n}\n", start)]
         bootstrap = body.index("bootstrap_early_tools || return 1")
         validator = body.index("python3 - \"$panel_domain\"")
-        cover = body.index("server_ip=$(resolve_panel_ipv4)")
+        cover = body.index("cover_server_ip=$(resolve_panel_ipv4)")
         self.assertLess(bootstrap, validator)
         self.assertLess(bootstrap, cover)
 

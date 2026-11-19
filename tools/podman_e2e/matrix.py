@@ -24,6 +24,9 @@ VISION_INBOUND = "VISION"
 
 AIO = "aio"
 MULTI_NODE = "multi-node"
+# The Panel and the camouflage site without a traffic plane. It is a topology
+# the suite accepts, not a Vision combination: there is no node to configure.
+PANEL_ONLY = "panel-only"
 
 
 def load(path: Path = MATRIX_PATH) -> Dict[str, Any]:
@@ -106,6 +109,12 @@ def combination(topology: str, vision: bool = False, worker_vision: bool = False
         if worker_vision:
             return "worker-only"
         return "neither"
+    if topology == PANEL_ONLY:
+        if vision or worker_vision:
+            raise KeyError(
+                "the Panel-only topology has no traffic plane, so it configures no Vision inbound"
+            )
+        return "none"
     raise KeyError(f"no Vision combination is defined for {topology!r} yet")
 
 
