@@ -35,13 +35,14 @@ from tools.podman_e2e import (
     lock_cases, matrix as matrix_data, mtls, operator_access, ownership,
     firewall_image, mutation_baseline,
     negative_journal,
+    negative_matrix,
     ownership_targets,
     package_residual,
     preflight_cases, revocation,
     rollback_sides,
     runstate_cases,
     signal_compensation,
-    skip_policy, status, teardown, topology, transaction_recovery, trust_bundle,
+    skip_policy, staging_trust, status, teardown, topology, transaction_recovery, trust_bundle,
     vision as vision_policy, worker_journal,
 )
 from tools.podman_e2e.podman import wait_until
@@ -8738,6 +8739,12 @@ def cases(
              preflight_cases.case_distinct_domains, timeout_seconds=120),
         Case(preflight_cases.ROOT_IDENTITY_CASE_ID, "multi-node",
              preflight_cases.case_root_identity, timeout_seconds=120),
+        # A target address the suite must not be pointed at: every class the
+        # sentence names is refused by the product's own validator, and the two
+        # harness addresses the rest of the run uses are read back as global so
+        # the refusals above are not the rule rejecting everything.
+        Case(preflight_cases.PRIVATE_ADDRESS_CASE_ID, "multi-node",
+             preflight_cases.case_private_address_rejected, timeout_seconds=240),
         # None of these reads the cluster: the two environment cases start their
         # own clean container from the run's own image and network, the trust case
         # reads the product's bundle builder, the skip case reads a policy, the CI
@@ -8753,6 +8760,15 @@ def cases(
         Case(trust_bundle.DP12_CASE_ID, "multi-node",
              lambda context: trust_bundle.case_production_bundle_excludes_staging(product, context),
              timeout_seconds=180),
+        Case(staging_trust.DP11_CASE_ID, "multi-node",
+             lambda context: staging_trust.case_staging_roots_are_pinned(product, context),
+             timeout_seconds=240),
+        Case(staging_trust.DP10_CASE_ID, "multi-node",
+             lambda context: staging_trust.case_xray_outbounds_carry_anchors(product, context),
+             timeout_seconds=180),
+        Case(staging_trust.DP09_CASE_ID, "multi-node",
+             lambda context: staging_trust.case_staging_and_public_chains_are_trusted(product, context),
+             timeout_seconds=240),
         Case(skip_policy.DP14_CASE_ID, "multi-node",
              lambda context: skip_policy.case_skipped_traffic_is_never_pass(product, context),
              timeout_seconds=180),
@@ -8784,6 +8800,13 @@ def cases(
              timeout_seconds=300),
         Case(operator_access.FALLBACK_CASE_ID, "multi-node",
              lambda context: operator_access.case_failed_bootstrap_falls_back_to_timer(
+                 product, context),
+             timeout_seconds=300),
+        # What happens to the access after the run, on both hosts: the key and the
+        # timer are withdrawn, and a host that keeps them is recorded as
+        # INCOMPLETE instead of passing.
+        Case(operator_access.REVOKED_CASE_ID, "multi-node",
+             lambda context: operator_access.case_temporary_access_is_revoked(
                  product, context),
              timeout_seconds=300),
         # The deploy hook of whichever target the transaction wrote, driven the
@@ -8875,6 +8898,16 @@ def cases(
         Case(revocation.REV_02, "multi-node",
              lambda context: revocation.case_revocation_cannot_be_verified(product, context),
              timeout_seconds=300),
+        # The negative matrix itself: fifteen rows the spec prints, each with the
+        # case that stops at its boundary and the contour able to produce it. The
+        # witnesses are read out of the suite's own registry, so a witness deleted
+        # from the code fails here instead of quietly emptying a catalog entry.
+        Case(negative_matrix.MATRIX_CASE_ID, "multi-node",
+             lambda context: negative_matrix.case_fifteen_rows_are_witnessed(product, context),
+             timeout_seconds=120),
+        Case(negative_matrix.TEN_CASE_ID, "multi-node",
+             lambda context: negative_matrix.case_ten_rows_are_witnessed(product, context),
+             timeout_seconds=120),
         # The lifecycle cases run last: they revoke a client and fault the
         # Worker's own unit, so nothing that observes a healthy cluster may run
         # after them and no earlier case may be blamed for their state.

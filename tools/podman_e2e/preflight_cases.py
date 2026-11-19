@@ -30,6 +30,7 @@ bind failure instead of a verdict about the product.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import subprocess
@@ -42,7 +43,7 @@ from typing import Any, Dict, Iterator, List
 
 from tools.live_vps import dns as live_dns
 from tools.live_vps import firewall as live_firewall
-from tools.live_vps.config import load_config
+from tools.live_vps.config import load_config, validate_public_ip
 from tools.live_vps.preflight import check_ssh_trust
 from tools.podman_e2e import topology
 from tools.podman_e2e.runner import RunContext
@@ -56,6 +57,7 @@ DNS_FIXTURE = REPO / "tests" / "fixtures" / "dns_server.py"
 SSH_TRUST_CASE_ID = "PRE-01"
 DNS_MISMATCH_CASE_ID = "PRE-02"
 AAAA_WITHOUT_IPV6_CASE_ID = "PRE-03"
+PRIVATE_ADDRESS_CASE_ID = "PRE-04"
 AAAA_WITH_IPV6_CASE_ID = "PRE-05"
 AAAA_BYPASS_CASE_ID = "PRE-06"
 DISTINCT_TARGETS_CASE_ID = "ADDR-01"
@@ -792,4 +794,115 @@ def case_root_identity(context: RunContext) -> Dict[str, Any]:
         "default_master_user": defaulted.master_ssh_user,
         "default_worker_user": defaulted.worker_ssh_user,
         "refused_before_lock": config_at < lock_at,
+    }
+
+
+#: The address classes the sentence names, each with the value that carries it.
+#: The values are literals: nothing here contacts the address, and a class the
+#: product stopped refusing is a line this table would no longer be able to read
+#: back from a refusal.
+_REFUSED_ADDRESSES = (
+    ("loopback", "127.0.0.1"),
+    ("rfc1918-10", "10.0.0.5"),
+    ("rfc1918-172", "172.16.3.4"),
+    ("rfc1918-192", "192.168.1.7"),
+    ("link-local", "169.254.10.20"),
+    ("multicast", "239.1.2.3"),
+    ("documentation", "203.0.113.10"),
+    ("unspecified", "0.0.0.0"),
+    ("broadcast", "255.255.255.255"),
+)
+
+#: The same classes in the family of a key that declares it carries IPv6.
+_REFUSED_IPV6 = (
+    ("loopback-v6", "::1"),
+    ("unique-local-v6", "fc00::1"),
+    ("link-local-v6", "fe80::1"),
+    ("multicast-v6", "ff02::1"),
+    ("documentation-v6", "2001:db8::1"),
+)
+
+
+def case_private_address_rejected(context: RunContext) -> Dict[str, Any]:
+    """``PRE-04``: a non-global target is refused, and the harness claims no exemption.
+
+    The container contour addresses its two hosts in the one block this harness
+    reserves for addresses ``ipaddress`` calls global, because a plan's own
+    container addresses (``10.89.0.x``) are exactly what the product refuses. The
+    exemption is therefore not a list of allowed private addresses inside the
+    parser — it is the harness's choice of a global block, and this case proves
+    that block is global so the choice fails closed if it ever is not.
+    """
+    refusals: Dict[str, str] = {}
+    with tempfile.TemporaryDirectory(prefix=f"gowave-pre-{context.topology}-") as directory:
+        root = Path(directory)
+        for label, address in _REFUSED_ADDRESSES:
+            message = _refused(_write(root, f"{label}.conf", _values(root, MASTER_IP=address)))
+            assert "MASTER_IP" in message, f"{label} was refused with {message!r}, which names no key"
+            assert address in message, (
+                f"{label} was refused with {message!r}, which does not identify the address it "
+                "rejected"
+            )
+            assert "not a public routable address" in message, (
+                f"{label} was refused with {message!r}, which does not name the rule"
+            )
+            refusals[label] = message
+        for label, address in _REFUSED_IPV6:
+            message = _refused(_write(
+                root, f"{label}.conf",
+                _values(
+                    root, MASTER_IPV6=address, WORKER_IPV6=WORKER_IPV6, ENABLE_IPV6="true",
+                ),
+            ))
+            assert "MASTER_IPV6" in message and address in message, (
+                f"{label} was refused with {message!r}, which does not name the IPv6 key and value"
+            )
+            refusals[label] = message
+
+        # The control: the addresses this harness does spell are accepted, so the
+        # refusals above are the class and not the configuration.
+        accepted = _config(root, "global.conf")
+        harness_addresses = {
+            "MASTER_IP": accepted.master_ip,
+            "WORKER_IP": accepted.worker_ip,
+        }
+        non_global = [
+            name for name, address in harness_addresses.items()
+            if not ipaddress.ip_address(address).is_global
+        ]
+        assert not non_global, (
+            f"the harness addresses {harness_addresses}, and {non_global} are not global: every "
+            "document it feeds the parser would be refused, or an exemption would have to exist"
+        )
+
+    # The parser carries no switch that could relax the rule: the exemption lives
+    # in what the harness writes, not in the product.
+    import inspect
+
+    parameters = list(inspect.signature(validate_public_ip).parameters)
+    assert parameters == ["val", "key_name", "allow_v6"], (
+        f"validate_public_ip takes {parameters}, so a caller could relax the global-address rule"
+    )
+
+    config_at, bootstrap_at = _source_order(
+        OPERATOR, "validation_config = load_config(", "targets.append(_bootstrap_one(",
+    )
+    assert config_at < bootstrap_at, (
+        "the operator reaches its first bootstrap before it validates the target address, so a "
+        "private address would reach a socket before it reached the refusal"
+    )
+
+    return {
+        "refused_classes": len(refusals),
+        "refused_class_names": ",".join(sorted(refusals)),
+        "loopback_refusal": refusals["loopback"],
+        "rfc1918_refusal": refusals["rfc1918-10"],
+        "multicast_refusal": refusals["multicast"],
+        "documentation_refusal": refusals["documentation"],
+        "ipv6_refusal": refusals["unique-local-v6"],
+        "harness_master_ip": harness_addresses["MASTER_IP"],
+        "harness_worker_ip": harness_addresses["WORKER_IP"],
+        "harness_addresses_global": True,
+        "validator_parameters": ",".join(parameters),
+        "validated_before_bootstrap": config_at < bootstrap_at,
     }

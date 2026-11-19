@@ -682,15 +682,17 @@ all is a hook that ran as a program, and the record is how the case knows.
 | `Restore hook receives a versioned request and returns both restored resources` | `GATE-TEARDOWN` | The request is read out of the hook's own record rather than from a mock, so `schema_version`, `action`, `test_run_id` and the per-host objects are what the hook was handed. The replies that are not a restored host — no version, a later version, no host object, a host unrestored, an id the run did not ask for — are refused beside it. `RESTORE_TIMEOUT` is the bound the configuration declares: a hook that outlives a one-second bound is refused at one second. |
 | `Snapshot restore hook success requires baseline verification` | `GATE-TEARDOWN` | Two matching manifests report the comparison as `MATCHED` and the status as `INCOMPLETE`, never `PASS`, because the teardown phase does not reacquire the pair lock and the complete ownership comparison is still unimplemented; one differing field is `TEARDOWN_FAILED` and names the field. What the case cannot do is recollect the manifest from a restored host, so the two manifests are supplied to the product's own comparison rather than read over SSH. |
 | `Snapshot restore hook does not restore both hosts` | `GATE-TEARDOWN` | A nonzero exit, a non-JSON answer, JSON that is not an object, a call that outlives the bound, and a host that came back with the install still on it are each `TEARDOWN_FAILED`. The last clause writes the live reporter's `junit.xml` — the contour that owns this status — and requires the failure to appear as a JUnit `<error>` beside a passing acceptance case, so no reader of the report can take the run for green. |
+| `Snapshot restore reacquires the remote lock pair before baseline verification` | `MN-LOCK-LOSS` | The ordering is read on two real containers, one clause at a time: the pair is taken in the sorted address order rather than the order the caller passed it, a contender refused on the second host leaves the first free, a terminated holder session stops every mutating phase as `INCOMPLETE` while read-only phases still answer, the release is confirmed on both hosts before the replacement pair is taken, and the reacquired pair publishes a fresh token whose lost predecessor the product's own validator refuses. What the case cannot do is join that ordering to a snapshot restore: the hook's reboot has not happened, so the restore half stays the live run's. |
 
-**Two scenarios of that requirement stay live-only.** `TD-05` is `partial`: the
+**One scenario of that requirement stays live-only.** `TD-05` is `partial`: the
 ordering it asks for after a restore — release every original holder, including a
 surviving one, then reacquire the pair in address order and refuse to hold half of
-it — is what `MN-LOCK` and `MN-LOCK-LOSS` now prove on their own, but the case
-that would join that ordering to a snapshot restore needs the hook's reboot to
-have happened, which a container cannot produce, so the scenario stays partial
-until a case drives the restored-host path. `TD-06` needs a provider snapshot and
-a real reboot for the same reason.
+it — is what `MN-LOCK-LOSS` proves on two real hosts, while the case that would
+join that ordering to a snapshot restore needs the hook's reboot to have happened,
+which a container cannot produce, so the scenario stays partial and the live run
+keeps the restore half. `TD-06` needs a provider snapshot and a real reboot for
+the same reason, and is the one scenario of the requirement this suite does not
+drive at all.
 `TEARDOWN_FAILED` is not in this suite's vocabulary for the same reason the
 report section gives: a container run has no teardown phase to name.
 

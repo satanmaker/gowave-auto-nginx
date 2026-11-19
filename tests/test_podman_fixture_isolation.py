@@ -36,8 +36,16 @@ GLOBAL_ANCHOR_WRITES = (
 # count zero connections, zero remote writes and zero remote commands — so these
 # are names the harness reads, not hosts it reaches. The pair is listed here so a
 # second such file is visible rather than assumed.
+#
+# The address case is the mirror image and the same kind of name: `PRE-04` hands
+# each refused class to the parser to read the refusal, and a multicast group is
+# the one class `ipaddress` calls global, so the literal cannot be replaced by a
+# private one without deleting the clause it proves. Nothing in that case opens a
+# socket either: each value is written into a mode-0600 configuration file and
+# answered by `load_config`.
 NAMED_GLOBAL_ADDRESSES = {
     "operator_access.py": {"45.13.20.10", "91.203.40.20"},
+    "preflight_cases.py": {"239.1.2.3"},
 }
 
 

@@ -52,6 +52,7 @@ DNS_CASES = {
 
 LOCAL_CASES = {
     preflight_cases.SSH_TRUST_CASE_ID: preflight_cases.case_ssh_trust,
+    preflight_cases.PRIVATE_ADDRESS_CASE_ID: preflight_cases.case_private_address_rejected,
     preflight_cases.DISTINCT_TARGETS_CASE_ID: preflight_cases.case_distinct_targets,
     preflight_cases.DISTINCT_DOMAINS_CASE_ID: preflight_cases.case_distinct_domains,
     preflight_cases.ROOT_IDENTITY_CASE_ID: preflight_cases.case_root_identity,
@@ -68,6 +69,11 @@ EXPECTED_REFUSALS = {
     ("PRE-01", "order-inverted"): "reads a remote baseline before it checks local host trust",
     ("PRE-02", "dns-accepts"): "was accepted while it resolved to",
     ("PRE-03", "dns-accepts"): "preflight accepted it while",
+    ("PRE-04", "config-accepts"): "was accepted by configuration preflight",
+    ("PRE-04", "validator-relaxed"): "so a caller could relax the global-address rule",
+    ("PRE-04", "harness-private"): "are not global",
+    ("PRE-04", "order-inverted"):
+        "reaches its first bootstrap before it validates the target address",
     ("PRE-05", "dns-accepts"): "a domain with no AAAA record was answered with",
     ("PRE-06", "dns-accepts"): "preflight accepted it while ENABLE_IPV6=false",
     ("PRE-06", "firewall-passes"): "a firewall verification with no IPv6 target reported PASS",
@@ -131,6 +137,15 @@ def _firewall_that_passes(*_args, **_kwargs):
     return {"status": "PASS"}
 
 
+def _validator_that_could_relax(*_args, **_kwargs):
+    return None
+
+
+def _config_with_a_private_harness(root, name, **overrides):
+    """The harness's own control configuration, answered with addresses it must refuse."""
+    return SimpleNamespace(master_ip="10.89.0.2", worker_ip="10.89.0.3")
+
+
 DAMAGES = {
     "trust-accepts": lambda: mock.patch.object(
         preflight_cases, "check_ssh_trust", _trust_that_accepts),
@@ -142,6 +157,10 @@ DAMAGES = {
         preflight_cases.live_dns, "verify_all_domains", _dns_that_accepts),
     "firewall-passes": lambda: mock.patch.object(
         preflight_cases.live_firewall, "verify_master_firewall", _firewall_that_passes),
+    "validator-relaxed": lambda: mock.patch.object(
+        preflight_cases, "validate_public_ip", _validator_that_could_relax),
+    "harness-private": lambda: mock.patch.object(
+        preflight_cases, "_config", _config_with_a_private_harness),
     "order-inverted": lambda: mock.patch.object(
         preflight_cases, "_source_order", _descending),
     "operator-order-inverted": lambda: mock.patch.object(
@@ -248,6 +267,38 @@ class TestPreflightLocalCases(unittest.TestCase):
     def test_a_trust_check_that_accepts_an_unpinned_host_is_refused(self):
         _, refusal = run_case("PRE-01", "aio", "trust-accepts")
         self.assertIn(EXPECTED_REFUSALS[("PRE-01", "trust-accepts")], refusal)
+
+    def test_the_non_global_address_is_refused_and_the_harness_claims_no_exemption(self):
+        facts, refusal = run_case(preflight_cases.PRIVATE_ADDRESS_CASE_ID, "aio")
+        self.assertIsNone(refusal)
+        self.assertEqual(facts["refused_classes"], 14)
+        self.assertEqual(facts["refused_class_names"].split(","), [
+            "broadcast", "documentation", "documentation-v6", "link-local", "link-local-v6",
+            "loopback", "loopback-v6", "multicast", "multicast-v6", "rfc1918-10",
+            "rfc1918-172", "rfc1918-192", "unique-local-v6", "unspecified",
+        ])
+        for key in ("loopback_refusal", "rfc1918_refusal", "multicast_refusal",
+                    "documentation_refusal", "ipv6_refusal"):
+            self.assertIn("not a public routable address", facts[key], key)
+        self.assertEqual(facts["validator_parameters"], "val,key_name,allow_v6")
+        self.assertTrue(facts["harness_addresses_global"])
+        self.assertTrue(facts["validated_before_bootstrap"])
+
+    def test_a_configuration_that_accepts_a_private_target_is_refused(self):
+        _, refusal = run_case("PRE-04", "aio", "config-accepts")
+        self.assertIn(EXPECTED_REFUSALS[("PRE-04", "config-accepts")], refusal)
+
+    def test_a_validator_with_a_relaxing_switch_is_refused(self):
+        _, refusal = run_case("PRE-04", "aio", "validator-relaxed")
+        self.assertIn(EXPECTED_REFUSALS[("PRE-04", "validator-relaxed")], refusal)
+
+    def test_a_harness_that_addresses_private_hosts_is_refused(self):
+        _, refusal = run_case("PRE-04", "aio", "harness-private")
+        self.assertIn(EXPECTED_REFUSALS[("PRE-04", "harness-private")], refusal)
+
+    def test_an_operator_that_bootstraps_before_validating_the_address_is_refused(self):
+        _, refusal = run_case("PRE-04", "aio", "order-inverted")
+        self.assertIn(EXPECTED_REFUSALS[("PRE-04", "order-inverted")], refusal)
 
     def test_a_trust_check_that_appends_the_key_is_refused(self):
         _, refusal = run_case("PRE-01", "aio", "trust-appends")

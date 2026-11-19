@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """Suite nonroot: the operator's input gate, its password and the access it installs.
 
-``OP-01``, ``OP-02``, ``SSHID-01``, ``SSHID-02``, ``TSSH-01`` and ``TSSH-02`` are
-Control-Machine sentences: they are decided by ``tools/live_vps/operator.py``
-rather than by a running pair, so the cases are driven here whole instead of
-quoted. The transport, the SFTP channel and ``ssh-keygen`` are the seams; the
-remote is a model whose filesystem, modes, systemd answers and clock the case
-reads back.
+``OP-01``, ``OP-02``, ``SSHID-01``, ``SSHID-02``, ``TSSH-01``, ``TSSH-02`` and
+``BOOT-02`` are Control-Machine sentences: they are decided by
+``tools/live_vps/operator.py`` rather than by a running pair, so the cases are
+driven here whole instead of quoted. The transport, the SFTP channel and
+``ssh-keygen`` are the seams; the remote is a model whose filesystem, modes,
+systemd answers and clock the case reads back.
 
 Each clause is then damaged on its own — a parser that accepts everything, a
 controller that parses after it dials, a password that reaches a log line or an
 environment variable, a known_hosts file left world-readable, a password read
 before the host was confirmed, a temporary entry that replaces the provider's,
-a one-minute expiry, and a cleanup reported as verified — so each assertion is
-seen to fail for the reason it protects.
+a one-minute expiry, a cleanup reported as verified, a revocation that drops a
+host or gives up after one it cannot reach, one that reports a pass without
+running the script, one that removes the provider's own entry, one that leaves
+the timer files behind, and one whose record hides what survived — so each
+assertion is seen to fail for the reason it protects.
 """
 import os
 import shutil
@@ -39,6 +42,7 @@ CASES = {
     operator_access.SSHID_DECLINED_CASE_ID: operator_access.case_unconfirmed_host_key_aborts,
     operator_access.BOUNDED_CASE_ID: operator_access.case_temporary_key_is_bounded,
     operator_access.FALLBACK_CASE_ID: operator_access.case_failed_bootstrap_falls_back_to_timer,
+    operator_access.REVOKED_CASE_ID: operator_access.case_temporary_access_is_revoked,
 }
 
 #: What each damage is meant to make its case say, so a probe that went red on an
@@ -53,6 +57,23 @@ EXPECTED_REFUSALS = {
     "existing-entry-replaced": "not the provider's entry beside exactly one temporary one",
     "expiry-shortened": "not a persistent two-hour bound",
     "cleanup-reported-verified": "does not name the timer as the remaining bound",
+    "revocation-skips-a-host": "a finished pair was not revoked on both hosts",
+    "revocation-unverified": "revocation reported ['INCOMPLETE', 'INCOMPLETE']",
+    "revocation-reuses-one-connection": "not one per host",
+    "revocation-passes-without-running-the-script": "a temporary key survived revocation",
+    "revocation-removes-the-provider-entry":
+        "revocation removed the provider's own authorized_keys entry",
+    "revocation-leaves-the-timer-files":
+        "revocation left expiry files",
+    "revocation-forgets-the-script-presence": "does not say the revocation script was present",
+    "revocation-record-claims-residue": "the record still reports residue after revocation",
+    "revocation-accepts-an-inert-cleanup":
+        "a pass can be claimed without the key being gone",
+    "revocation-hides-what-survived": "the incomplete record hides what survived",
+    "revocation-names-nothing": "does not name what the operator has to remove by hand",
+    "revocation-passes-an-unreachable-host": "an unreachable host was reported",
+    "revocation-gives-up-after-a-failure":
+        "stopped the revocation of the host behind it",
 }
 
 _REAL_BOOTSTRAP = operator._bootstrap_one
@@ -106,6 +127,162 @@ class _VerifiedCleanup(_REAL_REMOTE):
         return 0, "", ""
 
 
+# --------------------------------------------------------------------------- #
+# BOOT-02 — the damages. Each one changes the revocation product or the host it
+# answers for, never the case; the seam is the same ``SSHClient`` the case uses.
+# --------------------------------------------------------------------------- #
+_REAL_CLEANUP_ACCESS = operator._cleanup_access
+_REAL_REVOKE_ALL = operator._revoke_all
+_REAL_FAKE_CLIENT = operator_access._FakeSSHClient
+
+
+class _AlwaysCleanRemote(_REAL_REMOTE):
+    """A host that runs its revocation script even when the case asked it not to."""
+
+    def _cleanup_script(self):
+        ignored, self.cleanup_ignored = self.cleanup_ignored, False
+        try:
+            return super()._cleanup_script()
+        finally:
+            self.cleanup_ignored = ignored
+
+
+class _ProviderWipingCleanup(_REAL_REMOTE):
+    """A revocation script that clears the file instead of removing one line."""
+
+    def _cleanup_script(self):
+        self.files["/root/.ssh/authorized_keys"] = ""
+        self.timers.clear()
+        for path in [p for p in list(self.files) if "gowave-e2e-key-expiry" in p]:
+            self.files.pop(path, None)
+        return 0, "", ""
+
+
+class _TimerFileLeavingCleanup(_REAL_REMOTE):
+    """A revocation script that stops the timer but leaves its unit files behind."""
+
+    def _cleanup_script(self):
+        marker = self.marker
+        if marker:
+            lines = self.files.get("/root/.ssh/authorized_keys", "").splitlines(True)
+            self.files["/root/.ssh/authorized_keys"] = "".join(
+                line for line in lines if marker not in line)
+        self.timers.clear()
+        return 0, "", ""
+
+
+class _InertCleanup(_REAL_REMOTE):
+    """A host whose revocation script answers success and changes nothing."""
+
+    def _cleanup_script(self):
+        return 0, "", ""
+
+
+def _one_connection_for_both_hosts():
+    """``SSHClient`` faked as one multiplexed master reported for every host."""
+
+    opened = []
+
+    class _Reused(_REAL_FAKE_CLIENT):
+        def __init__(self, remotes, **kwargs):
+            super().__init__(remotes, **kwargs)
+            recorded = kwargs.get("constructed")
+            if recorded:
+                if not opened:
+                    opened.append(self.host)
+                recorded[-1] = opened[0]
+
+    return _Reused
+
+
+def _revocation_that_skips_a_host(targets):
+    """``_revoke_all`` cut down to one host, as a loop that loses its last target."""
+    results, ok = _REAL_REVOKE_ALL(targets[:-1])
+    return results, ok
+
+
+def _revocation_that_reports_an_unreachable_host_as_a_pass(targets):
+    """``_revoke_all`` that turns a transport failure into a pass."""
+    results = {}
+    for target in reversed(targets):
+        try:
+            ok, message, evidence = _REAL_CLEANUP_ACCESS(target)
+        except Exception:  # noqa: BLE001 - the damage is this broad catch
+            ok, message, evidence = True, "temporary SSH key removed", {}
+        entry = {"status": "PASS" if ok else "INCOMPLETE", "message": message}
+        entry.update(evidence)
+        results[f"{target['user']}@{target['host']}"] = entry
+    return results, all(item["status"] == "PASS" for item in results.values())
+
+
+def _revocation_that_gives_up_after_a_failure(targets):
+    """``_revoke_all`` that walks the list forward and stops at the first failure."""
+    results = {}
+    given_up = False
+    for target in targets:
+        key = f"{target['user']}@{target['host']}"
+        if given_up:
+            results[key] = {
+                "status": "INCOMPLETE",
+                "message": "not attempted after an earlier host failed",
+            }
+            continue
+        try:
+            ok, message, evidence = _REAL_CLEANUP_ACCESS(target)
+        except Exception:  # noqa: BLE001 - the damage is this broad catch
+            given_up = True
+            results[key] = {"status": "INCOMPLETE", "message": "host unreachable"}
+            continue
+        entry = {"status": "PASS" if ok else "INCOMPLETE", "message": message}
+        entry.update(evidence)
+        results[key] = entry
+        given_up = not ok
+    return results, all(item["status"] == "PASS" for item in results.values())
+
+
+def _cleanup_that_never_verifies(target):
+    ok, message, evidence = _REAL_CLEANUP_ACCESS(target)
+    return False, message, evidence
+
+
+def _revocation_that_aggregates_a_pass(targets):
+    """``_revoke_all`` whose aggregate says PASS while a target's record says otherwise."""
+    results, _ = _REAL_REVOKE_ALL(targets)
+    return results, True
+
+
+def _cleanup_that_calls_an_inert_host_a_pass(target):
+    ok, message, evidence = _REAL_CLEANUP_ACCESS(target)
+    return True, message, evidence
+
+
+def _cleanup_that_forgets_the_script_presence(target):
+    ok, message, evidence = _REAL_CLEANUP_ACCESS(target)
+    evidence = {key: value for key, value in evidence.items()
+                if key != "revocation_script_present"}
+    return ok, message, evidence
+
+
+def _cleanup_that_records_residue_as_a_pass(target):
+    ok, message, evidence = _REAL_CLEANUP_ACCESS(target)
+    return True, message, dict(evidence, key_present=True)
+
+
+def _cleanup_that_hides_what_survived(target):
+    ok, message, evidence = _REAL_CLEANUP_ACCESS(target)
+    if not ok:
+        evidence = {key: value for key, value in evidence.items()
+                    if key not in ("key_present", "timer_active")}
+    return ok, message, evidence
+
+
+def _cleanup_that_names_nothing(target):
+    ok, message, evidence = _REAL_CLEANUP_ACCESS(target)
+    if not ok:
+        message = "temporary SSH access cleanup could not be verified"
+    return ok, message, evidence
+
+
 def _damages(workdir):
     return {
         "parser-bypassed": [
@@ -139,6 +316,59 @@ def _damages(workdir):
         ],
         "cleanup-reported-verified": [
             mock.patch.object(operator_access, "_Remote", _VerifiedCleanup),
+        ],
+        "revocation-skips-a-host": [
+            mock.patch.object(operator, "_revoke_all",
+                              side_effect=_revocation_that_skips_a_host),
+        ],
+        "revocation-unverified": [
+            mock.patch.object(operator, "_cleanup_access",
+                              side_effect=_cleanup_that_never_verifies),
+            mock.patch.object(operator, "_revoke_all",
+                              side_effect=_revocation_that_aggregates_a_pass),
+        ],
+        "revocation-reuses-one-connection": [
+            mock.patch.object(operator_access, "_FakeSSHClient",
+                              _one_connection_for_both_hosts()),
+        ],
+        "revocation-passes-without-running-the-script": [
+            mock.patch.object(operator_access, "_Remote", _InertCleanup),
+            mock.patch.object(operator, "_cleanup_access",
+                              side_effect=_cleanup_that_calls_an_inert_host_a_pass),
+        ],
+        "revocation-removes-the-provider-entry": [
+            mock.patch.object(operator_access, "_Remote", _ProviderWipingCleanup),
+        ],
+        "revocation-leaves-the-timer-files": [
+            mock.patch.object(operator_access, "_Remote", _TimerFileLeavingCleanup),
+        ],
+        "revocation-forgets-the-script-presence": [
+            mock.patch.object(operator, "_cleanup_access",
+                              side_effect=_cleanup_that_forgets_the_script_presence),
+        ],
+        "revocation-record-claims-residue": [
+            mock.patch.object(operator, "_cleanup_access",
+                              side_effect=_cleanup_that_records_residue_as_a_pass),
+        ],
+        "revocation-accepts-an-inert-cleanup": [
+            mock.patch.object(operator_access, "_Remote", _AlwaysCleanRemote),
+        ],
+        "revocation-hides-what-survived": [
+            mock.patch.object(operator, "_cleanup_access",
+                              side_effect=_cleanup_that_hides_what_survived),
+        ],
+        "revocation-names-nothing": [
+            mock.patch.object(operator, "_cleanup_access",
+                              side_effect=_cleanup_that_names_nothing),
+        ],
+        "revocation-passes-an-unreachable-host": [
+            mock.patch.object(
+                operator, "_revoke_all",
+                side_effect=_revocation_that_reports_an_unreachable_host_as_a_pass),
+        ],
+        "revocation-gives-up-after-a-failure": [
+            mock.patch.object(operator, "_revoke_all",
+                              side_effect=_revocation_that_gives_up_after_a_failure),
         ],
     }
 
@@ -268,6 +498,23 @@ class TestOperatorAccessCases(unittest.TestCase):
         self.assertFalse(facts["key_installed"])
         self.assertTrue(facts["existing_entry_preserved"])
 
+    def test_the_access_a_finished_run_installed_is_revoked(self):
+        facts, refusal = run_case(operator_access.REVOKED_CASE_ID)
+        self.assertIsNone(refusal)
+        self.assertEqual(facts["targets_revoked"], 2)
+        self.assertEqual(facts["revocation_statuses"], "PASS,PASS")
+        self.assertEqual(facts["revocation_clients"], 2)
+        self.assertTrue(facts["revocation_script_present"])
+        self.assertFalse(facts["key_present_after"])
+        self.assertFalse(facts["timer_active_after"])
+        self.assertTrue(facts["provider_entry_preserved"])
+        self.assertEqual(facts["timer_files_remaining"], 0)
+        self.assertEqual(facts["inert_cleanup_status"], "INCOMPLETE")
+        self.assertTrue(facts["inert_key_present"])
+        self.assertTrue(facts["inert_message_names_residue"])
+        self.assertEqual(facts["unreachable_status"], "INCOMPLETE")
+        self.assertTrue(facts["reachable_host_revoked_despite_failure"])
+
 
 class TestOperatorAccessDamage(unittest.TestCase):
     """Each clause is damaged on its own and its case refuses for that reason."""
@@ -309,6 +556,55 @@ class TestOperatorAccessDamage(unittest.TestCase):
 
     def test_a_cleanup_reported_as_verified_is_refused(self):
         self.assert_refused(operator_access.FALLBACK_CASE_ID, "cleanup-reported-verified")
+
+    def test_a_revocation_that_drops_a_host_is_refused(self):
+        self.assert_refused(operator_access.REVOKED_CASE_ID, "revocation-skips-a-host")
+
+    def test_a_revocation_that_verifies_nothing_is_refused(self):
+        self.assert_refused(operator_access.REVOKED_CASE_ID, "revocation-unverified")
+
+    def test_a_revocation_that_reports_one_connection_is_refused(self):
+        self.assert_refused(operator_access.REVOKED_CASE_ID,
+                            "revocation-reuses-one-connection")
+
+    def test_a_revocation_that_runs_no_script_is_refused(self):
+        self.assert_refused(operator_access.REVOKED_CASE_ID,
+                            "revocation-passes-without-running-the-script")
+
+    def test_a_revocation_that_removes_the_providers_entry_is_refused(self):
+        self.assert_refused(operator_access.REVOKED_CASE_ID,
+                            "revocation-removes-the-provider-entry")
+
+    def test_a_revocation_that_leaves_the_timer_files_is_refused(self):
+        self.assert_refused(operator_access.REVOKED_CASE_ID,
+                            "revocation-leaves-the-timer-files")
+
+    def test_a_revocation_that_forgets_the_script_is_refused(self):
+        self.assert_refused(operator_access.REVOKED_CASE_ID,
+                            "revocation-forgets-the-script-presence")
+
+    def test_a_record_that_claims_residue_is_refused(self):
+        self.assert_refused(operator_access.REVOKED_CASE_ID,
+                            "revocation-record-claims-residue")
+
+    def test_a_revocation_that_accepts_an_inert_script_is_refused(self):
+        self.assert_refused(operator_access.REVOKED_CASE_ID,
+                            "revocation-accepts-an-inert-cleanup")
+
+    def test_a_record_that_hides_what_survived_is_refused(self):
+        self.assert_refused(operator_access.REVOKED_CASE_ID,
+                            "revocation-hides-what-survived")
+
+    def test_a_record_that_names_nothing_is_refused(self):
+        self.assert_refused(operator_access.REVOKED_CASE_ID, "revocation-names-nothing")
+
+    def test_an_unreachable_host_reported_as_a_pass_is_refused(self):
+        self.assert_refused(operator_access.REVOKED_CASE_ID,
+                            "revocation-passes-an-unreachable-host")
+
+    def test_a_revocation_that_gives_up_after_a_failure_is_refused(self):
+        self.assert_refused(operator_access.REVOKED_CASE_ID,
+                            "revocation-gives-up-after-a-failure")
 
 
 if __name__ == "__main__":

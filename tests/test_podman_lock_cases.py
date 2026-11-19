@@ -724,6 +724,54 @@ except OSError:
 
 TOKEN = "token = secrets.token_hex(32)"
 
+_REAL_RELEASE = preflight.RemotePairLock.release
+_REAL_CHECK_ALIVE = preflight.RemotePairLock.check_alive
+
+
+class _PairThatIgnoresTheAddressOrder(preflight.RemotePairLock):
+    """The product's pair with the sort dropped, so it takes the caller's order.
+
+    ``RemotePairLock`` sorts its two clients by address so that two runners take
+    the same two hosts in the same order and cannot deadlock on each other. Here
+    the clients come out in the reverse of the address order — what a Worker
+    enumerated before the Master looks like — which is the pair the case's order
+    guard exists to refuse before it takes anything.
+    """
+
+    def __init__(self, master_ssh, worker_ssh, run_id="live_vps_run"):
+        super().__init__(master_ssh, worker_ssh, run_id=run_id)
+        self.clients.reverse()
+
+
+def _release_that_forgets_the_sessions(abandoned):
+    """A release that drops the record of the sessions instead of ending them.
+
+    The ``Popen`` objects are kept in ``abandoned`` so their pipes stay open: a
+    dropped reference would be collected, the holder would see EOF and free its
+    own lock, and the probe would pass for a reason of its own. The contender's
+    release is left real, because the half-pair guard above it is a different
+    clause and would otherwise refuse first.
+    """
+    def release(lock):
+        if lock.run_id != "podman-lock-loss":
+            return _REAL_RELEASE(lock)
+        abandoned.extend(lock._procs)
+        lock._procs.clear()
+        lock.lease_tokens.clear()
+    return release
+
+
+def _release_that_is_never_confirmed(lock):
+    """The real release, followed by a pair that goes on reporting a live session."""
+    _REAL_RELEASE(lock)
+    lock.release_unconfirmed = True
+
+
+def _check_alive_that_ignores_the_release(lock):
+    if getattr(lock, "release_unconfirmed", False):
+        return True
+    return _REAL_CHECK_ALIVE(lock)
+
 
 class TestCaseGuards(CaseHarness, HolderCase, unittest.TestCase):
     """Each guard, damaged on its own, refusing for its own reason."""
@@ -800,6 +848,42 @@ class TestCaseGuards(CaseHarness, HolderCase, unittest.TestCase):
                 with contextlib.suppress(OSError):
                     process.kill()
         self.assertIn("half the pair", sentence)
+
+    def test_a_pair_taken_out_of_address_order_fails_the_loss_case(self):
+        damage = mock.patch.object(
+            lock_cases, "RemotePairLock", _PairThatIgnoresTheAddressOrder)
+        self.assertIn(
+            "not the deterministic address order",
+            self.refusal(lock_cases.LOCK_LOSS_CASE_ID, damage),
+        )
+
+    def test_a_release_that_is_never_confirmed_fails_the_loss_case(self):
+        # The release itself really ends both holders, so the hosts are free: only
+        # the pair's own answer about its sessions is wrong, which is what a runner
+        # that reacquires on the strength of that answer would be misled by.
+        damage = mock.patch.multiple(
+            lock_cases.RemotePairLock,
+            release=_release_that_is_never_confirmed,
+            check_alive=_check_alive_that_ignores_the_release,
+        )
+        self.assertIn(
+            "the release was not confirmed before reacquisition",
+            self.refusal(lock_cases.LOCK_LOSS_CASE_ID, damage),
+        )
+
+    def test_a_release_that_leaves_both_sessions_running_fails_the_loss_case(self):
+        abandoned = []
+        damage = mock.patch.object(
+            lock_cases.RemotePairLock, "release",
+            _release_that_forgets_the_sessions(abandoned),
+        )
+        try:
+            sentence = self.refusal(lock_cases.LOCK_LOSS_CASE_ID, damage)
+        finally:
+            for process in abandoned:
+                with contextlib.suppress(OSError):
+                    process.kill()
+        self.assertIn("a lock-holder session survived its release", sentence)
 
     def test_a_runner_that_never_notices_a_lost_session_fails_the_loss_case(self):
         damage = mock.patch.object(lock_cases.RemotePairLock, "check_alive", lambda _self: True)

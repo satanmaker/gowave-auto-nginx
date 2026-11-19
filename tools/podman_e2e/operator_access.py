@@ -47,6 +47,7 @@ SSHID_CONFIRMED_CASE_ID = "SSHID-01"
 SSHID_DECLINED_CASE_ID = "SSHID-02"
 BOUNDED_CASE_ID = "TSSH-01"
 FALLBACK_CASE_ID = "TSSH-02"
+REVOKED_CASE_ID = "BOOT-02"
 
 OPERATOR = Path(operator.__file__).resolve()
 
@@ -154,6 +155,7 @@ class _Remote:
         clock: str = "2026-11-17T12:00:00Z",
         rollback_verified: bool = True,
         fail_write_suffix: Optional[str] = None,
+        cleanup_ignored: bool = False,
     ) -> None:
         self.files: Dict[str, str] = {"/root/.ssh/authorized_keys": authorized_keys}
         self.modes: Dict[str, int] = {"/root/.ssh/authorized_keys": auth_mode}
@@ -162,6 +164,7 @@ class _Remote:
         self.clock = clock
         self.rollback_verified = rollback_verified
         self.fail_write_suffix = fail_write_suffix
+        self.cleanup_ignored = cleanup_ignored
         self.timers: Dict[str, str] = {}
         self.calls: List[str] = []
         self.exec_log: List[str] = []
@@ -201,6 +204,9 @@ class _Remote:
             timer = command.split("'")[1]
             self.timers[timer] = "active"
             return 0, "", ""
+        if command.startswith("systemctl is-active --quiet"):
+            timer = command.split("'")[1]
+            return (0 if self.timers.get(timer) == "active" else 1), "", ""
         if command.startswith("systemctl is-active"):
             timer = command.split("'")[1]
             state = self.timers.get(timer, "inactive")
@@ -217,7 +223,30 @@ class _Remote:
             return 0, "", ""
         if command.startswith("if [ -x"):
             return self._rollback()
+        if command.startswith("test -x "):
+            path = command.split("'")[1]
+            return (0 if path in self.files else 1), "", ""
+        if command.startswith("/bin/sh '"):
+            return self._cleanup_script()
+        if command.startswith("grep -Fq --"):
+            marker = re.findall(r"grep -Fq -- '([^']+)'", command)[0]
+            present = marker in self.files.get("/root/.ssh/authorized_keys", "")
+            return (0 if present else 1), "", ""
         return 1, "", f"unmodelled command: {command}"
+
+    def _cleanup_script(self) -> Tuple[int, str, str]:
+        """What the revocation script does to this host, or nothing when it is inert."""
+        if self.cleanup_ignored:
+            return 0, "", ""
+        marker = self.marker
+        if marker:
+            lines = self.files.get("/root/.ssh/authorized_keys", "").splitlines(True)
+            kept = [line for line in lines if marker not in line]
+            self.files["/root/.ssh/authorized_keys"] = "".join(kept)
+        self.timers.clear()
+        for path in [p for p in list(self.files) if "gowave-e2e-key-expiry" in p]:
+            self.files.pop(path, None)
+        return 0, "", ""
 
     def _rollback(self) -> Tuple[int, str, str]:
         if not self.rollback_verified:
@@ -347,12 +376,15 @@ def _patched(
     password_reads: Optional[List[str]] = None,
     connections: Optional[List[Tuple[str, int]]] = None,
     server_key: Optional[_FakeKey] = None,
+    transports: Optional[List[_FakeTransport]] = None,
 ):
     """Install the transport seam, the scripted prompts and the key generator."""
     import unittest.mock as mock
 
     key = server_key or _FakeKey(b"probe-host-key")
     fake = _FakeParamiko(remote, key)
+    if transports is not None:
+        transports.append(fake.transport)
     reads = password_reads if password_reads is not None else []
     calls = run_calls if run_calls is not None else []
     dialled = connections if connections is not None else []
@@ -403,6 +435,92 @@ def _bootstrap(
         return operator._bootstrap_one(
             label="MASTER",
             host="45.13.20.10",
+            port=22,
+            username="root",
+            run_id=run_id,
+            runtime_dir=runtime_dir,
+        )
+
+
+class _CommandResult:
+    """The three fields ``SSHClient.run`` returns; the revocation reads no more."""
+
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = "") -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class _FakeSSHClient:
+    """``tools.live_vps.ssh.SSHClient`` replaced by the same host models.
+
+    The revocation phase runs after the bootstrap's transport is closed, so it
+    reaches the hosts through a second seam: the ``ssh`` subprocess wrapper. Each
+    client is bound to the model of the host it was constructed for, which is what
+    lets one contour serve a host that answers and one that refuses.
+    """
+
+    def __init__(
+        self,
+        remotes: Dict[str, "_Remote"],
+        *,
+        failing: Optional[set] = None,
+        constructed: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> None:
+        self.host = kwargs["host"]
+        self.remote = remotes[self.host]
+        self.failing = failing or set()
+        self.commands: List[str] = []
+        if constructed is not None:
+            constructed.append(self.host)
+
+    def run(
+        self, remote_cmd: str, input_data: Any = None, timeout: int = 60,
+    ) -> _CommandResult:
+        self.commands.append(remote_cmd)
+        if self.host in self.failing:
+            raise OSError(f"ssh: connect to host {self.host} port 22: Connection refused")
+        return _CommandResult(*self.remote.exec(remote_cmd, timeout))
+
+    def close(self) -> None:
+        pass
+
+
+@contextlib.contextmanager
+def _revocation(
+    remotes: Dict[str, "_Remote"],
+    *,
+    failing: Optional[set] = None,
+    constructed: Optional[List[str]] = None,
+):
+    """Point the revocation phase at the models, keeping every other seam out of it."""
+    import unittest.mock as mock
+
+    def factory(**kwargs: Any) -> _FakeSSHClient:
+        return _FakeSSHClient(
+            remotes, failing=failing, constructed=constructed, **kwargs,
+        )
+
+    with mock.patch.object(operator, "SSHClient", factory):
+        yield constructed if constructed is not None else []
+
+
+def _installed(
+    remote: "_Remote",
+    *,
+    runtime_dir: Path,
+    label: str,
+    host: str,
+    blob: bytes,
+    run_id: str,
+) -> Dict[str, Any]:
+    """Bootstrap one model host, returning the target the revocation phase receives."""
+    with _patched(remote, inputs=[_fingerprint(blob)], server_key=_FakeKey(blob)), \
+            contextlib.redirect_stdout(io.StringIO()):
+        return operator._bootstrap_one(
+            label=label,
+            host=host,
             port=22,
             username="root",
             run_id=run_id,
@@ -680,10 +798,17 @@ def case_confirmed_host_key_is_pinned(product: Any, context: Any) -> Dict[str, A
 
 
 def case_unconfirmed_host_key_aborts(product: Any, context: Any) -> Dict[str, Any]:
-    """``SSHID-02``: a fingerprint that does not match stops the controller first."""
+    """``SSHID-02``: a fingerprint that does not match stops the controller first.
+
+    ``BOOT-01`` observes this case: the sentence it carries is that a bootstrap
+    sends no password to a host whose key was not confirmed, and the transport
+    model records every ``auth_password`` call so the claim is read from the
+    authentication itself rather than from the prompts around it.
+    """
     blob = b"probe-host-key-declined"
     remote = _Remote()
     reads: List[str] = []
+    transports: List[_FakeTransport] = []
     failure = ""
     with tempfile.TemporaryDirectory(prefix="gowave-sshid-02-") as directory:
         runtime_dir = Path(directory)
@@ -693,12 +818,14 @@ def case_unconfirmed_host_key_aborts(product: Any, context: Any) -> Dict[str, An
                 runtime_dir=runtime_dir,
                 inputs=["SHA256:not-the-fingerprint-the-host-published"],
                 password_reads=reads,
+                transports=transports,
                 server_key=_FakeKey(blob),
             )
         except RuntimeError as error:
             failure = str(error)
         known_hosts_exists = (runtime_dir / "master_known_hosts").exists()
 
+    attempts = sum(len(transport.auth_calls) for transport in transports)
     require(
         SSHID_DECLINED_CASE_ID,
         "fingerprint was not confirmed" in failure,
@@ -709,6 +836,12 @@ def case_unconfirmed_host_key_aborts(product: Any, context: Any) -> Dict[str, An
         SSHID_DECLINED_CASE_ID,
         not reads,
         f"the controller read a password ({reads!r}) before the host was confirmed",
+    )
+    require(
+        SSHID_DECLINED_CASE_ID,
+        attempts == 0,
+        f"the controller called auth_password {attempts} time(s) on a host whose key it did "
+        f"not confirm (calls {[t.auth_calls for t in transports]!r})",
     )
     require(
         SSHID_DECLINED_CASE_ID,
@@ -730,6 +863,7 @@ def case_unconfirmed_host_key_aborts(product: Any, context: Any) -> Dict[str, An
     return {
         "refusal": "fingerprint was not confirmed",
         "password_reads": len(reads),
+        "password_attempts": attempts,
         "remote_writes": len(remote.write_log),
         "remote_commands": len(remote.exec_log),
         "authorized_keys_unchanged": True,
@@ -886,4 +1020,185 @@ def case_failed_bootstrap_falls_back_to_timer(product: Any, context: Any) -> Dic
         "key_installed": "gowave-e2e:" in remote.files.get("/root/.ssh/authorized_keys", ""),
         "existing_entry_preserved": _EXISTING_KEY
         in remote.files.get("/root/.ssh/authorized_keys", ""),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# BOOT-02 — the access a run installs is withdrawn when the run ends.
+# --------------------------------------------------------------------------- #
+def case_temporary_access_is_revoked(product: Any, context: Any) -> Dict[str, Any]:
+    """``BOOT-02``: revocation removes the key and the timer, and never reports a pass it lacks.
+
+    Three contours of the same sentence. A finished pair is revoked through the
+    product's own ``_revoke_all``: both hosts answer, both markers are gone, both
+    timers are down, and the provider's own authorized_keys entry survives. A host
+    whose cleanup script did nothing is reported ``INCOMPLETE`` rather than
+    ``PASS``. A host that cannot be reached at all is recorded as such and does not
+    skip the host behind it.
+    """
+    blob = b"probe-host-key-revoked"
+    with tempfile.TemporaryDirectory(prefix="gowave-boot-02-") as directory:
+        runtime_dir = Path(directory)
+
+        pair = {"45.13.20.10": _Remote(), "91.203.40.20": _Remote()}
+        targets = [
+            _installed(
+                pair["45.13.20.10"], runtime_dir=runtime_dir, label="MASTER",
+                host="45.13.20.10", blob=blob, run_id="run-probe-0002",
+            ),
+            _installed(
+                pair["91.203.40.20"], runtime_dir=runtime_dir, label="WORKER",
+                host="91.203.40.20", blob=blob, run_id="run-probe-0002",
+            ),
+        ]
+        constructed: List[str] = []
+        with _revocation(pair, constructed=constructed), \
+                contextlib.redirect_stdout(io.StringIO()):
+            results, revoked = operator._revoke_all(targets)
+        pair_results = {
+            host: results.get(f"root@{host}", {"status": "ABSENT", "message": ""})
+            for host in pair
+        }
+        pair_evidence = {
+            host: {key: value for key, value in entry.items() if key != "message"}
+            for host, entry in pair_results.items()
+        }
+        pair_keys = {
+            host: remote.files.get("/root/.ssh/authorized_keys", "")
+            for host, remote in pair.items()
+        }
+        pair_timers_left = {
+            host: [path for path in remote.files if "gowave-e2e-key-expiry" in path]
+            for host, remote in pair.items()
+        }
+
+        inert = _Remote(cleanup_ignored=True)
+        stubborn = _installed(
+            inert, runtime_dir=runtime_dir, label="MASTER", host="45.13.20.10",
+            blob=blob, run_id="run-probe-0003",
+        )
+        with _revocation({"45.13.20.10": inert}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            inert_results, inert_ok = operator._revoke_all([stubborn])
+        inert_entry = inert_results.get(
+            "root@45.13.20.10", {"status": "ABSENT", "message": ""})
+
+        unreachable = _Remote()
+        reachable = _Remote()
+        blocked = _installed(
+            unreachable, runtime_dir=runtime_dir, label="MASTER", host="45.13.20.10",
+            blob=blob, run_id="run-probe-0004",
+        )
+        behind = _installed(
+            reachable, runtime_dir=runtime_dir, label="WORKER", host="91.203.40.20",
+            blob=blob, run_id="run-probe-0004",
+        )
+        with _revocation(
+            {"45.13.20.10": unreachable, "91.203.40.20": reachable},
+            failing={"45.13.20.10"},
+        ), contextlib.redirect_stdout(io.StringIO()):
+            partial_results, partial_ok = operator._revoke_all([blocked, behind])
+        blocked_entry = partial_results.get(
+            "root@45.13.20.10", {"status": "ABSENT", "message": ""})
+        behind_entry = partial_results.get(
+            "root@91.203.40.20", {"status": "ABSENT", "message": ""})
+        behind_key = reachable.files.get("/root/.ssh/authorized_keys", "")
+
+    require(
+        REVOKED_CASE_ID,
+        revoked and len(results) == 2 and sorted(results) == [f"root@{host}" for host in sorted(pair)],
+        f"a finished pair was not revoked on both hosts: ok={revoked}, "
+        f"record={sorted(results)}",
+    )
+    require(
+        REVOKED_CASE_ID,
+        all(entry["status"] == "PASS" for entry in pair_results.values()),
+        f"revocation reported {[entry['status'] for entry in pair_results.values()]} for a "
+        "pair whose hosts answered every check",
+    )
+    require(
+        REVOKED_CASE_ID,
+        len(constructed) == 2 and set(constructed) == set(pair),
+        f"revocation opened {len(constructed)} connection(s) to {constructed!r}, not one per "
+        "host",
+    )
+    require(
+        REVOKED_CASE_ID,
+        all("gowave-e2e:" not in body for body in pair_keys.values()),
+        f"a temporary key survived revocation: "
+        f"{ {host: 'gowave-e2e:' in body for host, body in pair_keys.items()} }",
+    )
+    require(
+        REVOKED_CASE_ID,
+        all(_EXISTING_KEY in body for body in pair_keys.values()),
+        "revocation removed the provider's own authorized_keys entry along with the "
+        "temporary one",
+    )
+    require(
+        REVOKED_CASE_ID,
+        all(not left for left in pair_timers_left.values())
+        and all(not remote.timers for remote in pair.values()),
+        f"revocation left expiry files {pair_timers_left} or armed timers behind",
+    )
+    require(
+        REVOKED_CASE_ID,
+        all(entry.get("revocation_script_present") is True for entry in pair_results.values()),
+        f"the record does not say the revocation script was present: "
+        f"{[entry.get('revocation_script_present') for entry in pair_results.values()]}",
+    )
+    require(
+        REVOKED_CASE_ID,
+        all(entry.get("key_present") is False and entry.get("timer_active") is False
+            for entry in pair_results.values()),
+        f"the record still reports residue after revocation: {pair_evidence}",
+    )
+    require(
+        REVOKED_CASE_ID,
+        not inert_ok and inert_entry["status"] == "INCOMPLETE",
+        f"a host whose cleanup script did nothing was reported "
+        f"{inert_entry['status']!r} (ok={inert_ok}), so a pass can be claimed without the "
+        "key being gone",
+    )
+    require(
+        REVOKED_CASE_ID,
+        inert_entry.get("key_present") is True and inert_entry.get("timer_active") is True,
+        f"the incomplete record hides what survived: {inert_entry!r}",
+    )
+    require(
+        REVOKED_CASE_ID,
+        "still present" in inert_entry.get("message", ""),
+        f"the incomplete record says {inert_entry.get('message')!r}, which does not name what "
+        "the operator has to remove by hand",
+    )
+    require(
+        REVOKED_CASE_ID,
+        not partial_ok and blocked_entry["status"] == "INCOMPLETE",
+        f"an unreachable host was reported {blocked_entry['status']!r} (ok={partial_ok})",
+    )
+    require(
+        REVOKED_CASE_ID,
+        behind_entry["status"] == "PASS" and "gowave-e2e:" not in behind_key,
+        "a host that could not be reached stopped the revocation of the host behind it, so "
+        "the remaining key is still installed",
+    )
+
+    return {
+        "targets_revoked": len(pair_results),
+        "revocation_statuses": ",".join(
+            sorted(entry["status"] for entry in pair_results.values())),
+        "revocation_message": pair_results["45.13.20.10"].get("message", ""),
+        "revocation_clients": len(constructed),
+        "revocation_script_present": all(
+            entry.get("revocation_script_present") is True for entry in pair_results.values()),
+        "key_present_after": any(entry.get("key_present") for entry in pair_results.values()),
+        "timer_active_after": any(
+            entry.get("timer_active") for entry in pair_results.values()),
+        "provider_entry_preserved": all(
+            _EXISTING_KEY in body for body in pair_keys.values()),
+        "timer_files_remaining": sum(len(left) for left in pair_timers_left.values()),
+        "inert_cleanup_status": inert_entry["status"],
+        "inert_key_present": inert_entry.get("key_present"),
+        "inert_message_names_residue": "still present" in inert_entry.get("message", ""),
+        "unreachable_status": blocked_entry["status"],
+        "reachable_host_revoked_despite_failure": behind_entry["status"] == "PASS",
     }

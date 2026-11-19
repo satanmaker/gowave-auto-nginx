@@ -593,6 +593,86 @@ detected: nothing ran on the far end, so the remote restore stays `HOOK-03`'s an
 drop-in-the-middle is the live run's. `Connection refused` is a closed loopback port answering, not a packet filter
 dropping a live host; a blackholed address would fail on a timeout and is a different case, as are the states of the
 Panel that the network-free rollback never has to replay.
+**Thirty-fifth batch: 9.3's eleven partials — each split states what the container proves, and the container half exists.**
+The task asks for two things per scenario, and they are separate claims: the split is prose in the catalog entry, the container
+half is a case the suite builds. Eleven entries carried `environment: partial` with no container half, and they fall into three
+kinds, which is why one batch closes them. Four are answered by a case that already exists on both contours — `NEG-07` by
+`GATE-STATUS`, `NEG-08` by `DP-14`, `BOOT-01` by `SSHID-02`, `TD-05` by `MN-LOCK-LOSS` — so duplicating that case would be a
+second implementation of one rule; they are closed by `LIVE_PARITY_OBSERVERS`, which names the observer per contour and carries
+the reason in the table, and the entry keeps its own `drivers` shape so `catalog check` reads the same closure either way. Two
+(`NEG-01`, `NEG-04`) are conjunctions over the fifteen-row table the spec prints inside its own sentence, so no run can decide
+them; `tools/podman_e2e/negative_matrix.py` (234 lines) reads the sentence, the product and the suite instead: the table's fifteen
+rows in code with the scenario id, the component cell, the contour able to produce the boundary and the case that stops there; the
+sentence still prints one `| **NEG-NN**` row per id with the same component; `NEG-04`'s sentence still states the scope
+`NEG-01 through NEG-10` it is a conjunction over; `tools/live_vps/negative.py` still defines one `run_neg_NN_*` per row, read by
+`ast`, so the matrix the table describes is the matrix the product carries; and every witness is a `Case` the suite builds for the
+contour the row names, read from `catalog.driver_registry()` — the same registry the catalog is generated from, so a witness
+deleted from the code fails here instead of quietly emptying an entry. Five get new drivers. `PRE-04` drives the product's own
+`load_config` over nine IPv4 classes (loopback, the three RFC-1918 blocks, link-local, multicast, documentation, unspecified,
+broadcast) and five IPv6 ones, each refusal asserted to name its key, its address and `not a public routable address`, with the
+control that the two addresses this harness itself spells are `is_global` — the exemption lives in what the harness writes, not in
+the parser, which `inspect.signature(validate_public_ip) == ["val", "key_name", "allow_v6"]` and a source-order check that
+`validation_config = load_config(` precedes `targets.append(_bootstrap_one(` both pin. Reading it turned up a real defect:
+`ipaddress.is_global` is `True` for a multicast group in both families, so the message promised a class the check did not reject;
+`tools/live_vps/config.py` now reads `if not ip.is_global or ip.is_multicast:`. `DP-11`, `DP-10` and `DP-09` are one module,
+`tools/podman_e2e/staging_trust.py` (547 lines), because all three read the same four vendored roots and the same builder: the pins
+are re-digested from the PEM files and compared to `pins.json`, and a missing file, a tampered digest, a manifest shorter than its
+directory, an extra PEM, a certificate that is not self-signed and an intermediate offered as an anchor are each refused by the
+product's own `verify_staging_roots` before anything is written; `apply_xray_trust_anchors` is driven with a `tls` outbound, a
+REALITY outbound and `ACME_MODE=production`, and the case requires one `{"usage": "verify"}` anchor per pinned root only on the
+first, the input outbound unchanged, an anchor already present preserved, and `allowInsecure` absent; `build_runtime_ca_bundle` and
+`create_ssl_context` are then asked the trust question by `openssl` itself — the bundle accepts a pinned Staging root and an ordinary
+public root, rejects a CA this case mints, and building it leaves `/etc/ssl/certs`, the system bundle and the process environment
+byte-identical. `BOOT-02` drives `_revoke_all` from `tools/live_vps/operator.py` against `_FakeSSHClient`/`_FakeParamiko` models of
+the transport: a finished pair answers on both hosts, both markers are gone, both expiry timers are down and the provider's own
+`authorized_keys` entry survives; a cleanup script that does nothing is `INCOMPLETE` with a sentence naming the residue, and an
+unreachable host is recorded as such without stopping the host behind it. `TD-05` is the same case `MN-LOCK-LOSS` read harder: the
+pair must be taken in `sorted` address order, `check_alive()` must be `False` after the release so the release is confirmed rather
+than assumed, and both hosts must be free before the replacement pair is taken — three clauses added to `case_lock_loss` with
+`acquisition_order`, `released_sessions_confirmed` and `hosts_free_after_release` as their evidence.
+**Suite:** five modules hold the batch, registered in `nonroot` — `test_podman_staging_trust` (20 tests: two registration, five
+case, thirteen damage), `test_podman_negative_matrix` (14: two, five, seven), `test_podman_preflight_cases` (22, five of them
+`PRE-04`'s), `test_podman_operator_access` (33, fourteen of them `BOOT-02`'s) and `test_podman_lock_cases` (61, three of them
+`TD-05`'s). Each registration test proves the id is built on both contours with the driver string the catalog records, each case
+test proves the evidence set equals the catalog's and drives the case on both topologies, and each damage test rewrites one clause
+of the driver or of the product it reads, asserts the anchor occurs exactly once, and requires the case to refuse with its own
+sentence. **Live runs:** both PASS — `podman-aio-20261119T052258-b9ef289b` **98/98** in 627.359 s of the declared 2700 s with
+`vision disabled` and 19 files redaction-audited with no offence, and `podman-multi-node-20261119T053359-ce1a1027` **119/119** in
+1059.423 s of 4500 s with `vision neither` and `worker_vision disabled`; both record `commit c3646b0` with `tree: dirty`, and the
+dirty tree is exactly the diff this line describes. `PRE-04`, `DP-09`, `DP-10`, `DP-11`, `NEG-01`, `NEG-04` and `BOOT-02` are
+`PASS` on both contours; `MN-LOCK-LOSS` is `PASS` in 3.888 s on the pair with all thirteen keys — `acquisition_order
+10.89.0.10,10.89.0.11`, the contender refused on the second host, `mutating_gate_status INCOMPLETE` with the sentence naming the
+lost session, `read_only_gate_ok True`, `released_sessions_confirmed True`, `hosts_free_after_release
+aio-ce1a1027:free,worker-ce1a1027:free`, `reacquired_leases 2`, `lost_lease_rejected True`, `live_lease_accepted True` — and the
+four observers are `PASS` wherever they run (`GATE-STATUS`, `DP-14`, `SSHID-02` on both, `MN-LOCK-LOSS` on the pair alone, which
+is why `TD-05` is closed only there). Audits on that tree: `catalog check` PASS, `catalog gaps` down to five — the five 9.8 gates
+and nothing else — `trace --strict` 46 scenarios / 46 rows / 0 gaps, `--check-completeness` PASS, `openspec validate --all
+--strict` 5 passed, and `--suite nonroot` `Ran 2616 tests in 2313.625 s` OK (skipped=1). **Damage probes:** forty-two, each red on
+its own sentence — thirteen for the Staging roots, anchors and bundle; seven for the matrix (a sentence one row short, a row naming
+another component, a runner that lost a scenario, a witness the suite does not build, a witness built only for the other contour, a
+table out of order, a narrower scope); five for `PRE-04` (a configuration that accepts a private target, a validator with a
+relaxing switch, a harness that addresses private hosts, an operator that bootstraps before validating, a trust check that appends
+the key); fourteen for `BOOT-02` (a cleanup reported verified, a revocation that drops a host, verifies nothing, reports one
+connection, runs no script, forgets the script, removes the provider's entry, leaves the timer files, accepts an inert script, a
+record that claims residue, hides what survived or names nothing, an unreachable host reported as a pass, a revocation that gives
+up after a failure); and three for `TD-05` (a pair out of address order, a release never confirmed, a release that leaves both
+sessions running). **Not claimed:** `NEG-01`/`NEG-04` decide that every row has a witness and that the witness exists in the
+contour the row names — not that the witness asserts the right boundary, which is a judgement the source cannot make and which is
+why the table carries a sentence per row; `DP-09`/`DP-10`/`DP-11` use the vendored anchors as the trust decision because a leaf
+chain under them cannot be minted offline, so real Staging issuance, a real https egress probe and four engines making the request
+stay live-only; `BOOT-02`'s host is a model — no SSH server answers, so what is decided is the controller's commands, records and
+verdicts, not a key observed gone from a real `authorized_keys`; `TD-05` reads the ordering and the release on two real hosts but
+cannot join them to a snapshot restore, because the hook's reboot has not happened, and the status half of the sentence
+(`TEARDOWN_FAILED` on a mismatch, never `PASS` on a match) stays `GATE-TEARDOWN`'s; `PRE-04` opens no socket, so it proves the
+parser's rule, not a provider's address policy. **Repairs disclosed:** three, and none by weakening a clause. The full nonroot run
+was red on this batch's first attempt: the discovery page had no row for the TD-05 scenario and still counted two live-only
+scenarios where there is now one, so the page gained the `MN-LOCK-LOSS` row and lost one — both edited to the new truth, neither
+relaxed; and the fixture-isolation guard flagged the multicast literal `PRE-04` must spell, which is the one class `ipaddress` calls
+global and which cannot be replaced by a private address without deleting the clause it proves, so the guard gained
+`NAMED_GLOBAL_ADDRESSES` with a written justification instead of a looser rule. Separately, `negative_matrix`'s drivers were
+invisible to `catalog.evidence_keys()` — a bare `return _checked(...)` records `evidence: []` — so both drivers now assign and
+return, and `PRE-04` was missing from `LOCAL_CASES` and from the traceability table; both were gaps in this batch's own work, not
+in the suite.
 - [ ] 9.3 Classify the 8 partial scenarios with an explicit split of what the container proves and what only the live run proves; implement the container half.
 - [ ] 9.4 Register the 2 live-only scenarios with a written environment limitation and report them as justified exclusions in every Podman run.
 - [ ] 9.5 Register the Podman-first cases that have no live counterpart yet, each with a promotion target and owning live requirement.

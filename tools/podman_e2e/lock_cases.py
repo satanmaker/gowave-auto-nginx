@@ -642,6 +642,18 @@ def case_lock_loss(product: Any) -> Dict[str, Any]:
     containers = _containers(host)
     with _pair(host) as (master, worker):
         pair = RemotePairLock(master, worker, run_id="podman-lock-loss")
+        # TD-05 reads this case for the order the replacement pair is taken in, so
+        # the order is asserted against the addresses rather than inferred from the
+        # host the loss was staged on. The clients are handed in Master-then-Worker
+        # and must still come out in address order: a pair taken in the order the
+        # caller happens to pass it is a pair two runners can deadlock on.
+        order = [client.host for client in pair.clients]
+        require(
+            LOCK_LOSS_CASE_ID,
+            order == sorted(_addresses(host)),
+            f"the pair is taken in the order {order}, not the deterministic address order "
+            f"{sorted(_addresses(host))}",
+        )
         require(
             LOCK_LOSS_CASE_ID,
             pair.acquire(),
@@ -731,7 +743,26 @@ def case_lock_loss(product: Any) -> Dict[str, Any]:
 
         # Resuming is not a matter of trying again: both locks are reacquired and the
         # lost lease is dead, which is what makes the saved run state safe to reread.
+        # The release first has to be a release of *both* original sessions, the
+        # surviving holder included: reacquiring while one of this runner's own
+        # holders still owned its host would be a second lock on a host already held
+        # by this run, and the kernel would answer it as somebody else's.
         pair.release()
+        released = not pair.check_alive()
+        released_free = {
+            name: _flock_free(host, name) for name in containers
+        }
+        require(
+            LOCK_LOSS_CASE_ID,
+            released,
+            "the released pair still reports a live lock-holder session, so the release "
+            "was not confirmed before reacquisition",
+        )
+        require(
+            LOCK_LOSS_CASE_ID,
+            all(released_free.values()),
+            f"a lock-holder session survived its release: {released_free}",
+        )
         resumed = RemotePairLock(master, worker, run_id="podman-lock-resumed")
         require(
             LOCK_LOSS_CASE_ID,
@@ -761,12 +792,17 @@ def case_lock_loss(product: Any) -> Dict[str, Any]:
 
     return {
         "terminated_holder": first_container,
+        "acquisition_order": ",".join(order),
         "session_loss_detected": stopped,
         "mutating_gate_status": gate.status,
         "mutating_gate_error": gate.error,
         "read_only_gate_ok": reading.ok,
         "contender_refusal": contender.last_error,
         "released_partial_acquisition": True,
+        "released_sessions_confirmed": released,
+        "hosts_free_after_release": ",".join(
+            f"{name}:{'free' if free else 'held'}" for name, free in released_free.items()
+        ),
         "reacquired_leases": len(fresh_tokens),
         "lost_lease_rejected": True,
         "live_lease_accepted": True,

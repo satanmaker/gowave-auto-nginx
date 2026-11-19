@@ -56,7 +56,7 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Case incubation and promotion path | Promotion keeps one definition | — | — | `test_podman_matrix.TestMatrixCatalog` | Lint, Completeness, and Suite Nonroot | — |
 | Case incubation and promotion path | Live-only case states its reason | — | — | `test_podman_matrix.TestMatrixCatalog` | Lint, Completeness, and Suite Nonroot | — |
 | Live scenario parity | Parity inventory matches both suites | — | — | `test_podman_matrix.TestMatrixCatalog` | Lint, Completeness, and Suite Nonroot | — |
-| Live scenario parity | Partial case splits the proof | — | — | `test_podman_matrix.TestMatrixCatalog` | Lint, Completeness, and Suite Nonroot | — |
+| Live scenario parity | Partial case splits the proof | — | `DP-09`, `DP-10`, `DP-11` | `test_podman_matrix.TestMatrixCatalog`, `test_podman_staging_trust.TestStagingTrustCases` | Lint, Completeness, and Suite Nonroot | — |
 | Live scenario parity | Podman-first case has a promotion target | — | — | `test_podman_aio.TestAcmeRenewalCase.test_the_case_is_catalogued_as_an_incubating_podman_first_case`, `test_podman_aio.TestAcmeOutageCase.test_the_case_is_catalogued_as_an_incubating_podman_first_case` | Lint, Completeness, and Suite Nonroot | — |
 | Trustworthy result and diagnostics | Secret redaction | — | — | `test_podman_redaction.TestRedactionFilter`, `test_podman_redaction.TestArtifactTreeHoldsNoSentinel`, `test_podman_redaction.TestDiagnosticsNeverPrintValues` | Lint, Completeness, and Suite Nonroot | — |
 | Trustworthy result and diagnostics | Unexpected skip | — | `GATE-STATUS` | `test_podman_runner.TestResultSemantics`, `test_podman_status.TestStatusCase` | All-in-One Podman Acceptance, Multi-Node Podman Acceptance | — |
@@ -72,7 +72,7 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Failure injection and recovery | `AIO-FAULT-DISK`, `AIO-FAULT-PANEL`, `AIO-FAULT-XRAY`, `AIO-FAULT-LATENCY` |
 | Live scenario parity | `AIO-PKT-02`, `MN-PKT-03`, `AIO-NEG-PIN`, `GATE-TEARDOWN` |
 | Live scenario parity | `VIS-CONFIG`, `VIS-GATE`, `VIS-05`, `VIS-06` |
-| Live scenario parity | `PRE-01`, `PRE-02`, `PRE-03`, `PRE-05`, `PRE-06`, `ADDR-01`, `ADDR-02`, `ADDR-03` |
+| Live scenario parity | `PRE-01`, `PRE-02`, `PRE-03`, `PRE-04`, `PRE-05`, `PRE-06`, `ADDR-01`, `ADDR-02`, `ADDR-03` |
 | Live scenario parity | `MN-LOCK`, `MN-LOCK-LOSS`, `MN-LOCK-PATH`, `MN-LOCK-CLI`, `MN-LOCK-NESTED` |
 | Live scenario parity | `RUNID-01`, `RESUME-01` |
 | Live scenario parity | `ENV-01`, `ENV-02`, `DP-12`, `DP-14`, `LOCAL-01` |
@@ -89,7 +89,8 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Live scenario parity | `HOOK-03` |
 | Live scenario parity | `HOOK-04` |
 | Live scenario parity | `HOOK-01` |
-| Live scenario parity | `REV-01`, `REV-02` |
+| Live scenario parity | `REV-01`, `REV-02`, `BOOT-02` |
+| Live scenario parity | `NEG-01`, `NEG-04` |
 | Live scenario parity | `AIO-AUTH-NEG`, `MN-DUP-ADD`, `RED-01`, `RED-02`, `APIC-01` |
 
 ## Named behaviours
