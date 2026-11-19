@@ -114,9 +114,9 @@
 |    (P1-2)              | binary and writes       | install.sh with checksums, | sh as primary installer  | download and systemd unit| leverages upstream updates   |
 |                        | systemd unit manually.  | systemd, and rollback.     | orchestrating parameters.| generation.              | and rollback logic.          |
 +------------------------+-------------------------+----------------------------+--------------------------+--------------------------+------------------------------+
-| 5. Service Hardening   | Installer writes manual | gowave-server service      | Manage service via       | Writing redundant drop-in| Clean systemd unit hierarchy;|
-|    (P1-3)              | 90-unprivileged.conf    | install creates identical  | native service install;  | that may conflict or     | zero race conditions during  |
-|                        | drop-in file.           | 90-unprivileged.conf.      | remove manual duplicate. | break on update.         | upgrades.                    |
+| 5. Service Hardening   | Installer writes the    | managed base unit and      | Helper units authored;   | Invoking service         | No second unit generator;    |
+|    (P1-3)              | base unit itself, not   | the update helper from     | managed service unit     | install from the product | drop-in is reapplied by      |
+|                        | via service install.    | the same contract.         | stays authoritative.     | is refused;              | the vendored helper.         |
 +------------------------+-------------------------+----------------------------+--------------------------+--------------------------+------------------------------+
 | 6. External Proxy Mode | NGINX managed externally| GoWave install.sh checks   | Set GOWAVE_PROXY=external| Allowing GoWave to try to| NGINX configs owned 100% by  |
 |    (P1-4)              | without informing       | GOWAVE_PROXY == external   | in /opt/gowave/.env      | configure Caddy or Nginx | GoWave Auto NGINX; zero      |

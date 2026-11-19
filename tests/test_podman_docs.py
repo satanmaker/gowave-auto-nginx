@@ -1875,9 +1875,11 @@ class TestContourBoundary(unittest.TestCase):
         security = (REPO_ROOT / "modules" / "security.sh").read_text(encoding="utf-8")
         self.assertIn("Before=systemd-sysctl.service", security)
         suite = SYSTEMD_SUITE.read_text(encoding="utf-8")
-        self.assertEqual(len(re.findall(r"^    def test_", suite, re.MULTILINE)), 5,
-                         "the systemd suite changed length; the page still says five tests")
-        self.assertIn("five tests", page)
+        self.assertEqual(len(re.findall(r"^    def test_", suite, re.MULTILINE)), 8,
+                         "the systemd suite changed length; the page still says eight tests")
+        self.assertIn("eight tests", page)
+        self.assertIn("`gowave-auto.sh`", page,
+                      "the page no longer names the file the install and uninstall tests read")
 
     def test_the_design_scope_names_the_same_three_contours(self):
         text = DESIGN.read_text(encoding="utf-8")

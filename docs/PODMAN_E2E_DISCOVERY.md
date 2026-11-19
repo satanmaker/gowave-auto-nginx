@@ -834,16 +834,18 @@ units the product writes survive a real cold boot under a genuine systemd PID 1.
 `tests/systemd/boot.sh` builds a rootfs from `tests/Containerfile.testbed` for
 all four base images, boots it with QEMU (KVM when available, TCG otherwise),
 and the guest's own `gowave-ci.service` runs `python3 tests/run_ci.py --suite
-systemd`. That suite is five tests and installs nothing: four of them read
-files — the unit templates in `modules/panel.sh` and `modules/security.sh`, and
-`tests/systemd/boot.sh` itself for executability and the four-image/KVM matrix
-— and `test_guest_genuine_pid1_when_in_vm` reads `/proc/1/comm` and
-`systemctl is-system-running` from inside the guest. No `gowave-auto.sh install`
-runs there, no traffic flows, no subscription is fetched, and the contour
-carries no catalog case id at all: it is a check that the units are accepted,
-not a scenario of the product. What it cannot answer is therefore not a gap in
-the cases — a container with `--systemd=always` runs a systemd as PID 1 that
-belongs to the container, and the cold boot is what removes that difference.
+systemd`. That suite is eight tests and installs nothing: seven of them read
+files — the unit templates in `modules/panel.sh` and `modules/security.sh`, the
+install and uninstall blocks that arm and remove the Panel's update helper in
+`gowave-auto.sh`, and `tests/systemd/boot.sh` itself for executability and the
+four-image/KVM matrix — and `test_guest_genuine_pid1_when_in_vm` reads
+`/proc/1/comm` and `systemctl is-system-running` from inside the guest. No
+`gowave-auto.sh install` runs there, no traffic flows, no subscription is
+fetched, and the contour carries no catalog case id at all: it is a check that
+the units are accepted, not a scenario of the product. What it cannot answer is
+therefore not a gap in the cases — a container with `--systemd=always` runs a
+systemd as PID 1 that belongs to the container, and the cold boot is what
+removes that difference.
 
 What only a VPS can answer is the live half of the eight partial entries plus
 the two live-only ones: provider-level reachability, real public addresses and
@@ -971,10 +973,11 @@ same run would not be traced.
 
 Six entrypoints are not invoked by a container case, for two different reasons,
 and keeping them apart is the point of this page. `status` and `health` report
-facts the cases assert from their source — `AIO-04` reads the unit states and
-the open sockets, `AIO-01` calls the Panel API from the client — so invoking the
-summary would test the summary, and `user links` prints links that `AIO-CLIENT`
-fetches over the authenticated API, which is the path a real client uses.
+facts the cases assert from their source — `AIO-04` reads the unit states, the
+open sockets and the in-panel update helper's own files, `AIO-01` calls the
+Panel API from the client — so invoking the summary would test the summary, and
+`user links` prints links that `AIO-CLIENT` fetches over the authenticated API,
+which is the path a real client uses.
 `uninstall`, `node list` and `node rollback` have no container case at all;
 their absence is recorded here so that a future parity review sees a gap rather
 than a coverage claim.
