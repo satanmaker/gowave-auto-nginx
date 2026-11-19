@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The mode-specific CA bundle, and what each mode is allowed to trust.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Data Plane E2E
+``openspec/specs/podman-e2e/spec.md`` §Data Plane E2E
 Traffic Through All VPN Endpoints says that under ``ACME_MODE=production`` the
 runner's bundle carries the complete public roots and no Let's Encrypt Staging
 root, that a chain terminating in a Staging root stays untrusted, and that

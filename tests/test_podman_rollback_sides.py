@@ -2,7 +2,7 @@
 """Suite nonroot: a failed node add is INCOMPLETE until both sides are verified.
 
 ``TXN-03`` is §Signal-Safe and Verifiable Transaction Compensation in
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md``: when the Worker
+``openspec/specs/podman-e2e/spec.md``: when the Worker
 compensation succeeds but the Panel API rollback fails, or the other way round,
 Master retains both recovery records, reports the overall operation as
 INCOMPLETE, and MUST NOT mark the transaction rolled back or committed until both

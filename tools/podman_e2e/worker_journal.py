@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A run killed mid-install is reconciled before the next one writes anything.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Global Certbot
+``openspec/specs/podman-e2e/spec.md`` §Global Certbot
 Deploy Hook Ownership: a Worker deployment terminated by SIGKILL, a kernel panic
 or power loss after it wrote its transaction journal is discovered by the next
 authenticated entrypoint, which reconciles it before accepting a new mutation;

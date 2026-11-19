@@ -1,6 +1,6 @@
 """Temporary access is revoked, or the run is not PASS.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Local-only live VPS
+``openspec/specs/podman-e2e/spec.md`` §Local-only live VPS
 credential handling and §Transactional Updates say the run's temporary SSH access
 is gone when the cleanup phase reports PASS, and that a cleanup which cannot be
 verified turns an otherwise PASS run into INCOMPLETE.

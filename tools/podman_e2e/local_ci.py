@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Repository CI runs the runner unit tests with no target credentials.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Local-only live VPS
+``openspec/specs/podman-e2e/spec.md`` §Local-only live VPS
 credential handling says repository CI executes the runner unit tests without
 requiring VPS target credentials or GitHub Environment secrets. The workflow is
 ``.github/workflows/live-vps-unit.yml`` and the claim has three halves, each read

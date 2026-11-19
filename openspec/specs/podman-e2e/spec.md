@@ -1,6 +1,10 @@
-# Capability: Product-Level Podman E2E
+# Podman E2E Specification
 
-## ADDED Requirements
+## Purpose
+
+Prove each released installer against observable product behaviour on both acceptance topologies, by running the real commands in rootful Podman on a pinned image instead of asserting what the documentation says they do.
+
+## Requirements
 
 ### Requirement: Independent All-in-One acceptance topology
 

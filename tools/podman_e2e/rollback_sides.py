@@ -1,6 +1,6 @@
 """A failed node add is INCOMPLETE until both its sides are verified.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Signal-Safe and
+``openspec/specs/podman-e2e/spec.md`` §Signal-Safe and
 Verifiable Transaction Compensation: when the Worker compensation succeeds and
 the Panel API rollback fails, or the other way round, Master retains both
 recovery records, reports the overall operation as INCOMPLETE, and does not mark

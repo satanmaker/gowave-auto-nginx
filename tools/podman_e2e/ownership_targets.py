@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A Worker path this install did not write is not a rollback target.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Complete
+``openspec/specs/podman-e2e/spec.md`` §Complete
 Mutation-Target Baseline and Resource Ownership says the runner rejects a
 pre-existing systemd unit, drop-in, binary or managed webroot unless a complete
 ownership record proves the object belongs to this run. The Worker payload now

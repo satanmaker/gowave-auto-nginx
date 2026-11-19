@@ -2,7 +2,7 @@
 """Suite nonroot: an interrupted Worker install compensates once and says so.
 
 ``TXN-01`` is §Signal-Safe and Verifiable Transaction Compensation in
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md``: a remote Worker
+``openspec/specs/podman-e2e/spec.md``: a remote Worker
 deployment that has mutated at least one resource and has not committed, on HUP,
 INT or TERM, stops starting new mutations, persists interruption state, executes
 compensation exactly once, verifies the result and exits nonzero — secret and

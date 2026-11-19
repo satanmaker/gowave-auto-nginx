@@ -1,6 +1,6 @@
 """A Worker install the transport never accepted leaves no committed journal.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Negative Scenario
+``openspec/specs/podman-e2e/spec.md`` §Negative Scenario
 and Fault Injection Tests: when the SSH connection to a Worker is interrupted
 mid-installation, the recovery journal on the Master is not ``COMMITTED`` — it is
 in a failure or recovery-required state that needs an operator before the Worker

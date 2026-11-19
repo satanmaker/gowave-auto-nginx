@@ -4,7 +4,7 @@
 <!-- Edited by hand, it drifts: the audit refuses a report that is not this text. -->
 
 One row per scenario of
-`openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`.
+`openspec/specs/podman-e2e/spec.md`.
 `matrix` is the `tests/cases/matrix.yaml` row each case id decodes to —
 `inbound/client`, or `node/inbound/client` on Multi-Node, where both
 nodes run the same pair — so the protocol and the client a scenario
