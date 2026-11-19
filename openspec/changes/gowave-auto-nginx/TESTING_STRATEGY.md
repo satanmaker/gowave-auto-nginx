@@ -118,7 +118,6 @@ flowchart TD
 - **Privilege**: Root (`id -u == 0`) inside disposable container or VM.
 - **Tests Covered**:
   - `test_user_permissions`: Creation of user `gowave:gowave`, verify directory permissions `1770 root:gowave` on `/opt/gowave`, and verify executable is owned by `root:root`.
-  - `test_service_install`: Execution of `gowave-server service install /opt/gowave` and verification of generated `90-unprivileged.conf` and `gowave-update.path`.
   - `test_secret_delivery`: Delivery of `SECRET_KEY` strictly via stdin or temporary `0600` file; assert process inspection of both local `ssh` process and remote runner via `/proc/<pid>/cmdline` and `ps aux` reveals zero secrets.
   - `test_fail2ban_syntax`: Validation of `/etc/fail2ban/jail.d/90-gowave-auto-nginx.local` via `fail2ban-client --test`.
   - `test_backup_format_v1`: Generation of `GoWave Auto NGINX Backup Format v1` archive; verify mode `0600` and validation of `meta.json` manifest.

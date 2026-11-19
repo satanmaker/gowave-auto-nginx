@@ -23,12 +23,12 @@ The management utility SHALL enforce mutually exclusive execution using file loc
 - **THEN** the second instance detects the active lock, reports that another operation is in progress, and exits with code 1 without modifying system state.
 
 ### Requirement: External Proxy Mode and Service Ownership
-The installation module SHALL configure `GOWAVE_PROXY=external` in `/opt/gowave/.env`, write complete base unit `/etc/systemd/system/gowave.service`, enable it via `systemctl enable`, and invoke `gowave-server service install` for drop-in sandboxing `90-unprivileged.conf`.
+The installation module SHALL configure `GOWAVE_PROXY=external` in `/opt/gowave/.env`, write the base unit `/etc/systemd/system/gowave.service` itself, and write and enable the in-panel update helper units `gowave-update.service` and `gowave-update.path` from its own templates. It MUST NOT invoke `gowave-server service install`.
 
 #### Scenario: GoWave external proxy mode verification
 - **GIVEN** a newly provisioned GoWave Panel
-- **WHEN** `/opt/gowave/.env` is generated, base unit `/etc/systemd/system/gowave.service` is written and enabled, and `gowave-server service install` is executed
-- **THEN** `GOWAVE_PROXY=external` is present in `/opt/gowave/.env`, base unit `/etc/systemd/system/gowave.service` is registered with systemd, and the native service unit drop-in `90-unprivileged.conf` applies unprivileged user sandboxing without missing unit errors.
+- **WHEN** `/opt/gowave/.env` is generated and the managed units are written and enabled
+- **THEN** `GOWAVE_PROXY=external` is present in `/opt/gowave/.env`, the base unit and both helper units are registered with systemd, no `gowave-server service install` invocation exists in the installation path, and no `gowave.service.d/90-unprivileged.conf` is created by the installation; the vendored helper reapplies that drop-in on each in-panel update
 
 ### Requirement: Safe Channel Switching Between Stable and Dev Releases
 The manager SHALL provide a dedicated command `gowave-auto.sh channel [stable|dev]` supporting transitions between Stable and Dev release channels with automated pre-switch snapshotting, schema migration guardrails, health checks, and rollback on failure. The command SHALL NOT fetch or replace release assets: it records the channel the Panel reads at startup and restarts it, and installing a different release remains the job of `gowave-auto.sh update`.

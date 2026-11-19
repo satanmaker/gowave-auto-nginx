@@ -16,9 +16,9 @@ Refer to `TECHNICAL_AUDIT.md` for verified upstream commit SHAs and technical fa
 +-------------------+----------------------------+-----------------------------------+---------------------------------------------------+
 | Subsystem         | Supervising Process        | Primary Configuration / State     | Ownership Policy                                  |
 +===================+============================+===================================+===================================================+
-| GoWave Panel      | systemd: gowave.service    | /opt/gowave/.env, gowave.db       | Managed via gowave-server service install;        |
-|                   |                            | (GOWAVE_PROXY=external)           | unprivileged gowave user; sticky bit 1770;        |
-|                   |                            |                                   | orchestrated initially & updated by gowave-auto.sh|
+| GoWave Panel      | systemd: gowave.service    | /opt/gowave/.env, gowave.db       | Managed by gowave-auto.sh, which writes           |
+|                   |                            | (GOWAVE_PROXY=external)           | base and helper units; unprivileged gowave        |
+|                   |                            |                                   | user, sticky bit 1770; no service install.        |
 +-------------------+----------------------------+-----------------------------------+---------------------------------------------------+
 | GoWave Node       | systemd: gowave-node.service| /opt/gowave-node/.env, /run/...  | Installed via upstream gowave-node/install.sh;    |
 |                   |                            |                                   | runs as root; orchestrated by gowave-node-auto.sh |

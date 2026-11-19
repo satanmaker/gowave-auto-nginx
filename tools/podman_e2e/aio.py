@@ -108,6 +108,10 @@ UNITS: Sequence[str] = (
 )
 
 CREDENTIALS_FILE = "/root/gowave-credentials.txt"
+UPDATE_UNIT = "/etc/systemd/system/gowave-update.service"
+UPDATE_PATH_UNIT = "/etc/systemd/system/gowave-update.path"
+UPDATE_RUNTIME_DIR = "/run/gowave"
+UNPRIVILEGED_DROPIN = "/etc/systemd/system/gowave.service.d/90-unprivileged.conf"
 LETSENCRYPT_ROOT = "/etc/letsencrypt/live"
 LOOPBACK_PANEL = "http://127.0.0.1:3000"
 PUBLIC_PANEL = f"https://{topology.PANEL_DOMAIN}"
@@ -2142,7 +2146,55 @@ def case_services(product: AioProduct) -> Dict[str, Any]:
             f"the local Node is not listening on 3002: {addresses}")
     require("AIO-04", any(addr.endswith(":443") and not addr.startswith("127.0.0.1") for addr in addresses),
             f"NGINX is not listening publicly on 443: {addresses}")
-    return {"units": states, "listeners": sorted(addresses)}
+
+    # The in-panel update helper is provisioned by the installer itself: a
+    # private runtime directory for the Panel, both units, an armed path unit,
+    # and no upstream sandbox drop-in until the first in-panel update runs.
+    helper_script = (
+        f"stat -c '%U %a' {UPDATE_RUNTIME_DIR} 2>/dev/null || echo 'runtime-dir missing'\n"
+        "echo ---\n"
+        f"test -f {UPDATE_UNIT} && echo present || echo missing\n"
+        f"test -f {UPDATE_PATH_UNIT} && echo present || echo missing\n"
+        "echo ---\n"
+        "systemctl is-enabled gowave-update.path 2>/dev/null || true\n"
+        "systemctl is-active gowave-update.path 2>/dev/null || true\n"
+        "echo ---\n"
+        f"test -e {UNPRIVILEGED_DROPIN} && echo present || echo absent"
+    )
+    helper = product.host_script(helper_script)
+    require("AIO-04", helper.returncode == 0, f"update helper probe failed: {helper.stderr.strip()}")
+    helper_parts = (helper.stdout or "").split("---")
+    require("AIO-04", len(helper_parts) == 4, f"update helper probe was truncated: {helper.stdout!r}")
+    runtime_stat, unit_stat, state_stat, dropin_stat = (part.strip() for part in helper_parts)
+
+    runtime_owner, _, runtime_mode = runtime_stat.partition(" ")
+    require("AIO-04", runtime_owner == "gowave",
+            f"{UPDATE_RUNTIME_DIR} is not owned by the service account: {runtime_stat!r}")
+    require("AIO-04", runtime_mode == "700",
+            f"{UPDATE_RUNTIME_DIR} mode is {runtime_mode!r}, expected 700")
+    unit_states = unit_stat.splitlines()
+    require("AIO-04", unit_states.count("present") == 2,
+            f"update helper units are missing: {unit_states}")
+    path_states = state_stat.splitlines()
+    require("AIO-04", path_states[:1] == ["enabled"],
+            f"gowave-update.path is not enabled: {path_states}")
+    require("AIO-04", path_states[1:2] == ["active"],
+            f"gowave-update.path is not active: {path_states}")
+    require("AIO-04", dropin_stat == "absent",
+            f"the installation created {UNPRIVILEGED_DROPIN}")
+
+    return {
+        "units": states,
+        "listeners": sorted(addresses),
+        "update_helper": {
+            "runtime_owner": runtime_owner,
+            "runtime_mode": runtime_mode,
+            "units": unit_states,
+            "path_enabled": path_states[:1],
+            "path_active": path_states[1:2],
+            "unprivileged_dropin": dropin_stat,
+        },
+    }
 
 
 def case_panel_ready(product: AioProduct) -> Dict[str, Any]:
@@ -7409,7 +7461,11 @@ print(json.dumps({
     "binary": digest_file(paths.get("binary")),
     "database": database(paths.get("db")),
     "frontend": digest_tree(paths.get("frontend")),
-    "frontend_index": digest_file(os.path.join(paths.get("frontend") or "", "index.html")),
+    # The Panel resolves ./frontend/dist before ./dist, so the document the tree
+    # above holds sits one level below it.
+    "frontend_index": digest_file(
+        os.path.join(paths.get("frontend") or "", "dist", "index.html")
+    ),
     "state": digest_file(paths.get("state")),
     "nginx": digest_tree(paths.get("nginx")),
     "nginx_conf": digest_file(os.path.join(paths.get("nginx") or "", "nginx.conf")),
@@ -7670,8 +7726,8 @@ lineage = chains[0] if chains else ""
 
 replace("/opt/gowave/gowave-server", b"#!/bin/sh\nexit 1\n", 0o755)
 replace("/opt/gowave/gowave.db", b"this is not a sqlite database\n")
-if os.path.isfile("/opt/gowave/frontend/index.html"):
-    replace("/opt/gowave/frontend/index.html", b"<html>e2e sabotage</html>\n")
+if os.path.isfile("/opt/gowave/frontend/dist/index.html"):
+    replace("/opt/gowave/frontend/dist/index.html", b"<html>e2e sabotage</html>\n")
 with open("/opt/gowave/.env", "rb") as handle:
     environment = handle.read()
 replace("/opt/gowave/.env", environment + b"E2E_CHANNEL_SABOTAGE=1\n", 0o640)
@@ -7685,7 +7741,7 @@ for chain_path in chains:
 targets = {
     "binary": "/opt/gowave/gowave-server",
     "database": "/opt/gowave/gowave.db",
-    "frontend_index": "/opt/gowave/frontend/index.html",
+    "frontend_index": "/opt/gowave/frontend/dist/index.html",
     "environment": "/opt/gowave/.env",
     "state": "/var/lib/gowave-auto-nginx/state.json",
     "nginx_conf": "/etc/nginx/nginx.conf",

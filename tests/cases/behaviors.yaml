@@ -55,7 +55,11 @@ behaviors:
     description: >-
       The installed units, listeners, certificate and Panel inventory are read
       back from the host, survive a restart of the product's own units and a
-      second install, and fail closed when the public surface is stopped.
+      second install, and fail closed when the public surface is stopped. The
+      same read-back also holds the Panel's own update trigger: a `/run/gowave`
+      directory of mode `0700` owned by `gowave`, both `gowave-update.*` units,
+      an enabled and active path unit, and no upstream sandbox drop-in before
+      the first in-panel update.
     topology: [aio, multi-node]
     gate: pre-push
     cases: [AIO-01, AIO-02, AIO-03, AIO-04, AIO-05, AIO-RESTART, AIO-IDEMPOTENT]

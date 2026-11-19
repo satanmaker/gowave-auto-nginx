@@ -331,6 +331,19 @@ SOCKET_LISTING = (
     "LISTEN 0 511 127.0.0.1:3002 0.0.0.0:*\n"
 )
 
+# The in-panel update helper probe, in the four sections the case splits on:
+# `stat -c '%U %a' /run/gowave`, the two unit files, the two path-unit states,
+# and the absence of the drop-in the upstream `service install` writes.
+UPDATE_HELPER_PROBE = (
+    "gowave 700\n"
+    "---\n"
+    "present\npresent\n"
+    "---\n"
+    "enabled\nactive\n"
+    "---\n"
+    "absent"
+)
+
 
 class TestAioVerificationCases(unittest.TestCase):
     def setUp(self):
@@ -354,12 +367,44 @@ class TestAioVerificationCases(unittest.TestCase):
 
     def test_service_case_requires_active_units_and_correct_listeners(self):
         output = "active\nactive\nactive\nactive\n---\n" + SOCKET_LISTING
-        product, _ = installed_product(self.context, [(output, 0)])
+        product, _ = installed_product(self.context, [(output, 0), (UPDATE_HELPER_PROBE, 0)])
         evidence = aio.case_services(product)
         self.assertTrue(all(state == "active" for state in evidence["units"].values()))
         self.assertEqual(evidence["listeners"], sorted([
             "0.0.0.0:443", "127.0.0.1:3000", "127.0.0.1:3002",
         ]))
+        self.assertEqual(evidence["update_helper"], {
+            "runtime_owner": "gowave",
+            "runtime_mode": "700",
+            "units": ["present", "present"],
+            "path_enabled": ["enabled"],
+            "path_active": ["active"],
+            "unprivileged_dropin": "absent",
+        })
+
+    def test_service_case_refuses_a_runtime_directory_other_than_0700_gowave(self):
+        output = "active\nactive\nactive\nactive\n---\n" + SOCKET_LISTING
+        probe = UPDATE_HELPER_PROBE.replace("gowave 700", "gowave 755", 1)
+        product, _ = installed_product(self.context, [(output, 0), (probe, 0)])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_services(product)
+        self.assertIn("expected 700", str(caught.exception))
+
+    def test_service_case_refuses_a_path_unit_that_is_not_armed(self):
+        output = "active\nactive\nactive\nactive\n---\n" + SOCKET_LISTING
+        probe = UPDATE_HELPER_PROBE.replace("enabled\nactive", "disabled\ninactive", 1)
+        product, _ = installed_product(self.context, [(output, 0), (probe, 0)])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_services(product)
+        self.assertIn("not enabled", str(caught.exception))
+
+    def test_service_case_refuses_the_upstream_sandbox_dropin(self):
+        output = "active\nactive\nactive\nactive\n---\n" + SOCKET_LISTING
+        probe = UPDATE_HELPER_PROBE[:-len("absent")] + "present"
+        product, _ = installed_product(self.context, [(output, 0), (probe, 0)])
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_services(product)
+        self.assertIn("90-unprivileged.conf", str(caught.exception))
 
     def test_inactive_unit_fails_the_service_case(self):
         output = "active\nactive\ninactive\nactive\n---\n" + SOCKET_LISTING
@@ -1303,8 +1348,10 @@ class TestChannelCases(unittest.TestCase):
             database.close()
         (directory / ".env").write_text("GOWAVE_CHANNEL=stable\nAPP_SECRET=kept\n", encoding="utf-8")
         (directory / "gowave-server").write_bytes(b"#!/bin/sh\nexit 0\n")
-        (directory / "frontend").mkdir(exist_ok=True)
-        (directory / "frontend" / "index.html").write_text("<html>panel</html>\n", encoding="utf-8")
+        (directory / "frontend" / "dist").mkdir(parents=True, exist_ok=True)
+        (directory / "frontend" / "dist" / "index.html").write_text(
+            "<html>panel</html>\n", encoding="utf-8"
+        )
         (directory / "state.json").write_text('{"domain": "panel.test"}\n', encoding="utf-8")
         (directory / "etc" / "nginx" / "conf.d").mkdir(parents=True, exist_ok=True)
         (directory / "etc" / "nginx" / "nginx.conf").write_text("events {}\n", encoding="utf-8")
@@ -1336,6 +1383,22 @@ class TestChannelCases(unittest.TestCase):
         # must not mistake the live host's journal for part of the snapshot.
         self.assertEqual(facts["journal"], {})
         self.assertEqual(facts["snapshots"], [])
+
+    def test_the_state_probe_reads_the_document_only_from_the_shipped_layout(self):
+        """The Panel resolves ./frontend/dist, so a document left at ./frontend is not served.
+
+        The fault and channel cases compare this digest before and after a
+        change of state; a probe pointed at the pre-change location reports no
+        document at all on both sides, which reads as "unchanged" while nothing
+        was measured.
+        """
+        snapshot = self.tree(Path(self.tmp.name) / "recovery" / "update-1")
+        (snapshot / "frontend" / "dist" / "index.html").rename(
+            snapshot / "frontend" / "index.html"
+        )
+        facts = self.probe(aio.channel_state_paths(str(snapshot)))
+        self.assertIsNone(facts["frontend_index"])
+        self.assertTrue(facts["frontend"], "the tree digest must still see the tree")
 
     def test_the_state_probe_counts_the_rows_of_every_table(self):
         snapshot = self.tree(Path(self.tmp.name) / "recovery" / "update-1")
@@ -1579,7 +1642,10 @@ class TestChannelCases(unittest.TestCase):
         (gowave / "frontend").mkdir(parents=True)
         (gowave / "gowave-server").write_text("binary\n", encoding="utf-8")
         (gowave / "gowave.db").write_bytes(b"database\n")
-        (gowave / "frontend/index.html").write_text("<html>panel</html>\n", encoding="utf-8")
+        (gowave / "frontend/dist").mkdir(parents=True)
+        (gowave / "frontend/dist/index.html").write_text(
+            "<html>panel</html>\n", encoding="utf-8"
+        )
         (gowave / ".env").write_text("GOWAVE_CHANNEL=stable\n", encoding="utf-8")
         (tmp / "etc/nginx").mkdir(parents=True)
         (tmp / "etc/nginx/nginx.conf").write_text("events {}\n", encoding="utf-8")

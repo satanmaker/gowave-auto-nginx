@@ -1,7 +1,7 @@
 version: 1
 schema: gowave-case-catalog/v1
 live_spec: openspec/specs/live-vps-e2e/spec.md
-live_spec_sha256: 485975c572e46198c2b42e05f01e3c25284aa22353f9704c9dcda2d937494863
+live_spec_sha256: fcd3612038df6d2c480f56ffdd3a8348d0339cb1da26bb401566008e55d29155
 counts:
   live_total: 125
   container: 111
@@ -1462,13 +1462,20 @@ cases:
   live_scenario: Master services active and listeners correct
   assertion: '**GIVEN** `gowave-auto.sh install` completed with exit code 0
 
-    **WHEN** the runner checks systemd service status and port listeners on Master
+    **WHEN** the runner checks systemd service status, port listeners and the in-panel update helper on
+    Master
 
     **THEN** `gowave.service`, `gowave-node.service`, `nginx.service`, and `fail2ban.service` are all
     active;
 
-    Panel listens on `127.0.0.1:3000`, Node on `3002`, and NGINX publicly on `443`'
-  assertion_sha256: 9c0427a97715cf6ebbb0d689d4485663d6c5e8a5c655dc8290772f575810becc
+    Panel listens on `127.0.0.1:3000`, Node on `3002`, and NGINX publicly on `443`; both
+
+    `gowave-update.service` and `gowave-update.path` exist, the path unit is enabled and active over a
+
+    `/run/gowave` directory of mode `0700` owned by `gowave`, and no
+
+    `gowave.service.d/90-unprivileged.conf` exists before the first in-panel update'
+  assertion_sha256: 0b352b271ad319d39dda7a130746509ac0e5d763fb06d25418a9425434722c87
   runs_in:
   - podman
   - live
@@ -1485,6 +1492,7 @@ cases:
       evidence:
       - listeners
       - units
+      - update_helper
   promotion_target: null
 - id: AIO-05
   requirement: All-in-One Master VPS Installation Verification

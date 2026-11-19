@@ -14,7 +14,9 @@ The test framework MUST provide an isolated All-in-One topology that starts from
 
 - **WHEN** the All-in-One acceptance suite is executed against a clean disposable target
 - **THEN** it invokes the real operator in the supported full-install mode
-- **AND** verifies the installed services, Panel/API readiness, TLS endpoint, and configured data-plane endpoint independently
+- **AND** verifies the installed services — including the in-panel update trigger the installer arms, its
+  runtime directory, both `gowave-update.*` units and the enabled path unit — Panel/API readiness, TLS
+  endpoint, and configured data-plane endpoint independently
 - **AND** records a machine-readable result and sanitized diagnostics
 
 #### Scenario: All-in-One repeated provisioning
