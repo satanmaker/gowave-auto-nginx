@@ -1,0 +1,67 @@
+# Tasks
+
+## 1. Panel-only product mode
+
+- [ ] 1.1 Thread an installation mode (`all-in-one` | `panel-only`) through `cmd_install`, defaulting to All-in-One, and accept `--panel-only` / `--mode panel-only` without changing the meaning of the three positional arguments. Verify: `bash -n gowave-auto.sh`; a unit test in `tests/` that parses the argument contract and asserts the default mode and the accepted spellings.
+- [ ] 1.2 Make `generate_stream_config` mode-aware: in Panel-only it emits the panel entry, the cover entries, and `default 127.0.0.1:9443`, with no 8443, 8444, or vision entry. Verify: a unit test that renders both modes and asserts the exact map lines, including that `8443` appears only in the All-in-One render; `shellcheck --severity=error modules/nginx.sh` from the Podman shellcheck image (report it as not run if the image is unavailable).
+- [ ] 1.3 Skip the vision lineage and the vision fallback vhost in Panel-only, and make the decoy vhost use the camouflage lineage in that mode. Verify: rendered-config assertions in the same unit test file, plus `nginx -t` on a container host once the topology exists (task 6.2).
+- [ ] 1.4 In Panel-only, stop installation after the API bootstraps admin, token, and default user — no config profile, no inbound, no host record, no internal squad, no local node. Verify: a unit test asserting the provisioning call order for both modes, and a container run whose API audit shows zero hosts after install (task 6.3).
+- [ ] 1.5 Write `installationMode`, an empty `nodes` list, and no local-node fields into `state.json` for Panel-only, leaving `schemaVersion` at 2. Verify: a unit test reading a rendered state document, and `node list` on the container host reporting no nodes with exit 0.
+- [ ] 1.6 Make `health` warn about the absent Node listener instead of failing, and `status` report the absent unit and free 8443/8444 without a failure. Verify: unit assertions on both commands' output for a Panel-only state, and the container case asserting `Overall health status: HEALTHY`.
+- [ ] 1.7 Keep the mode through `domain-change`: the regenerated map in a Panel-only host still has no 8443/8444 backend and still defaults to 9443. Verify: a unit test that runs the render twice (install, then changed names) and compares the map shape.
+
+## 2. Internal squad provisioning
+
+- [ ] 2.1 Take `squad_uuid` from `client.provision_internal_squad(...)` in `node add`, persist it into `state.json`, and pass it to `provision_hosts`; abort with the compensating rollback when the returned value is empty. Verify: a unit test driving a stub client whose state has no `squadUuid` and asserting the host payload carries the returned identifier and never `[null]`; a second test asserting a `None` return stops before `provision_hosts`.
+- [ ] 2.2 Assert the second worker reuses the same squad and creates no duplicate. Verify: a unit test stubbing two registrations against one client double and counting `POST /api/internal-squads` calls.
+- [ ] 2.3 Confirm the fix reaches both installs paths: the All-in-One install still writes the squad its local node uses, and the Panel-only install writes none. Verify: unit test on both state documents plus the existing install assertions in the container suite.
+
+## 3. Wizard surface and language catalog
+
+- [ ] 3.1 Add `modules/i18n.sh` with a message catalog (RU and EN), a `t` lookup that falls back to English for an unknown key, and `GOWAVE_WIZARD_LANG` as the selector. Verify: a unit test asserting identical key sets in both catalogs and English fallback for an unknown key.
+- [ ] 3.2 Add `modules/wizard.sh` with the question sequence: language, deployment variant (with All-in-One labelled as trial-only), node count, and per-host names. Verify: unit tests driving the functions with scripted answers and asserting the collected plan for all three variants.
+- [ ] 3.3 Validate every collected name as a DNS hostname and reject a name already used by another host in the same plan, before any mutation. Verify: unit tests for a repeated camouflage name, an over-long label, and a rejected invalid character, each asserting no mutation was attempted.
+- [ ] 3.4 Enter the wizard only from an argument-less `install` with a terminal; an argument-less `install` without a terminal exits non-zero with a usage message naming the arguments. Verify: a unit test running both shapes with a non-TTY stdin and asserting exit code and message; the readiness test that refuses `input()` in tests keeps passing.
+- [ ] 3.5 Keep the positional path prompt-free and English: a complete `install` prints no question and no translated string. Verify: a unit test asserting no catalog lookup is reachable when arguments are complete, plus the existing container install staying green (task 6.2).
+
+## 4. Remote node onboarding over temporary access
+
+- [ ] 4.1 Add `modules/ssh_bootstrap.sh`: exact-string fingerprint confirmation typed in full, password read with `read -rsp`, Ed25519 key in a `0700` directory, atomic `authorized_keys` write, and a systemd timer that removes the entry within two hours. Verify: unit tests on the pure helpers (fingerprint comparison, entry rendering, timer unit content) and `shellcheck --severity=error modules/ssh_bootstrap.sh`.
+- [ ] 4.2 Abort onboarding when the expiry timer cannot be installed or enabled, before any key is authorised. Verify: a unit test with a failing timer command asserting zero `authorized_keys` writes and a non-zero exit.
+- [ ] 4.3 Run the existing `node add` while the temporary key is authorised, then remove the entry, stop and disable the timer, and delete the key on success and on failure. Verify: a unit test driving the success and failure paths with a stub remote and asserting the cleanup calls in both, plus the container case that reads the node's `authorized_keys` and timer list after an add (task 6.4).
+- [ ] 4.4 Read `GOWAVE_SSH_FINGERPRINT` and `GOWAVE_SSH_PASSWORD_FILE` (mode `0600`) as the non-interactive inputs, read the password once, and unset it after use; never place either value in an argument. Verify: a unit test asserting no spawned command line contains the password, and a test asserting a `0644` password file is refused.
+- [ ] 4.5 Document the two variables in `README.md` and `docs/`, and verify the documented invocation runs as written against a throwaway container node.
+
+## 5. Certificate budget preflight and domain policy
+
+- [ ] 5.1 Implement the count `C = 2 + v_panel + 2N + k` and the four ceilings (24, 23, 16, 15) as pure functions, with the shared/separate registered-domain distinction. Verify: a table-driven unit test covering every ceiling boundary, including one node above and at each limit.
+- [ ] 5.2 Wire the preflight into the wizard: separate domains proceed silently, a shared domain within the ceiling proceeds only after explicit confirmation with the shared-budget warning, a shared domain above the ceiling is refused with the ceiling for that combination and the recommendation of one registered domain per host. Verify: unit tests for all three outcomes asserting the refusal message names the computed count and the ceiling.
+- [ ] 5.3 Resolve every planned name before the first ACME order and refuse the plan on a mismatch, before any host is modified. Verify: a unit test with one unresolvable name asserting no install call and no certbot call.
+- [ ] 5.4 Record in `design.md`'s domain section and in `README.md` that the remaining budget is not queryable, that the apex camouflage certificate belongs to a single host, and that wildcard is not a remedy for a shared domain. Verify: the two documents name all three limits; a documentation test that greps for the three statements stays green.
+
+## 6. Podman acceptance for the new mode and the squad fix
+
+- [ ] 6.1 Add `panel-only` as a third `--topology` value in `tools/podman_e2e/` (parser, plan, distribution handling) and make its install script emit the documented flag. Verify: `python3 -m tools.podman_e2e --help` lists the value; a unit test asserting the rendered install command; the environment probe still refuses an unpinned image lock.
+- [ ] 6.2 Prove the Panel-only host from inside the container: Panel active over 443, no `gowave-node.service`, no Xray process, no 8443/8444 listener, decoy name serving the static site, `nginx -t` passing. Verify: the new cases pass in a real run directory under `artifacts/podman-e2e/`, and the run's `result.json` records the topology.
+- [ ] 6.3 Prove the API shape after a Panel-only install: no host records, no local node, default user present, and `state.json` naming the mode. Verify: the case reads the Panel API and the state file from inside the container and both assertions pass.
+- [ ] 6.4 Prove squad behaviour in the container: first `node add` after a Panel-only install creates the squad and the host records carry it; no request body carries a null squad. Verify: a case reading host records and `state.json`; a negative case proving a refused host payload fails the registration rather than passing.
+- [ ] 6.5 Declare every new case in the five artifacts it lives in — `tests/cases/catalog.yaml` (generated), `tests/cases/behaviors.yaml`, `tests/cases/traceability.yaml`, `tests/cases/matrix.yaml`, and the suite declaration in `tools/podman_e2e/aio.py` or `multi_node.py`. Verify: `python3 -m tools.podman_e2e.catalog check` and `python3 -m tools.podman_e2e.trace --strict` both pass, then regenerate the two generated pages.
+- [ ] 6.6 Keep the invariants: four distributions, one distribution per run, no parallel runs, and the existing case counts otherwise unchanged. Verify: `python3 tests/run_ci.py --suite nonroot` and `--check-completeness` both pass; `tests/test_podman_docs.py` distribution assertions stay green.
+
+## 7. Live contour
+
+- [ ] 7.1 Add `INSTALL_MODE` to the live runner configuration and make `gowave-auto.sh install` be invoked with the panel-only flag when it is set. Verify: a unit test on the rendered command; `python3 -m unittest discover -s tools/tests -p 'test_*.py'` passes.
+- [ ] 7.2 Add the Panel-only Master verification to the live runner: units, listeners, decoy response, `health`, `state.json`, certificate line count. Verify: a live run directory whose evidence holds those readings; until such a run exists, record the requirement as declared but not live-proven.
+- [ ] 7.3 Run the Panel-only Master case on the pair and read the evidence back from the host side, not from the runner's log lines. Verify: a named run directory with its commit recorded as an ancestor of the reviewed tree, plus the host-side readings quoted in the task note.
+
+## 8. Integration and recorded limits
+
+- [ ] 8.1 Run the full local verification in one window: `bash -n` on every changed script, `shellcheck --severity=error` on them, `python3 tests/run_ci.py --suite nonroot`, `--check-completeness`, `python3 -m tools.podman_e2e.catalog check`, `trace --strict`, and `openspec validate interactive-setup-wizard --strict`. Verify: every command's exit status and summary line recorded; anything not run named explicitly.
+- [ ] 8.2 Run both container topologies end to end and read the run directories back, not the console tail. Verify: two run directories under `artifacts/podman-e2e/` whose `result.json` shows PASS with the recorded commit, and both case counts reported with the new ids listed.
+- [ ] 8.3 Update `README.md` (three deployment variants, the flag, the two `GOWAVE_SSH_*` variables, the domain policy) and the scenario catalogue docs. Verify: every documented command runs as written; the documentation guards in `tests/` stay green.
+- [ ] 8.4 Record what this change does not prove: cross-OS Panel/worker combinations (out of scope by decision on 2026-11-15), the remaining Let's Encrypt budget (not queryable), wildcard on a shared domain (rejected as worse), and the Panel-only live case until task 7.3 has a run. Verify: `tasks.md` and `design.md` name all four; no claim in `README.md` contradicts them.
+
+## Workflow follow-up
+
+- Archive the change after the project's review requirements are satisfied.
+- Verify the archived result and that both main specs received their delta requirements.

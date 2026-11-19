@@ -31,22 +31,27 @@ The installation module SHALL configure `GOWAVE_PROXY=external` in `/opt/gowave/
 - **THEN** `GOWAVE_PROXY=external` is present in `/opt/gowave/.env`, base unit `/etc/systemd/system/gowave.service` is registered with systemd, and the native service unit drop-in `90-unprivileged.conf` applies unprivileged user sandboxing without missing unit errors.
 
 ### Requirement: Safe Channel Switching Between Stable and Dev Releases
-The manager SHALL provide a dedicated command `gowave-auto.sh channel [stable|dev]` supporting transitions between Stable and Dev release channels with automated pre-switch snapshotting, schema migration guardrails, health checks, and rollback on failure.
+The manager SHALL provide a dedicated command `gowave-auto.sh channel [stable|dev]` supporting transitions between Stable and Dev release channels with automated pre-switch snapshotting, schema migration guardrails, health checks, and rollback on failure. The command SHALL NOT fetch or replace release assets: it records the channel the Panel reads at startup and restarts it, and installing a different release remains the job of `gowave-auto.sh update`.
 
 #### Scenario: Switch from Stable to Dev channel
 - **GIVEN** an active GoWave installation currently tracking the `stable` channel
 - **WHEN** `gowave-auto.sh channel dev` is executed
-- **THEN** the manager creates an automated SQLite Online Backup snapshot in `/var/lib/gowave-auto-nginx/recovery/`, updates `GOWAVE_CHANNEL=dev` in `/opt/gowave/.env`, fetches and verifies the latest dev release assets, restarts `gowave.service`, and confirms health via `GET http://127.0.0.1:3000/api/system/health`.
+- **THEN** the manager captures a recovery snapshot in `/var/lib/gowave-auto-nginx/recovery/update-<timestamp>/` (SQLite Online Backup of the database plus the Panel binary, the frontend tree, `.env`, `state.json`, and the `/etc/nginx` and `/etc/letsencrypt` trees), writes the `APPLYING` journal, updates `GOWAVE_CHANNEL=dev` in `/opt/gowave/.env`, restarts `gowave.service`, confirms health via `GET http://127.0.0.1:3000/api/system/health` within 30 seconds, marks the journal `COMMITTED`, prunes old snapshots, and exits with code 0.
+
+#### Scenario: Repeating the command for the current channel is a no-op
+- **GIVEN** an active GoWave installation already tracking the requested channel
+- **WHEN** `gowave-auto.sh channel <current channel>` is executed
+- **THEN** the manager reports `GoWave is already on channel '<channel>'.` and exits with code 0 without taking a snapshot, rewriting `.env`, or restarting the service.
 
 #### Scenario: Switch from Dev to Stable channel with snapshot and confirmation
 - **GIVEN** an active GoWave installation currently tracking the `dev` channel
-- **WHEN** `gowave-auto.sh channel stable` is executed
-- **THEN** the manager displays an explicit warning that Dev database migrations cannot be automatically rolled back to an older Stable release, requires explicit confirmation or `--force` flag, creates an automated SQLite Online Backup snapshot, applies the stable release, and verifies service health.
+- **WHEN** `gowave-auto.sh channel stable` is executed without `--force`
+- **THEN** the manager displays an explicit warning that Dev database migrations cannot be automatically rolled back to an older Stable release, exits with code 1 without snapshotting, rewriting `.env`, or restarting the service, and only a repeated invocation with `--force` captures the recovery snapshot, applies the stable channel label, restarts the service, and verifies service health.
 
 #### Scenario: Channel switch failure and automatic rollback
-- **GIVEN** a channel switch operation where the new release binary fails to start or healthcheck fails
-- **WHEN** healthcheck times out after 30 seconds
-- **THEN** the manager immediately stops the failed binary, restores the previous binary and SQLite database from the pre-switch snapshot, restores the previous `GOWAVE_CHANNEL` in `.env`, restarts the service, and exits with code 1.
+- **GIVEN** a channel switch operation where the restarted Panel does not become active or its healthcheck fails
+- **WHEN** `systemctl restart gowave.service` fails or the healthcheck times out after 30 seconds
+- **THEN** the manager restores the previous binary, SQLite database, frontend tree, `.env`, `state.json`, and the NGINX and ACME state from the pre-switch snapshot, restarts the service, marks the journal `ROLLED_BACK`, and exits with code 1, leaving the journal `ROLLBACK_REQUIRED` when the rollback itself cannot complete so that the boot recovery unit retries it.
 
 ### Requirement: Transaction-Safe Updates with Crash Recovery Journal
 The update module SHALL execute SQLite Online Backup, capture a persistent snapshot in `/var/lib/gowave-auto-nginx/recovery/update-<timestamp>/`, maintain atomic state in `journal.json`, and roll back automatically upon healthcheck failure or power loss.
@@ -90,20 +95,30 @@ The lifecycle manager SHALL enforce a retention policy keeping the last 3 recove
 - **THEN** the oldest snapshot is safely removed, keeping exactly 3 snapshots, and free disk space is verified.
 
 ### Requirement: Atomic Domain Reconfiguration with Rollback
-The manager SHALL support changing the panel domain or REALITY domain with DNS preflight validation, proper variable scoping (`new_panel_domain` and `new_reality_domain`), rolling back cleanly if certificate issuance fails.
+The manager SHALL support changing the panel domain or REALITY domain with DNS preflight validation, proper variable scoping (`new_panel_domain` and `new_reality_domain`), recomputing the camouflage apex from the new panel domain, reissuing the REALITY lineage with `--expand` so it also carries the apex and `www.<apex>`, verifying that SAN before deploying production vhosts, and rolling back cleanly if certificate issuance or SAN validation fails.
 
 #### Scenario: Failed domain change rollback
 - **GIVEN** an operator requesting a domain change to `new.example.com`
 - **WHEN** ACME challenge verification fails due to misconfigured DNS
 - **THEN** NGINX configurations and `.env` are restored to the previous domain, NGINX is reloaded, and active traffic to the old domain continues uninterrupted.
 
+#### Scenario: Domain change carries the camouflage apex along
+- **GIVEN** an operator changing the panel domain from `dns.old.example` to `panel.new.example`, with the new camouflage apex `new.example` resolving to this host
+- **WHEN** the manager provisions certificates for the new names
+- **THEN** it derives the new camouflage apex `new.example`, issues the panel lineage for `panel.new.example`, issues the REALITY lineage for the REALITY domain together with `new.example` and `www.new.example` using `--expand`, verifies the REALITY certificate covers that apex SAN, deploys stream, port 80, and decoy vhosts naming the new apex and `www.<apex>`, and rolls the whole change back if issuance or SAN verification fails.
+
 ### Requirement: Safe and Targeted Component Uninstallation
-The uninstall command SHALL inspect `# Managed by GoWave Auto NGINX` ownership markers and remove only project-managed units, configurations, and data directories without purging system packages or modifying user home directories.
+The uninstall command SHALL remove only project-managed systemd units, NGINX vhosts, and the managed stream include block, SHALL stop and disable the managed services, and SHALL preserve application data, Worker binaries, certificates, backups, and recovery state without purging system packages or modifying user home directories.
 
 #### Scenario: Clean component removal
 - **GIVEN** an installed GoWave Auto NGINX instance
-- **WHEN** `gowave-auto.sh uninstall --confirm` is executed
-- **THEN** `gowave` and `gowave-node` systemd units are stopped and disabled, NGINX project vhosts and `# Managed by GoWave Auto NGINX` stream blocks in `/etc/nginx/nginx.conf` are cleanly removed, `/opt/gowave` and `/opt/gowave-node` are deleted, and system-wide packages (Python, systemd, SSH, base NGINX) remain intact.
+- **WHEN** `gowave-auto.sh uninstall --yes` is executed
+- **THEN** `gowave.service` and `gowave-node.service` are stopped and disabled, the managed unit files (`gowave`, `gowave-node`, both recovery units, and `bbr-load.service`) are removed, NGINX project vhosts and `# Managed by GoWave Auto NGINX` stream blocks in `/etc/nginx/nginx.conf` are cleanly removed, and system-wide packages (Python, systemd, SSH, base NGINX, Certbot) remain installed and intact.
+
+#### Scenario: Application data survives uninstallation
+- **GIVEN** an installed GoWave Auto NGINX instance with an active database, certificates, and recovery snapshots
+- **WHEN** `gowave-auto.sh uninstall --yes` completes
+- **THEN** `/opt/gowave`, `/opt/gowave-node`, `/var/lib/gowave-auto-nginx`, `/var/www/gowave-auto-nginx`, and `/var/www/gowave-acme` remain on disk, are reported to the operator for manual review, and are not recursively deleted, because no verified installer ownership marker exists for them.
 
 ### Requirement: Local Multi-Distribution Podman Testbed Gate
 The verification harness SHALL provide `tests/podman_testbed.sh` executing containerized pre-flight tests with PID 1 systemd across all 4 supported operating systems (Ubuntu 24.04, Ubuntu 26.04, Debian 12, Debian 13), requiring 100% pass rate across the 8-stage verification pipeline prior to VPS deployment.

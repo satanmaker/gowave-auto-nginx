@@ -1,17 +1,36 @@
 #!/usr/bin/env python3
 import http.server
+import io
 import json
 import os
+import sqlite3
+import stat
 from pathlib import Path
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.parse
+import urllib.request
+from unittest import mock
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 import sys
 sys.path.insert(0, str(REPO_ROOT))
-from modules.api_client import GoWaveClient, atomic_write_state, save_credentials, rollback_provisioning, _extract_list
+import modules.api_client as api_client
+from modules.api_client import (
+    GoWaveAPIError,
+    GoWaveClient,
+    atomic_write_state,
+    save_credentials,
+    rollback_provisioning,
+    mihomo_x25519_enabled,
+    parse_core_version,
+    reality_fingerprint,
+    _extract_list,
+)
+from modules.recovery import sqlite_online_backup, write_journal_atomically
 
 
 class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
@@ -191,6 +210,85 @@ class TestAPIClient(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
 
+    def test_post_network_failure_is_not_retried(self):
+        client = GoWaveClient("http://panel.example.test")
+        with mock.patch(
+            "modules.api_client.urllib.request.urlopen",
+            side_effect=urllib.error.URLError("response connection lost"),
+        ) as urlopen:
+            with self.assertRaises(Exception):
+                client.request("POST", "/api/nodes", {"name": "worker"})
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_post_401_reauthenticates_once_then_retries_request(self):
+        client = GoWaveClient("http://panel.example.test")
+        client.username = "admin"
+        client.password = "secure-password"
+        unauthorized = urllib.error.HTTPError(
+            "http://panel.example.test/api/nodes", 401, "Unauthorized", {}, io.BytesIO(b'{"error":"unauthorized"}')
+        )
+        login_response = mock.MagicMock()
+        login_response.__enter__.return_value = login_response
+        login_response.read.return_value = b'{"response": {"accessToken": "fresh-token"}}'
+        login_response.headers.get.return_value = "application/json"
+        mutation_response = mock.MagicMock()
+        mutation_response.__enter__.return_value = mutation_response
+        mutation_response.read.return_value = b'{"created": true}'
+        mutation_response.headers.get.return_value = "application/json"
+        with mock.patch(
+            "modules.api_client.urllib.request.urlopen",
+            side_effect=[unauthorized, login_response, mutation_response],
+        ) as urlopen:
+            self.assertEqual(client.request("POST", "/api/nodes", {"name": "worker"}), {"created": True})
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual(client.token, "fresh-token")
+
+    def test_get_network_failure_is_retried(self):
+        client = GoWaveClient("http://panel.example.test")
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok": true}'
+        response.headers.get.return_value = "application/json"
+        with mock.patch(
+            "modules.api_client.urllib.request.urlopen",
+            side_effect=[urllib.error.URLError("temporary network failure"), response],
+        ) as urlopen, mock.patch("modules.api_client.time.sleep"):
+            self.assertEqual(client.request("GET", "/api/nodes"), {"ok": True})
+        self.assertEqual(urlopen.call_count, 2)
+
+    def test_recovery_journal_is_created_with_private_permissions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = Path(tmpdir) / "journal.json"
+            tmp_path = Path(f"{journal_path}.tmp")
+            tmp_path.write_text("stale temporary data")
+            tmp_path.chmod(0o644)
+            write_journal_atomically(str(journal_path), {
+                "transaction_id": "provision_private_journal",
+                "op": "provision",
+                "state": "PROVISION_PREPARED",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": {},
+            })
+            self.assertEqual(stat.S_IMODE(journal_path.stat().st_mode), 0o600)
+
+    def test_recovery_journal_refuses_temporary_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal_path = Path(tmpdir) / "journal.json"
+            target = Path(tmpdir) / "do-not-overwrite.txt"
+            tmp_path = Path(f"{journal_path}.tmp")
+            target.write_text("sentinel")
+            tmp_path.symlink_to(target)
+            with self.assertRaises(OSError):
+                write_journal_atomically(str(journal_path), {
+                    "transaction_id": "provision_symlink_journal",
+                    "op": "provision",
+                    "state": "PROVISION_PREPARED",
+                    "timestamp": "2026-11-08T00:00:00Z",
+                    "entities": {},
+                })
+            self.assertEqual(target.read_text(), "sentinel")
+            self.assertTrue(tmp_path.is_symlink())
+
     def test_save_credentials(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             creds_file = Path(tmpdir) / "gowave-credentials.txt"
@@ -203,6 +301,60 @@ class TestAPIClient(unittest.TestCase):
             self.assertIn("ADMIN_PASSWORD=securepass1234567890", content)
             self.assertIn("SCOPED_API_TOKEN=token-xyz", content)
 
+    def test_save_credentials_refuses_temporary_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            creds_file = Path(tmpdir) / "credentials.txt"
+            target = Path(tmpdir) / "do-not-overwrite.txt"
+            tmp_path = Path(f"{creds_file}.tmp")
+            target.write_text("sentinel")
+            tmp_path.symlink_to(target)
+            with self.assertRaises(OSError):
+                save_credentials("admin", "secret-password", "https://panel.example.com", creds_path=str(creds_file))
+            self.assertEqual(target.read_text(), "sentinel")
+            self.assertTrue(tmp_path.is_symlink())
+
+    def test_root_sqlite_backup_uses_argv_and_unique_staging_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db_file = root / "source ' database.sqlite"
+            backup_file = root / "backup ' destination.sqlite"
+            connection = sqlite3.connect(db_file)
+            try:
+                connection.execute("CREATE TABLE sample (value TEXT)")
+                connection.execute("INSERT INTO sample VALUES ('backup-ok')")
+                connection.commit()
+            finally:
+                connection.close()
+
+            calls = []
+
+            def fake_run(args, check):
+                calls.append(args)
+                if args[0] == "runuser":
+                    self.assertNotIn("bash", args)
+                    self.assertEqual(args[4:6], ["python3", "-c"])
+                    source = sqlite3.connect(args[-2])
+                    destination = sqlite3.connect(args[-1])
+                    try:
+                        source.backup(destination)
+                    finally:
+                        destination.close()
+                        source.close()
+                return mock.Mock(returncode=0)
+
+            with mock.patch("modules.recovery.os.geteuid", return_value=0), \
+                 mock.patch("modules.recovery.subprocess.run", side_effect=fake_run):
+                self.assertTrue(sqlite_online_backup(str(db_file), str(backup_file)))
+
+            self.assertTrue(any(call[0] == "chown" for call in calls))
+            self.assertTrue(any(call[0] == "runuser" for call in calls))
+            check = sqlite3.connect(backup_file)
+            try:
+                self.assertEqual(check.execute("SELECT value FROM sample").fetchone(), ("backup-ok",))
+            finally:
+                check.close()
+            self.assertEqual(list(root.glob(".backup-*.db")), [])
+
     def test_atomic_write_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             state_file = Path(tmpdir) / "state.json"
@@ -212,6 +364,27 @@ class TestAPIClient(unittest.TestCase):
             loaded = json.loads(state_file.read_text())
             self.assertEqual(loaded["schemaVersion"], 2)
             self.assertEqual(loaded["installationMode"], "all-in-one")
+
+    def test_atomic_state_file_uses_private_permissions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            tmp_path = Path(f"{state_file}.tmp")
+            tmp_path.write_text("stale temporary data")
+            tmp_path.chmod(0o644)
+            atomic_write_state({"nodes": []}, str(state_file))
+            self.assertEqual(stat.S_IMODE(state_file.stat().st_mode), 0o600)
+
+    def test_atomic_state_writer_refuses_temporary_symlink(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            target = Path(tmpdir) / "do-not-overwrite.txt"
+            tmp_path = Path(f"{state_file}.tmp")
+            target.write_text("sentinel")
+            tmp_path.symlink_to(target)
+            with self.assertRaises(OSError):
+                atomic_write_state({"nodes": []}, str(state_file))
+            self.assertEqual(target.read_text(), "sentinel")
+            self.assertTrue(tmp_path.is_symlink())
 
     def test_compile_config_profile(self):
         # Case 1: Default mode without vision_domain (4 inbounds)
@@ -285,9 +458,10 @@ class TestAPIClient(unittest.TestCase):
         hosts = self.client.provision_hosts(prof_uuid, inbounds, node_uuid, squad_uuid, "vpn.example.com", "cdn.example.com")
         self.assertEqual(len(hosts), 4)
 
-        # Check that all hosts strictly use firefox fingerprint
-        for h in MockGoWaveServer.hosts.values():
-            self.assertEqual(h.get("fingerprint"), "firefox")
+        # All transports use the modern Firefox uTLS preset
+        fps = {h.get("remark"): h.get("fingerprint") for h in MockGoWaveServer.hosts.values()}
+        for remark, fp in fps.items():
+            self.assertEqual(fp, "firefox")
 
         # 7. Provision User
         short_uuid = self.client.provision_user("default-user", squad_uuid)
@@ -321,8 +495,9 @@ class TestAPIClient(unittest.TestCase):
         self.assertEqual(len(hosts), 5)
         remarks = {MockGoWaveServer.hosts[h].get("remark") for h in hosts}
         self.assertIn("VLESS-Vision-TLS@vision-node", remarks)
-        for h in hosts:
-            self.assertEqual(MockGoWaveServer.hosts[h].get("fingerprint"), "firefox")
+        fps = {MockGoWaveServer.hosts[h].get("remark"): MockGoWaveServer.hosts[h].get("fingerprint") for h in hosts}
+        for remark, fp in fps.items():
+            self.assertEqual(fp, "firefox")
 
     def test_provision_hosts_idempotent_patch(self):
         """Re-provisioning existing hosts must execute PATCH /api/hosts with uuid in body without 405 error."""
@@ -340,6 +515,206 @@ class TestAPIClient(unittest.TestCase):
         # Re-provisioning with same remark (triggers PATCH /api/hosts with uuid in body)
         hosts2 = self.client.provision_hosts(prof_uuid, inbounds, "node-patch-test", "squad-patch-test", "vpn.example.com", "cdn.example.com", "patch-test-node")
         self.assertEqual(hosts1, hosts2)
+
+    def test_unchanged_profile_is_not_written_again(self):
+        # The Panel restarts every node that uses a profile whenever the profile
+        # is written, so a repeated install must not re-send an identical one.
+        config = json.dumps({"inbounds": [{"tag": "a", "protocol": "vless", "port": 443}]})
+        stored = json.dumps(json.loads(config), sort_keys=True, separators=(",", ":"))
+        client = GoWaveClient("http://panel.example.test")
+        calls = []
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            calls.append((method, endpoint))
+            if endpoint == "/api/config-profiles":
+                return {"response": {"configProfiles": [{"uuid": "profile-1", "name": "P", "config": stored}]}}
+            if endpoint == "/api/config-profiles/profile-1/computed-config":
+                return {"response": {"config": config}}
+            if endpoint == "/api/config-profiles/profile-1/inbounds":
+                return {"response": {"inbounds": [{"uuid": "inbound-1"}]}}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client.request = fake_request
+        result = client.provision_config_profile("P", config)
+        self.assertEqual(result["profile_uuid"], "profile-1")
+        self.assertEqual([c for c in calls if c[0] in ("PATCH", "POST")], [])
+        self.assertEqual(client.transaction_entities, [])
+
+    def test_changed_profile_is_written_and_rolled_back(self):
+        stored = json.dumps({"inbounds": [{"tag": "a", "protocol": "vless", "port": 443}]})
+        changed = json.dumps({"inbounds": [{"tag": "a", "protocol": "vless", "port": 8443}]})
+        client = GoWaveClient("http://panel.example.test")
+        calls = []
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            calls.append((method, endpoint))
+            if endpoint == "/api/config-profiles":
+                return {"response": {"configProfiles": [{"uuid": "profile-1", "name": "P", "config": stored}]}}
+            if endpoint == "/api/config-profiles/profile-1/computed-config":
+                return {"response": {"config": changed}}
+            if endpoint == "/api/config-profiles/profile-1/inbounds":
+                return {"response": {"inbounds": [{"uuid": "inbound-1"}]}}
+            if method == "PATCH":
+                return {"response": {}}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client.request = fake_request
+        client.provision_config_profile("P", changed)
+        self.assertIn(("PATCH", "/api/config-profiles/profile-1"), calls)
+        self.assertEqual(client.transaction_entities[0]["type"], "profile")
+        self.assertEqual(client.transaction_entities[0]["before"]["config"], stored)
+
+    def test_unchanged_node_is_not_written_again(self):
+        # Writing a node's configuration starts Xray on it, so an install that
+        # finds the node unchanged must leave the running data plane alone.
+        node = {
+            "uuid": "node-1",
+            "name": "local-node",
+            "address": "127.0.0.1",
+            "port": 3002,
+            "configProfile": {
+                "activeConfigProfileUuid": "profile-1",
+                "activeInbounds": [{"uuid": "inbound-1"}],
+            },
+        }
+        client = GoWaveClient("http://panel.example.test")
+        calls = []
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            calls.append((method, endpoint))
+            if endpoint == "/api/nodes":
+                return {"response": {"nodes": [node]}}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client.request = fake_request
+        node_uuid = client.associate_node(
+            "local-node", "127.0.0.1", 3002, "profile-1", ["inbound-1"],
+        )
+        self.assertEqual(node_uuid, "node-1")
+        self.assertEqual([c for c in calls if c[0] != "GET"], [])
+        self.assertEqual(client.transaction_entities, [])
+
+    def test_node_change_is_written(self):
+        node = {
+            "uuid": "node-1",
+            "name": "local-node",
+            "address": "127.0.0.1",
+            "port": 3002,
+            "configProfile": {
+                "activeConfigProfileUuid": "profile-1",
+                "activeInbounds": [{"uuid": "inbound-1"}],
+            },
+        }
+        client = GoWaveClient("http://panel.example.test")
+        calls = []
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            calls.append((method, endpoint))
+            if endpoint == "/api/nodes":
+                return {"response": {"nodes": [node]}}
+            if method == "PATCH":
+                return {"response": {}}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client.request = fake_request
+        node_uuid = client.associate_node(
+            "local-node", "127.0.0.1", 3002, "profile-2", ["inbound-1"],
+        )
+        self.assertEqual(node_uuid, "node-1")
+        self.assertIn(("PATCH", "/api/nodes/node-1"), calls)
+        self.assertEqual(client.transaction_entities[0]["before"]["configProfile"], node["configProfile"])
+
+    def test_parse_core_version(self):
+        self.assertEqual(parse_core_version("v26.11.9"), (26, 11, 9))
+        self.assertEqual(parse_core_version("26.9.9"), (26, 9, 9))
+        self.assertEqual(parse_core_version("1.260327.1"), (1, 260327, 1))
+        self.assertEqual(parse_core_version(""), ())
+        self.assertEqual(parse_core_version(None), ())
+
+    def test_mihomo_x25519_defaults_enabled_without_pin(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GOWAVE_MIHOMO_X25519", None)
+            os.environ.pop("XRAY_SERVER_VERSION", None)
+            self.assertTrue(mihomo_x25519_enabled())
+
+    def test_mihomo_x25519_requires_hybrid_capable_server_core(self):
+        # REALITY servers older than 26.9.9 accept classic X25519 key shares only.
+        with patch.dict(os.environ, {"XRAY_SERVER_VERSION": "26.9.8"}, clear=False):
+            os.environ.pop("GOWAVE_MIHOMO_X25519", None)
+            self.assertFalse(mihomo_x25519_enabled())
+        with patch.dict(os.environ, {"XRAY_SERVER_VERSION": "v26.9.9"}, clear=False):
+            self.assertTrue(mihomo_x25519_enabled())
+        with patch.dict(os.environ, {"XRAY_SERVER_VERSION": "26.11.9"}, clear=False):
+            self.assertTrue(mihomo_x25519_enabled())
+
+    def test_mihomo_x25519_explicit_override_wins(self):
+        with patch.dict(os.environ, {"XRAY_SERVER_VERSION": "26.9.8", "GOWAVE_MIHOMO_X25519": "1"}, clear=False):
+            self.assertTrue(mihomo_x25519_enabled())
+        with patch.dict(os.environ, {"XRAY_SERVER_VERSION": "26.11.9", "GOWAVE_MIHOMO_X25519": "0"}, clear=False):
+            self.assertFalse(mihomo_x25519_enabled())
+
+    def test_reality_fingerprint_defaults_to_firefox(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("GOWAVE_REALITY_FINGERPRINT", None)
+            self.assertEqual(reality_fingerprint(), "firefox")
+
+    def test_reality_fingerprint_env_override_is_normalized(self):
+        with patch.dict(os.environ, {"GOWAVE_REALITY_FINGERPRINT": "Firefox"}, clear=False):
+            self.assertEqual(reality_fingerprint(), "firefox")
+
+    def test_reality_fingerprint_rejects_unknown_preset(self):
+        with patch.dict(os.environ, {"GOWAVE_REALITY_FINGERPRINT": "opera"}, clear=False):
+            with self.assertRaises(ValueError):
+                reality_fingerprint()
+
+    def test_reality_host_advertises_mihomo_x25519_hybrid(self):
+        """REALITY hosts must carry mihomoX25519 so Mihomo sends an X25519MLKEM768 key share."""
+        self.client.login("admin", "admin-pass-12345")
+        x25519 = self.client.generate_x25519()
+        raw_cfg = self.client.compile_config_profile("hybrid-node", "cdn.example.com", x25519["privateKey"])
+        prof_info = self.client.provision_config_profile("GoWave MVP Unified Profile - hybrid", raw_cfg)
+        prof_uuid = prof_info["profile_uuid"]
+        inbounds = prof_info["inbounds"]
+
+        hosts = self.client.provision_hosts(
+            prof_uuid, inbounds, "node-hybrid", "squad-hybrid",
+            "vpn.example.com", "cdn.example.com", "hybrid-node"
+        )
+
+        remarks = {MockGoWaveServer.hosts[uuid].get("remark"): uuid for uuid in hosts}
+        reality_uuid = remarks[f"VLESS-REALITY-Vision@hybrid-node"]
+        self.assertIs(MockGoWaveServer.hosts[reality_uuid].get("mihomoX25519"), True)
+        for remark, uuid in remarks.items():
+            if remark != f"VLESS-REALITY-Vision@hybrid-node":
+                self.assertNotIn("mihomoX25519", MockGoWaveServer.hosts[uuid], remark)
+
+        # Re-provisioning keeps the flag and records it in the rollback snapshot.
+        self.client.transaction_entities.clear()
+        rehosts = self.client.provision_hosts(
+            prof_uuid, inbounds, "node-hybrid", "squad-hybrid",
+            "vpn.example.com", "cdn.example.com", "hybrid-node"
+        )
+        self.assertEqual(hosts, rehosts)
+        reality_snapshot = next(
+            entry for entry in self.client.transaction_entities
+            if entry["type"] == "host" and entry["uuid"] == reality_uuid and entry["action"] == "updated"
+        )
+        self.assertIn("mihomoX25519", reality_snapshot["before"])
+
+    def test_reality_host_omits_hybrid_flag_for_legacy_core(self):
+        self.client.login("admin", "admin-pass-12345")
+        x25519 = self.client.generate_x25519()
+        raw_cfg = self.client.compile_config_profile("legacy-node", "cdn.example.com", x25519["privateKey"])
+        prof_info = self.client.provision_config_profile("GoWave MVP Unified Profile - legacy", raw_cfg)
+        with patch.dict(os.environ, {"XRAY_SERVER_VERSION": "26.9.8"}, clear=False):
+            os.environ.pop("GOWAVE_MIHOMO_X25519", None)
+            hosts = self.client.provision_hosts(
+                prof_info["profile_uuid"], prof_info["inbounds"], "node-legacy", "squad-legacy",
+                "vpn.example.com", "cdn.example.com", "legacy-node"
+            )
+        remarks = {MockGoWaveServer.hosts[uuid].get("remark"): uuid for uuid in hosts}
+        reality_uuid = remarks["VLESS-REALITY-Vision@legacy-node"]
+        self.assertIs(MockGoWaveServer.hosts[reality_uuid].get("mihomoX25519"), False)
 
     def test_panel_discovers_master_and_worker_nodes(self):
         """Test that Panel registers and discovers both master node and worker node via GET /api/nodes."""
@@ -455,6 +830,256 @@ class TestAPIClient(unittest.TestCase):
             updated_jdata = json.loads(jfile.read_text())
             self.assertEqual(updated_jdata["state"], "PROVISION_ROLLED_BACK")
 
+    def test_rollback_rejects_dangling_symlink_recovery_journal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            jfile.symlink_to(Path(tmpdir) / "missing-target.json")
+            stderr = io.StringIO()
+
+            with mock.patch("sys.stderr", stderr):
+                result = rollback_provisioning(
+                    str(jfile),
+                    str(Path(tmpdir) / "state.json"),
+                    str(Path(tmpdir) / "missing-credentials.txt"),
+                )
+
+            self.assertFalse(result)
+            self.assertIn("OSError", stderr.getvalue())
+            self.assertTrue(jfile.is_symlink())
+
+    def test_rollback_rejects_non_regular_recovery_journal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.fifo"
+            os.mkfifo(jfile)
+            stderr = io.StringIO()
+
+            with mock.patch("sys.stderr", stderr):
+                result = rollback_provisioning(
+                    str(jfile),
+                    str(Path(tmpdir) / "state.json"),
+                    str(Path(tmpdir) / "missing-credentials.txt"),
+                )
+
+            self.assertFalse(result)
+            self.assertIn("OSError", stderr.getvalue())
+            self.assertTrue(jfile.exists())
+
+    def test_rollback_journal_parse_error_does_not_echo_file_contents(self):
+        marker = "sensitive-journal-content-marker"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            jfile.write_text(marker + " { invalid json")
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                result = rollback_provisioning(
+                    str(jfile), str(Path(tmpdir) / "state.json"),
+                    str(Path(tmpdir) / "missing-credentials.txt"),
+                )
+            self.assertFalse(result)
+            self.assertNotIn(marker, stderr.getvalue())
+            self.assertIn("JSONDecodeError", stderr.getvalue())
+
+    def test_rollback_journal_validation_error_does_not_echo_field_values(self):
+        marker = "sensitive-transaction-marker"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            jfile.write_text(json.dumps({
+                "transaction_id": marker,
+                "op": "invalid-operation",
+                "state": "PROVISION_APPLYING",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": [],
+            }))
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                result = rollback_provisioning(
+                    str(jfile), str(Path(tmpdir) / "state.json"),
+                    str(Path(tmpdir) / "missing-credentials.txt"),
+                )
+            self.assertFalse(result)
+            self.assertNotIn(marker, stderr.getvalue())
+            self.assertIn("JournalValidationError", stderr.getvalue())
+
+    def test_rollback_journal_does_not_persist_api_response_secrets(self):
+        marker = "private-key-secret-marker"
+        class FailingRollbackClient:
+            def __init__(self, base_url):
+                pass
+
+            def login(self, username, password):
+                return "mock-token"
+
+            def delete_node(self, uuid):
+                raise GoWaveAPIError(
+                    f"API rejected request and echoed {marker}",
+                    status_code=500,
+                    response_body=f'{{"error":"{marker}"}}',
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            cfile = Path(tmpdir) / "credentials.txt"
+            save_credentials("admin", "securepass1234567890", "https://panel.example.com", creds_path=str(cfile))
+            jfile.write_text(json.dumps({
+                "transaction_id": "provision_redaction",
+                "op": "provision",
+                "state": "PROVISION_APPLYING",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": [{"type": "node", "uuid": "node-1", "action": "created"}],
+            }))
+
+            with mock.patch("modules.api_client.GoWaveClient", FailingRollbackClient):
+                result = rollback_provisioning(
+                    str(jfile), str(Path(tmpdir) / "state.json"), str(cfile)
+                )
+
+            self.assertFalse(result)
+            journal_text = jfile.read_text()
+            self.assertNotIn(marker, journal_text)
+            journal = json.loads(journal_text)
+            self.assertIn("GoWaveAPIError", journal["rollback_errors"][0])
+            self.assertIn("HTTP 500", journal["rollback_errors"][0])
+
+    def test_post_persists_transaction_checkpoint_before_network_mutation(self):
+        client = GoWaveClient("http://panel.example.test")
+        callback = mock.Mock()
+        client.transaction_callback = callback
+        response = mock.MagicMock()
+        response.read.return_value = b'{"ok":true}'
+        response.headers.get.return_value = "application/json"
+        opener = mock.MagicMock()
+        opener.__enter__.return_value = response
+
+        with mock.patch("modules.api_client.urllib.request.urlopen", return_value=opener) as urlopen:
+            result = client.request("POST", "/api/nodes", {"name": "worker-1"})
+
+        self.assertEqual(result, {"ok": True})
+        callback.assert_called_once_with([])
+        urlopen.assert_called_once()
+
+    def test_post_aborts_before_network_when_transaction_checkpoint_fails(self):
+        client = GoWaveClient("http://panel.example.test")
+        client.transaction_callback = mock.Mock(side_effect=OSError("journal unavailable"))
+        with mock.patch("modules.api_client.urllib.request.urlopen") as urlopen:
+            with self.assertRaisesRegex(OSError, "journal unavailable"):
+                client.request("POST", "/api/nodes", {"name": "worker-1"})
+        urlopen.assert_not_called()
+
+    def test_pending_create_is_journaled_before_api_post(self):
+        """A crash after POST must leave a durable pending-create marker, not an empty ledger."""
+        client = GoWaveClient(f"http://127.0.0.1:{self.port}")
+        persisted = []
+        client.transaction_callback = lambda entities: persisted.append(json.loads(json.dumps(entities)))
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            if method == "GET" and endpoint == "/api/nodes":
+                return {"response": []}
+            if method == "POST" and endpoint == "/api/nodes":
+                self.assertEqual(persisted[-1], [{"type": "node", "action": "pending_create"}])
+                return {"response": {"uuid": "node-pending-1"}}
+            raise AssertionError(f"Unexpected request: {method} {endpoint}")
+
+        client.request = fake_request
+        node_uuid = client.associate_node("worker-1", "127.0.0.1", 3002, "profile-1", [])
+        self.assertEqual(node_uuid, "node-pending-1")
+        self.assertEqual(persisted[0], [{"type": "node", "action": "pending_create"}])
+        self.assertEqual(
+            persisted[1],
+            [{"type": "node", "action": "created", "uuid": "node-pending-1"}],
+        )
+
+    def test_unresolved_pending_create_requires_manual_reconciliation(self):
+        """A durable pending create with no UUID must never be treated as rolled back."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            jfile.write_text(json.dumps({
+                "transaction_id": "provision_pending_create",
+                "op": "provision",
+                "state": "PROVISION_APPLYING",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": [{"type": "node", "action": "pending_create"}],
+            }))
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                result = rollback_provisioning(
+                    str(jfile), str(Path(tmpdir) / "state.json"),
+                    str(Path(tmpdir) / "missing-credentials.txt"),
+                    base_url=f"http://127.0.0.1:{self.port}",
+                )
+            self.assertFalse(result)
+            journal = json.loads(jfile.read_text())
+            self.assertEqual(journal["state"], "PROVISION_ROLLBACK_REQUIRED")
+            self.assertIn("Unresolved node create request", journal["rollback_errors"][0])
+            self.assertIn("API outcome is unknown", stderr.getvalue())
+
+    def test_empty_applying_journal_requires_manual_rollback(self):
+        cases = (
+            ("provision", "PROVISION_APPLYING", {}, "PROVISION_ROLLBACK_REQUIRED"),
+            ("node_add", "NODE_ADD_APPLYING", [], "NODE_ADD_ROLLBACK_REQUIRED"),
+        )
+        for op, state, entities, expected_state in cases:
+            with self.subTest(op=op), tempfile.TemporaryDirectory() as tmpdir:
+                jfile = Path(tmpdir) / "journal.json"
+                jfile.write_text(json.dumps({
+                    "transaction_id": f"{op}_empty_applying",
+                    "op": op,
+                    "state": state,
+                    "node_name": "worker-1" if op == "node_add" else None,
+                    "timestamp": "2026-11-08T00:00:00Z",
+                    "entities": entities,
+                }))
+                stderr = io.StringIO()
+                with mock.patch("sys.stderr", stderr):
+                    result = rollback_provisioning(
+                        str(jfile), str(Path(tmpdir) / "state.json"),
+                        str(Path(tmpdir) / "missing-credentials.txt"),
+                    )
+                self.assertFalse(result)
+                journal = json.loads(jfile.read_text())
+                self.assertEqual(journal["state"], expected_state)
+                self.assertIn("API side effects may exist", journal["rollback_error"])
+                self.assertIn("automatic rollback is unsafe", stderr.getvalue())
+
+    def test_http_error_message_does_not_echo_response_body(self):
+        marker = "private-api-response-secret-marker"
+        http_error = urllib.error.HTTPError(
+            "http://panel.example.test/api/nodes",
+            500,
+            "Internal Server Error",
+            {},
+            io.BytesIO(marker.encode("utf-8")),
+        )
+        client = GoWaveClient("http://panel.example.test")
+        with mock.patch("modules.api_client.urllib.request.urlopen", side_effect=http_error):
+            with self.assertRaises(GoWaveAPIError) as ctx:
+                client.request("POST", "/api/nodes", {"name": "worker-1"})
+        self.assertIn("HTTP 500 on POST /api/nodes", str(ctx.exception))
+        self.assertNotIn(marker, str(ctx.exception))
+        self.assertEqual(ctx.exception.response_body, marker)
+
+    def test_network_error_message_and_traceback_do_not_echo_transport_details(self):
+        marker = "transport-secret-marker"
+        client = GoWaveClient("http://panel.example.test")
+        with mock.patch(
+            "modules.api_client.urllib.request.urlopen",
+            side_effect=urllib.error.URLError(marker),
+        ):
+            with self.assertRaises(GoWaveAPIError) as ctx:
+                client.request("POST", "/api/nodes", {"name": "worker-1"})
+        self.assertNotIn(marker, str(ctx.exception))
+        self.assertIsNone(ctx.exception.__cause__)
+
+    def test_login_and_x25519_errors_do_not_echo_response_payloads(self):
+        marker = "private-key-or-token-marker"
+        client = GoWaveClient("http://panel.example.test")
+        with mock.patch.object(client, "request", return_value={"response": {"message": marker}}):
+            with self.assertRaises(GoWaveAPIError) as login_error:
+                client.login("admin", "password")
+            with self.assertRaises(GoWaveAPIError) as key_error:
+                client.generate_x25519()
+        self.assertNotIn(marker, str(login_error.exception))
+        self.assertNotIn(marker, str(key_error.exception))
+
     def test_empty_prepared_journal_rolls_back_without_api_login(self):
         """A PREPARED journal with no recorded side effects is safe to close without credentials."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -515,6 +1140,95 @@ class TestAPIClient(unittest.TestCase):
             updated_sdata = json.loads(sfile.read_text())
             self.assertEqual(len(updated_sdata["nodes"]), 1)
             self.assertEqual(updated_sdata["nodes"][0]["name"], "local-node")
+
+    def test_node_add_rollback_does_not_report_success_when_local_state_is_corrupt(self):
+        previous_admin = MockGoWaveServer.registered_users.get("admin")
+        previous_node = MockGoWaveServer.nodes.get("node-corrupt-state")
+        def restore_mock_state():
+            if previous_admin is None:
+                MockGoWaveServer.registered_users.pop("admin", None)
+            else:
+                MockGoWaveServer.registered_users["admin"] = previous_admin
+            if previous_node is None:
+                MockGoWaveServer.nodes.pop("node-corrupt-state", None)
+            else:
+                MockGoWaveServer.nodes["node-corrupt-state"] = previous_node
+        self.addCleanup(restore_mock_state)
+        """API entities may be compensated, but corrupt local state keeps the journal rollback-required."""
+        MockGoWaveServer.registered_users["admin"] = "securepass1234567890"
+        MockGoWaveServer.nodes["node-corrupt-state"] = {"name": "worker-corrupt", "uuid": "node-corrupt-state"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            sfile = Path(tmpdir) / "state.json"
+            cfile = Path(tmpdir) / "credentials.txt"
+            save_credentials("admin", "securepass1234567890", "https://panel.example.com", "token-xyz", str(cfile))
+            jfile.write_text(json.dumps({
+                "transaction_id": "node_add_worker-corrupt",
+                "op": "node_add",
+                "state": "NODE_ADD_APPLYING",
+                "node_name": "worker-corrupt",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": [{"type": "node", "uuid": "node-corrupt-state", "action": "created"}],
+            }))
+            sfile.write_text("{not-json")
+
+            result = rollback_provisioning(
+                str(jfile), str(sfile), str(cfile), base_url=f"http://127.0.0.1:{self.port}"
+            )
+
+            self.assertFalse(result)
+            self.assertNotIn("node-corrupt-state", MockGoWaveServer.nodes)
+            journal = json.loads(jfile.read_text())
+            self.assertEqual(journal["state"], "NODE_ADD_ROLLBACK_REQUIRED")
+            self.assertTrue(journal["rollback_errors"])
+            self.assertTrue(any("local state" in error for error in journal["rollback_errors"]))
+
+    def test_node_add_rollback_recovers_from_valid_atomic_state_temp_file(self):
+        previous_admin = MockGoWaveServer.registered_users.get("admin")
+        previous_node = MockGoWaveServer.nodes.get("node-temp-state")
+        def restore_mock_state():
+            if previous_admin is None:
+                MockGoWaveServer.registered_users.pop("admin", None)
+            else:
+                MockGoWaveServer.registered_users["admin"] = previous_admin
+            if previous_node is None:
+                MockGoWaveServer.nodes.pop("node-temp-state", None)
+            else:
+                MockGoWaveServer.nodes["node-temp-state"] = previous_node
+        self.addCleanup(restore_mock_state)
+        """A valid state.json.tmp is used when state.json is corrupt after an interrupted atomic write."""
+        MockGoWaveServer.registered_users["admin"] = "securepass1234567890"
+        MockGoWaveServer.nodes["node-temp-state"] = {"name": "worker-temp", "uuid": "node-temp-state"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jfile = Path(tmpdir) / "journal.json"
+            sfile = Path(tmpdir) / "state.json"
+            tmp_state = Path(tmpdir) / "state.json.tmp"
+            cfile = Path(tmpdir) / "credentials.txt"
+            save_credentials("admin", "securepass1234567890", "https://panel.example.com", "token-xyz", str(cfile))
+            jfile.write_text(json.dumps({
+                "transaction_id": "node_add_worker-temp",
+                "op": "node_add",
+                "state": "NODE_ADD_APPLYING",
+                "node_name": "worker-temp",
+                "timestamp": "2026-11-08T00:00:00Z",
+                "entities": [{"type": "node", "uuid": "node-temp-state", "action": "created"}],
+            }))
+            sfile.write_text("{interrupted")
+            tmp_state.write_text(json.dumps({
+                "schemaVersion": 2,
+                "nodes": [{"name": "local-node", "uuid": "node-local"}, {"name": "worker-temp", "uuid": "node-temp-state"}],
+            }))
+
+            result = rollback_provisioning(
+                str(jfile), str(sfile), str(cfile), base_url=f"http://127.0.0.1:{self.port}"
+            )
+
+            self.assertTrue(result)
+            self.assertNotIn("node-temp-state", MockGoWaveServer.nodes)
+            self.assertEqual(json.loads(sfile.read_text())["nodes"], [{"name": "local-node", "uuid": "node-local"}])
+            self.assertEqual(json.loads(jfile.read_text())["state"], "NODE_ADD_ROLLED_BACK")
 
     def test_rollback_preserves_adopted_entities(self):
         """Rollback never deletes entities adopted from prior configurations (C-03)."""
@@ -629,6 +1343,137 @@ class TestAPIClient(unittest.TestCase):
             self.assertIn("rollback_error", updated)
             self.assertIn("unrelated-prof", MockGoWaveServer.profiles)
             self.assertIn("unrelated-node", MockGoWaveServer.nodes)
+
+
+class TestRepeatedInstallContract(unittest.TestCase):
+    """A second operator run must reuse what the installed Panel already publishes."""
+
+    def make_client(self):
+        return GoWaveClient("http://127.0.0.1:1")
+
+    def test_an_existing_admin_is_a_login_not_a_registration_failure(self):
+        client = self.make_client()
+        calls = []
+
+        def request(method, path, payload=None, authenticate=True):
+            calls.append((method, path))
+            if path == "/api/auth/register":
+                raise api_client.GoWaveAPIError("an admin already exists", status_code=403)
+            return {"response": {"accessToken": "reused-token"}}
+
+        with mock.patch.object(client, "request", request):
+            client.register_initial_admin("admin", "stored-password")
+
+        self.assertEqual(calls, [("POST", "/api/auth/register"), ("POST", "/api/auth/login")])
+        self.assertEqual(client.token, "reused-token")
+
+    def test_a_registration_failure_the_stored_password_cannot_fix_is_raised(self):
+        client = self.make_client()
+
+        def request(method, path, payload=None, authenticate=True):
+            raise api_client.GoWaveAPIError("server error", status_code=500)
+
+        with mock.patch.object(client, "request", request):
+            with self.assertRaises(api_client.GoWaveAPIError):
+                client.register_initial_admin("admin", "stored-password")
+
+    def test_a_listed_token_is_reused_instead_of_issued_twice(self):
+        client = self.make_client()
+        calls = []
+
+        def request(method, path, payload=None, authenticate=True):
+            calls.append((method, path))
+            return {"response": {"tokens": [{"name": "gowave-auto-sub-token", "uuid": "token-1"}]}}
+
+        with mock.patch.object(client, "request", request):
+            info = client.ensure_api_token(existing_token="stored-token")
+
+        self.assertEqual(info, {"token": "stored-token", "id": "", "reused": True})
+        self.assertEqual(calls, [("GET", "/api/tokens")])
+
+    def test_a_token_the_panel_no_longer_lists_is_issued_again(self):
+        client = self.make_client()
+        calls = []
+
+        def request(method, path, payload=None, authenticate=True):
+            calls.append((method, path))
+            if method == "GET":
+                return {"response": {"tokens": []}}
+            return {"response": {"token": "fresh-token", "id": "token-2"}}
+
+        with mock.patch.object(client, "request", request):
+            info = client.ensure_api_token(existing_token="stale-token")
+
+        self.assertEqual(info, {"token": "fresh-token", "id": "token-2", "reused": False})
+        self.assertEqual(calls, [("GET", "/api/tokens"), ("POST", "/api/tokens")])
+
+    def test_without_a_stored_token_nothing_is_looked_up(self):
+        client = self.make_client()
+        calls = []
+
+        def request(method, path, payload=None, authenticate=True):
+            calls.append((method, path))
+            return {"response": {"token": "fresh-token", "id": "token-3"}}
+
+        with mock.patch.object(client, "request", request):
+            info = client.ensure_api_token()
+
+        self.assertFalse(info["reused"])
+        self.assertEqual(calls, [("POST", "/api/tokens")])
+
+    def installed_profile(self):
+        config = json.loads(
+            self.make_client().compile_config_profile(
+                "local-node", "reality.example.com", "installed-private-key",
+                short_ids=["0123456789abcdef"], public_key="installed-public-key",
+            )
+        )
+        return {"uuid": "profile-1", "name": "GoWave MVP Unified Profile - local-node",
+                "config": json.dumps(config)}
+
+    def test_the_installed_reality_material_is_reused(self):
+        client = self.make_client()
+        profile = self.installed_profile()
+
+        with mock.patch.object(
+            client, "request", lambda *args, **kwargs: {"response": {"configProfiles": [profile]}},
+        ):
+            material = client.existing_reality_material(profile["name"], "reality.example.com")
+
+        self.assertEqual(material["privateKey"], "installed-private-key")
+        self.assertEqual(material["publicKey"], "installed-public-key")
+        self.assertEqual(material["shortIds"], ["0123456789abcdef"])
+
+    def test_a_profile_for_another_server_name_yields_no_material(self):
+        client = self.make_client()
+        profile = self.installed_profile()
+
+        with mock.patch.object(
+            client, "request", lambda *args, **kwargs: {"response": {"configProfiles": [profile]}},
+        ):
+            self.assertIsNone(client.existing_reality_material(profile["name"], "other.example.com"))
+
+    def test_a_profile_with_unparsable_config_yields_no_material(self):
+        client = self.make_client()
+        profile = {"uuid": "profile-1", "name": "GoWave MVP Unified Profile - local-node",
+                   "config": "not json"}
+
+        with mock.patch.object(
+            client, "request", lambda *args, **kwargs: {"response": {"configProfiles": [profile]}},
+        ):
+            self.assertIsNone(
+                client.existing_reality_material(profile["name"], "reality.example.com")
+            )
+
+    def test_no_profile_yields_no_material(self):
+        client = self.make_client()
+        with mock.patch.object(
+            client, "request", lambda *args, **kwargs: {"response": {"configProfiles": []}},
+        ):
+            self.assertIsNone(
+                client.existing_reality_material("GoWave MVP Unified Profile - local-node",
+                                                 "reality.example.com")
+            )
 
 
 if __name__ == "__main__":

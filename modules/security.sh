@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # modules/security.sh - Host security, firewall, swap, BBR, and log rotation
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANAGED_SECURITY_PY="${SCRIPT_DIR}/assets/security/managed.py"
@@ -66,11 +66,15 @@ configure_ufw() {
 
     # 4. Handle IPv6 configuration in /etc/default/ufw
     if [[ -f "$ufw_default" ]]; then
-        if [[ ! -f "$if_inet6" ]] || [[ ! -s "$if_inet6" ]]; then
+        # Same decision the listener generator makes, taken through the same
+        # helper: one host must never get ``[::]`` listeners without the v6
+        # rules that filter them, or the reverse.
+        if check_kernel_ipv6 "$if_inet6" 2>/dev/null; then
+            echo "UFW: IPv6 active in kernel; setting IPV6=yes in $ufw_default..."
+            sed -i 's/^IPV6=.*/IPV6=yes/' "$ufw_default" || true
+        else
             echo "UFW: IPv6 disabled in kernel; setting IPV6=no in $ufw_default..."
             sed -i 's/^IPV6=.*/IPV6=no/' "$ufw_default" || true
-        else
-            sed -i 's/^IPV6=.*/IPV6=yes/' "$ufw_default" || true
         fi
     fi
 
@@ -186,13 +190,21 @@ configure_bbr_and_mtu() {
     echo "Configuring MTU probing and BBR congestion control..."
     mkdir -p "$(dirname "$sysctl_conf")" "$(dirname "$bbr_unit")"
 
-    # 1. Configure MTU probing
-    cat > "$sysctl_conf" <<'EOF'
-# Managed by GoWave Auto NGINX
-net.ipv4.tcp_mtu_probing = 1
-EOF
+    # A file this install did not write is not its to truncate. Only a regular
+    # file carrying our marker and nothing but our own lines is adopted, so an
+    # operator's policy file, an empty file and a symlink are each refused.
+    if [[ -e "$sysctl_conf" || -L "$sysctl_conf" ]]; then
+        if [[ -L "$sysctl_conf" ]] ||
+            ! grep -qxF '# Managed by GoWave Auto NGINX' "$sysctl_conf" ||
+            grep -qvxF -e '# Managed by GoWave Auto NGINX' \
+                -e 'net.ipv4.tcp_mtu_probing = 1' \
+                -e 'net.ipv4.tcp_congestion_control = bbr' "$sysctl_conf"; then
+            echo "Error: Pre-existing unmanaged sysctl configuration at $sysctl_conf. Refusing to overwrite unmanaged host resource." >&2
+            return 1
+        fi
+    fi
 
-    # 2. Deploy bbr-load.service
+    # 1. Deploy bbr-load.service
     cat > "$bbr_unit" <<'EOF'
 [Unit]
 Description=Load tcp_bbr and set congestion control
@@ -217,7 +229,6 @@ EOF
         avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
         if [[ "$avail" =~ bbr ]]; then
             if sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null; then
-                echo "net.ipv4.tcp_congestion_control = bbr" >> "$sysctl_conf"
                 selected_cc="bbr"
                 echo "BBR congestion control enabled."
             else
@@ -230,6 +241,22 @@ EOF
         echo "Warning: BBR unavailable, falling back to CUBIC" >&2
     fi
 
+    # 2. Write the sysctl drop-in once, from a temporary sibling, so an
+    # interrupted run never leaves a half-written policy file behind.
+    local sysctl_tmp
+    sysctl_tmp=$(mktemp "${sysctl_conf}.gowave.XXXXXX") || return 1
+    {
+        echo "# Managed by GoWave Auto NGINX"
+        echo "net.ipv4.tcp_mtu_probing = 1"
+        if [[ "$selected_cc" == "bbr" ]]; then
+            echo "net.ipv4.tcp_congestion_control = bbr"
+        fi
+    } > "$sysctl_tmp" || { rm -f "$sysctl_tmp"; return 1; }
+    chmod 0644 "$sysctl_tmp" || { rm -f "$sysctl_tmp"; return 1; }
+    sync "$sysctl_tmp" 2>/dev/null || true
+    mv -f "$sysctl_tmp" "$sysctl_conf" || { rm -f "$sysctl_tmp"; return 1; }
+    sync "$(dirname "$sysctl_conf")" 2>/dev/null || true
+
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload --no-ask-password
         if [[ "$selected_cc" == "bbr" ]]; then
@@ -239,31 +266,28 @@ EOF
 
     # Record congestionControl in state_file if directory exists
     if [[ -d "$(dirname "$state_file")" ]]; then
-        python3 -c "
-import json, os
-path = '$state_file'
-data = {'schemaVersion': 2}
+        local module_root
+        module_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)" || return 1
+        python3 - "$state_file" "$selected_cc" "$module_root" <<'PY' || return 1
+import json
+import os
+import sys
+
+path, selected_cc, module_root = sys.argv[1:4]
+sys.path.insert(0, module_root)
+from modules.api_client import atomic_write_state
+
 if os.path.exists(path):
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except Exception:
-        pass
-data['schemaVersion'] = 2
-data['congestionControl'] = '$selected_cc'
-tmp_path = path + '.tmp'
-with open(tmp_path, 'w') as f:
-    json.dump(data, f, indent=2)
-    f.flush()
-    os.fsync(f.fileno())
-os.chmod(tmp_path, 0o600)
-os.replace(tmp_path, path)
-dir_fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_DIRECTORY)
-try:
-    os.fsync(dir_fd)
-finally:
-    os.close(dir_fd)
-"
+    with open(path, "r", encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict):
+        raise ValueError("state.json root must be a JSON object")
+else:
+    data = {}
+
+data["congestionControl"] = selected_cc
+atomic_write_state(data, path)
+PY
     fi
 }
 

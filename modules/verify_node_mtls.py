@@ -91,7 +91,7 @@ def validate_payload_crypto(ca_pem: str, jwt_pub_pem: str, node_cert_pem: str, n
 
 
 def perform_mtls_handshake(host: str, port: int, sni: str, ca_pem: str, cert_pem: str, key_pem: str,
-                           timeout: float = 10.0) -> dict:
+                           timeout: float = 10.0, jwt_token: str | None = None) -> dict:
     """Connects to GoWave Node, negotiates mTLS 1.3 with derived SNI, and queries health endpoint."""
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -123,13 +123,16 @@ def perform_mtls_handshake(host: str, port: int, sni: str, ca_pem: str, cert_pem
                     raise ssl.SSLError(f"Expected TLSv1.3 negotiation, got {actual_version}")
 
                 # Send HTTP health check request
-                http_req = (
-                    f"GET /node/xray/healthcheck HTTP/1.1\r\n"
-                    f"Host: {sni}\r\n"
-                    f"User-Agent: gowave-auto-nginx/mtls-verifier\r\n"
-                    f"Accept: application/json\r\n"
-                    f"Connection: close\r\n\r\n"
-                ).encode("utf-8")
+                headers = [
+                    f"GET /node/xray/healthcheck HTTP/1.1",
+                    f"Host: {sni}",
+                    "User-Agent: gowave-auto-nginx/mtls-verifier",
+                    "Accept: application/json",
+                ]
+                if jwt_token:
+                    headers.append(f"Authorization: Bearer {jwt_token}")
+                headers.append("Connection: close\r\n\r\n")
+                http_req = "\r\n".join(headers).encode("utf-8")
                 tls_sock.sendall(http_req)
 
                 raw_resp = b""
@@ -159,6 +162,10 @@ def main():
     parser.add_argument("--mode", choices=["full", "crypto-only"], default="full",
                         help="Verification mode: 'full' (crypto + live TLS 1.3 socket) or 'crypto-only'")
     parser.add_argument("--timeout", type=float, default=10.0, help="Socket connect and handshake timeout")
+    parser.add_argument("--client-cert", default=None, help="Path to client certificate PEM for mTLS client auth")
+    parser.add_argument("--client-key", default=None, help="Path to client private key PEM for mTLS client auth")
+    parser.add_argument("--priv-key", default=None, help="Path to RSA private key PEM for JWT generation")
+    parser.add_argument("--db", default="/opt/gowave/gowave.db", help="Path to gowave sqlite database to resolve client cert")
     args = parser.parse_args()
 
     # Read base64 secret payload strictly from standard input
@@ -208,8 +215,67 @@ def main():
 
     # 3. Live mTLS 1.3 socket connection and healthcheck
     print(f"Initiating mutual TLS 1.3 handshake to https://{args.host}:{args.port} with SNI '{sni}'...")
+
+    client_cert_pem = None
+    client_key_pem = None
+    priv_key_pem = None
+
+    if args.client_cert and args.client_key:
+        try:
+            client_cert_pem = Path(args.client_cert).read_text(encoding="utf-8")
+            client_key_pem = Path(args.client_key).read_text(encoding="utf-8")
+            if args.priv_key:
+                priv_key_pem = Path(args.priv_key).read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"Warning: Failed to load specified client cert/key files: {e}", file=sys.stderr)
+    elif os.path.exists(args.db):
+        try:
+            import sqlite3
+            conn = sqlite3.connect(args.db)
+            row = conn.execute("SELECT client_cert, client_key, priv_key FROM keygen LIMIT 1").fetchone()
+            if row and row[0] and row[1]:
+                client_cert_pem = row[0]
+                client_key_pem = row[1]
+                if len(row) > 2 and row[2]:
+                    priv_key_pem = row[2]
+        except Exception:
+            pass
+
+    active_cert_pem = client_cert_pem if client_cert_pem else node_cert_pem
+    active_key_pem = client_key_pem if client_key_pem else node_key_pem
+
+    jwt_token = None
+    if priv_key_pem:
+        try:
+            import time
+            header_b64 = base64.urlsafe_b64encode(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()).rstrip(b"=").decode()
+            payload_b64 = base64.urlsafe_b64encode(json.dumps({"iat": int(time.time()), "exp": int(time.time()) + 3600}).encode()).rstrip(b"=").decode()
+            signing_input = f"{header_b64}.{payload_b64}".encode()
+            with tempfile.NamedTemporaryFile("w", delete=False) as f:
+                f.write(priv_key_pem)
+                tmp_priv = f.name
+            try:
+                p = subprocess.run(["openssl", "dgst", "-sha256", "-sign", tmp_priv], input=signing_input, capture_output=True)
+                if p.returncode == 0:
+                    sig_b64 = base64.urlsafe_b64encode(p.stdout).rstrip(b"=").decode()
+                    jwt_token = f"{header_b64}.{payload_b64}.{sig_b64}"
+            finally:
+                if os.path.exists(tmp_priv):
+                    os.unlink(tmp_priv)
+        except Exception:
+            pass
+
     try:
-        res = perform_mtls_handshake(args.host, args.port, sni, ca_pem, node_cert_pem, node_key_pem, timeout=args.timeout)
+        res = perform_mtls_handshake(
+            args.host,
+            args.port,
+            sni,
+            ca_pem,
+            active_cert_pem,
+            active_key_pem,
+            timeout=args.timeout,
+            jwt_token=jwt_token,
+        )
         print(f"Handshake SUCCESS: {res['tls_version']} negotiated.")
         print(f"Node response: {res['status_line']}")
 

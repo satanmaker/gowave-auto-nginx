@@ -142,7 +142,16 @@ class Transaction:
 
     def write(self, filename, text):
         path = self.root / filename.lstrip('/')
-        path.parent.mkdir(parents=True, exist_ok=True)
+        missing = []
+        parent = path.parent
+        while not parent.is_dir():
+            missing.append(parent)
+            parent = parent.parent
+        for directory in reversed(missing):
+            directory.mkdir()
+            # Drop-ins are read by unprivileged daemons (systemd-resolved runs as
+            # systemd-resolve), so the caller's umask of 077 must not hide them.
+            directory.chmod(0o755)
         path.write_text(text)
         path.chmod(0o644)
 

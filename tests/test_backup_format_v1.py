@@ -50,6 +50,43 @@ class TestBackupFormatV1(unittest.TestCase):
             self.assertEqual(res_verify.returncode, 0, res_verify.stderr)
             self.assertIn("15-point preflight archive validation PASSED", res_verify.stdout)
 
+    def test_a_store_that_cannot_hold_the_archive_publishes_nothing(self):
+        # A store that fills up mid-write must not leave a file whose name says
+        # "backup": the next restore would offer it, and the operator would learn
+        # about the truncation only after a preflight refusal. tar is failed here
+        # rather than the disk being filled, so the fault is deterministic.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            gowave_dir = tmp / "opt_gowave"
+            gowave_dir.mkdir()
+            conn = sqlite3.connect(str(gowave_dir / "gowave.db"))
+            conn.execute("CREATE TABLE test (id INT);")
+            conn.commit()
+            conn.close()
+            (gowave_dir / ".env").write_text("APP_PORT=3000\n")
+
+            shim = tmp / "shim"
+            shim.mkdir()
+            (shim / "tar").write_text(
+                "#!/usr/bin/env bash\n"
+                "echo 'tar: write error: No space left on device' >&2\n"
+                "exit 2\n"
+            )
+            (shim / "tar").chmod(0o755)
+
+            store = tmp / "store"
+            out_archive = store / "backup-panel.tar.gz"
+            res = subprocess.run(
+                ["bash", "-c",
+                 f'"{BACKUP_SH}" backup --type panel "{out_archive}" "{gowave_dir}"'],
+                capture_output=True, text=True,
+                env={**os.environ, "PATH": f"{shim}:{os.environ['PATH']}"},
+            )
+            self.assertNotEqual(res.returncode, 0, res.stdout)
+            self.assertIn("nothing was published", res.stderr)
+            self.assertEqual(sorted(store.iterdir()) if store.exists() else [], [],
+                             "the failed backup left a file a restore could pick up")
+
     def test_rejection_of_malicious_archives(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -116,12 +153,17 @@ class TestBackupFormatV1(unittest.TestCase):
 
             payload = b"CERTIFICATE DATA"
             sha = hashlib.sha256(payload).hexdigest()
+            # A panel archive is only valid with its mandatory database member, so
+            # this fixture carries one: the case under test is the symlink rule.
+            database = b"SQLite format 3\x00"
+            database_sha = hashlib.sha256(database).hexdigest()
 
             with tarfile.open(cert_tar, "w:gz") as tar:
                 meta = {
                     "format_version": 1,
                     "backup_type": "panel",
                     "files": [
+                        {"path": "opt/gowave/gowave.db", "sha256": database_sha},
                         {"path": "etc/letsencrypt/archive/example.com/fullchain1.pem", "sha256": sha}
                     ]
                 }
@@ -129,6 +171,10 @@ class TestBackupFormatV1(unittest.TestCase):
                 ti_meta = tarfile.TarInfo("meta.json")
                 ti_meta.size = len(meta_bytes)
                 tar.addfile(ti_meta, fileobj=io_bytes(meta_bytes))
+
+                ti_db = tarfile.TarInfo("files/opt/gowave/gowave.db")
+                ti_db.size = len(database)
+                tar.addfile(ti_db, fileobj=io_bytes(database))
 
                 # Regular cert in archive/
                 ti_reg = tarfile.TarInfo("files/etc/letsencrypt/archive/example.com/fullchain1.pem")
@@ -257,10 +303,135 @@ class TestBackupFormatV1(unittest.TestCase):
             self.assertEqual(jdata.get("op"), "restore")
             self.assertEqual(jdata.get("state"), "COMMITTED")
 
+    def test_sqlite_preflight_runs_as_service_user_when_requested(self):
+        """Root preflight must not open the service DB with O_CREAT (fs.protected_regular)."""
+        import sys
+        from unittest.mock import patch
+
+        sys.path.insert(0, str(REPO_ROOT))
+        from modules import recovery
+
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        with patch.object(recovery, "_service_user_exists", return_value=True), \
+                patch.object(recovery.subprocess, "run", return_value=completed) as run_mock:
+            recovery.sqlite_preflight_checkpoint(Path("/opt/gowave/gowave.db"), "gowave")
+
+        argv = run_mock.call_args[0][0]
+        self.assertEqual(argv[:5], ["runuser", "-u", "gowave", "--", "python3"])
+        self.assertEqual(argv[5], "-c")
+        self.assertIn("wal_checkpoint", argv[6])
+        self.assertEqual(argv[7], "/opt/gowave/gowave.db")
+
+    def test_sqlite_preflight_reports_service_user_failure(self):
+        import sys
+        from unittest.mock import patch
+
+        sys.path.insert(0, str(REPO_ROOT))
+        from modules import recovery
+
+        failed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="attempt to write a readonly database"
+        )
+        with patch.object(recovery, "_service_user_exists", return_value=True), \
+                patch.object(recovery.subprocess, "run", return_value=failed):
+            with self.assertRaises(ValueError) as ctx:
+                recovery.sqlite_preflight_checkpoint(Path("/opt/gowave/gowave.db"), "gowave")
+        self.assertIn("readonly", str(ctx.exception))
+
 
 def io_bytes(b):
     import io
     return io.BytesIO(b)
+
+
+class TestIncompleteArchiveRejection(unittest.TestCase):
+    """An archive that cannot deliver its contract must never be applied."""
+
+    def verify(self, archive, type_name="panel"):
+        return subprocess.run(
+            ["bash", "-c", f'"{BACKUP_SH}" verify "{archive}" {type_name}'],
+            capture_output=True, text=True)
+
+    def write_archive(self, path, members, declared, type_name="panel"):
+        with tarfile.open(path, "w:gz") as tar:
+            meta = json.dumps({
+                "format_version": 1,
+                "backup_type": type_name,
+                "files": [{"path": rel, "sha256": hashlib.sha256(content).hexdigest()}
+                          for rel, content in (declared or ())],
+            }).encode()
+            info = tarfile.TarInfo("meta.json")
+            info.size = len(meta)
+            tar.addfile(info, fileobj=io_bytes(meta))
+            for rel, content in members:
+                info = tarfile.TarInfo(f"files/{rel}")
+                info.size = len(content)
+                tar.addfile(info, fileobj=io_bytes(content))
+
+    def test_a_member_declared_but_absent_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "absent.tar.gz"
+            database = b"SQLite format 3\x00"
+            self.write_archive(
+                archive,
+                members=[
+                    ("opt/gowave/gowave.db", database),
+                ],
+                declared=[
+                    ("opt/gowave/gowave.db", database),
+                    ("opt/gowave/.env", b"APP_SECRET=deadbeef\n"),
+                ],
+            )
+            result = self.verify(archive)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Missing archive member declared in meta.json: opt/gowave/.env",
+                      result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_a_panel_archive_without_its_database_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "no-db.tar.gz"
+            self.write_archive(
+                archive,
+                members=[("opt/gowave/.env", b"APP_SECRET=deadbeef\n")],
+                declared=[("opt/gowave/.env", b"APP_SECRET=deadbeef\n")],
+            )
+            result = self.verify(archive)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing its required member: opt/gowave/gowave.db", result.stderr)
+
+    def test_a_truncated_archive_is_rejected_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "truncated.tar.gz"
+            self.write_archive(
+                archive,
+                members=[("opt/gowave/gowave.db", b"SQLite format 3\x00" * 4096)],
+                declared=[("opt/gowave/gowave.db", b"SQLite format 3\x00" * 4096)],
+            )
+            truncated = Path(directory) / "half.tar.gz"
+            content = archive.read_bytes()
+            truncated.write_bytes(content[: len(content) // 3])
+            result = self.verify(truncated)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Validation Error:", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_a_node_archive_without_its_environment_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "no-env.tar.gz"
+            self.write_archive(archive, members=[], declared=[], type_name="node")
+            result = self.verify(archive, "node")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing its required member: opt/gowave-node/.env", result.stderr)
+
+    def test_garbage_instead_of_an_archive_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "garbage.tar.gz"
+            archive.write_bytes(b"not an archive at all\n")
+            result = self.verify(archive)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a readable Format v1 tar.gz", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":

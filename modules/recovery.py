@@ -8,10 +8,12 @@ from datetime import datetime
 import math
 from pathlib import Path
 import shutil
+import stat
 import sqlite3
 import subprocess
 import sys
 import time
+import tempfile
 
 VALID_OPS = {"provision", "node_add", "update", "channel_switch", "restore"}
 OP_ALLOWED_STATES = {
@@ -32,6 +34,18 @@ VALID_STATES = {st for states in OP_ALLOWED_STATES.values() for st in states}
 
 class JournalValidationError(Exception):
     pass
+
+
+def load_journal_file(journal_path):
+    """Load a regular recovery journal without following symlinks or blocking on special files."""
+    fd = os.open(
+        str(journal_path),
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+    )
+    with os.fdopen(fd, "r", encoding="utf-8") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError("recovery journal is not a regular file")
+        return json.load(stream)
 
 
 def validate_journal(journal_data):
@@ -76,8 +90,12 @@ def validate_journal(journal_data):
                     raise JournalValidationError(f"Invalid entity entry at index {index}")
                 if item.get("type") not in {"profile", "node", "squad", "host", "user", "token"}:
                     raise JournalValidationError(f"Unsupported entity type at index {index}")
-                if item.get("action") not in {"created", "updated", "adopted"}:
+                if item.get("action") not in {"created", "updated", "adopted", "pending_create"}:
                     raise JournalValidationError(f"Unsupported entity action at index {index}")
+                if item["action"] == "pending_create":
+                    if set(item) != {"type", "action"}:
+                        raise JournalValidationError(f"Pending create entry has unexpected fields at index {index}")
+                    continue
                 if not isinstance(item.get("uuid"), str) or not item["uuid"].strip():
                     raise JournalValidationError(f"Missing entity UUID at index {index}")
                 if item["action"] == "updated":
@@ -118,7 +136,16 @@ def write_journal_atomically(journal_path, journal_data):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.parent / f"{path.name}.tmp"
 
-    with open(tmp_path, "w") as f:
+    # The journal contains rollback before-images (including private config
+    # material); create it as 0600 before writing and never follow a pre-planted
+    # temporary symlink.
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+        0o600,
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        os.fchmod(f.fileno(), 0o600)
         json.dump(journal_data, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
@@ -130,6 +157,43 @@ def write_journal_atomically(journal_path, journal_data):
         os.fsync(dir_fd)
     finally:
         os.close(dir_fd)
+
+
+ROLLBACK_SIDES = ("ROLLED_BACK", "INCOMPLETE")
+
+
+def record_rollback_sides(journal_path, worker_status, api_status):
+    """Record both compensation sides and refuse to call a one-sided result rolled back.
+
+    The Panel API rollback writes this journal itself and finalizes it as
+    ROLLED_BACK; the Worker restore is a separate host whose verdict arrives
+    afterwards. Writing both outcomes here is what keeps the later, failing side
+    from being hidden behind the earlier side's success: the transaction reaches
+    ROLLED_BACK only when both sides are, and otherwise keeps the recovery record
+    with the side that is still open.
+    """
+    for label, value in (("Worker", worker_status), ("Panel API", api_status)):
+        if value not in ROLLBACK_SIDES:
+            raise JournalValidationError(f"Invalid {label} rollback status: {value}")
+
+    data = load_journal_file(journal_path)
+    validate_journal(data)
+    op = data["op"]
+    if op not in ("provision", "node_add"):
+        raise JournalValidationError(f"Refusing a rollback outcome for operation: {op}")
+    if data["state"] in ("PROVISION_COMMITTED", "NODE_ADD_COMMITTED"):
+        raise JournalValidationError("Refusing to rewrite a committed transaction as a rollback")
+
+    verified = worker_status == "ROLLED_BACK" and api_status == "ROLLED_BACK"
+    data["rollback_sides"] = {"worker": worker_status, "api": api_status}
+    data["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    if verified:
+        data["state"] = "PROVISION_ROLLED_BACK" if op == "provision" else "NODE_ADD_ROLLED_BACK"
+        data.pop("rollback_errors", None)
+    else:
+        data["state"] = "PROVISION_ROLLBACK_REQUIRED" if op == "provision" else "NODE_ADD_ROLLBACK_REQUIRED"
+    write_journal_atomically(journal_path, data)
+    return verified
 
 
 def prune_snapshots(recovery_dir, max_snapshots=3, max_bytes=5 * 1024 * 1024 * 1024):
@@ -170,17 +234,50 @@ def prune_snapshots(recovery_dir, max_snapshots=3, max_bytes=5 * 1024 * 1024 * 1
             print(f"Warning: Failed to prune snapshot {item}: {e}", file=sys.stderr)
 
 
-def sqlite_online_backup(db_path, backup_dest, gowave_user="gowave"):
-    """Preflight integrity check, WAL checkpoint, and staged SQLite Online Backup."""
-    db_file = Path(db_path)
-    dest_file = Path(backup_dest)
-    dest_file.parent.mkdir(parents=True, exist_ok=True)
+_SQLITE_PREFLIGHT_SCRIPT = """\
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], timeout=5.0)
+try:
+    cur = conn.cursor()
+    cur.execute("PRAGMA busy_timeout = 5000;")
+    integrity = cur.execute("PRAGMA integrity_check;").fetchall()
+    if not integrity or integrity[0][0] != "ok":
+        raise SystemExit(f"SQLite preflight integrity check failed: {integrity}")
+    cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+finally:
+    conn.close()
+"""
 
-    if not db_file.exists():
-        raise FileNotFoundError(f"Database {db_path} not found")
 
-    # Connect to verify integrity and perform WAL checkpoint
-    conn = sqlite3.connect(str(db_file), timeout=5.0)
+def _service_user_exists(name):
+    try:
+        import pwd
+        pwd.getpwnam(name)
+        return True
+    except (ImportError, KeyError):
+        return False
+
+
+def sqlite_preflight_checkpoint(db_path, gowave_user=None):
+    """Run the integrity check and WAL checkpoint with write access to the database.
+
+    SQLite opens the file with O_CREAT, which the kernel refuses for another
+    user's file inside a sticky directory while fs.protected_regular is set
+    (the Debian/Ubuntu default). When running as root against the service
+    database, the preflight must therefore run under the service account.
+    """
+    if gowave_user and _service_user_exists(gowave_user):
+        result = subprocess.run(
+            ["runuser", "-u", gowave_user, "--", "python3", "-c",
+             _SQLITE_PREFLIGHT_SCRIPT, str(db_path)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip() or "unknown error"
+            raise ValueError(f"SQLite preflight integrity check failed: {detail}")
+        return
+
+    conn = sqlite3.connect(str(db_path), timeout=5.0)
     try:
         cur = conn.cursor()
         cur.execute("PRAGMA busy_timeout = 5000;")
@@ -193,29 +290,65 @@ def sqlite_online_backup(db_path, backup_dest, gowave_user="gowave"):
     finally:
         conn.close()
 
-    # Staged backup into pre-created file
-    staged_file = db_file.parent / f".backup-{int(time.time())}.db"
+
+def sqlite_online_backup(db_path, backup_dest, gowave_user="gowave"):
+    """Preflight integrity check, WAL checkpoint, and staged SQLite Online Backup."""
+    db_file = Path(db_path)
+    dest_file = Path(backup_dest)
+    dest_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if not db_file.exists():
+        raise FileNotFoundError(f"Database {db_path} not found")
 
     is_root = os.geteuid() == 0
-    if is_root:
-        # Pre-create with 0640 ownership gowave:gowave
-        subprocess.run(["install", "-o", gowave_user, "-g", gowave_user, "-m", "0640", "/dev/null", str(staged_file)], check=True)
-        # Execute backup under service user privileges
-        backup_cmd = f"sqlite3 '{db_file}' '.backup {staged_file}'"
-        subprocess.run(["runuser", "-u", gowave_user, "--", "bash", "-c", backup_cmd], check=True)
-        # Move into private recovery storage
+    sqlite_preflight_checkpoint(db_file, gowave_user if is_root else None)
+
+    # Staged backup into pre-created file
+    # Use a unique staging file; timestamp-only names collide for concurrent backups.
+    fd, staged_name = tempfile.mkstemp(prefix=".backup-", suffix=".db", dir=str(db_file.parent))
+    os.close(fd)
+    staged_file = Path(staged_name)
+
+    try:
+        if is_root:
+            # The service user performs the SQLite Online Backup, but all paths
+            # are passed as argv rather than interpolated into a shell command.
+            subprocess.run(["chown", f"{gowave_user}:{gowave_user}", str(staged_file)], check=True)
+            os.chmod(str(staged_file), 0o640)
+            backup_script = (
+                "import sqlite3, sys\n"
+                "source = sqlite3.connect(sys.argv[1], timeout=5.0)\n"
+                "destination = sqlite3.connect(sys.argv[2], timeout=5.0)\n"
+                "try:\n"
+                "    source.backup(destination)\n"
+                "finally:\n"
+                "    destination.close()\n"
+                "    source.close()\n"
+            )
+            subprocess.run(
+                ["runuser", "-u", gowave_user, "--", "python3", "-c",
+                 backup_script, str(db_file), str(staged_file)],
+                check=True,
+            )
+        else:
+            # Non-root fallback (for testing/unprivileged execution).
+            bconn = sqlite3.connect(str(staged_file))
+            try:
+                src_conn = sqlite3.connect(str(db_file))
+                try:
+                    src_conn.backup(bconn)
+                finally:
+                    src_conn.close()
+            finally:
+                bconn.close()
+
         shutil.move(str(staged_file), str(dest_file))
         os.chmod(str(dest_file), 0o600)
-    else:
-        # Non-root fallback (for testing/unprivileged execution)
-        bconn = sqlite3.connect(str(dest_file))
+    finally:
         try:
-            src_conn = sqlite3.connect(str(db_file))
-            src_conn.backup(bconn)
-            src_conn.close()
-        finally:
-            bconn.close()
-        os.chmod(str(dest_file), 0o600)
+            staged_file.unlink()
+        except FileNotFoundError:
+            pass
 
     # Verify integrity of destination copy
     dest_conn = sqlite3.connect(str(dest_file))
@@ -231,8 +364,7 @@ def sqlite_online_backup(db_path, backup_dest, gowave_user="gowave"):
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--validate-journal":
-        with open(sys.argv[2]) as f:
-            data = json.load(f)
+        data = load_journal_file(sys.argv[2])
         validate_journal(data)
         print("Journal valid.")
     else:

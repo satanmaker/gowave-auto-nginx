@@ -1,0 +1,395 @@
+# How each live acceptance scenario is answered, as a checked field rather than a
+# default. `build_catalog` reads this file, so a scenario the spec gains and this
+# file does not classify fails generation instead of being claimed by a container
+# that never ran it; `validate_catalog` holds the same rule in both directions.
+schema: gowave-live-scenario-environments/v1
+environments:
+  - requirement: 'Disposable Environment Gate'
+    scenario: 'Clean VPS passes baseline gate'
+    environment: container
+  - requirement: 'Disposable Environment Gate'
+    scenario: 'Contaminated VPS blocked before modification'
+    environment: container
+  - requirement: 'Complete Mutation-Target Baseline and Resource Ownership'
+    scenario: 'Existing Worker system configuration is not overwritten'
+    environment: container
+  - requirement: 'Complete Mutation-Target Baseline and Resource Ownership'
+    scenario: 'Existing Worker service or binary paths are not removed'
+    environment: container
+  - requirement: 'Complete Mutation-Target Baseline and Resource Ownership'
+    scenario: 'Existing firewall policy is preserved'
+    environment: container
+  - requirement: 'Complete Mutation-Target Baseline and Resource Ownership'
+    scenario: 'Failure restores every transaction-owned resource'
+    environment: container
+  - requirement: 'Preflight SSH Trust and DNS Verification'
+    scenario: 'SSH host key not pre-pinned'
+    environment: container
+  - requirement: 'Preflight SSH Trust and DNS Verification'
+    scenario: 'DNS A-record points to wrong IP'
+    environment: container
+  - requirement: 'Preflight SSH Trust and DNS Verification'
+    scenario: 'Published AAAA is rejected when IPv6 testing is disabled'
+    environment: container
+  - requirement: 'Preflight SSH Trust and DNS Verification'
+    scenario: 'Private or reserved IP rejected'
+    environment: partial
+    partial_split: 'Container proves the private/reserved rule against Podman addresses with an explicitly scoped, fail-closed exemption; the live run is authoritative for real public addresses.'
+  - requirement: 'Preflight SSH Trust and DNS Verification'
+    scenario: 'IPv6 AAAA records verified when enabled'
+    environment: container
+  - requirement: 'Preflight SSH Trust and DNS Verification'
+    scenario: 'Published AAAA records cannot bypass IPv6 verification'
+    environment: container
+  - requirement: 'Target Address, Domain, and SSH Identity Safety'
+    scenario: 'Master and Worker target addresses must differ'
+    environment: container
+  - requirement: 'Target Address, Domain, and SSH Identity Safety'
+    scenario: 'Mandatory domains are pairwise unique'
+    environment: container
+  - requirement: 'Target Address, Domain, and SSH Identity Safety'
+    scenario: 'Non-root SSH account is rejected in v1'
+    environment: container
+  - requirement: 'Independent Optional Vision Domains'
+    scenario: 'Master-only Vision configuration'
+    environment: container
+  - requirement: 'Independent Optional Vision Domains'
+    scenario: 'Worker-only Vision configuration'
+    environment: container
+  - requirement: 'Independent Optional Vision Domains'
+    scenario: 'Both Vision domains are configured'
+    environment: container
+  - requirement: 'Independent Optional Vision Domains'
+    scenario: 'Vision domains are unique'
+    environment: container
+  - requirement: 'Independent Optional Vision Domains'
+    scenario: 'Vision certificate failure aborts the relevant host installation'
+    environment: container
+  - requirement: 'Independent Optional Vision Domains'
+    scenario: 'Incomplete Vision compensation is reported, not hidden'
+    environment: container
+  - requirement: 'Independent Optional Vision Domains'
+    scenario: 'Vision disabled preserves the four-inbound topology'
+    environment: container
+  - requirement: 'Independent Optional Vision Domains'
+    scenario: 'Vision port gate applies only to the Vision-enabled host'
+    environment: container
+  - requirement: 'Pinned Version Fidelity'
+    scenario: 'Version mismatch detected post-installation'
+    environment: container
+  - requirement: 'Pinned Version Fidelity'
+    scenario: 'Floating installer branch or installer digest mismatch rejected'
+    environment: container
+  - requirement: 'Pinned Version Fidelity'
+    scenario: 'Server and client Xray versions are independently pinned'
+    environment: container
+  - requirement: 'All-in-One Master VPS Installation Verification'
+    scenario: 'Panel service active and API ready'
+    environment: container
+  - requirement: 'All-in-One Master VPS Installation Verification'
+    scenario: 'Installer TLS/SNI probe trusts only the per-run CA bundle'
+    environment: container
+  - requirement: 'All-in-One Master VPS Installation Verification'
+    scenario: 'Credentials file has correct permissions and content'
+    environment: container
+  - requirement: 'All-in-One Master VPS Installation Verification'
+    scenario: 'Master services active and listeners correct'
+    environment: container
+  - requirement: 'All-in-One Master VPS Installation Verification'
+    scenario: 'TLS certificate valid and shortUuid retrievable'
+    environment: container
+  - requirement: 'Distributed Worker VPS Deployment Verification'
+    scenario: 'SECRET_KEY is absent from a complete process argv trace'
+    environment: container
+  - requirement: 'Distributed Worker VPS Deployment Verification'
+    scenario: 'Long argv string is not truncated'
+    environment: container
+  - requirement: 'Distributed Worker VPS Deployment Verification'
+    scenario: 'Later argv elements are not abbreviated'
+    environment: container
+  - requirement: 'Distributed Worker VPS Deployment Verification'
+    scenario: 'Worker node registered and connected in Panel'
+    environment: container
+  - requirement: 'Distributed Worker VPS Deployment Verification'
+    scenario: 'Worker deployment details verified'
+    environment: container
+  - requirement: 'Public mTLS Control Plane Verification (Master → Worker)'
+    scenario: 'Existing verifier succeeds with valid credentials'
+    environment: container
+  - requirement: 'Public mTLS Control Plane Verification (Master → Worker)'
+    scenario: 'HTTP 200 is distinguished from HTTP 401'
+    environment: container
+  - requirement: 'Public mTLS Control Plane Verification (Master → Worker)'
+    scenario: 'Panel-to-Worker authenticated connectivity is independently verified'
+    environment: container
+  - requirement: 'Public mTLS Control Plane Verification (Master → Worker)'
+    scenario: 'Untrusted client certificate rejected by Worker'
+    environment: container
+  - requirement: 'Public mTLS Control Plane Verification (Master → Worker)'
+    scenario: 'Absent client certificate rejected by Worker'
+    environment: container
+  - requirement: 'Public mTLS Control Plane Verification (Master → Worker)'
+    scenario: 'Mismatched client certificate and private key is classified as local failure'
+    environment: container
+  - requirement: 'Public mTLS Control Plane Verification (Master → Worker)'
+    scenario: 'Untrusted Worker CA is classified as client-side server verification failure'
+    environment: container
+  - requirement: 'Public mTLS Control Plane Verification (Master → Worker)'
+    scenario: 'Wrong SNI routing is measured without assuming a TLS alert'
+    environment: container
+  - requirement: 'TLS-aware Bounded Panel API Client'
+    scenario: 'Panel API client uses scoped trust and configured timeout'
+    environment: container
+  - requirement: 'Panel API Cluster Structure Audit'
+    scenario: 'Hosts present with correct node and inbound associations'
+    environment: container
+  - requirement: 'Panel API Cluster Structure Audit'
+    scenario: 'Internal Squad contains all provisioned inbound UUIDs'
+    environment: container
+  - requirement: 'Panel API Cluster Structure Audit'
+    scenario: 'Two nodes and two config profiles with correct structure'
+    environment: container
+  - requirement: 'Real Subscription Delivery and User-Agent Policy'
+    scenario: 'Subscription rejected with absent User-Agent'
+    environment: container
+  - requirement: 'Real Subscription Delivery and User-Agent Policy'
+    scenario: 'Proxy-capable outbounds in Xray JSON'
+    environment: container
+  - requirement: 'Real Subscription Delivery and User-Agent Policy'
+    scenario: 'Xray JSON subscription headers and content verified'
+    environment: container
+  - requirement: 'Real Subscription Delivery and User-Agent Policy'
+    scenario: 'Mihomo YAML subscription verified'
+    environment: container
+  - requirement: 'UFW Firewall Isolation Verification'
+    scenario: 'Worker allows Master and blocks Control Machine'
+    environment: container
+  - requirement: 'UFW Firewall Isolation Verification'
+    scenario: 'Negative probe is not misclassified'
+    environment: container
+  - requirement: 'UFW Firewall Isolation Verification'
+    scenario: 'Master local and external access are distinguished'
+    environment: partial
+    partial_split: 'Container proves isolation between distinct source addresses; provider-level external reachability is live-only.'
+  - requirement: 'UFW Firewall Isolation Verification'
+    scenario: 'IPv6 firewall isolation checked when enabled'
+    environment: container
+  - requirement: 'NGINX SNI Routing and REALITY Decoy Verification'
+    scenario: 'Panel HTTPS accessible with correct SNI'
+    environment: container
+  - requirement: 'NGINX SNI Routing and REALITY Decoy Verification'
+    scenario: 'REALITY decoy does not leak GoWave API content'
+    environment: container
+  - requirement: 'NGINX SNI Routing and REALITY Decoy Verification'
+    scenario: 'REALITY fallback and cover-reality assets present'
+    environment: container
+  - requirement: 'NGINX SNI Routing and REALITY Decoy Verification'
+    scenario: 'Optional Vision SNI routing and decoy fallback'
+    environment: container
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'All active logical endpoints are exercised by both clients'
+    environment: container
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'Tunnel setup tolerates one cold resolver stall'
+    environment: container
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'Clients are the cores deployed by Panel and Node'
+    environment: container
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'Xray runtime request traverses the selected Master endpoint'
+    environment: container
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'Mihomo runtime configuration is isolated on Control Machine'
+    environment: container
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'Mihomo runtime request traverses the selected Master endpoint'
+    environment: container
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'Xray runtime request traverses the selected Worker endpoint'
+    environment: container
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'Mihomo runtime request traverses the selected Worker endpoint'
+    environment: container
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'Staging and public CA chains are both trusted without bypass'
+    environment: partial
+    partial_split: "Container proves explicit verify anchors and no global trust change; public Let's Encrypt issuance is live-only."
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'Xray TLS outbounds carry explicit Staging trust anchors'
+    environment: partial
+    partial_split: 'Container proves the injected verify anchor is required; real Staging material is live-only.'
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'Staging CA material is pinned and reproducible'
+    environment: partial
+    partial_split: 'Container proves fixture CA pinning by digest; real Staging CA distribution is live-only.'
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'Production mode does not add Staging roots to trust'
+    environment: container
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'Ingress evidence is ambiguous'
+    environment: container
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'Data Plane is explicitly disabled'
+    environment: container
+  - requirement: 'Data Plane E2E Traffic Through All VPN Endpoints'
+    scenario: 'One or more mandatory runtime cases fail'
+    environment: container
+  - requirement: 'Negative Scenario and Fault Injection Tests'
+    scenario: 'Matrix of fifteen fault scenarios verified (NEG-01..NEG-15)'
+    environment: partial
+    partial_split: "Container witnesses the matrix one case per row, each at its own boundary; 'all 15 scenarios terminate at their designated boundaries' is a property of the suite's case list rather than a verdict one run can produce, and `catalog gaps` with the divergence table is what audits it."
+  - requirement: 'Negative Scenario and Fault Injection Tests'
+    scenario: 'Duplicate Worker registration is rejected without mutation (NEG-14)'
+    environment: container
+  - requirement: 'Negative Scenario and Fault Injection Tests'
+    scenario: 'Partial SSH deployment leaves no false COMMITTED journal state (NEG-13)'
+    environment: container
+  - requirement: 'Negative Scenario and Fault Injection Tests'
+    scenario: 'Preflight, lifecycle, and protocol scenarios verified (NEG-01..NEG-10)'
+    environment: partial
+    partial_split: 'Container witnesses the ten rows one case per sentence, including the timeout bounds `MN-OUTAGE` records as offline and control-plane seconds; the conjunction over the ten is a suite property, not a verdict a single case can read.'
+  - requirement: 'Negative Scenario and Fault Injection Tests'
+    scenario: 'Backup and restore negative scenarios verified (NEG-11, NEG-12)'
+    environment: container
+  - requirement: 'Negative Scenario and Fault Injection Tests'
+    scenario: 'Forged or expired Panel JWT is rejected (NEG-15)'
+    environment: container
+  - requirement: 'Negative Scenario and Fault Injection Tests'
+    scenario: 'Negative suite PASS requires all fifteen scenarios to pass'
+    environment: partial
+    partial_split: 'Container proves the aggregate refuses a run that recorded any non-PASS among its declared cases; the live `negative_tests` field, the `NOT_RUN` and `PARTIAL` states and a skip verdict of INCOMPLETE do not exist in this contour, whose aggregate turns a skipped declared case into FAIL.'
+  - requirement: 'Negative Scenario and Fault Injection Tests'
+    scenario: 'Negative suite cannot be silently skipped for a passing run'
+    environment: partial
+    partial_split: 'Container proves a run cannot report PASS while a declared case is SKIP; the negative phase the sentence names, and its INCOMPLETE verdict, are live-only because this suite has no switch that disables a phase and aggregates a skip to FAIL.'
+  - requirement: 'Global Certbot Deploy Hook Ownership'
+    scenario: 'Pre-existing global deploy hook blocks installation safely'
+    environment: container
+  - requirement: 'Global Certbot Deploy Hook Ownership'
+    scenario: 'Transaction-created hook is cleaned up only while still owned'
+    environment: container
+  - requirement: 'Global Certbot Deploy Hook Ownership'
+    scenario: 'Uncatchable Worker termination is recovered before the next mutation'
+    environment: container
+  - requirement: 'Global Certbot Deploy Hook Ownership'
+    scenario: 'PRESERVE reports package-manager residuals without claiming OS baseline restoration'
+    environment: container
+  - requirement: 'Signal-Safe and Verifiable Transaction Compensation'
+    scenario: 'Worker deployment is interrupted by a signal'
+    environment: container
+  - requirement: 'Signal-Safe and Verifiable Transaction Compensation'
+    scenario: 'Remote rollback cannot claim success after a failed cleanup step'
+    environment: container
+  - requirement: 'Signal-Safe and Verifiable Transaction Compensation'
+    scenario: 'Worker and Panel API rollback results are both required'
+    environment: container
+  - requirement: 'Teardown Policy Enforcement'
+    scenario: 'Destroy policy rejected before the run starts'
+    environment: container
+  - requirement: 'Teardown Policy Enforcement'
+    scenario: 'Preserve policy after success or failure'
+    environment: container
+  - requirement: 'Teardown Policy Enforcement'
+    scenario: 'Snapshot restore hook configuration and protocol are validated'
+    environment: container
+  - requirement: 'Teardown Policy Enforcement'
+    scenario: 'Restore hook receives a versioned request and returns both restored resources'
+    environment: container
+  - requirement: 'Teardown Policy Enforcement'
+    scenario: 'Snapshot restore reacquires the remote lock pair before baseline verification'
+    environment: partial
+    partial_split: 'Container proves lock ordering and hook protocol; provider snapshots are live-only.'
+  - requirement: 'Teardown Policy Enforcement'
+    scenario: 'Single-host snapshot reboot does not self-deadlock lock reacquisition'
+    environment: live-only
+    live_only_reason: 'Requires a provider snapshot and a real reboot; a container cannot reproduce the host lifecycle.'
+  - requirement: 'Teardown Policy Enforcement'
+    scenario: 'Snapshot restore hook success requires baseline verification'
+    environment: container
+  - requirement: 'Teardown Policy Enforcement'
+    scenario: 'Snapshot restore hook does not restore both hosts'
+    environment: container
+  - requirement: 'Pair-Wide Run Locking'
+    scenario: 'A second Control Machine cannot acquire an occupied VPS'
+    environment: container
+  - requirement: 'Pair-Wide Run Locking'
+    scenario: 'Loss of a remote lock-holder session fails closed'
+    environment: container
+  - requirement: 'Shared Mutation Lock Across All Management Entry Points'
+    scenario: 'Existing management command is blocked while the E2E run owns the host'
+    environment: container
+  - requirement: 'Shared Mutation Lock Across All Management Entry Points'
+    scenario: 'Runner-owned nested command does not release exclusivity'
+    environment: container
+  - requirement: 'Shared Mutation Lock Across All Management Entry Points'
+    scenario: 'Unsafe remote lock path is rejected'
+    environment: container
+  - requirement: 'Durable Run State for Partial CLI Modes'
+    scenario: 'Run ID cannot escape the artifact root'
+    environment: container
+  - requirement: 'Durable Run State for Partial CLI Modes'
+    scenario: 'Partial mode cannot resume a different run or repeat completed installation'
+    environment: container
+  - requirement: 'Redacted Diagnostic Artifact Collection'
+    scenario: 'Redacted copy of credentials file'
+    environment: container
+  - requirement: 'Redacted Diagnostic Artifact Collection'
+    scenario: 'Diagnostic files contain required safe fields'
+    environment: container
+  - requirement: 'Result Status Semantics'
+    scenario: 'PASS requires all active Data Plane runtime cases'
+    environment: container
+  - requirement: 'Result Status Semantics'
+    scenario: 'Vision-enabled PASS requires all active runtime cases'
+    environment: container
+  - requirement: 'Result Status Semantics'
+    scenario: 'result.json schema fields present'
+    environment: container
+  - requirement: 'Local Operator Credential Bootstrap and Cleanup'
+    scenario: 'Host identity is verified before password authentication'
+    environment: partial
+    partial_split: "Container proves host identity precedes the password; the live controller's public-target path is live-only."
+  - requirement: 'Local Operator Credential Bootstrap and Cleanup'
+    scenario: 'Temporary access is bounded and revoked'
+    environment: partial
+    partial_split: 'Container proves bounded key lifetime and revocation; live account behaviour is live-only.'
+  - requirement: 'Per-Case Data-Plane Packet Evidence'
+    scenario: 'Selected VPS receives the proxy request'
+    environment: container
+  - requirement: 'Per-Case Data-Plane Packet Evidence'
+    scenario: 'Packet evidence is unavailable or ambiguous'
+    environment: container
+  - requirement: 'Per-Case Data-Plane Packet Evidence'
+    scenario: 'Traffic reaches the wrong VPS'
+    environment: container
+  - requirement: 'Local interactive operator entrypoint'
+    scenario: 'Five-domain input is validated before network access'
+    environment: container
+  - requirement: 'Local interactive operator entrypoint'
+    scenario: 'Password is hidden and not persisted'
+    environment: container
+  - requirement: 'Out-of-band SSH host identity verification'
+    scenario: 'Host key is confirmed'
+    environment: container
+  - requirement: 'Out-of-band SSH host identity verification'
+    scenario: 'Host key is not confirmed'
+    environment: container
+  - requirement: 'Temporary SSH access with remote expiry'
+    scenario: 'Temporary key is installed'
+    environment: container
+  - requirement: 'Temporary SSH access with remote expiry'
+    scenario: 'Bootstrap fails after expiry is armed'
+    environment: container
+  - requirement: 'Immediate credential revocation gates overall status'
+    scenario: 'Immediate revocation succeeds'
+    environment: container
+  - requirement: 'Immediate credential revocation gates overall status'
+    scenario: 'Immediate revocation cannot be verified'
+    environment: container
+  - requirement: 'Local-only live VPS credential handling'
+    scenario: 'GitHub CI runs without target credentials'
+    environment: container
+  - requirement: 'Local-only live VPS credential handling'
+    scenario: 'Local operator starts a live run'
+    environment: live-only
+    live_only_reason: 'Starts the interactive operator against real disposable VPS instances; live infrastructure only.'

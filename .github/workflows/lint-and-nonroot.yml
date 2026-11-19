@@ -18,7 +18,11 @@ jobs:
   lint-and-nonroot:
     name: Lint, Completeness, and Suite Nonroot
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # The nonroot suite alone prints `Ran 2677 tests in 3030.919s` — 51 minutes
+    # of wall clock — so the previous 20-minute cap ended every run as
+    # `cancelled` and the job could no longer report on the tree at all. 90
+    # leaves the same headroom the Multi-Node acceptance job carries.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
 
@@ -33,9 +37,34 @@ jobs:
           sudo apt-get install -y --no-install-recommends shellcheck sqlite3 tar gzip openssl curl
           npm install -g @fission-ai/openspec
 
+      # The completeness check imports every test module, and the protocol matrix
+      # and the served-payload probes parse YAML, so the toolchain Python needs it.
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check PyYAML
+
       - name: ShellCheck validation
         run: |
           shellcheck --severity=error gowave-auto.sh gowave-node-auto.sh assets/backup/gowave-backup.sh modules/*.sh tests/*.sh
+
+      # `--severity=error` structurally hides the warning class that covers
+      # suppressed errexit (SC2310) and combined declare-and-assign (SC2155), and
+      # those optional checks only exist in newer ShellCheck than the runner
+      # ships. Report them without failing the build yet.
+      - name: ShellCheck advisory checks
+        continue-on-error: true
+        run: |
+          opts=()
+          for opt in check-set-e-suppressed check-extra-masked-returns deprecate-which; do
+            printf '#!/bin/sh\n' > /tmp/shellcheck-probe.sh
+            if shellcheck -o "$opt" /tmp/shellcheck-probe.sh >/dev/null 2>&1; then
+              opts+=(-o "$opt")
+            fi
+          done
+          if ((${#opts[@]})); then
+            shellcheck "${opts[@]}" gowave-auto.sh gowave-node-auto.sh \
+              assets/backup/gowave-backup.sh modules/*.sh tests/*.sh
+          fi
 
       - name: OpenSpec validation
         run: |

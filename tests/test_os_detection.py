@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parent.parent / "modules" / "os.sh"
+OPERATOR_PATH = Path(__file__).resolve().parent.parent / "gowave-auto.sh"
 
 
 class TestOSDetection(unittest.TestCase):
@@ -104,9 +105,28 @@ class TestOSDetection(unittest.TestCase):
             res = self.run_bash_fn("check_kernel_ipv6", str(inet6_file))
             self.assertNotEqual(res.returncode, 0)
 
+            # Whitespace only, which no address table ever contains
+            inet6_file.write_text("\n   \n")
+            res = self.run_bash_fn("check_kernel_ipv6", str(inet6_file))
+            self.assertNotEqual(res.returncode, 0)
+
             # Missing file
             res = self.run_bash_fn("check_kernel_ipv6", str(Path(tmpdir) / "no_file"))
             self.assertNotEqual(res.returncode, 0)
+
+    def test_the_address_table_is_read_rather_than_measured(self):
+        # /proc/net/if_inet6 reports st_size 0 however many addresses it prints,
+        # so a helper that trusted ``[[ -s ]]`` reported "IPv6 disabled" on every
+        # dual-stack host. /proc/version is the same shape: zero-sized, non-empty.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_bin = Path(tmpdir)
+            sysctl = fake_bin / "sysctl"
+            sysctl.write_text("#!/usr/bin/env bash\necho 0\n")
+            sysctl.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            res = self.run_bash_fn("check_kernel_ipv6", "/proc/version", env=env)
+            self.assertEqual(res.returncode, 0, res.stderr)
 
     def test_configure_debian_security_apt(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -127,6 +147,25 @@ class TestOSDetection(unittest.TestCase):
             self.assertEqual(res.returncode, 0)
             conf = (apt_dir / "99zz-gowave-auto-nginx").read_text()
             self.assertIn('Unattended-Upgrade::Automatic-Reboot "false";', conf)
+
+    def test_install_bootstraps_tools_before_validating_arguments(self):
+        """cmd_install validates arguments and probes the cover apex before prerequisites."""
+        script = OPERATOR_PATH.read_text(encoding="utf-8")
+        start = script.index("cmd_install() {")
+        body = script[start:start + 4000]
+        bootstrap = body.index("bootstrap_early_tools || return 1")
+        validator = body.index("python3 - \"$panel_domain\"")
+        cover = body.index("server_ip=$(resolve_panel_ipv4)")
+        self.assertLess(bootstrap, validator)
+        self.assertLess(bootstrap, cover)
+
+    def test_bootstrap_packages_are_part_of_the_prerequisite_inventory(self):
+        required = set(self.run_bash_fn("get_required_packages").stdout.split())
+        bootstrap = set(self.run_bash_fn("get_bootstrap_packages").stdout.split())
+        self.assertTrue(bootstrap)
+        self.assertLessEqual(bootstrap, required)
+        self.assertIn("python3", bootstrap)
+        self.assertIn("iproute2", bootstrap)
 
     def test_required_packages_inventory(self):
         res = self.run_bash_fn("get_required_packages")

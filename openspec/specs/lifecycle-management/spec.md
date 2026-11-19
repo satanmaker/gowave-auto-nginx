@@ -1,0 +1,105 @@
+# Lifecycle Management Specification
+
+## Purpose
+
+Defines how the GoWave Auto NGINX lifecycle manager behaves for operators: its CLI and interactive surface, exclusive mutation locking, external proxy ownership, channel switching, transaction-safe updates with crash recovery, atomic reconfiguration, targeted uninstallation, and ACME endpoint selection with certificate lineage isolation.
+
+## Requirements
+
+### Requirement: Explicit ACME Endpoint Selection and Certificate Lineage Isolation
+
+The installer and distributed orchestrator SHALL accept `GOWAVE_ACME_SERVER` (defaulting to Let's Encrypt
+production when unset) restricted to official Let's Encrypt staging and production directory URLs. The runner
+SHALL map `ACME_MODE` to the matching URL, propagate it over SSH stdin to Worker, and prevent cross-lineage
+staging and production reuse.
+
+#### Scenario: Runner maps ACME mode to the official staging directory
+
+- **GIVEN** E2E config has `ACME_MODE=staging`
+- **WHEN** the runner invokes Master installation and subsequent `node add`
+- **THEN** it passes exactly `https://acme-staging-v02.api.letsencrypt.org/directory` as `GOWAVE_ACME_SERVER`; for `ACME_MODE=production` it passes exactly `https://acme-v02.api.letsencrypt.org/directory`; no arbitrary URL is accepted
+
+#### Scenario: Staging certificate issued on a clean disposable Master
+
+- **GIVEN** `GOWAVE_ACME_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory` and a clean disposable Master
+- **WHEN** `gowave-auto.sh install` provisions the Panel and REALITY certificates
+- **THEN** every Certbot issuance call uses the staging directory; the resulting certificate chain is staging-issued; no production ACME endpoint is contacted
+
+#### Scenario: Master installer TLS probe uses scoped staging trust
+
+- **GIVEN** the Master receives a staging-issued Panel certificate and the runner has built the D9 mode-specific CA bundle
+- **WHEN** `gowave-auto.sh install` invokes `verify_public_tls_sni`
+- **THEN** the runner supplies the bundle through `GOWAVE_TLS_CA_FILE`, the probe uses `-CAfile` with hostname and chain verification, and the staging certificate passes without installing Staging roots into system trust; an untrusted test certificate still fails. The same optional override applies to `domain-change`; with no override, legacy `-CApath` behavior is unchanged.
+
+#### Scenario: Staging parameter propagated to Worker
+
+- **GIVEN** the Master installation uses the staging directory
+- **WHEN** `gowave-auto.sh node add` invokes the remote Worker deployment
+- **THEN** the exact ACME directory URL is serialized through SSH stdin and every Worker Certbot issuance call uses that URL
+
+#### Scenario: Vision certificates use the selected ACME directory on both hosts
+
+- **GIVEN** both `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` are configured
+- **WHEN** Master and Worker certificates are issued
+- **THEN** Master and Worker each issue and verify a third Vision certificate using the same selected ACME directory as their two mandatory certificates; before Worker issuance, its HTTP-01 bootstrap vhost includes `WORKER_VISION_DOMAIN` in `server_name`; each Vision renewal lineage MUST match that directory
+
+#### Scenario: Vision certificate failure is not silently ignored
+
+- **GIVEN** the paired Vision domains are configured but Certbot issuance or certificate validation fails on either VPS
+- **WHEN** the corresponding installation phase runs
+- **THEN** that host's installation fails and rolls back; on Worker, the HTTP-01 bootstrap vhost must have included the Vision name before issuance, and rollback must remove any transaction-created Vision certificate/renewal lineage, stream-map entry, 9444 fallback vhost and generated profile/host state. It MUST preserve pre-existing/unowned lineages and unrelated resources. Deployment MUST NOT proceed with a profile or NGINX route advertising an unusable Vision inbound
+
+#### Scenario: Master and Worker Vision domains are independently optional
+
+- **GIVEN** either, both, or neither of `MASTER_VISION_DOMAIN` and `WORKER_VISION_DOMAIN` is configured
+- **WHEN** the runner validates its configuration and invokes the corresponding Master/Worker install paths
+- **THEN** preflight accepts each valid independently configured domain
+- **AND** only the host with a configured Vision domain provisions its Vision certificate, inbound, Panel host, NGINX route, and fallback
+- **AND** an unset Vision domain does not block installation on the other host
+- **AND** no Vision artifacts are created on a host whose Vision domain is unset
+
+#### Scenario: Missing or unknown renewal directory fails closed
+
+- **GIVEN** an existing Certbot lineage has no readable `server` field or an unrecognized ACME directory URL
+- **WHEN** installation checks whether that lineage can be reused
+- **THEN** the installer MUST NOT infer the directory from the generic Let's Encrypt issuer; it fails closed or
+  provisions a separately named lineage with all consumers and renewal hooks migrated atomically
+
+#### Scenario: Existing certificate is reused only for the same ACME directory
+
+- **GIVEN** a valid certificate lineage exists for the requested domain
+- **WHEN** installation is repeated with the same ACME directory URL
+- **THEN** Certbot may reuse the lineage without unnecessary issuance, after validating its renewal configuration and certificate SAN/expiry
+
+#### Scenario: Failed transaction preserves pre-existing certificate lineages
+
+- **GIVEN** a requested-domain certificate lineage existed before installation and is valid for the selected ACME directory
+- **WHEN** a later Master or Worker provisioning step fails and compensation runs
+- **THEN** rollback MUST NOT delete the pre-existing lineage; if Certbot changed it, restore and verify its certificate, private key, renewal configuration, live symlink targets, ownership and modes from the same-host snapshot under `/var/lib/gowave-auto-nginx/recovery/<transaction-id>/acme/<domain>/` (root-owned `0700` directories, root-owned `0600` private-key files). Snapshots MUST NOT be copied to runner/CI artifacts or logs. Only lineages proven to have been absent before the failed transaction may be deleted. Remove snapshots only after verified commit/rollback; retain them and report incomplete recovery if restoration fails. If safe restoration cannot be guaranteed, the install MUST fail before issuance or report cleanup incomplete rather than claim rollback success.
+
+#### Scenario: ACME directory changes between staging and production
+
+- **GIVEN** the domain has a certificate lineage issued by the other ACME directory
+- **WHEN** the operator changes `GOWAVE_ACME_SERVER`
+- **THEN** the installer MUST NOT treat the old lineage as a valid reusable certificate; it MUST require a fresh disposable baseline or create a separately named lineage and atomically update all consumers; it MUST never mix staging and production certificates
+
+#### Scenario: Existing NGINX certificate path contract is preserved
+
+- **GIVEN** Master or Worker has NGINX consumers referencing `/etc/letsencrypt/live/<domain>/`
+- **WHEN** a staging or production lineage is issued or migrated
+- **THEN** every consumer continues to resolve the expected certificate and private-key paths; any isolated
+  lineage migration updates all consumers and renewal hooks atomically before reload, or fails without
+  replacing the active certificate
+
+#### Scenario: Existing global deploy hook is not overwritten or removed
+
+- **GIVEN** Master or Worker already contains
+  `/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` from another workflow
+- **WHEN** GoWave installation checks its ACME hook prerequisites or rollback executes
+- **THEN** installation fails before replacing the existing hook; rollback never deletes it, including when it is a symlink or non-regular object. A hook created by the current transaction is recorded with host-local ownership metadata and may be removed only if its current identity and digest still match that transaction
+
+#### Scenario: ACME parameter is unset
+
+- **GIVEN** `GOWAVE_ACME_SERVER` is unset
+- **WHEN** the existing installer is run
+- **THEN** the production endpoint and existing certificate behavior remain backward-compatible

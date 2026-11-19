@@ -1,0 +1,1213 @@
+# Design: Live VPS E2E Testing
+
+## Context
+
+See `proposal.md — Why` for motivation. Key implementation constraints derived from codebase audit:
+
+- `modules/verify_node_mtls.py` already implements HKDF-SHA256 SNI derivation and mTLS socket handshake;
+  the E2E runner reuses this logic via subprocess call, not by copying crypto code.
+- `modules/api_client.py` implements `GoWaveClient` with Bearer token auth (`/api/auth/login` → `accessToken`);
+  the runner uses the same auth pattern against the real Panel.
+- `shortUuid` is stored in `state.json` as `defaultUserShortUuid`, not in `/root/gowave-credentials.txt`;
+  the runner reads it from `state.json` via SSH and cross-validates via `GET /api/users/by-username/default-user`.
+- `gowave-auto.sh node add` reads Master egress IP via `curl -s4 https://ifconfig.me` and uses it for Worker
+  UFW allowlist; this IP may differ from `MASTER_IP` under NAT/multi-homed setups.
+- The implementation now maps the validated `ACME_MODE` to the exact Let's Encrypt staging or production
+  directory and passes the selected `--server` to Master and Worker Certbot calls. The default remains
+  production-compatible; the local operator controller selects staging unless production is explicitly chosen.
+- `modules/node.sh` falls back to `curl -fsSL https://raw.githubusercontent.com/aaaSaZaN/gowave-node/main/install.sh`
+  when no bundled installer is present; E2E runs must gate on bundled installer with verified SHA256.
+- `tests/podman_testbed.sh multi-node` runs an isolated three-container transport acceptance (pinned SSH, TLS 1.3 mTLS, negative client-certificate cases, and Worker TCP/3002 source filtering). It does not install GoWave Panel/Node or test subscriptions/client proxy traffic; those remain live-VPS acceptance responsibilities.
+- Existing 5-suite CI continues unchanged; Live VPS E2E is a separate acceptance tier.
+
+---
+
+## Local Multi-Node Podman Test Boundary
+
+The Podman multi-node target creates isolated Control, Master, and Worker systemd containers on a private Podman network. It validates the real SSH trust/command path, TLS 1.3 mutual authentication (positive, absent-certificate, and untrusted-certificate cases), and source-address filtering on Worker TCP/3002. Rootful Podman is required because the test inserts INPUT-chain rules inside the privileged Worker network namespace. The CI job is independent of the live-VPS credentials and never contacts external VPS targets.
+
+This test remains intentionally named transport acceptance: it does not start upstream GoWave Panel/Node binaries, create Panel API entities, or validate subscriptions and Xray/Mihomo proxy traffic. A transport PASS must not be reported as full GoWave E2E acceptance. The separate `podman-full-e2e` OpenSpec change defines the planned local product-level Podman acceptance that will add real operator provisioning, Panel/Worker API lifecycle, both Xray and Mihomo subscription/data-plane paths, and node-attributed egress evidence. Until that framework is implemented and its required CI jobs pass, the existing transport test remains the only Multi-Node Podman acceptance and must not be promoted to product E2E. Live VPS acceptance remains responsible for public DNS, public ingress, public ACME, provider firewall behavior, and external Internet reachability that private Podman networks cannot prove.
+
+## Goals / Non-Goals
+
+**Goals (design-level):**
+- Zero-secret-in-argv architecture throughout the runner.
+- Single-process Python runner with structured submodule package; each phase has bounded timeout and explicit
+  status.
+- Reuse existing crypto/mTLS logic via subprocess, not reimplementation.
+- The local controller verifies each SSH host key out of band before password authentication, then bootstraps a per-host ephemeral Ed25519 key. The existing runner uses system OpenSSH with `StrictHostKeyChecking=yes` and the controller-generated, host-specific temporary `known_hosts` files.
+- E2E v1 connects to both VPS as `root`; the current deployment scripts have no `sudo` execution adapter. The controller rejects non-root identities before mutation.
+- Temporary SSH keys are guarded by a persistent two-hour remote systemd expiry timer installed before the key is appended. Immediate revocation is independently verified and is a PASS gate; otherwise the overall result is INCOMPLETE.
+- All log output passes through a redaction filter before writing.
+- Teardown is policy-driven and idempotent; it never destroys a VPS not created by this runner.
+- Run-level lock prevents concurrent tests on the same Master/Worker pair.
+
+**Non-Goals (design-level):**
+- Cloud provider VPS provisioning API (Provider Adapter interface reserved for future, not implemented).
+- Modifying GoWave Panel or GoWave Node upstream behavior.
+- Replacing or merging with the existing 5-suite unit/integration CI.
+- Running on Windows or macOS (Linux Control Machine only, v1).
+- Supporting concurrent tests on the same VPS pair (explicitly locked out).
+
+---
+
+## Decisions
+
+### D1: Hybrid SSH Bootstrap and OpenSSH Runner Transport
+
+**Chosen:** The local operator controller uses Paramiko only for the initial unauthenticated SSH key exchange,
+out-of-band SHA-256 host-key fingerprint confirmation, and hidden root-password bootstrap. After that it
+installs a per-run Ed25519 public key. The existing E2E runner continues to use system OpenSSH `ssh`/`scp`
+with `shell=False`, argument arrays, mandatory timeouts, `StrictHostKeyChecking=yes`, and controller-generated
+temporary `known_hosts` files pinned to the exact host keys.
+
+**Rationale:** Passwords never enter argv, environment variables, persistent config, reports, or CI secrets.
+The operator compares the observed fingerprint with the VPS provider's trusted console before any password is
+sent. The long-running runner retains OpenSSH's mature host-key enforcement and uses only short-lived keys.
+
+**Alternatives considered:** Permanent GitHub Environment SSH secrets — rejected because they persist target
+credentials in CI and are a poor fit for operator-supplied VPS instances. Trust-on-first-use via `ssh-keyscan`
+— rejected because it does not independently authenticate host identity.
+
+**Security consequence:** Secrets are never placed in argv. Remote commands that require secrets (reading
+credentials, extracting SECRET_KEY) pipe data via stdin or use isolated SSH `cat` commands followed by
+in-memory processing, then immediate unset.
+
+---
+
+### D2: Config Parser — Whitelist-only env parser, no `eval`, no `source`
+
+**Chosen:** A custom Python parser that reads the `.env` file line-by-line, strips comments, splits on the
+first `=`, and validates each key against a strict whitelist with type/range/value rules.
+
+**Rationale:** `eval` and Python `os.environ` source-execute arbitrary shell; a `.env` file from an untrusted
+path could inject shell commands. The whitelist parser fails on unknown keys, duplicate keys, and values that
+fail type validation. File must have mode `0600` before parsing; parser enforces this.
+
+**Alternatives considered:** `python-dotenv` — rejected because it supports interpolation and exec features
+that expand the attack surface. Shell `source` — rejected per AGENTS.md zero-leak credential requirement.
+
+---
+
+### D3: mTLS Verification — Reuse Existing Verifier, Separate Client- and Server-Side Negative Cases
+
+**Chosen:**
+1. **Positive verification** runs `modules/verify_node_mtls.py` on Master (the allowed source address),
+   with the already-Base64-encoded `SECRET_KEY` value returned by `modules/node.sh:extract_secret_key`
+   supplied unchanged over stdin. The existing extractor returns the encoded value consumed by the verifier;
+   `verify_node_mtls.py` performs exactly one `base64.b64decode()` before parsing the JSON payload. The runner
+   MUST NOT Base64-encode this value a second time. The runner records the verifier exit code,
+   negotiated TLS version and HTTP status as separate observations. It MUST NOT parse synthetic markers that
+   the current verifier does not emit. The existing verifier prints `Handshake SUCCESS`, `Node response`,
+   and `mTLS 1.3 control plane verification PASSED`; it treats both `200 OK` and `401 Unauthorized` as
+   successful TLS/SNI handshake evidence.
+2. **Certificate/key consistency negative case** is local: pair a valid client certificate with a different
+   private key and call the existing verifier's `validate_payload_crypto()` path. It compares the certificate
+   public key with the private key's derived public key through OpenSSL before any socket is opened; the
+   mismatch MUST fail this local validation. The test MUST assert that no TCP connection was attempted. This
+   is not a remote Worker-handshake test and MUST be reported separately.
+3. **Server-side client-auth negative cases** use a TCP/TLS client from Master: an untrusted client certificate
+   and an absent client certificate must be rejected by Worker during handshake. Wrong-SNI behavior is tested
+   independently against the documented SNI router and must assert the observed route/handshake outcome rather
+   than assume every wrong SNI produces a TLS alert.
+4. **Server-certificate trust negative case** uses a dedicated TLS probe with the valid HKDF-derived SNI and
+   valid client certificate/key unchanged, but replaces only the client's server-trust store with one that
+   does not contain the GoWave CA. The test MUST assert a server-certificate trust failure and MUST prove that
+   SNI routing and client identity were held constant. Do not derive a new SNI from the deliberately untrusted
+   trust bundle. This is client-side certificate verification failure, not Worker rejecting the client.
+
+**Rationale:** The current verifier performs local cryptographic validation before opening a socket and only
+then performs TLS 1.3 mTLS. A mismatched key is rejected by `validate_payload_crypto()` through an OpenSSL
+public-key comparison before the socket function is called; it is not a TLS-library handshake failure. A wrong
+server CA is validated by the client, not by the Worker. To isolate that negative case, preserve the valid
+SNI and valid client certificate/key and change only the client's server trust anchors. Treating these as
+server-side handshake rejection would produce false security evidence.
+
+**Output contract:** The runner derives `MTLS_CRYPTO_VALIDATION_PASS` from successful verifier completion
+before socket creation only when that stage is independently exposed; otherwise it records the verifier as a
+single `MTLS_VERIFIER_PASS` observation. It derives `MTLS_HANDSHAKE_PASS` from the explicit handshake-success
+output plus negotiated `TLSv1.3`, and records the HTTP status separately. `200 OK` is application health
+success; `401 Unauthorized` proves TLS/SNI reached the HTTP layer but is NOT an authenticated health pass.
+`PANEL_WORKER_AUTH_PASS` requires independent evidence of an authenticated Panel-to-Worker exchange and
+MUST NOT be inferred from the local verifier's HTTP response.
+
+---
+
+### D4: Xray Client Config Construction
+
+**Chosen:** The runner constructs a minimal temporary Xray client config file per endpoint: one outbound
+(extracted from the real subscription), one SOCKS5 inbound with a unique local port, and mandatory `log`
+and `routing` sections. The config is written to a `tempfile.NamedTemporaryFile` with mode `0600`, the Xray
+process is started, the runner waits for the SOCKS5 port to become connectable (bounded poll), traffic test
+runs, then Xray is terminated and the temp file is deleted. When `ACME_MODE=staging`, the client trusts the
+specific Let's Encrypt Staging CA chain through a scoped CA bundle. `allowInsecure: true` is prohibited even
+for disposable tests because it disables server identity verification and can conceal SNI/certificate errors.
+
+**Rationale:** The subscription endpoint returns a JSON structure that may be an outbound-only fragment, not
+a standalone `xray run`-compatible config. Building the wrapper config ensures `xray run -test` and `xray run`
+both work correctly regardless of the subscription format.
+
+**Alternatives considered:** Direct `xray run -c <subscription.json>` — rejected because subscription format
+is not guaranteed to be a complete standalone config.
+
+---
+
+### D5: Per-Case Packet-Capture Evidence and Egress Verification
+
+**Chosen:** Every Xray and Mihomo proxy request is bracketed by simultaneous inbound `tcpdump` captures on
+Master and Worker. The capture filter names only the exact destination port of the tested proxy endpoint and
+excludes the target's SSH destination port; it deliberately names no source address. Each remote capture has a
+45-second hard lifetime.
+
+Attribution is decided after the capture from the source addresses tcpdump actually observed, compared against
+the control machine's IPv4 as each target reports it on the runner's own SSH session (`SSH_CONNECTION`). A public
+echo service is not an acceptable substitute for that address: VPN split tunnelling and carrier-grade NAT pools
+answer different destinations, and sometimes different flows, from different public addresses, so a filter or a
+comparison built from an echo-service value can match none of the packets that actually arrive.
+
+A case is PASS only when all conditions hold:
+1. The intended VPS captures at least one matching inbound TCP packet.
+2. The other VPS captures zero matching inbound TCP packets (offload detection).
+3. The client-observed egress IPv4 equals the expected egress address of the intended VPS.
+
+Missing `tcpdump`, targets that do not report the control machine's IPv4, invalid endpoint port, or a
+missing/invalid capture summary yields INCOMPLETE. An empty capture, or one whose every packet came from an
+address other than the reported control IPv4, is also INCOMPLETE and records the addresses it did see
+(`observed_other_sources`): that proves the filter or the NAT mapping moved, not that the connection leaked.
+Aggregate `/proc/net/dev` counters are not a fallback and cannot produce PASS. Only packet counts, source-address
+metadata, and evidence metadata are persisted; no PCAP or payload is stored. This attribution requires both VPS
+instances to report the same control-machine IPv4; otherwise every case is INCOMPLETE, not PASS.
+
+**Rationale:** Default GoWave Xray templates do not enable the Xray Stats API. The public NGINX stream listener
+is shared by SNI-routed transports, so packet evidence proves traversal to the intended VPS but not by itself
+which protocol was selected. Protocol identity is established by the client runtime and successful request;
+server-side ingress is an independent host-traversal check.
+
+**Rationale:** A client-only egress check can be fooled if Master relays traffic. Server-side packet evidence
+combined with egress IP matching confirms the traffic genuinely traversed Worker, not Master.
+
+---
+
+### D6: Redaction Architecture
+
+**Chosen:** A `redaction.py` module maintains a runtime set of sensitive string patterns (populated from
+config values: secrets, tokens, shortUuid, subscription endpoint URLs). All log writes, SSH stdout/stderr,
+and subprocess output pass through `redact(text)` before being written to any file or emitted to console.
+Artifact files that could contain mixed content (e.g., API summaries) are written via a redact-on-write
+wrapper.
+
+**Pattern sources:** `ADMIN_PASSWORD`, `SCOPED_API_TOKEN`, `SECRET_KEY` (read from Master), `shortUuid`,
+raw subscription URLs, JWT tokens (detected by pattern), private key PEM blocks.
+
+---
+
+### D7: Parallel vs Sequential Phase Execution
+
+**Chosen:** Sequential execution with explicit phase checkpoints. Each phase is recorded with start time,
+end time, and status before the next begins.
+
+**Rationale:** Phases have hard dependencies (Worker must be deployed before mTLS can be verified; mTLS must
+pass before Panel API audit makes sense). Parallel execution would complicate error attribution and teardown
+ordering. The total run time is dominated by installation and certificate issuance, not Python computation.
+
+---
+
+### D8: Run-Level Locking
+
+**Chosen:** Use both a local process lock and authoritative remote locks; a local-only lock is not sufficient
+to protect a shared VPS pair from two different Control Machines.
+
+1. The Control Machine acquires a per-target local `fcntl.flock(LOCK_EX | LOCK_NB)` in a private runtime
+   directory owned by the runner user (directory mode `0700`, lock file mode `0600`, opened without following
+   symlinks). This prevents duplicate runner processes on one Control Machine.
+2. Before any deployment or fault-injection mutation, acquire an authoritative kernel `flock` on both
+   target VPS hosts at `/run/lock/gowave-managed-mutation.lock`. Acquire the two host locks in deterministic
+   address order; if either acquisition fails, release the first and abort before remote modification.
+   Hold each lock through a dedicated non-PTY SSH session for the complete run/partial operation. The
+   remote SSH session is the lock holder; use bounded SSH keepalives and treat loss of either lock-holder
+   session as loss of exclusivity.
+3. The remote lock file may remain after release: lock ownership is determined by the kernel `flock`, not
+   file existence. Never remove a lock file to force acquisition. A contender that cannot acquire either
+   lock fails closed. The lock owner metadata (run ID, Control Machine identity, start time) is informational
+   only and MUST NOT override a held kernel lock.
+4. If either remote lock-holder session is lost during a run, stop starting new mutating phases and do not
+   silently reconnect and continue without reacquiring both locks and validating the saved run state. Outside
+   an already executing `RESTORE_SNAPSHOT` teardown, this is a terminal `INCOMPLETE` condition. During that
+   declared teardown only, loss caused by snapshot reboot is an expected interruption: keep teardown
+   non-passing and wait for the restore hook to confirm both resources. Because the hook may reboot only one
+   VPS, the other host's original SSH holder may still own its kernel lock. Before reacquiring the pair, the
+   runner MUST explicitly close/release **both** original holder sessions (including any surviving session),
+   confirm their termination, and then acquire a fresh pair in deterministic address order. It MUST NOT open
+   a replacement holder on a host while its previous holder from the same run may still hold that lock.
+   If another controller acquires either lock during this release/reacquisition window, release any lock
+   already reacquired and fail teardown closed as `TEARDOWN_FAILED`; do not bypass or steal the contender's
+   lock. Validate saved run identity and clean baseline while the new pair is held before finalizing teardown.
+   Failed reacquisition or validation remains `TEARDOWN_FAILED`; no other phase may resume.
+
+**Rationale:** A lock under `/tmp` on the Control Machine only serializes processes on that one machine.
+Two operators or CI runners on different hosts could otherwise mutate the same Master or Worker at once.
+Authoritative locks on both VPS hosts coordinate all controllers that use the target machines; deterministic
+acquisition order prevents lock-order deadlocks. The local lock remains a cheap first-line guard.
+
+---
+
+### D9: Reproducible ACME Staging CA Trust on Control Machine
+
+**Chosen:** When `ACME_MODE=staging`, the runner builds a per-run CA bundle from the Control Machine's
+complete default public CA bundle plus a version-controlled set of Let's Encrypt Staging self-signed root
+certificates. Staging roots are test-only trust anchors: they MUST NOT be installed in or appended to the
+Control Machine's system-wide trust store, a browser trust store, or any non-E2E client.
+
+1. The repository MUST vendor exactly the four active Staging root certificates listed by the official
+   Let's Encrypt Staging Environment documentation
+   (`https://letsencrypt.org/docs/staging-environment/`, page last updated 2026-04-10), under
+   `tools/certs/letsencrypt-staging/`:
+
+   | File | Official source URL | Expected subject CN |
+   |---|---|---|
+   | `pretend-pear-x1.pem` | `https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem` | `(STAGING) Pretend Pear X1` |
+   | `bogus-broccoli-x2.pem` | `https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x2.pem` | `(STAGING) Bogus Broccoli X2` |
+   | `yearning-yucca-root-ye.pem` | `https://letsencrypt.org/certs/staging/gen-y/root-ye.pem` | `(STAGING) Yearning Yucca Root YE` |
+   | `yonder-yam-root-yr.pem` | `https://letsencrypt.org/certs/staging/gen-y/root-yr.pem` | `(STAGING) Yonder Yam Root YR` |
+
+2. `tools/certs/letsencrypt-staging/pins.json` MUST contain a versioned entry for each file: exact
+   official source URL, expected subject, and a 64-hex SHA-256 fingerprint calculated over the DER-encoded
+   X.509 certificate (not the PEM text and not the SPKI). No placeholder, dynamically learned, or
+   trust-on-first-use fingerprint is permitted. A runtime load MUST reject a missing, extra, duplicate,
+   malformed, expired, not-yet-valid, non-CA, non-self-signed, wrong-subject, or fingerprint-mismatched
+   certificate and MUST fail preflight before remote modification.
+
+3. Only the four self-signed Staging roots are vendored as trust anchors. Staging intermediates MUST NOT be
+   pinned or added as trust anchors: Let's Encrypt documents that the intermediate set changes and must not
+   be pinned or trusted as a system root. The TLS peer must present the required intermediate chain; a missing
+   or invalid chain fails normal certificate verification. Root updates are never downloaded automatically
+   during a test run.
+
+4. The update procedure is review-gated: compare the official Let's Encrypt Staging Environment page with the
+   current four-root manifest; retrieve changed material only from the exact official URLs above or their
+   replacement links on that official page; verify subject, CA constraints, self-signature and validity;
+   calculate the DER SHA-256 with OpenSSL; update the vendored PEM and `pins.json` together in a PR; and run
+   positive staging-chain plus negative untrusted-CA tests. Retired roots are removed only after the official
+   page no longer lists them as active. A changed source URL or root set requires an explicit design/manifest
+   review, never an automatic fallback.
+
+5. `tools/live_vps/tls.py` MUST always resolve the Control Machine's complete default public CA bundle and
+   fail preflight if it cannot be read in full. Bundle composition is conditional on `ACME_MODE`:
+   - `staging`: verify exactly the four vendored roots against `pins.json` and append those roots to the
+     complete public bundle to create the private per-run combined bundle. A staging-only bundle is forbidden.
+   - `production`: use the complete public CA bundle without adding any Staging roots. Staging roots MUST NOT
+     become trust anchors in production-mode runs, even in the private per-run bundle.
+   Record the source public bundle path and SHA-256; for staging also record the Staging pin-manifest SHA-256
+   and selected certificate subjects in redacted result metadata.
+
+6. Python Panel API calls use `ssl.create_default_context(cafile=<mode-specific-bundle>)`. Every curl request
+   that performs TLS verification, including the HTTPS public egress probe, passes
+   `--cacert <mode-specific-bundle>`. Xray and Mihomo child processes receive
+   `SSL_CERT_FILE=<mode-specific-bundle>` only in their process environment. In staging mode, the exact pinned
+   binaries MUST pass a staging endpoint, an ordinary public-CA endpoint, and an untrusted-CA rejection test;
+   in production mode they MUST pass an ordinary public-CA endpoint and reject an untrusted test CA, without
+   trusting a Staging-only root. `allowInsecure`, `skip-cert-verify`, and equivalent verification bypasses
+   are prohibited.
+
+7. The mode-specific per-run bundle (whether production or staging) is mode `0600`, private to the current
+   run, contains public certificates only, and is removed during local cleanup. In production it contains the
+   complete public CA roots only; in staging it additionally contains only the four verified Staging roots.
+   It MUST NOT be installed in a host-wide trust directory or reused by unrelated processes.
+
+**Rationale:** Let's Encrypt explicitly warns that Staging roots are not audited for ordinary trust and must
+only be added to test-only trust stores. Vendoring the documented roots and pinning their DER fingerprints
+makes the test trust reproducible, reviewable, and independent of a mutable network download while preserving
+ordinary public trust for the E2E clients.
+
+---
+
+### D10: Complete Process argv Observation During Worker Registration
+
+**Chosen:** Do not use periodic `/proc/*/cmdline` sampling or a Bash DEBUG trap as proof: both can miss
+short-lived processes, and shell tracing can itself disclose expanded secrets. On Master, derive a positive
+string-print limit as `STRACE_STRING_LIMIT = 32 * os.sysconf("SC_PAGE_SIZE")`. Linux limits each individual
+`execve` argument/environment string to 32 pages, including its terminating NUL; a positive strace limit
+at that bound is sufficient to print every legal individual string. Do not use `-s 0`: strace interprets
+zero as a zero-character limit, not unlimited output.
+
+Run the exact `gowave-auto.sh node add` process tree on the Master VPS with both string and array abbreviation
+disabled:
+`strace -f -v -s "$STRACE_STRING_LIMIT" -e trace=execve,execveat -o "$RAW_TRACE" -- ...`.
+The `-v` / `--no-abbrev` option is mandatory: it is equivalent to `-e abbrev=none` and prevents
+strace's default structure/array abbreviation from replacing later `argv` elements with an omission marker.
+The positive `-s` limit independently prevents individual argument strings from being truncated. The observer
+MUST capture both `execve` and `execveat` for all descendants of the local `gowave-auto.sh node add`
+process on Master, including the local SSH client process. This is a Master-side observation only:
+it does not trace the remote Worker shell/process tree after the SSH boundary and MUST NOT be represented as
+proof about Worker-side argv. If page size cannot be determined, the computed limit is invalid, the installed
+strace does not support either option, or the complete output cannot be parsed, record `INCOMPLETE`; do not
+use a weaker observer as fallback.
+
+Because `-v` also expands the `envp` vector, the raw trace MUST be treated as containing arbitrary
+environment secrets as well as argv values. The `strace` process, parser, and raw file MUST all execute/remain
+on the Master VPS: store the trace only in a mode-`0600` file inside a private `/run` tmpfs directory (mode
+`0700`), never stream or copy it to the Control Machine, console, logs, or artifacts. Parse the `argv` and
+`envp` fields on Master separately; inspect `argv` for the exact `SECRET_KEY` and known encoded forms, and
+discard `envp` without publishing or logging it. Return to the Control Machine only a sanitized structured
+verdict (status, observer version/options, effective string limit, coverage metadata and timestamps). If the parser cannot unambiguously separate both
+vectors or establish that every `argv` element was decoded, record `INCOMPLETE`. Unlink the raw trace and
+remove the private directory in a guaranteed cleanup path; do not claim secure overwrite on SSD or
+journaled storage. The observer must exit successfully, follow all descendants, and contain no truncated,
+abbreviated, unfinished or unparseable exec records, nor observer errors.
+
+The acceptance tests MUST cover both independent completeness dimensions for both syscall forms:
+(a) a sentinel after byte 32 of a long argument, and (b) a sentinel in the final element of an argv vector
+containing at least 128 arguments. The parsed trace MUST contain the complete sentinel and every argv
+element, with no strace omission marker. A trace that only passes the long-string test but omits later array
+elements MUST fail acceptance and can never produce a live `PASS`. The report stores only `PASS`/`FAIL`,
+observer version, effective string limit, selected options, coverage limitations and timestamps.
+
+**Rationale:** `-s` controls the maximum printed size of each string, while `-v` disables strace's
+default abbreviation of structured syscall arguments. Both are required for a complete `argv` observation.
+The expanded raw trace can contain environment secrets, so it is strictly ephemeral. This verifies argv only;
+it does not prove absence from process environment, stdin, memory or files.
+
+---
+
+### D11: Operational Lifecycle and Disposable Baseline Policy in v1
+
+**Chosen:** v1 accepts only operator-provisioned disposable VPS instances and has no built-in cloud
+provider adapter. The runner accepts one mutually exclusive `TEST_TEARDOWN_POLICY` value: `PRESERVE`
+(default) or `RESTORE_SNAPSHOT`; `DESTROY` is rejected during preflight before any remote modification.
+`PRESERVE` leaves both VPS running and retains diagnostics after both successful and failed runs; no uninstall
+is implied.
+
+`RESTORE_SNAPSHOT` is supported only through an explicit operator-supplied restore hook on the Control Machine.
+It requires `MASTER_SNAPSHOT_ID`, `WORKER_SNAPSHOT_ID`, an absolute `SNAPSHOT_RESTORE_HOOK` path, and a
+matching `SNAPSHOT_RESTORE_HOOK_SHA256`. Preflight verifies that the absolute hook path is not a
+symlink, resolves to a regular executable owned by the runner user or root, is not group/world-writable, and
+matches the pinned SHA256; the digest is checked again immediately before execution. The runner invokes it
+directly with `shell=False` and sends this versioned JSON request
+on stdin:
+```json
+{"schema_version":1,"action":"restore","test_run_id":"...","master":{"address":"...","snapshot_id":"..."},"worker":{"address":"...","snapshot_id":"..."}}
+```
+The hook must exit zero and return valid JSON:
+```json
+{"schema_version":1,"status":"RESTORED","master":{"snapshot_id":"...","restored":true},"worker":{"snapshot_id":"...","restored":true}}
+```
+Both returned snapshot IDs must exactly match the request. Hook stdout/stderr are captured in memory and MUST
+NOT be published verbatim; the operation is bounded by `RESTORE_TIMEOUT`.
+After the hook confirms both resources, the runner reconnects to both VPS. Snapshot restoration may reboot
+only one VPS; therefore, the original holder session on the non-rebooted host may still own its kernel lock.
+The runner MUST close/release both original lock-holder sessions, including a surviving session, and confirm
+that neither remains active before opening replacement holders. It then reacquires the complete pair in the
+same deterministic address order used by preflight. It MUST NOT try to acquire a second lock on a host while
+the first holder from the same run is still alive. If another controller wins either lock during this
+intentional release/reacquisition window, release any lock already reacquired and fail teardown as
+`TEARDOWN_FAILED`; never bypass a contender. It verifies the saved run identity and recollects the Phase 0
+baseline while both replacement locks are held; only then may teardown be recorded `PASS`. The hook's
+`RESTORED` response alone is never teardown success. If either lock cannot be reacquired, the saved run
+identity differs, or the baseline differs, teardown is `TEARDOWN_FAILED`; no further mutating phase may start. Keep both replacement locks through final reporting
+and release them only after the final result is durably written. Missing/invalid hook configuration is a
+preflight `FAIL`; hook timeout, nonzero exit, invalid/mismatched response or failed reconnection also produces
+`TEARDOWN_FAILED`, never a simulated restore success. The hook may use operator-managed provider credentials
+but must not print them.
+
+Boolean policy combinations are not accepted. The runner does not claim that `gowave-auto.sh uninstall`
+restores OS packages, UFW, sysctl, swap/fstab, certificates or unrelated host state. A clean baseline gate is
+mandatory before installation. After `PRESERVE`, the next run requires operator re-image or this verified
+external restore procedure.
+
+**Rationale:** Attempting in-place uninstallation leaves residual files, modified kernel sysctl, and firewall
+state that invalidate clean-room acceptance testing. Clear documentation of this operational cycle prevents
+unexpected Phase 0.7 failures.
+
+---
+
+### D12: Panel API TLS Context and Request Timeout Injection
+
+**Chosen:** Extend `modules/api_client.py`'s `GoWaveClient` constructor compatibly with optional `ssl_context`
+and `timeout` parameters (defaults preserve existing callers). Its `urlopen` call passes the configured timeout
+and SSL context; `panel_api.py` constructs a client for `https://MASTER_PANEL_DOMAIN` with an SSL context built
+from the per-run mode-specific CA bundle (public roots only in production, public plus verified Staging roots
+in staging). Do not use `allowInsecure`, disable hostname verification, or silently fall back to system roots if
+the mode-specific bundle cannot be built. API timeout applies
+to each HTTP attempt; `NODE_READY_TIMEOUT` remains the separate overall polling deadline.
+
+**Rationale:** The current `GoWaveClient` hard-codes `urlopen(..., timeout=15)` and exposes no SSL-context
+injection. The E2E contract requires both a staging-aware trust context and configured `API_TIMEOUT`; those
+cannot be claimed by simply instantiating the current class unchanged.
+
+---
+
+### D13: Partial Run State and Optional Negative Suite Semantics
+
+**Chosen:** A fresh `--mode preflight` without `--run-id` generates a new `TEST_RUN_ID`; it may also accept
+an explicitly supplied unused ID. Preflight performs read-only SSH inspection, stores the baseline manifest,
+and atomically creates a mode-`0600` `run-state.json` under
+`artifacts/live-vps/<TEST_RUN_ID>/run-state.json`. It prints the generated ID for the subsequent command.
+`--mode full` also generates a new ID and executes all phases in one run; it MUST reject an already existing
+run directory rather than overwrite it. The state records only non-secret target/config identity, repository
+commit, baseline-manifest reference, phase statuses and timestamps. It MUST NOT contain passwords, tokens,
+`SECRET_KEY`, `shortUuid`, subscription contents, or hashes of secret values.
+
+Every later partial mode (`install`, `verify`, `traffic`, `negative`, `teardown`) requires `--run-id` and an
+existing matching run-state record. It verifies target addresses, pinned repository commit and non-secret
+configuration identity before proceeding. `install` requires a successful preflight record; `verify` requires
+successful install records; `traffic` requires verification PASS; `negative` requires an installed disposable
+environment; `teardown` requires an existing run and diagnostics/baseline record. A completed phase is not
+repeated implicitly. A mismatch or missing state record fails closed before remote modification.
+
+`TEST_RUN_ID` is a path component, not an arbitrary path. Accept only `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`;
+explicitly reject `.` and `..`, path separators, NUL and any value whose resolved artifact path escapes
+`artifacts/live-vps/`. Reject a pre-existing run directory, symlinked run directory, or symlinked parent path;
+create the directory atomically with restrictive permissions. The same validation applies to generated IDs.
+
+`install` requires a successful preflight record and, after reacquiring both remote locks, MUST re-collect the
+baseline/disposable-gate invariants and compare them with the saved preflight manifest before its first remote
+mutation. A stale run-state record or any baseline drift fails closed; it is not enough that the original
+preflight phase once passed.
+
+`TEST_NEGATIVE_SUITE` defaults to `true`. When explicitly false, all 15 negative scenarios are `SKIP` and the
+overall result is at least `INCOMPLETE`; disabling the suite can never yield overall `PASS`.
+
+**Rationale:** The CLI currently lists partial modes but has no durable contract for which run they resume or
+how it prevents a second install from mutating an already provisioned VPS. The config already exposes a
+negative-suite switch, so its effect on the acceptance gate must be normative.
+
+---
+
+### D14: Optional Vision Is an Independent, Fail-Closed Capability
+
+**Chosen:** VLESS XTLS Vision is optional and configured independently per VPS. Either
+`MASTER_VISION_DOMAIN`, `WORKER_VISION_DOMAIN`, both, or neither may be set. A configured Vision domain
+adds one endpoint and one inbound only to its corresponding VPS. The default topology has eight logical
+endpoints and sixteen client/runtime cases; one-sided Vision has nine endpoints and eighteen cases; Vision
+on both VPS has ten endpoints and twenty cases. Each domain remains subject to global FQDN uniqueness and
+host-specific DNS/certificate validation.
+
+For each host independently, when its corresponding Vision domain is configured:
+
+1. Master installation MUST issue and cryptographically verify the Vision certificate in addition to the
+   Panel and REALITY certificates before compiling/provisioning the Master profile. The current best-effort
+   suppression of Vision Certbot/certificate-verification failures (`|| true`) MUST be removed for this E2E
+   path. A missing, wrong-ACME-lineage, expired, or hostname-invalid Vision certificate fails Master
+   installation; implementation MUST record which requested-domain lineages existed before the transaction.
+   Cleanup may remove only lineages created by the failed transaction. If Certbot changes a pre-existing
+   lineage, the implementation MUST restore its pre-install certificate, key, and renewal configuration from
+   a securely permissioned transaction snapshot; if safe restoration cannot be guaranteed, fail before
+   issuance. The rollback test MUST prove that no pre-existing lineage or unrelated certificate is lost and
+   no partial Vision profile, certificate consumer, or NGINX route remains active. The runner MUST NOT report
+   a partial four-inbound Master as successful Vision-enabled installation.
+2. `gowave-auto.sh node add` MUST receive the Worker Vision domain through an explicit named
+   `--vision-domain` option (not by shifting the existing optional SSH-user/SSH-port positional arguments).
+   It validates the domain, includes it in the Worker API profile via `compile_config_profile(...,
+   vision_domain=...)` and `provision_hosts(..., vision_domain=...)`, and records it in `state.json`.
+3. `gowave-node-auto.sh remote_payload` MUST serialize the Worker Vision domain over SSH stdin. Before
+   issuing the third certificate, the Worker HTTP-01 bootstrap server's `server_name` MUST include
+   `WORKER_VISION_DOMAIN` as well as the mandatory Worker and REALITY domains; the challenge path MUST resolve
+   to the same webroot for all three names. Worker installation MUST issue and verify its Vision certificate
+   using the same selected `GOWAVE_ACME_SERVER` as its Panel/REALITY certificates and validate the matching
+   renewal lineage. The NGINX stream map routes Vision SNI to `127.0.0.1:8444`; the Xray Vision fallback
+   template sends non-VLESS HTTP traffic to `127.0.0.1:9444` with PROXY protocol (`xver: 1`). Worker MUST
+   create a loopback-only cleartext HTTP decoy vhost on `127.0.0.1:9444` with `proxy_protocol` enabled,
+   serving the managed cover-reality content and never the GoWave Panel/API. `nginx -t` MUST pass before
+   activation/reload. Any requested Vision prerequisite failure fails the Worker phase.
+4. Worker failure compensation MUST account for all Worker certificate and Vision artifacts: record the
+   pre-transaction presence/identity of the Worker, REALITY and optional Vision lineages; remove only lineages
+   created by this transaction, and restore any pre-existing lineage changed by Certbot from a secure snapshot.
+   The same ownership rule applies to bootstrap names, renewal metadata, stream-map entries, the 9444 vhost,
+   generated inbound/profile/host state and deploy-hook effects. The host-global
+   `gowave-nginx.sh` deploy hook MUST follow D17 ownership checks: a pre-existing hook blocks the disposable
+   run; rollback may remove only a hook created by and still matching this transaction. Rollback MUST restore
+   a valid NGINX configuration before reload and MUST NOT delete unrelated resources. If ownership or
+   restoration cannot be proven, fail closed and report cleanup incomplete. The Master orchestrator MUST
+   check and record both remote Worker rollback and Panel API rollback results; it MUST NOT suppress a failed
+   `remote_rollback` with `|| true`. If either compensation fails, preserve the recovery journal, mark
+   rollback incomplete and force the E2E run to `INCOMPLETE`; only verified success of both sides is rollback PASS.
+5. Panel API acceptance MUST verify four core inbounds and corresponding hosts per node, plus one additional
+   inbound/host only on each VPS whose Vision domain is configured. The subscription MUST expose one Vision
+   proxy for each configured Vision domain, and Xray and Mihomo MUST exercise each such endpoint independently.
+6. When a host's Vision domain is absent, that host retains its default four-inbound topology: no Vision
+   certificate issuance, no Vision SNI route/fallback, and no Vision subscription endpoint. The other host's
+   independently configured Vision endpoint remains enabled.
+
+**Rationale:** The current Master installer suppresses Vision certificate issuance/verification errors, while
+the current Worker dispatch does not propagate the Vision domain into Worker API provisioning or Worker
+certificate issuance. Treating Vision as active after either partial path can create mismatched Master/Worker
+profiles, missing TLS material, or an advertised proxy that cannot accept traffic. Host-specific validation and
+fail-closed activation make the sixteen-, eighteen-, or twenty-case test matrix deterministic.
+
+---
+
+### D15: ACME Lineage Snapshot Ownership and Recovery
+
+**Chosen:** Before any Certbot command may reuse, renew, replace, or delete a requested-domain lineage, the
+installer records whether that lineage existed before the transaction. For an existing lineage, it snapshots
+the complete recoverable state on the same VPS under
+`/var/lib/gowave-auto-nginx/recovery/<transaction-id>/acme/<domain>/`: the renewal configuration, live symlink
+targets, archive certificate and private-key bytes, ownership, and file modes. Snapshot directories MUST be
+owned by root with mode `0700`; regular snapshot files containing private keys MUST be root-owned mode `0600`.
+The snapshot MUST NOT be copied to the Control Machine, runner artifacts, CI artifacts, logs, or reports.
+
+On successful installation, the snapshot is removed only after the transaction is committed and all certificate
+consumers, renewal configuration, and NGINX health checks have passed. On failure, rollback restores the complete
+pre-transaction state and verifies the restored bytes, symlink targets, ownership, and modes; only lineages
+recorded as absent before the transaction may be removed as transaction-created. If restoration cannot be
+verified, the snapshot is retained for operator recovery and the transaction/teardown is reported incomplete.
+The same ownership and recovery protocol applies to Master and Worker and to Panel, REALITY, and optional Vision
+domains.
+
+**Rationale:** Certbot can reuse an existing same-directory lineage, and a later failure must not cause broad
+rollback code to delete a certificate and private key that pre-dated the current deployment transaction.
+
+---
+
+### D16: Scoped CA Trust for Master Installer TLS/SNI Verification
+
+**Chosen:** `gowave-auto.sh:verify_public_tls_sni` currently invokes OpenSSL with the system
+`/etc/ssl/certs` CA path. That check is incompatible with `ACME_MODE=staging`: Let's Encrypt Staging roots are
+not part of ordinary system trust and MUST NOT be installed there. For E2E invocations, the runner MUST stage
+the exact mode-specific CA bundle built by D9 on Master in a root-owned mode-`0700` directory under `/run`,
+with a root-owned mode-`0600` bundle file, and pass its path as `GOWAVE_TLS_CA_FILE`. When that variable is set,
+`verify_public_tls_sni` MUST use OpenSSL `-CAfile "$GOWAVE_TLS_CA_FILE"` while retaining
+`-verify_return_error` and `-verify_hostname`; it MUST NOT fall back to the system CA path on an error. The
+same optional override applies to `domain-change`. When unset, legacy callers retain the existing system
+`-CApath` behavior. The runner removes the remote bundle on both success and failure; it is never copied to
+system trust stores, kept in persistent state, or included in artifacts. Production mode uses the complete
+public-CA bundle; staging mode uses the same bundle plus the four validated Staging roots.
+
+**Rationale:** Master installation calls `verify_public_tls_sni` after certificate issuance, and domain change
+calls it after certificate replacement. Without a scoped trust override, a valid staging certificate fails
+that local OpenSSL probe because the staging roots are intentionally absent from system trust.
+
+---
+
+### D17: Ownership of the Host-Global Certbot Deploy Hook
+
+**Chosen:** `/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh` is a host-global Certbot deploy hook,
+not a per-domain ACME lineage file. Certbot may execute it after renewal of any certificate on that host.
+The current Master and Worker installers write to this fixed path, while Worker rollback removes it
+unconditionally. It therefore MUST be handled as a separately owned host resource on both VPS.
+
+1. Before the first remote mutation, inspect the exact hook path on Master and Worker. If the path exists
+   (including a symlink, directory, or non-regular object), fail the disposable-baseline gate unless the
+   runner can prove that the object was created and is still owned by the same active E2E transaction.
+   Do not overwrite, follow, or delete an unowned object. Validate the parent directory and its permissions
+   before writing.
+2. When the current transaction creates the hook, record in the host-local recovery journal that the path
+   was absent and that this transaction owns the new file. Create it atomically in the same directory with
+   root ownership and mode `0755`; do not follow symlinks. Record the resulting file identity and SHA-256
+   so cleanup can distinguish the transaction's file from a later replacement.
+3. On failed installation or compensation, remove the hook only when the journal proves this transaction
+   created it and the current regular file still matches the recorded identity and digest. If it was replaced,
+   modified, or cannot be safely inspected, preserve it, retain recovery state, and report cleanup incomplete.
+   Never issue an unconditional `rm -f` for this shared path.
+4. On successful commit, retain the newly installed GoWave hook as an owned deployment resource. Any later
+   managed removal may delete it only after validating the same ownership record and current identity/digest.
+   A pre-existing unrelated hook is never replaced or removed. The same rules apply independently on Master
+   and Worker.
+5. Tests MUST cover a pre-existing sentinel hook (preflight rejects without changing bytes, mode, owner, or
+   symlink target), a transaction-created hook removed after a later injected failure, a modified/replaced hook
+   preserved during rollback with an incomplete-recovery result, and successful commit retaining the new hook.
+
+**Rationale:** The ACME lineage snapshot in D15 captures per-domain renewal/certificate material, but it does
+not cover this shared hook. Treating the hook as lineage state would miss a global side effect and could
+silently disable an unrelated renewal workflow.
+
+---
+
+
+### D18: One Shared Mutation Lock for the Runner and Lifecycle Commands
+
+**Problem:** D8's remote lock currently uses a separate path from the existing lifecycle manager. The
+current gowave-auto.sh acquires /run/lock/gowave-auto.lock, while the E2E design acquires a different
+lock; gowave-node-auto.sh remote_payload and remote_rollback do not participate in the E2E lock at
+all. A normal operator command can therefore mutate the same VPS while the E2E runner believes it has
+exclusive access. A pair of locks only coordinates processes that actually honour the same lock contract.
+
+**Chosen:**
+
+1. Use one canonical host-wide mutation lock on both VPS:
+   /run/lock/gowave-managed-mutation.lock. The existing Master lifecycle commands, Worker remote
+   entrypoints, E2E runner, recovery and restore paths MUST all use this same kernel flock; a second
+   lock file is not an equivalent substitute.
+2. All host-mutating entrypoints MUST participate, including gowave-auto.sh install, node add,
+   node rollback/remove, domain-change, channel switching, uninstall, backup restore and recovery,
+   plus gowave-node-auto.sh remote_payload and remote_rollback. Read-only status commands need not
+   acquire the exclusive lock. New mutation entrypoints inherit this requirement.
+3. The E2E runner MUST retain the original kernel lock holders throughout the run. It MUST NOT release
+   the lock merely to invoke a child installer or rollback command. Define a narrowly scoped re-entrant
+   operation lease for runner-owned child commands: the lease is generated only while the holder owns the
+   kernel lock, is bound to the run ID, target host and live holder identity, is stored root-only under
+   /run, and is delivered to the child through stdin (never argv, environment dumps, logs or artifacts).
+   The common lock helper validates both the live holder and the lease before allowing the nested command.
+   A run ID or environment flag alone is not authorization; there MUST NOT be a general --force or
+   environment-variable bypass. Ordinary operator invocations without the matching live lease fail before
+   their first mutation.
+4. Open the lock path without following symlinks and validate with lstat/fstat that it is a regular
+   root-owned file with mode 0600, beneath a root-owned non-symlink lock directory. Reject hard-link or
+   path substitution, unsafe parent directories, and unexpected owner/mode/type. Never unlink the lock
+   file to reset a lock; kernel lock ownership, not file existence, determines exclusivity.
+5. Losing either holder or invalidating its owner lease stops all new mutations. The runner cannot resume
+   until it reacquires both locks and validates the saved run identity and baseline.
+
+**Required tests:** while an E2E pair lock is held, invoke each representative Master and Worker mutation
+entrypoint from a second process/session and prove it fails before mutation; prove the E2E child lease can
+run the intended nested command without releasing the lock; prove a second Control Machine still cannot
+acquire either host; reject symlink, wrong-owner, wrong-mode and non-regular lock paths; test holder
+disconnect and lease replay after holder termination.
+
+**Rationale:** A lock held only by the E2E runner does not stop the existing installer, a manual rollback,
+or another administrative path. The test's claim of exclusive host ownership is valid only when every
+supported mutation path participates in the same lock protocol.
+
+
+### D19: Complete Baseline and Ownership for Every Mutated Host Resource
+
+**Problem:** The disposable gate inventories GoWave directories, services and ports, but rollback also
+writes/removes system paths and host policy that are not implied by those checks. For example, Worker
+configure_host_security() tests whether /etc/sysctl.d/99-gowave-node.conf exists to set an ownership
+flag, then redirects output to that path unconditionally. If the file already exists, its bytes are
+overwritten while the flag remains false, so the trap does not restore it. Worker rollback also removes
+systemd units/drop-ins, Xray binaries, NGINX files, the global Certbot hook and the sysctl file without
+proving that the current transaction owns each object. UFW defaults/rules are mutated without a complete
+before-image.
+
+**Chosen:**
+
+1. Before any remote mutation, build a host-local baseline inventory for every path, directory, symlink,
+   service/unit, binary, certificate lineage, NGINX include, firewall rule/policy and kernel setting that
+   the selected Master/Worker install or rollback path can write, replace, enable, disable or remove.
+   Derive and review this inventory against the exact pinned repository commit; it is not sufficient to
+   check only that GoWave is not currently running or that its expected ports are free.
+2. At minimum, cover the actual Master and Worker targets, including the managed NGINX bootstrap/vhost/
+   stream files and nginx.conf include mutation; /etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh
+   and all requested live/archive/renewal lineages; Worker
+   /etc/sysctl.d/99-gowave-node.conf, systemd units and drop-ins
+   (gowave-node.service, remnanode.service), /opt/gowave-node, /run/gowave-node,
+   /opt/remnanode, /usr/local/bin/gowave-node, /usr/local/bin/xray,
+   /var/www/gowave-acme, /var/www/gowave-auto-nginx/cover-reality, /swapfile and /etc/fstab,
+   and UFW enabled state, default policies and complete rule set.
+3. Inspect paths with no-follow metadata operations, including broken symlinks and non-regular objects.
+   For each target, record one of: ABSENT (the transaction may create it and then records identity/digest),
+   PREEXISTING_SNAPSHOT (a complete same-host before-image is captured and can be restored), or
+   REJECTED (the runner cannot safely own or restore it). Unknown or unreadable state fails preflight.
+   A pre-existing file MUST NOT be overwritten merely because its corresponding service is inactive.
+4. Use write-ahead ownership records before the first mutation. Capture bytes or recursive content as
+   appropriate, symlink targets, file type, inode/device identity, owner, group, mode, ACL/xattrs where
+   applicable, and digest. Create new files atomically. If a resource is pre-existing and exact restoration
+   is not implemented and tested, reject the baseline rather than proceeding.
+5. Snapshot complete UFW state: enabled/disabled status, IPv4/IPv6 rule sets, default policies and relevant
+   backend state. Either require a provably pristine supported firewall baseline or restore the exact
+   before-image. Deleting a few rules added by the script is not an equivalent rollback because it can
+   leave changed default policies or remove a pre-existing duplicate rule.
+6. Include package-manager side effects in the baseline and transaction record: package
+   versions installed/upgraded, apt source configuration changed, service units/drop-ins and defaults created
+   by package post-install scripts, and relevant package state. The normal compensation path MUST NOT blindly
+   purge dependencies because that can remove unrelated shared packages. Under PRESERVE, such package
+   changes are explicit retained residuals; report them in the result and never claim the original OS
+   baseline was restored. A later run requires the re-image or verified RESTORE_SNAPSHOT path from D11.
+7. On compensation, restore a pre-existing resource only if its current state is still attributable to this
+   transaction; if an external actor changed/replaced it, preserve the current object and report incomplete
+   recovery. Verify the restored bytes, link targets, metadata, firewall policy, service state and effective
+   sysctl values before reporting cleanup PASS. Do not use an ownership flag that records created-by-us
+   while still truncating an existing file.
+
+**Required tests:** seed sentinels at each class of target path (including the existing sysctl filename,
+systemd unit/drop-in, Xray symlink/binary, NGINX include, webroot, and deploy hook); verify preflight rejects
+or records a full restorable pre-image before any write. Seed custom UFW defaults/rules and prove they are
+either rejected or restored byte-for-byte/effectively. Inject failure after each write and verify exact
+baseline restoration; replace a transaction-owned path during rollback and verify it is preserved with
+incomplete recovery. Include broken symlinks and directories at file targets.
+
+**Rationale:** A VPS may have no running GoWave service and still contain unrelated system configuration.
+A disposable check based only on services, ports and familiar application directories cannot justify broad
+rm, redirection, firewall or systemd cleanup.
+
+
+### D20: Signal-Safe and Verifiable Remote Compensation
+
+**Problem:** The Worker payload installs an ERR trap for compensation, but its EXIT/HUP/INT/TERM
+trap currently only unsets secret variables and removes temporary verifier/installer files. It does not
+invoke compensation or explicitly terminate on a signal. A disconnect or operator interrupt can therefore
+leave a partially mutated Worker without the normal rollback path. In addition, the standalone Worker
+rollback uses broad path deletion and best-effort commands, and the Master dispatch currently suppresses
+the remote rollback exit status with an unconditional success fallback. An attempted cleanup is not
+evidence that cleanup completed.
+
+**Chosen:**
+
+1. Create a root-only host-local transaction journal before the first Worker mutation. It includes the
+   E2E run ID, transaction ID, target identity, ownership/pre-image references and a write-ahead record for
+   each resource/action. The journal is durable and independently recoverable after the Control Machine or
+   SSH connection disappears.
+2. Define explicit handlers for HUP, INT and TERM: stop starting new mutations, persist the interruption
+   and invoke the same idempotent compensator exactly once, then exit with a non-zero signal-derived
+   status. An EXIT handler performs final secret/temp-file cleanup and invokes recovery only when the
+   journal is still uncommitted and compensation has not completed. Do not assume an ERR trap covers
+   signals, ignored-error contexts (if, OR-list), function boundaries or an abruptly killed remote process.
+   SIGKILL, kernel panic and power loss are not catchable: on the next authenticated Worker management or
+   recovery invocation, inspect the durable journal and reconcile every uncommitted transaction before
+   allowing a new mutation. A stale journal is never silently ignored or overwritten.
+3. Make remote_rollback transaction-scoped: it consumes the matching host-local journal and the D19
+   ownership manifest. Without a matching uncommitted transaction and validated target identity it fails
+   closed. It MUST NOT act as a generic set of unconditional rm -rf commands against fixed system paths.
+   A deliberate standalone deprovision operation must use its own explicit, validated deployment-ownership
+   record and confirmation contract.
+4. Record each compensation step as attempted, exit status, observed final state and verification result.
+   Return a sanitized versioned result to Master containing schema_version, run_id, transaction_id,
+   status (ROLLED_BACK or INCOMPLETE) and per-resource results. Exit zero only when every required
+   action is verified; any failed deletion/restoration, failed nginx -t/reload, systemd state mismatch,
+   firewall/sysctl mismatch or unknown ownership returns non-zero and retains the journal/snapshots.
+   Best-effort diagnostics may continue after an error, but MUST NOT convert that error into rollback PASS.
+5. Master orchestration MUST collect and independently validate both the Worker compensation result and the
+   Panel API rollback result. It MUST retain both recovery records if either side is incomplete, set the
+   overall deployment/teardown state to INCOMPLETE, and MUST NOT write a rolled-back/committed terminal
+   state based on only one side succeeding. No unconditional success fallback may suppress a required
+   compensation result.
+
+**Required tests:** interrupt the remote payload with HUP, INT and TERM after each mutation boundary;
+send SIGKILL after a write-ahead journal update and prove the next invocation recovers before new mutation;
+simulate SSH loss, kernel/process termination and reboot; make each cleanup operation fail in turn (including
+Certbot, NGINX validation/reload, systemd, UFW and sysctl); force Worker rollback success/API rollback failure
+and the inverse; corrupt or mismatch the journal/run identity; rerun compensation after partial completion.
+Only a fully verified, idempotent compensation may return zero. The report must separately state whether the
+managed transaction was compensated and whether the complete original OS baseline was restored; retained
+package-manager side effects under PRESERVE MUST NOT be represented as baseline restoration.
+
+**Rationale:** The E2E runner uses destructive fault injection on disposable hosts. It must distinguish
+rollback attempted from original state restored; otherwise it can produce a false-clean result immediately
+before the VPS is reused.
+
+
+### D21: IPv6 DNS Must Match the Effective Listener Policy
+
+**Problem:** The runner's current plan checks AAAA records only when ENABLE_IPV6=true, but both current
+installers decide whether to add an IPv6 NGINX listener from the host's /proc/net/if_inet6 state, not
+from the runner's ENABLE_IPV6 setting. A published AAAA record can therefore be served or selected by
+clients/ACME even when the runner silently skips IPv6 verification.
+
+**Chosen:** Resolve and record A, AAAA and CNAME chains for every configured Panel, REALITY and optional
+Vision FQDN through at least two independent resolvers. All published address records must be accounted
+for. With ENABLE_IPV6=true, each FQDN's complete AAAA set must resolve only to its configured target
+MASTER_IPV6 or WORKER_IPV6, and those addresses/listeners/firewall paths must be verified. With
+ENABLE_IPV6=false, any published AAAA record is a preflight failure; the operator must remove it or
+explicitly enable and validate IPv6. Never ignore an AAAA record merely because the test flag is false.
+Reject CDN/proxy CNAME chains and unexpected extra A/AAAA answers under either mode.
+
+**Required tests:** correct and incorrect AAAA sets in both modes, mixed correct+foreign A/AAAA answers,
+resolver disagreement, CNAME-to-proxy responses, and proof that no remote mutation occurs on a DNS
+mismatch.
+
+**Rationale:** DNS and the actual NGINX listener policy must describe the same public surface. An untested
+IPv6 route invalidates the claim that the endpoint set and firewall surface are fully verified.
+
+## Runner Module Structure
+
+```
+tools/
+  test_live_vps.py          # CLI entrypoint, phase orchestration
+  live_vps/
+    __init__.py
+    config.py               # Whitelist env parser, validation, type coercion
+    redaction.py            # Runtime redaction registry and filter
+    ssh.py                  # SSH/SCP subprocess wrapper (no secrets in argv)
+    dns.py                  # DNS A/AAAA/CNAME verification via dig/getent
+    preflight.py            # Control Machine tools, baseline, disposable gate
+    deployment.py           # Master install, Worker node add, version capture
+    mtls.py                 # mTLS verification wrapper (calls verify_node_mtls.py)
+    panel_api.py            # GoWaveClient wrapper for E2E (real Panel, no mock)
+    subscriptions.py        # shortUuid retrieval, Xray JSON, Mihomo YAML fetch+verify
+    firewall.py             # UFW isolation checks, DROP confirmation, egress IP
+    nginx.py                # SNI routing, decoy, PROXY protocol, nginx -t
+    traffic.py              # Xray/Mihomo client process management, SOCKS5, egress
+    negative.py             # Negative scenario orchestration (NEG-01..NEG-15)
+    teardown.py             # Preserve / snapshot restore / destroy policy
+    reporting.py            # result.json, JUnit XML, summary.txt writers
+```
+
+---
+
+## Phase Execution Flow
+
+```
+Phase 0: Preflight
+  0.1  Config load + validate (whitelist parser, reserved IP rejection)
+  0.2  Acquire the local per-target `fcntl.flock` in the private runtime directory
+  0.3  Control Machine tool check (python3, ssh, openssl, curl, dig, xray, mihomo)
+  0.4  Local controller verifies each SSH host-key fingerprint against the provider console before hidden root-password authentication; bootstrap temporary per-host Ed25519 keys and host-specific known_hosts pins; verify root identity before mutation
+  0.5  Reject identical MASTER_IP/WORKER_IP and duplicate configured FQDNs; validate each independently configured Vision domain and its host-specific A/AAAA answers across all configured domains, using 2+ resolvers
+  0.6  Baseline snapshot (systemd, listeners, firewall, GoWave dirs)
+  0.7  Disposable gate (reject if GoWave present or ports occupied)
+  0.8  Port hygiene (11+ required ports checked as free: 80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, 10003; plus 8444 and 9444 only on each VPS whose Vision domain is configured)
+  0.9  Acquire and hold authoritative `flock` sessions on both VPS hosts in deterministic address order;
+       preflight-only runs release them on exit; all mutating phases require both locks
+  0.10 Re-collect the read-only baseline/disposable gate on both hosts while both locks are held; if any
+       invariant differs from the snapshot taken in 0.6, fail before remote modification
+
+Phase 1: Master Installation
+  1.1  After acquiring both remote locks (including in partial `install` mode), re-collect and compare the
+       stored preflight baseline before the first remote mutation; stale or changed baseline → fail closed
+  1.2  Copy pinned repo commit to Master /opt/gowave-auto-nginx; stage the exact D9 mode-specific CA bundle
+       in a root-owned mode-0700 `/run` directory with a mode-0600 file
+  1.3  Run gowave-auto.sh install with `GOWAVE_ACME_SERVER` derived from `ACME_MODE` and
+       `GOWAVE_TLS_CA_FILE` pointing to the staged bundle; set `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1`
+       and provide the pinned Node installer commit + SHA256;
+       when `MASTER_VISION_DOMAIN` is configured, pass `VISION_DOMAIN=MASTER_VISION_DOMAIN` in the
+       controlled environment and require Master Vision certificate issuance/verification to succeed
+  1.4  Verify service states, listeners, TLS certs
+  1.5  Verify credentials file (mode, owner, keys present — values not logged)
+  1.6  Retrieve shortUuid (state.json + API cross-check)
+  1.7  Verify Panel locally and from Control Machine
+  1.8  Install/verify the distribution `strace` package on Master, record `strace -V`, and prove the
+       installed build supports `-f`, `-v`, `-s` and `execveat`; fail before Worker dispatch if unavailable
+  1.9  Record and compare versions (Panel, Node, Node installer commit/hash, Xray server and client,
+       Mihomo, NGINX, OpenSSL, OS/kernel); an unpinned/mismatched component cannot PASS
+
+Phase 2: Worker Deployment
+  2.1  Run `gowave-auto.sh node add worker-1` on Master with the same validated ACME directory and the
+       same Node-installer commit + SHA256 explicitly supplied again for the Worker dispatch; when
+       `WORKER_VISION_DOMAIN` is configured, pass `--vision-domain WORKER_VISION_DOMAIN` as a named option
+  2.2  Verify exit code, state.json, process argv observation (SECRET_KEY not in Master-side argv)
+  2.3  Verify Worker services, listeners, certs, deploy hook, cover-reality SHA256
+  2.4  Poll Panel API isConnected until true (bounded NODE_READY_TIMEOUT)
+
+Phase 3: Public mTLS Verification (execute allowed-source probes from Master)
+  3.1  On Master, run `/opt/gowave/gowave-server rescue --print-secret-key-raw` via the existing
+       `modules/node.sh:extract_secret_key` contract; capture stdout in memory only (not state.json or credentials)
+  3.2  Feed the already-Base64-encoded extractor output unchanged to verifier stdin (do NOT encode it again);
+       the verifier performs one base64 decode. Run it on Master against Worker:3002 and retain raw output only in memory
+  3.3  Parse only actual verifier output: `Payload cryptographic verification PASSED`,
+       `Handshake SUCCESS: TLSv1.3 negotiated`, `Node response: <status line>`, and exit code;
+       never persist derived SNI or payload
+  3.4  Treat 200 as HTTP health success; 401 as TLS/SNI reached HTTP layer but not authenticated health
+  3.5  Verify Panel↔Worker authenticated connectivity independently through Panel API state
+  3.6  Run client-cert rejected / no-client-cert server-side probes from Master
+  3.7  Run wrong-key local client-load test and wrong-server-CA client-verification test separately
+
+Phase 4: Panel API Audit
+  4.1  GET /api/nodes — 2 nodes, correct addresses, 4 core inbounds each plus one only on a host with Vision configured, isConnected
+  4.2  GET /api/config-profiles — 2 profiles, 4 core inbounds each plus one only on a host with Vision configured, computed-config valid JSON
+  4.3  GET /api/internal-squads — Default MVP Squad, 8 core inbound UUIDs plus one per configured Vision domain (8/9/10 total), set equality
+  4.4  GET /api/hosts — 8 core hosts plus one per configured Vision domain (8/9/10 total), all fields verified, REALITY hosts carrying the configured REALITY fingerprint (`firefox` by default) and TLS hosts `firefox`, correct node/inbound associations
+
+Phase 5: Subscriptions
+  5.1  GET /api/users/by-username/default-user → shortUuid
+  5.2  User-Agent policy (empty, absent, Xray UA, Mihomo UA → check actual Panel response)
+  5.3  Fetch Xray JSON (Xray UA), verify 8 core proxy outbounds plus one per configured Vision domain (8/9/10), REALITY outbounds carrying the configured REALITY fingerprint (`firefox` by default) and TLS outbounds `fingerprint: "firefox"`, headers, no server secrets
+  5.4  Validate with xray run -test (temporary wrapper config)
+  5.5  Fetch Mihomo YAML (Mihomo UA), verify 8 core proxies plus one per configured Vision domain (8/9/10), REALITY `client-fingerprint` equal to the configured REALITY fingerprint (`firefox` by default) and TLS transports `firefox`, GEOIP rule, headers
+  5.6  Validate with mihomo -t
+  5.7  Verify Mihomo runtime copy binds all local listeners to 127.0.0.1 on collision-free per-run ports;
+       preserve proxy/rule semantics and reject externally exposed or non-loopback controllers
+
+Phase 6: Firewall
+  6.1  Master: loopback 127.0.0.1:3002 reachable; Control Machine public probe blocked
+  6.2  Worker: establish positive mTLS probe from Master first; record actual Master source IP seen by Worker
+  6.3  Compare observed source IP with the effective UFW allow rule; do not trust a separately queried egress IP alone
+  6.4  Observe the actual Control Machine probe source address on the target VPS and compare it with the
+       Master source address allowed by UFW; if they are equal, the Worker negative probe cannot prove
+       isolation and MUST be `INCOMPLETE` (use a distinct external probe vantage for PASS)
+  6.5  Confirm DROP evidence on the target host: Master evidence for Master external probes; Worker evidence for Control Machine → Worker probes
+  6.6  Repeat equivalent checks over IPv6 when ENABLE_IPV6=true
+
+Phase 7: NGINX SNI + REALITY Decoy (+ Optional Vision)
+  7.1  Panel HTTPS with correct SNI (TLS cert valid, Panel API responds)
+  7.2  Worker HTTPS with correct SNI
+  7.3  REALITY fallback with REALITY SNI + invalid REALITY params (decoy content on 9443, not GoWave API)
+  7.4  Unknown SNI routing (matches NGINX + Xray REALITY fallback behavior)
+  7.5  Optional per-host Vision SNI routing to 8444 and non-VLESS HTTP fallback to decoy on 9444 on each VPS whose Vision domain is configured
+  7.6  nginx -t on both VPS configs
+  7.7  cover-reality unique marker file accessible
+  7.8  PROXY protocol integrity (inferred from correct Panel, Worker, REALITY, and Vision responses)
+
+Phase 8: Data Plane E2E (8/9/10 logical endpoints × 2 client runtimes = 16/18/20 required cases)
+  8.1  Logical endpoint matrix: Master and Worker each have four core protocols; add one Vision endpoint only on each VPS whose Vision domain is configured (8 by default, 9 for one-sided Vision, 10 when both are configured)
+  8.2  For each logical endpoint, run a real Xray client case and a real Mihomo client case using the
+       configured REALITY fingerprint (`firefox` by default) with exactly the pinned `XRAY_CLIENT_VERSION`
+       and `MIHOMO_CLIENT_VERSION` binaries that match the cores GoWave Panel and GoWave Node deploy:
+       - Extract the corresponding proxy from the real subscription
+       - Build/validate a temporary Xray wrapper config; for Mihomo, create a per-run sanitized copy of
+         the real YAML preserving proxy definitions/rules but assigning free loopback-only mixed/SOCKS/
+         redir/controller ports and verifying `allow-lan: false` plus loopback controller binding
+       - Start the actual client process and wait for its selected local proxy listener
+       - Send HTTPS request through the selected proxy; verify HTTP response and observed egress IP
+       - Verify target VPS ingress evidence in an isolated observation window
+       - Stop client and remove temporary configuration
+  8.3  All 16, 18, or 20 cases (according to the number of configured Vision domains) are mandatory for overall
+       PASS. If a client runtime is intentionally disabled, mark its cases SKIP and overall status INCOMPLETE.
+       A syntax-only validation is not a runtime traffic pass.
+
+Phase 9: Negative Tests (NEG-01 .. NEG-15)
+  NEG-01..NEG-04 are isolated preflight contract tests using temporary known_hosts/config fixtures and
+  mocked SSH/DNS responses; never mutate the operator's real known_hosts file, public DNS, or SSH firewall.
+  NEG-05 uses an isolated Certbot failure fixture/failpoint (or an explicitly isolated staging test domain)
+  with guaranteed cleanup; it MUST NOT damage the active control domains or production lineages.
+  NEG-06..NEG-15 run only against confirmed disposable VPS state, with per-case cleanup and baseline checks;
+  any case that cannot restore its required preconditions is INCOMPLETE and stops dependent cases.
+  If TEST_NEGATIVE_SUITE=false, record all 15 as SKIP and force overall INCOMPLETE (never PASS)
+
+Phase 10: Diagnostics Collection
+  SSH dump: OS, packages, systemd, listeners, firewall, nginx -t, cert metadata, API summaries, and the
+  full version/digest inventory required by the result.json schema (Control Machine, Master, Worker).
+  All written via redact-on-write; no plaintext secrets in any file
+
+Phase 11: Teardown
+  Apply configured policy (PRESERVE / RESTORE_SNAPSHOT via the verified external restore hook; DESTROY rejected in v1)
+  v1: RESTORE_SNAPSHOT requires both per-host snapshot IDs and a SHA256-pinned external restore hook; post-restore baseline verification is mandatory
+  Record test outcome separately from teardown outcome; uninstall is not OS baseline restoration
+  Write final result.json, junit.xml, summary.txt
+  Release run-level lock
+```
+
+---
+
+## Trust Boundaries
+
+```
++------------------+       SSH (StrictHostKeyChecking=yes)        +-------------+
+| Control Machine  | ------------------------------------------> | Master VPS  |
+|                  |       pre-pinned known_hosts                 |             |
+|  Runner process  |                                              |  Panel API  |
+|  Xray client     | <--- HTTPS /api/* (Bearer, real Panel) ----> |  :3000      |
+|  Mihomo client   |                                              |             |
+|  ssh subprocess  | <--- HTTPS :443 (subscription, SNI) -------> |  NGINX :443 |
++------------------+                                              +------+------+
+                                                                         |
+                                        SSH stdin pipeline (from Master) |
+                                        mTLS 1.3 rw-v1 (from Master)     v
+                                                                  +-------------+
+                                                                  | Worker VPS  |
+                                                                  |             |
+                                                                  |  Node :3002 |
+                                                                  |  NGINX :443 |
+                                                                  +-------------+
+
+Secrets never cross trust boundaries via argv or log files.
+shortUuid and subscription content redacted in all CI artifacts.
+```
+
+---
+
+## ACME Staging/Production Delta
+
+**Problem:** The production installer currently invokes Certbot without `--server`; the runner's public
+configuration exposes `ACME_MODE`, while the installer contract uses `GOWAVE_ACME_SERVER`. These are two
+interfaces and MUST have one explicit mapping. The same selected directory must reach both Worker certificate
+issuance calls through the `node add` SSH-stdin payload.
+
+**Canonical mapping in the runner:**
+
+| `ACME_MODE` | Exact `GOWAVE_ACME_SERVER` value |
+|---|---|
+| `staging` | `https://acme-staging-v02.api.letsencrypt.org/directory` |
+| `production` | `https://acme-v02.api.letsencrypt.org/directory` |
+
+The runner accepts only the `ACME_MODE` enum and derives the URL itself; arbitrary ACME directory URLs are not
+accepted from the E2E config. The install scripts accept only those two exact URLs when `GOWAVE_ACME_SERVER`
+is set. When the variable is unset outside the runner, existing production-default behavior remains unchanged.
+
+**Propagation contract:**
+1. The runner derives the exact URL once and passes it to `gowave-auto.sh install` and `gowave-auto.sh node add`.
+2. `gowave-auto.sh install` and `domain-change` append `--server "$GOWAVE_ACME_SERVER"` to every Certbot issuance
+   call when set. `install` issues two mandatory lineages (Panel and REALITY) and a third Vision lineage only
+   when the corresponding host's Vision domain is enabled; `domain-change` applies the selected server to every lineage it
+   issues for the domains being changed.
+3. `gowave-auto.sh node add` forwards the same value to `gowave-node-auto.sh remote_payload`.
+4. `remote_payload()` serializes the validated ACME URL and optional Worker Vision domain into the SSH stdin
+   script. Worker issues the two mandatory Worker/REALITY lineages and, when Vision is enabled, a third Vision
+   lineage; every requested Certbot call uses that exact URL. A configured Vision certificate is mandatory,
+   not best-effort.
+5. Before any certificate reuse, Master and Worker validate the renewal lineage's `server` directory URL
+   for every requested domain (including Vision when enabled) against the selected mode. Missing, unknown,
+   or opposite-mode lineage metadata fails closed; do not infer
+   the ACME directory from a generic Let's Encrypt issuer string alone. A switch between modes requires a
+   verified isolated lineage plus atomic consumer/renewal-hook path migration, or a fresh disposable baseline;
+   never silently reuse or overwrite a cross-mode lineage.
+6. Tests cover both mandatory Master issuance calls, both mandatory Worker issuance calls, optional Vision
+   issuance on each host, `domain-change`, SSH propagation, lineage isolation for every configured domain,
+   and unset-variable backward compatibility.
+7. For E2E Master `install` and `domain-change`, the runner stages the D9 mode-specific CA bundle on Master
+   and supplies `GOWAVE_TLS_CA_FILE` to the installer. `verify_public_tls_sni` uses that file for chain and
+   hostname verification without changing `/etc/ssl/certs`; the remote bundle is removed after success or
+   failure. A staging certificate must pass this local probe, while an untrusted test CA must still fail.
+
+---
+
+## Negative Scenario Matrix (NEG-01 — NEG-15)
+
+The runner executes 15 negative scenarios in Phase 9 (and during isolated test phases) to assert error handling boundaries:
+
+| Scenario ID | Component / Area | Fault Injection Mechanism | Expected Outcome & Assertion Boundary |
+|-------------|------------------|---------------------------|---------------------------------------|
+| **NEG-01**  | Preflight SSH    | Host key absent or corrupted in `known_hosts` | Preflight terminates before any remote command |
+| **NEG-02**  | Preflight SSH    | Target SSH port closed / unreachable | Preflight terminates with connection timeout |
+| **NEG-03**  | Preflight DNS    | Domain resolves to IP other than target VPS | Preflight terminates before SSH connection |
+| **NEG-04**  | Preflight DNS    | Missing/incorrect/extra AAAA when `ENABLE_IPV6=true`, or any published AAAA when `ENABLE_IPV6=false` | Preflight terminates before remote execution; no remote mutation |
+| **NEG-05**  | ACME Install     | Certbot challenge failure (NXDOMAIN / blocked port 80) | Installation aborts; services not marked healthy |
+| **NEG-06**  | NGINX Config     | Syntax error in `/etc/nginx/conf.d/*.conf` | `nginx -t` fails; runner blocks config activation |
+| **NEG-07**  | Worker Node      | `systemctl stop gowave-node` on Worker | Panel detects offline; `isConnected` becomes `false` |
+| **NEG-08**  | Worker Node      | `systemctl start gowave-node` on Worker | Panel recovers; `isConnected` returns `true` |
+| **NEG-09**  | Subscription     | Request without User-Agent header | Real Panel rejects with upstream policy code (e.g. 403) |
+| **NEG-10**  | mTLS Control     | Forged / self-signed client certificate | Worker TLS 1.3 rejects handshake before HTTP handler |
+| **NEG-11**  | Backup Restore   | Corrupted archive header / invalid tar format | Preflight check rejects before mutating live files |
+| **NEG-12**  | Backup Restore   | SQLite DB file in archive corrupted | SQLite integrity check fails before replacing live DB |
+| **NEG-13**  | Worker Deploy    | SSH pipeline interrupted mid-execution | Master recovery journal does NOT enter `COMMITTED` |
+| **NEG-14**  | Worker Deploy    | Duplicate `node add` invocation when the name is already in `state.json` | Explicit fail-fast rejection before API client creation; no state/DB mutation or duplicate entities |
+| **NEG-15**  | Panel API Auth   | API request with expired or forged JWT | Panel returns 401 Unauthorized |
+
+---
+
+## Whitelist Configuration Schema (`tools/live_vps_config.env`)
+
+The whitelist parser in `tools/live_vps/config.py` enforces POSIX permissions `0600` and validates every key against
+the following strict schema:
+
+| Variable Name | Type / Format | Mandatory | Default | Description |
+|---------------|---------------|-----------|---------|-------------|
+| `MASTER_IP` | IPv4 address | Yes | — | Public IPv4 of Master VPS (disallowed: RFC-1918, loopback, docs); MUST differ from `WORKER_IP` |
+| `MASTER_PANEL_DOMAIN` | FQDN | Yes | — | Domain pointing to Master Panel NGINX HTTPS |
+| `MASTER_REALITY_DOMAIN` | FQDN | Yes | — | Camouflage decoy domain pointing to Master REALITY SNI |
+| `MASTER_VISION_DOMAIN` | FQDN | Optional | — | Optional Master Vision domain; independent of Worker Vision |
+| `MASTER_SSH_PORT` | Integer 1–65535 | No | `22` | Master SSH management port |
+| `MASTER_SSH_USER` | Literal `root` | No | `root` | Master SSH login identity; non-root is unsupported in E2E v1 |
+| `WORKER_IP` | IPv4 address | Yes | — | Public IPv4 of Worker VPS; MUST differ from `MASTER_IP` |
+| `WORKER_DOMAIN` | FQDN | Yes | — | Domain pointing to Worker NGINX HTTPS |
+| `WORKER_REALITY_DOMAIN` | FQDN | Yes | — | Camouflage decoy domain pointing to Worker REALITY SNI |
+| `WORKER_VISION_DOMAIN` | FQDN | Optional | — | Optional Worker Vision domain; independent of Master Vision |
+| `WORKER_SSH_PORT` | Integer 1–65535 | No | `22` | Worker SSH management port |
+| `WORKER_SSH_USER` | Literal `root` | No | `root` | Worker SSH login identity; non-root is unsupported in E2E v1 |
+| `SSH_KEY_PATH` | File path | Generated by controller | — | Per-run ephemeral Ed25519 private key; never a permanent operator-managed key |
+| `SSH_KNOWN_HOSTS` | File path | Generated by controller | — | Host-specific temporary known_hosts pin generated only after out-of-band fingerprint confirmation |
+| `ACME_MODE` | `staging` \| `production` | No | `staging` | Let's Encrypt endpoint mode |
+| `GOWAVE_PANEL_VERSION` | SemVer / commit | Yes | — | Target GoWave Panel version to pin and verify |
+| `GOWAVE_NODE_VERSION` | SemVer / commit | Yes | — | Target GoWave Node version to pin and verify |
+| `GOWAVE_NODE_INSTALLER_COMMIT` | 40-hex SHA | Yes | — | Pinned upstream `install.sh` commit; same value is used by Master-local and remote Worker paths |
+| `GOWAVE_NODE_INSTALLER_SHA256` | 64-hex SHA256 | Yes | — | SHA256 of exact upstream `install.sh` bytes at the pinned commit; verified before either execution path |
+| `XRAY_SERVER_VERSION` | Version string | Yes | — | Expected GoWave Node-managed Xray/rw-core version on both VPS; record and compare independently of Node version |
+| `XRAY_CLIENT_VERSION` | Version string | Yes | — | Pinned Xray client version on Control Machine |
+| `MIHOMO_CLIENT_VERSION` | Version string | Yes | — | Pinned Mihomo client version on Control Machine |
+| `ENABLE_IPV6` | Boolean | No | `false` | Enable IPv6 DNS, UFW, and listener verifications |
+| `MASTER_IPV6` | IPv6 address | Conditional | — | Required if `ENABLE_IPV6=true` |
+| `WORKER_IPV6` | IPv6 address | Conditional | — | Required if `ENABLE_IPV6=true` |
+| `EXPECTED_MASTER_EGRESS_IP` | IPv4 address | No | — | Expected outbound IP when routing through Master |
+| `EXPECTED_WORKER_EGRESS_IP` | IPv4 address | No | — | Expected outbound IP when routing through Worker |
+| `NODE_READY_TIMEOUT` | Integer seconds | No | `120` | Bounded timeout for Worker `isConnected: true` |
+| `API_TIMEOUT` | Integer seconds | No | `15` | Panel REST API call timeout |
+| `TRAFFIC_TIMEOUT` | Integer seconds | No | `30` | SOCKS5 tunnel request timeout |
+| `TEST_TRAFFIC_VERIFICATION` | Boolean | No | `true` | Verify Data Plane traffic (`false` yields `INCOMPLETE`) |
+| `TEST_MIHOMO_TRAFFIC` | Boolean | No | `true` | Verify traffic with real Mihomo client process; false skips mandatory Mihomo cases and makes overall status INCOMPLETE |
+| `TEST_NEGATIVE_SUITE` | Boolean | No | `true` | Execute NEG-01 through NEG-15; false marks all 15 SKIP and overall INCOMPLETE (never PASS) |
+| `TEST_TEARDOWN_POLICY` | Enum: `PRESERVE`, `RESTORE_SNAPSHOT` | No | `PRESERVE` | Mutually exclusive teardown policy; `DESTROY` is rejected in v1 |
+| `MASTER_SNAPSHOT_ID` | String | Conditional | — | Required for RESTORE_SNAPSHOT; operator-managed Master snapshot identifier |
+| `WORKER_SNAPSHOT_ID` | String | Conditional | — | Required for RESTORE_SNAPSHOT; operator-managed Worker snapshot identifier |
+| `SNAPSHOT_RESTORE_HOOK` | Absolute file path | Conditional | — | Required for RESTORE_SNAPSHOT; external Control Machine restore executable |
+| `SNAPSHOT_RESTORE_HOOK_SHA256` | 64-hex SHA256 | Conditional | — | Required digest pin for the external restore hook |
+| `RESTORE_TIMEOUT` | Integer seconds | No | `900` | Maximum runtime for external restore hook and post-restore readiness checks |
+| `ADMIN_EMAIL` | Email address | No | `admin@example.com` | Email for ACME certificate registration |
+
+---
+
+## Installer Pinning Gate
+
+**Problem:** `modules/node.sh` falls back to `curl .../main/install.sh` when no bundled installer is present;
+`gowave-node-auto.sh` separately hard-codes the remote installer commit and downloads `install.sh` without a
+content-digest check. The config's `GOWAVE_NODE_INSTALLER_COMMIT` therefore does not currently control both
+installation paths, and a commit pin alone is not the documented commit-plus-content-integrity contract.
+
+**Solution:** Vendor `sources/gowave-node/install.sh` from the exact configured 40-hex commit and record its
+real SHA256 in `GOWAVE_NODE_INSTALLER_SHA256`. The Master-local installer path MUST verify the bundled file against the configured SHA256; the commit
+provenance is established by fetching the upstream file at the configured immutable commit during vendoring
+and recording that source commit alongside the vendored artifact. The remote Worker path MUST use the same
+configured commit and digest, fetch only the immutable commit URL, verify the downloaded file's SHA256 before
+execution, and fail closed on any mismatch. `GOWAVE_NODE_REQUIRE_BUNDLED_INSTALLER=1` disables the local
+floating-`main` fallback for E2E. The remote script MUST NOT keep an independent hard-coded commit that can
+drift from runner configuration. The actual digest is computed from the vendored upstream file during
+implementation; no guessed or placeholder digest is allowed.
+
+**Required propagation chain:** the runner supplies `GOWAVE_NODE_INSTALLER_COMMIT` and
+`GOWAVE_NODE_INSTALLER_SHA256` to the Master for both `gowave-auto.sh install` and the later
+`gowave-auto.sh node add` invocation. `gowave-auto.sh node add` MUST pass both values to
+`gowave-node-auto.sh remote_payload`; that function MUST serialize both into the SSH-stdin Worker script.
+The Worker MUST validate the commit format and digest, fetch the exact commit URL, verify the bytes, and only
+then execute the installer. Supplying the variables only to the initial Master install is insufficient.
+
+---
+
+## Risks / Trade-offs
+
+**[RISK] Real ACME certificates required for production mode runs**
+→ Mitigation: Default to `ACME_MODE=staging`; document that production acceptance runs must be explicitly
+configured and rate-limit-aware.
+
+**[RISK] GoWave Panel API contracts may change between upstream versions**
+→ Mitigation: All API field access is gated on the `GOWAVE_PANEL_VERSION` pin; spec requires verifying actual
+API response structure before asserting field names. Runner fails fast with descriptive error on unexpected
+API schema.
+
+**[RISK] egress IP verification via `cloudflare.com/cdn-cgi/trace` depends on external service availability**
+→ Mitigation: Configure at least two independent external IP check endpoints; fall back to the second if the
+first times out.
+
+**[RISK] Server-side per-case packet evidence may be unavailable or unattributable**
+→ Mitigation: Every Xray/Mihomo request is bracketed by simultaneous inbound tcpdump captures on both VPS,
+filtered by the control machine's public IPv4 and the exact tested proxy destination port, excluding SSH ports.
+The remote capture is bounded by a 45-second timeout. Missing tcpdump, source-IP identity, endpoint port, or
+valid capture summary yields INCOMPLETE; aggregate interface counters are never a PASS fallback. No PCAP or
+payload is persisted.
+
+**[RISK] Xray and Mihomo binary versions on Control Machine may not match pinned config versions**
+→ Mitigation: Preflight checks client versions against `XRAY_CLIENT_VERSION` and `MIHOMO_CLIENT_VERSION`,
+and checks the Node-managed server core independently against `XRAY_SERVER_VERSION`; mismatches terminate preflight.
+
+**[RISK] API TLS behavior differs between system trust and the Staging CA bundle**
+→ Mitigation: `GoWaveClient` accepts an injected SSL context and timeout; staging and public-CA positive
+requests plus an untrusted-CA negative test validate the actual pinned Python client path.
+
+**[RISK] Mihomo's subscription listener/controller ports collide with Control Machine services**
+→ Mitigation: Runtime config is isolated to loopback and free per-run ports; proxy definitions and rules are
+preserved and the controller is local only.
+
+**[RISK] Partial Worker SSH deployment leaves Worker in unknown state**
+→ Mitigation: Runner invokes `gowave-auto.sh node rollback` on failure (which calls `remote_rollback`); result
+is recorded independently of the rollback success. NEG-13 tests this path explicitly.
+
+---
+
+## Migration / Deployment Plan
+
+1. Create `feature/live-vps-e2e-testing` branch (done).
+2. Apply ACME staging delta to `gowave-auto.sh` and `gowave-node-auto.sh` (small isolated change).
+3. Apply installer pinning gate to `modules/node.sh` preflight path.
+4. Add `tools/live_vps_config.env.example` to repo; add `tools/live_vps_config.env` to `.gitignore`.
+5. Implement `tools/test_live_vps.py` and `tools/live_vps/` package per tasks.md.
+6. Add `docs/LIVE_VPS_TESTING.md`.
+7. Remove the credential-bearing `.github/workflows/live-vps-e2e.yml`; retain `.github/workflows/live-vps-unit.yml` for CI.
+8. Add the local operator controller (`python3 tools/run_live_vps.py`) with hidden password prompts, out-of-band host-key confirmation, temporary keys, persistent remote expiry, and immediate revocation.
+9. Run staging acceptance on two fresh disposable VPS instances; production ACME is a separate, explicit operator decision and is not a substitute for staging acceptance.
+
+**Rollback:** Live VPS E2E is entirely additive. Removing `feature/live-vps-e2e-testing` branch leaves the
+existing codebase unchanged. The ACME staging delta is a backward-compatible default-off env var.
+
+---
+
+## Open Questions & Findings
+
+- **[RESOLVED] Xray stats API availability:** Codebase audit confirms that GoWave Panel profile templates
+  in `assets/xray/` do not configure the Xray Stats gRPC API (`"stats": {}`, `"StatsService"`). Upstream binaries
+  are treated as immutable per AGENTS.md. Therefore, server-side traffic evidence uses simultaneous per-case
+  `tcpdump` captures on both VPS, filtered by the exact tested proxy destination port while excluding each SSH
+  port; source attribution is decided afterwards from the addresses actually captured, compared with the
+  control-machine IPv4 each target reports on the runner's SSH session. Missing or unattributable capture evidence
+  is INCOMPLETE; aggregate interface/packet counters are not a PASS fallback.
+- **Worker `isConnected` polling behavior:** The 120s `NODE_READY_TIMEOUT` with 5s polling interval is a provisional
+  initial bound, not a measured real-VPS guarantee. Mock integration benchmarks do not establish the latency
+  distribution of the pinned Panel/Node pair; staging acceptance MUST record observed registration latency and
+  adjust the default or document the evidence before production acceptance.
+
+
+## Implementation synchronization (2026-11-09)
+
+The current implementation supersedes earlier design text in this change: live execution is local via
+`tools/run_live_vps.py`; Paramiko is used only for the initial fingerprint-confirmed password bootstrap,
+while the existing runner uses OpenSSH with ephemeral keys and strict host-key pins. Master and Worker Vision
+are independent optional domains. Per-case data-plane proof uses simultaneous, source-IP- and exact-service-port-
+filtered tcpdump captures on both VPS, with a 45-second remote timeout and no aggregate-counter fallback.
+See `../local-live-vps-controller/design.md` and `docs/LIVE_VPS_TESTING.md` for the current operator contract.

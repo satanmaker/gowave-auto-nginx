@@ -53,7 +53,7 @@ The installer SHALL provide an independent automated worker script (`gowave-node
 #### Scenario: Worker node complete edge traffic plane deployment
 - **GIVEN** a remote worker server running `gowave-node-auto.sh`
 - **WHEN** edge traffic plane configuration is applied
-- **THEN** NGINX Stream on port 443 routes camouflage SNI to local Xray REALITY (`127.0.0.1:8443`) and worker domain SNI to local NGINX HTTPS (`127.0.0.1:7443`) terminating Let's Encrypt TLS, proxying XHTTP, WebSocket, and Trojan gRPC to local Xray loopback inbounds, enabling direct client VPN connections without traversing the Central Panel.
+- **THEN** NGINX Stream on port 443 routes camouflage SNI to local Xray REALITY (`127.0.0.1:8443`), worker domain SNI to local NGINX HTTPS (`127.0.0.1:7443`) terminating Let's Encrypt TLS, proxying XHTTP, WebSocket, and Trojan gRPC to local Xray loopback inbounds, and routes the Worker's camouflage apex and `www.<apex>` directly to the local decoy listener (`127.0.0.1:9443`) so the bare domain serves the rendered static site, while the port 80 ACME vhost keeps those names in `server_name` (challenge served in place, `301` for other paths, `444` for unmanaged hosts), enabling direct client VPN connections without traversing the Central Panel.
 
 #### Scenario: Remote worker orchestration via SSH stdin streaming
 - **GIVEN** an operator running `gowave-node-auto.sh` targeting a remote edge server over SSH

@@ -9,6 +9,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MANAGED_PY = REPO_ROOT / "assets" / "security" / "managed.py"
 SECURITY_SH = REPO_ROOT / "modules" / "security.sh"
+OS_SH = REPO_ROOT / "modules" / "os.sh"
 
 
 class TestSecurityModule(unittest.TestCase):
@@ -90,12 +91,42 @@ class TestSecurityModule(unittest.TestCase):
             with self.assertRaises(ValueError):
                 managed.preflight(root=root, files=(), services=())
 
+    def test_dns_drop_in_directory_stays_readable_under_strict_umask(self):
+        """systemd-resolved runs as systemd-resolve and cannot read a 0700 drop-in dir."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("managed", str(MANAGED_PY))
+        managed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(managed)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "etc").mkdir()
+            txn = managed.Transaction(root=root, services=(), files=())
+            previous_umask = os.umask(0o077)
+            try:
+                txn.write("/etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf", managed.DOT)
+            finally:
+                os.umask(previous_umask)
+                txn.temp.cleanup()
+
+            drop_in_dir = root / "etc" / "systemd" / "resolved.conf.d"
+            self.assertEqual(drop_in_dir.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(
+                (drop_in_dir / "90-gowave-auto-nginx.conf").stat().st_mode & 0o777, 0o644
+            )
+
     def test_bbr_and_mtu_configuration(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             sysctl_file = tmp / "99-gowave.conf"
             bbr_service = tmp / "bbr-load.service"
             state_file = tmp / "state.json"
+            original_state = {
+                "schemaVersion": 2,
+                "nodes": [{"name": "worker-1", "uuid": "node-1"}],
+                "squadUuid": "squad-1",
+            }
+            state_file.write_text(json.dumps(original_state))
 
             cmd = f'source "{SECURITY_SH}" && configure_bbr_and_mtu "{state_file}" "{sysctl_file}" "{bbr_service}"'
             res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
@@ -114,7 +145,24 @@ class TestSecurityModule(unittest.TestCase):
             if state_file.exists():
                 data = json.loads(state_file.read_text())
                 self.assertIn(data.get("congestionControl"), ("bbr", "cubic"))
+                self.assertEqual(data["nodes"], original_state["nodes"])
+                self.assertEqual(data["squadUuid"], original_state["squadUuid"])
                 self.assertEqual(oct(state_file.stat().st_mode & 0o777), "0o600")
+
+    def test_bbr_state_update_refuses_corrupt_existing_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            state_file = tmp / "state.json"
+            sysctl_file = tmp / "99-gowave.conf"
+            bbr_service = tmp / "bbr-load.service"
+            corrupt = "{broken state"
+            state_file.write_text(corrupt)
+
+            cmd = f'source "{SECURITY_SH}" && configure_bbr_and_mtu "{state_file}" "{sysctl_file}" "{bbr_service}"'
+            result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(state_file.read_text(), corrupt)
 
     def test_log_rotation_and_journal_cap(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -135,6 +183,46 @@ class TestSecurityModule(unittest.TestCase):
             # Check journal cap SystemMaxUse=100M
             journal_content = journal_file.read_text()
             self.assertIn("SystemMaxUse=100M", journal_content)
+
+    def test_ufw_declares_the_same_ipv6_branch_the_listeners_render(self):
+        # A host with an address table gets ``IPV6=yes``, so the v6 rules that
+        # publish the same ports exist; an empty table keeps it ``IPV6=no``.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result, declaration, calls = self.run_configure_ufw(
+                tmpdir, "00000000000000000000000000000001 01 80 10 80       lo\n"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("IPV6=yes", declaration)
+            self.assertNotIn("IPV6=no", declaration)
+            self.assertIn("IPv6 active in kernel", result.stdout)
+            self.assertIn("deny 3002/tcp", calls)
+
+            result, declaration, _ = self.run_configure_ufw(tmpdir, "")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("IPV6=no", declaration)
+            self.assertIn("IPv6 disabled in kernel", result.stdout)
+
+    def run_configure_ufw(self, tmpdir, address_table):
+        root = Path(tmpdir)
+        fake_bin = root / "bin"
+        fake_bin.mkdir(exist_ok=True)
+        calls = root / "ufw.log"
+        calls.write_text("")
+        ufw = fake_bin / "ufw"
+        ufw.write_text(f'#!/usr/bin/env bash\nprintf \'%s\\n\' "$*" >> "{calls}"\n')
+        ufw.chmod(0o755)
+        table = root / "if_inet6"
+        table.write_text(address_table)
+        ufw_default = root / "ufw-default"
+        ufw_default.write_text("IPV6=yes\n")
+        env = os.environ.copy()
+        env["PATH"] = f"{fake_bin}:{env['PATH']}"
+        command = (
+            f'source "{OS_SH}" && source "{SECURITY_SH}" && '
+            f'configure_ufw false "" 3002 "{table}" "{ufw_default}"'
+        )
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, env=env)
+        return result, ufw_default.read_text(), calls.read_text()
 
 
 if __name__ == "__main__":

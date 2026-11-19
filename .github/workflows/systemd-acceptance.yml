@@ -27,6 +27,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check PyYAML
+
       - name: Run Suite Services (Unprivileged EUID != 0)
         run: |
           python3 tests/run_ci.py --suite services
@@ -46,6 +50,20 @@ jobs:
       - name: Run systemd static unit contract tests
         run: |
           sudo python3 tests/run_ci.py --suite systemd
+
+
+  multi-node-podman:
+    name: Multi-Node Podman Transport Acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install rootful Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman
+      - name: Execute isolated Master/Worker transport acceptance
+        run: sudo tests/podman_testbed.sh multi-node
 
   qemu-cold-boot:
     name: QEMU Cold Boot (${{ matrix.name }})
