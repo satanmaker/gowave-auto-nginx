@@ -35,10 +35,11 @@ fails after certificates have already been issued.
 - **BREAKING** for interactive callers: `gowave-auto.sh install` with no arguments starts the wizard rather than
   prompting three fields. The positional form `<panel> <reality> <email> [vision]` and `node add` keep their
   exact contract, so every non-interactive drive stays English and unchanged.
-- Fix the panel-only squad defect in the same change: `node add` reads `squadUuid` from `state.json`
-  (`gowave-auto.sh:846`) and discards what `provision_internal_squad` returns
-  (`modules/api_client.py:651`), so the first worker of a panel-only cluster would send
-  `"squads": [null]` (`modules/api_client.py:698`).
+- Fix the panel-only squad defect in the same change: `node add` used to read `squadUuid` from `state.json` and
+  discard what `provision_internal_squad` returns (`modules/api_client.py:651`), so the first worker of a
+  panel-only cluster would send `"squads": [null]` (`modules/api_client.py:697`). Task 2.1 makes it persist and
+  submit the returned identifier and refuse the registration when the Panel returns none
+  (`gowave-auto.sh:988-997`).
 - Extend both acceptance contours for the new topology: the Podman suite gains a panel-only drive and catalog
   cases, and the live runner gains the matching panel-only verification.
 
