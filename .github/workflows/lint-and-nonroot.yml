@@ -18,7 +18,11 @@ jobs:
   lint-and-nonroot:
     name: Lint, Completeness, and Suite Nonroot
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # The nonroot suite alone prints `Ran 2677 tests in 3030.919s` — 51 minutes
+    # of wall clock — so the previous 20-minute cap ended every run as
+    # `cancelled` and the job could no longer report on the tree at all. 90
+    # leaves the same headroom the Multi-Node acceptance job carries.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
 
