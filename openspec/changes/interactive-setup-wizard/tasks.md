@@ -37,7 +37,7 @@
 - [x] 5.1 Implement the count `C = 2 + v_panel + 2N + k` and the four ceilings (24, 23, 16, 15) as pure functions, with the shared/separate registered-domain distinction. Verify: a table-driven unit test covering every ceiling boundary, including one node above and at each limit.
 - [x] 5.2 Wire the preflight into the wizard: separate domains proceed silently, a shared domain within the ceiling proceeds only after explicit confirmation with the shared-budget warning, a shared domain above the ceiling is refused with the ceiling for that combination and the recommendation of one registered domain per host. Verify: unit tests for all three outcomes asserting the refusal message names the computed count and the ceiling.
 - [x] 5.3 Resolve every planned name before the first ACME order and refuse the plan on a mismatch, before any host is modified. Verify: a unit test with one unresolvable name asserting no install call and no certbot call.
-- [ ] 5.4 Record in `design.md`'s domain section and in `README.md` that the remaining budget is not queryable, that the apex camouflage certificate belongs to a single host, and that wildcard is not a remedy for a shared domain. Verify: the two documents name all three limits; a documentation test that greps for the three statements stays green.
+- [x] 5.4 Record in `design.md`'s domain section and in `README.md` that the remaining budget is not queryable, that the apex camouflage certificate belongs to a single host, and that wildcard is not a remedy for a shared domain. Verify: the two documents name all three limits; a documentation test that greps for the three statements stays green.
 
 ## 6. Podman acceptance for the new mode and the squad fix
 
@@ -50,8 +50,8 @@
 
 ## 7. Live contour
 
-- [ ] 7.1 Add `INSTALL_MODE` to the live runner configuration and make `gowave-auto.sh install` be invoked with the panel-only flag when it is set. Verify: a unit test on the rendered command; `python3 -m unittest discover -s tools/tests -p 'test_*.py'` passes.
-- [ ] 7.2 Add the Panel-only Master verification to the live runner: units, listeners, decoy response, `health`, `state.json`, certificate line count. Verify: a live run directory whose evidence holds those readings; until such a run exists, record the requirement as declared but not live-proven.
+- [x] 7.1 Add `INSTALL_MODE` to the live runner configuration and make `gowave-auto.sh install` be invoked with the panel-only flag when it is set. Verify: a unit test on the rendered command; `python3 -m unittest discover -s tools/tests -p 'test_*.py'` passes.
+- [x] 7.2 Add the Panel-only Master verification to the live runner: units, listeners, decoy response, `health`, `state.json`, certificate line count. Verify: a live run directory whose evidence holds those readings; until such a run exists, record the requirement as declared but not live-proven. Note (2026-11-19): `INSTALL_MODE` is whitelisted and parsed in `tools/live_vps/config.py` (default `all-in-one`; `panel-only` refuses `MASTER_VISION_DOMAIN` rather than dropping it), `master_install_command` renders `install --panel-only` ahead of the three positionals, and `deployment._verify_panel_only_master` reads the host: three units active, `gowave-node.service` absent, no `rw-core`/`xray` in `ps -eo comm`, no `:8443`/`:8444` listener, `health` HEALTHY, `state.json` naming the mode with `nodes: []` and no local-node keys, the camouflage name returning the static decoy from `curl --resolve`, and `certbot certificates` holding exactly the Panel and camouflage lineages. `deploy_worker` now also refuses a registration whose Master state carries no `squadUuid`. The requirement is **declared but not live-proven**: no run directory exists yet, and 7.3 is what produces one. Host-record-level squad evidence (the Panel's request bodies) stays with the container case 6.4.
 - [ ] 7.3 Run the Panel-only Master case on the pair and read the evidence back from the host side, not from the runner's log lines. Verify: a named run directory with its commit recorded as an ancestor of the reviewed tree, plus the host-side readings quoted in the task note.
 
 ## 8. Integration and recorded limits
@@ -59,7 +59,21 @@
 - [ ] 8.1 Run the full local verification in one window: `bash -n` on every changed script, `shellcheck --severity=error` on them, `python3 tests/run_ci.py --suite nonroot`, `--check-completeness`, `python3 -m tools.podman_e2e.catalog check`, `trace --strict`, and `openspec validate interactive-setup-wizard --strict`. Verify: every command's exit status and summary line recorded; anything not run named explicitly.
 - [ ] 8.2 Run both container topologies end to end and read the run directories back, not the console tail. Verify: two run directories under `artifacts/podman-e2e/` whose `result.json` shows PASS with the recorded commit, and both case counts reported with the new ids listed.
 - [ ] 8.3 Update `README.md` (three deployment variants, the flag, the two `GOWAVE_SSH_*` variables, the domain policy) and the scenario catalogue docs. Verify: every documented command runs as written; the documentation guards in `tests/` stay green.
-- [ ] 8.4 Record what this change does not prove: cross-OS Panel/worker combinations (out of scope by decision on 2026-11-15), the remaining Let's Encrypt budget (not queryable), wildcard on a shared domain (rejected as worse), and the Panel-only live case until task 7.3 has a run. Verify: `tasks.md` and `design.md` name all four; no claim in `README.md` contradicts them.
+- [x] 8.4 Record what this change does not prove: cross-OS Panel/worker combinations (out of scope by decision on 2026-11-15), the remaining Let's Encrypt budget (not queryable), wildcard on a shared domain (rejected as worse), and the Panel-only live case until task 7.3 has a run. Verify: `tasks.md` and `design.md` name all four; no claim in `README.md` contradicts them.
+
+### Recorded limits — what this change does not prove
+
+1. **Cross-OS Panel/worker combinations.** Decided out of scope on 2026-11-15: a run pairs one distribution and
+   the OS gate keeps Ubuntu 22.04 rejected (`tests/test_os_detection.py`). `design.md` risks, not a claim.
+2. **The remaining Let's Encrypt budget.** Not queryable — Let's Encrypt exposes no endpoint for it. The preflight
+   counts the plan in front of it and states the 50-per-registered-domain-per-7-days limit; it never reports a
+   remaining figure (`README.md`, `design.md` D8).
+3. **Wildcard on a shared domain.** Rejected as worse: every host would order the identical
+   `[domain, *.domain]` set under the five-per-identifier-set limit, capping a shared-domain cluster at about five
+   hosts a week, and it needs DNS-01 credentials on every host (`design.md` D8).
+4. **The Panel-only live case.** The runner drives `INSTALL_MODE=panel-only` and reads the host back, but no run
+   directory exists until task 7.3 produces one; until then the requirement is declared, not live-proven
+   (task 7.2 note, `design.md` risks).
 
 ## Workflow follow-up
 

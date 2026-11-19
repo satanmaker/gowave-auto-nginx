@@ -198,6 +198,51 @@ sys.exit(0)
     return True, "Acceptance fixtures passed on Master"
 
 
+def master_install_command(
+    config: LiveVPSConfig,
+    target_dir: str,
+    remote_ca_file: str,
+) -> Tuple[str, Dict[str, str]]:
+    """Render the Master install invocation.
+
+    Kept separate from the SSH call so the mode flag and the argument order can be
+    asserted without a remote host: ``--panel-only`` is a flag of ``install`` and
+    sits before the three positionals it qualifies.
+    """
+    acme_server = ACME_MODE_URLS.get(config.acme_mode)
+    if not acme_server:
+        raise ValueError(f"Invalid ACME mode: {config.acme_mode}")
+
+    env_values = {
+        "GOWAVE_ACME_SERVER": acme_server,
+        "GOWAVE_TLS_CA_FILE": remote_ca_file,
+        "GOWAVE_NODE_REQUIRE_PINNED_INSTALLER": "1",
+        "GOWAVE_NODE_INSTALLER_COMMIT": config.gowave_node_installer_commit,
+        "GOWAVE_NODE_INSTALLER_SHA256": config.gowave_node_installer_sha256,
+        "GOWAVE_PANEL_VERSION": config.gowave_panel_version,
+        "GOWAVE_NODE_VERSION": config.gowave_node_version,
+        "XRAY_SERVER_VERSION": config.xray_server_version,
+        "GOWAVE_REALITY_FINGERPRINT": config.reality_fingerprint,
+    }
+    env_vars = "\n".join(
+        f"export {key}={shlex.quote(str(value))}" for key, value in env_values.items()
+    )
+
+    args = [f"{target_dir}/gowave-auto.sh", "install"]
+    if config.install_mode == "panel-only":
+        args.append("--panel-only")
+    args.extend([
+        config.master_panel_domain,
+        config.master_reality_domain,
+        config.admin_email,
+    ])
+    if config.master_vision_domain:
+        args.append(config.master_vision_domain)
+
+    install_cmd = f"{env_vars}\nexec " + " ".join(shlex.quote(str(value)) for value in args)
+    return install_cmd, env_values
+
+
 def install_master(
     master_ssh: SSHClient,
     config: LiveVPSConfig,
@@ -217,33 +262,7 @@ def install_master(
     master_ssh.copy_to_remote(local_ca_bundle, remote_ca_file)
     master_ssh.run(f"chmod 0600 {remote_ca_file}")
 
-    # Pass immutable release versions and all non-secret arguments explicitly.
-    env_values = {
-        "GOWAVE_ACME_SERVER": acme_server,
-        "GOWAVE_TLS_CA_FILE": remote_ca_file,
-        "GOWAVE_NODE_REQUIRE_PINNED_INSTALLER": "1",
-        "GOWAVE_NODE_INSTALLER_COMMIT": config.gowave_node_installer_commit,
-        "GOWAVE_NODE_INSTALLER_SHA256": config.gowave_node_installer_sha256,
-        "GOWAVE_PANEL_VERSION": config.gowave_panel_version,
-        "GOWAVE_NODE_VERSION": config.gowave_node_version,
-        "XRAY_SERVER_VERSION": config.xray_server_version,
-        "GOWAVE_REALITY_FINGERPRINT": config.reality_fingerprint,
-    }
-    env_vars = "\n".join(
-        f"export {key}={shlex.quote(str(value))}" for key, value in env_values.items()
-    )
-
-    args = [
-        f"{target_dir}/gowave-auto.sh",
-        "install",
-        config.master_panel_domain,
-        config.master_reality_domain,
-        config.admin_email,
-    ]
-    if config.master_vision_domain:
-        args.append(config.master_vision_domain)
-
-    install_cmd = f"{env_vars}\nexec " + " ".join(shlex.quote(str(value)) for value in args)
+    install_cmd, _ = master_install_command(config, target_dir, remote_ca_file)
     input_data = f"GOWAVE_LEASE: {lease_token}\n" if lease_token else None
     try:
         r = master_ssh.run(install_cmd, input_data=input_data, timeout=600)
@@ -256,6 +275,9 @@ def install_master(
                 pass
     if not r.ok:
         return False, {"error": "gowave-auto.sh install exited non-zero", "stderr": r.stderr}
+
+    if config.install_mode == "panel-only":
+        return _verify_panel_only_master(master_ssh, config, target_dir)
 
     # Verify services
     services = ["gowave.service", "gowave-node.service", "nginx.service", "fail2ban.service"]
@@ -313,6 +335,112 @@ def install_master(
         "node_version_output": node_ver_r.stdout.strip(),
         "xray_server_version_output": xray_ver_r.stdout.strip(),
     }
+    return True, details
+
+
+def _verify_panel_only_master(
+    master_ssh: SSHClient,
+    config: LiveVPSConfig,
+    target_dir: str,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Prove a Panel-only Master from the host side.
+
+    The traffic plane is absent by design here, so the All-in-One invariants that
+    name a local node are replaced rather than skipped: the Node unit must not be
+    installed, no traffic process may run, the two ports the mode does not own stay
+    closed, and the certificate audit expects exactly the two lineages it orders.
+    """
+    details: Dict[str, Any] = {"status": "PASS", "mode": "panel-only"}
+
+    for svc in ("gowave.service", "nginx.service", "fail2ban.service"):
+        chk = master_ssh.run(f"systemctl is-active {svc}")
+        if not chk.ok or chk.stdout.strip() != "active":
+            return False, {"error": f"Required service {svc} is not active in panel-only mode: {chk.stdout}"}
+    details["active_services"] = ["gowave.service", "nginx.service", "fail2ban.service"]
+
+    unit_files = master_ssh.run("systemctl list-unit-files gowave-node.service")
+    if unit_files.ok and "gowave-node.service" in unit_files.stdout:
+        return False, {"error": "gowave-node.service is installed on a panel-only Master"}
+
+    # `comm` carries no arguments, so a shell whose command line names these
+    # binaries cannot answer for itself the way `pgrep -f` would.
+    procs = master_ssh.run("ps -eo comm= | grep -x -E 'rw-core|xray' | sort -u || true")
+    if procs.stdout.strip():
+        return False, {"error": f"A traffic process runs on a panel-only Master: {procs.stdout.strip()}"}
+
+    listeners_r = master_ssh.run("ss -tlnH || ss -tln")
+    listeners = listeners_r.stdout
+    if re.search(r":(?:8443|8444)\b", listeners):
+        return False, {"error": "A panel-only Master listens on 8443 or 8444"}
+    if ":443" not in listeners:
+        return False, {"error": "A panel-only Master does not listen on 443"}
+    if ":3000" not in listeners:
+        return False, {"error": "The Panel does not listen on 3000 on the Master"}
+
+    cred_chk = master_ssh.run("stat -c '%a %U %G' /root/gowave-credentials.txt")
+    if not cred_chk.ok or cred_chk.stdout.strip() != "600 root root":
+        return False, {"error": f"Invalid credentials permissions/owner: {cred_chk.stdout}"}
+    cred_keys = master_ssh.run(
+        "grep -E '^(ADMIN_USERNAME|ADMIN_PASSWORD|SCOPED_API_TOKEN)=' /root/gowave-credentials.txt | wc -l"
+    )
+    if not cred_keys.ok or int(cred_keys.stdout.strip() or "0") < 3:
+        return False, {"error": "Credentials file missing required keys"}
+
+    health_chk = master_ssh.run(f"{target_dir}/gowave-auto.sh health")
+    if not health_chk.ok or "HEALTHY" not in health_chk.stdout:
+        return False, {"error": f"gowave-auto.sh health failed: {health_chk.stdout}"}
+    details["health"] = "HEALTHY"
+
+    state_chk = master_ssh.run("cat /var/lib/gowave-auto-nginx/state.json")
+    if not state_chk.ok:
+        return False, {"error": "state.json is missing on a panel-only Master"}
+    try:
+        state = json.loads(state_chk.stdout)
+    except json.JSONDecodeError as exc:
+        return False, {"error": f"state.json is not valid JSON: {exc}"}
+    if state.get("installationMode") != "panel-only":
+        return False, {"error": f"state.json does not name the panel-only mode: {state.get('installationMode')!r}"}
+    if state.get("nodes") != []:
+        return False, {"error": f"state.json lists nodes after a panel-only install: {state.get('nodes')!r}"}
+    leftover = [key for key in ("localNodeUuid", "nodePort", "profileUuid") if key in state]
+    if leftover:
+        return False, {"error": f"state.json describes a local node: {leftover}"}
+    details["state"] = {"installationMode": "panel-only", "nodes": 0}
+
+    decoy_domain = shlex.quote(config.master_reality_domain)
+    decoy_r = master_ssh.run(
+        f"curl -sk --max-time 10 --resolve {decoy_domain}:443:127.0.0.1 https://{decoy_domain}/ "
+        "-w '\\n%{http_code}'"
+    )
+    decoy_body, _, decoy_status = decoy_r.stdout.rpartition("\n")
+    lowered = decoy_body.lower()
+    if not decoy_r.ok or decoy_status.strip() != "200" or "<html" not in lowered:
+        return False, {"error": "The camouflage name did not answer with the static decoy page",
+                       "snippet": decoy_r.stdout[:300]}
+    if "gowave" in lowered or "/api/" in lowered:
+        return False, {"error": "The camouflage name served Panel content",
+                       "snippet": decoy_body[:300]}
+    details["decoy"] = {"http_status": 200, "is_decoy": True}
+
+    certs_r = master_ssh.run("certbot certificates 2>/dev/null | grep 'Certificate Name:'")
+    lineages = sorted(
+        line.split("Certificate Name:", 1)[1].strip()
+        for line in certs_r.stdout.splitlines()
+        if "Certificate Name:" in line
+    )
+    expected = sorted([config.master_panel_domain, config.master_reality_domain])
+    if lineages != expected:
+        return False, {"error": "A panel-only Master does not hold exactly the Panel and camouflage lineages",
+                       "expected": expected, "observed": lineages}
+    details["certificate_lineages"] = lineages
+
+    panel_ver_r = master_ssh.run("/opt/gowave/gowave-server --version || /opt/gowave/gowave-server version")
+    observed = (panel_ver_r.stdout or "") + "\n" + (panel_ver_r.stderr or "")
+    if not panel_ver_r.ok or not output_matches_expected_version(observed, config.gowave_panel_version):
+        return False, {"error": "Installed Panel does not match the configured version",
+                       "expected": config.gowave_panel_version, "observed": observed.strip()[:300]}
+    details["panel_version_output"] = panel_ver_r.stdout.strip()
+
     return True, details
 
 
@@ -534,6 +662,22 @@ print(json.dumps({
     # Audit Worker host state
     worker_state_ok = True
     worker_errors = []
+
+    # The host records take their squad from the provisioning call, so a Master
+    # that registered a worker without one is the defect task 2.1 removed. The
+    # Panel-side body audit stays a container case; here the state file answers.
+    master_state_r = master_ssh.run("cat /var/lib/gowave-auto-nginx/state.json")
+    try:
+        master_state = json.loads(master_state_r.stdout) if master_state_r.ok else {}
+    except json.JSONDecodeError:
+        master_state = {}
+    registered = [entry for entry in (master_state.get("nodes") or []) if entry.get("name") == "worker-1"]
+    if not registered:
+        worker_state_ok = False
+        worker_errors.append("The Master state lists no worker-1 after node add")
+    elif not master_state.get("squadUuid"):
+        worker_state_ok = False
+        worker_errors.append("The Master state carries no squad for the registered worker")
 
     # gowave-node and nginx active on Worker
     for svc in ["gowave-node.service", "nginx.service"]:

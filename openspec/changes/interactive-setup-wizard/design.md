@@ -161,6 +161,10 @@ one-distribution-per-run rule are unchanged.
   the five-per-identifier-set limit still caps retries per host at five per week.
 - **Cross-OS combinations unverified** → recorded as unverified in `tasks.md` and never claimed as working. The
   OS gate stays as is; Ubuntu 22.04 remains rejected (`tests/test_os_detection.py:39-47`).
+- **The Panel-only live case is declared, not live-proven** → `INSTALL_MODE=panel-only` drives the flag and the
+  runner reads units, listeners, the decoy, `health`, `state.json`, and the lineage count back from the host, but
+  no run directory exists until task 7.3 produces one. Until it does, no claim rests on that reading: the
+  Panel-only evidence in this change is the container topology plus the unit level.
 - **`update`/`uninstall` on a Panel-only host** → both must tolerate a missing local node; `state.json` gains an
   optional mode field and a `schemaVersion` that does not change, so an older state is read as All-in-One.
 - **Temporary-access onboarding needs systemd on the node** → abort before authorising the key when the timer

@@ -41,6 +41,7 @@ WHITELIST_KEYS = {
     "MASTER_KNOWN_HOSTS_PATH",
     "WORKER_KNOWN_HOSTS_PATH",
     "ACME_MODE",
+    "INSTALL_MODE",
     "ADMIN_EMAIL",
     "GOWAVE_PANEL_VERSION",
     "GOWAVE_NODE_VERSION",
@@ -314,6 +315,20 @@ def load_config(path: str | Path, skip_mode_check: bool = False) -> LiveVPSConfi
         raise ValueError(f"Invalid ACME_MODE: '{acme_mode}'. Must be 'staging' or 'production'.")
     parsed["ACME_MODE"] = acme_mode
     parsed["ADMIN_EMAIL"] = raw_pairs.get("ADMIN_EMAIL", "admin@example.com")
+
+    # Installation mode. The runner drives the flag rather than the wizard, so the
+    # mode is configuration and defaults to the topology the older runs recorded.
+    install_mode = (raw_pairs.get("INSTALL_MODE", "all-in-one").strip().lower()
+                    or "all-in-one")
+    if install_mode not in ("all-in-one", "panel-only"):
+        raise ValueError(
+            f"Invalid INSTALL_MODE: '{install_mode}'. Must be 'all-in-one' or 'panel-only'."
+        )
+    if install_mode == "panel-only" and parsed["MASTER_VISION_DOMAIN"]:
+        raise ValueError(
+            "MASTER_VISION_DOMAIN requires a traffic plane; INSTALL_MODE=panel-only deploys none on the Master."
+        )
+    parsed["INSTALL_MODE"] = install_mode
 
     # Component versions follow the upstream release channel by default: "latest"
     # is the documented value, and the runner then verifies that each component

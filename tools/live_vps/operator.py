@@ -577,6 +577,12 @@ def run_interactive(acme_mode: str, mode: str = "full") -> int:
             print("Production ACME was not confirmed; aborting before any VPS connection.")
             return 1
 
+    # The runner drives the flag rather than the wizard, so the mode comes from the
+    # environment of the shell that starts the operator.
+    install_mode = os.environ.get("INSTALL_MODE", "all-in-one").strip().lower() or "all-in-one"
+    if install_mode != "all-in-one":
+        print(f"Installation mode: {install_mode}")
+
     run_id = "run-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
     targets: list[dict[str, Any]] = []
     result_code = 1
@@ -605,6 +611,7 @@ def run_interactive(acme_mode: str, mode: str = "full") -> int:
                 "WORKER_REALITY_DOMAIN": worker_reality, "WORKER_SSH_PORT": str(worker_port),
                 "WORKER_SSH_USER": worker_user, "SSH_KEY_PATH": "/tmp/not-used",
                 "SSH_KNOWN_HOSTS": "/tmp/not-used", "ACME_MODE": acme_mode,
+                "INSTALL_MODE": install_mode,
                 "ADMIN_EMAIL": admin_email,
             }
             if master_vision:
@@ -650,6 +657,7 @@ def run_interactive(acme_mode: str, mode: str = "full") -> int:
                 "MASTER_KNOWN_HOSTS_PATH": str(targets[0]["known_hosts"]),
                 "WORKER_KNOWN_HOSTS_PATH": str(targets[1]["known_hosts"]),
                 "ACME_MODE": acme_mode,
+                "INSTALL_MODE": install_mode,
                 "ADMIN_EMAIL": admin_email,
             }
             if master_vision:

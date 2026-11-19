@@ -21,7 +21,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT))
 
-from live_vps.deployment import parse_strace_argv_output, output_matches_expected_version
+from live_vps.deployment import (
+    master_install_command,
+    parse_strace_argv_output,
+    output_matches_expected_version,
+)
 from live_vps.panel_api import E2EPanelClient, read_master_credentials
 from live_vps.mtls import run_mtls_negative_tests
 from live_vps.nginx import verify_panel_https
@@ -527,6 +531,60 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
         panel_client = E2EPanelClient(panel_domain=f"localhost:{self.port}", ssl_context=trusted_ctx, timeout=1)
         with self.assertRaises(Exception):
             panel_client.client.request("GET", "/api/slow", authenticate=False)
+
+
+class TestMasterInstallCommand(unittest.TestCase):
+    """The install invocation is rendered where a test can read it."""
+
+    def _config(self, install_mode: str = "all-in-one", vision=None):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            acme_mode="staging",
+            gowave_node_installer_commit="7b3514d1ab8c674050597820d52d55525d4bece7",
+            gowave_node_installer_sha256="9a524f1383d3a6a8be42ac370699b0ec6725678ece4abe5b5bc61e8c2af682d0",
+            gowave_panel_version="latest",
+            gowave_node_version="latest",
+            xray_server_version="latest",
+            reality_fingerprint="firefox",
+            install_mode=install_mode,
+            master_panel_domain="panel.example.com",
+            master_reality_domain="decoy.example.com",
+            master_vision_domain=vision,
+            admin_email="admin@example.com",
+        )
+
+    def _exec_args(self, command: str):
+        exec_line = command.splitlines()[-1]
+        self.assertTrue(exec_line.startswith("exec "), exec_line)
+        return shlex.split(exec_line[len("exec "):])
+
+    def test_all_in_one_install_carries_no_mode_flag(self):
+        command, env = master_install_command(self._config(), "/opt/repo", "/run/ca.crt")
+        self.assertEqual(
+            self._exec_args(command),
+            ["/opt/repo/gowave-auto.sh", "install",
+             "panel.example.com", "decoy.example.com", "admin@example.com"],
+        )
+        self.assertEqual(env["GOWAVE_ACME_SERVER"],
+                         "https://acme-staging-v02.api.letsencrypt.org/directory")
+        self.assertNotIn("--panel-only", command.splitlines()[-1])
+
+    def test_panel_only_install_flags_the_three_positionals(self):
+        command, _ = master_install_command(
+            self._config(install_mode="panel-only"), "/opt/repo", "/run/ca.crt"
+        )
+        self.assertEqual(
+            self._exec_args(command),
+            ["/opt/repo/gowave-auto.sh", "install", "--panel-only",
+             "panel.example.com", "decoy.example.com", "admin@example.com"],
+        )
+
+    def test_the_vision_slot_stays_last_in_all_in_one(self):
+        command, _ = master_install_command(
+            self._config(vision="vision.example.com"), "/opt/repo", "/run/ca.crt"
+        )
+        self.assertEqual(self._exec_args(command)[-1], "vision.example.com")
 
 
 if __name__ == "__main__":
