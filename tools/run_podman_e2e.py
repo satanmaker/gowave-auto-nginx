@@ -127,6 +127,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     if args.topology == "multi-node":
         context.environment["worker_vision"] = "enabled" if args.worker_vision else "disabled"
+    # What this run does not execute is part of what it claims. A live-only
+    # scenario left unmentioned reads as parity in a green artifact, so every run
+    # states each omission with the limitation that justifies it, and the block
+    # travels into `result.json` as `environment.justified_exclusions`.
+    try:
+        exclusions = catalog.justified_exclusions(args.topology)
+    except catalog.CatalogError as exc:
+        parser.error(str(exc))
+    context.environment["justified_exclusions"] = exclusions
+    if exclusions:
+        print("justified exclusions (live-only, not executed here):")
+        for exclusion in exclusions:
+            print(f"  {exclusion['id']} — {exclusion['reason']}")
     podman = Podman(context)
     # A run killed with SIGKILL cannot clean up after itself, so the next
     # invocation reclaims what a run of this suite older than

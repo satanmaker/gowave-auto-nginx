@@ -55,6 +55,10 @@ class TestGateTiers(unittest.TestCase):
         self.assertIn("Live scenario has no catalog entry: ", evidence["unlisted_scenario"])
         self.assertIn("live-parity case was not executed by the Podman suite: ",
                       evidence["one_suite_message"])
+        self.assertIn("the live result and the Podman result assert different text",
+                      evidence["different_text_message"])
+        self.assertIn("records no assertion text",
+                      evidence["undeclared_text_message"])
         self.assertIn("Positive case counts diverge between catalog and matrix for aio: ",
                       evidence["count_divergence"])
 

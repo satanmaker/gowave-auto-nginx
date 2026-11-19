@@ -143,7 +143,9 @@ evidence/diagnostics/<CASE-ID>/   the failure bundle, when a case failed
 ```
 
 `result.json` (schema `gowave-podman-e2e-result/v1`) carries `overall`, the
-`cases[]` array with `id`, `status`, `duration`, `message` and the
+`cases[]` array with `id`, `assertion_sha256` — the digest of the catalog
+sentence the case asserted, which is what the divergence guard compares with the
+live suite's record of the same id — `status`, `duration`, `message` and the
 `evidence_files` that case produced, and an `environment` block with the commit
 and tree state the run measured, the image digests it resolved, the selected
 Vision configuration, the `required_groups` audit and the `redaction_audit`.

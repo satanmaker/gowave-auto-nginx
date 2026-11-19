@@ -6821,7 +6821,7 @@ cases:
       - fixture_without_optin
       - letsencrypt_production
       - unpinned_ca
-  promotion_target: Independent All-in-One Acceptance Topology
+  promotion_target: Independent All-in-One acceptance topology
 - id: AIO-NEG-DEP
   requirement: Security and network isolation verification
   live_scenario: null
@@ -7050,7 +7050,7 @@ cases:
       - seconds_fault
       - unit_state
       - verify_returncode
-  promotion_target: Backup and Restore Format v1
+  promotion_target: Lifecycle recovery acceptance
 - id: AIO-FAULT-PANEL
   requirement: Failure injection and recovery
   live_scenario: null
@@ -7219,7 +7219,7 @@ cases:
       evidence: []
   promotion_target: NGINX SNI Routing and REALITY Decoy Verification
 - id: ACME-01
-  requirement: Real ACME issuance and renewal through the pinned directory
+  requirement: Global Certbot Deploy Hook Ownership
   live_scenario: null
   assertion: On the installed host the certificate serving the Panel domain was issued during this run
     by the pinned ACME directory, Certbot's own renewal record names the webroot method and that webroot,
@@ -7241,7 +7241,7 @@ cases:
       evidence: []
   promotion_target: Global Certbot Deploy Hook Ownership
 - id: ACME-02
-  requirement: Real ACME issuance and renewal through the pinned directory
+  requirement: Global Certbot Deploy Hook Ownership
   live_scenario: null
   assertion: With the port 80 challenge webroot closed to the validator, and again with the pinned directory
     unreachable from the host, a forced renewal exits non-zero, quotes its own cause, leaves the installed
@@ -7483,7 +7483,7 @@ cases:
       - without_anchor_error
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-BACKUP
-  requirement: Backup and Restore Format v1
+  requirement: Lifecycle recovery acceptance
   live_scenario: null
   assertion: 'Both archive types are produced through the operator''s own interface — --type panel on
     Master and --type node on Worker — as mode-0600 Format v1 archives whose actual contents match their
@@ -7506,7 +7506,7 @@ cases:
       - roles
   promotion_target: Signal-Safe and Verifiable Transaction Compensation
 - id: MN-BACKUP-VOL
-  requirement: Backup and Restore Format v1
+  requirement: Lifecycle recovery acceptance
   live_scenario: null
   assertion: Both unencrypted archives are written into a /var/backups/gowave that is a run-owned Podman
     volume of its own — a filesystem distinct from the container's root, owned by root at mode 0700 with
@@ -7532,7 +7532,7 @@ cases:
       - roles
   promotion_target: Signal-Safe and Verifiable Transaction Compensation
 - id: MN-BACKUP-BAD
-  requirement: Backup and Restore Format v1
+  requirement: Lifecycle recovery acceptance
   live_scenario: null
   assertion: An archive the product did not write, or wrote incompletely, is refused by the product's
     own restore on the role it names — truncated, garbage, checksum-mismatched, missing a member its manifest
@@ -7560,7 +7560,7 @@ cases:
       - refused
   promotion_target: Signal-Safe and Verifiable Transaction Compensation
 - id: MN-RESTORE
-  requirement: Backup and Restore Format v1
+  requirement: Lifecycle recovery acceptance
   live_scenario: null
   assertion: 'A Panel archive and a Worker archive, both written by the product on the roles this run
     provisioned, are restored by the product''s own restore command on those roles: a client created through
@@ -8218,8 +8218,10 @@ cases:
       - control_errors
       - count_divergence
       - damaged_inputs
+      - different_text_message
       - live_parity_case
       - one_suite_message
+      - undeclared_text_message
       - unlisted_scenario
     multi-node:
       driver: gate_tiers:case_divergence_guard
@@ -8228,8 +8230,10 @@ cases:
       - control_errors
       - count_divergence
       - damaged_inputs
+      - different_text_message
       - live_parity_case
       - one_suite_message
+      - undeclared_text_message
       - unlisted_scenario
   promotion_target: Result Status Semantics
 - id: MN-REVOKE
