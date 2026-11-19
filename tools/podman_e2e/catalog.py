@@ -2095,7 +2095,11 @@ def justified_exclusions(topology: str) -> List[Dict[str, Any]]:
     instead of being printed as a justified exclusion.
     """
     cases = load_catalog().get("cases", [])
-    known = {name for case in cases for name in (case.get("topology") or [])}
+    # The matrix declares every topology this harness runs, including one whose
+    # cases have not landed yet; the catalog only names the topologies a case
+    # happens to be driven in, so it cannot answer for an empty suite.
+    known = set(matrix_data.load().get("topologies", {}))
+    known.update(name for case in cases for name in (case.get("topology") or []))
     if topology not in known:
         raise ValueError(f"unsupported topology: {topology!r}")
     exclusions: List[Dict[str, Any]] = []

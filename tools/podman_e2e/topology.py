@@ -1190,7 +1190,18 @@ class PanelOnlyTopology(AioTopology):
         # directory must not share a container name.
         self.target_name = self.context.resource_name("panel")
 
-    def install_script(self) -> str:
+    def install_script(self, vision_domain: Optional[str] = None) -> str:
+        """The operator's Panel-only command, which carries no Vision argument.
+
+        ``_install`` offers every topology a domain slot because the All-in-One
+        install can be re-run against a name that will fail to be issued; this
+        mode has nowhere to terminate one, so a request for it is refused here
+        instead of being dropped from the command line.
+        """
+        if vision_domain is not None:
+            raise ValueError(
+                "the Panel-only topology deploys no traffic plane, so it has no Vision domain"
+            )
         arguments = [self.panel_domain, self.reality_domain, self.admin_email]
         quoted = " ".join(f"'{value}'" for value in arguments)
         return f"bash {REPO_IN_CONTAINER}/gowave-auto.sh install --panel-only {quoted}"
