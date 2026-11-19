@@ -1,0 +1,509 @@
+# Behaviour inventory for the Podman acceptance capability.
+#
+# One entry per in-scope product behaviour: the cases that establish it, the
+# cases that exercise its error paths, the topologies it is proven in and the
+# gate tier that blocks on it. Every case of `tests/cases/catalog.yaml` is named
+# by exactly one entry, so the file is a partition and not a wish list:
+#
+#   python3 -m tools.podman_e2e.catalog check        # the audit
+#   python3 -m tools.podman_e2e.catalog behaviors    # the rendered view
+#
+# The audit refuses a behaviour with no case, a behaviour whose only cases are
+# its happy path, a case no behaviour names, a case two behaviours claim, an
+# area the requirement names but no entry covers, a gate the cases are not
+# gated by, a topology no case of the entry reaches, and an establishing case
+# whose topology the entry does not declare.
+schema: gowave-podman-behaviors/v1
+areas:
+  - installation
+  - provisioning
+  - subscription-representations
+  - data-plane
+  - decoy
+  - tls-dns-acme
+  - network-policy
+  - lifecycle
+  - failure-injection
+behaviors:
+  # ---------------------------------------------------------------- installation
+  - name: A disposable host is accepted or refused before it is touched
+    area: installation
+    description: >-
+      The baseline gate accepts a clean supported systemd host and refuses one
+      whose packages, units or filesystem would make the measurement
+      meaningless, before any remote modification; the Vision ports belong only
+      to the host whose own Vision domain is configured, and a host exempt from
+      them is still held to the default port set.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [ENV-01, VIS-GATE]
+    error_paths: [ENV-02]
+
+  - name: The documented All-in-One install provisions the Panel and its node
+    area: installation
+    description: >-
+      The operator's own command installs the Panel and the local node on a
+      clean host, installing every prerequisite it documents as its own, and
+      refuses a port a foreign process already holds.
+    topology: [aio]
+    gate: pre-push
+    cases: [AIO-INSTALL, AIO-PACKAGES]
+    error_paths: [AIO-NEG-PORT]
+
+  - name: The installed host keeps serving across a restart and a repeated install
+    area: installation
+    description: >-
+      The installed units, listeners, certificate and Panel inventory are read
+      back from the host, survive a restart of the product's own units and a
+      second install, and fail closed when the public surface is stopped.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [AIO-01, AIO-02, AIO-03, AIO-04, AIO-05, AIO-RESTART, AIO-IDEMPOTENT]
+    error_paths: [AIO-NEG-DEP]
+
+  - name: The Panel API answers its documented caller and refuses the rest
+    area: installation
+    description: >-
+      The documented login yields a bearer token the real Panel accepts, the
+      client lifecycle runs through the API, the bounded client trusts only its
+      scoped CA, and an anonymous, forged or expired credential is refused.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [AIO-AUTH, AIO-CLIENT, APIC-01, AIO-AUTH-NEG]
+    error_paths: [NEG-06]
+
+  - name: Every installed component reports its exact pinned version
+    area: installation
+    description: >-
+      The Panel, the node and both client cores report the versions the run
+      configured — exactly the pinned one where the run pins it, and a version
+      at all where it follows the channel — each read through its own binary,
+      and a floating installer branch or a digest mismatch is refused before
+      installation.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [VER-01, VER-03]
+    error_paths: [VER-02, AIO-NEG-PIN]
+
+  # ---------------------------------------------------------------- provisioning
+  - name: An install owns only what it created
+    area: provisioning
+    description: >-
+      Pre-existing worker configuration, service paths and firewall policy are
+      inventoried and left in place, and a failed transaction removes only the
+      objects whose identity and digest still match what it created.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [OWN-01, OWN-02, OWN-03]
+    error_paths: [OWN-04]
+
+  - name: The interactive entrypoint validates its inputs before the network
+    area: provisioning
+    description: >-
+      The five domains and the SSH account are validated before any connection
+      is opened, the password is never echoed or persisted, and a duplicated
+      domain, an identical target pair or a non-root account is refused.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [OP-01, OP-02]
+    error_paths: [ADDR-01, ADDR-02, ADDR-03]
+
+  - name: The controller runs only against a host key it was given
+    area: provisioning
+    description: >-
+      The Worker's SSH host key is pinned before the first mutation, a rotation
+      is adopted through the pin, and a key the controller was not given stops
+      the operation before the remote command runs.
+    topology: [multi-node]
+    gate: pre-push
+    cases: [MN-SSHKEY]
+    error_paths: [PRE-01]
+
+  - name: Host identity is confirmed out of band before a password is sent
+    area: provisioning
+    description: >-
+      The provider console fingerprint is compared with the offered key before
+      any credential moves, and a fingerprint the operator does not confirm
+      aborts the bootstrap.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [SSHID-01]
+    error_paths: [SSHID-02, BOOT-01]
+
+  - name: Temporary access is bounded by an armed remote expiry
+    area: provisioning
+    description: >-
+      The temporary key is installed only after its two-hour remote expiry timer
+      is enabled, and the bootstrap fails closed once that expiry has passed.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [TSSH-01, BOOT-02]
+    error_paths: [TSSH-02]
+
+  - name: Target credentials stay on the control machine and are revoked
+    area: provisioning
+    description: >-
+      No CI job carries a target credential, the local operator's access lives
+      only on the control machine, and the run's temporary access is gone when
+      the cleanup phase reports PASS.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [LOCAL-01, LOCAL-02, REV-01]
+    error_paths: [REV-02]
+
+  - name: Each Vision domain is provisioned per node or refuses the host
+    area: provisioning
+    description: >-
+      Vision is configured on the Master, the Worker, both or neither, the four
+      combinations are counted separately, and a certificate the host cannot
+      validate aborts that host while an incomplete compensation is reported.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [VIS-01, VIS-02, VIS-03, VIS-07, VIS-08, MN-VISION]
+    error_paths: [VIS-04, VIS-CONFIG, VIS-05, VIS-06]
+
+  - name: A Worker is deployed without a secret and registered as it runs
+    area: provisioning
+    description: >-
+      The Worker is provisioned over an SSH stdin pipeline with no secret in
+      argv and no abbreviated payload, the Panel registers it and the cluster
+      inventory describes it, and a duplicate registration or an unapproved
+      Master address is refused.
+    topology: [multi-node]
+    gate: pre-push
+    cases: [MN-INSTALL, MN-ARGV-OBSERVER, WRK-01, WRK-04, WRK-05, WRK-06, CLUS-01, CLUS-02, CLUS-03]
+    error_paths: [WRK-02, WRK-03, PODNET-MASTER-ADDR]
+
+  # ------------------------------------------------ subscription representations
+  - name: Every representation reaches the client family that consumes it
+    area: subscription-representations
+    description: >-
+      The base64 share-link list, the Xray JSON profile list and the Mihomo
+      YAML are fetched with the consuming client's User-Agent and loaded by the
+      pinned binaries, while an absent or blank User-Agent is refused for every
+      representation.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [SUB-SERVED, SUB-B64, SUB-JSON-SHAPES, SUB-02, SUB-03, SUB-04]
+    error_paths: [SUB-01, SUB-UA-ABSENT, SUB-UA-BLANK]
+
+  # ------------------------------------------------------------------ data plane
+  - name: Both pinned clients carry a payload through every All-in-One outbound
+    area: data-plane
+    description: >-
+      The Xray and Mihomo cores deployed by the Panel move a payload through
+      every served inbound, the matrix counts them, and the credentials stop
+      carrying anything once the documented revoke rotates them while a
+      prohibited destination is never reached.
+    topology: [aio]
+    gate: pre-push
+    cases:
+      - AIO-DP-REALITY-xray
+      - AIO-DP-REALITY-mihomo
+      - AIO-DP-XHTTP-xray
+      - AIO-DP-XHTTP-mihomo
+      - AIO-DP-WS-xray
+      - AIO-DP-WS-mihomo
+      - AIO-DP-TROJAN-GRPC-xray
+      - AIO-DP-TROJAN-GRPC-mihomo
+      - AIO-DP-VISION-xray
+      - AIO-DP-VISION-mihomo
+      - AIO-MATRIX
+    error_paths: [AIO-REVOKE, AIO-NEG-DEST]
+
+  - name: Both pinned clients carry a payload through every Multi-Node outbound
+    area: data-plane
+    description: >-
+      Every Master and Worker outbound of the Multi-Node topology is exercised
+      by both pinned clients, and a revoked credential carries nothing through
+      either node afterwards.
+    topology: [multi-node]
+    gate: pre-push
+    cases:
+      - MN-DP-master-REALITY-xray
+      - MN-DP-master-REALITY-mihomo
+      - MN-DP-master-XHTTP-xray
+      - MN-DP-master-XHTTP-mihomo
+      - MN-DP-master-WS-xray
+      - MN-DP-master-WS-mihomo
+      - MN-DP-master-TROJAN-GRPC-xray
+      - MN-DP-master-TROJAN-GRPC-mihomo
+      - MN-DP-master-VISION-xray
+      - MN-DP-master-VISION-mihomo
+      - MN-DP-worker-REALITY-xray
+      - MN-DP-worker-REALITY-mihomo
+      - MN-DP-worker-XHTTP-xray
+      - MN-DP-worker-XHTTP-mihomo
+      - MN-DP-worker-WS-xray
+      - MN-DP-worker-WS-mihomo
+      - MN-DP-worker-TROJAN-GRPC-xray
+      - MN-DP-worker-TROJAN-GRPC-mihomo
+      - MN-DP-worker-VISION-xray
+      - MN-DP-worker-VISION-mihomo
+      - MN-MATRIX
+    error_paths: [MN-REVOKE]
+
+  - name: A runtime request traverses the endpoint its case selects
+    area: data-plane
+    description: >-
+      Each request is observed traversing the selected endpoint, Mihomo runs
+      isolated on the control machine, one cold resolver stall is tolerated,
+      and the data plane is claimed only when it was observed rather than
+      disabled or ambiguous.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [DP-01, DP-02, DP-03, DP-04, DP-05, DP-06, DP-07, DP-08]
+    error_paths: [DP-13, DP-14]
+
+  - name: Both engines trust exactly the declared chain
+    area: data-plane
+    description: >-
+      Staging and public chains are both trusted without a bypass, the Xray TLS
+      outbounds carry their own verify anchors, the fixture material is pinned
+      by digest, and production adds no staging root while a removed anchor
+      turns the same transfer into a chain failure.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [DP-09, DP-10, DP-11]
+    error_paths: [DP-12, TLS-VERIFY-ANCHORS]
+
+  - name: A payload is attributed to the node that carried it
+    area: data-plane
+    description: >-
+      Each matrix payload is recorded by the external endpoint under the egress
+      identity of the node its case names, both hosts' captures agree, and
+      missing or contradicting packet evidence fails the case instead of
+      passing on the address alone.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [MN-EGRESS, PKT-01]
+    error_paths: [PKT-02, PKT-03, AIO-PKT-02, MN-PKT-03]
+
+  # ----------------------------------------------------------------------- decoy
+  - name: The cover apex is derived, rendered complete and refused when unresolved
+    area: decoy
+    description: >-
+      The cover apex is the last two labels of the panel domain, every template
+      document is rendered with the derived brand and no template marker left
+      behind, and a host whose apex does not resolve to it refuses the lineage
+      instead of publishing a partial decoy.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [NGX-03, NGX-COVER-DERIVE, NGX-COVER-SITE]
+    error_paths: [NGX-COVER-UNRESOLVED]
+
+  - name: The camouflage listener never exposes the management surface
+    area: decoy
+    description: >-
+      The stream map sends the cover apex and its www to the decoy listener and
+      nothing else does, the listener answers every cover name with the cover
+      site, and it refuses every panel, API and subscription path with that
+      site's own 404 while the Panel still answers on its own name.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [NGX-01, NGX-04, NGX-DECOY-ROUTE, DECOY-01]
+    error_paths: [NGX-02]
+
+  # --------------------------------------------------------------- tls-dns-acme
+  - name: Names resolve to the declared address from both vantages or are refused
+    area: tls-dns-acme
+    description: >-
+      A-only and AAAA-only names answer with exactly their own family at the
+      published TTL, NXDOMAIN, stale and steered answers are served as
+      published, and a mismatch, a private address or an AAAA record under a
+      policy that disables IPv6 is refused before mutation.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [DNS-01, PRE-05]
+    error_paths: [PRE-02, PRE-03, PRE-04, PRE-06]
+
+  - name: Every HTTPS role serves its own certificate and only when it validates
+    area: tls-dns-acme
+    description: >-
+      An independent client that trusts only the fixture CA completes TLSv1.3
+      against each role's own name, still negotiates TLSv1.2, is refused when it
+      pins TLSv1.1 and fails verification without the CA, while an invalid
+      NGINX configuration is never reloaded into the running listener.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [TLS-01]
+    error_paths: [NGX-05]
+
+  - name: Real issuance and renewal run through the pinned directory
+    area: tls-dns-acme
+    description: >-
+      The certificate serving the Panel domain is issued during the run by the
+      pinned directory, its renewal record names the webroot, a forced renewal
+      performs an HTTP-01 challenge and a closed webroot or unreachable
+      directory leaves the working leaf and its serial untouched; the test
+      endpoint is refused without its opt-in, for any other URL and for any
+      other CA digest.
+    topology: [aio]
+    gate: pre-push
+    cases: [ACME-01]
+    error_paths: [ACME-02, AIO-NEG-ACME]
+
+  - name: A Worker keeps a working HTTP-01 path across reconfiguration
+    area: tls-dns-acme
+    description: >-
+      A Worker install or reconfiguration keeps its port 80 ACME vhost
+      reachable so renewal retains a challenge path, and an arbitrary ACME
+      directory is refused on both roles.
+    topology: [multi-node]
+    gate: pre-push
+    cases: [NGX-WORKER-ACME80]
+    error_paths: [ACME-REJECT-ARB]
+
+  - name: The managed deploy hook is removed only while the journal owns it
+    area: tls-dns-acme
+    description: >-
+      A transaction-created Certbot deploy hook is cleaned up only while the
+      journal proves the transaction created it, PRESERVE reports the package
+      manager's residuals without claiming a restored baseline, and a hook the
+      installation did not write blocks it before mutation.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [HOOK-02, HOOK-04]
+    error_paths: [HOOK-01]
+
+  # --------------------------------------------------------------- network policy
+  - name: The Worker's firewall admits the Master and refuses every other origin
+    area: network-policy
+    description: >-
+      The ruleset the product installs is read from the sources that can reach
+      it: the Worker accepts its Master and drops an untrusted control machine,
+      the Master distinguishes local from external access, and a negative probe
+      is never misclassified as an allowance.
+    topology: [multi-node]
+    gate: pre-push
+    cases: [FW-01, FW-03, FW-04]
+    error_paths: [FW-02]
+
+  - name: The control plane is mutual TLS and refuses anything less
+    area: network-policy
+    description: >-
+      The Master authenticates to the Worker's control port with its client
+      certificate, HTTP 200 is distinguished from 401, and an untrusted, absent
+      or mismatched certificate is classified by which side rejected it.
+    topology: [multi-node]
+    gate: pre-push
+    cases: [MTLS-01, MTLS-02, MTLS-03]
+    error_paths: [MTLS-04, MTLS-05, MTLS-06, MTLS-07, MTLS-08]
+
+  # ------------------------------------------------------------------- lifecycle
+  - name: A channel switch is a snapshot, a rewrite and a restart that can be undone
+    area: lifecycle
+    description: >-
+      The documented stable-to-dev transition snapshots, rewrites and restarts
+      with the journal COMMITTED and the guarded direction still refused, a
+      repeated call is a no-op, and a switch whose Panel cannot start is rolled
+      back field by field from the snapshot it took.
+    topology: [aio]
+    gate: pre-push
+    cases: [AIO-CHANNEL-NOOP, AIO-CHANNEL-DEV]
+    error_paths: [AIO-CHANNEL-ROLLBACK]
+
+  - name: Panel and Worker archives restore on the roles that wrote them
+    area: lifecycle
+    description: >-
+      Both archive types are produced by the operator's own interface as
+      mode-0600 Format v1 files in a run-owned volume and restored on their own
+      roles, and an archive the product did not write, or wrote incompletely,
+      is refused by its own restore.
+    topology: [multi-node]
+    gate: pre-push
+    cases: [MN-BACKUP, MN-BACKUP-VOL, MN-RESTORE]
+    error_paths: [MN-BACKUP-BAD]
+
+  - name: Teardown is a validated policy, not a side effect
+    area: lifecycle
+    description: >-
+      PRESERVE and a pinned snapshot restore are both validated before the run,
+      the hook receives a versioned request and its result is reported apart
+      from the test outcome, and DESTROY or a failed hook is a teardown failure
+      rather than a passing run. The container contour reads the whole policy
+      from a real configuration file and a real hook: what preflight refuses,
+      what the hook is handed, and the status a broken restore may not become.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [TD-02, TD-03, TD-04, TD-05, TD-06, TD-07, GATE-TEARDOWN]
+    error_paths: [TD-01, TD-08]
+
+  - name: A run holds both hosts exclusively for its whole duration
+    area: lifecycle
+    description: >-
+      A runner-owned nested command keeps exclusivity through its lease, a
+      second control machine cannot acquire an occupied host and is refused with
+      the path it was refused on while the owner's published leases stay
+      untouched, every shipped management command is refused by that same lock
+      instead of taking a private one, a lost lock-holder session fails closed
+      and gates every mutating phase as INCOMPLETE while a read-only phase may
+      still report, and an unsafe lock path — a link, a directory, a FIFO, a
+      broad mode or another owner — is refused before either host is modified
+      rather than followed, replaced or removed.
+    topology: [multi-node]
+    gate: pre-push
+    cases: [MN-LOCK, MLOCK-02, MN-LOCK-NESTED]
+    error_paths: [MN-LOCK-LOSS, MN-LOCK-PATH, MN-LOCK-CLI, LOCK-01, LOCK-02, MLOCK-01, MLOCK-03]
+
+  - name: Diagnostics land in a run-owned root with the secrets removed
+    area: lifecycle
+    description: >-
+      Diagnostic files carry the required safe fields and a credentials summary
+      that records field names rather than values, inside an artifact root that
+      neither a crafted run id nor a resumed partial mode can escape.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [RED-01, RED-02]
+    error_paths: [STATE-01, STATE-02, RUNID-01, RESUME-01]
+
+  - name: An overall PASS is never reported for a run that lost a case
+    area: lifecycle
+    description: >-
+      result.json carries every documented field, and a run whose mandatory
+      runtime case failed, or whose mandatory cases were not executed, reports
+      FAIL or INCOMPLETE naming the case instead of PASS.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [RES-03, GATE-STATUS]
+    error_paths: [RES-01, RES-02, DP-15]
+
+  - name: The acceptance gate blocks a change it cannot prove
+    area: lifecycle
+    description: >-
+      The documented pre-push entrypoint runs both topologies without live
+      credentials and blocks a regressed change with its case ids, an exhausted
+      budget reports INCOMPLETE, an unmapped behaviour or orphan case fails the
+      coverage audit, a diverging suite fails the guard, and a negative suite
+      that was skipped or short cannot yield a passing run.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [GATE-PREPUSH, GATE-BUDGET, GATE-COVERAGE, GATE-DIVERGENCE]
+    error_paths: [NEG-07, NEG-08]
+
+  # ----------------------------------------------------------- failure injection
+  - name: Every injected fault is survived or reported without collateral damage
+    area: failure-injection
+    description: >-
+      The fifteen fault scenarios are a matrix in their own right: a stopped
+      unit, a killed core, a lost SSH session, a full disk, an injected delay
+      and a restarted Worker each degrade only their own layer, leave operator
+      files intact and lose none of the rows the database held, and recover when
+      the cause is removed, while duplicate registration, partial deployment and
+      forged credentials are refused without mutation.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [NEG-01, AIO-FAULT-DISK, AIO-FAULT-PANEL, AIO-FAULT-XRAY, AIO-FAULT-LATENCY, MN-OUTAGE, MN-RESTART, MN-SSH-DOWN, MN-DUP-ADD]
+    error_paths: [NEG-02, NEG-03, NEG-04, NEG-05]
+
+  - name: An interrupted mutation stays recoverable and its compensation is honest
+    area: failure-injection
+    description: >-
+      An operator killed mid-switch leaves a validated journal naming the
+      snapshot it took, an uncatchable Worker termination is recovered before
+      the next mutation, and a compensation that could not clean up reports
+      INCOMPLETE instead of claiming success.
+    topology: [aio, multi-node]
+    gate: pre-push
+    cases: [AIO-INTERRUPT, HOOK-03]
+    error_paths: [TXN-01, TXN-02, TXN-03]

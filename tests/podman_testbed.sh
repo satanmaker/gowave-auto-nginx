@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tests/podman_testbed.sh - 4-Distribution Systemd Container Testbed & Multi-Node E2E
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -93,13 +93,11 @@ JSON
 }
 
 run_multi_node_e2e() {
-    echo "================================================================================"
-    echo "Multi-Node E2E is not implemented yet."
-    echo "This target does NOT provision a GoWave Panel, call remote_payload, register a Worker,"
-    echo "perform a real TLS 1.3 mTLS handshake, test UFW drops, or exercise client data-plane traffic."
-    echo "Returning 77 (SKIP/UNAVAILABLE) rather than reporting a false pass."
-    echo "================================================================================" >&2
-    return 77
+    if ! command -v podman >/dev/null 2>&1; then
+        echo "[UNAVAILABLE] Podman runtime not found." >&2
+        return 77
+    fi
+    bash "$SCRIPT_DIR/multi_node_testbed.sh"
 }
 
 case "$TARGET" in

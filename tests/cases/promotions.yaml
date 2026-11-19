@@ -1,0 +1,17 @@
+# The one-directional promotion path for Podman-first cases.
+#
+# A case enters the catalog as `incubating` with a Podman driver. It becomes
+# `podman-stable` only through an entry here: after the configured number of
+# green Podman runs and a review. It becomes `live-parity` only when the live
+# spec gains a scenario that asserts the same outcome, which is why no entry in
+# this file can promote to that state.
+#
+# `build_catalog` reads this file, so `tests/cases/catalog.yaml` cannot carry a
+# state this register does not grant, and `validate_catalog` refuses an entry
+# that names an unknown case, a case that is already live-parity, too few green
+# runs, or no review.
+schema: gowave-case-promotions/v1
+criteria:
+  green_runs: 3
+  review: A named reviewer records the promotion on the pull request that lands it.
+promotions: []

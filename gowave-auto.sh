@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # gowave-auto.sh - Main GoWave Auto NGINX Lifecycle Manager and CLI Entrypoint
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCK_FILE="/run/lock/gowave-auto.lock"
-STATE_FILE="/var/lib/gowave-auto-nginx/state.json"
+STATE_FILE="${GOWAVE_STATE_FILE:-/var/lib/gowave-auto-nginx/state.json}"
 JOURNAL_FILE="/var/lib/gowave-auto-nginx/recovery/journal.json"
 CREDENTIALS_FILE="/root/gowave-credentials.txt"
 
 # Source submodules
+source "$SCRIPT_DIR/modules/lock.sh"
+source "$SCRIPT_DIR/modules/tempdir.sh"
+source "$SCRIPT_DIR/modules/address.sh"
 source "$SCRIPT_DIR/modules/os.sh"
 source "$SCRIPT_DIR/modules/preflight.sh"
 source "$SCRIPT_DIR/modules/security.sh"
@@ -28,19 +31,101 @@ reload_nginx_strict() {
 
 verify_public_tls_sni() {
     local domain="$1"
+    local connect="${2:-127.0.0.1:443}"
+    local attempts="${3:-10}"
     command -v timeout >/dev/null 2>&1 || { echo "Fatal: timeout is required for TLS verification." >&2; return 1; }
-    timeout 10 openssl s_client -connect 127.0.0.1:443 -servername "$domain" \
-        -verify_return_error -verify_hostname "$domain" -CApath /etc/ssl/certs -brief </dev/null
+    local ca_opts=(-CApath /etc/ssl/certs)
+    if [[ -n "${GOWAVE_TLS_CA_FILE:-}" ]]; then
+        if [[ ! -f "$GOWAVE_TLS_CA_FILE" || -L "$GOWAVE_TLS_CA_FILE" ]]; then
+            echo "Fatal: GOWAVE_TLS_CA_FILE must be a readable regular file, not a symlink." >&2
+            return 1
+        fi
+        ca_opts=(-CAfile "$GOWAVE_TLS_CA_FILE")
+    fi
+    local workdir
+    workdir=$(mktemp -d "${TMPDIR:-/tmp}/gowave-tls-sni.XXXXXX") || {
+        echo "Fatal: Could not create a temporary directory for TLS verification." >&2
+        return 1
+    }
+    track_temp_dir "$workdir"
+    # `systemctl reload nginx` only hands the new configuration to the master:
+    # the previous worker generation keeps its own certificates until it drains,
+    # so the first handshake after a reload can still be answered with what the
+    # change just replaced. Wait for the listener to settle, but judge every
+    # attempt strictly -- a name the served certificate does not cover, or a
+    # chain the trust store does not anchor, still fails closed.
+    local attempt name_check trust_check served
+    for ((attempt = 1; attempt <= attempts; attempt++)); do
+        rm -f -- "$workdir/chain.pem" "$workdir/leaf.pem" "$workdir/untrusted.pem"
+        timeout 10 openssl s_client -connect "$connect" -servername "$domain" -showcerts \
+            "${ca_opts[@]}" </dev/null >"$workdir/chain.pem" 2>"$workdir/handshake.log" || true
+        # s_client interleaves its banner with the PEM chain, so split the
+        # certificates out instead of trusting the raw stream.
+        awk -v leaf="$workdir/leaf.pem" -v rest="$workdir/untrusted.pem" '
+            /^-----BEGIN CERTIFICATE-----$/ {
+                seen += 1
+                inside = 1
+                target = (seen == 1) ? leaf : rest
+                print > target
+                next
+            }
+            /^-----END CERTIFICATE-----$/ {
+                if (inside) {
+                    print > target
+                    inside = 0
+                }
+                next
+            }
+            inside { print > target }
+        ' "$workdir/chain.pem" 2>/dev/null || true
+        if [[ -s "$workdir/leaf.pem" ]]; then
+            name_check=$(openssl x509 -noout -checkhost "$domain" -in "$workdir/leaf.pem" 2>&1 || true)
+            if [[ "$name_check" == "Hostname $domain does match certificate" ]]; then
+                if [[ -s "$workdir/untrusted.pem" ]]; then
+                    trust_check=$(openssl verify "${ca_opts[@]}" -untrusted "$workdir/untrusted.pem" \
+                        "$workdir/leaf.pem" 2>&1 || true)
+                else
+                    trust_check=$(openssl verify "${ca_opts[@]}" "$workdir/leaf.pem" 2>&1 || true)
+                fi
+                if [[ "$trust_check" == *": OK" ]]; then
+                    release_temp_dir "$workdir"
+                    return 0
+                fi
+                served=$(printf '%s' "$trust_check" | tr -s '[:space:]' ' ' | cut -c1-300)
+            else
+                served=$(openssl x509 -noout -ext subjectAltName -in "$workdir/leaf.pem" 2>/dev/null \
+                    | tr -s '[:space:]' ' ' || true)
+                served="wrong certificate: ${served:-no subjectAltName}"
+            fi
+        else
+            served="no certificate was served"
+        fi
+        if ((attempt < attempts)); then
+            # Give the previous worker generation time to finish draining.
+            sleep 1
+        fi
+    done
+    # The bare error leaves an operator guessing whether the wrong certificate
+    # or the wrong SNI route answered, so name everything on failure.
+    local routed certificate
+    routed=$(grep -F "$domain " /etc/nginx/stream-enabled/gowave-stream.conf 2>/dev/null \
+        | head -n 1 || true)
+    certificate=$(grep -E '^[[:space:]]*ssl_certificate[[:space:]]' /etc/nginx/conf.d/gowave-panel.conf 2>/dev/null \
+        | head -n 1 || true)
+    echo "Error: The port 443 listener did not prove TLS for $domain." >&2
+    echo "  SNI map entry: ${routed:-none}" >&2
+    echo "  Panel listener certificate: ${certificate:-none}" >&2
+    echo "  Last attempt answered with: ${served:-unreadable}" >&2
+    if [[ -s "$workdir/handshake.log" ]]; then
+        echo "  Handshake log:" >&2
+        tail -n 5 "$workdir/handshake.log" >&2 || true
+    fi
+    release_temp_dir "$workdir"
+    return 1
 }
 
 acquire_lock() {
-    mkdir -p "$(dirname "$LOCK_FILE")"
-    exec 9>>"$LOCK_FILE"
-    if ! flock -n 9; then
-        echo "Error: Another instance of GoWave Auto NGINX is currently executing." >&2
-        echo "Lock held on $LOCK_FILE. Please wait for it to finish." >&2
-        exit 1
-    fi
+    acquire_mutation_lock "$@"
 }
 
 cmd_status() {
@@ -137,6 +222,10 @@ cmd_install() {
             read -r -p "Enter Vision domain (e.g. vision.example.com): " vision_domain
         fi
     fi
+    # Input validation and the camouflage probe need a handful of tools that
+    # install_prerequisites would install later; get them first so a bare host
+    # fails for a product reason rather than a missing interpreter.
+    bootstrap_early_tools || return 1
     python3 - "$panel_domain" "$reality_domain" "$vision_domain" <<'PY'
 import re, sys
 panel, reality, *extra = sys.argv[1:]
@@ -165,6 +254,25 @@ PY
         return 2
     fi
 
+    validate_acme_server "${GOWAVE_ACME_SERVER:-}" || return 1
+    local effective_acme_server="${GOWAVE_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
+    check_acme_lineage "$panel_domain" "$effective_acme_server" || return 1
+    check_acme_lineage "$reality_domain" "$effective_acme_server" || return 1
+    if [[ -n "$vision_domain" ]]; then
+        check_acme_lineage "$vision_domain" "$effective_acme_server" || return 1
+    fi
+
+    # The camouflage site lives on the registrable apex of the panel domain so
+    # that a browser reaching for the bare domain lands on a plausible static
+    # site. ACME validates it over port 80 on this host, so it is only enabled
+    # when both the apex and www already resolve here; the decision names its
+    # own refusal, including a panel domain that has no apex to derive.
+    local cover_domain="" cover_server_ip=""
+    if [[ -n "$(derive_cover_domain "$panel_domain")" ]]; then
+        cover_server_ip=$(resolve_panel_ipv4) || return 1
+    fi
+    cover_domain=$(cover_domain_for "$panel_domain" "$cover_server_ip")
+
     echo "==> Starting GoWave Auto NGINX All-in-One Deployment..."
     echo "Panel Domain:   $panel_domain"
     echo "Reality Domain: $reality_domain"
@@ -173,10 +281,22 @@ PY
     else
         echo "Vision Domain:  Disabled (default 4-inbound configuration)"
     fi
+    if [[ -n "$cover_domain" ]]; then
+        echo "Cover Site:     $cover_domain (+ www) — camouflage website on the apex"
+    else
+        echo "Cover Site:     Disabled"
+    fi
 
     # Step 1: Preflight Environment Inspection
     check_os
-    if command -v systemctl >/dev/null 2>&1; then
+    # A repeat install finds NGINX already serving the managed stream config.
+    # Taking it down there is downtime for a live target, and the ACME stage
+    # relies on that running vhost to answer challenges from the same webroot.
+    local managed_nginx_in_place=0
+    if [[ -f /etc/nginx/stream-enabled/gowave-stream.conf && -f /etc/nginx/conf.d/gowave-http.conf ]]; then
+        managed_nginx_in_place=1
+    fi
+    if (( managed_nginx_in_place == 0 )) && command -v systemctl >/dev/null 2>&1; then
         systemctl stop nginx 2>/dev/null || true
     fi
     run_preflight_panel
@@ -191,55 +311,126 @@ PY
     configure_log_rotation
 
     # Step 4: Webroot ACME TLS Acquisition
-    generate_bootstrap_acme_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/00-bootstrap-acme.conf" "/proc/net/if_inet6" "$vision_domain"
-    reload_nginx_strict
+    local acme_tx_id="install_$(date +%s)"
+    verify_deploy_hook_preflight "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" "$acme_tx_id" || return 1
+    snapshot_acme_lineage "$acme_tx_id" "$panel_domain"
+    snapshot_acme_lineage "$acme_tx_id" "$reality_domain"
+    if [[ -n "$vision_domain" ]]; then
+        snapshot_acme_lineage "$acme_tx_id" "$vision_domain"
+    fi
+
+    rollback_acme_lineages() {
+        local rollback_failed=0
+        echo "ACME acquisition or verification failed. Rolling back certificate lineages..." >&2
+        rollback_managed_deploy_hook "$acme_tx_id" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$acme_tx_id" "$panel_domain" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$acme_tx_id" "$reality_domain" 2>/dev/null || rollback_failed=1
+        if [[ -n "$vision_domain" ]]; then
+            restore_acme_lineage "$acme_tx_id" "$vision_domain" 2>/dev/null || rollback_failed=1
+        fi
+        rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf || rollback_failed=1
+        if [[ "$rollback_failed" -ne 0 ]]; then
+            echo "CRITICAL: ACME rollback incomplete; certificate lineage or deploy-hook restoration failed. Recovery snapshot retained for operator intervention." >&2
+        else
+            echo "ACME certificate lineage rollback completed successfully." >&2
+        fi
+        # Preserve the caller's original deployment failure status; the explicit
+        # diagnostic above distinguishes a complete rollback from partial recovery.
+        return 0
+    }
+
+    if (( managed_nginx_in_place == 1 )); then
+        # The managed :80 vhost already answers ACME challenges for these names
+        # from the same webroot, so a bootstrap vhost would only duplicate every
+        # server name NGINX is serving.
+        true
+    else
+        if ! generate_bootstrap_acme_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/00-bootstrap-acme.conf" "/proc/net/if_inet6" "$vision_domain" "$cover_domain"; then
+            echo "Error: Failed to generate bootstrap ACME NGINX configuration; rolling back certificate lineages." >&2
+            rollback_acme_lineages
+            return 1
+        fi
+        if ! reload_nginx_strict; then
+            echo "Error: Failed to activate bootstrap ACME NGINX configuration; rolling back certificate lineages." >&2
+            rollback_acme_lineages
+            return 1
+        fi
+    fi
 
     if ! command -v certbot >/dev/null 2>&1; then
         echo "Error: certbot is required for production TLS certificate acquisition but not installed." >&2
+        rollback_acme_lineages
         return 1
     fi
 
+    local certbot_extra_args=()
+    if [[ -n "${GOWAVE_ACME_SERVER:-}" ]]; then
+        certbot_extra_args+=(--server "$GOWAVE_ACME_SERVER")
+    fi
+
     echo "Acquiring Let's Encrypt TLS certificate for Panel ($panel_domain)..."
-    certbot certonly --webroot -w "$ACME_WEBROOT" \
+    if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" \
         -d "$panel_domain" --cert-name "$panel_domain" \
-        --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring
+        --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring \
+        "${certbot_extra_args[@]}"; then
+        rollback_acme_lineages
+        return 1
+    fi
 
     echo "Acquiring Let's Encrypt TLS certificate for REALITY decoy ($reality_domain)..."
-    certbot certonly --webroot -w "$ACME_WEBROOT" \
-        -d "$reality_domain" --cert-name "$reality_domain" \
-        --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring
+    # The camouflage certificate also covers the apex website, so one lineage
+    # serves both the probe fallback and the plain-domain landing page.
+    local reality_cert_args=(-d "$reality_domain")
+    local reality_cert_flags=()
+    if [[ -n "$cover_domain" ]]; then
+        reality_cert_args+=(-d "$cover_domain" -d "www.$cover_domain")
+        reality_cert_flags+=(--expand)
+    fi
+    if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" \
+        "${reality_cert_args[@]}" "${reality_cert_flags[@]}" --cert-name "$reality_domain" \
+        --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring \
+        "${certbot_extra_args[@]}"; then
+        rollback_acme_lineages
+        return 1
+    fi
 
     if [[ -n "$vision_domain" ]]; then
         echo "Acquiring Let's Encrypt TLS certificate for VLESS Vision ($vision_domain)..."
-        certbot certonly --webroot -w "$ACME_WEBROOT" \
+        if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" \
             -d "$vision_domain" --cert-name "$vision_domain" \
-            --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring || true
+            --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring \
+            "${certbot_extra_args[@]}"; then
+            rollback_acme_lineages
+            return 1
+        fi
     fi
 
     rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
 
     # Verify certificates cryptographically (refuse to proceed with invalid or missing certificates)
-    verify_acme_certificate "$panel_domain"
-    verify_acme_certificate "$reality_domain"
-    if [[ -n "$vision_domain" ]]; then
-        verify_acme_certificate "$vision_domain" || true
+    if ! verify_acme_certificate "$panel_domain" || \
+       ! verify_acme_certificate "$reality_domain" || \
+       { [[ -n "$cover_domain" ]] && ! verify_acme_certificate "$cover_domain" "/etc/letsencrypt/live/$reality_domain"; } || \
+       { [[ -n "$vision_domain" ]] && ! verify_acme_certificate "$vision_domain"; }; then
+        rollback_acme_lineages
+        return 1
     fi
 
     # Step 5: NGINX Configuration
     ensure_nginx_stream_block
-    generate_stream_config "$panel_domain" "$reality_domain" "/etc/nginx/stream-enabled/gowave-stream.conf" "/proc/net/if_inet6" "$vision_domain"
-    generate_production_http_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/gowave-http.conf" "/proc/net/if_inet6" "$vision_domain"
+    generate_stream_config "$panel_domain" "$reality_domain" "/etc/nginx/stream-enabled/gowave-stream.conf" "/proc/net/if_inet6" "$vision_domain" "$cover_domain"
+    generate_production_http_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/gowave-http.conf" "/proc/net/if_inet6" "$vision_domain" "$cover_domain"
     generate_panel_https_vhost "$panel_domain"
-    generate_decoy_vhost "$reality_domain"
+    generate_decoy_vhost "$reality_domain" "/etc/nginx/conf.d/gowave-decoy.conf" nginx "$COVER_REALITY_ROOT" "$cover_domain"
     if [[ -n "$vision_domain" ]]; then
         generate_vision_fallback_vhost "$vision_domain"
     fi
-    configure_certbot_deploy_hook
+    configure_certbot_deploy_hook "$acme_tx_id"
 
     reload_nginx_strict
 
     # Step 6: GoWave Panel Native Installation
-    download_panel_release "$GOWAVE_DIR"
+    download_panel_release "$GOWAVE_DIR" "${GOWAVE_PANEL_VERSION:-$GOWAVE_DEFAULT_VERSION}"
     generate_panel_env "$GOWAVE_DIR" "$panel_domain" "$panel_domain/api/sub"
     configure_panel_systemd "$GOWAVE_DIR"
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
@@ -260,12 +451,29 @@ PY
 
     # Step 9: REST API Provisioning
     echo "Executing REST API bootstrapping and MVP profile provisioning..."
+    # A repeated install must keep the credentials the running Panel accepts: a
+    # freshly generated password would be refused by the existing admin, and the
+    # credentials file would no longer hold the password the operator needs.
     local admin_user="admin"
-    local admin_pass
-    admin_pass=$(openssl rand -hex 16)
-    save_credentials "$admin_user" "$admin_pass" "https://$panel_domain" "" "$CREDENTIALS_FILE"
+    local admin_pass=""
+    if [[ -r "$CREDENTIALS_FILE" ]]; then
+        local stored_user
+        stored_user=$(grep -s '^ADMIN_USERNAME=' "$CREDENTIALS_FILE" | cut -d= -f2- || true)
+        admin_pass=$(grep -s '^ADMIN_PASSWORD=' "$CREDENTIALS_FILE" | cut -d= -f2- || true)
+        if [[ -n "$stored_user" ]]; then
+            admin_user="$stored_user"
+        fi
+    fi
+    if [[ -z "$admin_pass" ]]; then
+        admin_pass=$(openssl rand -hex 16)
+        save_credentials "$admin_user" "$admin_pass" "https://$panel_domain" "" "$CREDENTIALS_FILE"
+    fi
 
-    if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+    if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+        XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
+        GOWAVE_MIHOMO_X25519="${GOWAVE_MIHOMO_X25519:-}" \
+        GOWAVE_REALITY_FINGERPRINT="${GOWAVE_REALITY_FINGERPRINT:-}" \
+        python3 - \
         "$SCRIPT_DIR" "$panel_domain" "$reality_domain" "$admin_user" \
         "$JOURNAL_FILE" "$STATE_FILE" "$CREDENTIALS_FILE" "$vision_domain" 3<<< "$admin_pass" <<'PY'
 import json
@@ -295,20 +503,48 @@ client = GoWaveClient("http://127.0.0.1:3000")
 client.register_initial_admin(admin_user, admin_password)
 client.login(admin_user, admin_password)
 
-journal["state"] = "PROVISION_APPLYING"
-write_journal_atomically(journal_path, journal)
-
 def persist_transaction_entities(entities):
+    journal["state"] = "PROVISION_APPLYING"
+    journal["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     journal["entities"] = list(entities)
     write_journal_atomically(journal_path, journal)
 
 client.transaction_callback = persist_transaction_entities
-x25519 = client.generate_x25519()
+
+
+def stored_credentials(path):
+    values = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                key, separator, value = line.partition("=")
+                if separator:
+                    values[key.strip()] = value.strip()
+    except FileNotFoundError:
+        pass
+    return values
+
+
+PROFILE_NAME = "GoWave MVP Unified Profile - local-node"
+
+# A repeated install reuses the REALITY material and the API token the installed
+# Panel already publishes: new keys would invalidate every subscription already
+# served, and a new token would leave a duplicate behind.
+installed_material = client.existing_reality_material(PROFILE_NAME, reality_domain)
+if installed_material:
+    x25519 = {
+        "privateKey": installed_material["privateKey"],
+        "publicKey": installed_material["publicKey"],
+    }
+    short_ids = installed_material["shortIds"]
+else:
+    x25519 = client.generate_x25519()
+    short_ids = None
 raw_config = client.compile_config_profile(
-    "local-node", reality_domain, x25519["privateKey"],
+    "local-node", reality_domain, x25519["privateKey"], short_ids=short_ids,
     public_key=x25519.get("publicKey"), vision_domain=vision_domain, panel_domain=panel_domain
 )
-profile = client.provision_config_profile("GoWave MVP Unified Profile - local-node", raw_config)
+profile = client.provision_config_profile(PROFILE_NAME, raw_config)
 profile_uuid = profile["profile_uuid"]
 inbounds = profile["inbounds"]
 inbound_uuids = [item["uuid"] for item in inbounds]
@@ -331,7 +567,9 @@ journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
 
 short_uuid = client.provision_user("default-user", squad_uuid)
-token_info = client.issue_api_token()
+token_info = client.ensure_api_token(
+    existing_token=stored_credentials(credentials_path).get("SCOPED_API_TOKEN", "")
+)
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
 
@@ -372,6 +610,7 @@ write_journal_atomically(journal_path, journal)
 PY
     then
         echo "Initial API provisioning failed; attempting action-aware rollback." >&2
+        rollback_acme_lineages
         if [[ -f "$JOURNAL_FILE" ]] && ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
 from modules.api_client import rollback_provisioning
 import sys
@@ -381,9 +620,14 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
         fi
         return 1
     fi
-    # Read shortUuid
-    local user_short_uuid
-    user_short_uuid=$(python3 -c "import json; print(json.load(open('$STATE_FILE')).get('defaultUserShortUuid', ''))" 2>/dev/null || echo "default-user")
+
+    # The deploy-hook ownership manifest stays behind after commit: it is the
+    # host-local record that lets a later install recognise the hook it wrote.
+    cleanup_acme_snapshot "$acme_tx_id" "$panel_domain"
+    cleanup_acme_snapshot "$acme_tx_id" "$reality_domain"
+    if [[ -n "$vision_domain" ]]; then
+        cleanup_acme_snapshot "$acme_tx_id" "$vision_domain"
+    fi
 
     echo "================================================================================"
     echo "                   GoWave Auto NGINX Installation Complete                      "
@@ -392,15 +636,68 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
     echo "Admin Username:      $admin_user"
     echo "Saved Credentials:   $CREDENTIALS_FILE (mode 0600)"
     echo ""
-    echo "--- Client Subscription Links for 'default-user' ---"
-    echo "Xray JSON:           https://$panel_domain/api/sub/$user_short_uuid/v2ray-json"
-    echo "Mihomo YAML:         https://$panel_domain/api/sub/$user_short_uuid/mihomo"
-    echo ""
-    echo "MANDATORY REQUIREMENT: Clients MUST send a non-empty User-Agent header!"
-    echo "Example verification commands:"
-    echo "  curl -fsSL -H 'User-Agent: v2rayN/6.0' 'https://$panel_domain/api/sub/$user_short_uuid/v2ray-json'"
-    echo "  curl -fsSL -H 'User-Agent: ClashMeta/1.19' 'https://$panel_domain/api/sub/$user_short_uuid/mihomo'"
-    echo "================================================================================"
+    cmd_user_links default-user
+}
+
+# Compensate a failed `node add` on both sides and record what each one reached.
+#
+# The Panel API rollback is the writer that finalizes the journal as
+# NODE_ADD_ROLLED_BACK, and it runs on the Master while the Worker restore runs
+# on another host: a Worker failure discovered after the API side succeeded would
+# otherwise leave a transaction recorded as rolled back over a host that was
+# never put back. Both sides are attempted, both verdicts are written into the
+# journal by modules.recovery, and the operation is reported INCOMPLETE unless
+# both sides verified. The caller's panel_ip, panel_ipv6, node_port,
+# vision_domain and known_hosts are read from the enclosing scope.
+finalize_failed_node_add() {
+    local name="$1"
+    local ip="$2"
+    local ssh_port="$3"
+    local worker_domain="$4"
+    local reality_domain="$5"
+    local ssh_user="$6"
+    local acme_tx_id="$7"
+    local worker_status="INCOMPLETE"
+    local api_status="INCOMPLETE"
+
+    if ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
+        VISION_DOMAIN="$vision_domain" \
+        GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
+        "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
+        worker_status="ROLLED_BACK"
+    else
+        echo "CRITICAL: Remote Worker host rollback failed; manual inspection required." >&2
+    fi
+
+    if PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+from modules.api_client import rollback_provisioning
+import sys
+sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE') else 1)
+"; then
+        api_status="ROLLED_BACK"
+    else
+        echo "CRITICAL: API rollback incomplete; recovery journal requires operator attention." >&2
+    fi
+
+    if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$JOURNAL_FILE" "$worker_status" "$api_status" <<'PY'
+from modules.recovery import record_rollback_sides
+import sys
+
+journal_path, worker_status, api_status = sys.argv[1:]
+record_rollback_sides(journal_path, worker_status, api_status)
+PY
+    then
+        echo "CRITICAL: the rollback outcome for Worker '$name' could not be recorded; the recovery journal was not rewritten." >&2
+        return 1
+    fi
+
+    if [[ "$worker_status" != "ROLLED_BACK" || "$api_status" != "ROLLED_BACK" ]]; then
+        echo "CRITICAL: Node add '$name' is INCOMPLETE: Worker $worker_status, Panel API $api_status; both sides recorded in $JOURNAL_FILE." >&2
+        echo "CRITICAL: Rollback failed for Worker '$name'; recovery journal retained." >&2
+        return 1
+    fi
+    echo "Node add '$name' rolled back: Worker and Panel API both verified." >&2
+    return 0
 }
 
 cmd_node() {
@@ -410,26 +707,52 @@ cmd_node() {
     case "$subcmd" in
         add)
             acquire_lock
-            local name="${1:-}"
-            local ip="${2:-}"
-            local worker_domain="${3:-}"
-            local reality_domain="${4:-}"
-            local ssh_user="${5:-root}"
-            local ssh_port="${6:-22}"
+            local vision_domain="${VISION_DOMAIN:-}"
+            local positional_args=()
+            while (( $# > 0 )); do
+                case "$1" in
+                    --vision-domain)
+                        if (( $# < 2 )); then
+                            echo "Error: --vision-domain requires an argument." >&2
+                            return 1
+                        fi
+                        vision_domain="$2"
+                        shift 2
+                        ;;
+                    --vision-domain=*)
+                        vision_domain="${1#*=}"
+                        shift
+                        ;;
+                    *)
+                        positional_args+=("$1")
+                        shift
+                        ;;
+                esac
+            done
+
+            local name="${positional_args[0]:-}"
+            local ip="${positional_args[1]:-}"
+            local worker_domain="${positional_args[2]:-}"
+            local reality_domain="${positional_args[3]:-}"
+            local ssh_user="${positional_args[4]:-root}"
+            local ssh_port="${positional_args[5]:-22}"
 
             if [[ -z "$name" || -z "$ip" || -z "$worker_domain" || -z "$reality_domain" ]]; then
-                echo "Usage: gowave-auto.sh node add <worker-name> <worker-ip> <worker-domain> <reality-domain> [ssh-user] [ssh-port]" >&2
+                echo "Usage: gowave-auto.sh node add [--vision-domain <domain>] <worker-name> <worker-ip> <worker-domain> <reality-domain> [ssh-user] [ssh-port]" >&2
                 return 1
             fi
 
+            validate_acme_server "${GOWAVE_ACME_SERVER:-}" || return 1
+
             local panel_ip panel_ipv6
-            panel_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org || true)
-            panel_ipv6=$(curl -s6 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s6 --connect-timeout 5 --max-time 10 https://api64.ipify.org || true)
+            panel_ip=$(resolve_panel_ipv4) || return 1
+            panel_ipv6=$(resolve_panel_ipv6) || return 1
             if [[ -z "$panel_ip" && -z "$panel_ipv6" ]]; then
                 echo "Error: unable to determine a public Panel IP address; refusing an untrusted firewall fallback." >&2
                 return 1
             fi
             local node_port=3002
+            local acme_tx_id="worker_install_${name}_$(date +%s)_${BASHPID}"
 
             if [[ "$ip" == "$panel_ip" || "$ip" == "127.0.0.1" ]]; then
                 log_warn "Worker IP matches PANEL_IP or 127.0.0.1; enforcing NODE_PORT=3002 to avoid collision with Panel on 3000."
@@ -472,11 +795,23 @@ PY
                 return 1
             fi
 
+            # Resolve the local Worker secret before creating any API-side effects.
+            # A local config/read failure must not strand a partially registered node.
+            local secret_key
+            if ! secret_key=$(extract_secret_key "$GOWAVE_DIR"); then
+                echo "Error: unable to extract the Worker secret; no API changes were made." >&2
+                return 1
+            fi
+
             # 2. Register the node using argv for data and FD 3 for the password.
             # User-controlled values are never interpolated into Python source.
-            if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+            if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+                XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
+                GOWAVE_MIHOMO_X25519="${GOWAVE_MIHOMO_X25519:-}" \
+                GOWAVE_REALITY_FINGERPRINT="${GOWAVE_REALITY_FINGERPRINT:-}" \
+                python3 - \
                 "$SCRIPT_DIR" "$name" "$ip" "$worker_domain" "$reality_domain" \
-                "$node_port" "$admin_user" "$JOURNAL_FILE" "$STATE_FILE" 3<<< "$admin_pass" <<'PY'
+                "$node_port" "$admin_user" "$JOURNAL_FILE" "$STATE_FILE" "$vision_domain" 3<<< "$admin_pass" <<'PY'
 import ipaddress
 import json
 import os
@@ -485,7 +820,7 @@ import sys
 import time
 
 (script_dir, name, address, worker_domain, reality_domain, port, admin_user,
- journal_path, state_path) = sys.argv[1:]
+ journal_path, state_path, vision_domain) = sys.argv[1:]
 admin_password = os.fdopen(3, "r", encoding="utf-8").read().rstrip("\n")
 
 if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", name):
@@ -510,6 +845,10 @@ validate_domain(worker_domain)
 validate_domain(reality_domain)
 if worker_domain.lower().rstrip(".") == reality_domain.lower().rstrip("."):
     raise SystemExit("Worker and REALITY domains must be different.")
+if vision_domain:
+    validate_domain(vision_domain)
+    if vision_domain.lower().rstrip(".") in (worker_domain.lower().rstrip("."), reality_domain.lower().rstrip(".")):
+        raise SystemExit("Vision domain must be distinct from Worker and REALITY domains.")
 if not port.isdigit() or not 1 <= int(port) <= 65535:
     raise SystemExit("Invalid Node API port.")
 if not admin_password:
@@ -540,12 +879,19 @@ journal = {
 write_journal_atomically(journal_path, journal)
 
 def persist_transaction_entities(entities):
+    journal["state"] = "NODE_ADD_APPLYING"
+    journal["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     journal["entities"] = list(entities)
     write_journal_atomically(journal_path, journal)
 
 client.transaction_callback = persist_transaction_entities
 x25519 = client.generate_x25519()
-raw_config = client.compile_config_profile(f"GoWave Worker {name} Profile", reality_domain, x25519["privateKey"])
+raw_config = client.compile_config_profile(
+    f"GoWave Worker {name} Profile",
+    reality_domain,
+    x25519["privateKey"],
+    vision_domain=vision_domain or None
+)
 profile = client.provision_config_profile(f"GoWave Worker {name} Profile", raw_config)
 profile_uuid = profile["profile_uuid"]
 inbounds = profile["inbounds"]
@@ -562,21 +908,30 @@ squad_uuid = state_data.get("squadUuid")
 client.provision_internal_squad("Default MVP Squad", inbound_uuids)
 client.provision_hosts(
     profile_uuid, inbounds, node_uuid, squad_uuid,
-    worker_domain, reality_domain, name
+    worker_domain, reality_domain, name,
+    vision_domain=vision_domain or None
 )
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
 
-nodes.append({
+node_entry = {
     "name": name,
     "address": address,
     "port": int(port),
     "workerDomain": worker_domain,
     "realityDomain": reality_domain,
     "uuid": node_uuid,
-})
+}
+if vision_domain:
+    node_entry["visionDomain"] = vision_domain
+nodes.append(node_entry)
 state_data["nodes"] = nodes
 atomic_write_state(state_data, state_path)
+
+# Record that the local state and API entities are committed before remote dispatch.
+journal["state"] = "NODE_ADD_VERIFYING"
+journal["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+write_journal_atomically(journal_path, journal)
 PY
             then
                 echo "Worker API registration failed; attempting action-aware API rollback." >&2
@@ -591,38 +946,34 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
             fi
 
 
-            # Mark remote side effects as in-flight before dispatch.
-            python3 -c "
-import sys, json, time
-for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
-    if p not in sys.path:
-        sys.path.insert(0, p)
-from modules.recovery import write_journal_atomically
-jdata = json.load(open('$JOURNAL_FILE'))
-jdata['state'] = 'NODE_ADD_VERIFYING'
-jdata['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-write_journal_atomically('$JOURNAL_FILE', jdata)
-"
             # 4. Dispatch remote deployment strictly via SSH stdin
-            local secret_key
-            secret_key=$(extract_secret_key "$GOWAVE_DIR")
-            if ! PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
+            local acme_test_ca_b64=""
+            if [[ "${GOWAVE_ACME_TEST_MODE:-0}" == "1" && "${GOWAVE_ACME_SERVER:-}" == "$GOWAVE_ACME_TEST_ENDPOINT" ]]; then
+                validate_acme_test_ca || return 1
+                acme_test_ca_b64=$(base64 -w 0 "$GOWAVE_ACME_TEST_CA_FILE")
+            fi
+            if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
+                XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
+                GOWAVE_ACME_SERVER="${GOWAVE_ACME_SERVER:-}" \
+                GOWAVE_ACME_TEST_MODE="${GOWAVE_ACME_TEST_MODE:-0}" \
+                GOWAVE_ACME_TEST_CA_FILE="${GOWAVE_ACME_TEST_CA_FILE:-}" \
+                GOWAVE_ACME_TEST_CA_SHA256="${GOWAVE_ACME_TEST_CA_SHA256:-}" \
+                GOWAVE_ACME_TEST_CA_B64="$acme_test_ca_b64" \
+                GOWAVE_PODMAN_TEST_MODE="${GOWAVE_PODMAN_TEST_MODE:-0}" \
+                GOWAVE_NODE_INSTALLER_COMMIT="${GOWAVE_NODE_INSTALLER_COMMIT:-}" \
+                GOWAVE_NODE_INSTALLER_SHA256="${GOWAVE_NODE_INSTALLER_SHA256:-}" \
+                VISION_DOMAIN="$vision_domain" \
+                GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
                 SSH_KNOWN_HOSTS="$known_hosts" "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
                 echo "Remote Worker deployment failed; rolling back Worker host configuration and Panel API entities." >&2
-                PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
-                    "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user" || true
-                if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
-from modules.api_client import rollback_provisioning
-import sys
-sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE') else 1)
-"; then
-                    echo "CRITICAL: API rollback incomplete; recovery journal requires operator attention." >&2
-                fi
+                finalize_failed_node_add "$name" "$ip" "$ssh_port" \
+                    "$worker_domain" "$reality_domain" "$ssh_user" "$acme_tx_id" || true
                 return 1
             fi
 
-            # 5. Commit transaction
-            python3 -c "
+            # 5. Commit transaction. If the durable commit record fails after
+            # remote deployment succeeded, compensate both remote and API state.
+            if ! python3 -c "
 import sys, json, time
 for p in ['$SCRIPT_DIR', '/opt/gowave-auto-nginx']:
     if p not in sys.path:
@@ -632,7 +983,16 @@ jdata = json.load(open('$JOURNAL_FILE'))
 jdata['state'] = 'NODE_ADD_COMMITTED'
 jdata['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 write_journal_atomically('$JOURNAL_FILE', jdata)
-"
+"; then
+                echo "CRITICAL: Worker deployment succeeded but the commit journal could not be persisted; compensating both sides." >&2
+                finalize_failed_node_add "$name" "$ip" "$ssh_port" \
+                    "$worker_domain" "$reality_domain" "$ssh_user" "$acme_tx_id" || true
+                return 1
+            fi
+            if ! ACME_TX_ID="$acme_tx_id" SSH_KNOWN_HOSTS="$known_hosts" \
+                "$SCRIPT_DIR/gowave-node-auto.sh" remote_finalize "$ip" "$ssh_port" "$ssh_user"; then
+                echo "WARNING: Worker '$name' is committed and deployed, but its ACME recovery snapshot could not be finalized; snapshot retained for manual cleanup." >&2
+            fi
             echo "Worker '$name' successfully added and deployed."
             ;;
         list)
@@ -650,26 +1010,180 @@ for n in data.get('nodes', []):
             ;;
         rollback|remove)
             acquire_lock
-            local ip="${1:-}"
-            local worker_domain="${2:-}"
-            local reality_domain="${3:-}"
-            local ssh_user="${4:-root}"
-            local ssh_port="${5:-22}"
+            local vision_domain="${VISION_DOMAIN:-}"
+            local positional_args=()
+            while (( $# > 0 )); do
+                case "$1" in
+                    --vision-domain)
+                        if (( $# < 2 )); then
+                            echo "Error: --vision-domain requires an argument." >&2
+                            return 1
+                        fi
+                        vision_domain="$2"
+                        shift 2
+                        ;;
+                    --vision-domain=*)
+                        vision_domain="${1#*=}"
+                        shift
+                        ;;
+                    *)
+                        positional_args+=("$1")
+                        shift
+                        ;;
+                esac
+            done
+
+            local ip="${positional_args[0]:-}"
+            local worker_domain="${positional_args[1]:-}"
+            local reality_domain="${positional_args[2]:-}"
+            local ssh_user="${positional_args[3]:-root}"
+            local ssh_port="${positional_args[4]:-22}"
 
             if [[ -z "$ip" || -z "$worker_domain" || -z "$reality_domain" ]]; then
-                echo "Usage: gowave-auto.sh node rollback <worker-ip> <worker-domain> <reality-domain> [ssh-user] [ssh-port]" >&2
+                echo "Usage: gowave-auto.sh node rollback [--vision-domain <domain>] <worker-ip> <worker-domain> <reality-domain> [ssh-user] [ssh-port]" >&2
                 return 1
             fi
             local known_hosts="${SSH_KNOWN_HOSTS:-/root/.ssh/known_hosts}"
             local panel_ip panel_ipv6
-            panel_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org || true)
-            panel_ipv6=$(curl -s6 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s6 --connect-timeout 5 --max-time 10 https://api64.ipify.org || true)
+            panel_ip=$(resolve_panel_ipv4) || return 1
+            panel_ipv6=$(resolve_panel_ipv6) || return 1
             local node_port=3002
             PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SSH_KNOWN_HOSTS="$known_hosts" \
+                VISION_DOMAIN="$vision_domain" \
+                GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
                 "$SCRIPT_DIR/gowave-node-auto.sh" remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"
             ;;
+        reapply)
+            acquire_lock
+            local name="${1:-}"
+            local ssh_user="${2:-root}"
+            local ssh_port="${3:-22}"
+
+            if [[ -z "$name" ]]; then
+                echo "Usage: gowave-auto.sh node reapply <worker-name> [ssh-user] [ssh-port]" >&2
+                return 1
+            fi
+            if [[ ! -f "$STATE_FILE" ]]; then
+                echo "Error: no state.json found; no Worker is registered to re-apply." >&2
+                return 1
+            fi
+            if [[ ! "$ssh_port" =~ ^[0-9]+$ ]] || (( ssh_port < 1 || ssh_port > 65535 )); then
+                echo "Error: SSH port must be between 1 and 65535." >&2
+                return 2
+            fi
+            if [[ ! "$ssh_user" =~ ^[A-Za-z_][A-Za-z0-9._-]{0,31}$ ]]; then
+                echo "Error: invalid SSH username." >&2
+                return 2
+            fi
+
+            # The host is already registered with the Panel, so a re-apply
+            # converges it with the identity the operator added instead of
+            # registering a second node: every argument is read back from
+            # state.json and the Panel side is left untouched.
+            local identity_text=""
+            if ! identity_text=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$STATE_FILE" "$name" <<'PY'
+import json
+import sys
+
+state_path, name = sys.argv[1:]
+nodes = json.load(open(state_path, encoding="utf-8")).get("nodes", [])
+matches = [item for item in nodes if isinstance(item, dict) and item.get("name") == name]
+if not matches:
+    raise SystemExit(f"Worker name is not registered in state.json: {name}")
+node = matches[0]
+for field in ("address", "port", "workerDomain", "realityDomain"):
+    if not node.get(field):
+        raise SystemExit(f"state.json node '{name}' is missing {field}.")
+print(f"address={node['address']}")
+print(f"port={node['port']}")
+print(f"worker_domain={node['workerDomain']}")
+print(f"reality_domain={node['realityDomain']}")
+print(f"vision_domain={node.get('visionDomain') or ''}")
+PY
+            ); then
+                echo "Error: cannot re-apply Worker '$name': $identity_text" >&2
+                return 1
+            fi
+            # Read by label: a name may legitimately be empty (a Worker without
+            # Vision), and command substitution drops trailing empty lines.
+            local ip="" node_port="" worker_domain="" reality_domain="" vision_domain=""
+            while IFS='=' read -r key value; do
+                case "$key" in
+                    address) ip="$value" ;;
+                    port) node_port="$value" ;;
+                    worker_domain) worker_domain="$value" ;;
+                    reality_domain) reality_domain="$value" ;;
+                    vision_domain) vision_domain="$value" ;;
+                esac
+            done <<< "$identity_text"
+            if [[ -z "$ip" || -z "$node_port" || -z "$worker_domain" || -z "$reality_domain" ]]; then
+                echo "Error: state.json node '$name' did not yield its identity." >&2
+                return 1
+            fi
+            if [[ ! "$node_port" =~ ^[0-9]+$ ]] || (( node_port < 1 || node_port > 65535 )); then
+                echo "Error: state.json node '$name' carries an invalid port: $node_port" >&2
+                return 1
+            fi
+
+            local known_hosts="${SSH_KNOWN_HOSTS:-/root/.ssh/known_hosts}"
+            local host_key="$ip"
+            if [[ "$ssh_port" != "22" ]]; then
+                host_key="[$ip]:$ssh_port"
+            fi
+            if [[ ! -s "$known_hosts" ]] || ! ssh-keygen -F "$host_key" -f "$known_hosts" >/dev/null 2>&1; then
+                echo "Error: SSH host key for $host_key is not pre-pinned in $known_hosts." >&2
+                echo "Verify the fingerprint out of band before re-applying." >&2
+                return 1
+            fi
+
+            local secret_key
+            if ! secret_key=$(extract_secret_key "$GOWAVE_DIR"); then
+                echo "Error: unable to extract the Worker secret; the host was not touched." >&2
+                return 1
+            fi
+            validate_acme_server "${GOWAVE_ACME_SERVER:-}" || return 1
+            local panel_ip panel_ipv6
+            panel_ip=$(resolve_panel_ipv4) || return 1
+            panel_ipv6=$(resolve_panel_ipv6) || return 1
+            if [[ -z "$panel_ip" && -z "$panel_ipv6" ]]; then
+                echo "Error: unable to determine a public Panel IP address; refusing an untrusted firewall fallback." >&2
+                return 1
+            fi
+            local acme_test_ca_b64=""
+            if [[ "${GOWAVE_ACME_TEST_MODE:-0}" == "1" && "${GOWAVE_ACME_SERVER:-}" == "$GOWAVE_ACME_TEST_ENDPOINT" ]]; then
+                validate_acme_test_ca || return 1
+                acme_test_ca_b64=$(base64 -w 0 "$GOWAVE_ACME_TEST_CA_FILE")
+            fi
+
+            # The payload is streamed again instead of rebuilt: the Worker keeps
+            # no copy of it, so this is the only path that reconverges a host
+            # that is already installed.
+            local acme_tx_id="worker_install_reapply_$(date +%s)_${BASHPID}"
+            echo "Re-applying the Worker payload to '$name' ($ip:$ssh_port)..."
+            if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key" GOWAVE_NODE_VERSION="${GOWAVE_NODE_VERSION:-latest}" \
+                XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
+                GOWAVE_ACME_SERVER="${GOWAVE_ACME_SERVER:-}" \
+                GOWAVE_ACME_TEST_MODE="${GOWAVE_ACME_TEST_MODE:-0}" \
+                GOWAVE_ACME_TEST_CA_FILE="${GOWAVE_ACME_TEST_CA_FILE:-}" \
+                GOWAVE_ACME_TEST_CA_SHA256="${GOWAVE_ACME_TEST_CA_SHA256:-}" \
+                GOWAVE_ACME_TEST_CA_B64="$acme_test_ca_b64" \
+                GOWAVE_PODMAN_TEST_MODE="${GOWAVE_PODMAN_TEST_MODE:-0}" \
+                GOWAVE_NODE_INSTALLER_COMMIT="${GOWAVE_NODE_INSTALLER_COMMIT:-}" \
+                GOWAVE_NODE_INSTALLER_SHA256="${GOWAVE_NODE_INSTALLER_SHA256:-}" \
+                VISION_DOMAIN="$vision_domain" \
+                GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
+                SSH_KNOWN_HOSTS="$known_hosts" "$SCRIPT_DIR/gowave-node-auto.sh" remote_payload "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"; then
+                echo "Error: re-applying Worker '$name' failed; its Panel registration is unchanged." >&2
+                return 1
+            fi
+            if ! ACME_TX_ID="$acme_tx_id" SSH_KNOWN_HOSTS="$known_hosts" \
+                "$SCRIPT_DIR/gowave-node-auto.sh" remote_finalize "$ip" "$ssh_port" "$ssh_user"; then
+                echo "WARNING: Worker '$name' was re-applied, but its ACME recovery snapshot could not be finalized." >&2
+            fi
+            echo "Worker '$name' re-applied."
+            ;;
         *)
-            echo "Usage: gowave-auto.sh node {add|list|rollback}"
+            echo "Usage: gowave-auto.sh node {add|list|reapply|rollback}"
             ;;
     esac
 }
@@ -704,7 +1218,7 @@ PY
     echo "Changing domains to: $new_panel_domain / $new_reality_domain..."
 
     local srv_ip
-    srv_ip=$(curl -s4 --connect-timeout 5 --max-time 10 https://ifconfig.me || curl -s4 --connect-timeout 5 --max-time 10 https://api.ipify.org || echo "")
+    srv_ip=$(resolve_panel_ipv4) || return 1
     if [[ -n "$srv_ip" ]] && command -v getent >/dev/null 2>&1; then
         local resolved_ip
         resolved_ip=$(getent ahostsv4 "$new_panel_domain" 2>/dev/null | awk 'NR==1 {print $1}' || true)
@@ -713,6 +1227,14 @@ PY
             return 1
         fi
     fi
+
+    validate_acme_server "${GOWAVE_ACME_SERVER:-}" || return 1
+    local effective_acme_server="${GOWAVE_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
+    check_acme_lineage "$new_panel_domain" "$effective_acme_server" || return 1
+    check_acme_lineage "$new_reality_domain" "$effective_acme_server" || return 1
+
+    local cover_domain=""
+    cover_domain=$(cover_domain_for "$new_panel_domain" "$srv_ip")
 
     local snap_dir
     snap_dir=$(prepare_update_snapshot "domain-change")
@@ -747,27 +1269,41 @@ from modules.recovery import write_journal_atomically
 write_journal_atomically(str(p), data)
 PY
 
-    generate_bootstrap_acme_vhost "$new_panel_domain" "$new_reality_domain"
+    generate_bootstrap_acme_vhost "$new_panel_domain" "$new_reality_domain" "/etc/nginx/conf.d/00-bootstrap-acme.conf" "/proc/net/if_inet6" "" "$cover_domain"
     reload_nginx_strict || { rollback_domain_change "bootstrap NGINX activation failed"; return 1; }
 
-    if ! certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_panel_domain" --cert-name "$new_panel_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring; then
+    local certbot_extra_args=()
+    if [[ -n "${GOWAVE_ACME_SERVER:-}" ]]; then
+        certbot_extra_args+=(--server "$GOWAVE_ACME_SERVER")
+    fi
+
+    if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_panel_domain" --cert-name "$new_panel_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring "${certbot_extra_args[@]}"; then
         rollback_domain_change "ACME issuance failed for panel domain"; return 1
     fi
-    if ! certbot certonly --webroot -w "$ACME_WEBROOT" -d "$new_reality_domain" --cert-name "$new_reality_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring; then
+    local new_reality_cert_args=(-d "$new_reality_domain")
+    local new_reality_cert_flags=()
+    if [[ -n "$cover_domain" ]]; then
+        new_reality_cert_args+=(-d "$cover_domain" -d "www.$cover_domain")
+        new_reality_cert_flags+=(--expand)
+    fi
+    if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" "${new_reality_cert_args[@]}" "${new_reality_cert_flags[@]}" --cert-name "$new_reality_domain" --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring "${certbot_extra_args[@]}"; then
         rollback_domain_change "ACME issuance failed for REALITY domain"; return 1
     fi
     verify_acme_certificate "$new_panel_domain" || { rollback_domain_change "invalid panel certificate"; return 1; }
     verify_acme_certificate "$new_reality_domain" || { rollback_domain_change "invalid REALITY certificate"; return 1; }
+    if [[ -n "$cover_domain" ]] && ! verify_acme_certificate "$cover_domain" "/etc/letsencrypt/live/$new_reality_domain"; then
+        rollback_domain_change "REALITY certificate does not cover the camouflage apex"; return 1
+    fi
 
     rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
-    generate_stream_config "$new_panel_domain" "$new_reality_domain"
-    generate_production_http_vhost "$new_panel_domain" "$new_reality_domain"
+    generate_stream_config "$new_panel_domain" "$new_reality_domain" "/etc/nginx/stream-enabled/gowave-stream.conf" "/proc/net/if_inet6" "" "$cover_domain"
+    generate_production_http_vhost "$new_panel_domain" "$new_reality_domain" "/etc/nginx/conf.d/gowave-http.conf" "/proc/net/if_inet6" "" "$cover_domain"
     generate_panel_https_vhost "$new_panel_domain"
-    generate_decoy_vhost "$new_reality_domain"
+    generate_decoy_vhost "$new_reality_domain" "/etc/nginx/conf.d/gowave-decoy.conf" nginx "$COVER_REALITY_ROOT" "$cover_domain"
     sed -i "s/^PANEL_DOMAIN=.*/PANEL_DOMAIN=$new_panel_domain/" "$GOWAVE_DIR/.env"
     sed -i "s|^SUB_PUBLIC_DOMAIN=.*|SUB_PUBLIC_DOMAIN=$new_panel_domain/api/sub|" "$GOWAVE_DIR/.env"
 
-    python3 - "$JOURNAL_FILE" <<'PY'
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - "$JOURNAL_FILE" <<'PY'
 import json, sys, time
 from pathlib import Path
 p=Path(sys.argv[1]); data=json.loads(p.read_text())
@@ -876,15 +1412,23 @@ cmd_user_links() {
     echo "================================================================================"
     echo "GoWave Subscription Links for user: $identifier"
     echo "================================================================================"
-    echo "Xray Subscription URL (JSON):"
+    # v2rayNG and NekoBox parse a subscription body as base64 share links only; the
+    # /v2ray-json array of full configs is rejected by their subscription updater.
+    echo "v2rayNG / NekoBox / Hiddify / v2rayN 6+ (base64 share links):"
+    echo "  https://$panel_domain/api/sub/$short_uuid"
+    echo ""
+    echo "Xray JSON config array (file or JSON import, not a v2rayNG subscription):"
     echo "  https://$panel_domain/api/sub/$short_uuid/v2ray-json"
     echo ""
-    echo "Mihomo Subscription URL (YAML):"
+    echo "Mihomo / Clash Verge Rev / FlClash (Meta YAML):"
     echo "  https://$panel_domain/api/sub/$short_uuid/mihomo"
+    echo ""
+    echo "Clash / Clash Meta for Android (compact YAML):"
+    echo "  https://$panel_domain/api/sub/$short_uuid/clash"
     echo ""
     echo "NOTE: Upstream GoWave strictly enforces a non-empty User-Agent header!"
     echo "Verification curl examples:"
-    echo "  curl -fsSL -H 'User-Agent: v2rayN/6.0' 'https://$panel_domain/api/sub/$short_uuid/v2ray-json'"
+    echo "  curl -fsSL -H 'User-Agent: v2rayNG/1.8.5' 'https://$panel_domain/api/sub/$short_uuid'"
     echo "  curl -fsSL -H 'User-Agent: ClashMeta/1.19' 'https://$panel_domain/api/sub/$short_uuid/mihomo'"
     echo "================================================================================"
 }

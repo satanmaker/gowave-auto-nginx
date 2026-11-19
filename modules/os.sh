@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # modules/os.sh - Base OS, package inventory, and environment detection
-set -euo pipefail
+set -Eeuo pipefail
 
 detect_os() {
     local os_release="${1:-/etc/os-release}"
@@ -72,8 +72,10 @@ check_os() {
 
 check_kernel_ipv6() {
     local if_inet6="${1:-/proc/net/if_inet6}"
-    # Check proc file existence and non-empty content
-    if [[ ! -f "$if_inet6" ]] || [[ ! -s "$if_inet6" ]]; then
+    # The address table has to be read, not measured: procfs reports a zero
+    # inode size for /proc/net/if_inet6 however many addresses it prints, so
+    # ``[[ -s ]]`` answers "empty" even on a dual-stack host.
+    if [[ ! -f "$if_inet6" ]] || ! grep -q '[^[:space:]]' "$if_inet6" 2>/dev/null; then
         return 1
     fi
     # Check sysctl disable_ipv6 if sysctl is available
@@ -184,13 +186,32 @@ ensure_systemd_resolved() {
     local os_release="${1:-/etc/os-release}"
     detect_os "$os_release" || true
 
-    if ! command -v resolvectl >/dev/null 2>&1; then
-        if [[ "$OS_ID" == "debian" && ( "$OS_VERSION_ID" == "12" || "$OS_VERSION_ID" == "13" ) ]]; then
+    if [[ "$OS_ID" == "debian" && ( "$OS_VERSION_ID" == "12" || "$OS_VERSION_ID" == "13" ) ]]; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        if [[ ! -f /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf ]]; then
+            cat > /etc/systemd/resolved.conf.d/90-gowave-auto-nginx.conf << 'EOF'
+# Managed by GoWave Auto NGINX: VPS Security
+[Resolve]
+DNS=
+DNS=1.1.1.1#one.one.one.one 1.0.0.1#one.one.one.one 8.8.8.8#dns.google 8.8.4.4#dns.google
+FallbackDNS=
+Domains=
+Domains=~.
+DNSOverTLS=yes
+DNSSEC=no
+LLMNR=no
+MulticastDNS=no
+Cache=yes
+DNSStubListener=yes
+EOF
+        fi
+        if ! command -v resolvectl >/dev/null 2>&1; then
             echo "Installing systemd-resolved on Debian ${OS_VERSION_ID}..."
             DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends systemd-resolved
             systemctl enable --now systemd-resolved || true
         fi
+        systemctl restart systemd-resolved 2>/dev/null || true
     fi
 }
 
@@ -215,20 +236,52 @@ openssh-client
 EOF
 }
 
-check_prerequisites() {
-    local missing=()
-    while IFS= read -r pkg || [[ -n "$pkg" ]]; do
+# Packages the arguments-validation and address-resolution steps need before
+# install_prerequisites runs. Every one of them ships with a stock supported
+# image; the list exists so a minimal container is not failed blind.
+get_bootstrap_packages() {
+    cat <<'EOF'
+python3
+iproute2
+curl
+ca-certificates
+openssl
+EOF
+}
+
+missing_packages() {
+    local pkg
+    for pkg in "$@"; do
         [[ -z "$pkg" || "$pkg" =~ ^# ]] && continue
         if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
-            missing+=("$pkg")
+            printf '%s\n' "$pkg"
         fi
-    done < <(get_required_packages)
+    done
+}
+
+check_prerequisites() {
+    local packages=() missing=()
+    mapfile -t packages < <(get_required_packages)
+    mapfile -t missing < <(missing_packages "${packages[@]}")
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         printf '%s\n' "${missing[@]}"
         return 1
     fi
     return 0
+}
+
+bootstrap_early_tools() {
+    local packages=() missing=()
+    mapfile -t packages < <(get_bootstrap_packages)
+    mapfile -t missing < <(missing_packages "${packages[@]}")
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        return 0
+    fi
+    echo "Bootstrapping early tools required before prerequisites: ${missing[*]}..."
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
 }
 
 install_prerequisites() {
@@ -243,5 +296,6 @@ install_prerequisites() {
     echo "Installing missing prerequisites: ${missing[*]}..."
     DEBIAN_FRONTEND=noninteractive apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+    ensure_systemd_resolved
     return 0
 }

@@ -1,0 +1,6 @@
+# Module functions are sourced through a path computed at runtime, so point
+# ShellCheck at the source directory and follow the files: without this every
+# `source "$SCRIPT_DIR/modules/*.sh"` line reports SC1090/SC1091 instead of the
+# module being checked.
+external-sources=true
+source-path=SCRIPTDIR

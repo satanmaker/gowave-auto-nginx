@@ -1,0 +1,479 @@
+"""Preflight verification, disposable baseline gate, and pair-wide run locking.
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from .ssh import SSHClient, SSHResult
+from .redaction import redact
+from .deployment import output_matches_expected_version
+
+REQUIRED_PORTS_DEFAULT = [80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, 10003]
+VISION_PORTS = [8444, 9444]
+
+
+@dataclass
+class ToolCheckResult:
+    tool: str
+    ok: bool
+    version: Optional[str] = None
+    error: Optional[str] = None
+
+
+def check_tool_available(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def check_control_machine_tools(config: Any) -> Dict[str, ToolCheckResult]:
+    """Interrogate Control Machine tool inventory and pinned versions."""
+    results: Dict[str, ToolCheckResult] = {}
+
+    # 1. python3 >= 3.10
+    v = sys.version_info
+    py_ok = v >= (3, 10)
+    py_ver = f"{v.major}.{v.minor}.{v.micro}"
+    results["python3"] = ToolCheckResult(
+        tool="python3",
+        ok=py_ok,
+        version=py_ver,
+        error=None if py_ok else f"Python 3.10+ required, got {py_ver}",
+    )
+
+    # 2. Standard CLI utilities
+    standard_tools = ["ssh", "ssh-keygen", "openssl", "curl", "dig", "timeout"]
+    for t in standard_tools:
+        available = check_tool_available(t)
+        results[t] = ToolCheckResult(
+            tool=t,
+            ok=available,
+            error=None if available else f"Required CLI utility '{t}' not found in PATH",
+        )
+
+    # 3. Xray client binary version check
+    if not check_tool_available("xray"):
+        results["xray"] = ToolCheckResult(
+            tool="xray",
+            ok=False,
+            error="Xray client binary not found in PATH on Control Machine",
+        )
+    else:
+        try:
+            proc = subprocess.run(["xray", "version"], capture_output=True, text=True, timeout=5)
+            # Output like: Xray 25.10.15 (Xray, Penetrates Everything.)
+            match = re.search(r"Xray\s+([0-9\.]+)", proc.stdout)
+            ver = match.group(1) if match else proc.stdout.split()[1] if proc.stdout else "unknown"
+            expected = getattr(config, "XRAY_CLIENT_VERSION", None)
+            ver_ok = (expected is None) or output_matches_expected_version(proc.stdout, expected)
+            results["xray"] = ToolCheckResult(
+                tool="xray",
+                ok=ver_ok,
+                version=ver,
+                error=None if ver_ok else f"Xray client version mismatch: expected {expected}, got {ver}",
+            )
+        except Exception as e:
+            results["xray"] = ToolCheckResult(tool="xray", ok=False, error=str(e))
+
+    # 4. Mihomo client binary version check
+    if not check_tool_available("mihomo"):
+        results["mihomo"] = ToolCheckResult(
+            tool="mihomo",
+            ok=False,
+            error="Mihomo client binary not found in PATH on Control Machine",
+        )
+    else:
+        try:
+            proc = subprocess.run(["mihomo", "-v"], capture_output=True, text=True, timeout=5)
+            # Output like: Mihomo v1.19.1 linux amd64
+            match = re.search(r"v([0-9\.]+)", proc.stdout)
+            ver = match.group(1) if match else proc.stdout.strip()
+            expected = getattr(config, "MIHOMO_CLIENT_VERSION", None)
+            ver_ok = (expected is None) or output_matches_expected_version(proc.stdout, expected)
+            results["mihomo"] = ToolCheckResult(
+                tool="mihomo",
+                ok=ver_ok,
+                version=ver,
+                error=None if ver_ok else f"Mihomo client version mismatch: expected {expected}, got {ver}",
+            )
+        except Exception as e:
+            results["mihomo"] = ToolCheckResult(tool="mihomo", ok=False, error=str(e))
+
+    return results
+
+
+def check_private_key_file(key_path: str | Path) -> Tuple[bool, Optional[str]]:
+    """Require a runner-owned, regular, non-symlink private key with safe permissions."""
+    path = Path(key_path).expanduser()
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        return False, f"SSH private key cannot be inspected: {path}: {type(exc).__name__}"
+    if stat.S_ISLNK(info.st_mode):
+        return False, f"SSH private key must not be a symlink: {path}"
+    if not stat.S_ISREG(info.st_mode):
+        return False, f"SSH private key must be a regular file: {path}"
+    if info.st_uid != os.geteuid():
+        return False, f"SSH private key must be owned by the runner user: {path}"
+    if not (info.st_mode & stat.S_IRUSR):
+        return False, f"SSH private key must be readable by the runner user: {path}"
+    if stat.S_IMODE(info.st_mode) & 0o077:
+        return False, f"SSH private key permissions are too broad; require 0600 or 0400: {path}"
+    if info.st_size == 0:
+        return False, f"SSH private key is empty: {path}"
+    return True, None
+
+
+def check_ssh_trust(host: str, port: int, known_hosts_path: str | Path) -> Tuple[bool, Optional[str]]:
+    """Verify safe known_hosts metadata and a pre-pinned key for host:port."""
+    kh = Path(known_hosts_path).expanduser()
+    try:
+        info = kh.lstat()
+    except OSError as exc:
+        return False, f"SSH known_hosts file cannot be inspected: {kh}: {type(exc).__name__}"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return False, f"SSH known_hosts must be a regular non-symlink file: {kh}"
+    if info.st_uid != os.geteuid():
+        return False, f"SSH known_hosts must be owned by the runner user: {kh}"
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        return False, f"SSH known_hosts must not be group- or world-writable: {kh}"
+    if info.st_size == 0:
+        return False, f"SSH known_hosts file is empty: {kh}"
+
+    host_pattern = host if port == 22 else f"[{host}]:{port}"
+    cmd = ["ssh-keygen", "-F", host_pattern, "-f", str(kh)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return True, None
+        return False, f"Host key for {host_pattern} is not pre-pinned in {kh}"
+    except Exception as e:
+        return False, f"ssh-keygen check failed: {e}"
+
+
+def collect_remote_baseline(ssh: SSHClient) -> Dict[str, Any]:
+    """Collect read-only system baseline manifest from remote VPS."""
+    manifest: Dict[str, Any] = {}
+
+    # 1. Host OS / kernel
+    r = ssh.run("uname -a && cat /etc/os-release 2>/dev/null || true")
+    manifest["os_kernel"] = r.stdout.strip()
+
+    # 2. Running systemd services
+    r = ssh.run("systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null || true")
+    manifest["running_services"] = [line.split()[0] for line in r.stdout.splitlines() if line.strip()]
+
+    # 3. Active TCP listeners
+    r = ssh.run("ss -tlnH 2>/dev/null || netstat -tln 2>/dev/null || true")
+    manifest["tcp_listeners_raw"] = r.stdout.strip()
+
+    listening_ports = set()
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            # Look at local address column (usually 4th column in ss)
+            addr = parts[3]
+            if ":" in addr:
+                port_str = addr.rsplit(":", 1)[-1]
+                if port_str.isdigit():
+                    listening_ports.add(int(port_str))
+    manifest["listening_ports"] = sorted(listening_ports)
+
+    # 4. Existing GoWave directories
+    gowave_dirs = [
+        "/opt/gowave",
+        "/opt/gowave-node",
+        "/opt/gowave-auto-nginx",
+        "/var/www/gowave-auto-nginx",
+        "/etc/nginx/stream-enabled",
+    ]
+    r = ssh.run(f"for d in {' '.join(gowave_dirs)}; do if [ -e \"$d\" ]; then echo \"$d\"; fi; done")
+    existing_dirs = [d.strip() for d in r.stdout.splitlines() if d.strip()]
+    manifest["existing_gowave_dirs"] = existing_dirs
+
+    # 5. Firewall state
+    r = ssh.run("ufw status verbose 2>/dev/null || iptables -L -n 2>/dev/null || true")
+    manifest["firewall_status"] = r.stdout.strip()
+
+    # 6. Swap state
+    r = ssh.run("swapon --show 2>/dev/null || true")
+    manifest["swap_info"] = r.stdout.strip()
+
+    # 7. Filesystem usage
+    r = ssh.run("df -h / 2>/dev/null || true")
+    manifest["disk_usage"] = r.stdout.strip()
+
+    # 8. Packages
+    r = ssh.run("dpkg-query -W -f='${binary:Package}=${Version}\n' 2>/dev/null | grep -E '^(nginx|certbot|python3|ufw|fail2ban)' || true")
+    manifest["key_packages"] = r.stdout.strip()
+
+    # 9. Target-side tools required by the traffic phase (the controller never installs them)
+    r = ssh.run(
+        "for t in tcpdump timeout; do "
+        "if command -v \"$t\" >/dev/null 2>&1; then echo \"$t=ok\"; else echo \"$t=missing\"; fi; "
+        "done"
+    )
+    manifest["required_tools"] = dict(
+        line.split("=", 1) for line in r.stdout.splitlines() if "=" in line
+    )
+
+    return manifest
+
+
+def check_disposable_gate(manifest: Dict[str, Any], vision_enabled: bool = False) -> Tuple[bool, List[str]]:
+    """Evaluate whether VPS satisfies the clean disposable baseline gate."""
+    disqualifications: List[str] = []
+
+    # Check 1: No pre-existing GoWave directories
+    existing_dirs = manifest.get("existing_gowave_dirs", [])
+    if existing_dirs:
+        disqualifications.append(f"Pre-existing GoWave directories detected: {existing_dirs}")
+
+    # Check 2: No GoWave systemd services active
+    services = manifest.get("running_services", [])
+    for svc in services:
+        if "gowave" in svc.lower():
+            disqualifications.append(f"GoWave systemd service already active: {svc}")
+
+    # Check 3: Port hygiene (none of the required ports may be listening)
+    required = set(REQUIRED_PORTS_DEFAULT)
+    if vision_enabled:
+        required.update(VISION_PORTS)
+
+    listening = set(manifest.get("listening_ports", []))
+    conflicts = required.intersection(listening)
+    if conflicts:
+        disqualifications.append(f"Port conflicts detected; required ports already occupied: {sorted(conflicts)}")
+
+    # Check 4: Target-side tools the traffic phase needs; the controller never installs them
+    tools = manifest.get("required_tools") or {}
+    missing_tools = [tool for tool in ("tcpdump", "timeout") if tools.get(tool) != "ok"]
+    if missing_tools:
+        disqualifications.append(
+            "Missing required target tools (install them before the run): " + ", ".join(missing_tools)
+        )
+
+    return len(disqualifications) == 0, disqualifications
+
+
+class LocalLock:
+    """Local process lock using fcntl.flock in private mode-0700 runtime dir."""
+
+    def __init__(self, target_name: str):
+        self.target_name = target_name
+        self.lock_dir = Path.home() / ".cache" / "gowave-live-vps" / "locks"
+        self.lock_file = self.lock_dir / f"{target_name}.lock"
+        self._fd: Optional[int] = None
+
+    def acquire(self) -> bool:
+        self.lock_dir.mkdir(parents=True, exist_ok=True)
+        self.lock_dir.chmod(0o700)
+
+        # Open without following symlinks
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        self._fd = os.open(str(self.lock_file), flags, 0o600)
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (BlockingIOError, OSError):
+            os.close(self._fd)
+            self._fd = None
+            return False
+
+    def release(self) -> None:
+        if self._fd is not None:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+                os.close(self._fd)
+            except Exception:
+                pass
+            self._fd = None
+
+
+#: The program each lock-holder session runs on its host. It owns the kernel
+#: lock for as long as its session lives and publishes the lease that the host's
+#: own management commands accept as re-entrant authority. It is sent to
+#: ``python3 -c`` as one shell-quoted word on the pinned SSH channel, so the
+#: token, the run identity, and every path stay out of argv on both ends.
+#:
+#: A refusal is a sentence on stderr rather than a bare exit status: the caller
+#: has to report which object was rejected, and a lock path that is a symlink, a
+#: FIFO, a directory, another user's file, or a world-writable file is a
+#: different answer for the operator. Nothing here follows a link, replaces an
+#: object, or unlinks one: the holder only opens what the path already names and
+#: exits.
+LOCK_HOLDER_SCRIPT = r"""
+import errno, fcntl, json, os, secrets, stat, sys
+
+RUN_ID = %r
+HOST = %r
+LOCK_DIR = "/run/lock"
+LOCK_NAME = "gowave-managed-mutation.lock"
+LEASE_NAME = "gowave-mutation-lease.json"
+LOCK_PATH = LOCK_DIR + "/" + LOCK_NAME
+
+
+def refuse(reason):
+    sys.stderr.write("LOCK_REFUSED: " + reason + "\n")
+    sys.stderr.flush()
+    raise SystemExit(3)
+
+
+try:
+    os.makedirs(LOCK_DIR, exist_ok=True)
+    dir_fd = os.open(LOCK_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+except OSError:
+    refuse("the lock directory " + LOCK_DIR + " is a symlink or not a directory")
+
+try:
+    fd = os.open(LOCK_NAME, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+except OSError as error:
+    # `O_NOFOLLOW` answers a link with ELOOP and a directory with EISDIR, and an
+    # operator told only that "opening failed" cannot tell which object the path
+    # turned into. The refusal names it; nothing is followed, replaced or removed.
+    if error.errno == errno.ELOOP:
+        refuse("the lock file " + LOCK_PATH + " is a symlink")
+    if error.errno == errno.EISDIR:
+        refuse("the lock file " + LOCK_PATH + " is a directory")
+    refuse("the lock file " + LOCK_PATH + " cannot be opened without following a link: " + (error.strerror or "refused"))
+
+info = os.fstat(fd)
+if not stat.S_ISREG(info.st_mode):
+    refuse("the lock file " + LOCK_PATH + " is not a regular file")
+if info.st_uid != os.geteuid():
+    refuse("the lock file " + LOCK_PATH + " is not owned by the runner")
+if stat.S_IMODE(info.st_mode) & 0o077:
+    refuse("the lock file " + LOCK_PATH + " grants group or other access")
+
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    refuse("another process holds " + LOCK_PATH)
+
+token = secrets.token_hex(32)
+lease = json.dumps({"run_id": RUN_ID, "host": HOST, "holder_pid": os.getpid(), "lease_token": token})
+try:
+    lease_fd = os.open(LEASE_NAME, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+except OSError:
+    refuse("the lease file " + LOCK_DIR + "/" + LEASE_NAME + " cannot be written without following a link")
+os.write(lease_fd, lease.encode("utf-8"))
+os.fsync(lease_fd)
+os.close(lease_fd)
+
+sys.stdout.write("LEASE_TOKEN:" + token + "\n")
+sys.stdout.flush()
+
+# The kernel drops this flock when the holder dies, so a holder that outlives
+# its session holds the host with nobody to release it: killing the local SSH
+# client does not signal the remote process, and an orphan sleeping here would
+# refuse every later run. EOF on stdin is that session ending, and it is the
+# one signal the transport cannot lose.
+while os.read(0, 1):
+    pass
+"""
+
+
+class RemotePairLock:
+    """Authoritative remote locks on Master and Worker held over dedicated SSH sessions.
+    Acquires locks in deterministic host address order and generates re-entrant leases.
+    """
+
+    def __init__(self, master_ssh: SSHClient, worker_ssh: SSHClient, run_id: str = "live_vps_run"):
+        self.clients = [master_ssh, worker_ssh]
+        # Sort in deterministic address order to avoid deadlocks
+        self.clients.sort(key=lambda c: c.host)
+        self.run_id = run_id
+        self._procs: List[subprocess.Popen] = []
+        self.lease_tokens: Dict[str, str] = {}
+        #: Why the last acquisition failed, in the holder's own words.
+        self.last_error: str = ""
+
+    def acquire(self, timeout: int = 15) -> bool:
+        """Take the kernel lock on both hosts, in address order, or take neither."""
+        self.last_error = ""
+        for client in self.clients:
+            script = LOCK_HOLDER_SCRIPT % (self.run_id, client.host)
+            cmd = client._build_ssh_cmd(f"python3 -c {shlex.quote(script)}")
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            except OSError as error:
+                self.last_error = f"the lock holder for {client.host} could not start: {error}"
+                self.release()
+                return False
+            self._procs.append(proc)
+            # The holder publishes the lease before it settles into holding; a
+            # session that exits instead says why on stderr.
+            line = proc.stdout.readline().strip() if proc.stdout else ""
+            if line.startswith("LEASE_TOKEN:"):
+                self.lease_tokens[client.host] = line.split(":", 1)[1]
+                continue
+            self.last_error = self._refusal(client, proc, timeout)
+            self.release()
+            return False
+        return True
+
+    @staticmethod
+    def _refusal(client: SSHClient, proc: "subprocess.Popen[str]", timeout: int) -> str:
+        """The holder's own reason, so a refusal names the object it rejected."""
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        detail = (proc.stderr.read() or "").strip() if proc.stderr is not None else ""
+        for line in detail.splitlines():
+            if line.startswith("LOCK_REFUSED:"):
+                return f"{client.host}: {line.split(':', 1)[1].strip()}"
+        return f"{client.host}: {detail or 'the lock holder exited without publishing a lease'}"
+
+    def check_alive(self) -> bool:
+        """Both holder sessions are still running; a released pair is not held."""
+        return (
+            len(self._procs) == len(self.clients)
+            and all(proc.poll() is None for proc in self._procs)
+        )
+
+    def release(self) -> None:
+        """End both holders, each closing its own lock.
+
+        The session owns the lock, not the local client: a transport that dies
+        without telling the remote process leaves an orphan holding the flock,
+        so the holder is first told its session ended (EOF on stdin) and only
+        terminated if it is still there afterwards.
+        """
+        for p in self._procs:
+            try:
+                if p.stdin is not None and not p.stdin.closed:
+                    p.stdin.close()
+                p.wait(timeout=5)
+                continue
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                pass
+            try:
+                p.terminate()
+                p.wait(timeout=2)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        self._procs.clear()
+        self.lease_tokens.clear()

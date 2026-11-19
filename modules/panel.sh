@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # modules/panel.sh - GoWave Panel native deployment, environment, and service lifecycle
-set -euo pipefail
+set -Eeuo pipefail
+
+# Sourced here as well as by the entrypoint so the download path can be tested
+# by sourcing this module alone; tempdir.sh tolerates a second sourcing.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tempdir.sh"
 
 GOWAVE_INSTALL_DIR="/opt/gowave"
 GOWAVE_DEFAULT_VERSION="latest"
@@ -68,7 +72,7 @@ download_panel_release() {
     mkdir -p "$target_dir"
     local tmp_dir
     tmp_dir=$(mktemp -d "/tmp/gowave-download-XXXXXX")
-    trap '[[ -n "${tmp_dir:-}" ]] && rm -rf "$tmp_dir"' RETURN
+    track_temp_dir "$tmp_dir"
 
     local base_url="https://github.com/${GOWAVE_REPO}/releases"
     local tag_url="$base_url/latest/download"
@@ -86,15 +90,41 @@ download_panel_release() {
     fetch_panel_asset() {
         local name="$1"
         local target="$2"
-        if ! curl -fsSL --connect-timeout 15 "$tag_url/$name" -o "$target" 2>/dev/null; then
+        local candidate_urls=()
+        if [[ "$version" == "latest" ]]; then
+            candidate_urls+=("$base_url/latest/download/$name")
+        else
+            candidate_urls+=("$base_url/download/$version/$name")
+            if [[ "$version" == v* ]]; then
+                candidate_urls+=("$base_url/download/${version#v}/$name")
+            else
+                candidate_urls+=("$base_url/download/v${version}/$name")
+            fi
+        fi
+
+        local downloaded=0
+        for u in "${candidate_urls[@]}"; do
+            if curl -fsSL --retry 2 --connect-timeout 15 "$u" -o "$target" 2>/dev/null; then
+                if [[ -s "$target" ]]; then
+                    downloaded=1
+                    break
+                fi
+            fi
+        done
+
+        if [[ "$downloaded" -eq 0 ]]; then
             echo "Direct download failed for $name; attempting GitHub API fallback..."
             local api_url
-            api_url=$(curl -s "https://api.github.com/repos/${GOWAVE_REPO}/releases" | python3 -c "
+            api_url=$(curl -fsSL "https://api.github.com/repos/${GOWAVE_REPO}/releases" 2>/dev/null | python3 -c "
 import sys, json
 try:
     releases = json.load(sys.stdin)
+    v_target = '$version'
+    v_clean = v_target.lstrip('v')
     for r in releases:
-        if '$version' == 'latest' or r.get('tag_name') == '$version':
+        tag = r.get('tag_name', '')
+        tag_clean = tag.lstrip('v')
+        if v_target == 'latest' or tag == v_target or tag_clean == v_clean:
             for a in r.get('assets', []):
                 if a.get('name') == '$name':
                     print(a.get('url'))
@@ -103,9 +133,10 @@ except Exception:
     pass
 " 2>/dev/null || true)
             if [[ -n "$api_url" ]]; then
-                curl -fsSL -H "Accept: application/octet-stream" "$api_url" -o "$target"
+                curl -fsSL --retry 2 -H "Accept: application/octet-stream" "$api_url" -o "$target"
             fi
         fi
+        [[ -s "$target" ]] || return 1
     }
 
     if [[ -z "$bin_source" ]]; then
@@ -158,21 +189,42 @@ except Exception:
         fi
     )
 
-    # Install files
-    cp "$tmp_dir/gowave-server" "$target_dir/gowave-server"
-    chmod 0755 "$target_dir/gowave-server"
+    # Install files. A repeated install replaces the binary the Panel is already
+    # running from this path, and writing through that inode fails with ETXTBSY.
+    # Staging beside the target and renaming only swaps the directory entry.
+    local staged_server="$target_dir/.gowave-server.new"
+    cp "$tmp_dir/gowave-server" "$staged_server"
+    chmod 0755 "$staged_server"
+    sync "$staged_server" 2>/dev/null || true
+    mv -f "$staged_server" "$target_dir/gowave-server"
+    sync "$target_dir" 2>/dev/null || true
 
     mkdir -p "$target_dir/frontend"
     tar -xzf "$tmp_dir/gowave-frontend.tar.gz" -C "$target_dir/frontend"
+    ln -sfn "$target_dir/frontend" "$target_dir/dist"
 
     # Set ownership if root
     ensure_gowave_user
     if [[ "$(id -u)" -eq 0 ]]; then
         chown -R root:gowave "$target_dir"
+        retain_panel_data_ownership "$target_dir"
     fi
     chmod 1770 "$target_dir" 2>/dev/null || chmod 0770 "$target_dir" || true
     echo "GoWave Panel binaries installed successfully in $target_dir."
-    rm -rf "$tmp_dir"
+    release_temp_dir "$tmp_dir"
+}
+
+retain_panel_data_ownership() {
+    # The Panel writes its own database, and a binary refresh hands every file in
+    # the install directory to root. Leaving the database root-owned turns the
+    # running Panel's next write into "attempt to write a readonly database".
+    local target_dir="${1:-$GOWAVE_INSTALL_DIR}"
+    local data_file
+    for data_file in "$target_dir/gowave.db" "$target_dir/gowave.db-wal" "$target_dir/gowave.db-shm"; do
+        [[ -e "$data_file" ]] || continue
+        chown gowave:gowave "$data_file"
+        chmod 0600 "$data_file"
+    done
 }
 
 generate_panel_env() {
@@ -184,8 +236,16 @@ generate_panel_env() {
     local channel="${6:-stable}"
 
     local env_file="$target_dir/.env"
-    local app_secret
-    app_secret=$(openssl rand -hex 32)
+    # A repeated install keeps the running Panel's APP_SECRET: it is the key the
+    # Panel encrypts stored credentials with, so a new one would make every row
+    # it already wrote unreadable.
+    local app_secret=""
+    if [[ -r "$env_file" ]]; then
+        app_secret=$(grep -s '^APP_SECRET=' "$env_file" | cut -d= -f2- || true)
+    fi
+    if [[ -z "$app_secret" ]]; then
+        app_secret=$(openssl rand -hex 32)
+    fi
 
     mkdir -p "$target_dir"
     ensure_gowave_user
