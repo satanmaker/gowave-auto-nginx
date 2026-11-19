@@ -62,7 +62,7 @@ runners rather than only eyeballed in code review:
 ## Repository layout
 
 ```
-gowave-auto.sh            lifecycle manager (install, update, node, domain-change, backup, uninstall)
+gowave-auto.sh            lifecycle manager (install, channel, node, domain-change, backup, restore, uninstall)
 gowave-node-auto.sh       distributed edge worker orchestrator
 modules/                  lock, os detection, preflight, security, panel API, node, nginx, recovery
 config/ assets/           systemd units, logrotate, NGINX templates, SNI decoy sites
@@ -71,6 +71,10 @@ tools/                    E2E runners (podman, live VPS), acceptance gate, relea
 tests/                    podman multi-node, security, recovery, panel API suites
 docs/                     live-VPS testing guide, E2E scenario catalog
 ```
+
+Panel releases are upgraded from the Panel's own interface: the installer provisions the `gowave-update.path`
+trigger and the root oneshot it starts, so `gowave-auto.sh` stays on server-side operations — `install`,
+`channel`, `node`, `domain-change`, `backup`, `restore`, `uninstall` and `recover`.
 
 ## Provenance
 

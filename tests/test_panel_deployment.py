@@ -62,6 +62,48 @@ def run_public_tls_probe(script: Path, domain: str, address: str, attempts: int,
     )
 
 
+def build_panel_release_artifacts(tmp: Path) -> dict:
+    """A mock Panel release: binary, dashboard archive and SHA256SUMS.
+
+    The dashboard is packed the way the release workflow packs it
+    (`tar -czf gowave-frontend.tar.gz -C dist .`), so its entries sit at the
+    archive root instead of under a `dist/` prefix.
+    """
+    art_dir = tmp / "artifacts"
+    art_dir.mkdir()
+
+    mock_bin = art_dir / "gowave-server"
+    mock_bin.write_text("#!/bin/sh\necho mock gowave\n")
+
+    dashboard = tmp / "dashboard"
+    dashboard.mkdir()
+    (dashboard / "index.html").write_text("<html>GoWave UI</html>")
+
+    frontend_tar = art_dir / "gowave-frontend.tar.gz"
+    with tarfile.open(frontend_tar, "w:gz") as tar:
+        tar.add(dashboard, arcname=".")
+
+    arch_res = subprocess.run(
+        ["bash", "-c", f'source "{PANEL_SH}" && detect_arch'], capture_output=True, text=True,
+    )
+    arch = arch_res.stdout.strip()
+
+    bin_sha = hashlib.sha256(mock_bin.read_bytes()).hexdigest()
+    front_sha = hashlib.sha256(frontend_tar.read_bytes()).hexdigest()
+    sums_file = art_dir / "SHA256SUMS"
+    sums_file.write_text(f"{bin_sha}  gowave-linux-{arch}\n{front_sha}  gowave-frontend.tar.gz\n")
+
+    return {
+        "arch": arch,
+        "art_dir": art_dir,
+        "env": {
+            "GOWAVE_PANEL_BINARY": str(mock_bin),
+            "GOWAVE_FRONTEND_ARCHIVE": str(frontend_tar),
+            "GOWAVE_SHA256SUMS": str(sums_file),
+        },
+    }
+
+
 class TlsListener:
     """Answer each connection with the next certificate in the list.
 
@@ -313,45 +355,23 @@ class TestPanelDeployment(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             target_dir = tmp / "opt_gowave"
-            art_dir = tmp / "artifacts"
-            art_dir.mkdir()
-
-            # Create mock binary and frontend archive
-            mock_bin = art_dir / "gowave-server"
-            mock_bin.write_text("#!/bin/sh\necho mock gowave\n")
-
-            mock_frontend_tar = art_dir / "gowave-frontend.tar.gz"
-            frontend_dist = tmp / "frontend_dist"
-            frontend_dist.mkdir()
-            (frontend_dist / "index.html").write_text("<html>GoWave UI</html>")
-            with tarfile.open(mock_frontend_tar, "w:gz") as tar:
-                tar.add(frontend_dist, arcname="dist")
-
-            # Create valid SHA256SUMS
-            bin_sha = hashlib.sha256(mock_bin.read_bytes()).hexdigest()
-            front_sha = hashlib.sha256(mock_frontend_tar.read_bytes()).hexdigest()
-
-            # Detect current machine arch
-            arch_res = subprocess.run(["bash", "-c", f'source "{PANEL_SH}" && detect_arch'], capture_output=True, text=True)
-            arch = arch_res.stdout.strip()
-
-            sums_file = art_dir / "SHA256SUMS"
-            sums_file.write_text(f"{bin_sha}  gowave-linux-{arch}\n{front_sha}  gowave-frontend.tar.gz\n")
+            release = build_panel_release_artifacts(tmp)
+            arch = release["arch"]
 
             # 1. Successful download with matching checksums
             env = os.environ.copy()
-            env["GOWAVE_PANEL_BINARY"] = str(mock_bin)
-            env["GOWAVE_FRONTEND_ARCHIVE"] = str(mock_frontend_tar)
-            env["GOWAVE_SHA256SUMS"] = str(sums_file)
+            env.update(release["env"])
 
             cmd = f'source "{PANEL_SH}" && download_panel_release "{target_dir}"'
             res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env)
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertTrue((target_dir / "gowave-server").exists())
             self.assertTrue((target_dir / "frontend" / "dist" / "index.html").exists())
+            self.assertFalse((target_dir / "dist").exists())
+            self.assertFalse((target_dir / "frontend" / "index.html").exists())
 
             # 2. Corrupt checksum detection
-            sums_corrupt = art_dir / "SHA256SUMS.bad"
+            sums_corrupt = release["art_dir"] / "SHA256SUMS.bad"
             sums_corrupt.write_text(
                 f"0000000000000000000000000000000000000000000000000000000000000000  gowave-linux-{arch}\n"
                 "0000000000000000000000000000000000000000000000000000000000000000  gowave-frontend.tar.gz\n"
@@ -360,6 +380,31 @@ class TestPanelDeployment(unittest.TestCase):
             res_bad = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env)
             self.assertNotEqual(res_bad.returncode, 0)
             self.assertIn("Checksum mismatch", res_bad.stderr)
+
+    def test_download_panel_release_migrates_legacy_dist(self):
+        """A reinstall drops the old dist symlink and leaves a real dist path alone."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            target_dir = tmp / "opt_gowave"
+            (target_dir / "frontend").mkdir(parents=True)
+            (target_dir / "dist").symlink_to(target_dir / "frontend")
+            self.assertTrue((target_dir / "dist").is_symlink())
+
+            env = os.environ.copy()
+            env.update(build_panel_release_artifacts(tmp)["env"])
+            cmd = f'source "{PANEL_SH}" && download_panel_release "{target_dir}"'
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertFalse((target_dir / "dist").is_symlink())
+            self.assertFalse((target_dir / "dist").exists())
+            self.assertTrue((target_dir / "frontend" / "dist" / "index.html").exists())
+
+            # A real directory or file at that path is not ours to remove.
+            (target_dir / "dist").mkdir()
+            (target_dir / "dist" / "keep.txt").write_text("operator data\n")
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertTrue((target_dir / "dist" / "keep.txt").exists())
 
     def test_verify_panel_startup(self):
         # Start a local mock HTTP server on a random port

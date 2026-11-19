@@ -199,9 +199,26 @@ except Exception:
     mv -f "$staged_server" "$target_dir/gowave-server"
     sync "$target_dir" 2>/dev/null || true
 
+    # The release archive holds the dashboard files at its root and the Panel
+    # resolves ./frontend/dist first, so the dashboard belongs in
+    # frontend/dist. Extract into a sibling and rename, so a failed extraction
+    # never leaves a half-written dashboard behind.
     mkdir -p "$target_dir/frontend"
-    tar -xzf "$tmp_dir/gowave-frontend.tar.gz" -C "$target_dir/frontend"
-    ln -sfn "$target_dir/frontend" "$target_dir/dist"
+    local staged_frontend="$target_dir/frontend/.dist.new"
+    rm -rf "$staged_frontend"
+    mkdir -p "$staged_frontend"
+    tar -xzf "$tmp_dir/gowave-frontend.tar.gz" -C "$staged_frontend"
+    rm -rf "$target_dir/frontend/dist"
+    mv "$staged_frontend" "$target_dir/frontend/dist"
+    sync "$target_dir/frontend" 2>/dev/null || true
+
+    # A host installed by an earlier version carries dist -> frontend, and the
+    # upstream service policy refuses any symlink there. A real directory or
+    # file at that path is not ours to remove.
+    if [[ -L "$target_dir/dist" ]]; then
+        rm -f "$target_dir/dist"
+        sync "$target_dir" 2>/dev/null || true
+    fi
 
     # Set ownership if root
     ensure_gowave_user
@@ -281,6 +298,8 @@ configure_panel_systemd() {
     local unit_file="/etc/systemd/system/gowave.service"
     local recover_unit="/etc/systemd/system/gowave-recover.service"
     local recover_prov_unit="/etc/systemd/system/gowave-recover-provision.service"
+    local update_unit="/etc/systemd/system/gowave-update.service"
+    local update_path_unit="/etc/systemd/system/gowave-update.path"
 
     ensure_gowave_user
 
@@ -296,6 +315,9 @@ Type=simple
 User=gowave
 Group=gowave
 WorkingDirectory=$target_dir
+RuntimeDirectory=gowave
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 ExecStart=$target_dir/gowave-server
 Restart=always
 RestartSec=5
@@ -337,9 +359,40 @@ ExecStart=/usr/local/sbin/gowave-auto.sh recover --boot-provision
 WantedBy=multi-user.target
 EOF
 
+    # 4. In-panel update helper. The Panel leaves a request in its runtime
+    # directory and this root oneshot installs the verified release. These
+    # templates mirror the upstream service policy, so the "service install"
+    # that an update runs rewrites them with identical content.
+    cat > "$update_unit" <<EOF
+[Unit]
+Description=GoWave panel update from a verified release
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$target_dir/gowave-server update apply $target_dir
+TimeoutStartSec=15min
+EOF
+
+    cat > "$update_path_unit" <<'EOF'
+[Unit]
+Description=Watch for GoWave panel update requests
+
+[Path]
+PathExists=/run/gowave/update-request
+Unit=gowave-update.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    chmod 0644 "$update_unit" "$update_path_unit"
+
     if [[ "$(id -u)" -eq 0 ]] && command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload --no-ask-password
-        systemctl enable --no-ask-password gowave.service gowave-recover.service gowave-recover-provision.service
+        systemctl enable --no-ask-password gowave.service gowave-recover.service \
+            gowave-recover-provision.service gowave-update.path
     fi
 
     # The managed gowave.service unit above is authoritative. Do not invoke the

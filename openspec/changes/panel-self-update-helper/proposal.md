@@ -74,7 +74,13 @@ None.
   (RES-14) and its `tasks.md` 4.4 — correction of the stale `service install` claim.
 - `README.md` — the lifecycle-manager command list loses `update`, which the shipped usage
   (`gowave-auto.sh:1514`) does not offer.
+- `openspec/specs/live-vps-e2e/spec.md` (the scenario "Master services active and listeners correct", which the
+  catalog derives AIO-04's assertion from) and `openspec/specs/podman-e2e/spec.md` (the All-in-One clean
+  installation scenario) — both now state the armed helper, so the catalog assertion and the traceability row
+  are generated from a source that names it.
 - `tests/cases/catalog.yaml` (AIO-04 assertion and `assertion_sha256`), `tests/cases/behaviors.yaml`,
-  `tests/cases/traceability.yaml` and `tools/podman_e2e/aio.py` — the extended Podman evidence for the helper.
+  `docs/PODMAN_E2E_DISCOVERY.md`, `tests/test_podman_catalog.py` and `tools/podman_e2e/aio.py` — the extended
+  Podman evidence for the helper. `tests/cases/traceability.yaml` needs no edit: the scenario title and the
+  case that answers it are unchanged, and the row it renders stays true.
 - Operators: the Panel's own update endpoint starts working after a reinstall, and the upstream `--update` path
   stops aborting on the install layout; no new ports, no new packages, no NGINX or certificate changes.

@@ -10,6 +10,14 @@ import unittest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+def function_body(path: Path, name: str) -> str:
+    """The body of one shell function, without its siblings."""
+    text = path.read_text(encoding="utf-8")
+    start = text.index(f"\n{name}() {{")
+    end = text.index("\n}\n", start)
+    return text[start:end]
+
+
 class TestSystemdRunner(unittest.TestCase):
 
     def test_boot_script_executable(self):
@@ -25,6 +33,49 @@ class TestSystemdRunner(unittest.TestCase):
         self.assertIn("ExecStart=/usr/local/sbin/gowave-auto.sh recover --boot-files", source)
         self.assertIn("After=gowave.service", source)
         self.assertIn("ExecStart=/usr/local/sbin/gowave-auto.sh recover --boot-provision", source)
+
+    def test_panel_update_helper_units(self):
+        """Inspect the in-panel update helper emitted by configure_panel_systemd()."""
+        body = function_body(REPO_ROOT / "modules" / "panel.sh", "configure_panel_systemd")
+        self.assertIn("RuntimeDirectory=gowave\n", body)
+        self.assertIn("RuntimeDirectoryMode=0700", body)
+        self.assertIn("RuntimeDirectoryPreserve=yes", body)
+
+        self.assertIn("/etc/systemd/system/gowave-update.service", body)
+        self.assertIn("/etc/systemd/system/gowave-update.path", body)
+        self.assertIn("ExecStart=$target_dir/gowave-server update apply $target_dir", body)
+        self.assertIn("Type=oneshot", body)
+        self.assertIn("TimeoutStartSec=15min", body)
+        self.assertIn("PathExists=/run/gowave/update-request", body)
+        self.assertIn("Unit=gowave-update.service", body)
+        self.assertIn("WantedBy=multi-user.target", body)
+
+        collapsed = " ".join(body.split())
+        enabled = collapsed.split("systemctl enable --no-ask-password", 1)[1].split(" fi", 1)[0]
+        self.assertIn("gowave-update.path", enabled)
+
+        source = (REPO_ROOT / "modules" / "panel.sh").read_text(encoding="utf-8")
+        self.assertNotIn("gowave-server service install", source)
+
+    def test_panel_update_path_starts_after_the_panel_restart(self):
+        """The path unit is armed only after the restart created /run/gowave."""
+        source = (REPO_ROOT / "gowave-auto.sh").read_text(encoding="utf-8")
+        restart = source.index("systemctl restart --no-ask-password gowave.service")
+        following = source[restart:source.index("verify_panel_startup 127.0.0.1 3000 30", restart)]
+        self.assertIn("systemctl start --no-ask-password gowave-update.path", following)
+
+    def test_uninstall_removes_the_panel_update_helper(self):
+        """uninstall owns the helper like the other managed units."""
+        body = function_body(REPO_ROOT / "gowave-auto.sh", "cmd_uninstall")
+        collapsed = " ".join(body.split())
+        for verb in ("stop", "disable"):
+            units = collapsed.split(f"systemctl {verb} --no-ask-password", 1)[1].split(" 2>/dev/null", 1)[0]
+            self.assertIn("gowave-update.path", units)
+            self.assertIn("gowave-update.service", units)
+        for unit in ("/etc/systemd/system/gowave-update.path",
+                     "/etc/systemd/system/gowave-update.service"):
+            self.assertIn(unit, collapsed)
+        self.assertEqual(collapsed.count("systemctl daemon-reload"), 1)
 
     def test_bbr_load_service_ordering(self):
         """Inspect the actual BBR unit template emitted by configure_bbr_and_mtu()."""
