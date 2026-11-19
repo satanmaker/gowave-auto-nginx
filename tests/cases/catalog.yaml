@@ -579,8 +579,38 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: preflight_cases:case_private_address_rejected
+      evidence:
+      - documentation_refusal
+      - harness_addresses_global
+      - harness_master_ip
+      - harness_worker_ip
+      - ipv6_refusal
+      - loopback_refusal
+      - multicast_refusal
+      - refused_class_names
+      - refused_classes
+      - rfc1918_refusal
+      - validated_before_bootstrap
+      - validator_parameters
+    multi-node:
+      driver: preflight_cases:case_private_address_rejected
+      evidence:
+      - documentation_refusal
+      - harness_addresses_global
+      - harness_master_ip
+      - harness_worker_ip
+      - ipv6_refusal
+      - loopback_refusal
+      - multicast_refusal
+      - refused_class_names
+      - refused_classes
+      - rfc1918_refusal
+      - validated_before_bootstrap
+      - validator_parameters
   partial_split: Container proves the private/reserved rule against Podman addresses with an explicitly
     scoped, fail-closed exemption; the live run is authoritative for real public addresses.
   promotion_target: null
@@ -3282,8 +3312,42 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: staging_trust:case_staging_and_public_chains_are_trusted
+      evidence:
+      - bypass_directives
+      - check_hostname
+      - public_bytes
+      - public_certificates
+      - public_root_subject
+      - public_root_trusted
+      - staging_bytes
+      - staging_root_trusted
+      - staging_roots_in_bundle
+      - system_bundle_unchanged
+      - trust_environment_unchanged
+      - untrusted_authority_trusted
+      - untrusted_refusal
+      - verify_mode
+    multi-node:
+      driver: staging_trust:case_staging_and_public_chains_are_trusted
+      evidence:
+      - bypass_directives
+      - check_hostname
+      - public_bytes
+      - public_certificates
+      - public_root_subject
+      - public_root_trusted
+      - staging_bytes
+      - staging_root_trusted
+      - staging_roots_in_bundle
+      - system_bundle_unchanged
+      - trust_environment_unchanged
+      - untrusted_authority_trusted
+      - untrusted_refusal
+      - verify_mode
   partial_split: Container proves explicit verify anchors and no global trust change; public Let's Encrypt
     issuance is live-only.
   promotion_target: null
@@ -3314,8 +3378,34 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: staging_trust:case_xray_outbounds_carry_anchors
+      evidence:
+      - allow_insecure_absent
+      - anchor_paths
+      - anchor_usage
+      - anchors_are_files
+      - anchors_injected
+      - existing_anchor_preserved
+      - input_outbound_unchanged
+      - pinned_roots
+      - production_injects_none
+      - reality_untouched
+    multi-node:
+      driver: staging_trust:case_xray_outbounds_carry_anchors
+      evidence:
+      - allow_insecure_absent
+      - anchor_paths
+      - anchor_usage
+      - anchors_are_files
+      - anchors_injected
+      - existing_anchor_preserved
+      - input_outbound_unchanged
+      - pinned_roots
+      - production_injects_none
+      - reality_untouched
   partial_split: Container proves the injected verify anchor is required; real Staging material is live-only.
   promotion_target: null
 - id: DP-11
@@ -3342,8 +3432,38 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: staging_trust:case_staging_roots_are_pinned
+      evidence:
+      - bundle_builder_network_imports
+      - digests_recomputed
+      - extra_pem_refusal
+      - manifest_matches_directory
+      - missing_file_refusal
+      - not_self_signed_refusal
+      - pinned_files
+      - pinned_roots
+      - pinned_subjects
+      - pins_record_provenance
+      - short_manifest_refusal
+      - tampered_digest_refusal
+    multi-node:
+      driver: staging_trust:case_staging_roots_are_pinned
+      evidence:
+      - bundle_builder_network_imports
+      - digests_recomputed
+      - extra_pem_refusal
+      - manifest_matches_directory
+      - missing_file_refusal
+      - not_self_signed_refusal
+      - pinned_files
+      - pinned_roots
+      - pinned_subjects
+      - pins_record_provenance
+      - short_manifest_refusal
+      - tampered_digest_refusal
   partial_split: Container proves fixture CA pinning by digest; real Staging CA distribution is live-only.
   promotion_target: null
 - id: DP-12
@@ -3611,8 +3731,34 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: negative_matrix:case_fifteen_rows_are_witnessed
+      evidence:
+      - aio_rows
+      - components
+      - live_scenarios_defined
+      - matrix_rows
+      - multi_node_rows
+      - rows_in_sentence
+      - scenario_ids
+      - unwitnessed_rows
+      - witnessed_contours
+      - witnesses
+    multi-node:
+      driver: negative_matrix:case_fifteen_rows_are_witnessed
+      evidence:
+      - aio_rows
+      - components
+      - live_scenarios_defined
+      - matrix_rows
+      - multi_node_rows
+      - rows_in_sentence
+      - scenario_ids
+      - unwitnessed_rows
+      - witnessed_contours
+      - witnesses
   partial_split: Container witnesses the matrix one case per row, each at its own boundary; 'all 15 scenarios
     terminate at their designated boundaries' is a property of the suite's case list rather than a verdict
     one run can produce, and `catalog gaps` with the divergence table is what audits it.
@@ -3769,8 +3915,34 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: negative_matrix:case_ten_rows_are_witnessed
+      evidence:
+      - aio_rows
+      - components
+      - live_scenarios_defined
+      - matrix_rows
+      - multi_node_rows
+      - rows_in_sentence
+      - scenario_ids
+      - unwitnessed_rows
+      - witnessed_contours
+      - witnesses
+    multi-node:
+      driver: negative_matrix:case_ten_rows_are_witnessed
+      evidence:
+      - aio_rows
+      - components
+      - live_scenarios_defined
+      - matrix_rows
+      - multi_node_rows
+      - rows_in_sentence
+      - scenario_ids
+      - unwitnessed_rows
+      - witnessed_contours
+      - witnesses
   partial_split: Container witnesses the ten rows one case per sentence, including the timeout bounds
     `MN-OUTAGE` records as offline and control-plane seconds; the conjunction over the ten is a suite
     property, not a verdict a single case can read.
@@ -3867,8 +4039,38 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: status:case_status_semantics
+      evidence:
+      - failing_named
+      - junit_child
+      - report_keys
+      - report_schema
+      - runtime_cases
+      - skip_aggregate
+      - two_failing_overall
+      - undecided_overall
+      - vision_failing_named
+      - vision_failing_overall
+      - vision_runtime_cases
+      case: GATE-STATUS
+    multi-node:
+      driver: status:case_status_semantics
+      evidence:
+      - failing_named
+      - junit_child
+      - report_keys
+      - report_schema
+      - runtime_cases
+      - skip_aggregate
+      - two_failing_overall
+      - undecided_overall
+      - vision_failing_named
+      - vision_failing_overall
+      - vision_runtime_cases
+      case: GATE-STATUS
   partial_split: Container proves the aggregate refuses a run that recorded any non-PASS among its declared
     cases; the live `negative_tests` field, the `NOT_RUN` and `PARTIAL` states and a skip verdict of INCOMPLETE
     do not exist in this contour, whose aggregate turns a skipped declared case into FAIL.
@@ -3896,8 +4098,40 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: skip_policy:case_skipped_traffic_is_never_pass
+      evidence:
+      - case_counts
+      - container_skip_aggregate
+      - junit_case_child
+      - junit_failures
+      - junit_phase_child
+      - junit_skipped
+      - result_overall
+      - runner_reads_its_own_switch
+      - runner_skip_branch_quoted
+      - skip_case_status
+      - switch_off_status
+      - switch_on_status
+      case: DP-14
+    multi-node:
+      driver: skip_policy:case_skipped_traffic_is_never_pass
+      evidence:
+      - case_counts
+      - container_skip_aggregate
+      - junit_case_child
+      - junit_failures
+      - junit_phase_child
+      - junit_skipped
+      - result_overall
+      - runner_reads_its_own_switch
+      - runner_skip_branch_quoted
+      - skip_case_status
+      - switch_off_status
+      - switch_on_status
+      case: DP-14
   partial_split: Container proves a run cannot report PASS while a declared case is SKIP; the negative
     phase the sentence names, and its INCOMPLETE verdict, are live-only because this suite has no switch
     that disables a phase and aggregates a skip to FAIL.
@@ -4660,8 +4894,25 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: lock_cases:case_lock_loss
+      evidence:
+      - acquisition_order
+      - contender_refusal
+      - hosts_free_after_release
+      - live_lease_accepted
+      - lost_lease_rejected
+      - mutating_gate_error
+      - mutating_gate_status
+      - reacquired_leases
+      - read_only_gate_ok
+      - released_partial_acquisition
+      - released_sessions_confirmed
+      - session_loss_detected
+      - terminated_holder
+      case: MN-LOCK-LOSS
   partial_split: Container proves lock ordering and hook protocol; provider snapshots are live-only.
   promotion_target: null
 - id: TD-06
@@ -4891,7 +5142,9 @@ cases:
     multi-node:
       driver: lock_cases:case_lock_loss
       evidence:
+      - acquisition_order
       - contender_refusal
+      - hosts_free_after_release
       - live_lease_accepted
       - lost_lease_rejected
       - mutating_gate_error
@@ -4899,6 +5152,7 @@ cases:
       - reacquired_leases
       - read_only_gate_ok
       - released_partial_acquisition
+      - released_sessions_confirmed
       - session_loss_detected
       - terminated_holder
       case: MN-LOCK-LOSS
@@ -5422,8 +5676,32 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: operator_access:case_unconfirmed_host_key_aborts
+      evidence:
+      - authorized_keys_unchanged
+      - known_hosts_written
+      - password_attempts
+      - password_reads
+      - refusal
+      - remote_commands
+      - remote_writes
+      - timers_armed
+      case: SSHID-02
+    multi-node:
+      driver: operator_access:case_unconfirmed_host_key_aborts
+      evidence:
+      - authorized_keys_unchanged
+      - known_hosts_written
+      - password_attempts
+      - password_reads
+      - refusal
+      - remote_commands
+      - remote_writes
+      - timers_armed
+      case: SSHID-02
   partial_split: Container proves host identity precedes the password; the live controller's public-target
     path is live-only.
   promotion_target: null
@@ -5450,8 +5728,42 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: operator_access:case_temporary_access_is_revoked
+      evidence:
+      - inert_cleanup_status
+      - inert_key_present
+      - inert_message_names_residue
+      - key_present_after
+      - provider_entry_preserved
+      - reachable_host_revoked_despite_failure
+      - revocation_clients
+      - revocation_message
+      - revocation_script_present
+      - revocation_statuses
+      - targets_revoked
+      - timer_active_after
+      - timer_files_remaining
+      - unreachable_status
+    multi-node:
+      driver: operator_access:case_temporary_access_is_revoked
+      evidence:
+      - inert_cleanup_status
+      - inert_key_present
+      - inert_message_names_residue
+      - key_present_after
+      - provider_entry_preserved
+      - reachable_host_revoked_despite_failure
+      - revocation_clients
+      - revocation_message
+      - revocation_script_present
+      - revocation_statuses
+      - targets_revoked
+      - timer_active_after
+      - timer_files_remaining
+      - unreachable_status
   partial_split: Container proves bounded key lifetime and revocation; live account behaviour is live-only.
   promotion_target: null
 - id: PKT-01
@@ -5751,6 +6063,7 @@ cases:
       evidence:
       - authorized_keys_unchanged
       - known_hosts_written
+      - password_attempts
       - password_reads
       - refusal
       - remote_commands
@@ -5761,6 +6074,7 @@ cases:
       evidence:
       - authorized_keys_unchanged
       - known_hosts_written
+      - password_attempts
       - password_reads
       - refusal
       - remote_commands
@@ -7289,7 +7603,9 @@ cases:
     multi-node:
       driver: lock_cases:case_lock_loss
       evidence:
+      - acquisition_order
       - contender_refusal
+      - hosts_free_after_release
       - live_lease_accepted
       - lost_lease_rejected
       - mutating_gate_error
@@ -7297,6 +7613,7 @@ cases:
       - reacquired_leases
       - read_only_gate_ok
       - released_partial_acquisition
+      - released_sessions_confirmed
       - session_loss_detected
       - terminated_holder
   promotion_target: Pair-Wide Run Locking

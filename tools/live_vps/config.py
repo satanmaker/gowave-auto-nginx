@@ -133,7 +133,11 @@ def validate_public_ip(val: str, key_name: str, allow_v6: bool = False) -> str:
     if allow_v6 and ip.version != 6:
         raise ValueError(f"Expected IPv6 address for {key_name}, got IPv4: '{val}'")
 
-    if not ip.is_global:
+    # `is_global` is True for a multicast group in both families (239.0.0.0/8 and
+    # ff00::/8 are neither private nor reserved), so the class the refusal message
+    # names has to be asked for separately or the message would promise a rule the
+    # check does not apply.
+    if not ip.is_global or ip.is_multicast:
         raise ValueError(
             f"{key_name} ('{val}') is not a public routable address (private, loopback, multicast, or documentation address rejected)."
         )

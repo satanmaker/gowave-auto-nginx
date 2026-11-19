@@ -36,6 +36,7 @@ from . import (
     firewall_image,
     mutation_baseline,
     negative_journal,
+    negative_matrix,
     ownership_targets,
     package_residual,
     panel_surface,
@@ -45,6 +46,7 @@ from . import (
     runstate_cases,
     signal_compensation,
     skip_policy,
+    staging_trust,
     status,
     teardown,
     topology,
@@ -8849,6 +8851,12 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
              preflight_cases.case_distinct_domains, timeout_seconds=120),
         Case(preflight_cases.ROOT_IDENTITY_CASE_ID, "aio",
              preflight_cases.case_root_identity, timeout_seconds=120),
+        # A target address the suite must not be pointed at: every class the
+        # sentence names is refused by the product's own validator, and the two
+        # harness addresses the rest of the run uses are read back as global so
+        # the refusals above are not the rule rejecting everything.
+        Case(preflight_cases.PRIVATE_ADDRESS_CASE_ID, "aio",
+             preflight_cases.case_private_address_rejected, timeout_seconds=240),
         # The run's own record, read without a host: a run id names a directory
         # below the artifact root or nothing, and a partial phase resumes only the
         # run that wrote the state it was handed. Both call the product's own
@@ -8871,6 +8879,18 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case(trust_bundle.DP12_CASE_ID, "aio",
              lambda context: trust_bundle.case_production_bundle_excludes_staging(product, context),
              timeout_seconds=180),
+        # The three Staging sentences beside the production one, because they read
+        # the same vendored roots and the same builder: the pins and their digests,
+        # the anchors a TLS outbound receives, and what the combined bundle trusts.
+        Case(staging_trust.DP11_CASE_ID, "aio",
+             lambda context: staging_trust.case_staging_roots_are_pinned(product, context),
+             timeout_seconds=240),
+        Case(staging_trust.DP10_CASE_ID, "aio",
+             lambda context: staging_trust.case_xray_outbounds_carry_anchors(product, context),
+             timeout_seconds=180),
+        Case(staging_trust.DP09_CASE_ID, "aio",
+             lambda context: staging_trust.case_staging_and_public_chains_are_trusted(product, context),
+             timeout_seconds=240),
         Case(skip_policy.DP14_CASE_ID, "aio",
              lambda context: skip_policy.case_skipped_traffic_is_never_pass(product, context),
              timeout_seconds=180),
@@ -8900,6 +8920,13 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
              timeout_seconds=300),
         Case(operator_access.FALLBACK_CASE_ID, "aio",
              lambda context: operator_access.case_failed_bootstrap_falls_back_to_timer(
+                 product, context),
+             timeout_seconds=300),
+        # What happens to the access after the run: the key and the timer are
+        # withdrawn on every host, and a host that keeps them is recorded as
+        # INCOMPLETE instead of passing.
+        Case(operator_access.REVOKED_CASE_ID, "aio",
+             lambda context: operator_access.case_temporary_access_is_revoked(
                  product, context),
              timeout_seconds=300),
         # The Certbot deploy hook the transaction writes into the target: the
@@ -9001,6 +9028,16 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case(revocation.REV_02, "aio",
              lambda context: revocation.case_revocation_cannot_be_verified(product, context),
              timeout_seconds=300),
+        # The negative matrix itself: fifteen rows the spec prints, each with the
+        # case that stops at its boundary and the contour able to produce it. The
+        # witnesses are read out of the suite's own registry, so a witness deleted
+        # from the code fails here instead of quietly emptying a catalog entry.
+        Case(negative_matrix.MATRIX_CASE_ID, "aio",
+             lambda context: negative_matrix.case_fifteen_rows_are_witnessed(product, context),
+             timeout_seconds=120),
+        Case(negative_matrix.TEN_CASE_ID, "aio",
+             lambda context: negative_matrix.case_ten_rows_are_witnessed(product, context),
+             timeout_seconds=120),
         # Last, because the deadline it proves is the one the whole run spent: the
         # case reads the elapsed wall clock and the enforced budget, then produces
         # an exhausted run of the real runner and reads its report. A suite that

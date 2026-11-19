@@ -1638,6 +1638,33 @@ LIVE_PARITY_OBSERVERS: Dict[str, Dict[str, str]] = {
     # what it actually ships, so the integrity check the product runs on its
     # staged copy is the only gate left.
     "NEG-05": {"multi-node": "MN-BACKUP-BAD"},
+    # The sentence is the aggregate: any declared scenario that did not reach PASS
+    # leaves `negative_tests` not PASS. The container's aggregate is the one
+    # `GATE-STATUS` builds — a run whose runtime cases fail reports FAIL and names
+    # them, and a run whose runtime cases are all INCOMPLETE does not report PASS —
+    # so the same case answers for both contours. The live field, `NOT_RUN` and
+    # `PARTIAL` are the live runner's own vocabulary and stay live-only.
+    "NEG-07": {"aio": "GATE-STATUS", "multi-node": "GATE-STATUS"},
+    # The switch the sentence names does not exist here: this suite has no phase
+    # to disable, and a declared case that is skipped is a FAIL rather than an
+    # INCOMPLETE. What the container can prove is the other half — that a skipped
+    # declaration never becomes a PASS — which is the rule `DP-14` reads for the
+    # data plane and `skip_policy` enforces for every declared case.
+    "NEG-08": {"aio": "DP-14", "multi-node": "DP-14"},
+    # The controller aborts before it asks for a password when the fingerprint it
+    # was shown does not match the host's key. `SSHID-02` drives the product's own
+    # bootstrap against a modelled transport and reads the authentication itself:
+    # no `auth_password` call, no prompt, no write and no timer on the host.
+    "BOOT-01": {"aio": "SSHID-02", "multi-node": "SSHID-02"},
+    # The lock half of the teardown sentence, read on two real hosts: the pair is
+    # taken in address order, a refused second host leaves the first free, a lost
+    # holder session stops every mutating phase, and the replacement pair is taken
+    # only after the release is confirmed on both hosts — a fresh token, with the
+    # lost one refused by the product's own validator. The status half of the same
+    # sentence (a mismatch is TEARDOWN_FAILED and a match is still not PASS) is
+    # `GATE-TEARDOWN`'s, and provider snapshots are the live-only part named in the
+    # entry's own split.
+    "TD-05": {"multi-node": "MN-LOCK-LOSS"},
 }
 
 

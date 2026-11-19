@@ -386,8 +386,11 @@ requirements:
           - tests.test_podman_matrix.TestMatrixCatalog
         jobs: ["Lint, Completeness, and Suite Nonroot"]
       - scenario: Partial case splits the proof
+        cases: [DP-09, DP-10, DP-11]
+        topologies: [aio, multi-node]
         tests:
           - tests.test_podman_matrix.TestMatrixCatalog
+          - tests.test_podman_staging_trust.TestStagingTrustCases
         jobs: ["Lint, Completeness, and Suite Nonroot"]
       - scenario: Podman-first case has a promotion target
         tests:
@@ -490,9 +493,9 @@ cases_by_requirement:
       reads is the aggregate CRITICAL line and the retained journal naming that
       refusal, never a clean compensation reported as PASS
   - requirement: Live scenario parity
-    cases: [PRE-01, PRE-02, PRE-03, PRE-05, PRE-06, ADDR-01, ADDR-02, ADDR-03]
+    cases: [PRE-01, PRE-02, PRE-03, PRE-04, PRE-05, PRE-06, ADDR-01, ADDR-02, ADDR-03]
     reason: >-
-      all eight serve the same parity sentence for the two sentences every run
+      all nine serve the same parity sentence for the two sentences every run
       decides before it touches a host: what it trusts, and what it calls its
       targets. PRE-01 is the trust sentence — one host's key pinned and the
       other's absent, refused by name with the file that was read, the
@@ -501,7 +504,14 @@ cases_by_requirement:
       refused with its own words, and the same check accepting the pinned key so
       the refusal is the pin and not a check that always fails; the ordering is
       read from the runner's own source, because a refusal that arrives after a
-      remote baseline was collected has already used the key. PRE-02, PRE-03,
+      remote baseline was collected has already used the key. PRE-04 is the
+      address sentence: nine IPv4 and five IPv6 classes — loopback, the three
+      RFC1918 ranges, link-local, multicast, documentation, unspecified and
+      broadcast — are each refused by key and by value while naming the rule,
+      the parser is shown to carry no switch that could relax it, the harness's
+      own addresses are shown to be global so its control configuration is not
+      an exemption, and the operator's source shows the configuration parsed
+      before its first `_bootstrap_one`. PRE-02, PRE-03,
       PRE-05 and PRE-06 are the DNS sentence, answered by two real fixture
       resolvers on loopback because preflight refuses fewer than two independent
       resolvers: a name publishing another address fails with the domain, both
@@ -1016,10 +1026,11 @@ cases_by_requirement:
       preflight that refuses everything. No host is touched and no install runs;
       the case reads the exit status and what the preflight left on disk.
   - requirement: Live scenario parity
-    cases: [REV-01, REV-02]
+    cases: [REV-01, REV-02, BOOT-02]
     reason: >-
-      the two are the revocation sentence of the credential requirement, decided
-      by the controller the operator runs on this machine. `_cleanup_access`,
+      the three are the withdrawal sentence of the credential requirement,
+      decided by the controller the operator runs on this machine: the temporary
+      access a run installs is taken back when the run ends. `_cleanup_access`,
       `_revoke_all`, `_cleanup_summary_message`, `_write_operator_only_report`
       and `_refresh_report` are driven against a model of the SSH client that
       answers the four probes the cleanup makes and records every command it is
@@ -1035,8 +1046,39 @@ cases_by_requirement:
       fails the run even though the clean one passes, and `_refresh_report` on
       an otherwise PASS run-state rewrites the overall result to INCOMPLETE and
       records the cleanup under `operator_access_cleanup` while a passing
-      cleanup leaves the same state at PASS. The transport is a seam and the
-      host is a model: no SSH server answers, and neither case claims one does.
+      cleanup leaves the same state at PASS. BOOT-02 reads the same withdrawal
+      on a finished pair, from the hosts' own files rather than from the record:
+      both markers gone from `authorized_keys`, both expiry timer files gone, the
+      provider's own entry still in place, and three contours that must not pass
+      — a cleanup whose script did nothing is `INCOMPLETE` and names what
+      survived, and an unreachable host is recorded as such without stopping the
+      revocation of the host behind it. Its damages are the ways a pass can be
+      claimed without the key being gone: a revocation that skips a host, reuses
+      one connection for both, removes the provider's entry, leaves a timer file,
+      reports its own residue as a pass, or stops at the first failure. The
+      transport is a seam and the host is a model: no SSH server answers, and
+      none of the three claims one does.
+  - requirement: Live scenario parity
+    cases: [NEG-01, NEG-04]
+    reason: >-
+      both serve the parity sentence for the live negative suite's own matrix —
+      the table about fault, component and the boundary the run has to stop at,
+      which the delta spec states no scenario about. The table is a conjunction,
+      so what the two cases read is the suite's case list rather than a verdict:
+      NEG-01 requires the live requirement's sentence to still print fifteen
+      rows, one per scenario id, each row's component cell still naming the
+      component the case's table names, the live runner still defining one
+      `run_neg_NN_*` function per row, and every witness a case this suite
+      builds for the contour that row names — read from the catalog's own driver
+      registry, so a witness removed from the code fails here instead of quietly
+      emptying a catalog entry. NEG-04 is the same audit over the first ten rows,
+      whose sentence states its scope inline (`NEG-01 through NEG-10`) instead of
+      printing the table. Their damages are a row unbolded, a row naming another
+      component, a sentence that lost the ten-row scope, a runner missing one
+      scenario, and a witness built on no contour. What neither can check is
+      that a witness asserts the right boundary: the mapping from row to case is
+      a judgement written out row by row with a sentence saying what each
+      witness proves.
   - requirement: Live scenario parity
     cases: [AIO-AUTH-NEG, MN-DUP-ADD, RED-01, RED-02, APIC-01]
     reason: >-
