@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from tools.live_vps.redaction import redact, register_secret
+from tools.podman_e2e import catalog as catalog_data
 from tools.podman_e2e import groups
 
 PASS = "PASS"
@@ -462,6 +463,16 @@ class Runner:
 
     def report(self) -> int:
         self._apply_required_groups()
+        # The id says which case ran; the digest says which sentence it asserted.
+        # Recording it here is what lets the divergence guard compare this run
+        # with the live suite's, and refuse a case that recorded neither.
+        digests = catalog_data.assertion_digests()
+
+        def case_record(result: "CaseResult") -> Dict[str, Any]:
+            record = result.to_dict()
+            if result.id in digests:
+                record["assertion_sha256"] = digests[result.id]
+            return record
 
         def payload() -> Dict[str, Any]:
             return {
@@ -472,7 +483,7 @@ class Runner:
                 "duration": round(self.context.elapsed(), 3),
                 "budget_seconds": self.context.budget_seconds,
                 "environment": {**self.context.environment, "repository": repository_state()},
-                "cases": [result.to_dict() for result in self.results],
+                "cases": [case_record(result) for result in self.results],
             }
 
         data = payload()

@@ -13,6 +13,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from tools.podman_e2e import catalog  # noqa: E402
 from tools.podman_e2e.runner import (  # noqa: E402
     BLOCKED,
     FAIL,
@@ -53,6 +54,24 @@ class TestPodmanRunnerContract(unittest.TestCase):
         suite = ET.parse(context.artifact_dir / "junit.xml").getroot()
         self.assertEqual(suite.attrib["tests"], "1")
         self.assertEqual(suite.attrib["failures"], "0")
+
+    def test_a_catalog_case_records_the_digest_of_the_sentence_it_ran(self):
+        # The id says which case ran; the digest says which sentence it asserted,
+        # which is what the divergence guard compares with the live suite's.
+        context = self.context()
+        runner = Runner(context)
+        runner.add(Case("AIO-INSTALL", "aio", lambda ctx: {}))
+        runner.add(Case("PROBE-NOT-IN-CATALOG", "aio", lambda ctx: {}))
+        self.assertEqual(runner.execute(), 0)
+        by_id = {
+            case["id"]: case
+            for case in json.loads((context.artifact_dir / "result.json").read_text())["cases"]
+        }
+        self.assertEqual(
+            by_id["AIO-INSTALL"]["assertion_sha256"],
+            catalog.assertion_digests()["AIO-INSTALL"],
+        )
+        self.assertNotIn("assertion_sha256", by_id["PROBE-NOT-IN-CATALOG"])
 
     def test_each_case_names_the_evidence_files_it_wrote(self):
         # The inline evidence dict cannot be grepped from a shell, so a case also

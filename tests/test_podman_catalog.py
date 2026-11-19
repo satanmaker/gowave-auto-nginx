@@ -11,7 +11,11 @@ in both directions. The run's start sequence is read the same way, from the
 topology's own ``create()``, because a per-case fixture list cannot be derived
 from a driver at all.
 """
+import contextlib
 import copy
+import hashlib
+import io
+import json
 import sys
 import tempfile
 import unittest
@@ -474,6 +478,604 @@ class TestEntrypointRefusesAnUnknownSuite(unittest.TestCase):
         self.assertIn("the case list does not match tests/cases/catalog.yaml", message)
         self.assertNotIn("added", executed, "the refused suite must not have been handed over")
         self.assertNotIn("ran", executed, "the install must not start on a refused suite")
+
+
+class TestJustifiedExclusions(unittest.TestCase):
+    """What a run leaves out is printed, and the catalog is what says why.
+
+    Two live scenarios cannot be answered by a container, and a run that simply
+    does not mention them reads as parity in a green artifact. The catalog
+    carries the limitation, the run prints it, and `result.json` keeps it, so
+    "not executed" and "not considered" are different claims.
+    """
+
+    def setUp(self):
+        self.document = catalog.load_catalog()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+
+    def exclusions(self, topology="aio", document=None):
+        with mock.patch.object(
+            catalog, "load_catalog", return_value=document or self.document,
+        ):
+            return catalog.justified_exclusions(topology)
+
+    def entry(self, document, case_id):
+        return next(case for case in document["cases"] if case["id"] == case_id)
+
+    def test_the_two_live_only_entries_state_their_limitation(self):
+        live_only = {
+            case["id"]: case for case in self.document["cases"]
+            if case["environment"] == "live-only"
+        }
+        self.assertEqual(sorted(live_only), ["LOCAL-02", "TD-06"])
+        self.assertEqual(self.document["counts"]["live_only"], 2)
+        for case_id, case in live_only.items():
+            self.assertEqual(case["runs_in"], ["live"], case_id)
+            self.assertEqual(case["state"], "live-only", case_id)
+            self.assertEqual(case["driver_status"], "not-applicable", case_id)
+            self.assertTrue(case["live_only_reason"].strip(), case_id)
+
+    def test_a_run_reports_the_exclusions_that_apply_to_its_topology(self):
+        one = self.exclusions("aio")
+        both = self.exclusions("multi-node")
+        self.assertEqual(sorted(entry["id"] for entry in one), ["TD-06"])
+        self.assertEqual(sorted(entry["id"] for entry in both), ["LOCAL-02", "TD-06"])
+        for entry in both:
+            self.assertEqual(entry["environment"], "live-only")
+            self.assertTrue(entry["requirement"])
+            self.assertTrue(entry["reason"].strip())
+            self.assertIn("multi-node", entry["topology"])
+
+    def test_a_live_only_entry_with_no_reason_is_refused(self):
+        document = copy.deepcopy(self.document)
+        self.entry(document, "LOCAL-02")["live_only_reason"] = "   "
+        with self.assertRaises(catalog.CatalogError) as caught:
+            self.exclusions("multi-node", document)
+        self.assertIn(
+            "LOCAL-02: live-only case must state its reason", str(caught.exception)
+        )
+
+    def test_a_live_only_entry_that_also_runs_here_is_refused(self):
+        document = copy.deepcopy(self.document)
+        self.entry(document, "TD-06")["runs_in"] = ["live", "podman"]
+        with self.assertRaises(catalog.CatalogError) as caught:
+            self.exclusions("aio", document)
+        self.assertIn(
+            "TD-06: live-only case is listed as running in the Podman suite",
+            str(caught.exception),
+        )
+
+    def test_an_unknown_topology_is_a_usage_error(self):
+        with self.assertRaises(ValueError) as caught:
+            self.exclusions("aio-and-a-half")
+        self.assertIn("unsupported topology: 'aio-and-a-half'", str(caught.exception))
+
+    def stub_run(self, argv, executed):
+        """Drive `main` with a Podman and a Runner that touch nothing."""
+        from tools import run_podman_e2e
+
+        class _Podman:
+            def __init__(self, context):
+                executed["context"] = context
+                self.context = context
+
+            def remove_stale_runs(self):
+                return []
+
+            def register_cleanup(self):
+                pass
+
+        class _Runner:
+            def __init__(self, context):
+                executed["runner"] = context
+
+            def require_group(self, group):
+                pass
+
+            def add(self, case):
+                executed.setdefault("added", []).append(case.id)
+
+            def on_failure(self, hook):
+                pass
+
+            def execute(self):
+                return 0
+
+        patchers = [
+            mock.patch.object(run_podman_e2e, name, value)
+            for name, value in (
+                ("Podman", _Podman),
+                ("Runner", _Runner),
+                ("build_suite", lambda *a, **k: []),
+            )
+        ]
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return run_podman_e2e.main(argv)
+
+    def test_the_entrypoint_prints_and_records_every_exclusion(self):
+        executed = {}
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            status = self.stub_run(
+                ["--topology", "multi-node", "--artifact-root", self.tmp], executed,
+            )
+        self.assertEqual(status, 0)
+        output = printed.getvalue()
+        self.assertIn("justified exclusions (live-only, not executed here):", output)
+        for case_id in ("TD-06", "LOCAL-02"):
+            self.assertIn(case_id, output)
+        recorded = executed["context"].environment["justified_exclusions"]
+        self.assertEqual(sorted(entry["id"] for entry in recorded), ["LOCAL-02", "TD-06"])
+        by_id = {case["id"]: case for case in self.document["cases"]}
+        for entry in recorded:
+            self.assertEqual(
+                entry["reason"], by_id[entry["id"]]["live_only_reason"],
+                "the run must print the catalog's own limitation, not a paraphrase",
+            )
+
+    def test_the_entrypoint_refuses_an_exclusion_it_cannot_justify(self):
+        executed = {}
+        patcher = mock.patch.object(
+            catalog, "justified_exclusions",
+            mock.Mock(side_effect=catalog.CatalogError(
+                "the catalog cannot justify what this run leaves out: "
+                "TD-06: live-only case must state its reason"
+            )),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        with mock.patch("sys.stderr") as stderr:
+            with self.assertRaises(SystemExit) as caught:
+                self.stub_run(
+                    ["--topology", "aio", "--artifact-root", self.tmp], executed,
+                )
+        self.assertEqual(caught.exception.code, 2)
+        message = " ".join(str(call.args[0]) for call in stderr.write.call_args_list if call.args)
+        self.assertIn("TD-06: live-only case must state its reason", message)
+        self.assertNotIn("runner", executed, "a refused run must not construct the runner")
+
+
+class TestPodmanFirstPromotion(unittest.TestCase):
+    """A Podman-first case is a promise to promote, and the promise names an owner.
+
+    The catalog incubates 104 cases that no live scenario covers yet. Each one
+    states the requirement it belongs to here and the live requirement it is
+    being promoted into; both are read from the two specs, so a renamed
+    requirement orphans its cases loudly instead of leaving them pointing at a
+    string no spec declares.
+    """
+
+    def setUp(self):
+        self.document = catalog.load_catalog()
+        self.extras = [
+            case for case in self.document["cases"] if not case.get("live_scenario")
+        ]
+
+    def vocabulary(self):
+        names = {scenario.requirement for scenario in catalog.parse_live_spec()}
+        from tools.podman_e2e import trace
+
+        names.update(requirement for requirement, _ in trace.parse_spec())
+        return names
+
+    def problems(self, document=None):
+        return catalog.validate_catalog(document or self.document)
+
+    def entry(self, document, case_id):
+        return next(case for case in document["cases"] if case["id"] == case_id)
+
+    def test_every_podman_first_case_names_an_owner_and_a_target_the_specs_state(self):
+        vocabulary = self.vocabulary()
+        self.assertEqual(len(self.extras), self.document["counts"]["podman_first"])
+        self.assertEqual(len(self.extras), 104)
+        for case in self.extras:
+            self.assertEqual(case["runs_in"], ["podman"], case["id"])
+            self.assertEqual(case["state"], "incubating", case["id"])
+            self.assertIn(case["requirement"], vocabulary, case["id"])
+            self.assertIn(case["promotion_target"], vocabulary, case["id"])
+        self.assertEqual(self.problems(), [])
+
+    def test_an_owning_requirement_no_spec_states_is_refused(self):
+        document = copy.deepcopy(self.document)
+        self.entry(document, "MN-BACKUP")["requirement"] = "Backup and Restore Format v1"
+        problems = self.problems(document)
+        self.assertTrue(
+            any("MN-BACKUP: Podman-first case names no owning requirement" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_a_promotion_target_no_spec_states_is_refused(self):
+        document = copy.deepcopy(self.document)
+        self.entry(document, "AIO-INSTALL")["promotion_target"] = "Nowhere in particular"
+        problems = self.problems(document)
+        self.assertTrue(
+            any("AIO-INSTALL: promotion target is not a requirement either spec states" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_a_podman_first_case_without_a_target_is_refused(self):
+        document = copy.deepcopy(self.document)
+        self.entry(document, "AIO-INSTALL")["promotion_target"] = None
+        problems = self.problems(document)
+        self.assertTrue(
+            any("AIO-INSTALL: Podman-first case requires a promotion target" in problem
+                for problem in problems),
+            problems,
+        )
+
+
+class TestScenarioClassification(unittest.TestCase):
+    """A live scenario is answered where the checked table says, not by default.
+
+    The table is the catalog's input, so a scenario the spec gains without a row
+    stops the build instead of being called container-reproducible by the silence
+    of a default. A live-only addition is exactly the case that default used to
+    swallow.
+    """
+
+    def setUp(self):
+        self.document = catalog.load_catalog()
+        self.table = catalog.load_scenario_environments()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def test_every_live_scenario_is_classified_and_the_counts_agree(self):
+        scenarios = catalog.parse_live_spec()
+        self.assertEqual(len(scenarios), 125)
+        self.assertEqual(len(self.table), 125)
+        counted = {"container": 0, "partial": 0, "live-only": 0}
+        for scenario in scenarios:
+            environment, note = catalog.classify(scenario.requirement, scenario.title, self.table)
+            counted[environment] += 1
+            if environment == "partial":
+                self.assertTrue(note, scenario.title)
+            if environment == "live-only":
+                self.assertTrue(note, scenario.title)
+        self.assertEqual(counted, {
+            "container": self.document["counts"]["container"],
+            "partial": self.document["counts"]["partial"],
+            "live-only": self.document["counts"]["live_only"],
+        })
+
+    def test_a_scenario_the_table_does_not_classify_is_refused(self):
+        with self.assertRaises(ValueError) as caught:
+            catalog.classify("Teardown Policy Enforcement", "A scenario nobody placed", self.table)
+        self.assertIn(
+            "Live scenario has no environment classification: "
+            "Teardown Policy Enforcement / A scenario nobody placed",
+            str(caught.exception),
+        )
+
+    def test_a_live_scenario_the_table_does_not_classify_fails_the_audit(self):
+        spec = self.tmp / "spec.md"
+        original = catalog.LIVE_SPEC.read_text(encoding="utf-8")
+        addition = (
+            "\n#### Scenario: A live-only sentence nobody classified\n\n"
+            "- **WHEN** something happens\n- **THEN** it is observed\n"
+        )
+        marker = "### Requirement: Teardown Policy Enforcement"
+        self.assertEqual(original.count(marker), 1)
+        spec.write_text(
+            original.replace(marker, marker + addition, 1), encoding="utf-8",
+        )
+        problems = catalog.validate_catalog(self.document, spec_path=spec)
+        self.assertTrue(
+            any("Live scenario has no environment classification: "
+                "Teardown Policy Enforcement / A live-only sentence nobody classified" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_a_classification_row_no_scenario_names_is_refused(self):
+        extended = dict(self.table)
+        extended[("Teardown Policy Enforcement", "A row nobody wrote")] = {
+            "requirement": "Teardown Policy Enforcement",
+            "scenario": "A row nobody wrote",
+            "environment": "container",
+        }
+        with mock.patch.object(catalog, "load_scenario_environments", return_value=extended):
+            problems = catalog.validate_catalog(self.document)
+        self.assertTrue(
+            any("Environment classification names no live scenario: "
+                "Teardown Policy Enforcement / A row nobody wrote" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_an_entry_whose_environment_drifted_from_the_table_is_refused(self):
+        document = copy.deepcopy(self.document)
+        entry = next(case for case in document["cases"] if case["id"] == "TD-06")
+        entry["environment"] = "container"
+        problems = catalog.validate_catalog(document)
+        self.assertTrue(
+            any("TD-06: environment 'container' is not the classification table's 'live-only'"
+                in problem for problem in problems),
+            problems,
+        )
+
+
+class TestPromotionPath(unittest.TestCase):
+    """`incubating` → `podman-stable` → `live-parity`, and only that way round."""
+
+    def setUp(self):
+        self.document = catalog.load_catalog()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def register(self, promotions, criteria=None):
+        path = self.tmp / "promotions.yaml"
+        path.write_text(
+            "schema: gowave-case-promotions/v1\n"
+            f"criteria: {criteria or {'green_runs': 3, 'review': 'reviewed'}}\n"
+            f"promotions: {promotions}\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def problems(self, path, document=None):
+        return catalog._promotion_errors(
+            document or self.document, catalog.load_promotions(path),
+        )
+
+    def test_the_register_is_empty_and_every_podman_first_case_is_incubating(self):
+        register = catalog.load_promotions()
+        self.assertEqual(register["promoted"], {})
+        self.assertEqual(register["criteria"]["green_runs"], 3)
+        for case in self.document["cases"]:
+            if case.get("live_scenario"):
+                expected = (
+                    "live-only" if case["environment"] == "live-only" else "live-parity"
+                )
+                self.assertEqual(case["state"], expected, case["id"])
+            else:
+                self.assertEqual(case["state"], "incubating", case["id"])
+        self.assertEqual(self.problems(catalog.PROMOTIONS_PATH), [])
+
+    def test_a_registered_case_becomes_podman_stable(self):
+        path = self.register([
+            {"id": "AIO-INSTALL", "state": "podman-stable", "green_runs": 3,
+             "review": "PR #1234"},
+        ])
+        built = catalog.build_catalog(promotion_path=path)
+        entry = next(case for case in built["cases"] if case["id"] == "AIO-INSTALL")
+        self.assertEqual(entry["state"], "podman-stable")
+        self.assertEqual(entry["promotion"]["green_runs"], 3)
+        self.assertEqual(self.problems(path, built), [])
+
+    def test_a_promotion_to_live_parity_is_refused(self):
+        path = self.register([
+            {"id": "AIO-INSTALL", "state": "live-parity", "green_runs": 3,
+             "review": "PR #1234"},
+        ])
+        problems = self.problems(path)
+        self.assertTrue(
+            any("AIO-INSTALL: promotion state 'live-parity' is not reachable from the register"
+                in problem for problem in problems),
+            problems,
+        )
+
+    def test_a_promotion_with_too_few_green_runs_is_refused(self):
+        path = self.register([
+            {"id": "AIO-INSTALL", "state": "podman-stable", "green_runs": 1,
+             "review": "PR #1234"},
+        ])
+        problems = self.problems(path)
+        self.assertTrue(
+            any("AIO-INSTALL: promotion rests on 1 green runs, the criteria require 3"
+                in problem for problem in problems),
+            problems,
+        )
+
+    def test_a_promotion_without_a_review_is_refused(self):
+        path = self.register([
+            {"id": "AIO-INSTALL", "state": "podman-stable", "green_runs": 3, "review": ""},
+        ])
+        problems = self.problems(path)
+        self.assertTrue(
+            any("AIO-INSTALL: promotion names no review" in problem for problem in problems),
+            problems,
+        )
+
+    def test_a_promotion_of_a_case_that_is_already_live_parity_is_refused(self):
+        path = self.register([
+            {"id": "TD-06", "state": "podman-stable", "green_runs": 3, "review": "PR #1"},
+        ])
+        problems = self.problems(path)
+        self.assertTrue(
+            any("TD-06: already live-parity, and the promotion path runs one way" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_a_promotion_of_an_unknown_case_is_refused(self):
+        path = self.register([
+            {"id": "AIO-NOPE", "state": "podman-stable", "green_runs": 3, "review": "PR #1"},
+        ])
+        problems = self.problems(path)
+        self.assertTrue(
+            any("AIO-NOPE: the promotion register names no such case" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_a_state_the_register_does_not_grant_is_refused(self):
+        document = copy.deepcopy(self.document)
+        entry = next(case for case in document["cases"] if case["id"] == "AIO-INSTALL")
+        entry["state"] = "podman-stable"
+        problems = self.problems(catalog.PROMOTIONS_PATH, document)
+        self.assertTrue(
+            any("AIO-INSTALL: state 'podman-stable', but the promotion register does not list it"
+                in problem for problem in problems),
+            problems,
+        )
+
+    def test_a_register_without_criteria_is_refused(self):
+        path = self.register([], criteria={"review": "reviewed"})
+        problems = self.problems(path)
+        self.assertTrue(
+            any("promotion criteria must declare a positive green_runs" in problem
+                for problem in problems),
+            problems,
+        )
+
+
+class TestDivergenceGuard(unittest.TestCase):
+    """A result proves which case ran; its digest proves what the case asserted."""
+
+    def setUp(self):
+        self.document = catalog.load_catalog()
+        self.case = next(
+            case for case in self.document["cases"] if case.get("state") == "live-parity"
+        )
+        self.case_id = self.case["id"]
+        self.digest = self.case["assertion_sha256"]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def result(self, name, digest=None):
+        case = {"id": self.case_id, "status": "PASS"}
+        if digest is not None:
+            case["assertion_sha256"] = digest
+        path = self.tmp / name
+        path.write_text(
+            json.dumps({"schema": "gowave-podman-e2e-result/v1", "cases": [case]}),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_the_checked_in_tree_passes_the_guard(self):
+        self.assertEqual(catalog.divergence_guard(), [])
+
+    def test_a_result_recording_no_assertion_is_refused(self):
+        problems = catalog.divergence_guard(podman_results=[self.result("silent.json")])
+        self.assertTrue(
+            any(f"{self.case_id}: the Podman result records no assertion text" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_a_result_asserting_text_the_catalog_does_not_carry_is_refused(self):
+        problems = catalog.divergence_guard(
+            podman_results=[self.result("other.json", "f" * 64)]
+        )
+        self.assertTrue(
+            any(f"{self.case_id}: the Podman result asserts text the catalog does not carry"
+                in problem for problem in problems),
+            problems,
+        )
+
+    def test_the_same_id_asserting_different_text_in_the_two_suites_is_refused(self):
+        podman = self.result("podman.json", self.digest)
+        live = self.result("live.json", "f" * 64)
+        problems = catalog.divergence_guard(podman_results=[podman], live_results=[live])
+        self.assertIn(
+            f"{self.case_id}: the live result and the Podman result assert different text",
+            problems,
+        )
+        self.assertTrue(
+            any(f"{self.case_id}: the Live result asserts text the catalog does not carry"
+                in problem for problem in problems),
+            problems,
+        )
+
+    def test_both_suites_asserting_the_catalog_sentence_are_accepted(self):
+        problems = catalog.divergence_guard(
+            podman_results=[self.result("podman.json", self.digest)],
+            live_results=[self.result("live.json", self.digest)],
+        )
+        self.assertEqual(problems, [])
+
+    def test_the_recorder_publishes_the_digest_of_the_text_each_case_carries(self):
+        digests = catalog.assertion_digests()
+        self.assertEqual(digests[self.case_id], self.digest)
+        for case in self.document["cases"]:
+            if case.get("assertion_sha256"):
+                self.assertEqual(
+                    digests[case["id"]],
+                    hashlib.sha256(case["assertion"].encode("utf-8")).hexdigest(),
+                    case["id"],
+                )
+
+
+class TestParityInventory(unittest.TestCase):
+    """The published inventory answers per scenario, and a stale copy is refused."""
+
+    def setUp(self):
+        self.document = catalog.load_catalog()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def live_cases(self):
+        return [case for case in self.document["cases"] if case.get("live_scenario")]
+
+    def rows(self, text):
+        section = text.split("## Scenario inventory", 1)[1].split("## Partial splits", 1)[0]
+        return [
+            line for line in section.splitlines()
+            if line.startswith("| ") and not line.startswith("| Case")
+            and not line.startswith("|---")
+        ]
+
+    def test_the_rendered_inventory_has_one_row_per_live_scenario(self):
+        rendered = catalog.render_parity(self.document)
+        rows = self.rows(rendered)
+        self.assertEqual(len(rows), self.document["counts"]["live_total"])
+        self.assertEqual(len(rows), len(self.live_cases()))
+        for case, row in zip(self.live_cases(), rows):
+            cells = [cell.strip() for cell in row.strip("|").split("|")]
+            self.assertEqual(cells[0], case["id"])
+            self.assertEqual(cells[1], case["environment"])
+            self.assertEqual(cells[2], case["gate"])
+        self.assertEqual(catalog.parity_audit(self.document), [])
+
+    def test_a_stale_inventory_is_refused(self):
+        stale = self.tmp / "PARITY.md"
+        stale.write_text(
+            catalog.render_parity(self.document) + "- an entry nobody generated\n",
+            encoding="utf-8",
+        )
+        problems = catalog.parity_audit(self.document, stale)
+        self.assertTrue(
+            any("is not what the catalog renders to" in problem for problem in problems),
+            problems,
+        )
+
+    def test_a_missing_inventory_is_refused(self):
+        problems = catalog.parity_audit(self.document, self.tmp / "absent.md")
+        self.assertTrue(
+            any("Parity inventory is missing" in problem for problem in problems),
+            problems,
+        )
+
+    def test_a_row_without_a_gate_is_refused(self):
+        damaged = copy.deepcopy(self.document)
+        damaged["cases"][0]["gate"] = ""
+        path = self.tmp / "PARITY.md"
+        path.write_text(catalog.render_parity(damaged), encoding="utf-8")
+        problems = catalog.parity_audit(damaged, path)
+        self.assertTrue(
+            any(f"{damaged['cases'][0]['id']}: parity row states no gate" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_the_coverage_audit_reports_the_stale_inventory(self):
+        stale = self.tmp / "PARITY.md"
+        stale.write_text("not the catalog's text\n", encoding="utf-8")
+        problems = catalog.coverage_audit(self.document, parity_path=stale)
+        self.assertTrue(
+            any("is not what the catalog renders to" in problem for problem in problems),
+            problems,
+        )
 
 
 if __name__ == "__main__":

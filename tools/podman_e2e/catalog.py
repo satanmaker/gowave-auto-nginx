@@ -33,6 +33,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import yaml
 
 from . import matrix as matrix_data
+from . import trace as trace_data
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 LIVE_SPEC = REPO_ROOT / "openspec" / "specs" / "live-vps-e2e" / "spec.md"
@@ -60,6 +61,23 @@ BEHAVIOR_AREAS: Tuple[str, ...] = (
 
 PODMAN_CASES: Sequence[str] = ("aio", "multi-node")
 ALL_CASES: Sequence[str] = ("podman", "live")
+
+# Where each live scenario is answered is a checked field, not a default: the
+# table below is read by `build_catalog`, so a scenario the spec gains and the
+# table does not classify stops the build instead of being claimed by a
+# container that never ran it.
+SCENARIOS_PATH = REPO_ROOT / "tests" / "cases" / "scenarios.yaml"
+ENVIRONMENT_SCHEMA = "gowave-live-scenario-environments/v1"
+ENVIRONMENTS: Sequence[str] = ("container", "partial", "live-only")
+
+# The one-directional path a case walks: implemented here, stabilised here after
+# the configured green-run count and a review, and finally asserted by a live
+# driver that states the same outcome. `live-parity` is entered by the live spec
+# gaining a scenario, never by editing the register, which is what keeps the
+# direction one-way.
+PROMOTIONS_PATH = REPO_ROOT / "tests" / "cases" / "promotions.yaml"
+PROMOTION_SCHEMA = "gowave-case-promotions/v1"
+PROMOTION_STATES: Sequence[str] = ("incubating", "podman-stable", "live-parity")
 
 # The modules that build the Podman case list, keyed by the topology their
 # `Case(...)` calls declare. Implementation facts are read from this code and
@@ -131,40 +149,6 @@ MULTI_NODE_ONLY = {
     "Pair-Wide Run Locking",
     "Shared Mutation Lock Across All Management Entry Points",
     "Local-only live VPS credential handling",
-}
-
-PARTIAL_SCENARIOS = {
-    ("Preflight SSH Trust and DNS Verification", "Private or reserved IP rejected"):
-        "Container proves the private/reserved rule against Podman addresses with an explicitly scoped, fail-closed exemption; the live run is authoritative for real public addresses.",
-    ("UFW Firewall Isolation Verification", "Master local and external access are distinguished"):
-        "Container proves isolation between distinct source addresses; provider-level external reachability is live-only.",
-    ("Data Plane E2E Traffic Through All VPN Endpoints", "Staging and public CA chains are both trusted without bypass"):
-        "Container proves explicit verify anchors and no global trust change; public Let's Encrypt issuance is live-only.",
-    ("Data Plane E2E Traffic Through All VPN Endpoints", "Xray TLS outbounds carry explicit Staging trust anchors"):
-        "Container proves the injected verify anchor is required; real Staging material is live-only.",
-    ("Data Plane E2E Traffic Through All VPN Endpoints", "Staging CA material is pinned and reproducible"):
-        "Container proves fixture CA pinning by digest; real Staging CA distribution is live-only.",
-    ("Teardown Policy Enforcement", "Snapshot restore reacquires the remote lock pair before baseline verification"):
-        "Container proves lock ordering and hook protocol; provider snapshots are live-only.",
-    ("Local Operator Credential Bootstrap and Cleanup", "Host identity is verified before password authentication"):
-        "Container proves host identity precedes the password; the live controller's public-target path is live-only.",
-    ("Local Operator Credential Bootstrap and Cleanup", "Temporary access is bounded and revoked"):
-        "Container proves bounded key lifetime and revocation; live account behaviour is live-only.",
-    ("Negative Scenario and Fault Injection Tests", "Matrix of fifteen fault scenarios verified (NEG-01..NEG-15)"):
-        "Container witnesses the matrix one case per row, each at its own boundary; 'all 15 scenarios terminate at their designated boundaries' is a property of the suite's case list rather than a verdict one run can produce, and `catalog gaps` with the divergence table is what audits it.",
-    ("Negative Scenario and Fault Injection Tests", "Preflight, lifecycle, and protocol scenarios verified (NEG-01..NEG-10)"):
-        "Container witnesses the ten rows one case per sentence, including the timeout bounds `MN-OUTAGE` records as offline and control-plane seconds; the conjunction over the ten is a suite property, not a verdict a single case can read.",
-    ("Negative Scenario and Fault Injection Tests", "Negative suite PASS requires all fifteen scenarios to pass"):
-        "Container proves the aggregate refuses a run that recorded any non-PASS among its declared cases; the live `negative_tests` field, the `NOT_RUN` and `PARTIAL` states and a skip verdict of INCOMPLETE do not exist in this contour, whose aggregate turns a skipped declared case into FAIL.",
-    ("Negative Scenario and Fault Injection Tests", "Negative suite cannot be silently skipped for a passing run"):
-        "Container proves a run cannot report PASS while a declared case is SKIP; the negative phase the sentence names, and its INCOMPLETE verdict, are live-only because this suite has no switch that disables a phase and aggregates a skip to FAIL.",
-}
-
-LIVE_ONLY_SCENARIOS = {
-    ("Teardown Policy Enforcement", "Single-host snapshot reboot does not self-deadlock lock reacquisition"):
-        "Requires a provider snapshot and a real reboot; a container cannot reproduce the host lifecycle.",
-    ("Local-only live VPS credential handling", "Local operator starts a live run"):
-        "Starts the interactive operator against real disposable VPS instances; live infrastructure only.",
 }
 
 PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
@@ -278,7 +262,7 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "requirement": "Fail-closed local ACME test mode",
         "assertion": "The local ACME fixture endpoint is refused without GOWAVE_ACME_TEST_MODE=1, an arbitrary directory URL is refused inside test mode, a CA whose digest does not match the pinned one is refused, and the production ACME directory is still accepted.",
         "topology": ["aio"],
-        "promotion_target": "Independent All-in-One Acceptance Topology",
+        "promotion_target": "Independent All-in-One acceptance topology",
     },
     {
         "id": "AIO-NEG-DEP",
@@ -327,7 +311,7 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "requirement": "Failure injection and recovery",
         "assertion": "A backup store that cannot hold the archive fails loudly and publishes nothing: no archive-shaped or partial file appears in the store, the Panel, its database, the frontend, state.json, the NGINX and ACME trees and the health route are unchanged by the failed write, and after the fault is removed the same operator command publishes a mode-0600 archive that the product's own preflight validator accepts.",
         "topology": ["aio"],
-        "promotion_target": "Backup and Restore Format v1",
+        "promotion_target": "Lifecycle recovery acceptance",
     },
     {
         "id": "AIO-FAULT-PANEL",
@@ -373,14 +357,14 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
     },
     {
         "id": "ACME-01",
-        "requirement": "Real ACME issuance and renewal through the pinned directory",
+        "requirement": "Global Certbot Deploy Hook Ownership",
         "assertion": "On the installed host the certificate serving the Panel domain was issued during this run by the pinned ACME directory, Certbot's own renewal record names the webroot method and that webroot, a token written into the webroot is fetched through the product's port 80 vhost from an independent client, and a forced renewal performs an HTTP-01 challenge and yields a new serial whose leaf the independent client receives after the product's deploy hook reloads NGINX without replacing the master.",
         "topology": ["aio"],
         "promotion_target": "Global Certbot Deploy Hook Ownership",
     },
     {
         "id": "ACME-02",
-        "requirement": "Real ACME issuance and renewal through the pinned directory",
+        "requirement": "Global Certbot Deploy Hook Ownership",
         "assertion": "With the port 80 challenge webroot closed to the validator, and again with the pinned directory unreachable from the host, a forced renewal exits non-zero, quotes its own cause, leaves the installed serial, notBefore and archive count unchanged, and keeps serving the working leaf to an independent client; once each outage is removed the same forced renewal issues a new serial whose leaf the client then receives.",
         "topology": ["aio"],
         "promotion_target": "Global Certbot Deploy Hook Ownership",
@@ -436,28 +420,28 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
     },
     {
         "id": "MN-BACKUP",
-        "requirement": "Backup and Restore Format v1",
+        "requirement": "Lifecycle recovery acceptance",
         "assertion": "Both archive types are produced through the operator's own interface — --type panel on Master and --type node on Worker — as mode-0600 Format v1 archives whose actual contents match their documented allowlists: the Panel archive carries the database, environment, NGINX vhosts, the complete certificate lineage and run state with every declared checksum present and no binary, while the Worker archive carries exactly its environment file, and the product's own validator accepts both.",
         "topology": ["multi-node"],
         "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
     },
     {
         "id": "MN-BACKUP-VOL",
-        "requirement": "Backup and Restore Format v1",
+        "requirement": "Lifecycle recovery acceptance",
         "assertion": "Both unencrypted archives are written into a /var/backups/gowave that is a run-owned Podman volume of its own — a filesystem distinct from the container's root, owned by root at mode 0700 with exactly one mount entry and carrying the run's cleanup label — each role's archive lands on that volume at mode 0600, and the run's artifact tree holds no gzip stream, no file named or suffixed as an archive, and no line carrying a private key or secret-bearing variable, so the volume's removal by label during cleanup leaves nothing behind.",
         "topology": ["multi-node"],
         "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
     },
     {
         "id": "MN-BACKUP-BAD",
-        "requirement": "Backup and Restore Format v1",
+        "requirement": "Lifecycle recovery acceptance",
         "assertion": "An archive the product did not write, or wrote incompletely, is refused by the product's own restore on the role it names — truncated, garbage, checksum-mismatched, missing a member its manifest declares, missing the member its type requires, and of the wrong type are each rejected with their own message and no traceback, while the untouched archives of both roles still pass the 15-point preflight; every refusal leaves Master's unit state, NGINX, environment and database bytes and snapshot count, and the Worker's environment digest and unit, exactly as they were, so a partially applied restore can never be mistaken for a refused one.",
         "topology": ["multi-node"],
         "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
     },
     {
         "id": "MN-RESTORE",
-        "requirement": "Backup and Restore Format v1",
+        "requirement": "Lifecycle recovery acceptance",
         "assertion": "A Panel archive and a Worker archive, both written by the product on the roles this run provisioned, are restored by the product's own restore command on those roles: a client created through the Panel API and then deleted comes back with its identity, the inventory and the exact bytes of every representation it was served, the Worker's environment file returns to the bytes the archive captured (the injected marker gone) with its unit active, and both nodes reconnect and carry data-plane payload through every served outbound afterwards.",
         "topology": ["multi-node"],
         "promotion_target": "Signal-Safe and Verifiable Transaction Compensation",
@@ -863,13 +847,45 @@ def parse_live_spec(path: Path = LIVE_SPEC) -> List[LiveScenario]:
     return scenarios
 
 
-def classify(requirement: str, title: str) -> Tuple[str, Optional[str]]:
-    key = (requirement, title)
-    if key in LIVE_ONLY_SCENARIOS:
-        return "live-only", LIVE_ONLY_SCENARIOS[key]
-    if key in PARTIAL_SCENARIOS:
-        return "partial", PARTIAL_SCENARIOS[key]
-    return "container", None
+def load_scenario_environments(path: Path = SCENARIOS_PATH) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """The classification table, keyed by (requirement, scenario)."""
+    document = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    if document.get("schema") != ENVIRONMENT_SCHEMA:
+        raise CatalogError(
+            f"{path}: schema is {document.get('schema')!r}, expected {ENVIRONMENT_SCHEMA!r}"
+        )
+    table: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for row in document.get("environments") or []:
+        key = (row.get("requirement"), row.get("scenario"))
+        if key in table:
+            raise CatalogError(f"{path}: {key[0]} / {key[1]} is classified twice")
+        table[key] = row
+    return table
+
+
+def classify(
+    requirement: str,
+    title: str,
+    table: Optional[Dict[Tuple[str, str], Dict[str, Any]]] = None,
+) -> Tuple[str, Optional[str]]:
+    """The environment a live scenario is answered in, or a refusal.
+
+    There is no default: a scenario that reached the spec without a row in
+    `tests/cases/scenarios.yaml` cannot be called container-reproducible by
+    accident, which is what a live-only addition would otherwise become.
+    """
+    table = table if table is not None else load_scenario_environments()
+    row = table.get((requirement, title))
+    if row is None:
+        raise ValueError(
+            f"Live scenario has no environment classification: {requirement} / {title}"
+        )
+    environment = row.get("environment")
+    if environment == "partial":
+        return environment, row.get("partial_split")
+    if environment == "live-only":
+        return environment, row.get("live_only_reason")
+    return environment, None
 
 
 _CONSTANT_CACHE: Dict[str, Dict[str, str]] = {}
@@ -1713,8 +1729,89 @@ def apply_implementations(cases: List[Dict[str, Any]], registry: Dict[str, Dict[
             case["driver_status"] = "planned"
 
 
-def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
+def load_promotions(path: Path = PROMOTIONS_PATH) -> Dict[str, Any]:
+    """The promotion register: the criteria and the cases that met them.
+
+    The register is an input, not a report. `build_catalog` reads it to decide
+    which Podman-first cases have left `incubating`, so a hand edit of
+    `tests/cases/catalog.yaml` cannot grant a state the register does not carry.
+    """
+    document = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    if document.get("schema") != PROMOTION_SCHEMA:
+        raise CatalogError(
+            f"{path}: schema is {document.get('schema')!r}, expected {PROMOTION_SCHEMA!r}"
+        )
+    criteria = document.get("criteria") or {}
+    promoted: Dict[str, Dict[str, Any]] = {}
+    for entry in document.get("promotions") or []:
+        case_id = entry.get("id")
+        if case_id in promoted:
+            raise CatalogError(f"{path}: {case_id} is listed twice")
+        promoted[case_id] = dict(entry)
+    return {"criteria": dict(criteria), "promoted": promoted}
+
+
+def _promotion_errors(catalog: Dict[str, Any], promotions: Dict[str, Any]) -> List[str]:
+    """The register and the catalog must agree about which case is where."""
+    errors: List[str] = []
+    criteria = promotions["criteria"]
+    green_runs = criteria.get("green_runs")
+    if not isinstance(green_runs, int) or green_runs < 1:
+        errors.append(f"promotion criteria must declare a positive green_runs, not {green_runs!r}")
+    if not str(criteria.get("review") or "").strip():
+        errors.append("promotion criteria must state what the review is")
+    minimum = green_runs if isinstance(green_runs, int) else 1
+
+    by_id = {case.get("id"): case for case in catalog.get("cases", [])}
+    for case_id, entry in sorted(promotions["promoted"].items()):
+        case = by_id.get(case_id)
+        if case is None:
+            errors.append(f"{case_id}: the promotion register names no such case")
+            continue
+        if case.get("live_scenario"):
+            errors.append(
+                f"{case_id}: already live-parity, and the promotion path runs one way"
+            )
+            continue
+        state = entry.get("state")
+        if state != "podman-stable":
+            errors.append(
+                f"{case_id}: promotion state {state!r} is not reachable from the register; "
+                f"live-parity is entered by a live scenario, not by an entry"
+            )
+        entry_runs = entry.get("green_runs")
+        if not isinstance(entry_runs, int) or entry_runs < minimum:
+            errors.append(
+                f"{case_id}: promotion rests on {entry_runs!r} green runs, "
+                f"the criteria require {minimum}"
+            )
+        if not str(entry.get("review") or "").strip():
+            errors.append(f"{case_id}: promotion names no review")
+
+    for case in catalog.get("cases", []):
+        if case.get("live_scenario"):
+            continue
+        registered = case.get("id") in promotions["promoted"]
+        expected = "podman-stable" if registered else "incubating"
+        if case.get("state") != expected:
+            errors.append(
+                f"{case.get('id')}: state {case.get('state')!r}, but the promotion register "
+                f"{'lists' if registered else 'does not list'} it, which makes it {expected!r}"
+            )
+        if registered and not case.get("promotion"):
+            errors.append(f"{case.get('id')}: promoted, but carries no promotion record")
+    return errors
+
+
+def build_catalog(
+    spec_path: Path = LIVE_SPEC,
+    scenario_path: Path = SCENARIOS_PATH,
+    promotion_path: Path = PROMOTIONS_PATH,
+) -> Dict[str, Any]:
     scenarios = parse_live_spec(spec_path)
+    environments = load_scenario_environments(scenario_path)
+    promotions = load_promotions(promotion_path)
+    promoted = promotions["promoted"]
     counters: Dict[str, int] = {}
     cases: List[Dict[str, Any]] = []
     for scenario in scenarios:
@@ -1723,7 +1820,7 @@ def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
             raise ValueError(f"No stable ID prefix for requirement: {scenario.requirement!r}")
         counters[prefix] = counters.get(prefix, 0) + 1
         case_id = f"{prefix}-{counters[prefix]:02d}"
-        environment, note = classify(scenario.requirement, scenario.title)
+        environment, note = classify(scenario.requirement, scenario.title, environments)
         if environment == "live-only":
             runs_in = ["live"]
             state = "live-only"
@@ -1756,6 +1853,7 @@ def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
 
     extras = PODMAN_FIRST_CASES + data_plane_cases()
     for extra in extras:
+        promotion = promoted.get(extra["id"])
         cases.append({
             "id": extra["id"],
             "requirement": extra["requirement"],
@@ -1763,13 +1861,14 @@ def build_catalog(spec_path: Path = LIVE_SPEC) -> Dict[str, Any]:
             "assertion": extra["assertion"],
             "assertion_sha256": hashlib.sha256(extra["assertion"].encode("utf-8")).hexdigest(),
             "runs_in": ["podman"],
-            "state": "incubating",
+            "state": "podman-stable" if promotion else "incubating",
             "environment": "container",
             "topology": extra["topology"],
             "gate": "pre-push",
             "driver_status": "planned",
             "drivers": {},
             "promotion_target": extra["promotion_target"],
+            **({"promotion": promotion} if promotion else {}),
         })
 
     apply_implementations(cases, driver_registry())
@@ -1853,6 +1952,36 @@ def validate_catalog(catalog: Dict[str, Any], spec_path: Path = LIVE_SPEC) -> Li
         if key not in {(s.requirement, s.title) for s in scenarios}:
             errors.append(f"Catalog entry has no live scenario: {case.get('id')} / {key[1]}")
 
+    # Every live scenario is classified, and the classification is the table's,
+    # not the catalog's own word: a scenario the spec gained and nobody placed is
+    # refused here, and so is an entry whose environment drifted from the row.
+    environments = load_scenario_environments()
+    for scenario in scenarios:
+        key = (scenario.requirement, scenario.title)
+        row = environments.get(key)
+        if row is None:
+            errors.append(
+                f"Live scenario has no environment classification: {key[0]} / {key[1]}"
+            )
+            continue
+        if row.get("environment") not in ENVIRONMENTS:
+            errors.append(
+                f"{key[0]} / {key[1]}: environment {row.get('environment')!r} "
+                f"is not one of {list(ENVIRONMENTS)}"
+            )
+        case = by_live.get(key)
+        if case is not None and case.get("environment") != row.get("environment"):
+            errors.append(
+                f"{case.get('id')}: environment {case.get('environment')!r} "
+                f"is not the classification table's {row.get('environment')!r}"
+            )
+    spec_keys = {(scenario.requirement, scenario.title) for scenario in scenarios}
+    for key in environments:
+        if key not in spec_keys:
+            errors.append(
+                f"Environment classification names no live scenario: {key[0]} / {key[1]}"
+            )
+
     counts = catalog.get("counts", {})
     # 115 was the plan-time split. Four of those sentences turned out to be
     # conjunctions over other cases' verdicts — no single run can own them — so
@@ -1870,13 +1999,35 @@ def validate_catalog(catalog: Dict[str, Any], spec_path: Path = LIVE_SPEC) -> Li
                 f"Parity count drift: {field_name}={counts.get(field_name)} expected {expected_value}"
             )
 
+    # A Podman-first case is incubated here and promoted later, so both names it
+    # carries must be requirements a spec actually states: an owning requirement
+    # nobody declares is a string, and a promotion target nobody owns can never
+    # be reached. The vocabulary is read from the two specs rather than typed
+    # here, so a renamed requirement turns its cases red instead of orphaning
+    # them quietly.
+    vocabulary = {scenario.requirement for scenario in scenarios}
+    vocabulary.update(requirement for requirement, _ in trace_data.parse_spec())
     for case in catalog.get("cases", []):
-        if not case.get("live_scenario") and case.get("runs_in") != ["podman"]:
-            errors.append(f"{case.get('id')}: Podman-first case must run only in Podman")
-        if not case.get("live_scenario") and not case.get("promotion_target"):
-            errors.append(f"{case.get('id')}: Podman-first case requires a promotion target")
+        if case.get("live_scenario"):
+            continue
+        case_id = case.get("id")
+        if case.get("runs_in") != ["podman"]:
+            errors.append(f"{case_id}: Podman-first case must run only in Podman")
+        owner = case.get("requirement")
+        if owner not in vocabulary:
+            errors.append(
+                f"{case_id}: Podman-first case names no owning requirement: {owner!r}"
+            )
+        target = case.get("promotion_target")
+        if not target:
+            errors.append(f"{case_id}: Podman-first case requires a promotion target")
+        elif target not in vocabulary:
+            errors.append(
+                f"{case_id}: promotion target is not a requirement either spec states: {target!r}"
+            )
     errors.extend(_implementation_errors(catalog))
     errors.extend(_run_start_errors(catalog))
+    errors.extend(_promotion_errors(catalog, load_promotions()))
     return errors
 
 
@@ -1934,6 +2085,48 @@ def _implementation_errors(catalog: Dict[str, Any]) -> List[str]:
     return errors
 
 
+def justified_exclusions(topology: str) -> List[Dict[str, Any]]:
+    """The live-only entries a run of ``topology`` does not execute, with their reason.
+
+    A scenario that is simply absent from a run reads as parity in a green
+    artifact, so each run names what it leaves out and why. The reason is the
+    catalog's own ``live_only_reason`` rather than a copy kept here: an entry
+    that cannot state one, or that also claims to run in this suite, is refused
+    instead of being printed as a justified exclusion.
+    """
+    cases = load_catalog().get("cases", [])
+    known = {name for case in cases for name in (case.get("topology") or [])}
+    if topology not in known:
+        raise ValueError(f"unsupported topology: {topology!r}")
+    exclusions: List[Dict[str, Any]] = []
+    problems: List[str] = []
+    for case in cases:
+        if case.get("environment") != "live-only":
+            continue
+        if topology not in (case.get("topology") or []):
+            continue
+        case_id = case.get("id")
+        reason = (case.get("live_only_reason") or "").strip()
+        if not reason:
+            problems.append(f"{case_id}: live-only case must state its reason")
+        if "podman" in (case.get("runs_in") or []):
+            problems.append(
+                f"{case_id}: live-only case is listed as running in the Podman suite"
+            )
+        exclusions.append({
+            "id": case_id,
+            "requirement": case.get("requirement"),
+            "environment": case.get("environment"),
+            "topology": list(case.get("topology") or []),
+            "reason": reason or None,
+        })
+    if problems:
+        raise CatalogError(
+            "the catalog cannot justify what this run leaves out: " + "; ".join(problems)
+        )
+    return exclusions
+
+
 def require_executable(cases: Iterable[Tuple[str, str]]) -> None:
     """Refuse a run whose case list is not what the catalog declares.
 
@@ -1984,6 +2177,7 @@ def coverage_audit(
     catalog: Dict[str, Any],
     behaviors_path: Path = BEHAVIORS_PATH,
     matrix_path: Path = MATRIX_PATH,
+    parity_path: Path = PARITY_PATH,
 ) -> List[str]:
     """Judge the behaviour inventory against the catalog it claims to cover.
 
@@ -2145,6 +2339,7 @@ def coverage_audit(
     for area in BEHAVIOR_AREAS:
         if area not in covered_areas:
             errors.append(f"Area has no behavior: {area}")
+    errors.extend(parity_audit(catalog, parity_path))
     return errors
 
 
@@ -2248,6 +2443,34 @@ def executed_ids_from_results(paths: Iterable[Path]) -> set:
     return executed
 
 
+def executed_assertions_from_results(paths: Iterable[Path]) -> Dict[str, set]:
+    """The assertion digest each executed case declared, grouped by case id.
+
+    A case that ran without recording one is present with an empty declaration,
+    so the guard can refuse the silence instead of reading it as agreement.
+    """
+    declared: Dict[str, set] = {}
+    for path in paths:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        for case in data.get("cases", []):
+            if case.get("status") in ("SKIP", None):
+                continue
+            case_id = case.get("id")
+            declared.setdefault(case_id, set()).add(
+                str(case.get("assertion_sha256") or "")
+            )
+    return declared
+
+
+def assertion_digests(path: Path = CATALOG_PATH) -> Dict[str, str]:
+    """The assertion digest every catalog case carries, for the run that reports it."""
+    return {
+        str(case["id"]): str(case["assertion_sha256"])
+        for case in load_catalog(path).get("cases", [])
+        if case.get("id") and case.get("assertion_sha256")
+    }
+
+
 def divergence_guard(
     catalog_path: Path = CATALOG_PATH,
     spec_path: Path = LIVE_SPEC,
@@ -2285,6 +2508,37 @@ def divergence_guard(
             errors.append(f"Live run executed an unknown case: {case_id}")
         elif case.get("state") == "live-parity" and case_id not in podman_executed:
             errors.append(f"live-parity case was not executed by the Podman suite: {case_id}")
+
+    # An id proves the case ran, not what it ran. A result that names a catalog
+    # case without the digest of the sentence it asserted cannot be compared, so
+    # it is refused rather than read as agreement with the other suite.
+    declared_by_suite = {
+        "Podman": executed_assertions_from_results(podman_results),
+        "Live": executed_assertions_from_results(live_results),
+    }
+    for suite, declared in declared_by_suite.items():
+        for case_id, digests in declared.items():
+            case = by_id.get(case_id)
+            if case is None or not case.get("assertion_sha256"):
+                continue
+            if "" in digests:
+                errors.append(
+                    f"{case_id}: the {suite} result records no assertion text, so the case "
+                    "cannot be compared with the other suite"
+                )
+            if digests - {""} and digests - {""} != {str(case["assertion_sha256"])}:
+                errors.append(
+                    f"{case_id}: the {suite} result asserts text the catalog does not carry"
+                )
+    podman_declared = declared_by_suite["Podman"]
+    live_declared = declared_by_suite["Live"]
+    for case_id in sorted(set(podman_declared) & set(live_declared)):
+        podman_text = podman_declared[case_id] - {""}
+        live_text = live_declared[case_id] - {""}
+        if podman_text and live_text and podman_text != live_text:
+            errors.append(
+                f"{case_id}: the live result and the Podman result assert different text"
+            )
     return errors
 
 
@@ -2316,6 +2570,31 @@ def render_parity(catalog: Dict[str, Any]) -> str:
         lines.append(
             f"| {requirement} | {total} | {counts['container']} | {counts['partial']} | {counts['live-only']} |"
         )
+    lines.extend([
+        "",
+        "## Scenario inventory",
+        "",
+        "One row per live scenario: the catalog case that covers it, the environment",
+        "classification `tests/cases/scenarios.yaml` states, and the gate tier that",
+        "blocks on the case. A scenario missing from this table has no case, and",
+        "`python3 -m tools.podman_e2e.catalog check` refuses that before the table can",
+        "be published.",
+        "",
+        "| Case | Environment | Gate | Live scenario | Requirement |",
+        "|---|---|---|---|---|",
+    ])
+    for case in catalog["cases"]:
+        if not case.get("live_scenario"):
+            continue
+        lines.append(
+            "| {id} | {environment} | {gate} | {scenario} | {requirement} |".format(
+                id=case.get("id"),
+                environment=case.get("environment"),
+                gate=case.get("gate"),
+                scenario=str(case.get("live_scenario") or "").replace("|", "\\|"),
+                requirement=str(case.get("requirement") or "").replace("|", "\\|"),
+            )
+        )
     lines.extend(["", "## Partial splits", ""])
     for case in catalog["cases"]:
         if case.get("environment") == "partial":
@@ -2330,6 +2609,42 @@ def render_parity(catalog: Dict[str, Any]) -> str:
             lines.append(f"- **{case['id']}** — promotion target: {case.get('promotion_target')}")
     lines.append("")
     return "\n".join(lines)
+
+
+def parity_audit(catalog: Dict[str, Any], parity_path: Path = PARITY_PATH) -> List[str]:
+    """The published inventory covers every live scenario and is the catalog's own text.
+
+    A stale render is a claim about a catalog that no longer exists, so it is
+    refused here rather than read as documentation.
+    """
+    errors: List[str] = []
+    seen: Set[str] = set()
+    for case in catalog.get("cases", []):
+        if not case.get("live_scenario"):
+            continue
+        case_id = str(case.get("id") or "")
+        if not case_id:
+            errors.append("Live scenario has no case id in the parity inventory")
+            continue
+        if case_id in seen:
+            errors.append(f"Parity inventory names case {case_id} twice")
+        seen.add(case_id)
+        if case.get("environment") not in ENVIRONMENTS:
+            errors.append(
+                f"{case_id}: parity row states environment {case.get('environment')!r}"
+            )
+        if not case.get("gate"):
+            errors.append(f"{case_id}: parity row states no gate")
+    parity_path = Path(parity_path)
+    if not parity_path.exists():
+        return errors + [f"Parity inventory is missing: {_display(parity_path)}"]
+    expected = render_parity(catalog)
+    if parity_path.read_text(encoding="utf-8") != expected:
+        errors.append(
+            f"{_display(parity_path)} is not what the catalog renders to: run "
+            "`python3 -m tools.podman_e2e.catalog generate` and commit the result"
+        )
+    return errors
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

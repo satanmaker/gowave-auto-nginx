@@ -514,13 +514,16 @@ def case_coverage_audit(product: Any, context: Any) -> Dict[str, Any]:
 # --- GATE-DIVERGENCE ---------------------------------------------------------
 
 
-def _results(path: Path, case_id: str) -> Path:
+def _results(path: Path, case_id: str, assertion_sha256: Optional[str]) -> Path:
     """A result file naming one executed case, in the shape the runner writes."""
+    case: Dict[str, Any] = {"id": case_id, "status": "PASS"}
+    if assertion_sha256 is not None:
+        case["assertion_sha256"] = assertion_sha256
     path.write_text(
         json.dumps(
             {
                 "schema": "gowave-podman-e2e-result/v1",
-                "cases": [{"id": case_id, "status": "PASS"}],
+                "cases": [case],
             }
         ),
         encoding="utf-8",
@@ -546,6 +549,27 @@ def case_divergence_guard(product: Any, context: Any) -> Dict[str, Any]:
         "would have nothing to damage",
     )
     case_id = str(live_parity["id"])
+    assertion_sha256 = str(live_parity.get("assertion_sha256") or "")
+    require(
+        DIVERGENCE_CASE_ID,
+        bool(assertion_sha256),
+        f"the live-parity case {case_id} records no assertion digest, so the text damage below "
+        "would have nothing to compare",
+    )
+    neighbour = next(
+        (
+            case
+            for case in document.get("cases") or []
+            if case.get("id") != case_id and case.get("assertion_sha256")
+        ),
+        None,
+    )
+    require(
+        DIVERGENCE_CASE_ID,
+        neighbour is not None,
+        f"the catalog holds no other case with an assertion digest, so the same-id damage below "
+        f"could not assert a sentence that {case_id} does not carry",
+    )
 
     baseline = catalog_data.divergence_guard()
     require(
@@ -581,8 +605,8 @@ def case_divergence_guard(product: Any, context: Any) -> Dict[str, Any]:
         )
 
         # The same live-parity case executed by the live suite alone.
-        live_only = _results(root / "live-only.json", case_id)
-        both = _results(root / "both.json", case_id)
+        live_only = _results(root / "live-only.json", case_id, assertion_sha256)
+        both = _results(root / "both.json", case_id, assertion_sha256)
         one_suite = catalog_data.divergence_guard(live_results=[live_only])
         one_suite_message = f"live-parity case was not executed by the Podman suite: {case_id}"
         require(
@@ -599,6 +623,39 @@ def case_divergence_guard(product: Any, context: Any) -> Dict[str, Any]:
             control == [],
             f"the same case executed by both suites was still refused ({control[:3]}), so the "
             "one-suite refusal above does not depend on which suites ran",
+        )
+
+        # The same id executed by both suites, asserting two different catalog
+        # sentences: the id proves a case ran, not what it ran.
+        other_text = _results(
+            root / "live-text.json", case_id, str(neighbour["assertion_sha256"])
+        )
+        same_id = _results(root / "podman-text.json", case_id, assertion_sha256)
+        different = catalog_data.divergence_guard(
+            podman_results=[same_id], live_results=[other_text]
+        )
+        different_message = (
+            f"{case_id}: the live result and the Podman result assert different text"
+        )
+        require(
+            DIVERGENCE_CASE_ID,
+            different_message in different,
+            f"the same id asserting two different sentences was judged as {different[:3]}, which "
+            "does not name it: a reworded live clause would ride on the Podman pass",
+        )
+
+        # A result that records the id and not the sentence it asserted.
+        silent = _results(root / "silent.json", case_id, None)
+        undeclared = catalog_data.divergence_guard(podman_results=[silent])
+        undeclared_message = (
+            f"{case_id}: the Podman result records no assertion text, so the case cannot be "
+            "compared with the other suite"
+        )
+        require(
+            DIVERGENCE_CASE_ID,
+            undeclared_message in undeclared,
+            f"a result with no assertion digest was judged as {undeclared[:3]}, which does not name "
+            "it: an artifact could carry the id and prove nothing about the sentence",
         )
 
         # A topology whose positive-case count left the matrix.
@@ -622,8 +679,10 @@ def case_divergence_guard(product: Any, context: Any) -> Dict[str, Any]:
         "baseline_errors": str(len(baseline)),
         "control_errors": str(len(control)),
         "count_divergence": drift_sentence,
-        "damaged_inputs": "counts,one_suite,spec",
+        "damaged_inputs": "assertion_silent,assertion_text,counts,one_suite,spec",
+        "different_text_message": different_message,
         "live_parity_case": case_id,
         "one_suite_message": one_suite_message,
+        "undeclared_text_message": undeclared_message,
         "unlisted_scenario": unlisted_message,
     }
