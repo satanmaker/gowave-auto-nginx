@@ -713,11 +713,13 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
     echo ""
     cmd_user_links default-user
 
-    if [[ "${GOWAVE_PLAN_VARIANT:-}" == "multi-node" ]]; then
-        echo ""
-        echo "Onboarding the planned remote nodes..."
-        wizard_onboard_nodes || return 1
-    fi
+    case "${GOWAVE_PLAN_VARIANT:-}" in
+        multi-node | panel-only)
+            echo ""
+            echo "Onboarding the planned remote nodes..."
+            wizard_onboard_nodes || return 1
+            ;;
+    esac
 }
 
 # Compensate a failed `node add` on both sides and record what each one reached.

@@ -444,7 +444,9 @@ wizard_collect_plan() {
 
     GOWAVE_PLAN_EMAIL=$(wizard_read_email) || return 1
 
-    if [[ "$GOWAVE_PLAN_VARIANT" == "multi-node" ]]; then
+    # A Panel-only host has no local node, so its workers are the whole traffic
+    # plane; only the All-in-One variant ends at the local host.
+    if [[ "$GOWAVE_PLAN_VARIANT" != "all-in-one" ]]; then
         GOWAVE_PLAN_NODE_COUNT=$(wizard_read_node_count) || return 1
         for ((i = 1; i <= GOWAVE_PLAN_NODE_COUNT; i++)); do
             local node_name node_camouflage node_vision=""

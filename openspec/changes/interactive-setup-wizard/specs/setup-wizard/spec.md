@@ -10,9 +10,10 @@ onboarded — while every non-interactive invocation keeps the existing English 
 
 ### Requirement: Language selection precedes every other question
 
-The wizard SHALL ask for the display language, Russian or English, before any other question, apply the choice
-to every message it prints afterwards, and accept only one of the two offered answers. Every other command and
-every non-interactive invocation SHALL remain in English.
+The wizard SHALL ask for the display language, Russian or English, before any other question unless
+`GOWAVE_WIZARD_LANG` already names one of the two, apply the choice to every message it prints afterwards, and
+accept only one of the two offered answers. Every other command and every non-interactive invocation SHALL
+remain in English.
 
 #### Scenario: Russian wizard prints Russian prompts
 
@@ -95,9 +96,9 @@ already uses, and SHALL finish collecting every name before the first mutation.
 
 The wizard SHALL compute the number of certificates a plan requires as `2 + v_panel + 2N + k`, where `N` is the
 number of remote nodes, `v_panel` is one when the Panel host runs a local node with Vision, and `k` is the number
-of remote nodes with Vision. It SHALL state the limit of 50 new certificates per registered domain per 7 days,
-SHALL recommend a separate registered domain per host, and SHALL refuse a plan that shares one registered domain
-while exceeding the ceiling.
+of remote nodes with Vision. It SHALL recommend a separate registered domain per host, SHALL state the
+50-per-registered-domain-per-7-days limit whenever the plan shares one, and SHALL refuse a plan whose shared
+domain exceeds that ceiling.
 
 #### Scenario: A separate registered domain per host is not limited by the arithmetic
 
