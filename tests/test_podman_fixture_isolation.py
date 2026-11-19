@@ -196,11 +196,19 @@ class TestPodmanFixtureIsolation(unittest.TestCase):
         # model so the product's own bootstrap runs without a socket, and that
         # patch target is the dependency's name — which is why the rule reads the
         # two forms that can actually open a connection instead of the word.
+        # The word itself may appear only as an entry of the refusal list a gate
+        # scans a suite command for (`CREDENTIAL_TOKENS`): naming what a command
+        # must not carry is the opposite of carrying it, and every other line
+        # stays refused.
         for path in python_sources(HARNESS_DIR):
             code = executable_source(path)
             self.assertIsNone(PARAMIKO_USE.search(code), f"{path.name} uses the SSH library")
-            self.assertIsNone(re.search(r"[\"']ssh[\"']", code), path.name)
-            self.assertIsNone(re.search(r"[\"']scp[\"']", code), path.name)
+            for match in re.finditer(r"[\"'](?:ssh|scp)[\"']", code):
+                line_start = code.rfind("\n", 0, match.start()) + 1
+                line_end = code.find("\n", match.start())
+                line = code[line_start:line_end if line_end != -1 else len(code)]
+                self.assertIn("CREDENTIAL_TOKENS", line,
+                              f"{path.name}: {match.group(0)} outside the refusal list")
         for use in ("import paramiko\n", "from paramiko import Transport\n",
                     "transport = paramiko.Transport(sock)\n",
                     "paramiko.Ed25519Key.from_private_key_file(one)\n"):

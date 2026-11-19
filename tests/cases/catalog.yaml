@@ -7445,8 +7445,42 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: tls_anchors:case_every_tls_outbound_carries_the_fixture_ca
+      evidence:
+      - anchor_usage
+      - anchored_tags
+      - anchors_embedded
+      - anchors_named_by_path
+      - chain_error_accepted
+      - container_ca_file
+      - fixture_ca_trusts_leaf
+      - input_unchanged
+      - non_chain_failure_refused
+      - reality_untouched
+      - unanchored_tags
+      - unrelated_ca_rejects_leaf
+      - verify_anchors_per_outbound
+      - without_anchor_error
+    multi-node:
+      driver: tls_anchors:case_every_tls_outbound_carries_the_fixture_ca
+      evidence:
+      - anchor_usage
+      - anchored_tags
+      - anchors_embedded
+      - anchors_named_by_path
+      - chain_error_accepted
+      - container_ca_file
+      - fixture_ca_trusts_leaf
+      - input_unchanged
+      - non_chain_failure_refused
+      - reality_untouched
+      - unanchored_tags
+      - unrelated_ca_rejects_leaf
+      - verify_anchors_per_outbound
+      - without_anchor_error
   promotion_target: Data Plane E2E Traffic Through All VPN Endpoints
 - id: MN-BACKUP
   requirement: Backup and Restore Format v1
@@ -7871,8 +7905,36 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: acme_mode:case_arbitrary_directory_is_refused
+      evidence:
+      - accepted_inputs
+      - allowlisted_directories
+      - arbitrary_inside_sentence
+      - arbitrary_outside_sentence
+      - fixture_without_optin_sentence
+      - function_copies
+      - missing_ca_sentence
+      - pinned_endpoint
+      - refused_inputs
+      - unpinned_ca_sentence
+      - worker_copies_identical
+    multi-node:
+      driver: acme_mode:case_arbitrary_directory_is_refused
+      evidence:
+      - accepted_inputs
+      - allowlisted_directories
+      - arbitrary_inside_sentence
+      - arbitrary_outside_sentence
+      - fixture_without_optin_sentence
+      - function_copies
+      - missing_ca_sentence
+      - pinned_endpoint
+      - refused_inputs
+      - unpinned_ca_sentence
+      - worker_copies_identical
   promotion_target: Global Certbot Deploy Hook Ownership
 - id: GATE-BUDGET
   requirement: Pre-push and pull-request acceptance gate
@@ -8045,8 +8107,28 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: gate_tiers:case_coverage_audit
+      evidence:
+      - baseline_errors
+      - behaviors
+      - catalog_cases
+      - damaged_inventories
+      - happy_path_only_message
+      - no_case_message
+      - orphan_message
+    multi-node:
+      driver: gate_tiers:case_coverage_audit
+      evidence:
+      - baseline_errors
+      - behaviors
+      - catalog_cases
+      - damaged_inventories
+      - happy_path_only_message
+      - no_case_message
+      - orphan_message
   promotion_target: Result Status Semantics
 - id: GATE-PREPUSH
   requirement: Pre-push and pull-request acceptance gate
@@ -8062,8 +8144,56 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: gate_tiers:case_pre_push_gate
+      evidence:
+      - blocked_exit
+      - blocked_sentence
+      - credential_tokens
+      - foreign_hook_refusal
+      - foreign_hook_refused
+      - gated_topologies
+      - green_exit
+      - hook_marker_present
+      - hook_mode
+      - host_tokens
+      - manifest_damage_topologies
+      - nonroot_exit
+      - nonroot_sentence
+      - not_run_named
+      - overrun_exit
+      - overrun_sentence
+      - suite_arguments
+      - suite_streams_captured
+      - tier_budget_seconds
+      - topology_budgets
+      - unrun_topology_started
+    multi-node:
+      driver: gate_tiers:case_pre_push_gate
+      evidence:
+      - blocked_exit
+      - blocked_sentence
+      - credential_tokens
+      - foreign_hook_refusal
+      - foreign_hook_refused
+      - gated_topologies
+      - green_exit
+      - hook_marker_present
+      - hook_mode
+      - host_tokens
+      - manifest_damage_topologies
+      - nonroot_exit
+      - nonroot_sentence
+      - not_run_named
+      - overrun_exit
+      - overrun_sentence
+      - suite_arguments
+      - suite_streams_captured
+      - tier_budget_seconds
+      - topology_budgets
+      - unrun_topology_started
   promotion_target: Result Status Semantics
 - id: GATE-DIVERGENCE
   requirement: Live scenario parity
@@ -8079,8 +8209,28 @@ cases:
   - aio
   - multi-node
   gate: pre-push
-  driver_status: planned
-  drivers: {}
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: gate_tiers:case_divergence_guard
+      evidence:
+      - baseline_errors
+      - control_errors
+      - count_divergence
+      - damaged_inputs
+      - live_parity_case
+      - one_suite_message
+      - unlisted_scenario
+    multi-node:
+      driver: gate_tiers:case_divergence_guard
+      evidence:
+      - baseline_errors
+      - control_errors
+      - count_divergence
+      - damaged_inputs
+      - live_parity_case
+      - one_suite_message
+      - unlisted_scenario
   promotion_target: Result Status Semantics
 - id: MN-REVOKE
   requirement: Real client data-plane verification

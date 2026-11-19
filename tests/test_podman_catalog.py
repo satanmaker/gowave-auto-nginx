@@ -195,11 +195,17 @@ class TestImplementationRegistry(unittest.TestCase):
         self.assertIn("AIO-NOT-A-CASE: no catalog entry", str(caught.exception))
 
     def test_a_case_the_catalog_calls_planned_is_refused_before_it_runs(self):
-        planned = next(case["id"] for case in self.catalog["cases"]
-                       if case.get("driver_status") == "planned")
-        with self.assertRaises(catalog.CatalogError) as caught:
-            catalog.require_executable([(planned, "aio")])
-        self.assertIn(f"{planned}: the catalog says 'planned'", str(caught.exception))
+        # Every shipped entry is implemented now, so the state under test is
+        # built instead of borrowed from a gap: a refusal that needed one would
+        # stop being tested the moment the last entry landed.
+        document = self.doctored()
+        planned = next(case for case in document["cases"] if case["id"] == "AIO-04")
+        planned["driver_status"] = "planned"
+        planned["drivers"] = {}
+        with mock.patch.object(catalog, "load_catalog", return_value=document):
+            with self.assertRaises(catalog.CatalogError) as caught:
+                catalog.require_executable([("AIO-04", "aio")])
+        self.assertIn("AIO-04: the catalog says 'planned'", str(caught.exception))
 
     def test_a_topology_the_entry_does_not_drive_is_refused_before_it_runs(self):
         with self.assertRaises(catalog.CatalogError) as caught:

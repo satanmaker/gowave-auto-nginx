@@ -242,6 +242,10 @@ def _budget_problems(contract: Dict[str, Any]) -> List[str]:
     problems.extend(
         _tier_problem(manifest, "pr", wave, "one full wave plus one recovery wave")
     )
+    problems.extend(
+        _tier_problem(manifest, "nightly", sum(budgets.values()),
+                      "every topology at its own budget")
+    )
     return problems
 
 

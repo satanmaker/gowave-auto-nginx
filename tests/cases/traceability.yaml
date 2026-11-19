@@ -190,16 +190,18 @@ requirements:
     scenarios:
       - scenario: Fixture chain is trusted by Xray and Mihomo
         cases:
+          - TLS-VERIFY-ANCHORS
           - AIO-DP-XHTTP-xray
           - AIO-DP-XHTTP-mihomo
           - AIO-DP-WS-xray
           - AIO-DP-WS-mihomo
           - AIO-DP-TROJAN-GRPC-xray
           - AIO-DP-TROJAN-GRPC-mihomo
-        topologies: [aio]
+        topologies: [aio, multi-node]
         tests:
           - tests.test_podman_client_trust.TestPodmanClientTrust
           - tests.test_podman_client_image.TestClientImageContract
+          - tests.test_podman_tls_anchors.TestTlsAnchors
         jobs: [All-in-One Podman Acceptance]
 
   - requirement: Non-bypassable node egress attribution
@@ -233,10 +235,11 @@ requirements:
           - tests.test_podman_aio.TestNegativeCases
         jobs: [All-in-One Podman Acceptance]
       - scenario: Arbitrary ACME URL is rejected inside test mode
-        cases: [AIO-NEG-ACME]
-        topologies: [aio]
+        cases: [AIO-NEG-ACME, ACME-REJECT-ARB]
+        topologies: [aio, multi-node]
         tests:
           - tests.test_podman_aio.TestNegativeCases
+          - tests.test_podman_acme_mode.TestAcmeMode
         jobs: [All-in-One Podman Acceptance]
 
   - requirement: Security and network isolation verification
@@ -334,8 +337,11 @@ requirements:
   - requirement: Pre-push and pull-request acceptance gate
     scenarios:
       - scenario: Pre-push run blocks a regressed change
+        cases: [GATE-PREPUSH]
+        topologies: [aio, multi-node]
         tests:
           - tests.test_podman_pre_push.TestPrePushGate
+          - tests.test_podman_gate_tiers.TestGateTiers
         jobs: ["Lint, Completeness, and Suite Nonroot"]
       - scenario: Budget overrun is not a truncated pass
         cases: [GATE-BUDGET]
@@ -355,9 +361,12 @@ requirements:
   - requirement: Coverage completeness and error paths
     scenarios:
       - scenario: Unmapped behavior or orphan case fails the audit
+        cases: [GATE-COVERAGE]
+        topologies: [aio, multi-node]
         tests:
           - tests.test_podman_behaviors.TestBehaviorInventory
           - tests.test_podman_traceability.TestTraceabilityRules
+          - tests.test_podman_gate_tiers.TestGateTiers
         jobs: ["Lint, Completeness, and Suite Nonroot"]
       - scenario: Shared contract diverges from live acceptance
         tests:
@@ -382,8 +391,11 @@ requirements:
   - requirement: Live scenario parity
     scenarios:
       - scenario: Parity inventory matches both suites
+        cases: [GATE-DIVERGENCE]
+        topologies: [aio, multi-node]
         tests:
           - tests.test_podman_matrix.TestMatrixCatalog
+          - tests.test_podman_gate_tiers.TestGateTiers
         jobs: ["Lint, Completeness, and Suite Nonroot"]
       - scenario: Partial case splits the proof
         cases: [DP-09, DP-10, DP-11]

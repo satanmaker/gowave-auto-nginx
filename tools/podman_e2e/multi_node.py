@@ -30,10 +30,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tools.podman_e2e import (
-    acme_fixture, aio, argv_probe, budget, denial, environment_gate, hook_ownership,
+    acme_fixture, acme_mode, aio, argv_probe, budget, denial, environment_gate, hook_ownership,
     ingress, local_ci,
     lock_cases, matrix as matrix_data, mtls, operator_access, ownership,
-    firewall_image, mutation_baseline,
+    firewall_image, gate_tiers, mutation_baseline,
     negative_journal,
     negative_matrix,
     ownership_targets,
@@ -42,7 +42,8 @@ from tools.podman_e2e import (
     rollback_sides,
     runstate_cases,
     signal_compensation,
-    skip_policy, staging_trust, status, teardown, topology, transaction_recovery, trust_bundle,
+    skip_policy, staging_trust, status, teardown, tls_anchors, topology, transaction_recovery,
+    trust_bundle,
     vision as vision_policy, worker_journal,
 )
 from tools.podman_e2e.podman import wait_until
@@ -8943,6 +8944,29 @@ def cases(
              runstate_cases.case_run_id_root, timeout_seconds=120),
         Case(runstate_cases.RESUME_CASE_ID, "multi-node",
              runstate_cases.case_resume_gate, timeout_seconds=120),
+        # Both read the shipped tree rather than a host: the ACME refusal table
+        # lives in the Master's module and in two payload copies, and the trust
+        # anchor is placed by the helper the pair's data-plane cases call.
+        Case(acme_mode.CASE_ID, "multi-node",
+             lambda context: acme_mode.case_arbitrary_directory_is_refused(product, context),
+             timeout_seconds=300),
+        Case(tls_anchors.CASE_ID, "multi-node",
+             lambda context: tls_anchors.case_every_tls_outbound_carries_the_fixture_ca(
+                 product, context),
+             timeout_seconds=300),
+        # The same three gates the All-in-One suite runs, read from the same
+        # manifests: the pair topology is the one the pre-push gate spends the
+        # larger half of its tier budget on, and both audits judge the catalog
+        # rather than a container, so running them here costs no host.
+        Case(gate_tiers.PREPUSH_CASE_ID, "multi-node",
+             lambda context: gate_tiers.case_pre_push_gate(product, context),
+             timeout_seconds=300),
+        Case(gate_tiers.COVERAGE_CASE_ID, "multi-node",
+             lambda context: gate_tiers.case_coverage_audit(product, context),
+             timeout_seconds=300),
+        Case(gate_tiers.DIVERGENCE_CASE_ID, "multi-node",
+             lambda context: gate_tiers.case_divergence_guard(product, context),
+             timeout_seconds=600),
         # Last: the deadline it proves is this topology's own, and the elapsed
         # clock it reads is the two hosts' install and transfer, not a single
         # container's. It starts no container and reads no cluster, so it cannot
