@@ -641,8 +641,8 @@ class TestLiveContractReconciliation(unittest.TestCase):
         self.assertIn("8, 9 or 10", self.prose)
         self.assertIn("carries 4 (5 with Vision)", self.prose)
         self.assertIn("Multi-Node one carries 8, 9 or 10", self.prose)
-        self.assertEqual(sorted(self.manifest["topologies"]), ["aio", "multi-node"],
-                         "the page names two topologies the manifest does not declare")
+        self.assertEqual(sorted(self.manifest["topologies"]), ["aio", "multi-node", "panel-only"],
+                         "the page names topologies the manifest does not declare")
 
     def test_the_geoip_divergence_names_the_pinned_template(self):
         self.assertIn("internal/database/default_data.go:108", self.prose)

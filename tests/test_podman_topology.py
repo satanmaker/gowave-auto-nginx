@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Suite nonroot: the AIO topology uses only run-scoped, pinned, two-network pieces."""
+import contextlib
+import io
 import ipaddress
 import subprocess
 import sys
@@ -11,7 +13,8 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.podman_e2e import acme_fixture, target_image, topology  # noqa: E402
+from tools import run_podman_e2e  # noqa: E402
+from tools.podman_e2e import acme_fixture, panel_only, target_image, topology  # noqa: E402
 from tools.podman_e2e.runner import RunContext  # noqa: E402
 
 PEM = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
@@ -388,6 +391,116 @@ class TestPodmanTopology(unittest.TestCase):
         with self.assertRaises(target_image.TargetImageError):
             topology.AioTopology(podman, distribution="centos-9")
         self.assertEqual(podman.runs, [])
+
+
+class TestPanelOnlyTopology(unittest.TestCase):
+    """The Panel-only drive: the operator's own flag, no Vision, and no case yet.
+
+    The mode is a product deployment the installer documents, so the harness has
+    to invoke it through the command an operator would type rather than through a
+    second entry point. These tests hold the rendered command, the refusal of the
+    Vision argument the mode cannot honour, and the refusal of an empty run.
+    """
+
+    def make(self, **overrides):
+        podman = FakePodman(**{
+            key: overrides[key]
+            for key in ("install_output", "install_returncode") if key in overrides
+        })
+        self.addCleanup(podman.context.run_cleanup)
+        overrides.setdefault("egress_resolvers", ["192.0.2.53"])
+        instance = topology.PanelOnlyTopology(
+            podman, **{
+                key: value for key, value in overrides.items()
+                if key not in ("install_output", "install_returncode")
+            }
+        )
+        return instance, podman
+
+    def test_the_rendered_command_is_the_documented_panel_only_flag(self):
+        instance, _podman = self.make()
+        self.assertEqual(
+            instance.install_script(),
+            f"bash /repo/gowave-auto.sh install --panel-only '{topology.PANEL_DOMAIN}' "
+            f"'{topology.REALITY_DOMAIN}' '{instance.admin_email}'",
+            "the harness must drive the flag the operator documentation names",
+        )
+        self.assertEqual(instance.install_script().count("'"), 6, "three positionals, no Vision")
+
+    def test_the_mode_refuses_a_vision_domain_it_cannot_terminate(self):
+        with self.assertRaises(ValueError) as caught:
+            self.make(vision_domain="vision.testbed.internal")
+        self.assertIn("no Vision domain", str(caught.exception))
+
+    def test_install_and_reinstall_keep_their_own_evidence(self):
+        instance, podman = self.make(install_output="panel-only ok")
+        outcome = instance.install()
+        self.assertTrue(outcome.ok)
+        evidence = podman.context.artifact_dir / "evidence"
+        self.assertTrue((evidence / "panel-only-install.stdout.log").is_file())
+        self.assertTrue((evidence / "panel-only-install.stderr.log").is_file())
+        self.assertIn("install --panel-only", podman.install_script)
+        instance.reinstall()
+        self.assertTrue((evidence / "panel-only-reinstall.stdout.log").is_file())
+        self.assertIn("install --panel-only", podman.install_script)
+
+    def test_the_host_and_its_record_are_named_by_the_mode(self):
+        instance, _podman = self.make()
+        self.assertEqual(instance.target_role, "panel-only")
+        self.assertNotEqual(instance.target_name, instance.context.resource_name("aio"))
+        record = instance.evidence(instance.install())
+        self.assertEqual(record["installation_mode"], "panel-only")
+        self.assertEqual(record["install_command"], instance.install_script())
+        self.assertEqual(record["vision_domain"], "")
+
+    def test_the_topology_declares_no_case_and_a_run_is_refused(self):
+        with self.assertRaises(panel_only.SuiteNotDeclared) as caught:
+            panel_only.cases(None)
+        self.assertIn("proves nothing", str(caught.exception))
+        self.assertIn("6.2-6.5", str(caught.exception), "the refusal names what is missing")
+
+    def test_the_entrypoint_lists_the_third_topology(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as caught:
+            run_podman_e2e.main(["--help"])
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("panel-only", out.getvalue())
+
+    def _refused(self, arguments):
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            run_podman_e2e.main([*arguments, "--artifact-root", directory])
+        return caught.exception.code, err.getvalue()
+
+    def test_the_vision_flags_are_refused_before_any_container(self):
+        for flag in ("--vision", "--worker-vision"):
+            with self.subTest(flag=flag):
+                code, err = self._refused(["--topology", "panel-only", flag])
+                self.assertEqual(code, 2)
+                self.assertIn("topology has none", err)
+
+    def test_a_panel_only_run_is_refused_while_the_suite_is_undeclared(self):
+        class _Podman:
+            def __init__(self, context):
+                self.context = context
+
+            def remove_stale_runs(self):
+                return []
+
+            def register_cleanup(self):
+                pass
+
+        # The refusal is a named exit rather than a traceback: the suite it would
+        # run is empty, and an empty suite is a green result that proved nothing.
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(run_podman_e2e, "Podman", _Podman), \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+            run_podman_e2e.main(["--topology", "panel-only", "--artifact-root", directory])
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("proves nothing", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
 
 
 if __name__ == "__main__":

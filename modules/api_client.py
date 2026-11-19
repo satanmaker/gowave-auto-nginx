@@ -748,7 +748,9 @@ class GoWaveClient:
             "status": "ACTIVE",
             "trafficLimitStrategy": "NO_RESET",
             "expireAt": expire_at,
-            "activeInternalSquads": [squad_uuid],
+            # A Panel-only install has no squad to attach yet; an empty list is
+            # a real answer, while a null entry is the defect this change fixes.
+            "activeInternalSquads": [squad_uuid] if squad_uuid else [],
         }
         pending = self._record_pending_create("user")
         res = self.request("POST", "/api/users", payload)

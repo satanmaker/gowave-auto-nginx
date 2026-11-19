@@ -14,6 +14,10 @@ source "$SCRIPT_DIR/modules/tempdir.sh"
 source "$SCRIPT_DIR/modules/address.sh"
 source "$SCRIPT_DIR/modules/os.sh"
 source "$SCRIPT_DIR/modules/preflight.sh"
+source "$SCRIPT_DIR/modules/install_args.sh"
+source "$SCRIPT_DIR/modules/i18n.sh"
+source "$SCRIPT_DIR/modules/wizard.sh"
+source "$SCRIPT_DIR/modules/ssh_bootstrap.sh"
 source "$SCRIPT_DIR/modules/security.sh"
 source "$SCRIPT_DIR/modules/panel.sh"
 source "$SCRIPT_DIR/modules/node.sh"
@@ -129,6 +133,8 @@ acquire_lock() {
 }
 
 cmd_status() {
+    local install_mode
+    install_mode=$(installation_mode_from_state)
     echo "================================================================================"
     echo "                      GoWave Auto NGINX Service Status                          "
     echo "================================================================================"
@@ -137,14 +143,18 @@ cmd_status() {
     for svc in gowave.service gowave-node.service nginx.service fail2ban.service; do
         if command -v systemctl >/dev/null 2>&1; then
             local state
-            state=$(systemctl is-active "$svc" 2>/dev/null || echo "not-found")
+            state=$(systemctl is-active "$svc" 2>/dev/null | head -n 1 || true)
+            [[ -n "$state" ]] || state="not-found"
+            if [[ "$svc" == "gowave-node.service" && "$install_mode" == "panel-only" && "$state" != "active" ]]; then
+                state="not present (panel-only installation)"
+            fi
             printf "%-25s : %s\n" "$svc" "$state"
         fi
     done
 
     echo ""
     echo "--- Port Listeners ---"
-    for port in 80 443 3000 3001 3002 7443 8443 9443; do
+    for port in 80 443 3000 3001 3002 7443 8443 8444 9443; do
         local line
         line=$(ss -Hltnp "sport = :$port" 2>/dev/null || true)
         if [[ -n "$line" ]]; then
@@ -172,6 +182,8 @@ cmd_status() {
 }
 
 cmd_health() {
+    local install_mode
+    install_mode=$(installation_mode_from_state)
     echo "Checking GoWave system health..."
     local ok=true
 
@@ -185,7 +197,11 @@ cmd_health() {
 
     if ! ss -Hltn "sport = :3002" 2>/dev/null | grep -q "3002" && \
        ! (: < /dev/tcp/127.0.0.1/3002) 2>/dev/null; then
-        echo "[WARN] GoWave Node listener (127.0.0.1:3002) is not listening." >&2
+        if [[ "$install_mode" == "panel-only" ]]; then
+            echo "[WARN] GoWave Node listener (127.0.0.1:3002) is intentionally absent in Panel-only mode." >&2
+        else
+            echo "[WARN] GoWave Node listener (127.0.0.1:3002) is not listening." >&2
+        fi
     else
         echo "[PASS] GoWave Node listener (127.0.0.1:3002) is active."
     fi
@@ -200,11 +216,26 @@ cmd_health() {
 }
 
 cmd_install() {
+    local install_mode
+    if wizard_should_run "$@"; then
+        wizard_collect_plan || return 1
+        wizard_apply_plan || return 1
+        install_mode="$GOWAVE_INSTALL_MODE"
+    else
+        if [[ $# -eq 0 ]]; then
+            wizard_missing_terminal || return $?
+        fi
+        parse_install_arguments "$@" || return $?
+        install_mode="$GOWAVE_INSTALL_MODE"
+    fi
     acquire_lock
-    local panel_domain="${1:-}"
-    local reality_domain="${2:-}"
-    local admin_email="${3:-}"
-    local vision_domain="${4:-${VISION_DOMAIN:-}}"
+    local panel_domain="${GOWAVE_INSTALL_POSITIONAL[0]:-}"
+    local reality_domain="${GOWAVE_INSTALL_POSITIONAL[1]:-}"
+    local admin_email="${GOWAVE_INSTALL_POSITIONAL[2]:-}"
+    local vision_domain="${GOWAVE_INSTALL_POSITIONAL[3]:-${VISION_DOMAIN:-}}"
+    if [[ "$install_mode" == "panel-only" ]]; then
+        vision_domain=""
+    fi
 
     if [[ -z "$panel_domain" ]]; then
         read -r -p "Enter GoWave Panel domain (e.g. vpn.example.com): " panel_domain
@@ -215,7 +246,7 @@ cmd_install() {
     if [[ -z "$admin_email" ]]; then
         read -r -p "Enter Let's Encrypt admin email: " admin_email
     fi
-    if [[ -z "$vision_domain" ]] && [[ -t 0 ]] && [[ -z "${1:-}" ]]; then
+    if [[ -z "$vision_domain" ]] && [[ -t 0 ]] && [[ ${#GOWAVE_INSTALL_POSITIONAL[@]} -eq 0 ]] && [[ "$install_mode" == "all-in-one" ]]; then
         local enable_vision="n"
         read -r -p "Configure optional VLESS + XTLS Vision? (requires a dedicated 3rd domain/subdomain) [y/N]: " enable_vision
         if [[ "$enable_vision" =~ ^[Yy]$ ]]; then
@@ -273,10 +304,18 @@ PY
     fi
     cover_domain=$(cover_domain_for "$panel_domain" "$cover_server_ip")
 
-    echo "==> Starting GoWave Auto NGINX All-in-One Deployment..."
+    if [[ "$install_mode" == "panel-only" ]]; then
+        echo "==> Starting GoWave Auto NGINX Panel-only Deployment..."
+        echo "Installation Mode: Panel-only (no traffic plane, no local node)"
+    else
+        echo "==> Starting GoWave Auto NGINX All-in-One Deployment..."
+        echo "Installation Mode: All-in-One"
+    fi
     echo "Panel Domain:   $panel_domain"
     echo "Reality Domain: $reality_domain"
-    if [[ -n "$vision_domain" ]]; then
+    if [[ "$install_mode" == "panel-only" ]]; then
+        echo "Traffic Plane:  Disabled (Panel and static decoy only)"
+    elif [[ -n "$vision_domain" ]]; then
         echo "Vision Domain:  $vision_domain (Optional VLESS + XTLS Vision enabled)"
     else
         echo "Vision Domain:  Disabled (default 4-inbound configuration)"
@@ -418,11 +457,11 @@ PY
 
     # Step 5: NGINX Configuration
     ensure_nginx_stream_block
-    generate_stream_config "$panel_domain" "$reality_domain" "/etc/nginx/stream-enabled/gowave-stream.conf" "/proc/net/if_inet6" "$vision_domain" "$cover_domain"
+    generate_stream_config "$panel_domain" "$reality_domain" "/etc/nginx/stream-enabled/gowave-stream.conf" "/proc/net/if_inet6" "$vision_domain" "$cover_domain" "$install_mode"
     generate_production_http_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/gowave-http.conf" "/proc/net/if_inet6" "$vision_domain" "$cover_domain"
     generate_panel_https_vhost "$panel_domain"
     generate_decoy_vhost "$reality_domain" "/etc/nginx/conf.d/gowave-decoy.conf" nginx "$COVER_REALITY_ROOT" "$cover_domain"
-    if [[ -n "$vision_domain" ]]; then
+    if [[ "$install_mode" == "all-in-one" && -n "$vision_domain" ]]; then
         generate_vision_fallback_vhost "$vision_domain"
     fi
     configure_certbot_deploy_hook "$acme_tx_id"
@@ -443,14 +482,16 @@ PY
     verify_panel_startup 127.0.0.1 3000 30
     verify_public_tls_sni "$panel_domain"
 
-    # Step 7: Local Node Installation
-    local secret_key
-    secret_key=$(extract_secret_key "$GOWAVE_DIR")
-    install_local_node "$secret_key" 3002
-    verify_node_mtls_health "$secret_key" 3002
-
-    # Step 8: Safe UFW Activation
-    configure_ufw false "" 3002
+    # Step 7: Local Node Installation (the traffic plane is absent in Panel-only)
+    if [[ "$install_mode" == "all-in-one" ]]; then
+        local secret_key
+        secret_key=$(extract_secret_key "$GOWAVE_DIR")
+        install_local_node "$secret_key" 3002
+        verify_node_mtls_health "$secret_key" 3002
+        configure_ufw false "" 3002
+    else
+        configure_ufw false ""
+    fi
 
     # Step 9: REST API Provisioning
     echo "Executing REST API bootstrapping and MVP profile provisioning..."
@@ -478,7 +519,7 @@ PY
         GOWAVE_REALITY_FINGERPRINT="${GOWAVE_REALITY_FINGERPRINT:-}" \
         python3 - \
         "$SCRIPT_DIR" "$panel_domain" "$reality_domain" "$admin_user" \
-        "$JOURNAL_FILE" "$STATE_FILE" "$CREDENTIALS_FILE" "$vision_domain" 3<<< "$admin_pass" <<'PY'
+        "$JOURNAL_FILE" "$STATE_FILE" "$CREDENTIALS_FILE" "$vision_domain" "$install_mode" 3<<< "$admin_pass" <<'PY'
 import json
 import os
 import sys
@@ -487,6 +528,7 @@ import time
 (script_dir, panel_domain, reality_domain, admin_user,
  journal_path, state_path, credentials_path, *extra) = sys.argv[1:]
 vision_domain = extra[0] if extra and extra[0] else None
+mode = extra[1] if len(extra) > 1 and extra[1] else "all-in-one"
 admin_password = os.fdopen(3, "r", encoding="utf-8").read().rstrip("\n")
 
 sys.path.insert(0, script_dir)
@@ -529,6 +571,44 @@ def stored_credentials(path):
 
 
 PROFILE_NAME = "GoWave MVP Unified Profile - local-node"
+
+existing_cc = "bbr"
+if os.path.exists(state_path):
+    try:
+        with open(state_path, encoding="utf-8") as state_file:
+            existing_cc = json.load(state_file).get("congestionControl", "bbr")
+    except Exception:
+        pass
+
+if mode == "panel-only":
+    # Nothing exists that an inbound could reference, so the install stops at
+    # the credentials the operator needs to reach the Panel. The first node add
+    # creates the profile, the inbounds, the squad, and the host records.
+    short_uuid = client.provision_user("default-user", None)
+    token_info = client.ensure_api_token(
+        existing_token=stored_credentials(credentials_path).get("SCOPED_API_TOKEN", "")
+    )
+    journal["entities"] = client.transaction_entities
+    write_journal_atomically(journal_path, journal)
+
+    save_credentials(admin_user, admin_password, f"https://{panel_domain}",
+                     token_info["token"], credentials_path)
+
+    state = {
+        "schemaVersion": 2,
+        "installationMode": "panel-only",
+        "panelDomain": panel_domain,
+        "realityDomain": reality_domain,
+        "congestionControl": existing_cc,
+        "defaultUserShortUuid": short_uuid,
+        "nodes": [],
+    }
+    atomic_write_state(state, state_path)
+
+    journal["state"] = "PROVISION_COMMITTED"
+    journal["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    write_journal_atomically(journal_path, journal)
+    sys.exit(0)
 
 # A repeated install reuses the REALITY material and the API token the installed
 # Panel already publishes: new keys would invalidate every subscription already
@@ -578,14 +658,6 @@ write_journal_atomically(journal_path, journal)
 
 save_credentials(admin_user, admin_password, f"https://{panel_domain}",
                  token_info["token"], credentials_path)
-
-existing_cc = "bbr"
-if os.path.exists(state_path):
-    try:
-        with open(state_path, encoding="utf-8") as state_file:
-            existing_cc = json.load(state_file).get("congestionControl", "bbr")
-    except Exception:
-        pass
 
 state = {
     "schemaVersion": 2,
@@ -640,6 +712,12 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
     echo "Saved Credentials:   $CREDENTIALS_FILE (mode 0600)"
     echo ""
     cmd_user_links default-user
+
+    if [[ "${GOWAVE_PLAN_VARIANT:-}" == "multi-node" ]]; then
+        echo ""
+        echo "Onboarding the planned remote nodes..."
+        wizard_onboard_nodes || return 1
+    fi
 }
 
 # Compensate a failed `node add` on both sides and record what each one reached.
@@ -907,8 +985,14 @@ node_uuid = client.associate_node(name, address, int(port), profile_uuid, inboun
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
 
-squad_uuid = state_data.get("squadUuid")
-client.provision_internal_squad("Default MVP Squad", inbound_uuids)
+squad_uuid = client.provision_internal_squad("Default MVP Squad", inbound_uuids)
+journal["entities"] = client.transaction_entities
+write_journal_atomically(journal_path, journal)
+if not squad_uuid:
+    raise SystemExit(
+        "The Panel returned no internal squad identifier; refusing to submit a host record with a null squad."
+    )
+state_data["squadUuid"] = squad_uuid
 client.provision_hosts(
     profile_uuid, inbounds, node_uuid, squad_uuid,
     worker_domain, reality_domain, name,
@@ -1003,9 +1087,13 @@ write_journal_atomically('$JOURNAL_FILE', jdata)
                 python3 -c "
 import json
 data = json.load(open('$STATE_FILE'))
-print(f'Total configured nodes: {len(data.get(\"nodes\", []))}')
-for n in data.get('nodes', []):
-    print(f'  - {n.get(\"name\")}: {n.get(\"address\")}:{n.get(\"port\")} (UUID: {n.get(\"uuid\")})')
+nodes = data.get('nodes', [])
+if not nodes:
+    print('No nodes are registered.')
+else:
+    print(f'Total configured nodes: {len(nodes)}')
+    for n in nodes:
+        print(f'  - {n.get(\"name\")}: {n.get(\"address\")}:{n.get(\"port\")} (UUID: {n.get(\"uuid\")})')
 "
             else
                 echo "No state file found."
@@ -1193,6 +1281,8 @@ PY
 
 cmd_domain_change() {
     acquire_lock
+    local install_mode
+    install_mode=$(installation_mode_from_state)
     local new_panel_domain="${1:-}"
     local new_reality_domain="${2:-}"
     if [[ -z "$new_panel_domain" || -z "$new_reality_domain" ]]; then
@@ -1299,7 +1389,7 @@ PY
     fi
 
     rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
-    generate_stream_config "$new_panel_domain" "$new_reality_domain" "/etc/nginx/stream-enabled/gowave-stream.conf" "/proc/net/if_inet6" "" "$cover_domain"
+    generate_stream_config "$new_panel_domain" "$new_reality_domain" "/etc/nginx/stream-enabled/gowave-stream.conf" "/proc/net/if_inet6" "" "$cover_domain" "$install_mode"
     generate_production_http_vhost "$new_panel_domain" "$new_reality_domain" "/etc/nginx/conf.d/gowave-http.conf" "/proc/net/if_inet6" "" "$cover_domain"
     generate_panel_https_vhost "$new_panel_domain"
     generate_decoy_vhost "$new_reality_domain" "/etc/nginx/conf.d/gowave-decoy.conf" nginx "$COVER_REALITY_ROOT" "$cover_domain"

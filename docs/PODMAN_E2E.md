@@ -67,24 +67,29 @@ sudo python3 -m tools.run_podman_e2e --topology aio --require-group recovery
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--topology` | `aio` | `aio` (one host) or `multi-node` (Master and Worker). |
+| `--topology` | `aio` | `aio` (one host), `multi-node` (Master and Worker) or `panel-only` (Panel and the static decoy, no traffic plane). |
 | `--distribution` | `ubuntu-24.04` | Target alias from `tests/cases/images.lock.yaml`: `ubuntu-24.04`, `ubuntu-26.04`, `debian-12`, `debian-13`. |
-| `--vision` | off | Install the optional VLESS Vision inbound. The positive-case count becomes 10 instead of 8 (AIO) or 18/20 instead of 16 (Multi-Node). |
-| `--worker-vision` | off | Configure the same optional inbound on the Multi-Node Worker. Refused on `aio`, which has no Worker. |
+| `--vision` | off | Install the optional VLESS Vision inbound. The positive-case count becomes 10 instead of 8 (AIO) or 18/20 instead of 16 (Multi-Node). Refused on `panel-only`, which has no traffic plane to terminate it. |
+| `--worker-vision` | off | Configure the same optional inbound on the Multi-Node Worker. Refused on `aio`, which has no Worker, and on `panel-only`, which has no node. |
 | `--artifact-root` | `artifacts/podman-e2e` | Directory the run's own run directory is created under. |
-| `--budget-seconds` | the matrix's `runtime_budget_seconds`: `2700` (AIO), `4500` (Multi-Node) | Wall-clock deadline for the whole suite. It may be lowered, never raised. On exhaustion the cases that did not run are reported `INCOMPLETE`, never dropped and never made green. |
+| `--budget-seconds` | the matrix's `runtime_budget_seconds`: `2700` (AIO), `4500` (Multi-Node), `1800` (Panel-only) | Wall-clock deadline for the whole suite. It may be lowered, never raised. On exhaustion the cases that did not run are reported `INCOMPLETE`, never dropped and never made green. |
 | `--require-group` | — | Fail the run unless every case id of a declared group was present and passed. Today the only group is `recovery`. |
 
 Exit status is `0` only when `result.json` says `overall: PASS`; every other
 state exits `1`. Argument errors, including `--worker-vision` on the AIO
-topology, an unknown group and a `--budget-seconds` above the declared budget,
-exit `2` before any container is created.
+topology, `--vision` on Panel-only, an unknown group and a `--budget-seconds`
+above the declared budget, exit `2` before any container is created.
+
+`panel-only` drives the operator's own command — `gowave-auto.sh install
+--panel-only <panel> <camouflage> <email>`, with no fourth positional argument
+— and the suite declares no case for it yet, so `--topology panel-only` exits
+`2` naming that gap instead of reporting an empty suite green.
 
 The deadline is the `runtime_budget_seconds` the manifest declares for the
-topology — 2700 s and 4500 s — and it is a ceiling rather than a default: a run
-that asks for more wall clock than the matrix promises has left the envelope the
-`pre-push` and `pr` tiers are defined by, so the entrypoint refuses it
-(`--budget-seconds` may only tighten). Every run also executes `GATE-BUDGET`
+topology — 2700 s, 4500 s and 1800 s — and it is a ceiling rather than a
+default: a run that asks for more wall clock than the matrix promises has left
+the envelope the `pre-push` and `pr` tiers are defined by, so the entrypoint
+refuses it (`--budget-seconds` may only tighten). Every run also executes `GATE-BUDGET`
 first, which asserts that deadline is inside the declared one and then produces
 an exhausted run of the real runner with no container at all, reading its report
 back to prove the unexecuted case is named and `overall` is `INCOMPLETE` rather
