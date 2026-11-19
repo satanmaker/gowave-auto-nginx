@@ -30,7 +30,7 @@ TESTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(TESTS_DIR))
 
-from tools.podman_e2e import aio, budget, ingress, lock_cases, matrix, mtls, multi_node, panel_surface, runstate_cases, topology  # noqa: E402
+from tools.podman_e2e import acme_mode, aio, budget, gate_tiers, ingress, lock_cases, matrix, mtls, multi_node, panel_surface, runstate_cases, tls_anchors, topology  # noqa: E402
 from tools.podman_e2e.runner import Case, CaseBlocked  # noqa: E402
 from test_podman_aio import (  # noqa: E402
     BROKEN_TAIL, VISION_OTHER_SHA, VISION_ROUTED_SHA, nginx_probe, vision_answer,
@@ -1779,14 +1779,20 @@ class TestMultiNodeSuite(unittest.TestCase):
     def test_the_budget_case_is_declared_last(self):
         # It reads this topology's deadline and the clock two hosts spent, so no
         # case may close the report behind it. It starts no container and reads no
-        # cluster, which is why the three cases after VIS-06 — which leaves the
-        # cluster incomplete on purpose — are the two that read the run's own
-        # record and this one.
+        # cluster, which is why the cases after VIS-06 — which leaves the cluster
+        # incomplete on purpose — are the two that read the run's own record, the
+        # three gates, and this one.
         suite = multi_node.cases(self.podman)
-        self.assertEqual([case.id for case in suite][-4:],
+        self.assertEqual([case.id for case in suite][-9:],
                          [multi_node.VIS_COMPENSATION_CASE_ID,
                           runstate_cases.RUN_ID_CASE_ID,
-                          runstate_cases.RESUME_CASE_ID, budget.BUDGET_CASE_ID])
+                          runstate_cases.RESUME_CASE_ID,
+                          acme_mode.CASE_ID,
+                          tls_anchors.CASE_ID,
+                          gate_tiers.PREPUSH_CASE_ID,
+                          gate_tiers.COVERAGE_CASE_ID,
+                          gate_tiers.DIVERGENCE_CASE_ID,
+                          budget.BUDGET_CASE_ID])
         self.assertEqual(suite[-1].topology, "multi-node")
 
     def test_every_node_contributes_its_own_matrix_tuples(self):
@@ -1882,9 +1888,10 @@ class TestMultiNodeSuite(unittest.TestCase):
         # Master, so it closes the install-facing run instead of reading what they
         # left behind. 9.2's VIS-06 follows it because it needs that Worker whole
         # before it provisions a second node onto it and observes the compensation
-        # that tears it down. The three cases after them start no container: the
-        # run's own record is read from the state it wrote, and GATE-BUDGET reads
-        # the clock of the whole run.
+        # that tears it down. The cases after them start no container: the run's
+        # own record is read from the state it wrote, the three gates read the
+        # tree and the run's artifacts, and GATE-BUDGET reads the clock of the
+        # whole run.
         ids = [case.id for case in multi_node.cases(self.podman)]
         self.assertSequence(
             ids,
@@ -1893,9 +1900,11 @@ class TestMultiNodeSuite(unittest.TestCase):
              multi_node.VIS_COMPENSATION_CASE_ID],
         )
         self.assertEqual(
-            ids[-3:],
+            ids[-8:],
             [runstate_cases.RUN_ID_CASE_ID, runstate_cases.RESUME_CASE_ID,
-             budget.BUDGET_CASE_ID],
+             acme_mode.CASE_ID, tls_anchors.CASE_ID,
+             gate_tiers.PREPUSH_CASE_ID, gate_tiers.COVERAGE_CASE_ID,
+             gate_tiers.DIVERGENCE_CASE_ID, budget.BUDGET_CASE_ID],
         )
 
     def test_the_incomplete_compensation_case_follows_the_worker_reprovision(self):

@@ -23,6 +23,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 
 from . import (
     acme_fixture,
+    acme_mode,
     budget,
     client_image,
     client_trust,
@@ -34,6 +35,7 @@ from . import (
     operator_access,
     ownership,
     firewall_image,
+    gate_tiers,
     mutation_baseline,
     negative_journal,
     negative_matrix,
@@ -49,6 +51,7 @@ from . import (
     staging_trust,
     status,
     teardown,
+    tls_anchors,
     topology,
     transaction_recovery,
     traffic_probe,
@@ -8740,6 +8743,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case("SUB-UA-BLANK", "aio", lambda context: case_user_agent_blank(product), timeout_seconds=300),
         Case("SUB-B64", "aio", lambda context: case_share_links(product), timeout_seconds=300),
         Case("SUB-JSON-SHAPES", "aio", lambda context: case_json_shapes(product), timeout_seconds=300),
+        # The anchor every TLS outbound needs, read from the helper the data-plane
+        # cases call: the config is minted here and the CA is minted here, so the
+        # case decides what the outbound carries and what that anchor trusts
+        # without starting an engine. The traffic cases decide the other half.
+        Case(tls_anchors.CASE_ID, "aio",
+             lambda context: tls_anchors.case_every_tls_outbound_carries_the_fixture_ca(
+                 product, context),
+             timeout_seconds=300),
     ]
     for case_id, inbound, client in data_plane:
         suite.append(Case(
@@ -8781,6 +8792,13 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
              timeout_seconds=TRAFFIC_TIMEOUT_SECONDS),
         Case("AIO-NEG-PORT", "aio", lambda context: case_foreign_listener(product), timeout_seconds=300),
         Case("AIO-NEG-ACME", "aio", lambda context: case_acme_fail_closed(product), timeout_seconds=300),
+        # The same refusal table, read from the three copies of the function that
+        # makes it: the install case proves the installer stops, this one proves
+        # the Master's copy and the Worker's two copies stop for the same inputs
+        # and accept the same allowlist.
+        Case(acme_mode.CASE_ID, "aio",
+             lambda context: acme_mode.case_arbitrary_directory_is_refused(product, context),
+             timeout_seconds=300),
         Case("AIO-NEG-PIN", "aio", lambda context: case_installer_pin(product), timeout_seconds=300),
         Case("AIO-NEG-DEP", "aio", lambda context: case_public_dependency(product),
              timeout_seconds=RECOVERY_TIMEOUT_SECONDS + 300),
@@ -9038,6 +9056,21 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case(negative_matrix.TEN_CASE_ID, "aio",
              lambda context: negative_matrix.case_ten_rows_are_witnessed(product, context),
              timeout_seconds=120),
+        # The three gates a change must pass, driven from inside the run that
+        # claims them: the pre-push entrypoint reads the manifest for what to
+        # run, and the coverage and divergence audits read the catalog and the
+        # inventory they ship with. Each one is also handed a damaged copy, so a
+        # green verdict here says the refusal exists rather than that nothing
+        # was damaged.
+        Case(gate_tiers.PREPUSH_CASE_ID, "aio",
+             lambda context: gate_tiers.case_pre_push_gate(product, context),
+             timeout_seconds=300),
+        Case(gate_tiers.COVERAGE_CASE_ID, "aio",
+             lambda context: gate_tiers.case_coverage_audit(product, context),
+             timeout_seconds=300),
+        Case(gate_tiers.DIVERGENCE_CASE_ID, "aio",
+             lambda context: gate_tiers.case_divergence_guard(product, context),
+             timeout_seconds=600),
         # Last, because the deadline it proves is the one the whole run spent: the
         # case reads the elapsed wall clock and the enforced budget, then produces
         # an exhausted run of the real runner and reads its report. A suite that

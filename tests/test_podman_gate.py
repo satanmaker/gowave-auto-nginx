@@ -202,6 +202,22 @@ class TestPodmanGateContract(unittest.TestCase):
             problems,
         )
 
+    def test_a_topology_budget_that_breaks_the_nightly_total_is_refused(self):
+        # The nightly tier is the one that runs every topology at its own
+        # budget, so a topology raised without raising the total would make the
+        # third tier a bound the manifest cannot keep.
+        problems = self.budget_problems(
+            lambda manifest: manifest["topologies"]["multi-node"].__setitem__(
+                "runtime_budget_seconds", 12000
+            )
+        )
+        self.assertTrue(
+            any("every topology at its own budget declares 14700s" in problem
+                and "nightly_total_seconds = 14400s" in problem
+                for problem in problems),
+            problems,
+        )
+
     def test_a_manifest_without_a_declared_budget_is_refused(self):
         problems = self.budget_problems(
             lambda manifest: manifest["topologies"]["aio"].pop("runtime_budget_seconds")
