@@ -555,6 +555,16 @@ class TestJustifiedExclusions(unittest.TestCase):
             self.exclusions("aio-and-a-half")
         self.assertIn("unsupported topology: 'aio-and-a-half'", str(caught.exception))
 
+    def test_a_topology_the_matrix_declares_but_no_case_owns_leaves_nothing_out(self):
+        # Panel-only has no case in the catalog yet, and the catalog is not what
+        # decides whether a topology exists: the matrix is. Reading the case list
+        # alone turned an empty suite into a usage error naming a real mode.
+        self.assertNotIn(
+            "panel-only", {name for case in self.document["cases"]
+                           for name in (case.get("topology") or [])},
+        )
+        self.assertEqual(self.exclusions("panel-only"), [])
+
     def stub_run(self, argv, executed):
         """Drive `main` with a Podman and a Runner that touch nothing."""
         from tools import run_podman_e2e
