@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The disposable-environment gate, decided on a host rather than on a literal.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Disposable
+``openspec/specs/podman-e2e/spec.md`` §Disposable
 Environment Gate says a clean target passes the baseline gate with its manifest
 recorded, and that a contaminated one is refused before anything is modified,
 with the rejection reason carried into ``result.json``. Both sentences are

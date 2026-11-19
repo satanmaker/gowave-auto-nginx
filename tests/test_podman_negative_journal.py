@@ -2,7 +2,7 @@
 """Suite nonroot: a Worker whose transport never answered is not registered.
 
 ``NEG-03`` is §Negative Scenario and Fault Injection Tests in
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md``: when the SSH
+``openspec/specs/podman-e2e/spec.md``: when the SSH
 connection to a Worker is interrupted mid-installation, the recovery journal on
 the Master is not ``COMMITTED``, the recorded rollback removes the partial Panel
 entities and the Worker entry from ``state.json``, and the host mutation lock is

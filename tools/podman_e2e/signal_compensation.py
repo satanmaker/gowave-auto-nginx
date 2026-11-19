@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A Worker install interrupted by a signal compensates once and says so.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Signal-Safe and
+``openspec/specs/podman-e2e/spec.md`` §Signal-Safe and
 Verifiable Transaction Compensation: a remote Worker deployment that has mutated
 at least one resource and has not committed, on HUP, INT or TERM, stops starting
 new mutations, persists interruption state, executes compensation exactly once,

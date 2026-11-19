@@ -21,6 +21,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from tools import run_podman_e2e  # noqa: E402
 from tools.podman_e2e import diagnostics, target_image  # noqa: E402
+from tools.podman_e2e import trace as trace_data  # noqa: E402
 
 DOC = REPO_ROOT / "docs" / "PODMAN_E2E.md"
 ENTRYPOINT = "tools.run_podman_e2e"
@@ -1737,7 +1738,7 @@ class TestReusableFixtureInventory(unittest.TestCase):
 BOUNDARY_HEADING = "## Where Podman stops, where QEMU starts, and what only a VPS can answer"
 PARITY = REPO_ROOT / "tests" / "cases" / "PARITY.md"
 SYSTEMD_SUITE = REPO_ROOT / "tests" / "test_systemd_runner.py"
-DESIGN = REPO_ROOT / "openspec" / "changes" / "podman-full-e2e" / "design.md"
+DESIGN = trace_data.change_root() / "design.md"
 LIVE_SPLIT = re.compile(r"Live scenarios: (\d+) — container (\d+), partial (\d+), live-only (\d+)\.")
 
 

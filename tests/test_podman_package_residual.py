@@ -2,7 +2,7 @@
 """Suite nonroot: a preserved host carries the packages the run installed.
 
 ``HOOK-04`` is §Global Certbot Deploy Hook Ownership in
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md``: when the
+``openspec/specs/podman-e2e/spec.md``: when the
 installation transaction has installed or upgraded OS packages and their
 post-install scripts have created service defaults, and compensation or teardown
 completes under ``TEST_TEARDOWN_POLICY=PRESERVE``, the report records the

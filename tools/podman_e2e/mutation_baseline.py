@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compensation restores every transaction-owned resource, not a blanket subset.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Complete
+``openspec/specs/podman-e2e/spec.md`` §Complete
 Mutation-Target Baseline and Resource Ownership: after a later deployment step
 fails, every path the transaction created is removed only while it is still what
 the install wrote, every path that was here before is put back with its recorded

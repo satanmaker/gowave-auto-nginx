@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A preserved host carries the packages the run installed, and says so.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Global Certbot
+``openspec/specs/podman-e2e/spec.md`` §Global Certbot
 Deploy Hook Ownership: when the installation transaction has installed or
 upgraded OS packages and their post-install scripts have created service
 defaults, and compensation or teardown then completes under

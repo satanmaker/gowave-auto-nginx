@@ -2,7 +2,7 @@
 """Suite nonroot: an interrupted Worker install is reconciled before the next one.
 
 ``HOOK-03`` is §Global Certbot Deploy Hook Ownership in
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md``: a deployment
+``openspec/specs/podman-e2e/spec.md``: a deployment
 terminated by SIGKILL, a kernel panic or power loss after it wrote its
 transaction journal is discovered by the next authenticated entrypoint, which
 reconciles it before accepting a new mutation — and refuses the new operation,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """An install owns only what it created: the sysctl file each role writes.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Complete
+``openspec/specs/podman-e2e/spec.md`` §Complete
 Mutation-Target Baseline and Resource Ownership says a host configuration file
 the install did not write is never truncated and then treated as
 transaction-created. Two writers can truncate such a file: the panel's

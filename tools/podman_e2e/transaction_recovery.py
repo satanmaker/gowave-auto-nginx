@@ -1,6 +1,6 @@
 """An interrupted mutation leaves a validated journal and is recovered first.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Transactional
+``openspec/specs/podman-e2e/spec.md`` §Transactional
 Updates says an operator killed mid-switch leaves a validated journal naming the
 snapshot it took, that the boot-time recovery runs before the next mutation, and
 that a recovery which cannot roll back refuses instead of reporting success.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """What a run that did not test the Data Plane is allowed to report.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Data Plane E2E
+``openspec/specs/podman-e2e/spec.md`` §Data Plane E2E
 Traffic Through All VPN Endpoints says that with ``TEST_TRAFFIC_VERIFICATION``
 off — or with Mihomo runtime testing disabled — the remaining phases still run,
 the skipped cases are recorded as ``SKIP``, and the overall status is

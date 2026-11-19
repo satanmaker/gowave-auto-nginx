@@ -58,12 +58,34 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-SPEC_PATH = (
-    REPO_ROOT / "openspec" / "changes" / "podman-full-e2e" / "specs"
-    / "podman-e2e" / "spec.md"
-)
+CHANGE_NAME = "podman-full-e2e"
+
+
+def change_root(repo_root: Path = REPO_ROOT) -> Path:
+    """The change's own directory, live or archived.
+
+    Archiving moves `openspec/changes/<name>` under `archive/<date>-<name>`, and
+    the ledger this module reads moves with it, so the directory is resolved
+    rather than pinned to the pre-archive location.
+    """
+    live = repo_root / "openspec" / "changes" / CHANGE_NAME
+    if live.is_dir():
+        return live
+    archived = sorted(
+        (repo_root / "openspec" / "changes" / "archive").glob(f"*-{CHANGE_NAME}")
+    )
+    if len(archived) != 1:
+        raise FileNotFoundError(
+            f"expected one archived {CHANGE_NAME} change, found {len(archived)}"
+        )
+    return archived[0]
+
+
+# The capability's spec is the permanent home of the requirements once the
+# change is archived; the delta is a copy of the same text while it is live.
+SPEC_PATH = REPO_ROOT / "openspec" / "specs" / "podman-e2e" / "spec.md"
 TABLE_PATH = REPO_ROOT / "tests" / "cases" / "traceability.yaml"
-TASKS_PATH = REPO_ROOT / "openspec" / "changes" / "podman-full-e2e" / "tasks.md"
+TASKS_PATH = change_root() / "tasks.md"
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 TESTS_DIR = REPO_ROOT / "tests"
 REPORT_PATH = REPO_ROOT / "docs" / "PODMAN_E2E_TRACEABILITY.md"
@@ -738,7 +760,7 @@ def render(table: Dict[str, Any]) -> str:
         "<!-- Edited by hand, it drifts: the audit refuses a report that is not this text. -->",
         "",
         "One row per scenario of",
-        "`openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`.",
+        "`openspec/specs/podman-e2e/spec.md`.",
         "`matrix` is the `tests/cases/matrix.yaml` row each case id decodes to —",
         "`inbound/client`, or `node/inbound/client` on Multi-Node, where both",
         "nodes run the same pair — so the protocol and the client a scenario",

@@ -1,6 +1,6 @@
 """The managed deploy hook is removed only while the journal owns it.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Host Ownership
+``openspec/specs/podman-e2e/spec.md`` §Host Ownership
 Inventory says a transaction-created Certbot deploy hook is cleaned up only while
 the journal proves the transaction created it, that a hook the installation did
 not write blocks the install before mutation, and that ``PRESERVE`` reports what

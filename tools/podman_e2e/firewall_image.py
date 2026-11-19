@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Existing firewall policy is preserved, not partially deleted.
 
-``openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`` §Complete
+``openspec/specs/podman-e2e/spec.md`` §Complete
 Mutation-Target Baseline and Resource Ownership: when UFW is active, or holds
 rules and default policies the operator set, an injected failure must leave
 them as they were — every original rule, every default policy and the enabled

@@ -1,7 +1,7 @@
 # Requirement -> scenario -> case/test -> CI job, for the delta spec.
 #
 # One row per scenario of
-# `openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md`. `cases` names ids
+# `openspec/specs/podman-e2e/spec.md`. `cases` names ids
 # the suites actually declare (`AIO-DP-*` and `MN-DP-*` expand against the
 # matrix); `tests` names `tests.<module>.<Class>[.<method>]` ids that exist;
 # `jobs` names jobs a workflow declares. A row with `gap` names the ledger task
@@ -16,7 +16,7 @@
 # naming is a failure, not a shorter report.
 schema: gowave-podman-traceability/v1
 version: 1
-spec: openspec/changes/podman-full-e2e/specs/podman-e2e/spec.md
+spec: openspec/specs/podman-e2e/spec.md
 requirements:
   - requirement: Independent All-in-One acceptance topology
     scenarios:
