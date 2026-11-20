@@ -68,6 +68,47 @@ class TestFingerprintConfirmation(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "ACCEPTED")
 
 
+class TestHostKeyScan(unittest.TestCase):
+    """OpenSSH 9.x answers ssh-keyscan with a banner comment above the key line."""
+
+    BANNER = "# 127.0.0.1:2222 SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.20"
+
+    def _scan(self, lines, tail=""):
+        with tempfile.TemporaryDirectory() as directory:
+            keyscan = Path(directory) / "ssh-keyscan"
+            body = "".join(f"printf '%s\\n' {shlex.quote(line)}\n" for line in lines)
+            keyscan.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+            keyscan.chmod(0o755)
+            return bash(
+                SOURCE + f"ssh_bootstrap_scan 127.0.0.1 2222{tail}\n",
+                env={"PATH": f"{directory}:{os.environ['PATH']}"},
+            )
+
+    def test_the_banner_comment_is_not_mistaken_for_the_key(self):
+        key_line = "[127.0.0.1]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITESTKEY"
+        result = self._scan([self.BANNER, key_line])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, key_line)
+
+    def test_a_comment_only_answer_is_refused(self):
+        result = self._scan([self.BANNER])
+        self.assertNotEqual(result.returncode, 0, "a banner is not a host key")
+        self.assertEqual(result.stdout, "")
+
+    def test_the_scanned_line_yields_a_fingerprint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key = Path(directory) / "id_ed25519"
+            subprocess.run(
+                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "verify", "-f", str(key)],
+                check=True,
+                timeout=60,
+            )
+            pubkey = Path(str(key) + ".pub").read_text(encoding="utf-8").strip()
+        result = self._scan([self.BANNER, f"[127.0.0.1]:2222 {pubkey}"], tail=" | ssh_bootstrap_fingerprint")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout.strip(), r"^SHA256:[A-Za-z0-9+/=]+$")
+
+
 class TestBootstrapPayloads(unittest.TestCase):
     def test_the_timer_is_installed_enabled_and_bounded_to_two_hours(self):
         result = bash(

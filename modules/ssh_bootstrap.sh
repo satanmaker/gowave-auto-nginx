@@ -127,7 +127,9 @@ ssh_bootstrap_scan() {
     if ! output=$(ssh-keyscan -T 10 -p "$port" -t ed25519 "$host" 2>/dev/null); then
         return 1
     fi
-    output="${output%%$'\n'*}"
+    # OpenSSH 9.x leads with a banner comment ("# host:port SSH-2.0-..."); only
+    # the key line carries a key, and a fingerprint of the comment is empty.
+    output=$(printf '%s\n' "$output" | awk '!/^[[:space:]]*#/ && NF > 0 { print; exit }')
     [[ -n "$output" ]] || return 1
     printf '%s' "$output"
 }
@@ -314,7 +316,11 @@ ssh_bootstrap_onboard_one() {
         return 1
     fi
     expected=$(printf '%s\n' "$scanned" | ssh_bootstrap_fingerprint)
-    if [[ -z "$expected" ]] || ! ssh_bootstrap_confirm_fingerprint "$host" "$expected"; then
+    if [[ -z "$expected" ]]; then
+        printf '%s\n' "$(tf wizard.ssh.scan_failed "$host")" >&2
+        return 1
+    fi
+    if ! ssh_bootstrap_confirm_fingerprint "$host" "$expected"; then
         return 1
     fi
     if ! ip=$(wizard_resolve_ipv4 "$host"); then

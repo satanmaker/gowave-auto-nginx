@@ -41,6 +41,7 @@ SUITES = {
         "test_wizard.TestWizardEntry",
         "test_wizard.TestWizardDocumentation",
         "test_ssh_bootstrap.TestFingerprintConfirmation",
+        "test_ssh_bootstrap.TestHostKeyScan",
         "test_ssh_bootstrap.TestBootstrapPayloads",
         "test_ssh_bootstrap.TestPasswordHandling",
         "test_ssh_bootstrap.TestTimerGate",
