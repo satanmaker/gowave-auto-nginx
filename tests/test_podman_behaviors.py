@@ -21,7 +21,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.podman_e2e import catalog  # noqa: E402
+from tools.podman_e2e import catalog, matrix  # noqa: E402
 
 CATALOG = catalog.load_catalog()
 INVENTORY = catalog.load_behaviors()
@@ -104,10 +104,14 @@ class TestBehaviorInventory(unittest.TestCase):
         self.assertEqual(sorted(areas), sorted(catalog.BEHAVIOR_AREAS))
 
     def test_every_behaviour_states_where_it_runs_and_what_blocks_on_it(self):
+        manifest = matrix.load()
         for entry in INVENTORY["behaviors"]:
             with self.subTest(behaviour=entry["name"]):
                 self.assertTrue(entry["topology"])
-                self.assertEqual(entry["gate"], "pre-push")
+                self.assertEqual(
+                    entry["gate"], catalog.case_gate(entry["topology"], manifest),
+                    "a behaviour is gated at the earliest tier that runs every topology it names",
+                )
                 self.assertLessEqual(reaches(entry, "cases"), set(entry["topology"]))
                 self.assertLessEqual(
                     set(entry["topology"]), reaches(entry, "cases") | reaches(entry, "error_paths")

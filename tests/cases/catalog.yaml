@@ -7,8 +7,8 @@ counts:
   container: 111
   partial: 12
   live_only: 2
-  podman_first: 104
-  total: 229
+  podman_first: 109
+  total: 234
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -8667,6 +8667,137 @@ cases:
       - state_nodes
       - state_unchanged
   promotion_target: Negative Scenario and Fault Injection Tests
+- id: PO-INSTALL
+  requirement: Independent Panel-only acceptance topology
+  live_scenario: null
+  assertion: The real operator runs its documented `install --panel-only` command on a clean supported
+    systemd host, exits successfully, and the Panel it installs reports the version this deployment configured
+    — a Panel-only install has no Node and no core to ask, and their absence is asserted by the host case
+    rather than reported here as a probe that could not run.
+  assertion_sha256: face2c2b2a6f5c50ec7fa3816ff917574d59841badf2ed84a740aa306d70dec2
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - panel-only
+  gate: pr
+  driver_status: implemented
+  drivers:
+    panel-only:
+      driver: panel_only:PanelOnlyProduct.install
+      evidence: []
+  promotion_target: Independent Panel-only acceptance topology
+- id: PO-HOST
+  requirement: Independent Panel-only acceptance topology
+  live_scenario: null
+  assertion: 'The installed host is a Panel and a camouflage site and nothing else: `gowave.service`,
+    `nginx.service` and `fail2ban.service` active, no `gowave-node.service` unit file, no listener on
+    8443 or 8444, no `rw-core` or `xray` process, no worker binary on disk, the Panel listening on 127.0.0.1:3000
+    and NGINX publicly on 443, `nginx -t` accepting the rendered configuration, the credentials file `600
+    root root` holding the three documented keys, exactly two certificate lineages (the Panel and the
+    camouflage name), a public handshake for each, and a decoy that answers with the static site rather
+    than any product content.'
+  assertion_sha256: 297d7bb0eb959367157337681756f56bad9ecd46d01970684c2594e540188621
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - panel-only
+  gate: pr
+  driver_status: implemented
+  drivers:
+    panel-only:
+      driver: panel_only:case_host_shape
+      evidence:
+      - certificate_lineages
+      - credentials
+      - listeners
+      - nginx_test
+      - node_unit_files
+      - public_decoy_san
+      - public_decoy_status
+      - public_panel
+      - traffic_binaries
+      - traffic_listeners
+      - traffic_processes
+      - units
+  promotion_target: Independent Panel-only acceptance topology
+- id: PO-API
+  requirement: Independent Panel-only acceptance topology
+  live_scenario: null
+  assertion: 'The Panel API, reached with the credentials the install wrote, reports the state a Panel-only
+    install ends in: the documented login answers 200, hosts, nodes, config profiles and internal squads
+    are all empty, the default user is served with a shortUuid and at least one scoped API token exists,
+    while `state.json` names `installationMode: panel-only` at `schemaVersion: 2`, holds an empty node
+    array and carries none of the local-node fields a traffic-plane deployment would own.'
+  assertion_sha256: d74c6d902220963692b1eea127034fdd0b5ff6a3ea8e6d3d01e37d05be0086e0
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - panel-only
+  gate: pr
+  driver_status: implemented
+  drivers:
+    panel-only:
+      driver: panel_only:case_api_shape
+      evidence:
+      - default_user
+      - hosts
+      - login_status
+      - nodes
+      - profiles
+      - squads
+      - state
+      - tokens
+  promotion_target: Independent Panel-only acceptance topology
+- id: PO-SQUAD
+  requirement: Independent Panel-only acceptance topology
+  live_scenario: null
+  assertion: The first `gowave-auto.sh node add` after a Panel-only install succeeds and leaves the identifier
+    it resolved in `state.json`, one internal squad named `Default MVP Squad` that allows at least one
+    inbound, one host record per matching inbound whose `ALLOW_ONLY` squad list names exactly that identifier,
+    and the registered Worker as the Panel's only node — the state a later subscription depends on, because
+    a host record carrying no squad grants access to none.
+  assertion_sha256: a82fdb6f4df3b7d7835c324e7347c434aa84a17732ada5824e7a42b44ec34481
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - panel-only
+  gate: pr
+  driver_status: implemented
+  drivers:
+    panel-only:
+      driver: panel_only:case_squad
+      evidence: []
+  promotion_target: Independent Panel-only acceptance topology
+- id: PO-SQUAD-REFUSED
+  requirement: Independent Panel-only acceptance topology
+  live_scenario: null
+  assertion: 'A host record whose squad list carries a null entry never becomes the operator''s own grant:
+    the same payload carrying the real squad is accepted first and removed again, so the answer is attributable
+    to the null entry rather than to the payload shape, and the Panel either refuses the null-squad post
+    and leaves the host count unchanged, or stores a record that does not name the identifier `state.json`
+    resolved — after which the probe removes what it created and the count returns to where it started.'
+  assertion_sha256: 4b1115965aef98d2b0bd0c249e335c4a409573cec1fee978521b69b55730f4a0
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - panel-only
+  gate: pr
+  driver_status: implemented
+  drivers:
+    panel-only:
+      driver: panel_only:case_refused_payload
+      evidence: []
+  promotion_target: Independent Panel-only acceptance topology
 - id: AIO-DP-REALITY-xray
   requirement: Real client data-plane verification
   live_scenario: null

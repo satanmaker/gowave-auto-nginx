@@ -87,6 +87,7 @@ PROMOTION_STATES: Sequence[str] = ("incubating", "podman-stable", "live-parity")
 DRIVER_MODULES: Dict[str, Path] = {
     "aio": REPO_ROOT / "tools" / "podman_e2e" / "aio.py",
     "multi-node": REPO_ROOT / "tools" / "podman_e2e" / "multi_node.py",
+    "panel-only": REPO_ROOT / "tools" / "podman_e2e" / "panel_only.py",
 }
 
 # Two drivers mint one `Case` per matrix tuple instead of writing each out, so
@@ -101,6 +102,28 @@ MATRIX_DRIVEN_BUILDERS: Set[Tuple[str, str]] = {
 }
 
 DRIVER_STATUSES: Sequence[str] = ("implemented", "planned", "not-applicable")
+
+# The tiers a topology can be gated at, earliest first. A case's gate is the
+# earliest tier its own topology is gated at, read from the manifest rather than
+# written into the entry: the behaviour audit compares the two, so a topology
+# moved behind another tier cannot leave the catalog advertising the old one.
+GATE_TIERS: Sequence[str] = ("pre-push", "pr")
+
+
+def case_gate(topologies: Sequence[str], manifest: Dict[str, Any]) -> str:
+    """The earliest tier every one of ``topologies`` is gated at."""
+    declared = {
+        str(tier)
+        for topology in topologies
+        for tier in (((manifest.get("topologies") or {}).get(str(topology)) or {}).get("gate") or [])
+    }
+    for tier in GATE_TIERS:
+        if tier in declared:
+            return tier
+    raise CatalogError(
+        f"no tier runs the topologies {sorted(str(name) for name in topologies)}, so a case "
+        "there would claim a gate no tier honours"
+    )
 
 
 class CatalogError(RuntimeError):
@@ -663,6 +686,81 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         ),
         "topology": ["multi-node"],
         "promotion_target": "Negative Scenario and Fault Injection Tests",
+    },
+    {
+        "id": "PO-INSTALL",
+        "requirement": "Independent Panel-only acceptance topology",
+        "assertion": (
+            "The real operator runs its documented `install --panel-only` command on a "
+            "clean supported systemd host, exits successfully, and the Panel it installs "
+            "reports the version this deployment configured — a Panel-only install has no "
+            "Node and no core to ask, and their absence is asserted by the host case "
+            "rather than reported here as a probe that could not run."
+        ),
+        "topology": ["panel-only"],
+        "promotion_target": "Independent Panel-only acceptance topology",
+    },
+    {
+        "id": "PO-HOST",
+        "requirement": "Independent Panel-only acceptance topology",
+        "assertion": (
+            "The installed host is a Panel and a camouflage site and nothing else: "
+            "`gowave.service`, `nginx.service` and `fail2ban.service` active, no "
+            "`gowave-node.service` unit file, no listener on 8443 or 8444, no `rw-core` or "
+            "`xray` process, no worker binary on disk, the Panel listening on "
+            "127.0.0.1:3000 and NGINX publicly on 443, `nginx -t` accepting the rendered "
+            "configuration, the credentials file `600 root root` holding the three "
+            "documented keys, exactly two certificate lineages (the Panel and the "
+            "camouflage name), a public handshake for each, and a decoy that answers with "
+            "the static site rather than any product content."
+        ),
+        "topology": ["panel-only"],
+        "promotion_target": "Independent Panel-only acceptance topology",
+    },
+    {
+        "id": "PO-API",
+        "requirement": "Independent Panel-only acceptance topology",
+        "assertion": (
+            "The Panel API, reached with the credentials the install wrote, reports the "
+            "state a Panel-only install ends in: the documented login answers 200, hosts, "
+            "nodes, config profiles and internal squads are all empty, the default user is "
+            "served with a shortUuid and at least one scoped API token exists, while "
+            "`state.json` names `installationMode: panel-only` at `schemaVersion: 2`, "
+            "holds an empty node array and carries none of the local-node fields a "
+            "traffic-plane deployment would own."
+        ),
+        "topology": ["panel-only"],
+        "promotion_target": "Independent Panel-only acceptance topology",
+    },
+    {
+        "id": "PO-SQUAD",
+        "requirement": "Independent Panel-only acceptance topology",
+        "assertion": (
+            "The first `gowave-auto.sh node add` after a Panel-only install succeeds and "
+            "leaves the identifier it resolved in `state.json`, one internal squad named "
+            "`Default MVP Squad` that allows at least one inbound, one host record per "
+            "matching inbound whose `ALLOW_ONLY` squad list names exactly that identifier, "
+            "and the registered Worker as the Panel's only node — the state a later "
+            "subscription depends on, because a host record carrying no squad grants "
+            "access to none."
+        ),
+        "topology": ["panel-only"],
+        "promotion_target": "Independent Panel-only acceptance topology",
+    },
+    {
+        "id": "PO-SQUAD-REFUSED",
+        "requirement": "Independent Panel-only acceptance topology",
+        "assertion": (
+            "A host record whose squad list carries a null entry never becomes the "
+            "operator's own grant: the same payload carrying the real squad is accepted "
+            "first and removed again, so the answer is attributable to the null entry "
+            "rather than to the payload shape, and the Panel either refuses the null-squad "
+            "post and leaves the host count unchanged, or stores a record that does not "
+            "name the identifier `state.json` resolved — after which the probe removes "
+            "what it created and the count returns to where it started."
+        ),
+        "topology": ["panel-only"],
+        "promotion_target": "Independent Panel-only acceptance topology",
     },
 ]
 
@@ -1852,6 +1950,7 @@ def build_catalog(
         cases.append(case)
 
     extras = PODMAN_FIRST_CASES + data_plane_cases()
+    manifest = matrix_data.load()
     for extra in extras:
         promotion = promoted.get(extra["id"])
         cases.append({
@@ -1864,7 +1963,7 @@ def build_catalog(
             "state": "podman-stable" if promotion else "incubating",
             "environment": "container",
             "topology": extra["topology"],
-            "gate": "pre-push",
+            "gate": case_gate(list(extra["topology"]), manifest),
             "driver_status": "planned",
             "drivers": {},
             "promotion_target": extra["promotion_target"],

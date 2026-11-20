@@ -265,6 +265,11 @@ be published.
 - **MN-ARGV-OBSERVER** — promotion target: Distributed Worker VPS Deployment Verification
 - **AIO-AUTH-NEG** — promotion target: Negative Scenario and Fault Injection Tests
 - **MN-DUP-ADD** — promotion target: Negative Scenario and Fault Injection Tests
+- **PO-INSTALL** — promotion target: Independent Panel-only acceptance topology
+- **PO-HOST** — promotion target: Independent Panel-only acceptance topology
+- **PO-API** — promotion target: Independent Panel-only acceptance topology
+- **PO-SQUAD** — promotion target: Independent Panel-only acceptance topology
+- **PO-SQUAD-REFUSED** — promotion target: Independent Panel-only acceptance topology
 - **AIO-DP-REALITY-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-REALITY-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-XHTTP-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints

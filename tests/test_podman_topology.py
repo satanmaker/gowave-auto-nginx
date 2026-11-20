@@ -394,12 +394,12 @@ class TestPodmanTopology(unittest.TestCase):
 
 
 class TestPanelOnlyTopology(unittest.TestCase):
-    """The Panel-only drive: the operator's own flag, no Vision, and no case yet.
+    """The Panel-only drive: the operator's own flag, no Vision, and five declared cases.
 
     The mode is a product deployment the installer documents, so the harness has
     to invoke it through the command an operator would type rather than through a
     second entry point. These tests hold the rendered command, the refusal of the
-    Vision argument the mode cannot honour, and the refusal of an empty run.
+    Vision arguments the mode cannot honour, and the suite the entrypoint builds.
     """
 
     def make(self, **overrides):
@@ -453,11 +453,13 @@ class TestPanelOnlyTopology(unittest.TestCase):
         self.assertEqual(record["install_command"], instance.install_script())
         self.assertEqual(record["vision_domain"], "")
 
-    def test_the_topology_declares_no_case_and_a_run_is_refused(self):
-        with self.assertRaises(panel_only.SuiteNotDeclared) as caught:
-            panel_only.cases(None)
-        self.assertIn("proves nothing", str(caught.exception))
-        self.assertIn("6.2-6.5", str(caught.exception), "the refusal names what is missing")
+    def test_the_topology_declares_the_five_panel_only_cases(self):
+        suite = panel_only.cases(FakePodman())
+        self.assertEqual(
+            [case.id for case in suite],
+            ["PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED"],
+        )
+        self.assertEqual({case.topology for case in suite}, {"panel-only"})
 
     def test_the_entrypoint_lists_the_third_topology(self):
         out = io.StringIO()
@@ -480,27 +482,15 @@ class TestPanelOnlyTopology(unittest.TestCase):
                 self.assertEqual(code, 2)
                 self.assertIn("topology has none", err)
 
-    def test_a_panel_only_run_is_refused_while_the_suite_is_undeclared(self):
-        class _Podman:
-            def __init__(self, context):
-                self.context = context
-
-            def remove_stale_runs(self):
-                return []
-
-            def register_cleanup(self):
-                pass
-
-        # The refusal is a named exit rather than a traceback: the suite it would
-        # run is empty, and an empty suite is a green result that proved nothing.
-        err = io.StringIO()
-        with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.object(run_podman_e2e, "Podman", _Podman), \
-                contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
-            run_podman_e2e.main(["--topology", "panel-only", "--artifact-root", directory])
-        self.assertEqual(caught.exception.code, 2)
-        self.assertIn("proves nothing", err.getvalue())
-        self.assertNotIn("Traceback", err.getvalue())
+    def test_the_entrypoint_builds_the_declared_panel_only_suite(self):
+        suite = run_podman_e2e.build_suite(
+            FakePodman(), "panel-only", run_podman_e2e.DEFAULT_DISTRIBUTION,
+        )
+        self.assertEqual(
+            [case.id for case in suite],
+            ["PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED"],
+        )
+        self.assertEqual(run_podman_e2e.TOPOLOGIES, ("aio", "multi-node", "panel-only"))
 
 
 if __name__ == "__main__":

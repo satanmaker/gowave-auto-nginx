@@ -365,9 +365,14 @@ class _StubHost:
         self.podman = podman
         self.target_name = "master"
         self.argv_observer = None
-        self.context = types.SimpleNamespace(
-            evidence_text=lambda name, text: None,
-        )
+        # The topology names the registration's evidence after itself; a stub
+        # without the field would exercise a ``node_add`` no host can run.
+        self.node_add_evidence_prefix = "mn-node-add"
+        self.evidence_files = []
+        self.context = types.SimpleNamespace(evidence_text=self._evidence)
+
+    def _evidence(self, name, text):
+        self.evidence_files.append(name)
 
     def node_add_script(self, name):
         return f"bash /repo/gowave-auto.sh node add '{name}' '10.89.0.12' 'worker.testbed.internal'"
@@ -394,6 +399,11 @@ class TestNodeAddIsTraced(unittest.TestCase):
         self.assertEqual(len(prepared), 1, "the trace directory is prepared before the trace")
         self.assertIn(f"rm -f {argv_probe.TRACE_PATH}", prepared[0],
                       "the dispatch drops a stale trace, so the case reads its own run's")
+        self.assertEqual(
+            host.evidence_files,
+            ["mn-node-add.stdout.log", "mn-node-add.stderr.log"],
+            "the dispatch files its output under the topology's own prefix",
+        )
 
     def test_an_unusable_observer_still_runs_the_deployment_untraced(self):
         podman = _FakePodman(strace_present=False, install_fails=True)

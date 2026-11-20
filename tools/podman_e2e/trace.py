@@ -122,7 +122,7 @@ NUMBER_RE = re.compile(
     r"\b(\d+|" + "|".join(sorted(NUMBER_WORDS, key=len, reverse=True)) + r")\b"
 )
 
-TOPOLOGIES: Tuple[str, ...] = ("aio", "multi-node")
+TOPOLOGIES: Tuple[str, ...] = ("aio", "multi-node", "panel-only")
 
 REQUIREMENT_RE = re.compile(r"^### Requirement:\s*(.+?)\s*$")
 SCENARIO_RE = re.compile(r"^#### Scenario:\s*(.+?)\s*$")
@@ -181,11 +181,12 @@ def declared_cases() -> Dict[str, List[str]]:
     """The case ids each suite actually declares, in declaration order."""
     from types import SimpleNamespace
 
-    from tools.podman_e2e import aio, multi_node
+    from tools.podman_e2e import aio, multi_node, panel_only
     from tools.podman_e2e.runner import RunContext
 
     declared: Dict[str, List[str]] = {}
-    for topology, module in (("aio", aio), ("multi-node", multi_node)):
+    for topology, module in (("aio", aio), ("multi-node", multi_node),
+                             ("panel-only", panel_only)):
         context = RunContext(topology, REPO_ROOT / "artifacts" / "traceability",
                              budget_seconds=60, run_id=f"podman-{topology}-trace-00000000")
         podman = SimpleNamespace(context=context)
@@ -1103,6 +1104,8 @@ def _run_count_problems(directory: Path) -> List[str]:
         (load_matrix().get("topologies") or {}).get(topology, {}).get("positive_case_counts")
         or {}
     )
+    if not counts:
+        return _run_case_list_problems(result, data, topology)
     expected = counts.get(combination)
     if expected is None:
         return [
@@ -1128,6 +1131,40 @@ def _run_count_problems(directory: Path) -> List[str]:
             0,
             f"{result}: the manifest owes {expected} positive cases for "
             f"{topology}/{combination}, the run executed {len(executed)}",
+        )
+    return failures
+
+
+def _run_case_list_problems(
+    result: Path, data: Dict[str, Any], topology: str
+) -> List[str]:
+    """A topology with no traffic plane owes its declared case list, not a count.
+
+    ``panel-only`` provisions no data plane, so the manifest states no Vision
+    combination and no positive count for it, and a count-based reading would
+    refuse every run of it — including the one its own CI job publishes. What it
+    owes is the set of ids its suite declares, read back from the suite rather
+    than restated here, so the audit and the run are judged by one declaration.
+    """
+    declared = declared_cases().get(topology) or []
+    if not declared:
+        return [
+            f"{result}: records the topology {topology!r}, which no suite in this tree declares"
+        ]
+    executed = {
+        str(case.get("id")): case.get("status") for case in data.get("cases") or []
+    }
+    failures = [
+        f"{result}: {case_id} is {executed[case_id]}, so it is not a case that ran"
+        for case_id in declared
+        if case_id in executed and executed[case_id] != "PASS"
+    ]
+    missing = [case_id for case_id in declared if case_id not in executed]
+    if missing:
+        failures.insert(
+            0,
+            f"{result}: the {topology} suite declares {len(declared)} cases, the run "
+            f"executed {len(declared) - len(missing)}: {', '.join(missing)} did not run",
         )
     return failures
 
