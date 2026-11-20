@@ -15,6 +15,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from live_vps.dns import DNSCheckResult
 from live_vps.ssh import SSHResult
 from live_vps.negative import (
+    run_neg_05_acme_install_failure,
     run_neg_10_mtls_forged_certificate,
     run_negative_suite,
     run_neg_01_ssh_host_key_absent,
@@ -469,6 +470,84 @@ class TestNegativeScenarios(unittest.TestCase):
         self.assertEqual(len(res["scenarios"]), 15)
         for s in res["scenarios"]:
             self.assertEqual(s["status"], "SKIP")
+
+
+class LeaseRecordingSSH:
+    """Records the stdin handed to each remote command, which FakeSSH drops."""
+
+    host = "198.51.100.10"
+
+    def __init__(self, result):
+        self._result = result
+        self.calls = []
+
+    def run(self, remote_cmd, input_data=None, timeout=60):
+        self.calls.append({"cmd": remote_cmd, "input_data": input_data})
+        return self._result
+
+
+ACME_REFUSAL = SSHResult(
+    returncode=1,
+    stdout="",
+    stderr=(
+        "Error: Invalid GOWAVE_ACME_SERVER: "
+        "'https://invalid-acme-directory.example.com/directory'. Only "
+        "'https://acme-staging-v02.api.letsencrypt.org/directory' or "
+        "'https://acme-v02.api.letsencrypt.org/directory' are supported.\n"
+    ),
+)
+
+LOCK_REFUSAL = SSHResult(
+    returncode=1,
+    stdout="",
+    stderr=(
+        "Error: Another process currently holds the mutation lock "
+        "(/run/lock/gowave-managed-mutation.lock).\n"
+        "Refusing concurrent mutation without an authorized re-entrant lease.\n"
+    ),
+)
+
+
+class TestNeg05PresentsTheRunsLease(unittest.TestCase):
+    def test_the_probe_hands_the_runs_lease_to_the_install_over_stdin(self):
+        ssh = LeaseRecordingSSH(ACME_REFUSAL)
+
+        result = run_neg_05_acme_install_failure(ssh, lease_token="token-of-this-run")
+
+        self.assertEqual(len(ssh.calls), 1)
+        self.assertEqual(ssh.calls[0]["input_data"], "GOWAVE_LEASE: token-of-this-run\n")
+        self.assertIn("gowave-auto.sh install", ssh.calls[0]["cmd"])
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["lease_presented"])
+        self.assertEqual(result["exit_code"], 1)
+
+    def test_a_lock_refusal_is_reported_as_a_failure_not_as_the_acme_rejection(self):
+        ssh = LeaseRecordingSSH(LOCK_REFUSAL)
+
+        result = run_neg_05_acme_install_failure(ssh)
+
+        self.assertIsNone(ssh.calls[0]["input_data"])
+        self.assertEqual(result["status"], "FAIL")
+        self.assertFalse(result["lease_presented"])
+        self.assertIn("Another process currently holds the mutation lock", result["message"])
+
+    @patch("live_vps.negative.run_neg_05_acme_install_failure", return_value={"status": "FAIL"})
+    @patch("live_vps.negative.run_neg_04_dns_missing_aaaa", return_value={"status": "PASS"})
+    @patch("live_vps.negative.run_neg_03_dns_wrong_ip", return_value={"status": "PASS"})
+    @patch("live_vps.negative.run_neg_02_ssh_port_unreachable", return_value={"status": "PASS"})
+    @patch("live_vps.negative.run_neg_01_ssh_host_key_absent", return_value={"status": "PASS"})
+    def test_the_negative_suite_passes_the_masters_lease_to_the_acme_probe(
+        self, neg01, neg02, neg03, neg04, neg05
+    ):
+        config = MagicMock()
+        config.test_negative_suite = True
+        master_ssh = MagicMock()
+
+        run_negative_suite(
+            config, master_ssh=master_ssh, master_lease_token="lease-of-this-run"
+        )
+
+        neg05.assert_called_once_with(master_ssh, lease_token="lease-of-this-run")
 
 
 if __name__ == "__main__":
