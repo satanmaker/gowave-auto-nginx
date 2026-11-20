@@ -61,8 +61,57 @@ def verify_master_firewall(
     master_ip: str,
     enable_ipv6: bool = False,
     master_ipv6: Optional[str] = None,
+    has_local_node: bool = True,
 ) -> Dict[str, Any]:
-    """Verify local-only Master control listener and independent external denial."""
+    """Verify local-only Master control listener and independent external denial.
+
+    ``has_local_node`` is false for a Panel-only Master, which deploys no traffic
+    plane and therefore has no control listener to reach: the claim to verify
+    there is the absence of the listener, not a loopback connection to it.
+    """
+    if not has_local_node:
+        absent = master_ssh.run("ss -ltnH 'sport = :3002'")
+        listener_lines = [line.split() for line in absent.stdout.splitlines() if line.split()]
+        if listener_lines:
+            return {
+                "status": "FAIL",
+                "local_node": False,
+                "error": "Panel-only Master deploys no traffic plane, yet TCP/3002 is listening",
+                "listeners": [" ".join(parts) for parts in listener_lines],
+            }
+        ext_ok, ext_reason = probe_tcp_port(master_ip, 3002, timeout=3.0)
+        if ext_ok:
+            return {
+                "status": "FAIL",
+                "local_node": False,
+                "error": "Master TCP/3002 answers from the external Control Machine",
+                "external_reason": ext_reason,
+            }
+        ipv6_reason = "not enabled"
+        if enable_ipv6:
+            if not master_ipv6:
+                return {
+                    "status": "INCOMPLETE",
+                    "local_node": False,
+                    "error": "ENABLE_IPV6=true but MASTER_IPV6 was not supplied to firewall verification",
+                }
+            ipv6_ok, ipv6_reason = probe_tcp_port(master_ipv6, 3002, timeout=3.0)
+            if ipv6_ok:
+                return {
+                    "status": "FAIL",
+                    "local_node": False,
+                    "error": "Master TCP/3002 is reachable over public IPv6",
+                    "ipv6_probe_reason": ipv6_reason,
+                }
+        return {
+            "status": "PASS" if ext_reason in ("TIMEOUT", "REFUSED") else "INCOMPLETE",
+            "local_node": False,
+            "listener_absent": True,
+            "external_blocked": not ext_ok,
+            "external_reason": ext_reason,
+            "ipv6_external_reason": ipv6_reason,
+        }
+
     loop_r = master_ssh.run(
         "python3 -c \"import socket; s = socket.create_connection(('127.0.0.1', 3002), timeout=3); s.close(); print('CONNECTED')\""
     )
@@ -119,6 +168,7 @@ def verify_master_firewall(
 
     return {
         "status": status,
+        "local_node": True,
         "loopback_accessible": loopback_ok,
         "external_blocked": not ext_ok,
         "external_reason": ext_reason,

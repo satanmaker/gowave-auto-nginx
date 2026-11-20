@@ -240,6 +240,35 @@ class TestPreflightSSHDNS(unittest.TestCase):
         result = verify_master_firewall(ssh, "203.0.113.10")
         self.assertEqual(result["status"], "INCOMPLETE")
 
+    @patch("live_vps.firewall.probe_tcp_port", return_value=(False, "REFUSED"))
+    def test_panel_only_master_passes_on_a_proven_absent_listener(self, probe):
+        # Measured on the live pair: the Panel-only Master had no TCP/3002
+        # listener at all, so the loopback probe could only ever fail there.
+        ssh = MagicMock()
+        ssh.run.side_effect = [MagicMock(ok=True, stdout="")]
+        result = verify_master_firewall(ssh, "203.0.113.10", has_local_node=False)
+        self.assertEqual(result["status"], "PASS")
+        self.assertFalse(result["local_node"])
+        self.assertTrue(result["listener_absent"])
+        self.assertTrue(result["external_blocked"])
+        self.assertEqual(ssh.run.call_args_list[0].args[0], "ss -ltnH 'sport = :3002'")
+
+    @patch("live_vps.firewall.probe_tcp_port", return_value=(False, "TIMEOUT"))
+    def test_panel_only_master_refuses_a_listener_it_did_not_deploy(self, probe):
+        ssh = MagicMock()
+        ssh.run.side_effect = [MagicMock(ok=True, stdout="LISTEN 0 4096 0.0.0.0:3002 *:*")]
+        result = verify_master_firewall(ssh, "203.0.113.10", has_local_node=False)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("no traffic plane", result["error"])
+
+    @patch("live_vps.firewall.probe_tcp_port", return_value=(True, "CONNECTED"))
+    def test_panel_only_master_refuses_an_externally_reachable_control_port(self, probe):
+        ssh = MagicMock()
+        ssh.run.side_effect = [MagicMock(ok=True, stdout="")]
+        result = verify_master_firewall(ssh, "203.0.113.10", has_local_node=False)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("external Control Machine", result["error"])
+
     @patch("live_vps.firewall.probe_tcp_port", return_value=(False, "TIMEOUT"))
     @patch("live_vps.firewall.get_control_machine_public_ip", return_value="198.51.100.77")
     def test_worker_firewall_requires_source_specific_master_allow(self, cm_ip, probe):
