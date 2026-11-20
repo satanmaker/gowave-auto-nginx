@@ -23,6 +23,42 @@ from .deployment import output_matches_expected_version
 REQUIRED_PORTS_DEFAULT = [80, 443, 3000, 3001, 3002, 7443, 8443, 9443, 10001, 10002, 10003]
 VISION_PORTS = [8444, 9444]
 
+#: Paths a Master-side install leaves behind that the product does not state in
+#: one place. The Worker side is read from the product instead (see
+#: `declared_worker_paths`).
+MASTER_RESIDUE_PATHS = [
+    "/opt/gowave",
+    "/opt/gowave-auto-nginx",
+    "/var/lib/gowave-auto-nginx",
+    "/var/www/gowave-auto-nginx",
+    "/etc/nginx/stream-enabled",
+]
+
+
+def declared_worker_paths() -> List[str]:
+    """The Worker paths the product says it creates and its rollback removes.
+
+    `worker_mutation_targets()` in `gowave-node-auto.sh` is the product's own
+    answer to "what does an install touch", and the gate needs the same answer:
+    a copy restated here drifted twice, and `/var/lib/gowave-auto-nginx` and
+    `/usr/local/bin/gowave-node` each reached a live run as residue the gate had
+    not asked about. The three copies of that heredoc (the script and its two
+    payload duplicates) must agree — a divergence is a defect in the product,
+    not something to paper over here.
+    """
+    script = (Path(__file__).resolve().parents[2] / "gowave-node-auto.sh").read_text(encoding="utf-8")
+    blocks = re.findall(r"cat <<'WORKER_TARGETS'\n(.*?)\nWORKER_TARGETS\n", script, re.S)
+    if not blocks:
+        raise AssertionError("worker_mutation_targets() no longer declares a 'WORKER_TARGETS' block")
+    declared = blocks[0].split()
+    for index, block in enumerate(blocks[1:], start=2):
+        if block.split() != declared:
+            raise AssertionError(
+                f"WORKER_TARGETS copy {index} disagrees with the product's first copy: "
+                f"{sorted(set(block.split()) ^ set(declared))}"
+            )
+    return [path for path in declared if path.startswith("/")]
+
 
 @dataclass
 class ToolCheckResult:
@@ -189,17 +225,11 @@ def collect_remote_baseline(ssh: SSHClient) -> Dict[str, Any]:
                     listening_ports.add(int(port_str))
     manifest["listening_ports"] = sorted(listening_ports)
 
-    # 4. Existing GoWave directories. `/var/lib/gowave-auto-nginx` holds the
-    #    installer's recovery transactions: a leftover one there is refused by
-    #    the next install, so a host carrying it is not disposable either.
-    gowave_dirs = [
-        "/opt/gowave",
-        "/opt/gowave-node",
-        "/opt/gowave-auto-nginx",
-        "/var/lib/gowave-auto-nginx",
-        "/var/www/gowave-auto-nginx",
-        "/etc/nginx/stream-enabled",
-    ]
+    # 4. Existing GoWave paths. A stale install leaves paths the next install
+    #    refuses — its recovery root, an unowned Worker binary — so a host that
+    #    carries any of them is not disposable. The Worker side is read from the
+    #    product's own target list rather than restated here.
+    gowave_dirs = list(dict.fromkeys(MASTER_RESIDUE_PATHS + declared_worker_paths()))
     r = ssh.run(f"for d in {' '.join(gowave_dirs)}; do if [ -e \"$d\" ]; then echo \"$d\"; fi; done")
     existing_dirs = [d.strip() for d in r.stdout.splitlines() if d.strip()]
     manifest["existing_gowave_dirs"] = existing_dirs
