@@ -228,6 +228,22 @@ cmd_install() {
         parse_install_arguments "$@" || return $?
         install_mode="$GOWAVE_INSTALL_MODE"
     fi
+    # A partial list is completed by prompting, and a prompt with no terminal is a
+    # `read` under `set -e`: it exits 1 with nothing on either stream.
+    if [[ ! -t 0 ]]; then
+        local missing="" index
+        local -a argument_names=("the panel or worker name" "the camouflage name" "the acme email")
+        for index in 0 1 2; do
+            if [[ -z "${GOWAVE_INSTALL_POSITIONAL[$index]:-}" ]]; then
+                missing+="${missing:+, }${argument_names[$index]}"
+            fi
+        done
+        if [[ -n "$missing" ]]; then
+            printf 'Error: no terminal to prompt on, so install needs %s.\n' "$missing" >&2
+            printf '%s\n' "$GOWAVE_INSTALL_USAGE" >&2
+            return 2
+        fi
+    fi
     acquire_lock
     local panel_domain="${GOWAVE_INSTALL_POSITIONAL[0]:-}"
     local reality_domain="${GOWAVE_INSTALL_POSITIONAL[1]:-}"
