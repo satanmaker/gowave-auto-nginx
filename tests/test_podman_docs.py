@@ -26,6 +26,8 @@ from tools.podman_e2e import trace as trace_data  # noqa: E402
 DOC = REPO_ROOT / "docs" / "PODMAN_E2E.md"
 ENTRYPOINT = "tools.run_podman_e2e"
 FLAG = re.compile(r"--[a-z][a-z0-9-]*")
+REQUIREMENT = re.compile(r"^### Requirement:", re.MULTILINE)
+SCENARIO = re.compile(r"^#### Scenario:", re.MULTILINE)
 
 
 def documented() -> str:
@@ -1974,6 +1976,20 @@ class TestPodmanE2EDocumentation(unittest.TestCase):
     def test_the_readme_points_at_the_guide(self):
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("docs/PODMAN_E2E.md", readme)
+
+    def test_the_readme_cites_the_requirements_and_scenarios_the_specs_hold(self):
+        # The quoted total is a copy of openspec/specs/, so it is read back from the
+        # specs rather than trusted: an added requirement or scenario moves the count
+        # and this test is where the README is told.
+        readme = " ".join((REPO_ROOT / "README.md").read_text(encoding="utf-8").split())
+        requirements = scenarios = 0
+        for spec in sorted((REPO_ROOT / "openspec" / "specs").glob("*/spec.md")):
+            text = spec.read_text(encoding="utf-8")
+            requirements += len(REQUIREMENT.findall(text))
+            scenarios += len(SCENARIO.findall(text))
+        self.assertIn(
+            f"**{requirements} requirements / {scenarios} GIVEN-WHEN-THEN acceptance scenarios**", readme
+        )
 
 
 if __name__ == "__main__":
