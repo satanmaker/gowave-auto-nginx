@@ -150,6 +150,32 @@ class TestPreflightSSHDNS(unittest.TestCase):
         self.assertNotIn("abc", str(ctx2.exception))
         self.assertNotIn("--admin_password", str(ctx2.exception))
 
+    def test_a_credential_read_from_a_file_is_not_an_argv_leak(self):
+        # The Worker lease is staged in a root-only file on the Master and read into
+        # the variable there; the name names a token but argv carries no value. The
+        # guard used to refuse the whole command on the substring `token=`, which
+        # aborted the live install phase before the node add was sent.
+        for indirect in (
+            'GOWAVE_WORKER_LEASE_TOKEN="$(cat /run/live_vps_worker_lease)"',
+            "GOWAVE_WORKER_LEASE_TOKEN=$(cat /run/live_vps_worker_lease)",
+            'GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_STAGED_LEASE}"',
+        ):
+            with self.subTest(indirect=indirect):
+                assert_no_secrets_in_argv(["ssh", "root@example.com", indirect])
+
+    def test_a_literal_credential_value_is_still_refused(self):
+        for literal in (
+            "GOWAVE_LEASE_TOKEN=abc123",
+            "--token=abc123",
+            "--admin_password=abc123",
+            "SECRET_KEY=abc123",
+        ):
+            with self.subTest(literal=literal):
+                with self.assertRaises(ValueError) as ctx:
+                    assert_no_secrets_in_argv(["ssh", "root@example.com", literal])
+                self.assertIn("Zero-leak violation", str(ctx.exception))
+                self.assertNotIn("abc123", str(ctx.exception))
+
     def test_dns_verification_mock(self):
         # Less than 2 resolvers raises ValueError
         with self.assertRaises(ValueError):
