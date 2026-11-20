@@ -314,6 +314,26 @@ class TestPreflightSSHDNS(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertTrue(any("timeout" in reason for reason in reasons))
 
+    def test_the_baseline_asks_about_the_installer_recovery_root(self):
+        """A leftover recovery transaction blocks the next install, so it is residue.
+
+        Measured on the pair: `run-20261120-105111-f101f4` refused in under a
+        minute with "Worker transaction worker_install_worker-1_1795170447_2734
+        is 'installed' and was never finalized", because `/var/lib/gowave-auto-nginx`
+        survived a reset that removed every other GoWave path.
+        """
+        ssh = MagicMock()
+        ssh.run.return_value = MagicMock(ok=True, stdout="")
+        collect_remote_baseline(ssh)
+        asked = "\n".join(call.args[0] for call in ssh.run.call_args_list if call.args)
+        self.assertIn("/var/lib/gowave-auto-nginx", asked)
+
+        manifest = {"existing_gowave_dirs": ["/var/lib/gowave-auto-nginx"], "running_services": [],
+                    "listening_ports": [22], "required_tools": {"tcpdump": "ok", "timeout": "ok"}}
+        eligible, reasons = check_disposable_gate(manifest)
+        self.assertFalse(eligible)
+        self.assertTrue(any("/var/lib/gowave-auto-nginx" in reason for reason in reasons))
+
     def test_check_disposable_gate(self):
         clean = {
             "existing_gowave_dirs": [],
