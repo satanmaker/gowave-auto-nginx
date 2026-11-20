@@ -3,7 +3,9 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +22,7 @@ def node_sh_without_bundle(directory: Path) -> Path:
     return copy
 
 
-def capture_remote_script(directory, *command) -> str:
+def capture_remote_script(directory, *command, extra_env=None) -> str:
     """Run a remote-* subcommand against a mock ssh and return the streamed script."""
     directory = Path(directory)
     known_hosts = directory / "known_hosts"
@@ -38,6 +40,8 @@ def capture_remote_script(directory, *command) -> str:
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["SSH_KNOWN_HOSTS"] = str(known_hosts)
     env["SECRET_KEY"] = "bW9jay1zZWNyZXQ="
+    if extra_env:
+        env.update(extra_env)
     result = subprocess.run(
         [str(REPO_ROOT / "gowave-node-auto.sh"), *command],
         env=env, capture_output=True, text=True,
@@ -45,6 +49,80 @@ def capture_remote_script(directory, *command) -> str:
     if result.returncode != 0:
         raise AssertionError(f"stdout: {result.stdout}, stderr: {result.stderr}")
     return capture.read_text()
+
+
+#: Takes the Worker's mutation lock the way the live runner's `RemotePairLock`
+#: does — an exclusive `flock` with the lease naming the holder published beside
+#: the lock — and then runs the finalizer in a process of its own. The holder
+#: stays the finalizer's parent so both live in one user namespace: a process in
+#: a child namespace cannot read the descriptor targets of one outside it, which
+#: would make the validator's own check fail for a reason the Worker never sees.
+LOCK_HOLDER_DRIVER = """
+import fcntl, json, os, subprocess, sys
+lock_path, lease_path, holder_token, finalizer, result_path = sys.argv[1:6]
+fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+with open(lease_path, "w", encoding="utf-8") as stream:
+    json.dump({"run_id": "run-test", "host": "127.0.0.1",
+               "holder_pid": os.getpid(), "lease_token": holder_token}, stream)
+result = subprocess.run(["bash", finalizer], capture_output=True, text=True)
+with open(result_path, "w", encoding="utf-8") as stream:
+    json.dump({"returncode": result.returncode, "stdout": result.stdout,
+               "stderr": result.stderr}, stream)
+"""
+
+
+def run_rendered_finalizer(directory, transaction, lease_token, holder_token=None):
+    """Run the finalize script the product streams while a real holder owns the lock.
+
+    `lease_token` is what the rendered script presents; `holder_token` is what the
+    live lease names, so the two differ when another run's lease is borrowed.
+    """
+    directory = Path(directory)
+    render_dir = directory / "render"
+    render_dir.mkdir()
+    script = capture_remote_script(
+        render_dir, "remote_finalize", "127.0.0.1", "22", "root",
+        extra_env={
+            "ACME_TX_ID": transaction.name,
+            "GOWAVE_WORKER_LEASE_TOKEN": lease_token,
+        },
+    )
+    root_line = 'recovery_root="/var/lib/gowave-auto-nginx/recovery"'
+    if script.count(root_line) != 1:
+        raise AssertionError("the streamed finalizer no longer names one recovery root")
+    finalizer = render_dir / "finalize.sh"
+    finalizer.write_text(
+        script.replace(root_line, f'recovery_root="{transaction.parent}"'), encoding="utf-8"
+    )
+
+    lock = directory / "gowave-managed-mutation.lock"
+    lease = directory / "gowave-mutation-lease.json"
+    result_path = directory / "finalizer-result.json"
+    env = os.environ.copy()
+    env["MUTATION_LOCK_FILE"] = str(lock)
+    env["MUTATION_LEASE_FILE"] = str(lease)
+    command = [
+        sys.executable, "-c", LOCK_HOLDER_DRIVER,
+        str(lock), str(lease), holder_token or lease_token, str(finalizer), str(result_path),
+    ]
+    if os.geteuid() != 0:
+        # The root guard is part of what the Worker runs, so the script is not
+        # relaxed for the test: holder and finalizer both run as uid 0 in a user
+        # namespace, which keeps the validator's owner, liveness and descriptor
+        # checks meaningful.
+        unshare = shutil.which("unshare")
+        if not unshare or subprocess.run(
+            [unshare, "-r", "true"], capture_output=True
+        ).returncode != 0:
+            raise unittest.SkipTest("this host cannot grant the finalizer its root guard")
+        command = [unshare, "-r", "--", *command]
+    driver = subprocess.run(command, env=env, capture_output=True, text=True)
+    if not result_path.exists():
+        raise AssertionError(f"the finalizer never ran: {driver.stdout}{driver.stderr}")
+    recorded = json.loads(result_path.read_text(encoding="utf-8"))
+    return subprocess.CompletedProcess(command, recorded["returncode"],
+                                       recorded["stdout"], recorded["stderr"])
 
 
 class TestNodeIntegration(unittest.TestCase):
@@ -760,6 +838,67 @@ class TestNodeIntegration(unittest.TestCase):
         self.assertIn('remote_rollback "$ip" "$ssh_port" "$worker_domain" "$reality_domain" "$ssh_user"', finalizer)
         self.assertIn("rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIALS_FILE')", finalizer)
         self.assertIn("return 1", commit_block)
+
+    def test_the_rendered_finalizer_accepts_the_lock_lease_of_the_run_that_owns_it(self):
+        """The streamed finalize script honours the pair lock's lease.
+
+        Measured on the live pair: `remote_finalize` took `flock` directly while the
+        run that installed the Worker held that same lock through `RemotePairLock`,
+        so the finalizer answered "Another process currently holds the mutation
+        lock", the verified install kept its snapshot, and every later install on
+        the Worker was refused as an unfinalized transaction.
+
+        The script under test is the one the product renders (a mock `ssh` captures
+        the stream) with only its recovery root rewritten into a temporary
+        directory; the root guard, the lock paths and the lease check are what the
+        Worker receives. The lock is taken by a real holder that publishes a real
+        lease, so the validator's owner, liveness and descriptor checks all run
+        against a live process, and the finalizer still fails its own `flock`.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            token = "lease-token-of-the-owning-run"
+            transaction = root / "recovery" / "worker_install_test_1_1"
+            transaction.mkdir(parents=True)
+            result = run_rendered_finalizer(root, transaction, lease_token=token)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Worker ACME recovery snapshot finalized", result.stderr)
+            self.assertFalse(transaction.exists())
+
+    def test_the_rendered_finalizer_refuses_another_runs_lease(self):
+        """A lease that names a different run buys the finalizer nothing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            transaction = root / "recovery" / "worker_install_test_1_1"
+            transaction.mkdir(parents=True)
+            result = run_rendered_finalizer(
+                root, transaction,
+                lease_token="a-borrowed-token",
+                holder_token="the-owning-runs-token",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Another process currently holds the mutation lock", result.stderr)
+            self.assertTrue(transaction.exists())
+
+    def test_every_finalize_call_hands_over_the_runs_lease(self):
+        """A finalize call that drops the token is refused by the lock it must honour.
+
+        The Worker-side fix is only reachable if the controller passes the lease
+        into `remote_finalize`; `node add` and `node reapply` each hold a session
+        that already carries it, and an inherited environment is not a contract.
+        """
+        lines = (REPO_ROOT / "gowave-auto.sh").read_text().splitlines()
+        call_sites = [
+            index for index, line in enumerate(lines)
+            if 'gowave-node-auto.sh" remote_finalize' in line
+        ]
+        self.assertEqual(len(call_sites), 2, call_sites)
+        for index in call_sites:
+            handed = "\n".join(lines[max(0, index - 3):index + 1])
+            self.assertIn(
+                'GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}"', handed,
+                f"the finalize call at line {index + 1} does not pass the run's lease",
+            )
 
     def test_worker_acme_snapshot_is_retained_until_controller_commit(self):
         """The remote payload must preserve its ACME before-image until the controller commits."""

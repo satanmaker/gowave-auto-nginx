@@ -1102,6 +1102,7 @@ write_journal_atomically('$JOURNAL_FILE', jdata)
                 return 1
             fi
             if ! ACME_TX_ID="$acme_tx_id" SSH_KNOWN_HOSTS="$known_hosts" \
+                GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
                 "$SCRIPT_DIR/gowave-node-auto.sh" remote_finalize "$ip" "$ssh_port" "$ssh_user"; then
                 echo "WARNING: Worker '$name' is committed and deployed, but its ACME recovery snapshot could not be finalized; snapshot retained for manual cleanup." >&2
             fi
@@ -1293,6 +1294,7 @@ PY
                 return 1
             fi
             if ! ACME_TX_ID="$acme_tx_id" SSH_KNOWN_HOSTS="$known_hosts" \
+                GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \
                 "$SCRIPT_DIR/gowave-node-auto.sh" remote_finalize "$ip" "$ssh_port" "$ssh_user"; then
                 echo "WARNING: Worker '$name' was re-applied, but its ACME recovery snapshot could not be finalized." >&2
             fi
