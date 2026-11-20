@@ -449,6 +449,24 @@ class TestWizardEntry(unittest.TestCase):
         self.assertIn("Usage: gowave-auto.sh install", result.stderr)
         self.assertIn("terminal", result.stderr)
 
+    def test_a_partial_install_without_a_terminal_names_the_missing_arguments(self):
+        # A flag-only invocation used to fall through to the prompts, and `read`
+        # under `set -e` exited 1 with nothing on either stream.
+        result = subprocess.run(
+            ["bash", str(GOWAVE_AUTO), "install", "--panel-only"],
+            stdin=subprocess.DEVNULL,
+            text=True,
+            capture_output=True,
+            timeout=120,
+            env={k: v for k, v in os.environ.items() if k != "GOWAVE_WIZARD_LANG"},
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("Usage: gowave-auto.sh install", result.stderr)
+        for argument in ("the panel or worker name", "the camouflage name", "the acme email"):
+            with self.subTest(argument=argument):
+                self.assertIn(argument, result.stderr)
+        self.assertNotIn("needs a terminal to run the setup wizard", result.stderr)
+
     def test_the_wizard_is_unreachable_when_any_argument_is_present(self):
         result = bash(
             f"source {shlex.quote(str(INSTALL_ARGS_SH))}\n"
