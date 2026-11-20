@@ -38,3 +38,17 @@ traffic plane is absent by design: Panel active and serving over 443, no Node un
 - **WHEN** the runner reads `state.json` over SSH
 - **THEN** it records the Panel-only mode, an empty node list, and no local-node identifiers, and the runner's
   certificate audit expects exactly the Panel and camouflage lineages rather than the All-in-One set
+
+#### Scenario: The panel-only subscription carries one traffic plane
+
+- **GIVEN** the Panel-only Master installation registered its first worker
+- **WHEN** the runner fetches `default-user`'s Xray and Mihomo subscriptions
+- **THEN** each carries four endpoints per deployed traffic plane, plus one per configured Vision domain, and the
+  runner's expected count is derived from the install mode rather than from the two-node default
+
+#### Scenario: The panel-only Master is verified for the listener it should not have
+
+- **GIVEN** a Panel-only Master that deploys no traffic plane
+- **WHEN** the runner verifies the Master's control port
+- **THEN** it requires that nothing listens on `3002` and that the port is unreachable from the Control Machine,
+  rather than requiring a loopback connection to a listener this mode never starts

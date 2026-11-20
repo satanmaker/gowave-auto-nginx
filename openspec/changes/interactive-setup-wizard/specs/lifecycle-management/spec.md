@@ -65,6 +65,32 @@ and no local-node identifier, so later commands do not treat an absent local nod
 - **WHEN** `gowave-auto.sh node list` runs
 - **THEN** it reports that no nodes are registered and exits 0
 
+### Requirement: The first worker assigns the panel-only default user
+
+A Panel-only installation creates `default-user` before any inbound exists, so `node add` SHALL put that user into
+the squad it provisions when, and only when, that user holds no squad. A user that already holds a squad SHALL be
+left as the operator set it, and the assignment SHALL be journalled so a failed registration takes it back off.
+
+#### Scenario: The squadless default user receives the new node's endpoints
+
+- **GIVEN** a Panel-only installation whose `default-user` holds no internal squad
+- **WHEN** `gowave-auto.sh node add` registers the first worker
+- **THEN** the Panel is told to assign that user the squad just created, and the user's subscription answers the
+  node's own endpoints rather than a placeholder
+
+#### Scenario: A user that already holds a squad is left alone
+
+- **GIVEN** a `default-user` already assigned to an operator-created squad
+- **WHEN** `gowave-auto.sh node add` registers a new worker
+- **THEN** the user's squad list is unchanged and the registration still completes
+
+#### Scenario: A failed registration takes the assignment back off
+
+- **GIVEN** a `node add` that assigned the squadless user and then failed
+- **WHEN** the compensating rollback runs
+- **THEN** the user's squad list is restored to the empty list the journal recorded, and the rollback reports its
+  outcome rather than a partial success
+
 ### Requirement: Host records carry a provisioned squad identifier
 
 Every host record SHALL carry the identifier of the internal squad provisioned for its inbounds, and the node
