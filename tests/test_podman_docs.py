@@ -337,11 +337,16 @@ class TestPanelApiContract(unittest.TestCase):
                 )
 
     def test_the_client_update_is_recorded_as_a_gap_not_as_not_applicable(self):
-        rows = [row for row in api_rows() if "PATCH /api/users" in row["endpoint"]]
+        rows = {row["endpoint"].strip("`"): row for row in api_rows() if "PATCH /api/users" in row["endpoint"]}
         self.assertEqual(len(rows), 2, "the map must record both client-update routes the pinned Panel serves")
-        for row in rows:
-            with self.subTest(endpoint=row["endpoint"]):
-                self.assertIn("coverage gap", row["caller"], "a supported route with no caller is a gap, not a NOT_APPLICABLE")
+        self.assertIn(
+            "coverage gap", rows["PATCH /api/users"]["caller"],
+            "a supported route with no caller is a gap, not a NOT_APPLICABLE",
+        )
+        self.assertIn(
+            "attach_squad_to_user", rows["PATCH /api/users/{userId}"]["caller"],
+            "the row a Panel-only plan reaches through the user it attaches must name that caller",
+        )
         self.assertIn("not a `NOT_APPLICABLE`", api_section())
 
     def test_the_page_pins_the_user_agent_policy_per_path(self):
