@@ -30,21 +30,27 @@ ruleset:
   required_status_checks:
     - All-in-One Podman Acceptance
     - Multi-Node Podman Acceptance
+    - Panel-only Podman Acceptance
     - All-in-One Lifecycle and Recovery Acceptance
     - Multi-Node Lifecycle and Recovery Acceptance
 
 # One entry per required check. `topology` and `group` say which half of the
 # matrix the job proves; the audit reads them back out of the job's own command
 # line, so a job that runs the other topology fails here rather than in a
-# review. `events` is what the job's `if:` must allow: the two full suites run
+# review. `events` is what the job's `if:` must allow: the three full suites run
 # on every push as well, the two recovery jobs only where a review can stop the
-# merge, because a push already spends the minutes on the full pair.
+# merge, because a push already spends the minutes on the full set.
 #
 # `timeout_minutes` has to outlive the suite it runs: the suite stops at the
 # `runtime_budget_seconds` the matrix declares and reports what it did not run,
 # while a job GitHub kills at its timeout reports nothing. The audit requires
 # at least 15 minutes of headroom over that budget for checkout, the package
 # install, cleanup and the artifact upload.
+#
+# Panel-only has no recovery group: the mode owns no traffic plane, no backup of
+# a traffic plane and no channel update, so the `recovery` group it would be
+# required to prove is empty, and a check requiring an empty group is a check
+# that passes by having nothing to run.
 checks:
   - name: All-in-One Podman Acceptance
     topology: aio
@@ -58,6 +64,12 @@ checks:
     events: [push, pull_request, workflow_dispatch]
     timeout_minutes: 90
     artifact_prefix: podman-multi-node-
+  - name: Panel-only Podman Acceptance
+    topology: panel-only
+    group:
+    events: [push, pull_request, workflow_dispatch]
+    timeout_minutes: 90
+    artifact_prefix: podman-panel-only-
   - name: All-in-One Lifecycle and Recovery Acceptance
     topology: aio
     group: recovery

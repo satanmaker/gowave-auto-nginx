@@ -17,11 +17,12 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 
-# The four job names the repository ruleset requires. A rename here without the
+# The five job names the repository ruleset requires. A rename here without the
 # ruleset would leave a pull request waiting for a check that never reports.
 REQUIRED_CHECK_JOBS = {
     "All-in-One Podman Acceptance",
     "Multi-Node Podman Acceptance",
+    "Panel-only Podman Acceptance",
     "All-in-One Lifecycle and Recovery Acceptance",
     "Multi-Node Lifecycle and Recovery Acceptance",
 }

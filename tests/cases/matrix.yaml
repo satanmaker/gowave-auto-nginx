@@ -183,6 +183,24 @@ topologies:
     case_id_pattern: "MN-DP-{node}-{inbound}-{client}"
     runtime_budget_seconds: 4500
     gate: [pre-push, pr]
+  # The Panel and the static decoy on one host, with no traffic plane: no local
+  # node, no backend on 8443/8444 and no Vision inbound. It therefore owes no
+  # data-plane tuple — no case id pattern, no Vision combination and no positive
+  # count — and its own cases (host shape, API state, the squad a later node add
+  # creates) are declared by the suite rather than by this matrix. It is gated at
+  # `pr` only: the pull request runs it as its own required check, while the push
+  # gate keeps spending its minutes on the two traffic-plane suites.
+  #
+  # Its budget matches the Multi-Node one because it runs the same two heavy
+  # steps from that suite — a real install and a real `node add` — and the `pr`
+  # wave bounds one full wave plus one recovery wave at 4500 + 4500 s.
+  panel-only:
+    nodes: []
+    vision_combinations: []
+    positive_case_counts: {}
+    case_id_pattern: ""
+    runtime_budget_seconds: 4500
+    gate: [pr]
 
 runtime_budget:
   pre_push_total_seconds: 7200

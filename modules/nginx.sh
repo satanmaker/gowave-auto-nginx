@@ -196,6 +196,7 @@ generate_stream_config() {
     local if_inet6="${4:-/proc/net/if_inet6}"
     local vision_domain="${5:-${VISION_DOMAIN:-}}"
     local cover_domain="${6:-}"
+    local install_mode="${7:-${GOWAVE_INSTALL_MODE:-all-in-one}}"
 
     mkdir -p "$(dirname "$out_file")"
 
@@ -204,9 +205,18 @@ generate_stream_config() {
         listen_v6="listen [::]:443 so_keepalive=on;"
     fi
 
-    local vision_entry=""
-    if [[ -n "$vision_domain" ]]; then
-        vision_entry="    $vision_domain 127.0.0.1:8444;"
+    # Panel-only has no traffic plane to route to: the Panel name keeps its
+    # listener, while the camouflage name and every unknown name reach the
+    # static decoy instead of a closed 8443/8444 port.
+    local vision_entry="" reality_entry="" default_backend="127.0.0.1:8443"
+    if [[ "$install_mode" == "panel-only" ]]; then
+        reality_entry="    $reality_domain 127.0.0.1:9443;"
+        default_backend="127.0.0.1:9443"
+    else
+        reality_entry="    $reality_domain 127.0.0.1:8443;"
+        if [[ -n "$vision_domain" ]]; then
+            vision_entry="    $vision_domain 127.0.0.1:8444;"
+        fi
     fi
 
     # The camouflage apex terminates on the decoy listener directly: no reason
@@ -222,10 +232,10 @@ generate_stream_config() {
 # Managed by GoWave Auto NGINX: Port 443 Stream SNI Router
 map \$ssl_preread_server_name \$sni_backend {
     $panel_domain 127.0.0.1:7443;
-    $reality_domain 127.0.0.1:8443;
+$reality_entry
 $vision_entry
 $cover_entry
-    default 127.0.0.1:8443;
+    default $default_backend;
 }
 
 server {

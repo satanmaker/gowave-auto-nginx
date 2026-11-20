@@ -6856,6 +6856,9 @@ remote_finalize() {
 
     {
         printf 'export ACME_TX_ID=%q\n' "$acme_tx_id"
+        # A finalization is a mutation too: the run that owns the Worker's lock
+        # passes its lease here, and one started by anyone else still refuses.
+        printf 'export GOWAVE_LEASE_TOKEN=%q\n' "${GOWAVE_WORKER_LEASE_TOKEN:-}"
         cat <<'FINALIZE_REMOTE_SCRIPT'
 set -Eeuo pipefail
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -6882,8 +6885,76 @@ if [[ ! -d "$transaction_dir" ]]; then
     echo "Error: Worker ACME snapshot path is not a directory." >&2
     exit 1
 fi
-lock_dir="/run/lock"
-lock_file="$lock_dir/gowave-managed-mutation.lock"
+# Root-only, so the module's non-root lock fallback cannot apply here.
+MUTATION_LOCK_FILE="${MUTATION_LOCK_FILE:-/run/lock/gowave-managed-mutation.lock}"
+MUTATION_LEASE_FILE="${MUTATION_LEASE_FILE:-/run/lock/gowave-mutation-lease.json}"
+
+validate_mutation_lease() {
+    local candidate_token="$1"
+    local lease_file="${2:-$MUTATION_LEASE_FILE}"
+    local lock_file="${3:-$MUTATION_LOCK_FILE}"
+
+    python3 - "$candidate_token" "$lease_file" "$lock_file" <<'PY'
+import json
+import os
+import sys
+
+token, lease_path, lock_path = sys.argv[1:4]
+
+if not os.path.exists(lease_path):
+    sys.exit(1)
+
+if os.path.islink(lease_path):
+    sys.exit(1)
+
+st = os.stat(lease_path)
+if os.geteuid() == 0 and st.st_uid != 0:
+    sys.exit(1)
+
+try:
+    with open(lease_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(1)
+
+expected_token = data.get("lease_token", "")
+holder_pid = data.get("holder_pid")
+
+if not expected_token or expected_token != token:
+    sys.exit(1)
+
+if not holder_pid or not isinstance(holder_pid, int):
+    sys.exit(1)
+
+try:
+    os.kill(holder_pid, 0)
+except OSError:
+    sys.exit(1)
+
+fd_dir = f"/proc/{holder_pid}/fd"
+if os.path.exists(fd_dir):
+    try:
+        real_lock = os.path.realpath(lock_path)
+        has_fd = False
+        for fd in os.listdir(fd_dir):
+            try:
+                target = os.path.realpath(os.path.join(fd_dir, fd))
+                if target == real_lock:
+                    has_fd = True
+                    break
+            except Exception:
+                continue
+        if not has_fd:
+            sys.exit(1)
+    except Exception:
+        pass
+
+sys.exit(0)
+PY
+}
+
+lock_dir="$(dirname "$MUTATION_LOCK_FILE")"
+lock_file="$MUTATION_LOCK_FILE"
 if [[ -L "$lock_dir" || -L "$lock_file" ||
       ( -e "$lock_file" && ! -f "$lock_file" ) ]]; then
     echo "Error: Mutation lock path is unsafe." >&2
@@ -6894,8 +6965,16 @@ mkdir -p "$lock_dir"
 chmod 0600 "$lock_file"
 exec 9>>"$lock_file"
 if ! flock -n 9; then
-    echo "Error: Another process currently holds the mutation lock." >&2
-    exit 1
+    # The run that owns this host holds the lock from a session of its own and
+    # publishes a lease for the work it starts; finalizing the snapshot that
+    # run's own install produced is such work. Refusing the lease here left a
+    # verified install's snapshot in place, and every later install on the host
+    # then refused with an unfinalized transaction.
+    if [[ -z "${GOWAVE_LEASE_TOKEN:-}" ]] \
+        || ! validate_mutation_lease "$GOWAVE_LEASE_TOKEN" "$MUTATION_LEASE_FILE" "$MUTATION_LOCK_FILE"; then
+        echo "Error: Another process currently holds the mutation lock." >&2
+        exit 1
+    fi
 fi
 rm -rf -- "$transaction_dir"
 echo "Worker ACME recovery snapshot finalized." >&2

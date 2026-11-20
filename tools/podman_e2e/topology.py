@@ -1201,6 +1201,10 @@ class MultiNodeTopology(AioTopology):
     # happens to enable.
     ipv6_host: bool = True
     target_role: str = "master"
+    # The prefix the registration's own two evidence files are named under. A
+    # topology that reuses this command names them after itself, so a run
+    # directory never files one contour's dispatch under another's name.
+    node_add_evidence_prefix: str = "mn-node-add"
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -1612,8 +1616,8 @@ class MultiNodeTopology(AioTopology):
             duration=time.monotonic() - started,
             command=script,
         )
-        self.context.evidence_text("mn-node-add.stdout.log", outcome.stdout)
-        self.context.evidence_text("mn-node-add.stderr.log", outcome.stderr)
+        self.context.evidence_text(f"{self.node_add_evidence_prefix}.stdout.log", outcome.stdout)
+        self.context.evidence_text(f"{self.node_add_evidence_prefix}.stderr.log", outcome.stderr)
         return outcome
 
     def evidence(self, outcome: Optional[InstallOutcome] = None) -> Dict[str, Any]:
@@ -1631,4 +1635,79 @@ class MultiNodeTopology(AioTopology):
             "roles_started": list(self.started),
             "pre_install_worker": getattr(self, "worker_clean_facts", {}),
         })
+        return record
+
+
+@dataclass
+class PanelOnlyTopology(MultiNodeTopology):
+    """The Panel and the static decoy on one host, its workers somewhere else.
+
+    ``gowave-auto.sh install --panel-only`` deploys the Panel, the decoy and
+    nothing that listens for tunnel traffic: no GoWave Node, no Xray, no inbound
+    port. A Panel-only deployment has no local node, so every worker it ever has
+    arrives through the operator's own ``node add`` — which is why this topology
+    starts the same clean Worker host the Multi-Node one does. A registration
+    that no host could receive cannot be proven, and the first registration after
+    this install is exactly what the squad fix has to answer for.
+
+    What it keeps from the Master contour is the Panel, the resolver, the ACME
+    fixture and the API; what it drops is the traffic plane and the Vision
+    lineage, which this mode has nowhere to terminate.
+    """
+
+    # The Master's IPv6 stack is not part of what this mode claims, so the host
+    # keeps the plain IPv4 shape the All-in-One contour installs.
+    ipv6_host: bool = False
+    target_role: str = "panel-only"
+    # The registration is the same product command the Multi-Node contour runs,
+    # and its evidence must not be filed under that contour's prefix.
+    node_add_evidence_prefix: str = "panel-only-node-add"
+
+    def __post_init__(self) -> None:
+        if self.vision_domain is not None or self.worker_vision_domain is not None:
+            raise ValueError(
+                "the Panel-only topology deploys no traffic plane, so it has no Vision domain"
+            )
+        super().__post_init__()
+        # The host is not an All-in-One one, and two topologies in one run
+        # directory must not share a container name.
+        self.target_name = self.context.resource_name("panel")
+
+    def roles(self) -> List[Dict[str, Any]]:
+        """The Multi-Node inventory with the Master described as what it now is."""
+        inventory = super().roles()
+        for role in inventory:
+            if role["role"] == "master":
+                role["role"] = "panel"
+                role["purpose"] = (
+                    "Panel-only host the operator installs: Panel, NGINX and the static decoy, "
+                    "with no Node, Xray or inbound listener."
+                )
+        return inventory
+
+    def install_script(self, vision_domain: Optional[str] = None) -> str:
+        """The operator's Panel-only command, which carries no Vision argument.
+
+        ``_install`` offers every topology a domain slot because the All-in-One
+        install can be re-run against a name that will fail to be issued; this
+        mode has nowhere to terminate one, so a request for it is refused here
+        instead of being dropped from the command line.
+        """
+        if vision_domain is not None:
+            raise ValueError(
+                "the Panel-only topology deploys no traffic plane, so it has no Vision domain"
+            )
+        arguments = [self.panel_domain, self.reality_domain, self.admin_email]
+        quoted = " ".join(f"'{value}'" for value in arguments)
+        return f"bash {REPO_IN_CONTAINER}/gowave-auto.sh install --panel-only {quoted}"
+
+    def install(self) -> InstallOutcome:
+        return self._install("panel-only-install")
+
+    def reinstall(self) -> InstallOutcome:
+        return self._install("panel-only-reinstall")
+
+    def evidence(self, outcome: Optional[InstallOutcome] = None) -> Dict[str, Any]:
+        record = super().evidence(outcome)
+        record["installation_mode"] = "panel-only"
         return record

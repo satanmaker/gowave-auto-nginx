@@ -55,6 +55,8 @@ from live_vps.subscriptions import (
     verify_user_agent_policy,
     fetch_and_validate_xray_subscription,
     fetch_and_validate_mihomo_subscription,
+    expected_proxy_count,
+    installed_node_count,
 )
 from live_vps.firewall import verify_master_firewall, verify_worker_firewall
 from live_vps.nginx import (
@@ -572,6 +574,7 @@ def main() -> int:
             fw_m_res = verify_master_firewall(
                 master_ssh, config.master_ip,
                 enable_ipv6=config.enable_ipv6, master_ipv6=config.master_ipv6,
+                has_local_node=config.install_mode != "panel-only",
             )
             fw_w_res = verify_worker_firewall(
                 master_ssh, worker_ssh, config.worker_ip,
@@ -585,15 +588,18 @@ def main() -> int:
             short_uuid = get_default_user_short_uuid(panel_client)
             ua_res = verify_user_agent_policy(config.master_panel_domain, short_uuid, ssl_ctx)
             vision_count = int(bool(config.master_vision_domain)) + int(bool(config.worker_vision_domain))
+            node_count = installed_node_count(config.install_mode)
             xray_sub_ok, xray_sub_res = fetch_and_validate_xray_subscription(
                 config.master_panel_domain, short_uuid, ssl_ctx,
                 vision_count=vision_count, ca_bundle_path=ca_bundle,
                 reality_fingerprint=config.reality_fingerprint,
+                node_count=node_count,
             )
             mih_sub_ok, mih_sub_res = fetch_and_validate_mihomo_subscription(
                 config.master_panel_domain, short_uuid, ssl_ctx,
                 vision_count=vision_count, ca_bundle_path=ca_bundle,
                 reality_fingerprint=config.reality_fingerprint,
+                node_count=node_count,
             )
 
             verification_statuses = [
@@ -649,7 +655,12 @@ def main() -> int:
             sweep_stale_captures(worker_ssh)
 
             # Fetch subscriptions
-            _, xray_sub_res = fetch_and_validate_xray_subscription(config.master_panel_domain, short_uuid, ssl_ctx, ca_bundle_path=ca_bundle)
+            traffic_node_count = installed_node_count(config.install_mode)
+            traffic_vision_count = int(bool(config.master_vision_domain)) + int(bool(config.worker_vision_domain))
+            _, xray_sub_res = fetch_and_validate_xray_subscription(
+                config.master_panel_domain, short_uuid, ssl_ctx, ca_bundle_path=ca_bundle,
+                vision_count=traffic_vision_count, node_count=traffic_node_count,
+            )
             mihomo_sub_url = f"https://{config.master_panel_domain}/api/sub/{short_uuid}/mihomo"
             req = urllib.request.Request(mihomo_sub_url, headers={"User-Agent": "mihomo"})
             with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
@@ -721,7 +732,11 @@ def main() -> int:
                 timeout=config.traffic_timeout,
             )
 
-            expected_per_client = 8 + int(bool(config.master_vision_domain)) + int(bool(config.worker_vision_domain))
+            # The traffic suite runs one case per delivered endpoint, so its expected
+            # case count is the same figure the subscription validator checks.
+            expected_per_client = expected_proxy_count(
+                vision_count=traffic_vision_count, node_count=traffic_node_count
+            )
             traffic_status = evaluate_traffic_suite_status(
                 test_traffic_verification=config.test_traffic_verification,
                 xray_results=xray_case_results,
@@ -752,6 +767,9 @@ def main() -> int:
                 panel_client=panel_client,
                 short_uuid=short_uuid,
                 ssl_context=ssl_ctx,
+                # NEG-05 installs through the same lock this run holds, so it
+                # needs the Master's lease the way `node add` does.
+                master_lease_token=getattr(remote_lock, "lease_tokens", {}).get(master_ssh.host),
             )
             state["results"]["negative"] = neg_res
             save_run_state(artifact_dir, state)

@@ -2,20 +2,22 @@
 
 ## Context
 
-`gowave-auto.sh install` takes `<panel> <reality> <email> [vision]`, prompts only for arguments it was not
-given (`gowave-auto.sh:202-226`), and unconditionally installs a local node at `:446`. The certificate step
-issues one lineage per host role (`:372`, `:389`, `:399`; worker equivalent at
-`gowave-node-auto.sh:2456-2481`), so a host spends two or three certificates, never one. The `:443` stream map is
+`gowave-auto.sh install` takes `<panel> <reality> <email> [vision]` and asks for whatever it was not given
+(`gowave-auto.sh:241-253`); before this change it installed a local node unconditionally, and Step 7 now skips
+that in Panel-only (`gowave-auto.sh:485-490`). The certificate step issues one lineage per host role
+(`gowave-auto.sh:411`, `:428`, `:438`; worker equivalent at `gowave-node-auto.sh:4655-4678`), so a host spends
+two or three certificates, never one. The `:443` stream map is
 a fixed literal (`modules/nginx.sh:192-250`): panel → 7443, reality → 8443, vision → 8444, cover → 9443, and
 `default` → 8443. The decoy vhost terminates on 9443 with the camouflage lineage
-(`modules/nginx.sh:501-541`). `modules/api_client.py:651` returns the internal squad identifier, `:698` puts it
-into every host record, and `gowave-auto.sh:846` ignores that return and reads `squadUuid` from `state.json`.
+(`modules/nginx.sh:511-545`). `modules/api_client.py:651` returns the internal squad identifier and `:697` puts it
+into every host record; `node add` used to discard that return and read `squadUuid` from `state.json`, which task
+2.1 replaced with the returned identifier (`gowave-auto.sh:641`, `:988`).
 
 Two SSH layers exist and must not be conflated: the product onboards a worker with a pre-pinned host key and
-`BatchMode=yes` (`gowave-auto.sh:726-734`, `gowave-node-auto.sh:3086`), while password bootstrap lives only in the
+`BatchMode=yes` (`gowave-node-auto.sh:2081-2089`, `:5358`), while password bootstrap lives only in the
 live operator (`tools/live_vps/operator.py:129-380`). The container suite drives the product positionally with no
-TTY (`tools/podman_e2e/topology.py:1026-1031`) and pins one distribution for both hosts
-(`tools/podman_e2e/multi_node.py:857-869`).
+TTY (`tools/podman_e2e/topology.py:1072-1084`) and pins one distribution for both hosts
+(`tools/podman_e2e/multi_node.py:953-967`).
 
 See `proposal.md` for motivation and `specs/` for the required behaviour.
 
@@ -139,11 +141,15 @@ own SNI map, and client links carry names rather than addresses — but three ca
 ### D9 — Acceptance drives the flag, not the wizard
 
 The Podman suite gains `--topology panel-only` as a third value alongside `aio` and `multi-node`; its install
-script emits the same command an operator would, with the flag and no TTY. Multi-node stays the 2.3 drive and
+script emits the same command an operator would, with the flag and no TTY. The mode is threaded through every
+place the harness enumerates topologies — the matrix entry, the entrypoint's value list, and
+`catalog.justified_exclusions`, which refuses a name the matrix does not declare and returns nothing to justify
+for a topology whose cases have not landed. Multi-node stays the 2.3 drive and
 gains a squad assertion. The live runner gains `INSTALL_MODE` so a disposable Master can prove the Panel-only
 mode. Sequencing is deliberate: the container contour proves the mode and the squad fix first, and the live
 contour follows in the same change only after that evidence exists. The four-distribution invariant
-(`tests/test_podman_docs.py:979`) and the one-distribution-per-run rule are unchanged.
+(`tests/test_podman_docs.py`, `test_the_product_declares_the_four_distributions_the_lock_pins`) and the
+one-distribution-per-run rule are unchanged.
 
 ## Risks / Trade-offs
 
@@ -155,6 +161,10 @@ contour follows in the same change only after that evidence exists. The four-dis
   the five-per-identifier-set limit still caps retries per host at five per week.
 - **Cross-OS combinations unverified** → recorded as unverified in `tasks.md` and never claimed as working. The
   OS gate stays as is; Ubuntu 22.04 remains rejected (`tests/test_os_detection.py:39-47`).
+- **The Panel-only live case is declared, not live-proven** → `INSTALL_MODE=panel-only` drives the flag and the
+  runner reads units, listeners, the decoy, `health`, `state.json`, and the lineage count back from the host, but
+  no run directory exists until task 7.3 produces one. Until it does, no claim rests on that reading: the
+  Panel-only evidence in this change is the container topology plus the unit level.
 - **`update`/`uninstall` on a Panel-only host** → both must tolerate a missing local node; `state.json` gains an
   optional mode field and a `schemaVersion` that does not change, so an older state is read as All-in-One.
 - **Temporary-access onboarding needs systemd on the node** → abort before authorising the key when the timer
@@ -162,7 +172,7 @@ contour follows in the same change only after that evidence exists. The four-dis
 - **i18n drift** → a test asserts identical key sets and that no wizard message is a bare literal.
 - **A wizard prompt reaching a container run hangs the suite** → `install` with no arguments and no terminal exits
   non-zero with usage; a readiness test refuses TTY-dependent code in the acceptance path
-  (`tests/test_podman_readiness.py:71-74` already refuses `input()` in tests).
+  (`tests/test_podman_readiness.py`, `test_no_interactive_input_calls`, already refuses `input()` in tests).
 
 ## Migration Plan
 

@@ -11,15 +11,21 @@ open: a job deleted from the workflow still reads as an expected check in a
 review, and a required check nothing publishes blocks everybody but the bypass
 actor. `--check` judges the checked-in half offline, `--live` reads the ruleset
 back and refuses a difference, and `--artifacts` answers the other question the
-ruleset answers on GitHub — whether the pair of topologies passed at one commit,
-because "the acceptance suite passed" is a claim about both.
+ruleset answers on GitHub — whether every topology a required check proves
+passed at one commit, because "the acceptance suite passed" is a claim about all
+of them. The width of that aggregate is read from the contract's own checks
+rather than restated here, so a check added for a new topology enters it without
+another edit; Panel-only entered it the same way when its job was added, and is
+judged there against the case list its suite declares, because a mode with no
+traffic plane owes no data-plane count.
 
 The aggregate is deliberately not a job. A job that runs one topology cannot
-hide the other, since the ruleset requires four names; a job that ran both would
-be exactly the aggregate the design forbids, so the audit refuses one. The
-proof that a skipped topology cannot read as PASS is therefore structural: the
-required set covers both topologies at full width and at recovery width, and
-that set is what `--check` and `--live` keep in place.
+hide another, since the ruleset requires one name per product check; a job that
+ran both would be exactly the aggregate the design forbids, so the audit refuses
+one. The proof that a skipped topology cannot read as PASS is therefore
+structural: the required set covers every topology at full width and the two
+shared by a recovery group at recovery width, and that set is what `--check` and
+`--live` keep in place.
 """
 from __future__ import annotations
 
@@ -54,6 +60,27 @@ GATE_HEADROOM_SECONDS = 900
 def load_contract(path: Path = CONTRACT_PATH) -> Dict[str, Any]:
     """The gate contract as written, without a second copy in Python."""
     return yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+
+
+def required_topologies(contract: Optional[Dict[str, Any]] = None) -> Tuple[str, ...]:
+    """Every topology a required check proves, in the contract's order.
+
+    The aggregate has to cover the whole required set, and the set is written
+    down once — in the contract's ``checks`` — so it is read from there instead
+    of being restated as a second list that a sixth check could leave behind.
+    """
+    contract = load_contract() if contract is None else contract
+    ordered: List[str] = []
+    for check in contract.get("checks") or []:
+        topology = str((check or {}).get("topology") or "")
+        if topology and topology not in ordered:
+            ordered.append(topology)
+    return tuple(ordered)
+
+
+# The widths the aggregate judges: aio, multi-node and panel-only as the
+# contract stands, and whatever a later check adds.
+TOPOLOGIES = required_topologies()
 
 
 def load_workflow(
@@ -172,12 +199,31 @@ def contract_problems(
     for topology in TOPOLOGIES:
         if topology not in full:
             problems.append(f"no required check runs the full {topology} suite")
+    # Only a topology the recovery group selects cases for can be required to
+    # run them. Panel-only provisions no traffic plane and no backup of one, so a
+    # check requiring its recovery cases would pass by having nothing to run;
+    # the requirement follows the group, not the list of topologies.
+    for topology in groups.GROUP_CASES[groups.RECOVERY]:
         if topology not in recovery:
             problems.append(f"no required check runs the {topology} recovery cases")
     for check in checks:
         group = check.get("group")
-        if group and group not in groups.GROUPS:
+        if not group:
+            continue
+        if group not in groups.GROUPS:
             problems.append(f"{check.get('name')!r} requires the unknown case group {group!r}")
+            continue
+        # A recovery check exists to make a deleted case a red verdict. A group
+        # that selects nothing for this topology would do the opposite: the run
+        # would be required to prove an empty set and would pass by having
+        # nothing to run, which is the green-looking outcome the group exists to
+        # refuse.
+        try:
+            groups.required_ids(str(group), str(check.get("topology")))
+        except ValueError as exc:
+            problems.append(
+                f"{check.get('name')!r} requires the {group} cases, and {exc}"
+            )
 
     for check in checks:
         name = check.get("name")
@@ -200,16 +246,28 @@ def _budget_problems(contract: Dict[str, Any]) -> List[str]:
     the pair of topologies behind ``pre-push`` and the two overlapping waves
     behind ``pr`` each have a declared wall clock, and a topology budget raised
     without raising the total would make the tier claim a bound it cannot keep.
+
+    The budgets are read for every topology the manifest declares, not only for
+    the two ``TOPOLOGIES`` the aggregate judges: a check that names a third one
+    would otherwise be exempt from the headroom rule and from the tiers that
+    spend its minutes, which is exactly the silent undercount this function
+    exists to refuse.
     """
     problems: List[str] = []
     manifest = matrix.load()
+    checks = contract.get("checks") or []
+    names: List[str] = list(TOPOLOGIES)
+    for candidate in [str(check.get("topology")) for check in checks] + list(
+        (manifest.get("topologies") or {}).keys()
+    ):
+        if candidate not in names:
+            names.append(candidate)
     budgets: Dict[str, int] = {}
-    for topology in TOPOLOGIES:
+    for topology in names:
         try:
             budgets[topology] = matrix.runtime_budget_seconds(manifest, topology)
         except KeyError as exc:
             problems.append(str(exc))
-    checks = contract.get("checks") or []
     for check in checks:
         name = check.get("name")
         budget = budgets.get(str(check.get("topology")))
@@ -444,7 +502,7 @@ def _read_result(run: Path) -> Tuple[Optional[Dict[str, Any]], str]:
 
 
 def aggregate_problems(directory: Path) -> List[str]:
-    """Judge the pair of topologies, not one run of one topology.
+    """Judge every topology a required check proves, not one run of one.
 
     Only the newest finished run of each topology is read, because that is what
     a reviewer would look at: an older green run of the same topology does not
@@ -508,7 +566,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for problem in problems:
                 print(f"  - {problem}")
             return 1
-        print(f"gate: both topologies passed at one commit under {arguments.artifacts}")
+        print(f"gate: every required topology passed at one commit under {arguments.artifacts}")
         return 0
     if not arguments.check and not arguments.live:
         parser.error("nothing to do: pass --check, --live or --artifacts")

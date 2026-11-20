@@ -24,12 +24,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from tools.podman_e2e import (  # noqa: E402
-    aio, catalog, diagnostics, groups, matrix, multi_node, target_image,
+    aio, catalog, diagnostics, groups, matrix, multi_node, panel_only, target_image,
 )
 from tools.podman_e2e.podman import Podman  # noqa: E402
 from tools.podman_e2e.runner import Case, RunContext, Runner  # noqa: E402
 
-TOPOLOGIES = ("aio", "multi-node")
+TOPOLOGIES = ("aio", "multi-node", "panel-only")
 
 # The row every CI job installs on. Named here rather than inline because
 # `docs/PODMAN_E2E_DISCOVERY.md` §The OS matrix states which row executes, and a
@@ -47,6 +47,8 @@ def build_suite(
         return multi_node.cases(
             podman, distribution, vision=vision, worker_vision=worker_vision,
         )
+    if topology == "panel-only":
+        return panel_only.cases(podman, distribution)
     raise ValueError(f"unsupported topology: {topology!r}")
 
 
@@ -90,7 +92,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     if args.worker_vision and args.topology != "multi-node":
-        parser.error("--worker-vision configures a Worker, and the AIO topology has none")
+        parser.error(
+            f"--worker-vision configures a Worker, and the {args.topology} topology has none"
+        )
+    if args.vision and args.topology == "panel-only":
+        parser.error(
+            "--vision installs the optional inbound on a traffic plane, and the panel-only "
+            "topology has none"
+        )
     if args.require_group:
         try:
             groups.required_ids(args.require_group, args.topology)
@@ -158,13 +167,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # also leaves the state of the run's own containers. The hook reads state and
     # cannot change a verdict, and it runs before the cleanup that removes them.
     runner.on_failure(lambda result: diagnostics.collect(context, podman, result))
+    # The suite is built from Python objects while the catalog is a separate
+    # artifact, so a case could run under an id no audit knows. Refusing the
+    # disagreement here costs no product time: the install has not started.
     suite = build_suite(
         podman, args.topology, args.distribution,
         vision=args.vision, worker_vision=args.worker_vision,
     )
-    # The suite is built from Python objects while the catalog is a separate
-    # artifact, so a case could run under an id no audit knows. Refusing the
-    # disagreement here costs no product time: the install has not started.
     try:
         catalog.require_executable([(case.id, case.topology) for case in suite])
     except catalog.CatalogError as exc:
