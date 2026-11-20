@@ -1011,6 +1011,13 @@ if not squad_uuid:
         "The Panel returned no internal squad identifier; refusing to submit a host record with a null squad."
     )
 state_data["squadUuid"] = squad_uuid
+# The Panel-only install created default-user before any inbound existed, so that
+# user holds no squad and its subscription would answer "No Hosts Available".
+# Attaching it here is what makes a Panel-only plan deliver the node's endpoints;
+# a user that already holds a squad is left exactly as the operator set it.
+client.attach_squad_to_user("default-user", squad_uuid)
+journal["entities"] = client.transaction_entities
+write_journal_atomically(journal_path, journal)
 client.provision_hosts(
     profile_uuid, inbounds, node_uuid, squad_uuid,
     worker_domain, reality_domain, name,

@@ -15,6 +15,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GOWAVE_AUTO = REPO_ROOT / "gowave-auto.sh"
@@ -92,6 +93,10 @@ class GoWaveClient:
     def provision_user(self, username, squad_uuid, **kwargs):
         _log("provision_user", username, squad_uuid)
         return "short-stub"
+
+    def attach_squad_to_user(self, username, squad_uuid):
+        _log("attach_squad_to_user", username, squad_uuid)
+        return os.environ.get("STUB_ATTACH", "True") != "None"
 
     def ensure_api_token(self, **kwargs):
         _log("ensure_api_token")
@@ -439,6 +444,38 @@ class TestNodeSquadProvisioning(unittest.TestCase):
         self.assertIn("no internal squad identifier", finished.stderr)
         self.assertEqual([call["name"] for call in calls if call["name"] == "provision_hosts"], [])
         self.assertEqual(json.loads(state), original)
+
+    def test_the_default_user_joins_the_squad_before_the_host_records(self):
+        # Measured on the live pair: a Panel-only install creates default-user with
+        # no squad, and the Panel answered that user's subscription with its own
+        # "No Hosts Available" placeholder until the user was assigned the squad.
+        finished, calls, _ = self.run_node_add(
+            {"schemaVersion": 2, "installationMode": "panel-only", "nodes": []}, "squad-new"
+        )
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        order = [call["name"] for call in calls]
+        attach = [call for call in calls if call["name"] == "attach_squad_to_user"]
+        self.assertEqual(len(attach), 1, order)
+        self.assertEqual(attach[0]["args"], ["'default-user'", "'squad-new'"])
+        self.assertLess(order.index("provision_internal_squad"), order.index("attach_squad_to_user"))
+        self.assertLess(order.index("attach_squad_to_user"), order.index("provision_hosts"))
+
+    def test_an_already_assigned_user_does_not_stop_the_worker(self):
+        # An All-in-One node add finds the user already holding the squad, so the
+        # attach reports False and stops nothing; a Panel without that user reports
+        # None, which is the same answer as "nothing to attach".
+        for stub in ("False", "None"):
+            with self.subTest(stub=stub):
+                with mock.patch.dict(os.environ, {"STUB_ATTACH": stub}):
+                    finished, calls, state = self.run_node_add(
+                        {"schemaVersion": 2, "installationMode": "all-in-one", "nodes": []},
+                        "squad-existing",
+                    )
+                self.assertEqual(finished.returncode, 0, finished.stderr)
+                self.assertEqual(
+                    [call["name"] for call in calls].count("provision_hosts"), 1
+                )
+                self.assertEqual(json.loads(state)["nodes"][0]["name"], "worker-1")
 
 
 class _SquadHandler(http.server.BaseHTTPRequestHandler):

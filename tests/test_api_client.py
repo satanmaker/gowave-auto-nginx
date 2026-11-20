@@ -84,6 +84,14 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
             self.send_json(404, {"error": "Not found"})
 
     def do_GET(self):
+        if self.path.startswith("/api/users/by-username/"):
+            username = self.path.rsplit("/", 1)[-1]
+            user = self.users.get(username)
+            if user is None:
+                self.send_json(404, {"error": "User not found"})
+            else:
+                self.send_json(200, {"response": user})
+            return
         if self.path == "/api/system/tools/x25519/generate":
             self.send_json(200, {"response": {"keypairs": [{"privateKey": "priv-key-base64", "publicKey": "pub-key-base64"}]}})
         elif self.path == "/api/config-profiles":
@@ -157,6 +165,11 @@ class MockGoWaveServer(http.server.BaseHTTPRequestHandler):
             n_uuid = self.path.split("/")[-1]
             if n_uuid in self.nodes:
                 self.nodes[n_uuid].update(body)
+        elif self.path.startswith("/api/users/"):
+            u_id = self.path.split("/")[-1]
+            for user in self.users.values():
+                if str(user.get("uuid")) == u_id:
+                    user.update(body)
         self.send_json(200, {"response": {"status": "updated", **body}})
 
     def do_DELETE(self):
@@ -1474,6 +1487,92 @@ class TestRepeatedInstallContract(unittest.TestCase):
                 client.existing_reality_material("GoWave MVP Unified Profile - local-node",
                                                  "reality.example.com")
             )
+
+
+class TestAttachSquadToUser(unittest.TestCase):
+    """A Panel-only user is created without a squad and joins the first one."""
+
+    def setUp(self):
+        MockGoWaveServer.users = {}
+        MockGoWaveServer.squads = {}
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), MockGoWaveServer)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.daemon = True
+        self.thread.start()
+        self.client = GoWaveClient(f"http://127.0.0.1:{self.port}")
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def seed_user(self, squads):
+        MockGoWaveServer.users["default-user"] = {
+            "uuid": "user-1",
+            "username": "default-user",
+            "shortUuid": "suuid-12345",
+            "activeInternalSquads": squads,
+        }
+
+    def test_a_user_without_a_squad_joins_the_new_one(self):
+        self.seed_user([])
+        self.assertIs(self.client.attach_squad_to_user("default-user", "squad-1"), True)
+        self.assertEqual(
+            MockGoWaveServer.users["default-user"]["activeInternalSquads"], ["squad-1"]
+        )
+        # The attach is journalled with the state it replaced, so a failed node add
+        # takes the squad back off the user.
+        self.assertEqual(
+            self.client.transaction_entities,
+            [{
+                "type": "user",
+                "uuid": "user-1",
+                "action": "updated",
+                "before": {"activeInternalSquads": []},
+            }],
+        )
+
+    def test_a_user_that_already_holds_a_squad_is_left_alone(self):
+        self.seed_user([{"uuid": "squad-old", "name": "Operator Squad"}])
+        self.assertIs(self.client.attach_squad_to_user("default-user", "squad-1"), False)
+        self.assertEqual(
+            MockGoWaveServer.users["default-user"]["activeInternalSquads"],
+            [{"uuid": "squad-old", "name": "Operator Squad"}],
+        )
+        self.assertEqual(self.client.transaction_entities, [])
+
+    def test_an_absent_user_is_not_created(self):
+        self.assertIsNone(self.client.attach_squad_to_user("default-user", "squad-1"))
+        self.assertEqual(MockGoWaveServer.users, {})
+        self.assertEqual(self.client.transaction_entities, [])
+
+    def test_the_rollback_takes_the_squad_back_off_the_user(self):
+        MockGoWaveServer.registered_users["admin"] = "securepass1234567890"
+        self.seed_user([])
+        self.assertTrue(self.client.attach_squad_to_user("default-user", "squad-1"))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            journal = Path(tmpdir) / "journal.json"
+            state = Path(tmpdir) / "state.json"
+            credentials = Path(tmpdir) / "credentials.txt"
+            save_credentials(
+                "admin", "securepass1234567890", "https://panel.example.com", "token-xyz", str(credentials)
+            )
+            state.write_text(json.dumps({"schemaVersion": 2, "nodes": [{"name": "worker-1"}]}), encoding="utf-8")
+            write_journal_atomically(str(journal), {
+                "transaction_id": "node_add_worker-1",
+                "op": "node_add",
+                "state": "NODE_ADD_VERIFYING",
+                "node_name": "worker-1",
+                "timestamp": "2026-11-20T00:00:00Z",
+                "entities": self.client.transaction_entities,
+            })
+            self.assertTrue(
+                rollback_provisioning(
+                    str(journal), str(state), str(credentials),
+                    base_url=f"http://127.0.0.1:{self.port}",
+                )
+            )
+        self.assertEqual(MockGoWaveServer.users["default-user"]["activeInternalSquads"], [])
 
 
 if __name__ == "__main__":
