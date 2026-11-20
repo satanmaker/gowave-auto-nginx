@@ -349,6 +349,7 @@ SUITES = {
     ),
     "integration": (
         "test_api_client.TestAPIClient",
+        "test_api_client.TestAttachSquadToUser",
         "test_api_client.TestRepeatedInstallContract",
         "test_integration.TestIntegration",
     ),
