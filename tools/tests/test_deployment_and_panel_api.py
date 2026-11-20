@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT))
 
 from live_vps.deployment import (
+    STAGE_WORKER_KEY_COMMAND,
     master_install_command,
     parse_strace_argv_output,
     output_matches_expected_version,
@@ -127,6 +128,48 @@ class TestDeploymentAndPanelAPI(unittest.TestCase):
         self.assertIn("if (( managed_nginx_in_place == 0 ))", install)
         # The ACME stage must not add a competing :80 vhost beside the managed one.
         self.assertIn("if (( managed_nginx_in_place == 1 ))", install)
+
+    def test_the_staged_worker_key_rewrites_its_public_half(self):
+        # The live install aborted with "identity_sign: private key
+        # /root/.ssh/id_ed25519 contents do not match public": the Panel install
+        # leaves its own id_ed25519 pair on the Master, and staging only the private
+        # key made OpenSSH refuse the identity, so the Worker deploy never started.
+        self.assertIn("/root/.ssh/id_ed25519.pub", STAGE_WORKER_KEY_COMMAND)
+        key = Path(tempfile.mkdtemp(prefix="gowave-stage-key-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(key, ignore_errors=True))
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key / "staged")],
+            check=True,
+        )
+        # A stale public half, as the installed Panel leaves behind, names another key.
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key / "other")],
+            check=True,
+        )
+        (key / "ssh" / ".ssh").mkdir(parents=True)
+        (key / "ssh" / ".ssh" / "id_ed25519.pub").write_text(
+            (key / "other.pub").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        staged_dir = key / "ssh" / ".ssh"
+        command = STAGE_WORKER_KEY_COMMAND.replace("/root/.ssh", str(staged_dir))
+        subprocess.run(
+            ["bash", "-c", command],
+            input=(key / "staged").read_text(encoding="utf-8"),
+            text=True,
+            check=True,
+            capture_output=True,
+        )
+        derived = subprocess.run(
+            ["ssh-keygen", "-y", "-f", str(staged_dir / "id_ed25519")],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(
+            (staged_dir / "id_ed25519.pub").read_text(encoding="utf-8").split()[1],
+            derived.split()[1],
+        )
+        self.assertEqual(
+            oct((staged_dir / "id_ed25519.pub").stat().st_mode & 0o777), oct(0o644)
+        )
 
     def test_panel_binary_is_replaced_by_rename(self):
         """A running Panel locks its own inode, so the binary is staged and renamed over."""

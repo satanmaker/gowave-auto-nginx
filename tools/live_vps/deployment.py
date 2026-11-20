@@ -444,6 +444,19 @@ def _verify_panel_only_master(
     return True, details
 
 
+#: Stages the operator's Worker key in the Master's root SSH directory. The public
+#: half is rewritten from the private key rather than left as it was: a Master with
+#: the Panel installed already owns an id_ed25519 pair of its own, and OpenSSH 9.x
+#: refuses to use an identity whose .pub names another key ("private key contents do
+#: not match public"), which fails the whole Worker deployment.
+STAGE_WORKER_KEY_COMMAND = (
+    "mkdir -p -m 0700 /root/.ssh && cat > /root/.ssh/id_ed25519 && "
+    "chmod 0600 /root/.ssh/id_ed25519 && "
+    "ssh-keygen -y -f /root/.ssh/id_ed25519 > /root/.ssh/id_ed25519.pub && "
+    "chmod 0644 /root/.ssh/id_ed25519.pub"
+)
+
+
 def deploy_worker(
     master_ssh: SSHClient,
     worker_ssh: SSHClient,
@@ -470,7 +483,7 @@ def deploy_worker(
     worker_key_path = Path(config.worker_ssh_key_path or config.ssh_key_path).expanduser()
     if worker_key_path.is_file():
         master_ssh.run(
-            "mkdir -p -m 0700 /root/.ssh && cat > /root/.ssh/id_ed25519 && chmod 0600 /root/.ssh/id_ed25519",
+            STAGE_WORKER_KEY_COMMAND,
             input_data=worker_key_path.read_text(encoding="utf-8"),
         )
     worker_kh_path = Path(config.worker_known_hosts_path or config.ssh_known_hosts).expanduser()
