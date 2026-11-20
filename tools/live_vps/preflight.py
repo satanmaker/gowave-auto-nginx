@@ -189,11 +189,14 @@ def collect_remote_baseline(ssh: SSHClient) -> Dict[str, Any]:
                     listening_ports.add(int(port_str))
     manifest["listening_ports"] = sorted(listening_ports)
 
-    # 4. Existing GoWave directories
+    # 4. Existing GoWave directories. `/var/lib/gowave-auto-nginx` holds the
+    #    installer's recovery transactions: a leftover one there is refused by
+    #    the next install, so a host carrying it is not disposable either.
     gowave_dirs = [
         "/opt/gowave",
         "/opt/gowave-node",
         "/opt/gowave-auto-nginx",
+        "/var/lib/gowave-auto-nginx",
         "/var/www/gowave-auto-nginx",
         "/etc/nginx/stream-enabled",
     ]
