@@ -67,24 +67,33 @@ sudo python3 -m tools.run_podman_e2e --topology aio --require-group recovery
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--topology` | `aio` | `aio` (one host) or `multi-node` (Master and Worker). |
+| `--topology` | `aio` | `aio` (one host), `multi-node` (Master and Worker) or `panel-only` (Panel and the static decoy, no traffic plane). |
 | `--distribution` | `ubuntu-24.04` | Target alias from `tests/cases/images.lock.yaml`: `ubuntu-24.04`, `ubuntu-26.04`, `debian-12`, `debian-13`. |
-| `--vision` | off | Install the optional VLESS Vision inbound. The positive-case count becomes 10 instead of 8 (AIO) or 18/20 instead of 16 (Multi-Node). |
-| `--worker-vision` | off | Configure the same optional inbound on the Multi-Node Worker. Refused on `aio`, which has no Worker. |
+| `--vision` | off | Install the optional VLESS Vision inbound. The positive-case count becomes 10 instead of 8 (AIO) or 18/20 instead of 16 (Multi-Node). Refused on `panel-only`, which has no traffic plane to terminate it. |
+| `--worker-vision` | off | Configure the same optional inbound on the Multi-Node Worker. Refused on `aio`, which has no Worker, and on `panel-only`, which has no node. |
 | `--artifact-root` | `artifacts/podman-e2e` | Directory the run's own run directory is created under. |
-| `--budget-seconds` | the matrix's `runtime_budget_seconds`: `2700` (AIO), `4500` (Multi-Node) | Wall-clock deadline for the whole suite. It may be lowered, never raised. On exhaustion the cases that did not run are reported `INCOMPLETE`, never dropped and never made green. |
+| `--budget-seconds` | the matrix's `runtime_budget_seconds`: `2700` (AIO), `4500` (Multi-Node), `4500` (Panel-only) | Wall-clock deadline for the whole suite. It may be lowered, never raised. On exhaustion the cases that did not run are reported `INCOMPLETE`, never dropped and never made green. |
 | `--require-group` | — | Fail the run unless every case id of a declared group was present and passed. Today the only group is `recovery`. |
 
 Exit status is `0` only when `result.json` says `overall: PASS`; every other
 state exits `1`. Argument errors, including `--worker-vision` on the AIO
-topology, an unknown group and a `--budget-seconds` above the declared budget,
-exit `2` before any container is created.
+topology, `--vision` on Panel-only, an unknown group and a `--budget-seconds`
+above the declared budget, exit `2` before any container is created.
+
+`panel-only` drives the operator's own command — `gowave-auto.sh install
+--panel-only <panel> <camouflage> <email>`, with no fourth positional argument
+— and declares five cases against it: the install (`PO-INSTALL`), the shape of
+the host it leaves (`PO-HOST`), the Panel's read surface and `state.json`
+(`PO-API`), the squad the first registration creates (`PO-SQUAD`), and the
+Panel's answer to a null squad entry (`PO-SQUAD-REFUSED`). The registration runs
+through the operator's own `node add` against a second clean host, because a
+Panel-only deployment has no local node whose squad could be read.
 
 The deadline is the `runtime_budget_seconds` the manifest declares for the
-topology — 2700 s and 4500 s — and it is a ceiling rather than a default: a run
-that asks for more wall clock than the matrix promises has left the envelope the
-`pre-push` and `pr` tiers are defined by, so the entrypoint refuses it
-(`--budget-seconds` may only tighten). Every run also executes `GATE-BUDGET`
+topology — 2700 s, 4500 s and 4500 s — and it is a ceiling rather than a
+default: a run that asks for more wall clock than the matrix promises has left
+the envelope the `pre-push` and `pr` tiers are defined by, so the entrypoint
+refuses it (`--budget-seconds` may only tighten). Every run also executes `GATE-BUDGET`
 first, which asserts that deadline is inside the declared one and then produces
 an exhausted run of the real runner with no container at all, reading its report
 back to prove the unexecuted case is named and `overall` is `INCOMPLETE` rather
@@ -161,7 +170,10 @@ sudo python3 -m tools.podman_e2e.trace --verify-run artifacts/podman-e2e
 ```
 
 It exits `1` naming the run, the count and the shortfall; CI runs it after every
-acceptance suite. The full requirement → scenario → matrix row → case → test →
+acceptance suite. A topology with no data plane owes no count — the manifest
+states none for Panel-only — so its run is read against the case list its suite
+declares instead, and a case that did not run or did not pass is refused the
+same way. The full requirement → scenario → matrix row → case → test →
 CI job mapping, and the count itself, are published in
 [`docs/PODMAN_E2E_TRACEABILITY.md`](PODMAN_E2E_TRACEABILITY.md). That page also
 carries a `Named behaviours` table: one row per promise too narrow to be a
@@ -256,8 +268,9 @@ ids existed at all.
   ends. Every artifact writer passes text through `redact()`, and a file that
   changes when redacted is scrubbed and fails the run.
 - CI uploads `artifacts/podman-e2e/` on every outcome (`if: always()`) as
-  `podman-aio-<run_id>`, `podman-multi-node-<run_id>`, `podman-aio-recovery-<run_id>`
-  or `podman-multi-node-recovery-<run_id>`, retained for 14 days.
+  `podman-aio-<run_id>`, `podman-multi-node-<run_id>`, `podman-panel-only-<run_id>`,
+  `podman-aio-recovery-<run_id>` or `podman-multi-node-recovery-<run_id>`, retained
+  for 14 days.
 
 Prune local runs explicitly when their evidence is no longer needed:
 
@@ -301,23 +314,27 @@ sudo podman images --filter label=gowave.e2e.run
 
 ## CI
 
-`.github/workflows/podman-acceptance.yml` runs four jobs, and these are the
+`.github/workflows/podman-acceptance.yml` runs five jobs, and these are the
 required status checks of the repository ruleset:
 
 | Job | Command |
 | --- | --- |
 | All-in-One Podman Acceptance | `sudo python3 -m tools.run_podman_e2e --topology aio` |
 | Multi-Node Podman Acceptance | `sudo python3 -m tools.run_podman_e2e --topology multi-node` |
+| Panel-only Podman Acceptance | `sudo python3 -m tools.run_podman_e2e --topology panel-only` |
 | All-in-One Lifecycle and Recovery Acceptance | `sudo python3 -m tools.run_podman_e2e --topology aio --require-group recovery` |
 | Multi-Node Lifecycle and Recovery Acceptance | `sudo python3 -m tools.run_podman_e2e --topology multi-node --require-group recovery` |
 
 The recovery jobs run on `pull_request` and `workflow_dispatch` only, because a
-push already spends the minutes on the two full suites. The transport testbed
+push already spends the minutes on the two full suites. Panel-only has no
+recovery group: it provisions no traffic plane whose restart or revocation could
+be recovered, so a check requiring that group would pass by having nothing to
+run. The transport testbed
 (`tests/podman_testbed.sh`) and the QEMU cold-boot matrix stay in
 `.github/workflows/systemd-acceptance.yml` as independent gates and are not
 replaced by this workflow.
 
-Those four names are also a contract that is checked in, because a required
+Those five names are also a contract that is checked in, because a required
 check is written down in three places and a name that drifts in one of them
 leaves the gate open: `tests/cases/gates.yaml` names each check, its topology,
 its case group, its timeout and the prefix its report is uploaded under;
@@ -336,11 +353,13 @@ a test rather than a review. `--live` additionally refuses a disabled ruleset, a
 widened branch list or a changed bypass actor, and exits `2` when `gh` cannot
 answer, because an unread ruleset is not a passing one.
 
-An omitted topology cannot read as PASS because no job aggregates the two: the
-ruleset requires four names, two of them per topology. The same question can be
-asked of a directory of finished runs, where `PASS` is a claim about the pair —
-the newest run of each topology must exist, pass, carry the positive-case count
-the matrix owes it, and measure one commit:
+An omitted topology cannot read as PASS because no job aggregates them: the
+ruleset requires five names — the full suite of each topology, one of which is
+Panel-only, and a recovery check for each traffic-plane topology. The same
+question can be asked of a directory of finished runs, where `PASS` is a claim
+about every topology a required check proves — the newest run of each must
+exist, pass, carry the positive-case count the matrix owes it (Panel-only owes
+the case list its suite declares), and measure one commit:
 
 ```bash
 python3 -m tools.podman_e2e.gate --artifacts artifacts/podman-e2e

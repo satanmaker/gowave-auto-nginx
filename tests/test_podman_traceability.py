@@ -58,9 +58,9 @@ class TestTraceabilityRules(unittest.TestCase):
         )
 
     def test_every_spec_scenario_has_exactly_one_row(self):
-        self.assertEqual(len(self.spec), 46, "the delta spec states 46 scenarios")
-        self.assertEqual(len(trace.rows(self.table)), 46)
-        self.assertEqual(len({tuple(row) for row in self.spec}), 46)
+        self.assertEqual(len(self.spec), 48, "the delta spec states 48 scenarios")
+        self.assertEqual(len(trace.rows(self.table)), 48)
+        self.assertEqual(len({tuple(row) for row in self.spec}), 48)
 
     def test_every_declared_case_is_mapped_or_serves_a_requirement(self):
         mapped = {
@@ -380,6 +380,56 @@ class TestTraceabilityRules(unittest.TestCase):
             problems = trace.run_count_problems(directory)
         self.assertTrue(any("declares no count for" in p for p in problems), problems)
 
+    def make_panel_only_run(self, directory, drop=(), status="PASS"):
+        """A Panel-only run, which owes a case list rather than a count."""
+        ids = [case for case in self.declared["panel-only"] if case not in drop]
+        result = {
+            "schema": "gowave-podman-e2e-result/v1",
+            "run_id": "podman-panel-only-stub",
+            "topology": "panel-only",
+            "environment": {"vision": "none"},
+            "cases": [{"id": case_id, "status": status} for case_id in ids],
+            "overall": "PASS",
+        }
+        path = Path(directory) / "result.json"
+        path.write_text(json.dumps(result), encoding="utf-8")
+        return path
+
+    def test_a_panel_only_run_that_executed_its_declared_cases_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_panel_only_run(directory)
+            self.assertEqual(trace.run_count_problems(directory), [])
+
+    def test_a_panel_only_run_missing_a_declared_case_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_panel_only_run(directory, drop=("PO-SQUAD-REFUSED",))
+            problems = trace.run_count_problems(directory)
+        self.assertTrue(
+            any(
+                "the panel-only suite declares 5 cases" in p
+                and "executed 4" in p
+                and "PO-SQUAD-REFUSED did not run" in p
+                for p in problems
+            ),
+            problems,
+        )
+
+    def test_a_panel_only_case_that_did_not_pass_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_panel_only_run(directory, status="BLOCKED")
+            problems = trace.run_count_problems(directory)
+        self.assertTrue(any("is BLOCKED, so it is not a case that ran" in p for p in problems), problems)
+
+    def test_a_run_of_an_undeclared_topology_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_run(directory)
+            path = Path(directory) / "result.json"
+            result = json.loads(path.read_text(encoding="utf-8"))
+            result["topology"] = "nightly"
+            path.write_text(json.dumps(result), encoding="utf-8")
+            problems = trace.run_count_problems(directory)
+        self.assertTrue(any("no suite in this tree declares" in p for p in problems), problems)
+
     def test_the_verify_run_entrypoint_reads_a_run_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             self.make_run(directory)
@@ -412,10 +462,10 @@ class TestTraceabilityRules(unittest.TestCase):
     def test_the_audit_entrypoint_reads_the_checked_in_table(self):
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(trace.main(["--check"]), 0)
-        self.assertIn("46 scenarios, 46 rows", printed.getvalue())
+        self.assertIn("48 scenarios, 48 rows", printed.getvalue())
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(trace.main(["--strict"]), 0)
-        self.assertIn("46 scenarios, 46 rows, 0 gaps", printed.getvalue())
+        self.assertIn("48 scenarios, 48 rows, 0 gaps", printed.getvalue())
 
     def test_the_audit_entrypoint_refuses_a_drifted_report(self):
         with tempfile.TemporaryDirectory() as directory:

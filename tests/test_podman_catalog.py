@@ -555,6 +555,26 @@ class TestJustifiedExclusions(unittest.TestCase):
             self.exclusions("aio-and-a-half")
         self.assertIn("unsupported topology: 'aio-and-a-half'", str(caught.exception))
 
+    def test_a_topology_the_matrix_declares_but_no_case_owns_leaves_nothing_out(self):
+        # The catalog is not what decides whether a topology exists: the matrix
+        # is. Reading the case list alone turned an empty suite into a usage
+        # error naming a real mode. Panel-only owns cases now, so the document is
+        # stripped to keep the property under test rather than leaning on a suite
+        # that happens to be empty today.
+        document = copy.deepcopy(self.document)
+        document["cases"] = [
+            case for case in document["cases"]
+            if "panel-only" not in (case.get("topology") or [])
+        ]
+        self.assertEqual(self.exclusions("panel-only", document), [])
+
+    def test_the_panel_only_topology_owns_cases_of_its_own(self):
+        owned = {case["id"] for case in self.document["cases"]
+                 if "panel-only" in (case.get("topology") or [])}
+        self.assertEqual(
+            owned, {"PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED"},
+        )
+
     def stub_run(self, argv, executed):
         """Drive `main` with a Podman and a Runner that touch nothing."""
         from tools import run_podman_e2e
@@ -644,7 +664,7 @@ class TestJustifiedExclusions(unittest.TestCase):
 class TestPodmanFirstPromotion(unittest.TestCase):
     """A Podman-first case is a promise to promote, and the promise names an owner.
 
-    The catalog incubates 104 cases that no live scenario covers yet. Each one
+    The catalog incubates 109 cases that no live scenario covers yet. Each one
     states the requirement it belongs to here and the live requirement it is
     being promoted into; both are read from the two specs, so a renamed
     requirement orphans its cases loudly instead of leaving them pointing at a
@@ -673,7 +693,7 @@ class TestPodmanFirstPromotion(unittest.TestCase):
     def test_every_podman_first_case_names_an_owner_and_a_target_the_specs_state(self):
         vocabulary = self.vocabulary()
         self.assertEqual(len(self.extras), self.document["counts"]["podman_first"])
-        self.assertEqual(len(self.extras), 104)
+        self.assertEqual(len(self.extras), 109)
         for case in self.extras:
             self.assertEqual(case["runs_in"], ["podman"], case["id"])
             self.assertEqual(case["state"], "incubating", case["id"])

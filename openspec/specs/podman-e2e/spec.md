@@ -57,6 +57,24 @@ The test framework MUST provide distinct Control, Master/Panel, and Worker roles
 - **AND** the observation covers the Master-side process tree only, not the remote Worker beyond the
   SSH boundary
 
+### Requirement: Independent Panel-only acceptance topology
+
+The test framework MUST provide an isolated Panel-only topology that installs the Panel and the static camouflage site on one clean supported image through the repository's real `gowave-auto.sh install --panel-only` command, provisioning no traffic plane — no local node, no backend listener, no Vision inbound — and MUST verify the resulting host and Panel state through the real API.
+
+#### Scenario: Panel-only clean installation
+
+- **WHEN** the Panel-only acceptance suite executes the documented `install --panel-only` command against a clean disposable target
+- **THEN** the host runs the Panel, NGINX and the static decoy while declaring no node unit, running no traffic-engine process and listening on neither of the two backend ports
+- **AND** the credentials file is root-owned with mode `0600`, exactly the Panel and camouflage lineages are issued, and the camouflage name answers with the static site instead of any product content
+- **AND** the Panel API reports the mode's own end state — no host, node, config profile or internal squad — with the default user and a scoped API token present, while `state.json` names the mode, holds an empty node array and carries no local-node fields
+- **AND** the run records a machine-readable result and sanitized diagnostics
+
+#### Scenario: Panel-only Worker registration
+
+- **WHEN** the Panel-only Master registers a Worker through the real `gowave-auto.sh node add`
+- **THEN** the Panel holds one internal squad that allows an inbound, one host record per matching inbound whose `ALLOW_ONLY` squad list names the identifier `state.json` stored, and the registered Worker as its only node
+- **AND** a host record carrying a null squad entry either is refused by the Panel with the host count unchanged, or is stored without naming that identifier, and the probe removes whatever it created
+
 ### Requirement: Real Panel subscription lifecycle
 
 The framework MUST use the actual GoWave Panel endpoint and the version-pinned contract to create, retrieve, update where supported, and revoke test client access. It MUST exercise the real User-Agent policy: a non-empty header is accepted, while absent and blank headers are rejected. If the pinned API exposes no client-update operation, that case is NOT_APPLICABLE only with a cited contract and a separate check of the closest supported mutation; the harness MUST NOT invent endpoints.

@@ -68,6 +68,25 @@ requirements:
           - tests.test_podman_argv_observer.TestObserverDocumentation
         jobs: [Multi-Node Podman Acceptance]
 
+  - requirement: Independent Panel-only acceptance topology
+    scenarios:
+      - scenario: Panel-only clean installation
+        cases: [PO-INSTALL, PO-HOST, PO-API]
+        topologies: [panel-only]
+        tests:
+          - tests.test_podman_panel_only.TestPanelOnlySuite
+          - tests.test_podman_panel_only.TestPanelOnlyInstallCase
+          - tests.test_podman_panel_only.TestPanelOnlyHostCase
+          - tests.test_podman_panel_only.TestPanelOnlyApiCase
+        jobs: [Panel-only Podman Acceptance]
+      - scenario: Panel-only Worker registration
+        cases: [PO-SQUAD, PO-SQUAD-REFUSED]
+        topologies: [panel-only]
+        tests:
+          - tests.test_podman_panel_only.TestPanelOnlySquadCase
+          - tests.test_podman_panel_only.TestPanelOnlyRefusalProbe
+        jobs: [Panel-only Podman Acceptance]
+
   - requirement: Real Panel subscription lifecycle
     scenarios:
       - scenario: Subscription User-Agent policy is enforced

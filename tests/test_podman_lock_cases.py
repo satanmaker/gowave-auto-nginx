@@ -1027,26 +1027,27 @@ class TestOwnershipShapeCapability(CaseHarness, HolderCase, unittest.TestCase):
 
 
 LEASE_FORWARDING = 'GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_WORKER_LEASE_TOKEN:-}" \\'
-DISPATCH = re.compile(r"gowave-node-auto\.sh\" remote_(payload|rollback)")
+DISPATCH = re.compile(r"gowave-node-auto\.sh\" remote_(payload|rollback|finalize)")
 PAYLOAD_EXPORT = """printf 'export GOWAVE_LEASE_TOKEN=%q\\n' "${GOWAVE_WORKER_LEASE_TOKEN:-}" """
 
 
 def _assert_dispatch_forwarding(text):
-    """Every dispatch carries the Worker's own transit variable, four lines for five dispatches.
+    """Every dispatch carries the Worker's own transit variable, six lines for six dispatches.
 
-    Four lines rather than five since the two node-add failure paths stopped
-    calling ``remote_rollback`` themselves and share ``finalize_failed_node_add``:
-    one line still serves both of them, and the total stays pinned so a further
-    way to ask the Worker to act cannot appear without a lease line of its own.
+    The two topologies ask the Worker to act the same three ways — deploy the
+    payload, finalize the snapshot it created, roll back a failure — so a further
+    way to ask it cannot appear without a lease line of its own. Finalization is a
+    mutation and takes the Worker's lock, which is why it forwards the lease the
+    deploy and rollback paths already did.
     """
     lines = text.splitlines()
     exports = [index for index, line in enumerate(lines) if line.strip() == LEASE_FORWARDING.strip()]
     dispatches = [index for index, line in enumerate(lines) if DISPATCH.search(line)]
-    if len(exports) != 4 or len(dispatches) != 4:
+    if len(exports) != 6 or len(dispatches) != 6:
         raise AssertionError(
             f"{len(exports)} lease-forwarding lines for {len(dispatches)} dispatches, and there "
-            "are four dispatches over five ways the Worker is asked to act: a rollback or deploy "
-            "started without the Worker's lease can only be refused by the Worker's own lock"
+            "are six dispatches — deploy, finalize and rollback on each of the two topologies: a "
+            "dispatch started without the Worker's lease can only be refused by the Worker's own lock"
         )
     for export, dispatch in zip(exports, dispatches):
         if dispatch != export + 1:
@@ -1057,17 +1058,17 @@ def _assert_dispatch_forwarding(text):
 
 
 def _assert_payload_forwarding(text):
-    """Both payload env blocks export the Worker's token as the lease, twice."""
+    """Every streamed program that mutates the Worker exports its token as the lease."""
     lines = text.splitlines()
     exports = [index for index, line in enumerate(lines) if line.strip() == PAYLOAD_EXPORT.strip()]
-    if len(exports) != 2:
+    if len(exports) != 3:
         raise AssertionError(
-            f"{len(exports)} payload lease exports, expected 2 (deploy payload and rollback "
-            "payload)"
+            f"{len(exports)} payload lease exports, expected 3 (deploy payload, rollback "
+            "payload and finalize payload)"
         )
     for export in exports:
         following = "\n".join(lines[export:export + 40])
-        if not re.search(r"cat <<'(RUNNER_FUNCS|ROLLBACK_REMOTE_SCRIPT)'", following):
+        if not re.search(r"cat <<'(RUNNER_FUNCS|ROLLBACK_REMOTE_SCRIPT|FINALIZE_REMOTE_SCRIPT)'", following):
             raise AssertionError(
                 f"the payload lease export on line {export + 1} is not part of a streamed program"
             )

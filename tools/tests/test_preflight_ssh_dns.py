@@ -18,6 +18,7 @@ from live_vps.preflight import (
     check_private_key_file,
     check_ssh_trust,
     collect_remote_baseline,
+    declared_worker_paths,
     LocalLock,
     check_control_machine_tools,
 )
@@ -150,6 +151,32 @@ class TestPreflightSSHDNS(unittest.TestCase):
         self.assertNotIn("abc", str(ctx2.exception))
         self.assertNotIn("--admin_password", str(ctx2.exception))
 
+    def test_a_credential_read_from_a_file_is_not_an_argv_leak(self):
+        # The Worker lease is staged in a root-only file on the Master and read into
+        # the variable there; the name names a token but argv carries no value. The
+        # guard used to refuse the whole command on the substring `token=`, which
+        # aborted the live install phase before the node add was sent.
+        for indirect in (
+            'GOWAVE_WORKER_LEASE_TOKEN="$(cat /run/live_vps_worker_lease)"',
+            "GOWAVE_WORKER_LEASE_TOKEN=$(cat /run/live_vps_worker_lease)",
+            'GOWAVE_WORKER_LEASE_TOKEN="${GOWAVE_STAGED_LEASE}"',
+        ):
+            with self.subTest(indirect=indirect):
+                assert_no_secrets_in_argv(["ssh", "root@example.com", indirect])
+
+    def test_a_literal_credential_value_is_still_refused(self):
+        for literal in (
+            "GOWAVE_LEASE_TOKEN=abc123",
+            "--token=abc123",
+            "--admin_password=abc123",
+            "SECRET_KEY=abc123",
+        ):
+            with self.subTest(literal=literal):
+                with self.assertRaises(ValueError) as ctx:
+                    assert_no_secrets_in_argv(["ssh", "root@example.com", literal])
+                self.assertIn("Zero-leak violation", str(ctx.exception))
+                self.assertNotIn("abc123", str(ctx.exception))
+
     def test_dns_verification_mock(self):
         # Less than 2 resolvers raises ValueError
         with self.assertRaises(ValueError):
@@ -214,6 +241,35 @@ class TestPreflightSSHDNS(unittest.TestCase):
         result = verify_master_firewall(ssh, "203.0.113.10")
         self.assertEqual(result["status"], "INCOMPLETE")
 
+    @patch("live_vps.firewall.probe_tcp_port", return_value=(False, "REFUSED"))
+    def test_panel_only_master_passes_on_a_proven_absent_listener(self, probe):
+        # Measured on the live pair: the Panel-only Master had no TCP/3002
+        # listener at all, so the loopback probe could only ever fail there.
+        ssh = MagicMock()
+        ssh.run.side_effect = [MagicMock(ok=True, stdout="")]
+        result = verify_master_firewall(ssh, "203.0.113.10", has_local_node=False)
+        self.assertEqual(result["status"], "PASS")
+        self.assertFalse(result["local_node"])
+        self.assertTrue(result["listener_absent"])
+        self.assertTrue(result["external_blocked"])
+        self.assertEqual(ssh.run.call_args_list[0].args[0], "ss -ltnH 'sport = :3002'")
+
+    @patch("live_vps.firewall.probe_tcp_port", return_value=(False, "TIMEOUT"))
+    def test_panel_only_master_refuses_a_listener_it_did_not_deploy(self, probe):
+        ssh = MagicMock()
+        ssh.run.side_effect = [MagicMock(ok=True, stdout="LISTEN 0 4096 0.0.0.0:3002 *:*")]
+        result = verify_master_firewall(ssh, "203.0.113.10", has_local_node=False)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("no traffic plane", result["error"])
+
+    @patch("live_vps.firewall.probe_tcp_port", return_value=(True, "CONNECTED"))
+    def test_panel_only_master_refuses_an_externally_reachable_control_port(self, probe):
+        ssh = MagicMock()
+        ssh.run.side_effect = [MagicMock(ok=True, stdout="")]
+        result = verify_master_firewall(ssh, "203.0.113.10", has_local_node=False)
+        self.assertEqual(result["status"], "FAIL")
+        self.assertIn("external Control Machine", result["error"])
+
     @patch("live_vps.firewall.probe_tcp_port", return_value=(False, "TIMEOUT"))
     @patch("live_vps.firewall.get_control_machine_public_ip", return_value="198.51.100.77")
     def test_worker_firewall_requires_source_specific_master_allow(self, cm_ip, probe):
@@ -258,6 +314,44 @@ class TestPreflightSSHDNS(unittest.TestCase):
         eligible, reasons = check_disposable_gate(manifest)
         self.assertFalse(eligible)
         self.assertTrue(any("timeout" in reason for reason in reasons))
+
+    def test_the_baseline_asks_about_the_installer_recovery_root(self):
+        """A leftover recovery transaction blocks the next install, so it is residue.
+
+        Measured on the pair: `run-20261120-105111-f101f4` refused in under a
+        minute with "Worker transaction worker_install_worker-1_1795170447_2734
+        is 'installed' and was never finalized", because `/var/lib/gowave-auto-nginx`
+        survived a reset that removed every other GoWave path.
+        """
+        ssh = MagicMock()
+        ssh.run.return_value = MagicMock(ok=True, stdout="")
+        collect_remote_baseline(ssh)
+        asked = "\n".join(call.args[0] for call in ssh.run.call_args_list if call.args)
+        self.assertIn("/var/lib/gowave-auto-nginx", asked)
+
+        manifest = {"existing_gowave_dirs": ["/var/lib/gowave-auto-nginx"], "running_services": [],
+                    "listening_ports": [22], "required_tools": {"tcpdump": "ok", "timeout": "ok"}}
+        eligible, reasons = check_disposable_gate(manifest)
+        self.assertFalse(eligible)
+        self.assertTrue(any("/var/lib/gowave-auto-nginx" in reason for reason in reasons))
+
+    def test_the_baseline_asks_about_every_worker_path_the_product_declares(self):
+        """The gate reads its Worker list from the product instead of keeping a copy.
+
+        Measured on the pair: `run-20261120-111537-bcdacd` passed the gate and was
+        then refused by the Worker — "Pre-existing unowned Worker path
+        /usr/local/bin/gowave-node" — because the gate's copy of the list had never
+        carried that path. The copy is gone: the list is `worker_mutation_targets`.
+        """
+        declared = declared_worker_paths()
+        self.assertIn("/usr/local/bin/gowave-node", declared)
+
+        ssh = MagicMock()
+        ssh.run.return_value = MagicMock(ok=True, stdout="")
+        collect_remote_baseline(ssh)
+        asked = "\n".join(call.args[0] for call in ssh.run.call_args_list if call.args)
+        for path in declared:
+            self.assertIn(path, asked)
 
     def test_check_disposable_gate(self):
         clean = {

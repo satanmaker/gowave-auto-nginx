@@ -26,6 +26,8 @@ from tools.podman_e2e import trace as trace_data  # noqa: E402
 DOC = REPO_ROOT / "docs" / "PODMAN_E2E.md"
 ENTRYPOINT = "tools.run_podman_e2e"
 FLAG = re.compile(r"--[a-z][a-z0-9-]*")
+REQUIREMENT = re.compile(r"^### Requirement:", re.MULTILINE)
+SCENARIO = re.compile(r"^#### Scenario:", re.MULTILINE)
 
 
 def documented() -> str:
@@ -335,11 +337,16 @@ class TestPanelApiContract(unittest.TestCase):
                 )
 
     def test_the_client_update_is_recorded_as_a_gap_not_as_not_applicable(self):
-        rows = [row for row in api_rows() if "PATCH /api/users" in row["endpoint"]]
+        rows = {row["endpoint"].strip("`"): row for row in api_rows() if "PATCH /api/users" in row["endpoint"]}
         self.assertEqual(len(rows), 2, "the map must record both client-update routes the pinned Panel serves")
-        for row in rows:
-            with self.subTest(endpoint=row["endpoint"]):
-                self.assertIn("coverage gap", row["caller"], "a supported route with no caller is a gap, not a NOT_APPLICABLE")
+        self.assertIn(
+            "coverage gap", rows["PATCH /api/users"]["caller"],
+            "a supported route with no caller is a gap, not a NOT_APPLICABLE",
+        )
+        self.assertIn(
+            "attach_squad_to_user", rows["PATCH /api/users/{userId}"]["caller"],
+            "the row a Panel-only plan reaches through the user it attaches must name that caller",
+        )
         self.assertIn("not a `NOT_APPLICABLE`", api_section())
 
     def test_the_page_pins_the_user_agent_policy_per_path(self):
@@ -641,8 +648,8 @@ class TestLiveContractReconciliation(unittest.TestCase):
         self.assertIn("8, 9 or 10", self.prose)
         self.assertIn("carries 4 (5 with Vision)", self.prose)
         self.assertIn("Multi-Node one carries 8, 9 or 10", self.prose)
-        self.assertEqual(sorted(self.manifest["topologies"]), ["aio", "multi-node"],
-                         "the page names two topologies the manifest does not declare")
+        self.assertEqual(sorted(self.manifest["topologies"]), ["aio", "multi-node", "panel-only"],
+                         "the page names topologies the manifest does not declare")
 
     def test_the_geoip_divergence_names_the_pinned_template(self):
         self.assertIn("internal/database/default_data.go:108", self.prose)
@@ -1786,8 +1793,8 @@ class TestContourBoundary(unittest.TestCase):
         environments = {}
         for case in catalog["cases"]:
             environments[case["environment"]] = environments.get(case["environment"], 0) + 1
-        self.assertEqual(len(catalog["cases"]), 229, "the catalog changed size; the page quotes its total")
-        self.assertEqual(environments, {"container": 215, "partial": 12, "live-only": 2})
+        self.assertEqual(len(catalog["cases"]), 234, "the catalog changed size; the page quotes its total")
+        self.assertEqual(environments, {"container": 220, "partial": 12, "live-only": 2})
         self.assertIn(f"The catalog holds {len(catalog['cases'])} entries",
                       " ".join(boundary_section().split()),
                       "the page states a total the catalog does not have")
@@ -1974,6 +1981,20 @@ class TestPodmanE2EDocumentation(unittest.TestCase):
     def test_the_readme_points_at_the_guide(self):
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("docs/PODMAN_E2E.md", readme)
+
+    def test_the_readme_cites_the_requirements_and_scenarios_the_specs_hold(self):
+        # The quoted total is a copy of openspec/specs/, so it is read back from the
+        # specs rather than trusted: an added requirement or scenario moves the count
+        # and this test is where the README is told.
+        readme = " ".join((REPO_ROOT / "README.md").read_text(encoding="utf-8").split())
+        requirements = scenarios = 0
+        for spec in sorted((REPO_ROOT / "openspec" / "specs").glob("*/spec.md")):
+            text = spec.read_text(encoding="utf-8")
+            requirements += len(REQUIREMENT.findall(text))
+            scenarios += len(SCENARIO.findall(text))
+        self.assertIn(
+            f"**{requirements} requirements / {scenarios} GIVEN-WHEN-THEN acceptance scenarios**", readme
+        )
 
 
 if __name__ == "__main__":

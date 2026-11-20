@@ -106,6 +106,9 @@ def validate_journal(journal_data):
                         "profile": {"name", "config"},
                         "node": {"name", "address", "port", "configProfile"},
                         "squad": {"name", "inbounds"},
+                        # A user's only journalled update is joining a squad, so the
+                        # before-image is the squad list that attach is reversed against.
+                        "user": {"activeInternalSquads"},
                         "host": {
                             "inbound", "nodes", "remark", "address", "port", "sni",
                             "path", "host", "alpn", "fingerprint", "securityLayer",

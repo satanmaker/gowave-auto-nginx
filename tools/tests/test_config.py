@@ -210,6 +210,28 @@ TEST_TEARDOWN_POLICY=PRESERVE
         self.assertIsNone(cfg.master_vision_domain)
         self.assertEqual(cfg.worker_vision_domain, "vision-worker.example.com")
 
+    def test_install_mode_defaults_to_all_in_one(self):
+        cfg = load_config(self._write_config(self._config_content()))
+        self.assertEqual(cfg.install_mode, "all-in-one")
+
+    def test_panel_only_install_mode_is_accepted(self):
+        cfg = load_config(self._write_config(self._config_content(INSTALL_MODE="panel-only")))
+        self.assertEqual(cfg.install_mode, "panel-only")
+
+    def test_unknown_install_mode_is_rejected(self):
+        content = self._config_content(INSTALL_MODE="panel")
+        with self.assertRaisesRegex(ValueError, "Invalid INSTALL_MODE"):
+            load_config(self._write_config(content))
+
+    def test_panel_only_with_master_vision_is_rejected(self):
+        # The mode deploys no traffic plane on the Master, so a Vision domain there
+        # has nowhere to terminate; refusing beats silently dropping the argument.
+        content = self._config_content(
+            INSTALL_MODE="panel-only", MASTER_VISION_DOMAIN="vision-master.example.com"
+        )
+        with self.assertRaisesRegex(ValueError, "requires a traffic plane"):
+            load_config(self._write_config(content))
+
     def test_global_domain_collision_rejected(self):
         content = self._config_content(WORKER_DOMAIN="panel.example.com")
         with self.assertRaisesRegex(ValueError, "globally distinct"):

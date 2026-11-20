@@ -748,7 +748,9 @@ class GoWaveClient:
             "status": "ACTIVE",
             "trafficLimitStrategy": "NO_RESET",
             "expireAt": expire_at,
-            "activeInternalSquads": [squad_uuid],
+            # A Panel-only install has no squad to attach yet; an empty list is
+            # a real answer, while a null entry is the defect this change fixes.
+            "activeInternalSquads": [squad_uuid] if squad_uuid else [],
         }
         pending = self._record_pending_create("user")
         res = self.request("POST", "/api/users", payload)
@@ -756,6 +758,42 @@ class GoWaveClient:
         short_uuid = data.get("shortUuid")
         self._complete_pending_create(pending, data.get("uuid") or data.get("id"))
         return short_uuid
+
+    def attach_squad_to_user(self, username, squad_uuid):
+        """Put a user that holds no squad into the squad just provisioned.
+
+        A Panel-only install creates ``default-user`` before any inbound exists, so
+        that user holds no squad; the first ``node add`` creates the squad, and
+        without this call the Panel answers the user's subscription with its own
+        "No Hosts Available" placeholder instead of the node's endpoints. A user the
+        Panel has never seen, or one that already holds a squad, is left alone —
+        assigning squads to *other* users stays the operator's decision.
+
+        Returns ``True`` when the squad was attached, ``False`` when the user was
+        already assigned, and ``None`` when there is no such user.
+        """
+        try:
+            res = self.request("GET", f"/api/users/by-username/{username}")
+        except GoWaveAPIError as e:
+            if e.status_code == 404:
+                return None
+            raise
+        user = res.get("response", res) or {}
+        squads = user.get("activeInternalSquads") or []
+        if squads:
+            return False
+        user_id = user.get("uuid") or user.get("id")
+        if user_id is None:
+            raise GoWaveAPIError(f"The Panel returned user {username} without an identifier")
+        # The read answers squad objects, the write takes identifiers.
+        before = {
+            "activeInternalSquads": [
+                item.get("uuid") if isinstance(item, dict) else item for item in squads
+            ]
+        }
+        self._record_transaction_entity("user", user_id, "updated", before)
+        self.request("PATCH", f"/api/users/{user_id}", {"activeInternalSquads": [squad_uuid]})
+        return True
 
     def issue_api_token(self, token_name="gowave-auto-sub-token"):
         scopes = [
@@ -1143,6 +1181,8 @@ def rollback_provisioning(journal_path="/var/lib/gowave-auto-nginx/recovery/jour
                         client.request("PATCH", "/api/internal-squads", {"uuid": uuid, **before})
                     elif etype == "host":
                         client.request("PATCH", "/api/hosts", {"uuid": uuid, **before})
+                    elif etype == "user":
+                        client.request("PATCH", f"/api/users/{uuid}", before)
                     else:
                         raise GoWaveAPIError(f"Unsupported updated entity type: {etype}")
                 elif action == "created":
