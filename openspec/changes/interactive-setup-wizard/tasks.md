@@ -79,3 +79,9 @@
 
 - Archive the change after the project's review requirements are satisfied.
 - Verify the archived result and that both main specs received their delta requirements.
+- Ruleset `27258177` («GoWave Podman acceptance») on `main` now requires five status contexts: the four that were
+  there before plus `Panel-only Podman Acceptance`, the job `.github/workflows/podman-acceptance.yml` declares at
+  line 141. The bypass actor and the conditions (`main`, `feature/podman-full-e2e`) were carried over unchanged
+  by the full `PUT`. **Not covered by that ruleset**: `feature/gowave-auto-nginx`, the dev line, and
+  `docs/interactive-setup-wizard`, this change's branch — so this branch's acceptance runs are evidence, not a
+  gate, and the fifth context binds only once the change lands on `main`.
