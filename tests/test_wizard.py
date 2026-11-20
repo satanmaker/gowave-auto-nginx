@@ -2,10 +2,14 @@
 """Suite nonroot: the interactive setup wizard, its catalog and its budget.
 
 Every test drives the sourced shell functions with scripted answers, so the
-collected plan is observed rather than asserted from the source text. The one
-exception is the non-TTY entry, which runs the real CLI and reads its refusal.
+collected plan is observed rather than asserted from the source text. Two
+exceptions read the source instead: the non-TTY entry runs the real CLI and
+reads its refusal, and the guarded reachability of the catalog is asserted
+against the shipped scripts, where a lookup could be added outside a function
+a test can call.
 """
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -17,6 +21,17 @@ GOWAVE_AUTO = REPO_ROOT / "gowave-auto.sh"
 INSTALL_ARGS_SH = REPO_ROOT / "modules" / "install_args.sh"
 I18N_SH = REPO_ROOT / "modules" / "i18n.sh"
 WIZARD_SH = REPO_ROOT / "modules" / "wizard.sh"
+
+# Every script that ships to a host; the catalog belongs to the wizard alone.
+SHIPPING_SCRIPTS = [
+    REPO_ROOT / "gowave-auto.sh",
+    REPO_ROOT / "gowave-node-auto.sh",
+    *sorted((REPO_ROOT / "modules").glob("*.sh")),
+    *sorted((REPO_ROOT / "assets").rglob("*.sh")),
+]
+# Every catalog key is namespaced `wizard.`, so a lookup is a `t` or `tf` call
+# that names one, in a command substitution or not.
+CATALOG_CALL = re.compile(r"\b(?:t|tf)\s+wizard\.")
 
 SOURCE_WIZARD = f"source {shlex.quote(str(WIZARD_SH))}\n"
 
@@ -480,6 +495,67 @@ class TestWizardEntry(unittest.TestCase):
         self.assertLess(
             install_body.index("wizard_collect_plan"),
             install_body.index("parse_install_arguments"),
+        )
+        self.assertNotRegex(
+            install_body,
+            CATALOG_CALL,
+            "cmd_install renders a catalog entry of its own; only the wizard may",
+        )
+        self.assertIn('wizard_onboard_nodes || return 1', install_body)
+        self.assertLess(
+            install_body.index('case "${GOWAVE_PLAN_VARIANT:-}" in'),
+            install_body.index("wizard_onboard_nodes"),
+            "a positional install must not reach the translated onboarding",
+        )
+        prompts = re.findall(r'read -r -p "([^"]*)"', install_body)
+        self.assertTrue(prompts, "cmd_install lost its positional prompts")
+        for prompt in prompts:
+            self.assertTrue(prompt.isascii(), f"a positional prompt is translated: {prompt}")
+
+    def test_the_catalog_is_reachable_only_from_the_wizard_and_its_ssh_helper(self):
+        callers = sorted(
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in SHIPPING_SCRIPTS
+            if CATALOG_CALL.search(path.read_text(encoding="utf-8"))
+        )
+        self.assertEqual(
+            callers,
+            ["modules/ssh_bootstrap.sh", "modules/wizard.sh"],
+            "a shipped script outside the wizard renders a translated string",
+        )
+
+    def test_the_ssh_helper_is_reached_only_through_a_collected_plan(self):
+        # The definition lives in that module; every other mention is a caller.
+        callers = [
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in SHIPPING_SCRIPTS
+            if path.name not in ("wizard.sh", "ssh_bootstrap.sh")
+            and "ssh_bootstrap_onboard_one" in path.read_text(encoding="utf-8")
+        ]
+        self.assertEqual(callers, [], "a shipped script outside the wizard onboards a node")
+
+    def test_a_complete_argument_list_collects_a_plan_without_the_catalog(self):
+        result = bash(
+            f"source {shlex.quote(str(INSTALL_ARGS_SH))}\n"
+            + SOURCE_WIZARD
+            + "t() { printf 'CATALOG:%s\\n' \"$1\" >&2; return 1; }\n"
+            "tf() { printf 'CATALOG:%s\\n' \"$1\" >&2; return 1; }\n"
+            "wizard_collect_plan() { printf 'WIZARD\\n' >&2; return 1; }\n"
+            "wizard_apply_plan() { printf 'WIZARD\\n' >&2; return 1; }\n"
+            "if wizard_should_run panel.example.com cdn.example.com admin@example.com;"
+            " then echo ENTERED; else echo SKIPPED; fi\n"
+            "parse_install_arguments panel.example.com cdn.example.com admin@example.com\n"
+            "printf 'mode=%s count=%s args=%s\\n' \"$GOWAVE_INSTALL_MODE\""
+            " \"${#GOWAVE_INSTALL_POSITIONAL[@]}\" \"${GOWAVE_INSTALL_POSITIONAL[*]}\"\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "", "the positional path asked a question or read the catalog")
+        self.assertEqual(
+            result.stdout.splitlines(),
+            [
+                "SKIPPED",
+                "mode=all-in-one count=3 args=panel.example.com cdn.example.com admin@example.com",
+            ],
         )
 
 
