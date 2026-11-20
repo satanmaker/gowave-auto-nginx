@@ -18,6 +18,7 @@ from live_vps.preflight import (
     check_private_key_file,
     check_ssh_trust,
     collect_remote_baseline,
+    declared_worker_paths,
     LocalLock,
     check_control_machine_tools,
 )
@@ -333,6 +334,24 @@ class TestPreflightSSHDNS(unittest.TestCase):
         eligible, reasons = check_disposable_gate(manifest)
         self.assertFalse(eligible)
         self.assertTrue(any("/var/lib/gowave-auto-nginx" in reason for reason in reasons))
+
+    def test_the_baseline_asks_about_every_worker_path_the_product_declares(self):
+        """The gate reads its Worker list from the product instead of keeping a copy.
+
+        Measured on the pair: `run-20261120-111537-bcdacd` passed the gate and was
+        then refused by the Worker — "Pre-existing unowned Worker path
+        /usr/local/bin/gowave-node" — because the gate's copy of the list had never
+        carried that path. The copy is gone: the list is `worker_mutation_targets`.
+        """
+        declared = declared_worker_paths()
+        self.assertIn("/usr/local/bin/gowave-node", declared)
+
+        ssh = MagicMock()
+        ssh.run.return_value = MagicMock(ok=True, stdout="")
+        collect_remote_baseline(ssh)
+        asked = "\n".join(call.args[0] for call in ssh.run.call_args_list if call.args)
+        for path in declared:
+            self.assertIn(path, asked)
 
     def test_check_disposable_gate(self):
         clean = {
