@@ -89,6 +89,25 @@ behaviors:
     cases: [VER-01, VER-03]
     error_paths: [VER-02, AIO-NEG-PIN]
 
+  - name: The Panel-only mode installs a Panel and a decoy and no traffic plane
+    area: installation
+    description: >-
+      The operator's documented `install --panel-only` command leaves a host
+      that runs the Panel and the static camouflage site and nothing else: no
+      node unit, no traffic-engine process, no backend listener and no worker
+      binary, the credentials file root-owned at mode `0600`, exactly the Panel
+      and camouflage lineages, and a decoy that answers with the static site
+      rather than any product content. The Panel API agrees — no host, node,
+      profile or squad, the default user and a scoped token present — and
+      `state.json` names the mode with an empty node array and no local-node
+      fields. The first registration after that install resolves a squad and
+      every host record names it, while a null squad entry never becomes the
+      operator's own grant.
+    topology: [panel-only]
+    gate: pr
+    cases: [PO-INSTALL, PO-HOST, PO-API, PO-SQUAD]
+    error_paths: [PO-SQUAD-REFUSED]
+
   # ---------------------------------------------------------------- provisioning
   - name: An install owns only what it created
     area: provisioning

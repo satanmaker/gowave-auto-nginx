@@ -167,18 +167,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # also leaves the state of the run's own containers. The hook reads state and
     # cannot change a verdict, and it runs before the cleanup that removes them.
     runner.on_failure(lambda result: diagnostics.collect(context, podman, result))
-    # A topology whose cases have not landed yet declares none, and an empty
-    # suite would report a green acceptance run that executed nothing.
-    try:
-        suite = build_suite(
-            podman, args.topology, args.distribution,
-            vision=args.vision, worker_vision=args.worker_vision,
-        )
-    except panel_only.SuiteNotDeclared as exc:
-        parser.error(str(exc))
     # The suite is built from Python objects while the catalog is a separate
     # artifact, so a case could run under an id no audit knows. Refusing the
     # disagreement here costs no product time: the install has not started.
+    suite = build_suite(
+        podman, args.topology, args.distribution,
+        vision=args.vision, worker_vision=args.worker_vision,
+    )
     try:
         catalog.require_executable([(case.id, case.topology) for case in suite])
     except catalog.CatalogError as exc:

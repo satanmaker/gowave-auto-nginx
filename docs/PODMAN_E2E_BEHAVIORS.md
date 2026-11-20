@@ -13,11 +13,11 @@ behaviour with no case, a behaviour covered only on its happy path, an
 area the delta spec names but no entry covers, and a case no behaviour
 names (an orphan) or two behaviours claim.
 
-Behaviours: 37 across 9 areas, naming 229 of 229 catalog cases.
+Behaviours: 38 across 9 areas, naming 234 of 234 catalog cases.
 
 | Area | Behaviours | Cases | Error-path cases |
 |---|---:|---:|---:|
-| installation | 5 | 17 | 6 |
+| installation | 6 | 21 | 7 |
 | provisioning | 8 | 27 | 16 |
 | subscription-representations | 1 | 6 | 3 |
 | data-plane | 5 | 45 | 11 |
@@ -36,6 +36,7 @@ Behaviours: 37 across 9 areas, naming 229 of 229 catalog cases.
 | The installed host keeps serving across a restart and a repeated install | aio, multi-node | pre-push | `AIO-01`, `AIO-02`, `AIO-03`, `AIO-04`, `AIO-05`, `AIO-RESTART`, `AIO-IDEMPOTENT` | `AIO-NEG-DEP` |
 | The Panel API answers its documented caller and refuses the rest | aio, multi-node | pre-push | `AIO-AUTH`, `AIO-CLIENT`, `APIC-01`, `AIO-AUTH-NEG` | `NEG-06` |
 | Every installed component reports its exact pinned version | aio, multi-node | pre-push | `VER-01`, `VER-03` | `VER-02`, `AIO-NEG-PIN` |
+| The Panel-only mode installs a Panel and a decoy and no traffic plane | panel-only | pr | `PO-INSTALL`, `PO-HOST`, `PO-API`, `PO-SQUAD` | `PO-SQUAD-REFUSED` |
 
 ## provisioning
 

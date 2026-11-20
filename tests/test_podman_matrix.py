@@ -103,14 +103,15 @@ class TestProtocolMatrix(unittest.TestCase):
             with self.subTest(vision=vision, worker_vision=worker_vision):
                 with self.assertRaises(KeyError):
                     matrix.combination(matrix.PANEL_ONLY, vision, worker_vision)
-        self.assertEqual(matrix.runtime_budget_seconds(self.data, matrix.PANEL_ONLY), 1800)
+        self.assertEqual(matrix.runtime_budget_seconds(self.data, matrix.PANEL_ONLY), 4500)
         self.assertEqual(
             self.data["topologies"][matrix.PANEL_ONLY]["positive_case_counts"], {},
             "the mode owes no data-plane case, so it declares no count",
         )
         self.assertEqual(
-            self.data["topologies"][matrix.PANEL_ONLY]["gate"], [],
-            "a topology no tier runs must not claim a gate tier",
+            self.data["topologies"][matrix.PANEL_ONLY]["gate"], ["pr"],
+            "the mode is judged by its own required check at the merge gate, and no push pays "
+            "for it: 'pre-push' here would put a third suite behind every push",
         )
         with self.assertRaises(KeyError):
             matrix.positive_count(self.data, matrix.PANEL_ONLY)

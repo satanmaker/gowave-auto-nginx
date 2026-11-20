@@ -3,8 +3,8 @@ name: Podman Product Acceptance
 # The full acceptance suites run real operator installs inside disposable
 # systemd containers: minutes, not seconds, and a failure is worth reading.
 # They get their own workflow so a red acceptance run cannot hide behind the
-# fast lint contour, and so the two topologies report as two distinct checks
-# rather than one aggregate the other could mask.
+# fast lint contour, and so each product topology reports as its own check
+# rather than one aggregate the others could mask.
 on:
   push:
     branches: [main, "feature/**"]
@@ -132,9 +132,65 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # The two jobs above fail when a case fails; neither notices a recovery case
-  # that was deleted from `cases()`, because the shorter suite still reports
-  # PASS. These jobs run the same suites with `--require-group recovery`, which
+  # The Panel and the static decoy on one host, with no traffic plane at all.
+  # It is a third product job rather than a flag on the All-in-One one: the
+  # suite installs a different mode of the installer, owes a different case
+  # list, and a failure here would otherwise hide behind a green All-in-One
+  # install that provisioned a Node this mode must not provision.
+  panel-only-podman-acceptance:
+    name: Panel-only Podman Acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install rootful Podman and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends podman iproute2 nftables iputils-ping
+          python3 -m pip install --disable-pip-version-check PyYAML
+
+      - name: Verify the runtime the suite depends on
+        run: |
+          sudo podman version
+          sudo podman info --format json | tee "${RUNNER_TEMP}/podman-info.json" >/dev/null
+          python3 - "${RUNNER_TEMP}/podman-info.json" <<'PY'
+          import json
+          import sys
+
+          host = json.load(open(sys.argv[1]))["host"]
+          print(f"podman host: cgroup={host['cgroupVersion']} network={host['networkBackend']}")
+          assert host["cgroupVersion"] == "v2", "the suite needs a cgroup v2 host"
+          assert host["networkBackend"] == "netavark", "the suite needs the netavark network backend"
+          PY
+
+      - name: Execute the Panel-only acceptance suite
+        run: sudo python3 -m tools.run_podman_e2e --topology panel-only
+
+      # The same read-back as the two full suites. Panel-only owes no
+      # data-plane tuple, so the count rule is silent here and what it checks is
+      # the five declared ids the run must have executed.
+      - name: Verify the positive-case counts the matrix owes
+        if: success()
+        run: sudo python3 -m tools.podman_e2e.trace --verify-run artifacts/podman-e2e
+
+      - name: Upload the run artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: podman-panel-only-${{ github.run_id }}
+          path: artifacts/podman-e2e/
+          if-no-files-found: warn
+          retention-days: 14
+
+  # The full jobs above fail when a case fails; none of them notices a recovery
+  # case that was deleted from `cases()`, because the shorter suite still
+  # reports PASS. These jobs run the same suites with `--require-group recovery`, which
   # makes the case ids a promise the run has to keep: an absent id and a
   # non-PASS one are both a red verdict, and the audit lands in result.json.
   # They run on the merge gate only — a push already spends the minutes on the

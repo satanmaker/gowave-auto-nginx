@@ -22,7 +22,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.podman_e2e import gate, trace  # noqa: E402
+from tools.podman_e2e import gate, matrix, trace  # noqa: E402
 
 
 def live_payload(contract):
@@ -77,16 +77,45 @@ class TestPodmanGateContract(unittest.TestCase):
             "the gate that ships with the repository must hold on its own tree",
         )
 
-    def test_the_contract_requires_both_topologies_at_full_and_recovery_width(self):
+    def test_the_contract_requires_every_topology_at_full_width(self):
         pairs = {(check["topology"], check["group"]) for check in self.contract["checks"]}
         self.assertEqual(
             pairs,
-            {("aio", None), ("multi-node", None), ("aio", "recovery"), ("multi-node", "recovery")},
+            {("aio", None), ("multi-node", None), ("panel-only", None),
+             ("aio", "recovery"), ("multi-node", "recovery")},
             "an aggregate that omits one topology would read green from the other's run",
         )
         self.assertEqual(
             sorted(self.contract["ruleset"]["required_status_checks"]),
             sorted(check["name"] for check in self.contract["checks"]),
+        )
+
+    def test_a_recovery_check_is_required_only_where_the_group_has_cases(self):
+        # Panel-only deploys no traffic plane, so it owns no case that takes one
+        # down and brings it back. Requiring an empty group would be a check that
+        # passes by having nothing to run, so the contract carries none — and the
+        # audit refuses one that is added.
+        panel = [check for check in self.contract["checks"]
+                 if check["topology"] == "panel-only"]
+        self.assertEqual([check["group"] for check in panel], [None])
+        contract = copy.deepcopy(self.contract)
+        contract["checks"].append({
+            "name": "Panel-only Lifecycle and Recovery Acceptance",
+            "topology": "panel-only",
+            "group": "recovery",
+            "events": ["pull_request", "workflow_dispatch"],
+            "timeout_minutes": 90,
+            "artifact_prefix": "podman-panel-only-recovery-",
+        })
+        contract["ruleset"]["required_status_checks"].append(
+            "Panel-only Lifecycle and Recovery Acceptance"
+        )
+        problems = self.problems(contract)
+        self.assertTrue(
+            any("Panel-only Lifecycle and Recovery Acceptance" in problem
+                and "declares no cases for topology 'panel-only'" in problem
+                for problem in problems),
+            problems,
         )
 
     def test_a_required_check_no_job_publishes_is_refused(self):
@@ -138,7 +167,11 @@ class TestPodmanGateContract(unittest.TestCase):
 
     def test_a_recovery_check_without_the_group_is_refused(self):
         contract = copy.deepcopy(self.contract)
-        contract["checks"][2]["group"] = None
+        check = next(
+            entry for entry in contract["checks"]
+            if entry["name"] == "All-in-One Lifecycle and Recovery Acceptance"
+        )
+        check["group"] = None
         problems = self.problems(contract)
         self.assertTrue(
             any("the job runs" in problem or "no required check runs the aio recovery" in problem
@@ -205,14 +238,15 @@ class TestPodmanGateContract(unittest.TestCase):
     def test_a_topology_budget_that_breaks_the_nightly_total_is_refused(self):
         # The nightly tier is the one that runs every topology at its own
         # budget, so a topology raised without raising the total would make the
-        # third tier a bound the manifest cannot keep.
+        # third tier a bound the manifest cannot keep. Every topology counts,
+        # including the one no `--artifacts` aggregate judges: 2700 + 12000 + 4500.
         problems = self.budget_problems(
             lambda manifest: manifest["topologies"]["multi-node"].__setitem__(
                 "runtime_budget_seconds", 12000
             )
         )
         self.assertTrue(
-            any("every topology at its own budget declares 14700s" in problem
+            any("every topology at its own budget declares 19200s" in problem
                 and "nightly_total_seconds = 14400s" in problem
                 for problem in problems),
             problems,
@@ -318,13 +352,19 @@ class TestPodmanGateContract(unittest.TestCase):
         )
 
     def make_run(self, root, topology, count=None, status="PASS", overall="PASS",
-                 commit="a" * 40):
+                 commit="a" * 40, drop=()):
         """A finished run of ``topology`` with the shape ``result.json`` has."""
         declared = trace.declared_cases()[topology]
-        ids = [case for case in declared if "-DP-" in case]
+        if (matrix.load()["topologies"][topology].get("positive_case_counts") or {}):
+            vision = "disabled" if topology == "aio" else "neither"
+            ids = [case for case in declared if "-DP-" in case]
+        else:
+            # A topology with no traffic plane owes its declared case list.
+            vision = "none"
+            ids = list(declared)
+        ids = [case for case in ids if case not in drop]
         if count is not None:
             ids = ids[:count]
-        vision = "disabled" if topology == "aio" else "neither"
         result = {
             "schema": "gowave-podman-e2e-result/v1",
             "run_id": f"podman-{topology}-stub",
@@ -383,6 +423,53 @@ class TestPodmanGateContract(unittest.TestCase):
             problems,
         )
 
+    def test_the_aggregate_covers_every_topology_a_check_proves(self):
+        from tools import run_podman_e2e
+
+        self.assertEqual(gate.TOPOLOGIES, gate.required_topologies())
+        self.assertEqual(gate.TOPOLOGIES, run_podman_e2e.TOPOLOGIES,
+                         "every topology the entrypoint can run has a required check")
+
+    def test_the_aggregate_refuses_a_missing_panel_only_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.make_run(directory, "aio")
+            self.make_run(directory, "multi-node")
+            problems = gate.aggregate_problems(Path(directory))
+        self.assertTrue(
+            any("no panel-only run finished" in problem for problem in problems), problems
+        )
+
+    def test_the_aggregate_refuses_a_panel_only_run_short_of_its_declared_cases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for topology in gate.TOPOLOGIES:
+                self.make_run(directory, topology)
+            self.make_run(directory, "panel-only", drop=("PO-SQUAD-REFUSED",))
+            problems = gate.aggregate_problems(Path(directory))
+        self.assertTrue(
+            any("PO-SQUAD-REFUSED did not run" in problem for problem in problems), problems
+        )
+
+    def test_the_aggregate_refuses_a_topology_no_check_proves(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for topology in gate.TOPOLOGIES:
+                self.make_run(directory, topology)
+            (Path(directory) / "podman-nightly-stub").mkdir()
+            (Path(directory) / "podman-nightly-stub" / "result.json").write_text(
+                json.dumps({
+                    "schema": "gowave-podman-e2e-result/v1",
+                    "topology": "nightly",
+                    "environment": {"repository": {"commit": "a" * 40}},
+                    "cases": [],
+                    "overall": "PASS",
+                }),
+                encoding="utf-8",
+            )
+            problems = gate.aggregate_problems(Path(directory))
+        self.assertTrue(
+            any("records topology 'nightly', which no gate requires" in problem for problem in problems),
+            problems,
+        )
+
     def test_a_root_with_no_finished_run_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             problems = gate.aggregate_problems(Path(directory))
@@ -391,7 +478,7 @@ class TestPodmanGateContract(unittest.TestCase):
     def test_the_entrypoint_judges_the_contract_and_needs_a_mode(self):
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(gate.main(["--check"]), 0)
-        self.assertIn("4 required checks agree with the workflow", printed.getvalue())
+        self.assertIn("5 required checks agree with the workflow", printed.getvalue())
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as raised:
                 gate.main([])
@@ -403,7 +490,7 @@ class TestPodmanGateContract(unittest.TestCase):
                 self.make_run(directory, topology)
             with contextlib.redirect_stdout(io.StringIO()) as printed:
                 self.assertEqual(gate.main(["--artifacts", directory]), 0)
-            self.assertIn("both topologies passed at one commit", printed.getvalue())
+            self.assertIn("every required topology passed at one commit", printed.getvalue())
             self.make_run(directory, "multi-node", overall="FAIL")
             with contextlib.redirect_stdout(io.StringIO()) as printed:
                 self.assertEqual(gate.main(["--artifacts", directory]), 1)
