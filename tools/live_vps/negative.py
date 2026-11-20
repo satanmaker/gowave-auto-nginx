@@ -103,17 +103,40 @@ def run_neg_04_dns_missing_aaaa() -> Dict[str, Any]:
     }
 
 
-def run_neg_05_acme_install_failure(master_ssh: SSHClient) -> Dict[str, Any]:
-    """NEG-05: ACME lineage guard / invalid ACME directory rejects installation before changing NGINX."""
+def run_neg_05_acme_install_failure(master_ssh: SSHClient, lease_token: Optional[str] = None) -> Dict[str, Any]:
+    """NEG-05: ACME lineage guard / invalid ACME directory rejects installation before changing NGINX.
+
+    The install under test is a mutation like any other, so it presents the
+    run's own lease: this suite holds the Master's mutation lock for the whole
+    run, and an install without the lease is refused by that lock before it ever
+    reads `GOWAVE_ACME_SERVER`. Measured in `run-20261120-112133-fb7bcb`: the
+    probe reported FAIL while the host was answering the lock sentence, and the
+    ACME refusal it was looking for appears only once the lock admits the call.
+    """
     # Call gowave-auto.sh install with invalid ACME directory URL
     bad_cmd = "GOWAVE_ACME_SERVER=https://invalid-acme-directory.example.com/directory /opt/gowave-auto-nginx/gowave-auto.sh install invalid.example.com reality.example.com admin@example.com"
-    r = master_ssh.run(bad_cmd)
-    rejected = (not r.ok) and ("Invalid GOWAVE_ACME_SERVER" in r.stderr or "Invalid GOWAVE_ACME_SERVER" in r.stdout)
+    r = master_ssh.run(
+        bad_cmd,
+        input_data=f"GOWAVE_LEASE: {lease_token}\n" if lease_token else None,
+    )
+    output = f"{r.stdout}\n{r.stderr}"
+    rejected = (not r.ok) and ("Invalid GOWAVE_ACME_SERVER" in output)
+    refusal = next(
+        (line.strip() for line in output.splitlines() if line.strip().startswith("Error:")),
+        "",
+    )
     return {
         "scenario": "NEG-05",
         "name": "ACME Install Invalid Directory Rejection",
         "status": "PASS" if rejected else "FAIL",
-        "message": "Installation aborted before modifying certificates or services",
+        "message": (
+            "Installation rejected the invalid ACME directory before modifying certificates or services"
+            if rejected else
+            f"Installation exited {r.returncode} without the ACME refusal: {refusal[:200]}"
+        ),
+        "exit_code": r.returncode,
+        "refusal": refusal[:200],
+        "lease_presented": bool(lease_token),
     }
 
 
@@ -854,6 +877,7 @@ def run_negative_suite(
     panel_client: Optional[E2EPanelClient] = None,
     short_uuid: Optional[str] = None,
     ssl_context: Optional[ssl.SSLContext] = None,
+    master_lease_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Execute all 15 negative scenarios in sequence.
     If TEST_NEGATIVE_SUITE is false, all cases are marked SKIP and overall status is INCOMPLETE.
@@ -885,7 +909,7 @@ def run_negative_suite(
 
     # Execute live / mock scenarios
     if master_ssh:
-        neg05 = run_neg_05_acme_install_failure(master_ssh)
+        neg05 = run_neg_05_acme_install_failure(master_ssh, lease_token=master_lease_token)
         scenarios.append(neg05)
         if neg05.get("status") != "PASS":
             for index in range(6, 16):

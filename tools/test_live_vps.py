@@ -767,6 +767,9 @@ def main() -> int:
                 panel_client=panel_client,
                 short_uuid=short_uuid,
                 ssl_context=ssl_ctx,
+                # NEG-05 installs through the same lock this run holds, so it
+                # needs the Master's lease the way `node add` does.
+                master_lease_token=getattr(remote_lock, "lease_tokens", {}).get(master_ssh.host),
             )
             state["results"]["negative"] = neg_res
             save_run_state(artifact_dir, state)
