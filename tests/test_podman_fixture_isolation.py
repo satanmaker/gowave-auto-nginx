@@ -45,7 +45,16 @@ GLOBAL_ANCHOR_WRITES = (
 # answered by `load_config`.
 NAMED_GLOBAL_ADDRESSES = {
     "operator_access.py": {"45.13.20.10", "91.203.40.20"},
-    "preflight_cases.py": {"239.1.2.3"},
+    # `239.1.2.3` is the multicast literal PRE-04 hands the parser; the
+    # `104.16.0.0/13` pair is the dated Cloudflare snapshot the proxy-refusal
+    # cases resolve against. All three are read, never dialled.
+    "preflight_cases.py": {"239.1.2.3", "104.16.0.0", "104.16.0.1"},
+    # The WhatsApp entry in PREVIEW_USER_AGENTS carries the client's real
+    # version in its User-Agent, `WhatsApp/2.23.20.0`. That is a version
+    # string the vhost classifies, not an address the harness binds or
+    # reaches, and the list is worthless if the header is invented rather
+    # than the one the client sends.
+    "panel_surface.py": {"2.23.20.0"},
 }
 
 

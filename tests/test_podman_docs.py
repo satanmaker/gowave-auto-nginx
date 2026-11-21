@@ -711,8 +711,13 @@ class TestLiveContractReconciliation(unittest.TestCase):
         self.assertIn("topology.ACME_CA_BUNDLE_NAME", collect,
                       "the edge fetch is no longer given the run's CA bundle")
         self.assertIn("--ca {ca_file}", collect)
+        # The request that is sent is the one whose headers are read, so the
+        # guard follows the function that writes the request rather than the
+        # name the callers use; a wrapper that stopped delegating would drop
+        # the edge header read without touching this line.
+        self.assertIn("return request(", function_body("tools/podman_e2e/panel_surface.py", "fetch"))
         self.assertIn('"cache_control": (response.getheader("Cache-Control") or "")',
-                      function_body("tools/podman_e2e/panel_surface.py", "fetch"))
+                      function_body("tools/podman_e2e/panel_surface.py", "request"))
 
     def test_the_database_contract_is_read_where_the_page_says_the_panel_writes(self):
         self.assertIn("a running Panel writes its own rows", self.prose)
@@ -1793,8 +1798,8 @@ class TestContourBoundary(unittest.TestCase):
         environments = {}
         for case in catalog["cases"]:
             environments[case["environment"]] = environments.get(case["environment"], 0) + 1
-        self.assertEqual(len(catalog["cases"]), 234, "the catalog changed size; the page quotes its total")
-        self.assertEqual(environments, {"container": 220, "partial": 12, "live-only": 2})
+        self.assertEqual(len(catalog["cases"]), 249, "the catalog changed size; the page quotes its total")
+        self.assertEqual(environments, {"container": 235, "partial": 12, "live-only": 2})
         self.assertIn(f"The catalog holds {len(catalog['cases'])} entries",
                       " ".join(boundary_section().split()),
                       "the page states a total the catalog does not have")

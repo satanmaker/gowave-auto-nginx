@@ -10,6 +10,10 @@ set -Eeuo pipefail
 _wizard_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=modules/i18n.sh
 source "$_wizard_dir/i18n.sh"
+# The wizard validates a field through the same contract the positional path
+# uses, so the same answer is refused on both.
+# shellcheck source=modules/preflight.sh
+source "$_wizard_dir/preflight.sh"
 
 GOWAVE_PLAN_VARIANT=""
 GOWAVE_PLAN_SHARED_DOMAIN="no"
@@ -49,21 +53,11 @@ wizard_normalize_name() {
 }
 
 wizard_validate_hostname() {
-    local name="$1"
-    local label
-    local IFS='.'
-    [[ ${#name} -ge 3 && ${#name} -le 253 ]] || return 1
-    [[ "$name" != .* && "$name" != *. && "$name" != *..* ]] || return 1
-    [[ "$name" == *.* ]] || return 1
-    for label in $name; do
-        [[ ${#label} -le 63 ]] || return 1
-        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
-    done
-    return 0
+    preflight_validate_hostname "$1"
 }
 
 wizard_validate_email() {
-    [[ "$1" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
+    preflight_validate_email "$1"
 }
 
 # Every name the plan already holds, as "owner<TAB>name".

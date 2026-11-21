@@ -414,7 +414,7 @@ class GoWaveClient:
                 }
         return None
 
-    def compile_config_profile(self, node_name, reality_domain, private_key, short_ids=None, public_key=None, vision_domain=None, panel_domain=None):
+    def compile_config_profile(self, node_name, reality_domain, private_key, short_ids=None, public_key=None, vision_domain=None, panel_domain=None, vision_cert_dir=None):
         if short_ids is None:
             short_ids = [secrets.token_hex(8) for _ in range(8)]
 
@@ -432,8 +432,12 @@ class GoWaveClient:
         # 2. Optional Inbound Vision (VLESS + XTLS Vision) - only compiled when a dedicated 3rd domain is provided
         if vision_domain:
             v_domain = vision_domain
-            cert_file = f"/etc/letsencrypt/live/{v_domain}/fullchain.pem"
-            key_file = f"/etc/letsencrypt/live/{v_domain}/privkey.pem"
+            # The certificate can live in a lineage whose name is not the served
+            # name (certbot keeps `example.com-0001` when the name was re-issued),
+            # so the directory the caller adopted is used when it names one.
+            cert_dir = (vision_cert_dir or f"/etc/letsencrypt/live/{v_domain}").rstrip("/")
+            cert_file = f"{cert_dir}/fullchain.pem"
+            key_file = f"{cert_dir}/privkey.pem"
 
             vision_template = json.loads((XRAY_ASSETS_DIR / "vless-vision.json").read_text())
             vision_template["tag"] = f"vless-vision-{node_name}"

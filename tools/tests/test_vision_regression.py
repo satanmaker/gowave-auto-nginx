@@ -260,23 +260,43 @@ class TestVisionRegressionCoverage(unittest.TestCase):
         harness = '''
 rollback_managed_deploy_hook() { return 0; }
 restore_acme_lineage() {
+    # An unnamed lineage cannot be restored: the rollback would delete or skip
+    # a certificate that belongs to a name this run never resolved.
+    if [[ -z "$2" ]]; then return 2; fi
+    printf '%s\n' "$2" >> "$RESTORED_LOG"
     if [[ "${FAIL_RESTORE:-0}" == "1" && "$2" == "panel.example.test" ]]; then return 1; fi
     return 0
 }
 rm() { return 0; }
 acme_tx_id=test_tx
+panel_lineage=panel.example.test
+reality_lineage=reality.example.test
+vision_lineage=vision.example.test
 panel_domain=panel.example.test
 reality_domain=reality.example.test
 vision_domain=vision.example.test
 '''
-        failed = subprocess.run(["bash", "-c", harness + "\n" + function + "\nrollback_acme_lineages"], env={**os.environ, "FAIL_RESTORE": "1"}, text=True, capture_output=True, check=False)
-        self.assertEqual(failed.returncode, 0)
-        self.assertIn("CRITICAL: ACME rollback incomplete", failed.stderr)
-        self.assertNotIn("ACME certificate lineage rollback completed successfully", failed.stderr)
-        succeeded = subprocess.run(["bash", "-c", harness + "\n" + function + "\nrollback_acme_lineages"], env={**os.environ, "FAIL_RESTORE": "0"}, text=True, capture_output=True, check=False)
-        self.assertEqual(succeeded.returncode, 0)
-        self.assertIn("ACME certificate lineage rollback completed successfully", succeeded.stderr)
-        self.assertNotIn("CRITICAL: ACME rollback incomplete", succeeded.stderr)
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "restored.txt"
+            env = {**os.environ, "RESTORED_LOG": str(log)}
+            failed = subprocess.run(["bash", "-c", harness + "\n" + function + "\nrollback_acme_lineages"], env={**env, "FAIL_RESTORE": "1"}, text=True, capture_output=True, check=False)
+            self.assertEqual(failed.returncode, 0)
+            self.assertIn("CRITICAL: ACME rollback incomplete", failed.stderr)
+            self.assertNotIn("ACME certificate lineage rollback completed successfully", failed.stderr)
+            self.assertEqual(
+                log.read_text().split(),
+                ["panel.example.test", "reality.example.test", "vision.example.test"],
+                "the rollback restored a name other than the lineages this run resolved",
+            )
+            log.unlink()
+            succeeded = subprocess.run(["bash", "-c", harness + "\n" + function + "\nrollback_acme_lineages"], env={**env, "FAIL_RESTORE": "0"}, text=True, capture_output=True, check=False)
+            self.assertEqual(succeeded.returncode, 0)
+            self.assertIn("ACME certificate lineage rollback completed successfully", succeeded.stderr)
+            self.assertNotIn("CRITICAL: ACME rollback incomplete", succeeded.stderr)
+            self.assertEqual(
+                log.read_text().split(),
+                ["panel.example.test", "reality.example.test", "vision.example.test"],
+            )
 
     def test_snapshot_acme_lineage_fails_when_directory_permissions_cannot_be_hardened(self):
         with tempfile.TemporaryDirectory() as td:

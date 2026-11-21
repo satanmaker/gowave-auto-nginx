@@ -19,6 +19,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 from . import (
@@ -77,6 +78,10 @@ INSTALL_CASE_ID = "AIO-INSTALL"
 # The real install downloads releases, resolves packages, and issues three
 # certificates; the ceiling is a hang guard, not an expectation.
 INSTALL_TIMEOUT_SECONDS = 5400
+
+# The artifact cases drive the shipped shell helpers from this checkout instead
+# of from the container, so the verdict is about the file the release ships.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Mirrors get_required_packages in modules/os.sh. The harness keeps its own copy
 # so a case can never be satisfied by asking the product what it installed; a
@@ -1575,6 +1580,11 @@ class AioProduct:
         # tuple: the core a client ran must be the core the node deployed.
         self._installed_versions: Optional[Dict[str, Any]] = None
         self.server_core_version = ""
+
+    @property
+    def repo(self) -> Path:
+        """The checkout the host-side cases source their shell helpers from."""
+        return REPO_ROOT
 
     @property
     def inbound_count(self) -> int:
@@ -3728,6 +3738,20 @@ def case_panel_service_down(product: AioProduct) -> Dict[str, Any]:
             f"Panel stopped, expected {PANEL_FAULT_UNAVAILABLE_STATUS}: "
             f"{(subscription.get('stderr') or subscription.get('stdout') or '').strip()[-600:]!r}",
         )
+        # The vhost adds these with ``always``, so the gateway error a pasted link
+        # receives carries them too. A 502 a cache could keep, or a 502 a crawler
+        # may index, would outlive the outage it belongs to.
+        headers = subscription["probe"].get("headers") or {}
+        require(
+            case, "no-store" in str(headers.get("cache-control") or "").lower(),
+            f"the gateway answer carries Cache-Control {headers.get('cache-control')!r}; "
+            f"a cached 502 is what a pasted link would keep",
+        )
+        require(
+            case, headers.get("x-robots-tag") == SUBSCRIPTION_ROBOTS_TAG,
+            f"the gateway answer lost X-Robots-Tag: {headers.get('x-robots-tag')!r} instead of "
+            f"{SUBSCRIPTION_ROBOTS_TAG!r}",
+        )
 
         # The data plane is the node's, not the Panel's: the tunnels that were already
         # configured must keep carrying payload while the control plane is down.
@@ -3783,6 +3807,12 @@ def case_panel_service_down(product: AioProduct) -> Dict[str, Any]:
     return {
         "public_status_with_panel_down": page["probe"].get("status"),
         "subscription_status_with_panel_down": subscription["probe"].get("status"),
+        "subscription_cache_control_with_panel_down": (
+            (subscription.get("probe") or {}).get("headers", {}).get("cache-control")
+        ),
+        "subscription_robots_tag_with_panel_down": (
+            (subscription.get("probe") or {}).get("headers", {}).get("x-robots-tag")
+        ),
         "health_with_panel_down": str(down.get("health"))[:120],
         "unit_sub_state_with_panel_down": down.get("unit", {}).get("SubState"),
         "rows_stable_with_panel_down": str(
@@ -4344,11 +4374,14 @@ def case_public_dependency(product: AioProduct) -> Dict[str, Any]:
 
 
 VISION_FAILURE_CASE_ID = "VIS-05"
-# A name inside the fixture zone that the zone deliberately does not answer: the
-# install asks the ACME fixture to validate it, the fixture answers NXDOMAIN, and
-# the Vision stage that owns the name is the one that fails. Nothing else in the
-# attempt differs from the install that already succeeded on this host.
+# A name inside the fixture zone that answers, and answers nowhere the run listens:
+# the Vision validation of that lineage is what fails. The address has to resolve,
+# because a name the resolver does not answer is refused by the direct-DNS
+# preflight before any ACME stage runs, and this case would then measure a refusal
+# that is not the one it is about. The offset is above every fixture the topology
+# places, so nothing in the run binds it and the HTTP-01 request cannot complete.
 VISION_FAILURE_DOMAIN = "vision-failed.testbed.internal"
+VISION_FAILURE_ADDRESS_OFFSET = 250
 # The failed attempt repeats the operator's install, so it runs the same stages
 # and gets the same hang ceiling rather than a shorter one that would read a slow
 # package step as a defect.
@@ -4454,7 +4487,22 @@ def case_vision_certificate_failure(product: AioProduct) -> Dict[str, Any]:
             f"NGINX reports {before.get('nginx_active')!r} before the failed attempt")
     baseline = (_panel_facts(product, VISION_FAILURE_CASE_ID, "surface") or {}).get("surface") or {}
 
-    attempt = host.install_vision_failure(VISION_FAILURE_DOMAIN)
+    # The name has to answer for the failure to land in the Vision stage: the
+    # direct-DNS preflight refuses an unresolvable one before ACME is reached.
+    import ipaddress
+
+    zone = host.zone()
+    black_hole = str(
+        ipaddress.ip_network(host.plan.subnet, strict=False).network_address
+        + VISION_FAILURE_ADDRESS_OFFSET
+    )
+    steered = json.loads(json.dumps(zone))
+    steered.setdefault("records", {})[VISION_FAILURE_DOMAIN] = {"A": [black_hole]}
+    host.write_dns_zone(steered)
+    try:
+        attempt = host.install_vision_failure(VISION_FAILURE_DOMAIN)
+    finally:
+        host.write_dns_zone(zone)
     output = f"{attempt.stdout}\n{attempt.stderr}"
     require(VISION_FAILURE_CASE_ID, not attempt.ok,
             f"the install asking for a Vision domain that cannot be validated exited 0:\n"
@@ -6134,6 +6182,534 @@ def case_user_agent_blank(product: AioProduct) -> Dict[str, Any]:
     return _user_agent_case(product, "SUB-UA-BLANK", "ua-blank", "blank")
 
 
+SUB_EDGE_CASE_ID = "SUB-EDGE"
+SUB_EDGE_FORGERY_CASE_ID = "SUB-EDGE-BAD"
+SUB_EDGE_TIMEOUT_SECONDS = 300
+# The two headers the shipped subscription location attaches to every answer it
+# sends. ``always`` is what makes them survive a refusal the Panel itself
+# produced, so the absent-header answer is read for them too.
+SUBSCRIPTION_CACHE_CONTROL = "no-store"
+SUBSCRIPTION_ROBOTS_TAG = "noindex, nofollow, noarchive, nosnippet"
+# The access log is read as a whole: a served subscription must leave no line
+# with a one-segment ``/api/sub/<shortUuid>`` target, while a refused raw target
+# must leave one. The refused target is the probe's own invention and carries no
+# client credential, which is why it may be looked for by its tail.
+SUB_EDGE_ACCESS_LOG_PROBE = r"""
+python3 - <<'PY'
+import json, re
+
+path = "/var/log/nginx/access.log"
+served = re.compile(r'"(?:GET|HEAD) /api/sub/[A-Za-z0-9_-]{16,}(?:\?[^"]*)? HTTP/[0-9.]+"')
+try:
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        lines = handle.read().splitlines()
+except OSError:
+    print(json.dumps({"present": False, "lines": 0, "served": 0,
+                      "refused_dot_segment": 0, "refused_encoded_separator": 0}))
+else:
+    print(json.dumps({
+        "present": True,
+        "lines": len(lines),
+        "served": sum(1 for line in lines if served.search(line)),
+        "refused_dot_segment": sum(
+            1 for line in lines if "/../x HTTP/" in line and '" 444 ' in line
+        ),
+        "refused_encoded_separator": sum(
+            1 for line in lines if "%2Fv2ray-json HTTP/" in line and '" 444 ' in line
+        ),
+    }))
+PY
+"""
+
+
+def case_subscription_edge(product: AioProduct) -> Dict[str, Any]:
+    """SUB-EDGE: the subscription surface answers crawlers and clients differently.
+
+    A subscription URL is what a client keeps on its phone, so it is also what
+    gets pasted into a chat. The listener therefore has to answer three audiences
+    differently: a client gets the bytes the Panel issued, a link-preview crawler
+    gets an empty ``204`` that unfurls into nothing, and a headerless request gets
+    whatever the Panel itself decides. The Panel's own request counter is read on
+    both sides of the crawler sweep, because the Panel is the process that would
+    have served them and it counts them whether or not its request log is enabled.
+    A loopback fetch after the sweep is the control that proves the counter moves.
+
+    The forged targets are the refusal case's subject; this one reads only the
+    answers a client and a crawler are meant to receive.
+    """
+    case = SUB_EDGE_CASE_ID
+    edge = _subscription_edge_facts(product, case)
+
+    served = edge.get("served") or {}
+    require(case, served.get("status") == 200,
+            f"a client fetch of the subscription answered {served.get('status')!r} instead of 200")
+    require(case, served.get("bytes", 0) > 0, "the subscription body was empty for a real client")
+    require(case, SUBSCRIPTION_CACHE_CONTROL in str(served.get("cache_control") or "").lower(),
+            f"the served subscription carries Cache-Control {served.get('cache_control')!r}, "
+            f"which would let a pasted link be cached")
+    require(case, (served.get("x_robots_tag") or "") == SUBSCRIPTION_ROBOTS_TAG,
+            f"the served subscription carries X-Robots-Tag {served.get('x_robots_tag')!r} "
+            f"instead of {SUBSCRIPTION_ROBOTS_TAG!r}")
+    require(case, edge.get("served_identical_to_loopback") is True,
+            "the edge did not hand the client the bytes the Panel issued")
+
+    foreign = edge.get("foreign") or {}
+    require(case, foreign.get("status") == 200,
+            f"a header naming no client family answered {foreign.get('status')!r}: the "
+            f"listener is selecting a representation from the header instead of the path")
+    require(case, edge.get("foreign_identical") is True,
+            "the same path answered a foreign User-Agent with different bytes")
+
+    absent = edge.get("absent") or {}
+    require(case, absent.get("status") == panel_surface.SUBSCRIPTION_ABSENT_HEADER_STATUS,
+            f"a request with no User-Agent answered {absent.get('status')!r} instead of the "
+            f"Panel's own {panel_surface.SUBSCRIPTION_ABSENT_HEADER_STATUS}")
+    require(case, SUBSCRIPTION_CACHE_CONTROL in str(absent.get("cache_control") or "").lower()
+            and (absent.get("x_robots_tag") or "") == SUBSCRIPTION_ROBOTS_TAG,
+            f"the Panel's refusal lost the transport headers: {absent.get('cache_control')!r} / "
+            f"{absent.get('x_robots_tag')!r}")
+
+    previews = edge.get("previews") or {}
+    require(case, set(previews) == set(panel_surface.PREVIEW_USER_AGENTS),
+            f"the probe classified {len(previews)} preview families instead of "
+            f"{len(panel_surface.PREVIEW_USER_AGENTS)}")
+    served_previews = sorted(
+        agent for agent, answer in previews.items()
+        if answer.get("status") != panel_surface.SUBSCRIPTION_PREVIEW_STATUS
+    )
+    require(case, not served_previews,
+            f"the listener answered {', '.join(served_previews)} with a subscription instead "
+            f"of {panel_surface.SUBSCRIPTION_PREVIEW_STATUS}")
+    leaked = sorted(agent for agent, answer in previews.items() if answer.get("bytes"))
+    require(case, not leaked, f"the empty answer carried a body for {', '.join(leaked)}")
+    missing_headers = sorted(
+        agent for agent, answer in previews.items()
+        if SUBSCRIPTION_CACHE_CONTROL not in str(answer.get("cache_control") or "").lower()
+        or (answer.get("x_robots_tag") or "") != SUBSCRIPTION_ROBOTS_TAG
+    )
+    require(case, not missing_headers,
+            f"the empty answer lost the transport headers for {', '.join(missing_headers)}")
+
+    counters = edge.get("counters") or {}
+    before = (counters.get("before") or {}).get("counts") or {}
+    after = (counters.get("after") or {}).get("counts") or {}
+    control = (counters.get("control") or {}).get("counts") or {}
+    require(case, (counters.get("before") or {}).get("status") == 200,
+            f"the Panel's route counters answered {(counters.get('before') or {}).get('status')!r}")
+    require(case, before == after,
+            f"the preview sweep reached the Panel: {after!r} vs {before!r}")
+    added = sum(int(control.get(pattern) or 0) for pattern in panel_surface.SUBSCRIPTION_ROUTE_PATTERNS) \
+        - sum(int(after.get(pattern) or 0) for pattern in panel_surface.SUBSCRIPTION_ROUTE_PATTERNS)
+    require(case, added == 1,
+            f"the control fetch moved the Panel's counter by {added!r}; without it the quiet "
+            f"sweep above would be an instrument that never moves")
+    require(case, counters.get("control_status") == 200,
+            f"the control fetch answered {counters.get('control_status')!r}")
+
+    return {
+        "served_status": served.get("status"),
+        "served_cache_control": served.get("cache_control"),
+        "served_x_robots_tag": served.get("x_robots_tag"),
+        "served_bytes": served.get("bytes"),
+        "foreign_status": foreign.get("status"),
+        "absent_status": absent.get("status"),
+        "preview_count": len(previews),
+        "preview_statuses": ",".join(sorted({str(answer.get("status")) for answer in previews.values()})),
+        "preview_bytes": max((int(answer.get("bytes") or 0) for answer in previews.values()), default=0),
+        "panel_requests_added_by_previews": (
+            sum(int(after.get(pattern) or 0) for pattern in panel_surface.SUBSCRIPTION_ROUTE_PATTERNS)
+            - sum(int(before.get(pattern) or 0) for pattern in panel_surface.SUBSCRIPTION_ROUTE_PATTERNS)
+        ),
+        "panel_requests_added_by_control": added,
+    }
+
+
+def case_subscription_edge_forgery(product: AioProduct) -> Dict[str, Any]:
+    """SUB-EDGE-BAD: a target the Panel never sees is closed, and the log says so.
+
+    The rule reads the raw request target, so it is only observable where the
+    target still exists: a client library normalises ``/x/../y`` and decodes
+    ``%2F`` before sending, and the request would then look like an ordinary
+    subscription. Both targets here go on the wire verbatim, and neither may be
+    answered with a status.
+
+    The access log is read from the same host as the pair that makes it evidence.
+    The refused targets have to appear — otherwise the log is off and its silence
+    about the served fetch proves nothing — and no served ``/api/sub/<shortUuid>``
+    line may appear, because that path is where a client's credential would be
+    written down.
+    """
+    case = SUB_EDGE_FORGERY_CASE_ID
+    edge = _subscription_edge_facts(product, case)
+
+    refused = edge.get("refused") or {}
+    for label, description in (
+        ("dot_segment", "a dot-segment target"),
+        ("encoded_separator", "an encoded separator"),
+    ):
+        answer = refused.get(label) or {}
+        require(case, answer.get("closed") is True and answer.get("bytes") == 0,
+                f"{description} was answered with {answer.get('status')!r} and "
+                f"{answer.get('bytes')!r} bytes instead of a closed connection")
+
+    log = probe_json(case, "the NGINX access log", product.host_script(SUB_EDGE_ACCESS_LOG_PROBE))
+    require(case, log.get("present") is True and int(log.get("lines") or 0) > 0,
+            f"the NGINX access log is absent or empty, so its silence proves nothing: {log!r}")
+    require(case, int(log.get("served") or 0) == 0,
+            f"the access log holds {log.get('served')!r} served subscription lines; a fetch of "
+            f"/api/sub/<shortUuid> must leave none")
+    require(case, int(log.get("refused_dot_segment") or 0) >= 1
+            and int(log.get("refused_encoded_separator") or 0) >= 1,
+            f"the access log did not record both refused targets, so it cannot be the log that "
+            f"would have recorded a served one: {log!r}")
+
+    return {
+        "refused_dot_segment": "closed" if (refused.get("dot_segment") or {}).get("closed") else "answered",
+        "refused_encoded_separator": (
+            "closed" if (refused.get("encoded_separator") or {}).get("closed") else "answered"
+        ),
+        "access_log_lines": log.get("lines"),
+        "access_log_served_lines": log.get("served"),
+        "access_log_refused_lines": (
+            int(log.get("refused_dot_segment") or 0) + int(log.get("refused_encoded_separator") or 0)
+        ),
+    }
+
+
+def _subscription_edge_facts(product: AioProduct, case_id: str) -> Dict[str, Any]:
+    """Run the edge-contract probe once and return the block the two cases read."""
+    host = product.require_installed()
+    ca_file = f"{topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}"
+    facts = panel_probe(
+        product, case_id, "edge-contract",
+        f"--edge-base https://{host.panel_domain} --ca {ca_file}",
+    )
+    edge = facts.get("edge") or {}
+    require(case_id, int(edge.get("short_uuid_length") or 0) > 0,
+            "the Panel served no default client, so there is no subscription to read")
+    return edge
+
+
+NGX_HYGIENE_CASE_ID = "NGX-HYGIENE"
+NGX_SCANNER_CASE_ID = "NGX-SCANNER"
+NGX_HYGIENE_TIMEOUT_SECONDS = 300
+
+
+def _panel_hygiene_facts(product: AioProduct, case_id: str) -> Dict[str, Any]:
+    """Run the vhost-hygiene probe once and return the block both cases read."""
+    host = product.require_installed()
+    ca_file = f"{topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}"
+    facts = panel_probe(
+        product, case_id, "vhost-hygiene",
+        f"--edge-base https://{host.panel_domain} --ca {ca_file}",
+    )
+    hygiene = facts.get("hygiene") or {}
+    require(case_id, int(hygiene.get("short_uuid_length") or 0) > 0,
+            "the Panel served no default client, so no request could be recorded against one")
+    return hygiene
+
+
+def case_ngx_hygiene(product: AioProduct) -> Dict[str, Any]:
+    """NGX-HYGIENE: the edge hides its build and passes on only the peer address.
+
+    Two audiences share one listener: an operator's scanner, which sorts hosts by
+    the version they announce, and the Panel, which believes whichever client
+    address it is handed and uses it for rate limits, login records and
+    notifications. The build therefore has to be absent from every answer NGINX
+    writes — including the error page it produces before a request reaches a
+    route — and the address the Panel records has to be the peer, whatever header
+    the client sends. Each header the Panel prefers over the socket is forged in
+    turn, because a listener that clears eight of nine would otherwise read as
+    correct; the subscription history is the Panel's own record of that address.
+    """
+    case = NGX_HYGIENE_CASE_ID
+    hygiene = _panel_hygiene_facts(product, case)
+
+    answers = hygiene.get("server") or {}
+    answered = answers.get("answered") or {}
+    unmatched = answers.get("unmatched") or {}
+    require(case, answered.get("status") == 200,
+            f"the Panel health route answered {answered.get('status')!r} through the edge")
+    # The Panel serves its own frontend for a path no route occupies, so the
+    # second reading is a 200 the upstream wrote. A 404 there would be the
+    # listener's page, which is what a path that stopped being proxied looks
+    # like.
+    require(case, unmatched.get("status") == 200,
+            f"a path no Panel route occupies answered {unmatched.get('status')!r} through the "
+            f"edge; the Panel serves its frontend there, so anything else is the listener "
+            f"answering in the product's place")
+    for label, entry in (("a served answer", answered), ("the frontend answer", unmatched)):
+        build = panel_surface.NGINX_VERSION.search(str(entry.get("server") or ""))
+        require(case, build is None,
+                f"{label} names the build in Server: {entry.get('server')!r}")
+
+    page = hygiene.get("error_page") or {}
+    require(case, page.get("status") == 414,
+            f"a request line past the header buffer was answered {page.get('status')!r}, so this "
+            f"run read no error page NGINX wrote itself")
+    build = panel_surface.NGINX_VERSION.search(str(page.get("server") or ""))
+    require(case, build is None,
+            f"NGINX's own error page carries its version in Server: {page.get('server')!r}")
+    require(case, not page.get("version_in_body"),
+            f"NGINX's own error page states its version in the body ({page.get('bytes')!r} bytes)")
+
+    peer = str(hygiene.get("peer_recorded_ip") or "")
+    source = str(hygiene.get("probe_source_ip") or "")
+    require(case, source,
+            "the probe could not read the source address its own request carries, so the "
+            "recorded address has nothing to be compared with")
+    require(case, peer == source,
+            f"the Panel recorded {peer!r} for a request carrying no forged header, not the "
+            f"address that request's own connection carried ({source!r})")
+    recorded = hygiene.get("client_ip") or {}
+    require(case, set(recorded) == set(panel_surface.PANEL_CLIENT_IP_HEADERS),
+            f"the probe read {sorted(recorded)} instead of every header the Panel prefers over "
+            f"the socket")
+    for header in panel_surface.PANEL_CLIENT_IP_HEADERS:
+        entry = recorded.get(header) or {}
+        with_header = f"a request carrying {header}: {panel_surface.FORGED_CLIENT_IP}"
+        require(case, entry.get("status") == 200,
+                f"{with_header} was answered {entry.get('status')!r} rather than served")
+        require(case, not entry.get("forged_was_recorded"),
+                f"the Panel recorded the address {with_header} supplied")
+        require(case, entry.get("recorded_is_peer"),
+                f"{with_header} was recorded against {entry.get('recorded_ip')!r} instead of the "
+                f"peer {peer!r}")
+
+    routes = hygiene.get("product_routes") or {}
+    require(case, set(routes) == {label for label, _, _ in panel_surface.PANEL_PRODUCT_ROUTE_PROBES}
+            | {"subscription"},
+            f"the probe read {sorted(routes)} rather than every product surface")
+    # The Panel's own refusals on the two API routes: a status it chose proves the
+    # request reached it, which is what "still proxied" means for a route behind
+    # an authenticated surface.
+    for label, expected in (("rest-api", (401, 403)), ("subscription", (200,))):
+        entry = routes.get(label) or {}
+        require(case, entry.get("status") in expected,
+                f"the {label} route answered {entry.get('status')!r} through the edge instead of "
+                f"{expected}")
+    for label, _, _ in panel_surface.PANEL_PRODUCT_ROUTE_PROBES:
+        if label == "rest-api":
+            continue
+        entry = routes.get(label) or {}
+        require(case, entry.get("closed") is False,
+                f"the {label} surface was closed instead of proxied")
+        require(case, entry.get("status") not in (0, 444),
+                f"the {label} surface answered {entry.get('status')!r}, which is the scanner rule "
+                f"and not the upstream")
+
+    observed = {label: (entry or {}).get("status") for label, entry in routes.items()}
+    return {
+        "server_answered": answered.get("server", ""),
+        "server_unmatched": unmatched.get("server", ""),
+        "error_page_status": page.get("status"),
+        "peer_recorded_ip": peer,
+        "probe_source_ip": source,
+        "headers_forged": " ".join(sorted(recorded)),
+        "product_routes": " ".join(f"{label}={observed[label]}" for label in sorted(observed)),
+    }
+
+
+def case_ngx_scanner(product: AioProduct) -> Dict[str, Any]:
+    """NGX-SCANNER: a scanner target is closed at the edge, the product is not.
+
+    The refusal is only worth reading next to a control: the same client, on a
+    path the Panel answers, has to reach the Panel. Without that half a listener
+    that closed every connection would pass, and the rule that made the host
+    quieter would have been indistinguishable from one that broke it.
+    """
+    case = NGX_SCANNER_CASE_ID
+    hygiene = _panel_hygiene_facts(product, case)
+
+    scanner = hygiene.get("scanner") or {}
+    require(case, set(scanner) == set(panel_surface.PANEL_SCANNER_PATHS),
+            f"the probe read {sorted(scanner)} rather than the shipped scanner set")
+    for path in panel_surface.PANEL_SCANNER_PATHS:
+        entry = scanner.get(path) or {}
+        require(case, entry.get("closed") is True,
+                f"{path} was answered with status {entry.get('status')!r} instead of a closed "
+                f"connection")
+        require(case, entry.get("status") == 0 and entry.get("bytes") == 0,
+                f"{path} closed after sending {entry.get('bytes')!r} bytes with status "
+                f"{entry.get('status')!r}")
+
+    control = hygiene.get("scanner_control") or {}
+    require(case, control.get("closed") is False,
+            "the control request on a proxied path was closed too, so the refusals prove nothing")
+    require(case, control.get("status") in (401, 403),
+            f"an anonymous /api/nodes answered {control.get('status')!r} through the edge, not "
+            f"the Panel's own refusal")
+
+    return {
+        "refused": " ".join(sorted(scanner)),
+        "control_status": control.get("status"),
+    }
+
+
+PRE_INPUTS_CASE_ID = "PRE-INPUTS"
+PRE_INPUTS_BAD_CASE_ID = "PRE-INPUTS-BAD"
+PRE_INPUTS_TIMEOUT_SECONDS = 300
+
+
+def preflight_inputs_script() -> str:
+    """Two install requests that must be refused before the host is touched.
+
+    Both are the operator's own command run against the host this run already
+    installed, so the control is the product itself: the first stops short of the
+    ACME contact, the second fills every position with a value that is not an
+    address. Neither may reach the NGINX stop or a managed path, which is why the
+    probe ends by reading the Panel back — an install that refused after stopping
+    NGINX would otherwise be indistinguishable from one that refused early.
+    """
+    quoted = " ".join(shlex.quote(value) for value in (PANEL_DOMAIN, REALITY_DOMAIN))
+    return (
+        "set -uo pipefail\n"
+        "ask() {\n"
+        '    local prefix="$1"\n'
+        "    shift\n"
+        "    bash " + topology.REPO_IN_CONTAINER + "/gowave-auto.sh install \"$@\""
+        ' </dev/null >"/tmp/${prefix}.log" 2>&1\n'
+        "    local status=$?\n"
+        "    printf '%s_rc=%s\\n' \"$prefix\" \"$status\"\n"
+        '    sed -n "s/^Error: /${prefix}_message=/p" "/tmp/${prefix}.log" | head -n 1\n'
+        "}\n"
+        f"ask missing {quoted}\n"
+        f"ask malformed {quoted} not-an-email\n"
+        + panel_probe_script()
+        + "printf 'nginx=%s\\n' \"$(systemctl is-active nginx.service 2>/dev/null | head -n 1)\"\n"
+    )
+
+
+def _preflight_inputs_facts(product: AioProduct, case_id: str) -> Dict[str, Any]:
+    """Run both refused requests once and return the block both cases read.
+
+    The two refusal sentences are read line by line: the shared token parser
+    keeps one word per value, and a message the case has to compare word for word
+    would otherwise arrive truncated to ``install``.
+    """
+    result = product.host_script(preflight_inputs_script(), timeout=PRE_INPUTS_TIMEOUT_SECONDS)
+    require(case_id, result.returncode == 0,
+            "the input-contract probe failed: "
+            f"{(result.stderr or result.stdout or '').strip()[-800:]}")
+    facts = _parse_key_values(result.stdout or "")
+    for line in (result.stdout or "").splitlines():
+        for key in ("missing_message", "malformed_message"):
+            prefix = f"{key}="
+            if line.startswith(prefix):
+                facts[key] = line[len(prefix):].strip()
+    require(case_id, bool(facts.get("missing_rc")) and bool(facts.get("malformed_rc")),
+            f"the probe reported no refusal for one of the two requests: {sorted(facts)}")
+    return facts
+
+
+def _inventory_changes(before: Dict[str, List[str]],
+                       after: Dict[str, List[str]]) -> List[str]:
+    """Name every resource area the two inventories disagree about, with its diff."""
+    changes: List[str] = []
+    for section in sorted(set(before) | set(after)):
+        old = before.get(section) or []
+        new = after.get(section) or []
+        if old == new:
+            continue
+        removed = [line for line in old if line not in new]
+        added = [line for line in new if line not in old]
+        detail = "; ".join(
+            [f"added {line}" for line in added[:3]] + [f"removed {line}" for line in removed[:3]]
+        )
+        changes.append(f"{section} ({detail})")
+    return changes
+
+
+def case_preflight_inputs(product: AioProduct) -> Dict[str, Any]:
+    """PRE-INPUTS: an incomplete request is refused and the installed host is untouched.
+
+    The refusal is only worth reading against the state it must not disturb: the
+    contract runs before the NGINX stop and before any managed path is written, so
+    a request that stops short of a required value has to leave the product
+    serving and its inventory byte-identical. The Panel is read back afterwards,
+    because a listener left stopped is the failure this ordering exists to avoid.
+    """
+    case = PRE_INPUTS_CASE_ID
+    before = system_inventory(product, case)
+    facts = _preflight_inputs_facts(product, case)
+    after = system_inventory(product, case)
+
+    message = str(facts.get("missing_message") or "")
+    require(case, facts.get("missing_rc") == "2",
+            f"an install request that stopped short of the ACME contact exited "
+            f"{facts.get('missing_rc')!r} instead of refusing")
+    # The positional entry point names the field in its own usage vocabulary
+    # ("the acme email"), while the shared input contract names it "the ACME
+    # contact email". Both are the product's own words on two different paths,
+    # so the case asks that the missing field is named at all, in either.
+    lowered = message.lower()
+    require(case, "acme" in lowered and "email" in lowered,
+            f"the refusal does not name the missing input: {message!r}")
+
+    changes = _inventory_changes(before, after)
+    require(case, not changes,
+            "the refused request rewrote the host it was supposed to leave alone: "
+            + " | ".join(changes))
+
+    require(case, facts.get("nginx") == "active",
+            f"NGINX was {facts.get('nginx')!r} after the refusal, not still serving")
+    require(case, facts.get("login") == "200" and facts.get("api") == "200",
+            f"the Panel answered login={facts.get('login')!r} api={facts.get('api')!r} after the "
+            f"refusal")
+
+    return {
+        "missing_status": facts.get("missing_rc"),
+        "missing_names": message,
+        "nginx": facts.get("nginx"),
+        "panel_login": facts.get("login"),
+        "panel_api": facts.get("api"),
+        "inventory_unchanged": not changes,
+    }
+
+
+def case_preflight_inputs_bad(product: AioProduct) -> Dict[str, Any]:
+    """PRE-INPUTS-BAD: a value that is present but malformed is refused on its field.
+
+    A contract that only counted arguments would accept this request and fail
+    later, inside a step that has already stopped NGINX. The value is quoted back
+    in the refusal so the operator can see which input was rejected, and the host
+    is inventoried again for the same reason the missing-input case does it.
+    """
+    case = PRE_INPUTS_BAD_CASE_ID
+    before = system_inventory(product, case)
+    facts = _preflight_inputs_facts(product, case)
+    after = system_inventory(product, case)
+
+    message = str(facts.get("malformed_message") or "")
+    require(case, facts.get("malformed_rc") == "2",
+            f"an install request carrying a malformed ACME contact exited "
+            f"{facts.get('malformed_rc')!r} instead of refusing")
+    require(case, "acme contact email" in message.lower(),
+            f"the refusal does not name the rejected input: {message!r}")
+    require(case, "not-an-email" in message,
+            f"the refusal does not quote the rejected value: {message!r}")
+
+    changes = _inventory_changes(before, after)
+    require(case, not changes,
+            "the refused request rewrote the host it was supposed to leave alone: "
+            + " | ".join(changes))
+
+    require(case, facts.get("nginx") == "active",
+            f"NGINX was {facts.get('nginx')!r} after the refusal, not still serving")
+    require(case, facts.get("login") == "200" and facts.get("api") == "200",
+            f"the Panel answered login={facts.get('login')!r} api={facts.get('api')!r} after the "
+            f"refusal")
+
+    return {
+        "malformed_status": facts.get("malformed_rc"),
+        "malformed_names": message,
+        "nginx": facts.get("nginx"),
+        "panel_login": facts.get("login"),
+        "panel_api": facts.get("api"),
+        "inventory_unchanged": not changes,
+    }
+
+
 def case_share_links(product: AioProduct) -> Dict[str, Any]:
     """SUB-B64: the base64 list describes exactly the served proxy inventory.
 
@@ -6629,10 +7205,11 @@ def case_json_shapes(product: AioProduct) -> Dict[str, Any]:
 
 DECOY_CASE_ID = "DECOY-01"
 # Every path the panel vhost is generated with, plus the two a scanner tries
-# first. Each one is answered by a management process on the panel's own name,
-# so a camouflage listener that answers any of them has published what the
-# deployment really is. ``/`` is deliberately absent: the cover site's own front
-# page is served there, and the case measures that separately.
+# first, plus the closed scanner set the panel vhost refuses outright. Each one
+# is answered by a management process on the panel's own name, so a camouflage
+# listener that answers any of them has published what the deployment really is.
+# ``/`` is deliberately absent: the cover site's own front page is served there,
+# and the case measures that separately.
 DECOY_MANAGEMENT_PATHS: Sequence[str] = (
     "/api/",
     "/api/sub/",
@@ -6643,6 +7220,13 @@ DECOY_MANAGEMENT_PATHS: Sequence[str] = (
     "/trojan-grpc",
     "/metrics",
     "/server-status",
+    "/.env",
+    "/.git/config",
+    "/.ds_store",
+    "/wp-login.php",
+    "/wp-admin/",
+    "/phpmyadmin/",
+    "/actuator/health",
 )
 # A path no cover site ships, so the answer to it is the site's own 404 page.
 DECOY_MISSING_PATH = "/e2e-no-such-cover-page"
@@ -8726,6 +9310,491 @@ def case_operator_interrupt(product: AioProduct) -> Dict[str, Any]:
             )
 
 
+VERIFIED_ARTIFACT_FETCH_CASE_ID = "VERIFIED-ARTIFACT-FETCH"
+PINNED_INSTALLER_HOSTS_CASE_ID = "PINNED-INSTALLER-HOSTS"
+PANEL_ASSET_VERIFICATION_CASE_ID = "PANEL-ASSET-VERIFICATION"
+FAIL_STEP_CASE_ID = "FAIL-STEP"
+
+
+def case_verified_artifact_fetch(product: AioProduct) -> Dict[str, Any]:
+    """``VERIFIED-ARTIFACT-FETCH``: the verified artifact chain fetches from ordered hosts,
+    verifies the digest before atomic rename, and stops on mismatch without fall-through.
+
+    The artifact helper `fetch_verified_artifact` is sourced and driven against a local
+    HTTP fixture that answers the first URL with a 404, the second with the correct
+    bytes, and a third with a mismatched payload. The case asserts fall-through on 404,
+    successful verification and atomic replace on the second, and terminal mismatch
+    refusal without trying the third host.
+    """
+    import hashlib
+    import http.server
+    import tempfile
+    import threading
+    import shlex
+    import subprocess
+    from pathlib import Path
+
+    payload = b"the pinned artifact bytes\n"
+    digest = hashlib.sha256(payload).hexdigest()
+
+    class FixtureServer:
+        def __init__(self, routes):
+            self.routes = dict(routes)
+            self.requests = []
+            routes = self.routes
+            requests = self.requests
+
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    requests.append(self.path)
+                    body = routes.get(self.path)
+                    if body is None:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                def log_message(self, *_args):
+                    pass
+
+            self._httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+
+        def __enter__(self):
+            self._thread.start()
+            self.base = f"http://127.0.0.1:{self._httpd.server_address[1]}"
+            return self
+
+        def __exit__(self, *_exc):
+            self._httpd.shutdown()
+            self._httpd.server_close()
+            self._thread.join(timeout=10)
+            return False
+
+        def url(self, path):
+            return self.base + path
+
+    # Test 1: fall-through on 404
+    with tempfile.TemporaryDirectory() as tmpdir, FixtureServer({"/second": payload}) as server:
+        dest = Path(tmpdir) / "artifact.bin"
+        command = " ".join([
+            f"source {shlex.quote(str(product.repo / 'modules' / 'artifact.sh'))} &&",
+            "fetch_verified_artifact",
+            shlex.quote(str(dest)),
+            shlex.quote("artifact"),
+            *(shlex.quote(server.url(p)) for p in ["/first", "/second"]),
+            shlex.quote(digest),
+        ])
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=120)
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            result.returncode == 0,
+            f"fall-through on 404 failed: {result.stderr}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            dest.read_bytes() == payload,
+            "artifact bytes do not match expected payload",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            server.requests == ["/first", "/second"],
+            f"expected requests [/first, /second], got {server.requests}",
+        )
+
+    # Test 2: terminal mismatch without fall-through
+    mismatched = b"different bytes\n"
+    with tempfile.TemporaryDirectory() as tmpdir, FixtureServer({"/first": mismatched, "/second": payload}) as server:
+        dest = Path(tmpdir) / "artifact.bin"
+        command = " ".join([
+            f"source {shlex.quote(str(product.repo / 'modules' / 'artifact.sh'))} &&",
+            "fetch_verified_artifact",
+            shlex.quote(str(dest)),
+            shlex.quote("artifact"),
+            *(shlex.quote(server.url(p)) for p in ["/first", "/second"]),
+            shlex.quote(digest),
+        ])
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=120)
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            result.returncode == 2,
+            f"mismatch should be terminal: {result.stderr}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            server.requests == ["/first"],
+            f"mismatch must not fall through, got {server.requests}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            not dest.exists(),
+            "mismatched download must not be left behind",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            "SHA256 mismatch" in result.stderr,
+            "error message must mention SHA256 mismatch",
+        )
+
+    # Test 3: no host delivering leaves nothing
+    with tempfile.TemporaryDirectory() as tmpdir, FixtureServer({}) as server:
+        dest = Path(tmpdir) / "artifact.bin"
+        command = " ".join([
+            f"source {shlex.quote(str(product.repo / 'modules' / 'artifact.sh'))} &&",
+            "fetch_verified_artifact",
+            shlex.quote(str(dest)),
+            shlex.quote("artifact"),
+            *(shlex.quote(server.url(p)) for p in ["/first", "/second"]),
+            shlex.quote(digest),
+        ])
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=120)
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            result.returncode == 1,
+            f"no host should fail: {result.stderr}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            server.requests == ["/first", "/second"],
+            f"both hosts should be tried, got {server.requests}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            not dest.exists(),
+            "no artifact should be left behind",
+        )
+
+    # Test 4: atomic replace - destination is replaced only after verification
+    with tempfile.TemporaryDirectory() as tmpdir, FixtureServer({"/only": payload}) as server:
+        dest = Path(tmpdir) / "artifact.bin"
+        dest.write_bytes(b"previous content\n")
+        command = " ".join([
+            f"source {shlex.quote(str(product.repo / 'modules' / 'artifact.sh'))} &&",
+            "fetch_verified_artifact",
+            shlex.quote(str(dest)),
+            shlex.quote("artifact"),
+            shlex.quote(server.url("/only")),
+            shlex.quote(digest),
+        ])
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=120)
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            result.returncode == 0,
+            f"atomic replace failed: {result.stderr}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            dest.read_bytes() == payload,
+            "destination must be replaced with verified content",
+        )
+
+    # Test 5: unusable digest refused before any download
+    with tempfile.TemporaryDirectory() as tmpdir, FixtureServer({"/only": payload}) as server:
+        dest = Path(tmpdir) / "artifact.bin"
+        command = " ".join([
+            f"source {shlex.quote(str(product.repo / 'modules' / 'artifact.sh'))} &&",
+            "fetch_verified_artifact",
+            shlex.quote(str(dest)),
+            shlex.quote("artifact"),
+            shlex.quote(server.url("/only")),
+            shlex.quote("not-a-digest"),
+        ])
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=120)
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            result.returncode == 2,
+            f"unusable digest should be refused: {result.stderr}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            server.requests == [],
+            "no download for unusable digest",
+        )
+
+    # Test 6: missing host list refused
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dest = Path(tmpdir) / "artifact.bin"
+        command = " ".join([
+            f"source {shlex.quote(str(product.repo / 'modules' / 'artifact.sh'))} &&",
+            "fetch_verified_artifact",
+            shlex.quote(str(dest)),
+            shlex.quote("artifact"),
+            shlex.quote(digest),
+        ])
+        result = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=120)
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            result.returncode == 1,
+            f"missing host list should be refused: {result.stderr}",
+        )
+        require(
+            VERIFIED_ARTIFACT_FETCH_CASE_ID,
+            "no source host" in result.stderr,
+            "error must mention missing host list",
+        )
+
+    return {
+        "tests_passed": 6,
+        "fall_through_404": True,
+        "terminal_mismatch": True,
+        "no_host_fails": True,
+        "atomic_replace": True,
+        "unusable_digest_refused": True,
+        "missing_host_list_refused": True,
+    }
+
+
+def case_pinned_installer_hosts(product: AioProduct) -> Dict[str, Any]:
+    """``PINNED-INSTALLER-HOSTS``: the pinned Worker installer URL order is GitHub first,
+    then jsDelivr.
+
+    The `pinned_node_installer_urls` function is sourced and its output is compared
+    against the expected order: raw.githubusercontent.com followed by cdn.jsdelivr.net.
+    """
+    import os
+    import shlex
+    import subprocess
+    from pathlib import Path
+
+    commit = "7b3514d1ab8c674050597820d52d55525d4bece7"
+    env = os.environ.copy()
+    env["GOWAVE_NODE_INSTALLER_COMMIT"] = commit
+
+    command = f"source {shlex.quote(str(product.repo / 'modules' / 'node.sh'))} && pinned_node_installer_urls"
+    result = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True, text=True, env=env, timeout=60,
+    )
+
+    require(
+        PINNED_INSTALLER_HOSTS_CASE_ID,
+        result.returncode == 0,
+        f"pinned_node_installer_urls failed: {result.stderr}",
+    )
+
+    urls = result.stdout.split()
+    expected = [
+        f"https://raw.githubusercontent.com/aaaSaZaN/gowave-node/{commit}/install.sh",
+        f"https://cdn.jsdelivr.net/gh/aaaSaZaN/gowave-node@{commit}/install.sh",
+    ]
+
+    require(
+        PINNED_INSTALLER_HOSTS_CASE_ID,
+        urls == expected,
+        f"URL order mismatch: got {urls}, expected {expected}",
+    )
+
+    return {
+        "urls": urls,
+        "github_first": urls[0].startswith("https://raw.githubusercontent.com/"),
+        "jsdelivr_second": urls[1].startswith("https://cdn.jsdelivr.net/"),
+    }
+
+
+def case_panel_asset_verification(product: AioProduct) -> Dict[str, Any]:
+    """``PANEL-ASSET-VERIFICATION``: the panel release asset transfer requires SHA256SUMS
+    from the release host, and a mismatched asset aborts without falling through.
+
+    The `download_panel_release` function is driven with a stubbed curl that answers
+    every URL with a mismatched payload. The SHA256SUMS file contains well-formed
+    digests that the stub's bytes cannot match. The case asserts the mismatch aborts
+    the transfer, the binary is not left behind, and only one URL is requested
+    (no fall-through to the next host).
+    """
+    import tempfile
+    import os
+    import shlex
+    import subprocess
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        target_dir = tmp / "opt_gowave"
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        log = tmp / "curl-urls.log"
+        payload = tmp / "stub-body.bin"
+        payload.write_bytes(b"another release's bytes\n")
+        stub = bin_dir / "curl"
+        stub.write_text(
+            "#!/bin/sh\n"
+            "url=''\n"
+            "target=''\n"
+            'while [ "$#" -gt 0 ]; do\n'
+            '  case "$1" in\n'
+            '    -o) target="$2"; shift 2 ;;\n'
+            '    -*) shift ;;\n'
+            '    *) url="$1"; shift ;;\n'
+            "  esac\n"
+            "done\n"
+            f'printf \'%s\\n\' "$url" >> "{log}"\n'
+            f'if [ -n "$target" ]; then cp "{payload}" "$target"; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+
+        arch_result = subprocess.run(
+            ["bash", "-c", f'source "{product.repo / "modules" / "panel.sh"}" && detect_arch'],
+            capture_output=True, text=True, timeout=60,
+        )
+        arch = arch_result.stdout.strip()
+
+        sums = tmp / "SHA256SUMS"
+        sums.write_text(
+            f"{'0' * 64}  gowave-linux-{arch}\n"
+            f"{'0' * 64}  gowave-frontend.tar.gz\n",
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env["GOWAVE_SHA256SUMS"] = str(sums)
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+
+        command = f'source "{product.repo / "modules" / "panel.sh"}" && download_panel_release "{target_dir}" v9.9.9'
+        result = subprocess.run(
+            ["bash", "-c", command],
+            capture_output=True, text=True, env=env, timeout=120,
+        )
+
+        require(
+            PANEL_ASSET_VERIFICATION_CASE_ID,
+            result.returncode != 0,
+            "mismatched asset must abort the transfer",
+        )
+        require(
+            PANEL_ASSET_VERIFICATION_CASE_ID,
+            "Checksum mismatch" in result.stderr,
+            "error must mention checksum mismatch",
+        )
+        require(
+            PANEL_ASSET_VERIFICATION_CASE_ID,
+            not (target_dir / "gowave-server").exists(),
+            "binary must not be left behind after mismatch",
+        )
+
+        requested = log.read_text().splitlines()
+        require(
+            PANEL_ASSET_VERIFICATION_CASE_ID,
+            len(requested) == 1,
+            f"a mismatch must abort instead of trying the next URL, got {requested}",
+        )
+        require(
+            PANEL_ASSET_VERIFICATION_CASE_ID,
+            f"gowave-linux-{arch}" in requested[0],
+            f"requested URL must be for the binary: {requested[0]}",
+        )
+        require(
+            PANEL_ASSET_VERIFICATION_CASE_ID,
+            "gowave-frontend.tar.gz" not in requested[0],
+            "frontend asset must not be requested in the same call",
+        )
+        require(
+            PANEL_ASSET_VERIFICATION_CASE_ID,
+            not any("api.github.com" in url for url in requested),
+            "a digest mismatch must not fall back to the release API",
+        )
+
+    return {
+        "mismatch_aborts": True,
+        "binary_not_left": True,
+        "single_url_requested": True,
+        "no_release_api_fallback": True,
+    }
+
+
+def case_fail_step(product: AioProduct) -> Dict[str, Any]:
+    """``FAIL-STEP``: a failed install prints a located failure with the step name,
+    the failing command and its status, exactly once, and exits with that status.
+
+    The ERR trap with CURRENT_STEP is installed per design.md D13. The fixture
+    sources ``gowave-auto.sh`` — the router stops at a sourced file, so the menu
+    does not start — sets CURRENT_STEP, and runs a step whose command fails. The
+    report is read for the three things the operator needs to locate the stop, and
+    the run is read for the status the trap must keep. A second run where the step
+    succeeds is the control: the same trap must stay silent.
+
+    The double-compensation clause is not measured here: this trap only reports,
+    and the unit suite (`tests/test_failure_report.py`) drives the handler against
+    a pre-rolled-back step to prove it. A case that asserted it from this fixture
+    would be asserting a behaviour the fixture cannot show.
+    """
+    import tempfile
+    import subprocess
+    import shlex
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        script_path = str(product.repo / "gowave-auto.sh")
+
+        failed = tmp / "test_fail_step.sh"
+        failed.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -Eeuo pipefail\n"
+            f"source {shlex.quote(script_path)}\n"
+            "\n"
+            "CURRENT_STEP='test-step'\n"
+            "failing_step() { false; }\n"
+            "failing_step\n"
+            "echo 'SHOULD_NOT_REACH'\n",
+            encoding="utf-8",
+        )
+        failed.chmod(0o755)
+        result = subprocess.run(
+            ["bash", str(failed)], capture_output=True, text=True, timeout=60,
+        )
+
+        succeeded = tmp / "test_ok_step.sh"
+        succeeded.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -Eeuo pipefail\n"
+            f"source {shlex.quote(script_path)}\n"
+            "\n"
+            "CURRENT_STEP='ok-step'\n"
+            "true\n"
+            "echo 'STEP_COMPLETED'\n",
+            encoding="utf-8",
+        )
+        succeeded.chmod(0o755)
+        control = subprocess.run(
+            ["bash", str(succeeded)], capture_output=True, text=True, timeout=60,
+        )
+
+    report = result.stderr
+    require(FAIL_STEP_CASE_ID, result.returncode == 1,
+            f"a failing step exited {result.returncode!r} instead of keeping its status")
+    require(FAIL_STEP_CASE_ID, 'step "test-step"' in report,
+            f"the report does not name the step: stdout={result.stdout!r}, stderr={report!r}")
+    require(FAIL_STEP_CASE_ID, 'running "false"' in report,
+            f"the report does not name the failing command: {report!r}")
+    require(FAIL_STEP_CASE_ID, "(exit 1)" in report,
+            f"the report does not name the status: {report!r}")
+    require(FAIL_STEP_CASE_ID, report.count('Error: step "') == 1,
+            f"the report was printed {report.count('Error: step \"')} times, so the handler "
+            f"re-entered itself: {report!r}")
+    require(FAIL_STEP_CASE_ID, "SHOULD_NOT_REACH" not in result.stdout,
+            "the run continued past the failing command")
+
+    require(FAIL_STEP_CASE_ID, control.returncode == 0,
+            f"a step that succeeded exited {control.returncode!r}: {control.stderr!r}")
+    require(FAIL_STEP_CASE_ID, "STEP_COMPLETED" in control.stdout,
+            f"the control run did not reach its end: {control.stdout!r}")
+    require(FAIL_STEP_CASE_ID, "Error: step " not in control.stderr,
+            f"a successful run printed a failure report: {control.stderr!r}")
+
+    return {
+        "step_named": "test-step" in report,
+        "command_named": 'running "false"' in report,
+        "status_named": "(exit 1)" in report,
+        "report_count": report.count('Error: step "'),
+        "exit_status": result.returncode,
+        "silent_on_success": "Error: step " not in control.stderr,
+    }
+
+
 def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False) -> List[Case]:
     """The AIO suite: the install case plus every case that reuses its host.
 
@@ -8797,7 +9866,25 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case("SUB-SERVED", "aio", lambda context: case_subscriptions(product), timeout_seconds=600),
         Case("SUB-UA-ABSENT", "aio", lambda context: case_user_agent_absent(product), timeout_seconds=300),
         Case("SUB-UA-BLANK", "aio", lambda context: case_user_agent_blank(product), timeout_seconds=300),
+        # The listener's own contract, read where a pasted link lands: the edge,
+        # not the loopback. It runs after the representation cases because it
+        # compares the payload it is served with the one they already imported.
+        Case(SUB_EDGE_CASE_ID, "aio", lambda context: case_subscription_edge(product),
+             timeout_seconds=SUB_EDGE_TIMEOUT_SECONDS),
+        Case(SUB_EDGE_FORGERY_CASE_ID, "aio",
+             lambda context: case_subscription_edge_forgery(product),
+             timeout_seconds=SUB_EDGE_TIMEOUT_SECONDS),
         Case("SUB-B64", "aio", lambda context: case_share_links(product), timeout_seconds=300),
+        Case(NGX_HYGIENE_CASE_ID, "aio", lambda context: case_ngx_hygiene(product),
+             timeout_seconds=NGX_HYGIENE_TIMEOUT_SECONDS),
+        Case(NGX_SCANNER_CASE_ID, "aio", lambda context: case_ngx_scanner(product),
+             timeout_seconds=NGX_HYGIENE_TIMEOUT_SECONDS),
+        # Two refusals of the same entrypoint, ordered after the install because
+        # the control they read is the product the install left serving.
+        Case(PRE_INPUTS_CASE_ID, "aio", lambda context: case_preflight_inputs(product),
+             timeout_seconds=PRE_INPUTS_TIMEOUT_SECONDS),
+        Case(PRE_INPUTS_BAD_CASE_ID, "aio", lambda context: case_preflight_inputs_bad(product),
+             timeout_seconds=PRE_INPUTS_TIMEOUT_SECONDS),
         Case("SUB-JSON-SHAPES", "aio", lambda context: case_json_shapes(product), timeout_seconds=300),
         # The anchor every TLS outbound needs, read from the helper the data-plane
         # cases call: the config is minted here and the CA is minted here, so the
@@ -8919,6 +10006,14 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
              preflight_cases.case_aaaa_verified_with_ipv6, timeout_seconds=240),
         Case(preflight_cases.AAAA_BYPASS_CASE_ID, "aio",
              preflight_cases.case_aaaa_cannot_bypass, timeout_seconds=240),
+        Case(preflight_cases.PROXY_CIDR_CASE_ID, "aio",
+             preflight_cases.case_proxy_cidr_refused, timeout_seconds=240),
+        Case(preflight_cases.PROXY_CIDR_OVERRIDE_CASE_ID, "aio",
+             preflight_cases.case_proxy_cidr_override, timeout_seconds=240),
+        Case(preflight_cases.TLS_LINEAGE_CASE_ID, "aio",
+             preflight_cases.case_tls_lineage, timeout_seconds=120),
+        Case(preflight_cases.TLS_LINEAGE_BAD_CASE_ID, "aio",
+             preflight_cases.case_tls_lineage_bad, timeout_seconds=120),
         Case(preflight_cases.DISTINCT_TARGETS_CASE_ID, "aio",
              preflight_cases.case_distinct_targets, timeout_seconds=120),
         Case(preflight_cases.DISTINCT_DOMAINS_CASE_ID, "aio",
@@ -9102,6 +10197,24 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
         Case(revocation.REV_02, "aio",
              lambda context: revocation.case_revocation_cannot_be_verified(product, context),
              timeout_seconds=300),
+        # The pinned artifact chain: ordered hosts, digest before use, mismatch
+        # terminal. These are unit-test-style cases that start no container and
+        # read no clock, so they run beside the other file-shaped cases. Their
+        # driver takes the product alone: the runner's context is what the cases
+        # that reach a host need, and passing it here was a call the function
+        # never accepted.
+        Case(VERIFIED_ARTIFACT_FETCH_CASE_ID, "aio",
+             lambda _context: case_verified_artifact_fetch(product),
+             timeout_seconds=120),
+        Case(PINNED_INSTALLER_HOSTS_CASE_ID, "aio",
+             lambda _context: case_pinned_installer_hosts(product),
+             timeout_seconds=120),
+        Case(PANEL_ASSET_VERIFICATION_CASE_ID, "aio",
+             lambda _context: case_panel_asset_verification(product),
+             timeout_seconds=120),
+        Case(FAIL_STEP_CASE_ID, "aio",
+             lambda _context: case_fail_step(product),
+             timeout_seconds=120),
         # The negative matrix itself: fifteen rows the spec prints, each with the
         # case that stops at its boundary and the contour able to produce it. The
         # witnesses are read out of the suite's own registry, so a witness deleted

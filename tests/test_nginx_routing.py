@@ -1,14 +1,169 @@
 #!/usr/bin/env python3
 import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from tools.podman_e2e import panel_surface  # noqa: E402
+
 NGINX_SH = REPO_ROOT / "modules" / "nginx.sh"
+PRODUCTION_DIRECTORY = "https://acme-v02.api.letsencrypt.org/directory"
+STAGING_DIRECTORY = "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+
+def issue_lineage(letsencrypt_root, name, sans, server=PRODUCTION_DIRECTORY, expired=False, archived=False):
+    """Place a lineage where certbot would: live/<name>/ and renewal/<name>.conf.
+
+    An expired certificate cannot be made with `openssl req -days` (the option
+    takes no negative value) and `-not_after` is too new for the OpenSSL 3.0 the
+    supported distributions ship, so the expired case goes through a throwaway CA
+    whose `-startdate`/`-enddate` accept any window.
+
+    ``archived`` reproduces certbot's real layout: the files live in
+    ``archive/<name>/`` and ``live/<name>/`` holds relative symlinks into it.
+    The snapshot helper refuses a lineage whose archive directory is absent, and
+    this is the shape a host that certbot has issued to actually has.
+    """
+    root = Path(letsencrypt_root)
+    live_dir = root / "live" / name
+    renewal_dir = root / "renewal"
+    live_dir.mkdir(parents=True, exist_ok=True)
+    renewal_dir.mkdir(parents=True, exist_ok=True)
+    (renewal_dir / f"{name}.conf").write_text(
+        f"[renewalparams]\nserver = {server}\nauthenticator = webroot\n", encoding="utf-8"
+    )
+    cert = live_dir / "fullchain.pem"
+    key = live_dir / "privkey.pem"
+    subject_alt_names = ",".join(f"DNS:{san}" for san in sans)
+    if expired:
+        work = root / f".ca-{name}"
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "serial").write_text("01\n", encoding="utf-8")
+        (work / "index.txt").write_text("", encoding="utf-8")
+        (work / "newcerts").mkdir(exist_ok=True)
+        (work / "ca.cnf").write_text(
+            "[ ca ]\n"
+            "default_ca = CA_default\n"
+            "[ CA_default ]\n"
+            "dir = .\n"
+            "database = ./index.txt\n"
+            "serial = ./serial\n"
+            "new_certs_dir = ./newcerts\n"
+            "default_md = sha256\n"
+            "policy = policy_any\n"
+            "copy_extensions = copy\n"
+            "[ policy_any ]\n"
+            "commonName = supplied\n"
+            "[ v3 ]\n"
+            f"subjectAltName = {subject_alt_names}\n"
+            "basicConstraints = critical,CA:FALSE\n",
+            encoding="utf-8",
+        )
+        subprocess.run([
+            "openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key), "-out", "req.csr", "-subj", f"/CN={sans[0]}",
+        ], check=True, cwd=work, stderr=subprocess.DEVNULL)
+        subprocess.run([
+            "openssl", "ca", "-batch", "-config", "ca.cnf", "-selfsign",
+            "-keyfile", str(key), "-in", "req.csr", "-out", str(cert),
+            "-startdate", "20200101000000Z", "-enddate", "20200102000000Z",
+            "-extensions", "v3", "-notext",
+        ], check=True, cwd=work, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key), "-out", str(cert), "-days", "30",
+            "-subj", f"/CN={sans[0]}",
+            "-addext", f"subjectAltName={subject_alt_names}",
+        ], check=True, stderr=subprocess.DEVNULL)
+
+    if archived:
+        store = root / "archive" / name
+        store.mkdir(parents=True, exist_ok=True)
+        for path in (cert, key):
+            target = store / path.name
+            shutil.move(str(path), str(target))
+            path.symlink_to(Path("..") / ".." / "archive" / name / path.name)
+    return live_dir
+
+
+def select_lineage(name, letsencrypt_root, server=PRODUCTION_DIRECTORY):
+    cmd = (
+        f'source "{NGINX_SH}" && select_acme_lineage '
+        f'"{name}" "{server}" "{letsencrypt_root}"'
+    )
+    return subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+
+
+def render_panel_vhost(directory, panel_domain="panel.example.com"):
+    out = Path(directory) / "gowave-panel.conf"
+    cmd = f'source "{NGINX_SH}" && generate_panel_https_vhost "{panel_domain}" "{out}"'
+    res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+    if res.returncode != 0:
+        raise AssertionError(res.stderr)
+    return out.read_text()
+
+
+def nginx_block(text, header):
+    """Return the body of the first block whose opening line contains ``header``."""
+    start = text.index(header)
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:index + 1]
+    raise AssertionError(f"unterminated block: {header}")
+
+
+def map_entries(text, header):
+    """Parse a map body into ``(mode, pattern, value)`` with ``mode`` in default|exact|regex."""
+    body = nginx_block(text, header)
+    body = body[body.index("{") + 1:body.rindex("}")]
+    entries = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.rpartition(" ")
+        key = key.strip()
+        value = value.rstrip(";").strip()
+        if key == "default":
+            entries.append(("default", None, value))
+        elif key.startswith('"~'):
+            entries.append(("regex", key.strip('"')[1:], value))
+        elif key.startswith("~*"):
+            entries.append(("regex_i", key[2:], value))
+        elif key.startswith("~"):
+            entries.append(("regex", key[1:], value))
+        else:
+            entries.append(("exact", key, value))
+    return entries
+
+
+def map_lookup(entries, subject):
+    fallback = ""
+    for mode, pattern, value in entries:
+        if mode == "default":
+            fallback = value
+        elif mode == "exact" and subject == pattern:
+            return value
+        elif mode == "regex" and re.search(pattern, subject):
+            return value
+        elif mode == "regex_i" and re.search(pattern, subject, re.IGNORECASE):
+            return value
+    return fallback
 
 
 class TestNginxRouting(unittest.TestCase):
@@ -89,6 +244,226 @@ class TestNginxRouting(unittest.TestCase):
             self.assertIn("proxy_pass http://127.0.0.1:10002;", c)
             self.assertIn("location /trojan-grpc {", c)
             self.assertIn("grpc_pass grpc://127.0.0.1:10003;", c)
+            # The panel vhost must not announce its build, must not copy a
+            # client-supplied forwarding header, and must declare its maps above
+            # the server block it serves.
+            self.assertIn("server_tokens off;", c)
+            self.assertLess(c.index("map $http_user_agent $gowave_sub_ua_class {"),
+                            c.index("server {"), "the User-Agent map must precede the server block")
+            self.assertLess(c.index("map $request_uri $gowave_sub_path_bad {"),
+                            c.index("server {"), "the path map must precede the server block")
+            self.assertNotIn("proxy_add_x_forwarded_for", c)
+            self.assertEqual(c.count("proxy_set_header X-Forwarded-For $remote_addr;"), 5)
+
+    def test_panel_vhost_hands_the_panel_only_the_peer_address(self):
+        """Every header the Panel prefers over the socket is answered by the edge.
+
+        The Panel reads ten address headers before it falls back to the
+        connection, and a vhost that rewrote only the two conventional ones left
+        eight by which a client could choose the address the Panel records for
+        rate limits, login attempts and notifications. The guard is written
+        against that list rather than a literal so a header the Panel starts
+        honouring cannot be added there and left forwarded here.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = render_panel_vhost(tmpdir)
+            cleared = tuple(panel_surface.PANEL_CLEARED_CLIENT_IP_HEADERS)
+            self.assertIn("X-Remnawave-Real-IP", cleared)
+            self.assertNotIn("X-Forwarded-For", cleared)
+            self.assertNotIn("X-Real-IP", cleared)
+            locations = (
+                "location ^~ /api/sub/",
+                "location ^~ /api/",
+                "location / {",
+                "location ^~ /xhttp-down/",
+                "location = /ws {",
+            )
+            for header in locations:
+                block = nginx_block(c, header)
+                for name in panel_surface.PANEL_CLIENT_IP_HEADERS:
+                    expected = (
+                        "$remote_addr"
+                        if name in panel_surface.PANEL_FORWARDED_CLIENT_IP_HEADERS
+                        else '""'
+                    )
+                    self.assertIn(
+                        f"proxy_set_header {name} {expected};", block,
+                        f"{header} does not hand the Panel {name!r} as {expected}",
+                    )
+                # Nothing the Panel trusts may arrive from the client itself.
+                self.assertNotRegex(
+                    block,
+                    r"proxy_set_header\s+(?:"
+                    + "|".join(re.escape(name) for name in panel_surface.PANEL_CLIENT_IP_HEADERS)
+                    + r")\s+\$http_",
+                )
+
+    def test_panel_vhost_subscription_headers_are_status_independent(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = render_panel_vhost(tmpdir)
+            block = nginx_block(c, "location ^~ /api/sub/")
+            self.assertIn('add_header Cache-Control "no-store, private" always;', block)
+            self.assertIn(
+                'add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet" always;', block)
+            # `always` is the whole point: without it a 502 from the Panel reaches
+            # the client with no cache directive.
+            for line in block.splitlines():
+                if "add_header" in line:
+                    self.assertIn("always", line, f"header without `always`: {line.strip()}")
+
+    def test_panel_vhost_subscription_access_log_is_off(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = render_panel_vhost(tmpdir)
+            self.assertIn("access_log off;", nginx_block(c, "location ^~ /api/sub/"))
+            # The transports keep the suppression they already had.
+            self.assertIn("access_log off;", nginx_block(c, "location ^~ /xhttp-down/"))
+            self.assertIn("access_log off;", nginx_block(c, "location = /ws {"))
+
+    def test_panel_vhost_user_agent_classification(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = render_panel_vhost(tmpdir)
+            header = "map $http_user_agent $gowave_sub_ua_class"
+            entries = map_entries(c, header)
+            self.assertEqual(entries[0], ("default", None, "client"))
+            self.assertNotIn('""', nginx_block(c, header),
+                             "an empty header key would answer an absent User-Agent itself")
+            previews = (
+                "TelegramBot (like TwitterBot)",
+                "WhatsApp/2.23.20.0",
+                "facebookexternalhit/1.1",
+                "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)",
+                "Discordbot/2.0",
+                "Twitterbot/1.0",
+                "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+                "Mozilla/5.0 (compatible; bingbot/2.0)",
+                "Mozilla/5.0 (compatible; YandexBot/3.0)",
+                "Mozilla/5.0 (compatible; YandexImages/3.0)",
+                "Mozilla/5.0 (compatible; Applebot/0.1)",
+                "Mozilla/5.0 (compatible; AhrefsBot/7.0)",
+                "Mozilla/5.0 (compatible; SemrushBot/7~bl)",
+            )
+            for ua in previews:
+                with self.subTest(user_agent=ua):
+                    self.assertEqual(map_lookup(entries, ua), "preview")
+            clients = (
+                "",
+                "curl/8.5.0",
+                "clash-verge/v2.0.0",
+                "ClashforWindows/0.20.39",
+                "mihomo/1.18.0",
+                "v2rayN/6.31",
+                "sing-box 1.10.0",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0",
+                "GoWave/1.0",
+            )
+            for ua in clients:
+                with self.subTest(user_agent=ua):
+                    self.assertEqual(map_lookup(entries, ua), "client")
+            # The `204` is answered by the same location, so `add_header` applies.
+            self.assertIn("if ($gowave_sub_ua_class = preview) {", c)
+            self.assertIn("return 204;", nginx_block(c, "location ^~ /api/sub/"))
+
+    def test_panel_vhost_path_guard_is_keyed_on_the_raw_target(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = render_panel_vhost(tmpdir)
+            header = "map $request_uri $gowave_sub_path_bad"
+            self.assertIn(header, c)
+            self.assertNotIn("map $uri $gowave_sub_path_bad", c)
+            # The counted pattern keeps its quotes: braces are block delimiters
+            # to the config parser, and an unquoted one fails `nginx -t`.
+            self.assertIn('"~^/api/sub/[A-Za-z0-9_-]+/[a-z0-9-]{17,}"', c)
+            entries = map_entries(c, header)
+            self.assertEqual([value for mode, _, value in entries if mode == "default"], ["0"])
+            good = (
+                "/api/sub/",
+                "/api/sub/abcd1234",
+                # The identifier is a shortUuid the Panel issues from base64url,
+                # so an upper-case letter or an underscore is part of a real link.
+                "/api/sub/k_2yr52aHyK4j4jg",
+                "/api/sub/k_2yr52aHyK4j4jg/v2ray-json",
+                "/api/sub/k_2yr52aHyK4j4jg/mihomo",
+                "/api/sub/k_2yr52aHyK4j4jg/clash",
+                "/api/sub/k_2yr52aHyK4j4jg/clash?token=abc",
+                "/api/sub/abcd1234/clash",
+                "/api/sub/abcd1234/mihomo",
+                "/api/sub/abcd1234/singbox",
+                "/api/sub/abcd1234/json",
+                "/api/sub/abcd1234/v2ray-json",
+                "/api/sub/abcd1234/stash",
+                "/api/sub/abcd1234/info",
+                "/api/sub/abcd1234/clash?token=abc",
+                "/api/sub/abcd1234/0123456789abcdef",
+            )
+            for target in good:
+                with self.subTest(target=target):
+                    self.assertEqual(map_lookup(entries, target), "0", target)
+            bad = (
+                "/api/sub/x/../y",
+                "/api/sub/x/../../../etc/passwd",
+                "/api/sub/k_2yr52aHyK4j4jg/../../x",
+                "/api/sub/abcd1234/x%2Fy",
+                "/api/sub/abcd1234/CLASH",
+                "/api/sub/abcd1234/cl ash",
+                "/api/sub/abcd1234/a;b",
+                "/api/sub/abcd1234/0123456789abcdefg",
+                "/api/sub/k_2yr52aHyK4j4jg/0123456789abcdefg",
+            )
+            for target in bad:
+                with self.subTest(target=target):
+                    self.assertEqual(map_lookup(entries, target), "1", target)
+            # Server level is the only place that sees a target which normalises
+            # out of the prefix.
+            server = nginx_block(c, "server {")
+            self.assertLess(server.index("if ($gowave_sub_path_bad)"),
+                            server.index("location "),
+                            "the guard must run in the rewrite phase, before location selection")
+
+    def test_panel_vhost_scanner_set_is_anchored_and_cannot_shadow_product_routes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c = render_panel_vhost(tmpdir)
+            block = nginx_block(c, "location ~* ^/(?:")
+            self.assertIn("return 444;", block)
+            pattern = re.search(r"location ~\* (\^/.*?) \{", block).group(1)
+            closed = (
+                "/.env",
+                "/.git/config",
+                "/.git/",
+                "/.DS_Store",
+                "/wp-login.php",
+                "/wp-admin/",
+                "/wp-admin",
+                "/phpmyadmin/",
+                "/server-status",
+                "/actuator/health",
+                "/actuator",
+            )
+            for path in closed:
+                with self.subTest(path=path):
+                    self.assertRegex(path, re.compile(pattern, re.IGNORECASE))
+            served = (
+                "/",
+                "/login",
+                "/dashboard",
+                "/api/",
+                "/api/sub/abcd1234/clash",
+                "/api/nodes",
+                "/api/auth/login",
+                "/xhttp-down/abcd",
+                "/ws",
+                "/trojan-grpc",
+                "/.well-known/acme-challenge/token",
+                "/.well-known/security.txt",
+                "/assets/app.9f8e7d.js",
+                "/.gitlab-ci.yml",
+                "/phpmyadminish",
+                "/server-statusx",
+            )
+            for path in served:
+                with self.subTest(path=path):
+                    self.assertNotRegex(path, re.compile(pattern, re.IGNORECASE))
+            # A regex location wins over the plain prefix `location /`, but never
+            # over `^~ /api/` or `^~ /xhttp-down/`.
+            self.assertLess(c.index("location ~* ^/(?:"), c.index("    location / {"))
 
     def test_generate_decoy_vhost(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -743,6 +1118,223 @@ class TestNginxRouting(unittest.TestCase):
             self.assertFalse((renewal_dir / f"{domain}.conf").exists())
             self.assertFalse(live_dir.exists())
             self.assertFalse(archive_dir.exists())
+
+    def test_select_acme_lineage_adopts_a_suffixed_covering_lineage(self):
+        """A lineage named after a suffix serves the name it covers.
+
+        Re-issuing under the requested name is what leaves a host with two
+        lineages for one name, and the vhost pointing at whichever the derivation
+        happened to spell.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            le_dir = Path(tmpdir) / "letsencrypt"
+            live_dir = issue_lineage(le_dir, "panel.example.com-0001", ["panel.example.com"])
+
+            res = select_lineage("panel.example.com", le_dir)
+
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout.strip(), str(live_dir))
+            self.assertIn("Adopting the ACME lineage panel.example.com-0001", res.stderr)
+
+    def test_select_acme_lineage_does_not_mix_acme_directories(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            le_dir = Path(tmpdir) / "letsencrypt"
+            issue_lineage(le_dir, "panel.example.com-0001", ["panel.example.com"], server=STAGING_DIRECTORY)
+
+            res = select_lineage("panel.example.com", le_dir, server=PRODUCTION_DIRECTORY)
+
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout.strip(), "", "a staging lineage must not serve a production run")
+            self.assertIn("was not issued by", res.stderr)
+
+    def test_select_acme_lineage_prefers_the_exact_name_and_repeats(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            le_dir = Path(tmpdir) / "letsencrypt"
+            exact = issue_lineage(le_dir, "panel.example.com", ["panel.example.com"])
+            suffixed = issue_lineage(le_dir, "panel.example.com-0001", ["panel.example.com"])
+
+            first = select_lineage("panel.example.com", le_dir)
+            second = select_lineage("panel.example.com", le_dir)
+            self.assertEqual(first.stdout.strip(), str(exact))
+            self.assertEqual(second.stdout.strip(), first.stdout.strip(), "the same tree must answer the same")
+
+            shutil.rmtree(exact.parent / "panel.example.com")
+            (le_dir / "renewal" / "panel.example.com.conf").unlink()
+            after = select_lineage("panel.example.com", le_dir)
+            self.assertEqual(after.stdout.strip(), str(suffixed))
+
+    def test_select_acme_lineage_ignores_a_name_the_certificate_does_not_cover(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            le_dir = Path(tmpdir) / "letsencrypt"
+            # `evilpanel.example.com` ends with the requested name but is a
+            # different name: coverage is decided per label, not by suffix.
+            issue_lineage(le_dir, "other.example.com-0001", ["evilpanel.example.com"])
+
+            res = select_lineage("panel.example.com", le_dir)
+
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout.strip(), "")
+
+    def test_select_acme_lineage_never_selects_an_expired_lineage(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            le_dir = Path(tmpdir) / "letsencrypt"
+            issue_lineage(le_dir, "panel.example.com", ["panel.example.com"], expired=True)
+
+            only_expired = select_lineage("panel.example.com", le_dir)
+            self.assertEqual(only_expired.returncode, 0, only_expired.stderr)
+            self.assertEqual(only_expired.stdout.strip(), "", "an expired certificate is not coverage")
+            self.assertIn("has expired", only_expired.stderr)
+
+            valid = issue_lineage(le_dir, "panel.example.com-0001", ["panel.example.com"])
+            beside_valid = select_lineage("panel.example.com", le_dir)
+            self.assertEqual(beside_valid.stdout.strip(), str(valid))
+            self.assertIn("has expired", beside_valid.stderr)
+
+    def test_select_acme_lineage_skips_a_symlinked_live_entry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            le_dir = Path(tmpdir) / "letsencrypt"
+            real = issue_lineage(Path(tmpdir) / "elsewhere", "panel.example.com-0001", ["panel.example.com"])
+            (le_dir / "live").mkdir(parents=True)
+            (le_dir / "renewal").mkdir(parents=True)
+            (le_dir / "live" / "panel.example.com-0001").symlink_to(real, target_is_directory=True)
+            shutil.copy(
+                real.parents[1] / "renewal" / "panel.example.com-0001.conf",
+                le_dir / "renewal" / "panel.example.com-0001.conf",
+            )
+
+            res = select_lineage("panel.example.com", le_dir)
+
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual(res.stdout.strip(), "", "a symlinked live entry is not a lineage this host owns")
+
+    def test_record_certificate_lineages_keeps_the_rest_of_the_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state = Path(tmpdir) / "state.json"
+            state.write_text('{"installationMode": "all-in-one", "nodes": []}', encoding="utf-8")
+
+            cmd = (
+                f'source "{NGINX_SH}" && record_certificate_lineages "{state}" '
+                '"/etc/letsencrypt/live/panel.example.com-0001" '
+                '"/etc/letsencrypt/live/reality.example.com"'
+            )
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+
+            data = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(data["installationMode"], "all-in-one")
+            self.assertEqual(data["nodes"], [])
+            self.assertEqual(data["certificateLineages"], {
+                "panel": "/etc/letsencrypt/live/panel.example.com-0001",
+                "reality": "/etc/letsencrypt/live/reality.example.com",
+            })
+            self.assertEqual(oct(state.stat().st_mode & 0o777), "0o600")
+
+    def test_an_adopted_lineage_survives_a_failed_transaction(self):
+        """The snapshot is what marks an adoption pre-existing, so rollback restores it."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            rec_dir = tmp / "recovery"
+            le_dir = tmp / "letsencrypt"
+            lineage = "panel.example.com-0001"
+            live_dir = issue_lineage(le_dir, lineage, ["panel.example.com"], archived=True)
+            original = (live_dir / "fullchain.pem").read_bytes()
+
+            snap = f'source "{NGINX_SH}" && snapshot_acme_lineage "tx_adopt" "{lineage}" "{rec_dir}" "{le_dir}"'
+            self.assertEqual(subprocess.run(["bash", "-c", snap], capture_output=True, text=True).returncode, 0)
+            manifest = json.loads((rec_dir / "tx_adopt" / "acme" / lineage / "lineage-manifest.json").read_text())
+            self.assertTrue(manifest["existed_before"])
+
+            # certbot rewrites the adopted lineage and then the run fails.
+            (live_dir / "fullchain.pem").write_bytes(b"renewed by certbot\n")
+
+            restore = f'source "{NGINX_SH}" && restore_acme_lineage "tx_adopt" "{lineage}" "{rec_dir}" "{le_dir}"'
+            res = subprocess.run(["bash", "-c", restore], capture_output=True, text=True)
+
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("Restoring pre-existing ACME lineage", res.stderr)
+            self.assertNotIn("Removing transaction-created", res.stderr)
+            self.assertEqual((live_dir / "fullchain.pem").read_bytes(), original)
+
+            # A rollback that only knows the requested name has no manifest for the
+            # adopted lineage, so it fails closed instead of deleting it.
+            blind = f'source "{NGINX_SH}" && restore_acme_lineage "tx_adopt" "panel.example.com" "{rec_dir}" "{le_dir}"'
+            res_blind = subprocess.run(["bash", "-c", blind], capture_output=True, text=True)
+            self.assertNotEqual(res_blind.returncode, 0)
+            self.assertTrue((live_dir / "fullchain.pem").is_file())
+
+    def test_the_installer_issues_and_renders_the_adopted_lineage(self):
+        """Source contract: selection precedes issuance, and every step uses the pick.
+
+        The unit tests above prove the selection function; this one proves the
+        installer actually feeds its answer to certbot, to the snapshot, to the
+        verifiers and to both vhost generators, instead of re-deriving the path.
+        """
+        installer = (REPO_ROOT / "gowave-auto.sh").read_text(encoding="utf-8")
+        selected = installer.index("panel_live=$(select_acme_lineage")
+        self.assertLess(selected, installer.index('snapshot_acme_lineage "$acme_tx_id" "$panel_lineage"'))
+        self.assertLess(selected, installer.index('--cert-name "$panel_lineage"'))
+        for expected in (
+            'snapshot_acme_lineage "$acme_tx_id" "$reality_lineage"',
+            'restore_acme_lineage "$acme_tx_id" "$panel_lineage"',
+            'restore_acme_lineage "$acme_tx_id" "$reality_lineage"',
+            '--cert-name "$reality_lineage"',
+            '--cert-name "$vision_lineage"',
+            'verify_acme_certificate "$panel_domain" "$panel_live"',
+            'generate_panel_https_vhost "$panel_domain" "/etc/nginx/conf.d/gowave-panel.conf" nginx "$panel_live"',
+            '"$cover_domain" "$reality_live"',
+            'GOWAVE_VISION_CERT_DIR="${vision_live}"',
+        ):
+            self.assertIn(expected, installer)
+
+        nginx_source = NGINX_SH.read_text(encoding="utf-8")
+        self.assertNotIn("ssl_certificate /etc/letsencrypt/live/$", nginx_source)
+
+    def test_panel_vhost_serves_from_the_given_lineage_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "gowave-panel.conf"
+            lineage = "/etc/letsencrypt/live/panel.example.com-0001"
+            cmd = (
+                f'source "{NGINX_SH}" && generate_panel_https_vhost '
+                f'"panel.example.com" "{out}" nginx "{lineage}"'
+            )
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+
+            text = out.read_text(encoding="utf-8")
+            self.assertIn(f"ssl_certificate {lineage}/fullchain.pem;", text)
+            self.assertIn(f"ssl_certificate_key {lineage}/privkey.pem;", text)
+            self.assertNotIn("/etc/letsencrypt/live/panel.example.com/", text)
+
+    def test_decoy_vhost_serves_from_the_given_lineage_directory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "gowave-decoy.conf"
+            cover = tmp / "cover"
+            cover.mkdir()
+            lineage = "/etc/letsencrypt/live/reality.example.com-0002"
+            cmd = (
+                f'source "{NGINX_SH}" && generate_decoy_vhost '
+                f'"reality.example.com" "{out}" nginx "{cover}" "" "{lineage}"'
+            )
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+
+            text = out.read_text(encoding="utf-8")
+            self.assertIn(f"ssl_certificate {lineage}/fullchain.pem;", text)
+            self.assertIn(f"ssl_certificate_key {lineage}/privkey.pem;", text)
+            self.assertNotIn("/etc/letsencrypt/live/reality.example.com/", text)
+
+    def test_the_vision_vhost_renders_no_certificate_of_its_own(self):
+        """Vision's TLS is Xray's: the vhost behind it is plain HTTP on 127.0.0.1:9444."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            out = tmp / "gowave-vision-fallback.conf"
+            cover = tmp / "cover"
+            cover.mkdir()
+            cmd = f'source "{NGINX_SH}" && generate_vision_fallback_vhost "vision.example.com" "{out}" "{cover}"'
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertNotIn("ssl_certificate", out.read_text(encoding="utf-8"))
 
     def test_deploy_hook_ownership_preflight_unowned_rejected(self):
         with tempfile.TemporaryDirectory() as tmpdir:

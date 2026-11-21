@@ -2114,6 +2114,12 @@ remote_payload() {
         return 1
     fi
 
+    local preflight_module="$SCRIPT_DIR/modules/preflight.sh"
+    if [[ ! -f "$preflight_module" ]]; then
+        echo "Error: the required-input contract is missing at $preflight_module." >&2
+        return 1
+    fi
+
     # Validate node port and warn on host collisions if worker host matches panel IP
     if [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "$panel_ip" ]]; then
         if [[ "$node_port" != "$RECOMMENDED_NODE_PORT" ]]; then
@@ -2161,6 +2167,11 @@ remote_payload() {
         printf 'COVER_REALITY_SHA256=%q\n' "$cover_sha256"
         # Secret strictly scoped, not exported globally
         printf '_NODE_SECRET_KEY=%q\n' "$SECRET_KEY"
+
+        # 1b. The required-input contract travels as the module itself, not as a
+        # copy of it: the Worker refuses the same values the controller refused
+        # because it runs the same function bodies.
+        cat "$preflight_module"
 
         # 2. Remote helper functions
         cat <<'RUNNER_FUNCS'
@@ -5219,13 +5230,6 @@ main() {
     _STREAM_INCLUDE_ADDED=0
     _NODE_SERVICE_CONFIGURED=0
 
-    if [[ "${GOWAVE_ACME_TEST_MODE:-0}" == "1" && -n "${GOWAVE_ACME_TEST_CA_B64:-}" ]]; then
-        printf '%s' "$GOWAVE_ACME_TEST_CA_B64" | base64 -d > /run/gowave-acme-test-ca.pem
-        chmod 0600 /run/gowave-acme-test-ca.pem
-        export GOWAVE_ACME_TEST_CA_FILE=/run/gowave-acme-test-ca.pem
-        unset GOWAVE_ACME_TEST_CA_B64
-    fi
-
     _COMPENSATED=0
     cleanup_temp_and_secrets() {
         unset _NODE_SECRET_KEY SECRET_KEY VERIFY_NODE_MTLS_B64 SECURITY_HELPER_B64 GOWAVE_ACME_TEST_CA_B64 2>/dev/null || true
@@ -5265,6 +5269,21 @@ main() {
     trap 'handle_signal TERM' TERM
     trap 'handle_error "$?"' ERR
     trap 'cleanup_temp_and_secrets' EXIT
+
+    # The controller validates the same fields before it opens the channel; the
+    # side that has to act on them checks again, because the values arrive over
+    # the stream and nothing here may reach a mutation on a spliced payload.
+    preflight_require_inputs worker \
+        "$WORKER_DOMAIN" "$REALITY_DOMAIN" "${VISION_DOMAIN:-}" "$NODE_PORT" || return 1
+
+    # The test-only trust anchor is the next thing written, so it comes after
+    # the contract and inside the traps that remove it.
+    if [[ "${GOWAVE_ACME_TEST_MODE:-0}" == "1" && -n "${GOWAVE_ACME_TEST_CA_B64:-}" ]]; then
+        printf '%s' "$GOWAVE_ACME_TEST_CA_B64" | base64 -d > /run/gowave-acme-test-ca.pem
+        chmod 0600 /run/gowave-acme-test-ca.pem
+        export GOWAVE_ACME_TEST_CA_FILE=/run/gowave-acme-test-ca.pem
+        unset GOWAVE_ACME_TEST_CA_B64
+    fi
 
     # Before the lease and the snapshots, not after: both are python3, and a
     # snapshot that dies for a missing interpreter has no snapshot to roll back

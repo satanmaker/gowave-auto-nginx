@@ -70,6 +70,7 @@ VISION_CASE_ID = "MN-VISION"
 SSH_KEY_CASE_ID = "MN-SSHKEY"
 MATRIX_CASE_ID = "MN-MATRIX"
 EGRESS_CASE_ID = "MN-EGRESS"
+ENV_CONTRACT_CASE_ID = "MN-ENV-CONTRACT"
 # One requirement, one case id: the AIO suite runs the same contract on its own
 # host, and a cluster runs it on both roles.
 NGINX_CONFIG_CASE_ID = aio.NGX_CONFIG_CASE_ID
@@ -2162,6 +2163,109 @@ def case_worker_registration(product: MultiNodeProduct) -> Dict[str, Any]:
         "unauthenticated_nodes_status": surface.get("unauthenticated_nodes_status"),
     })
     return evidence
+
+
+def case_env_contract(product: MultiNodeProduct) -> Dict[str, Any]:
+    """``MN-ENV-CONTRACT``: a Worker onboarded through the environment contract is registered correctly.
+
+    The node add command accepts all seven inputs via environment variables
+    (GOWAVE_NODE_NAME, GOWAVE_NODE_IP, GOWAVE_WORKER_DOMAIN, GOWAVE_REALITY_DOMAIN,
+    GOWAVE_SSH_USER, GOWAVE_SSH_PORT, GOWAVE_VISION_DOMAIN). This case provisions
+    a second Worker using only the environment contract and verifies the Panel's
+    host record matches the inputs.
+    """
+    import time
+
+    host = product.require_installed()
+
+    # Use a unique worker name for the environment contract test to avoid
+    # conflict with the regular node add (WRK-04) which uses WORKER_NODE_NAME.
+    env_worker_name = "worker-env"
+
+    # Build the node add command using environment variables instead of positional arguments
+    env_script = (
+        f"export GOWAVE_NODE_NAME='{env_worker_name}'\n"
+        f"export GOWAVE_NODE_IP='{host.plan.worker_ip}'\n"
+        f"export GOWAVE_WORKER_DOMAIN='{host.worker_domain}'\n"
+        f"export GOWAVE_REALITY_DOMAIN='{host.worker_reality_domain}'\n"
+        f"export GOWAVE_SSH_USER='root'\n"
+        f"export GOWAVE_SSH_PORT='22'\n"
+        f"export GOWAVE_VISION_DOMAIN='{host.worker_vision_domain}'\n"
+        f"bash {REPO_IN_CONTAINER}/gowave-auto.sh node add\n"
+    )
+
+    # Run node add with environment variables
+    started = time.monotonic()
+    proc = product.podman.exec_bash(
+        host.target_name, env_script, check=False, timeout=NODE_ADD_TIMEOUT_SECONDS,
+    )
+    outcome = InstallOutcome(
+        returncode=proc.returncode,
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
+        duration=time.monotonic() - started,
+        command="gowave-auto.sh node add (via environment variables)",
+    )
+
+    require(
+        ENV_CONTRACT_CASE_ID,
+        outcome.ok,
+        f"node add with environment contract failed with exit {outcome.returncode}:\n{outcome.tail(6000)}",
+    )
+
+    # Verify the Panel surface shows the correct host record
+    observed = product.wait_for_nodes(ENV_CONTRACT_CASE_ID, expected=3)  # Master + 2 Workers
+    facts = product.panel_surface(ENV_CONTRACT_CASE_ID)
+    surface = facts.get("surface") or {}
+    hosts = surface.get("hosts") or {}
+    nodes = surface.get("nodes") or {}
+    names = nodes.get("names") or []
+    endpoints = nodes.get("endpoints") or []
+    connected = nodes.get("connected") or {}
+    worker_endpoint = f"{host.plan.worker_ip}:{NODE_PORT}"
+
+    require(
+        ENV_CONTRACT_CASE_ID,
+        env_worker_name in names,
+        f"the Panel reports nodes {names or 'none'}, and none of them is the "
+        f"environment contract Worker {env_worker_name!r}",
+    )
+    require(
+        ENV_CONTRACT_CASE_ID,
+        worker_endpoint in endpoints,
+        f"the Panel reports endpoints {endpoints or 'none'} instead of registering the "
+        f"Worker at {worker_endpoint}",
+    )
+    require(
+        ENV_CONTRACT_CASE_ID,
+        connected.get(env_worker_name) is True,
+        f"the Panel reports the Worker as {connected.get(env_worker_name)!r} "
+        f"rather than connected; observed {connected}",
+    )
+    require(
+        ENV_CONTRACT_CASE_ID,
+        hosts.get("count", 0) >= 3,
+        f"the Panel publishes {hosts.get('count')!r} hosts instead of one per node",
+    )
+
+    return {
+        "node_add_returncode": outcome.returncode,
+        "node_add_duration_seconds": round(outcome.duration, 1) if outcome.duration else 0,
+        "node_add_command": "gowave-auto.sh node add (via environment variables)",
+        "panel_nodes": observed.get("nodes", {}),
+        "panel_node_names": names,
+        "panel_node_endpoints": endpoints,
+        "panel_node_connected": connected,
+        "worker_endpoint": worker_endpoint,
+        "env_worker_name": env_worker_name,
+        "panel_hosts": {
+            "count": hosts.get("count"),
+            "security_layers": hosts.get("security_layers"),
+            "fingerprints": hosts.get("fingerprints"),
+        },
+        "unauthenticated_nodes_status": surface.get("unauthenticated_nodes_status"),
+        "environment_contract_used": True,
+    }
 
 
 def case_argv_observer(product: MultiNodeProduct) -> Dict[str, Any]:
@@ -8483,6 +8587,10 @@ def cases(
         Case(SSH_KEY_CASE_ID, "multi-node", lambda context: case_ssh_host_key(product),
              timeout_seconds=SSH_TRUST_TIMEOUT_SECONDS),
         Case(NODE_ADD_CASE_ID, "multi-node", lambda context: case_worker_registration(product),
+             timeout_seconds=NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
+        # The environment contract: a Worker onboarded via environment variables
+        # instead of positional arguments is registered correctly.
+        Case(ENV_CONTRACT_CASE_ID, "multi-node", lambda context: case_env_contract(product),
              timeout_seconds=NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
         # The dispatch that case just ran was traced; this case reads the trace,
         # proves the observer can see a sentinel whole, and removes the file.

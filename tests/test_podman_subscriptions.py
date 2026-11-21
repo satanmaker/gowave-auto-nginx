@@ -396,6 +396,72 @@ def policy_facts(policy, status=403):
     return {"policy": policy, "representations": {name: status for name in aio.REPRESENTATIONS}}
 
 
+ROBOTS_TAG = "noindex, nofollow, noarchive, nosnippet"
+EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def edge_answer(status=200, size=4096, cache_control=NO_STORE, x_robots_tag=ROBOTS_TAG,
+                content_type="text/plain; charset=utf-8"):
+    """One edge answer as `_answer()` reduces it: headers, length, digest."""
+    return {
+        "status": status,
+        "content_type": content_type,
+        "cache_control": cache_control,
+        "x_robots_tag": x_robots_tag,
+        "bytes": size,
+        "sha256": EMPTY_SHA256 if size == 0 else "a" * 64,
+    }
+
+
+def edge_counters(before=7, after=None, control=None):
+    """The Panel's two subscription counters around the crawler sweep.
+
+    ``control`` is the loopback fetch that has to move them; ``after`` defaults
+    to ``before`` because a sweep the edge answered itself moves nothing.
+    """
+    patterns = panel_surface.SUBSCRIPTION_ROUTE_PATTERNS
+    after = before if after is None else after
+    control = after + 1 if control is None else control
+    return {
+        "before": {"status": 200, "counts": {pattern: before for pattern in patterns}},
+        "after": {"status": 200, "counts": {pattern: after for pattern in patterns}},
+        "control": {"status": 200,
+                    "counts": {patterns[0]: control, patterns[1]: after}},
+        "control_status": 200,
+    }
+
+
+def edge_facts(overrides=None):
+    """The edge-contract probe's block, with every family answering as shipped."""
+    facts = {
+        "short_uuid_length": len(SHORT_UUID),
+        "loopback": edge_answer(),
+        "served": edge_answer(),
+        "served_identical_to_loopback": True,
+        "foreign": edge_answer(),
+        "foreign_identical": True,
+        "absent": edge_answer(status=403, size=0, content_type="text/plain"),
+        "previews": {
+            agent: edge_answer(status=204, size=0)
+            for agent in panel_surface.PREVIEW_USER_AGENTS
+        },
+        "refused": {
+            "dot_segment": {"status": 0, "closed": True, "bytes": 0},
+            "encoded_separator": {"status": 0, "closed": True, "bytes": 0},
+        },
+        "counters": edge_counters(),
+    }
+    return merge(facts, overrides)
+
+
+def access_log_facts(overrides=None):
+    """The access-log probe's answer: served lines none, refused lines recorded."""
+    facts = {"present": True, "lines": 41, "served": 0,
+             "refused_dot_segment": 1, "refused_encoded_separator": 1}
+    facts.update(overrides or {})
+    return facts
+
+
 class StubPanel:
     """A Panel that answers the default-client lookup and every representation.
 
@@ -432,6 +498,10 @@ class StubPanel:
         self.enforce_user_agent = False
         self.refuse_foreign_user_agent = False
         self.no_cache_control = False
+        # `GET /api/system/stats/http` as the router answers it: a payload the
+        # case reads beside the sweep, so a fake that never moved it cannot be
+        # mistaken for a listener that never forwarded anything.
+        self.route_counts = {"response": {"routes": [], "total": 0}}
         self.certificate = None
         directory = Path(tempfile.mkdtemp(prefix="gowave-subscription-panel-"))
         self.credentials = directory / "credentials"
@@ -454,6 +524,7 @@ class StubPanel:
                 self.send_header("Content-Type", content_type)
                 if not panel.no_cache_control:
                     self.send_header("Cache-Control", NO_STORE)
+                self.send_header("X-Robots-Tag", "noindex, nofollow, noarchive, nosnippet")
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
@@ -461,8 +532,16 @@ class StubPanel:
             def do_GET(self):
                 agent = self.headers.get("User-Agent")
                 panel.requests.append((self.path, agent))
+                if "/../" in self.path or "%2F" in self.path or "%2f" in self.path:
+                    # What the shipped vhost does to a raw target it refuses: the
+                    # connection closes with no status, which is the answer the
+                    # forgery case has to see.
+                    self.close_connection = True
+                    return
                 if self.path == "/api/users/by-username/default-user":
                     return self._send(200, json.dumps({"response": panel.user}))
+                if self.path == "/api/system/stats/http":
+                    return self._send(200, json.dumps(panel.route_counts))
                 if self.path == "/api/users":
                     return self._send(200, json.dumps({"response": {"users": panel.users}}))
                 if self.path == "/api/hosts":
@@ -653,6 +732,50 @@ class TestPanelSubscriptionProbe(unittest.TestCase):
         )
         self.assertEqual(response["status"], 200)
         self.assertIn("no-store", response["cache_control"])
+
+    def test_the_edge_contract_scope_asks_the_edge_for_every_published_family(self):
+        edge = self.edge_panel()
+        facts, output = probe_output(
+            self.panel, "edge-contract", edge_base=edge.edge_url, ca=edge.certificate,
+        )
+        block = facts["edge"]
+        self.assertEqual(block["short_uuid_length"], len(SHORT_UUID))
+        self.assertIs(block["served_identical_to_loopback"], True)
+        self.assertEqual(set(block["previews"]), set(panel_surface.PREVIEW_USER_AGENTS))
+        for agent, answer in block["previews"].items():
+            with self.subTest(agent=agent):
+                self.assertEqual(answer["status"], 200,
+                                 "the stub serves every header; the probe must report what it saw")
+                self.assertIn("no-store", answer["cache_control"])
+                self.assertEqual(answer["x_robots_tag"], ROBOTS_TAG)
+        self.assertNotIn(SHORT_UUID, output)
+        self.assertNotIn(self.panel.password, output)
+        self.assertNotIn(self.panel.token, output)
+
+    def test_a_raw_target_that_closes_is_an_answer_with_no_status(self):
+        edge = self.edge_panel()
+        block = panel_surface.subscription_edge_contract(
+            panel_surface.Panel(self.panel.url), edge.edge_url,
+            ca_file=str(edge.certificate),
+        )
+        for label in ("dot_segment", "encoded_separator"):
+            with self.subTest(target=label):
+                self.assertIs(block["refused"][label]["closed"], True)
+                self.assertEqual(block["refused"][label]["status"], 0)
+                self.assertEqual(block["refused"][label]["bytes"], 0)
+
+    def test_the_route_counter_reads_the_routers_own_route_names(self):
+        self.panel.route_counts = {"response": {"total": 9, "routes": [
+            {"method": "GET", "route": "/api/sub/{shortUuid}", "count": 3},
+            {"method": "GET", "route": "/api/sub/{shortUuid}/{clientType}", "count": 1},
+            {"method": "GET", "route": "/api/users", "count": 5},
+        ]}}
+        facts = panel_surface.http_route_counts(panel_surface.Panel(self.panel.url))
+        self.assertEqual(facts["status"], 200)
+        self.assertEqual(facts["counts"], {
+            "GET /api/sub/{shortUuid}": 3,
+            "GET /api/sub/{shortUuid}/{clientType}": 1,
+        })
 
     def test_an_absent_user_agent_is_a_request_without_the_header(self):
         response = panel_surface.fetch(self.panel.url, f"/api/sub/{SHORT_UUID}", None)
@@ -1944,6 +2067,194 @@ class TestSubscriptionCases(unittest.TestCase):
         self.reject_shapes({"alternate_wrapped": 0}, "expected 1")
 
 
+class TestSubscriptionEdgeCases(unittest.TestCase):
+    """SUB-EDGE / SUB-EDGE-BAD: what a pasted link answers through the edge.
+
+    The two cases read one probe block and split the subject: the edge's answers
+    to a client and to a link-preview crawler, and the refusal of a raw target a
+    normalising client would never send. A fake that answered the probe but left
+    either side out is what these tests exist to name.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.context = RunContext(
+            topology="aio",
+            artifact_root=Path(self.tmp.name),
+            budget_seconds=600,
+            run_id="podman-subscription-edge-0000",
+        )
+        self.addCleanup(self.context.run_cleanup)
+
+    def edge_product(self, edge=None):
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[panel_result({"edge": edge_facts() if edge is None else edge})],
+        )
+        return product
+
+    def reject_edge(self, expected, overrides=None, edge=None):
+        product = self.edge_product(edge_facts(overrides) if edge is None else edge)
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_subscription_edge(product)
+        self.assertIn(expected, str(caught.exception))
+
+    def forgery_product(self, edge=None, log=None):
+        product, _ = installed_product(
+            self.context,
+            host_scripts=[
+                panel_result({"edge": edge_facts() if edge is None else edge}),
+                panel_result(access_log_facts(log)),
+            ],
+        )
+        return product
+
+    def reject_forgery(self, expected, edge=None, log=None):
+        product = self.forgery_product(edge, log)
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_subscription_edge_forgery(product)
+        self.assertIn(expected, str(caught.exception))
+
+    @staticmethod
+    def mutate_preview(edge, agent, **answer):
+        """One crawler's answer, changed after the fact.
+
+        The preview keys are User-Agent strings and hold dots, so they cannot be
+        addressed through the dotted merge the other fixtures use.
+        """
+        edge["previews"][agent] = {**edge["previews"][agent], **answer}
+        return edge
+
+    # ------------------------------------------------------------ SUB-EDGE
+    def test_edge_case_names_what_the_client_and_the_crawlers_received(self):
+        product, podman = installed_product(
+            self.context, host_scripts=[panel_result({"edge": edge_facts()})]
+        )
+        evidence = aio.case_subscription_edge(product)
+        self.assertEqual(evidence["served_status"], 200)
+        self.assertIn("no-store", evidence["served_cache_control"])
+        self.assertEqual(evidence["served_x_robots_tag"], ROBOTS_TAG)
+        self.assertEqual(evidence["served_bytes"], 4096)
+        self.assertEqual(evidence["foreign_status"], 200)
+        self.assertEqual(evidence["absent_status"], 403)
+        self.assertEqual(evidence["preview_count"], len(panel_surface.PREVIEW_USER_AGENTS))
+        self.assertEqual(evidence["preview_statuses"], "204")
+        self.assertEqual(evidence["preview_bytes"], 0)
+        self.assertEqual(evidence["panel_requests_added_by_previews"], 0)
+        self.assertEqual(evidence["panel_requests_added_by_control"], 1)
+        self.assertEqual(
+            podman.scripts[0],
+            f"python3 {aio.PANEL_SURFACE_SCRIPT} --scope edge-contract "
+            f"--edge-base https://{aio.PANEL_DOMAIN} "
+            f"--ca {topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}",
+        )
+        for value in evidence.values():
+            self.assertIsInstance(
+                value, (str, int, float, bool, type(None)),
+                "evidence is flattened to strings by the runner, so it must hold primitives",
+            )
+        self.assertNotIn(SHORT_UUID, json.dumps(evidence))
+
+    def test_edge_case_rejects_a_cachable_subscription(self):
+        self.reject_edge("would let a pasted link be cached",
+                         {"served.cache_control": "public, max-age=600"})
+
+    def test_edge_case_rejects_a_missing_robots_tag(self):
+        self.reject_edge("instead of 'noindex, nofollow, noarchive, nosnippet'",
+                         {"served.x_robots_tag": ""})
+
+    def test_edge_case_rejects_bytes_the_panel_did_not_issue(self):
+        self.reject_edge("did not hand the client the bytes",
+                         {"served_identical_to_loopback": False})
+
+    def test_edge_case_rejects_a_header_that_selects_a_representation(self):
+        self.reject_edge("selecting a representation from the header",
+                         {"foreign.status": 403})
+
+    def test_edge_case_rejects_a_panel_refusal_that_lost_the_headers(self):
+        self.reject_edge("lost the transport headers", {"absent.cache_control": ""})
+
+    def test_edge_case_rejects_an_absent_header_that_was_served(self):
+        self.reject_edge("instead of the Panel's own 403", {"absent.status": 200})
+
+    def test_edge_case_rejects_a_crawler_that_was_served_the_payload(self):
+        agent = panel_surface.PREVIEW_USER_AGENTS[0]
+        self.reject_edge("instead of 204",
+                         edge=self.mutate_preview(edge_facts(), agent, status=200))
+
+    def test_edge_case_rejects_an_empty_answer_that_carried_a_body(self):
+        agent = panel_surface.PREVIEW_USER_AGENTS[1]
+        self.reject_edge("carried a body",
+                         edge=self.mutate_preview(edge_facts(), agent, bytes=64))
+
+    def test_edge_case_rejects_an_empty_answer_that_lost_the_robots_tag(self):
+        agent = panel_surface.PREVIEW_USER_AGENTS[2]
+        self.reject_edge("lost the transport headers",
+                         edge=self.mutate_preview(edge_facts(), agent, x_robots_tag=""))
+
+    def test_edge_case_rejects_a_sweep_that_reached_the_panel(self):
+        self.reject_edge("the preview sweep reached the Panel", {
+            "counters.after.counts.GET /api/sub/{shortUuid}": 8,
+        })
+
+    def test_edge_case_rejects_a_control_that_did_not_move_the_counter(self):
+        self.reject_edge("moved the Panel's counter by 0", {
+            "counters.control.counts.GET /api/sub/{shortUuid}": 7,
+        })
+
+    def test_edge_case_rejects_a_counter_read_that_was_refused(self):
+        self.reject_edge("route counters answered 500", {"counters.before.status": 500})
+
+    def test_edge_case_rejects_a_panel_without_a_default_client(self):
+        self.reject_edge("served no default client", {"short_uuid_length": 0})
+
+    # -------------------------------------------------------- SUB-EDGE-BAD
+    def test_forgery_case_names_both_refusals_and_the_access_log(self):
+        product, podman = installed_product(
+            self.context,
+            host_scripts=[panel_result({"edge": edge_facts()}),
+                          panel_result(access_log_facts())],
+        )
+        evidence = aio.case_subscription_edge_forgery(product)
+        self.assertEqual(evidence["refused_dot_segment"], "closed")
+        self.assertEqual(evidence["refused_encoded_separator"], "closed")
+        self.assertEqual(evidence["access_log_lines"], 41)
+        self.assertEqual(evidence["access_log_served_lines"], 0)
+        self.assertEqual(evidence["access_log_refused_lines"], 2)
+        self.assertIn("--scope edge-contract", podman.scripts[0])
+        self.assertIn("/var/log/nginx/access.log", podman.scripts[1])
+        for value in evidence.values():
+            self.assertIsInstance(
+                value, (str, int, float, bool, type(None)),
+                "evidence is flattened to strings by the runner, so it must hold primitives",
+            )
+        self.assertNotIn(SHORT_UUID, json.dumps(evidence))
+
+    def test_forgery_case_rejects_a_target_the_listener_answered(self):
+        edge = edge_facts()
+        edge["refused"]["dot_segment"] = {"status": 444, "closed": False, "bytes": 0}
+        self.reject_forgery("instead of a closed connection", edge=edge)
+
+    def test_forgery_case_rejects_a_target_answered_with_bytes(self):
+        edge = edge_facts()
+        edge["refused"]["encoded_separator"] = {"status": 0, "closed": True, "bytes": 12}
+        self.reject_forgery("instead of a closed connection", edge=edge)
+
+    def test_forgery_case_rejects_an_absent_access_log(self):
+        self.reject_forgery("absent or empty", log={"present": False})
+
+    def test_forgery_case_rejects_an_empty_access_log(self):
+        self.reject_forgery("absent or empty", log={"lines": 0})
+
+    def test_forgery_case_rejects_a_log_that_recorded_a_served_line(self):
+        self.reject_forgery("must leave none", log={"served": 1})
+
+    def test_forgery_case_rejects_a_log_that_recorded_no_refusal(self):
+        self.reject_forgery("did not record both refused targets",
+                            log={"refused_encoded_separator": 0})
+
+
 class RecordingPodman:
     """Podman stub for the topology wiring: no container is really created."""
 
@@ -2095,9 +2406,10 @@ class TestSubscriptionWiring(unittest.TestCase):
         )
         self.addCleanup(self.context.run_cleanup)
 
-    def test_suite_declares_the_five_subscription_cases(self):
+    def test_suite_declares_the_subscription_cases(self):
         suite = {case.id: case for case in aio.cases(ScriptedPodman(self.context, []))}
-        expected = {"SUB-SERVED", "SUB-UA-ABSENT", "SUB-UA-BLANK", "SUB-B64", "SUB-JSON-SHAPES"}
+        expected = {"SUB-SERVED", "SUB-UA-ABSENT", "SUB-UA-BLANK", "SUB-B64", "SUB-JSON-SHAPES",
+                    "SUB-EDGE", "SUB-EDGE-BAD"}
         self.assertTrue(expected.issubset(suite))
         for case_id in expected:
             with self.subTest(case=case_id):
@@ -2108,7 +2420,8 @@ class TestSubscriptionWiring(unittest.TestCase):
 
     def test_every_subscription_case_is_in_the_shared_catalog(self):
         by_id = {case["id"]: case for case in catalog.load_catalog()["cases"]}
-        for case_id in ("SUB-SERVED", "SUB-UA-ABSENT", "SUB-UA-BLANK", "SUB-B64", "SUB-JSON-SHAPES"):
+        for case_id in ("SUB-SERVED", "SUB-UA-ABSENT", "SUB-UA-BLANK", "SUB-B64",
+                        "SUB-JSON-SHAPES", "SUB-EDGE", "SUB-EDGE-BAD"):
             with self.subTest(case=case_id):
                 case = by_id[case_id]
                 self.assertEqual(case["runs_in"], ["podman"])

@@ -239,6 +239,48 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Real Subscription Delivery and User-Agent Policy",
     },
     {
+        "id": "SUB-EDGE",
+        "requirement": "Panel subscription representations",
+        "assertion": "A subscription read through the public edge answers a client with the bytes the Panel issued plus no-store and the X-Robots-Tag, answers every link-preview crawler with an empty 204 carrying the same headers, lets the Panel's own 403 through for an absent header, and closes the connection for a dot-segment or an encoded-separator target; the Panel's route counter does not move for the crawler sweep but moves for a control fetch, and the NGINX access log holds no served subscription line while the refused targets are recorded.",
+        "topology": ["aio"],
+        "promotion_target": "Real Subscription Delivery and User-Agent Policy",
+    },
+    {
+        "id": "SUB-EDGE-BAD",
+        "requirement": "Panel subscription representations",
+        "assertion": "A raw request target a normalising client would never send — a dot segment inside the subscription path and an encoded separator before the representation — is answered by closing the connection with no bytes, and the NGINX access log records both refusals while holding no served /api/sub/<shortUuid> line.",
+        "topology": ["aio"],
+        "promotion_target": "Real Subscription Delivery and User-Agent Policy",
+    },
+    {
+        "id": "NGX-HYGIENE",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "The panel vhost answers from the edge without naming its build in Server or in the error page NGINX writes for a request line past its header buffer, the Panel records the peer address for a subscription request that carries each header it would otherwise prefer, with the forged address appearing in no record, and every product surface — the REST API, the subscription route, the dashboard, both inbound transports and the gRPC inbound — is still proxied.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "NGX-SCANNER",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "Every path in the shipped scanner set is answered by closing the connection with no bytes, while the same client on a proxied route reaches the Panel and reads its own refusal, so a rule that closed every request cannot pass as the scan defence.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "PRE-INPUTS",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "The operator's install command, run again against the installed host with the ACME contact left out, is refused before the NGINX stop and before any managed path is written: the refusal names the missing input, the host's unit files and digested NGINX configuration are unchanged, and the Panel still answers its documented authenticated calls.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "PRE-INPUTS-BAD",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "The same command carrying a complete argument list with a malformed ACME contact is refused on that field, quoting the rejected value, while the same unchanged inventory and the same serving Panel are read, so a contract that accepted any non-empty argument cannot pass as input validation.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
         "id": "SUB-JSON-SHAPES",
         "requirement": "Panel subscription representations",
         "assertion": "/v2ray-json is validated in both served shapes: a list entry as a complete config, and only a bare outbound object wrapped with the minimal runtime wrapper.",
@@ -688,6 +730,19 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "promotion_target": "Negative Scenario and Fault Injection Tests",
     },
     {
+        "id": "MN-ENV-CONTRACT",
+        "requirement": "Distributed Worker VPS Deployment Verification",
+        "assertion": (
+            "A Worker onboarded through the environment contract "
+            "(GOWAVE_NODE_NAME, GOWAVE_NODE_IP, GOWAVE_WORKER_DOMAIN, GOWAVE_REALITY_DOMAIN, "
+            "GOWAVE_SSH_USER, GOWAVE_SSH_PORT, GOWAVE_VISION_DOMAIN) instead of positional "
+            "arguments is registered by the Master, appears in the Panel with the correct "
+            "endpoint, and reports as connected."
+        ),
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
+    {
         "id": "PO-INSTALL",
         "requirement": "Independent Panel-only acceptance topology",
         "assertion": (
@@ -761,6 +816,62 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         ),
         "topology": ["panel-only"],
         "promotion_target": "Independent Panel-only acceptance topology",
+    },
+    {
+        "id": "PRE-PROXY-CIDR",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "A requested name that resolves to an address inside the dated Cloudflare CIDR snapshot is refused before any certificate request: the preflight check names the domain, the proxied address, and the CIDR it falls in, and HTTP-01 is not attempted. An override GOWAVE_PREFLIGHT_ALLOW_PROXIED=1 is honoured, and an unresolvable name is likewise refused with the resolution failure named.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "PRE-PROXY-CIDR-OVERRIDE",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "A name that resolves to a Cloudflare proxy address is accepted when GOWAVE_PREFLIGHT_ALLOW_PROXIED=1 is explicitly set, recording the operator's decision to continue despite the proxy. The same DNS check passes, and the policy layer allows the request through.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "TLS-LINEAGE",
+        "requirement": "Explicit ACME Endpoint Selection and Certificate Lineage Isolation",
+        "assertion": "A repeated install adopts an existing suffixed ACME lineage (e.g. panel.example.com-0001) that covers the panel domain instead of creating a second lineage: select_acme_lineage returns the adopted lineage's live directory, prints the adoption message, and the same tree answers the same way on a second call.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "TLS-LINEAGE-BAD",
+        "requirement": "Explicit ACME Endpoint Selection and Certificate Lineage Isolation",
+        "assertion": "An expired lineage or a lineage from a mismatched ACME directory is not adopted by select_acme_lineage: the function returns empty stdout and prints a refusal message naming the expiry or directory mismatch.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "FAIL-STEP",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "The ERR trap with CURRENT_STEP prints a located failure naming the step, the failing command and its status, prints it exactly once, and exits with the step's status; a step that succeeds prints no report.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "PANEL-ASSET-VERIFICATION",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "A release asset is checked against SHA256SUMS before the next URL is tried; a mismatched asset aborts without falling through, the binary is not left behind, and no release API fallback occurs.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "PINNED-INSTALLER-HOSTS",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "The commit is tried on GitHub first and jsDelivr second; the order is fixed and the environment variable GOWAVE_NODE_INSTALLER_COMMIT selects the exact commit.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "VERIFIED-ARTIFACT-FETCH",
+        "requirement": "Independent All-in-One acceptance topology",
+        "assertion": "A pinned artifact is fetched from ordered hosts; a host that cannot deliver falls through to the next, a mismatch is terminal and the next host is never asked, no host delivering leaves nothing behind, a destination is replaced only after its bytes are verified, an unusable digest is refused before any download, and a missing host list is refused.",
+        "topology": ["aio"],
+        "promotion_target": "All-in-One Master VPS Installation Verification",
     },
 ]
 
@@ -2106,6 +2217,10 @@ def validate_catalog(catalog: Dict[str, Any], spec_path: Path = LIVE_SPEC) -> Li
     # them quietly.
     vocabulary = {scenario.requirement for scenario in scenarios}
     vocabulary.update(requirement for requirement, _ in trace_data.parse_spec())
+    # Also include requirements from traceability.yaml cases_by_requirement
+    trace_table = trace_data.load_table()
+    for group in trace_table.get("cases_by_requirement") or []:
+        vocabulary.add(group.get("requirement"))
     for case in catalog.get("cases", []):
         if case.get("live_scenario"):
             continue

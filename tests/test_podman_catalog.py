@@ -664,9 +664,9 @@ class TestJustifiedExclusions(unittest.TestCase):
 class TestPodmanFirstPromotion(unittest.TestCase):
     """A Podman-first case is a promise to promote, and the promise names an owner.
 
-    The catalog incubates 109 cases that no live scenario covers yet. Each one
+    The catalog incubates 124 cases that no live scenario covers yet. Each one
     states the requirement it belongs to here and the live requirement it is
-    being promoted into; both are read from the two specs, so a renamed
+    being promoted into; both are read from the specs, so a renamed
     requirement orphans its cases loudly instead of leaving them pointing at a
     string no spec declares.
     """
@@ -682,6 +682,11 @@ class TestPodmanFirstPromotion(unittest.TestCase):
         from tools.podman_e2e import trace
 
         names.update(requirement for requirement, _ in trace.parse_spec())
+        # The lifecycle-management spec is the third authoritative vocabulary:
+        # `trace.validate` already resolves gap rows against it, and a
+        # Podman-first case owning a requirement from it (the ACME lineage
+        # selection) is a name a spec states, not an invented one.
+        names.update(trace.parse_lifecycle_spec())
         return names
 
     def problems(self, document=None):
@@ -693,7 +698,7 @@ class TestPodmanFirstPromotion(unittest.TestCase):
     def test_every_podman_first_case_names_an_owner_and_a_target_the_specs_state(self):
         vocabulary = self.vocabulary()
         self.assertEqual(len(self.extras), self.document["counts"]["podman_first"])
-        self.assertEqual(len(self.extras), 109)
+        self.assertEqual(len(self.extras), 124)
         for case in self.extras:
             self.assertEqual(case["runs_in"], ["podman"], case["id"])
             self.assertEqual(case["state"], "incubating", case["id"])

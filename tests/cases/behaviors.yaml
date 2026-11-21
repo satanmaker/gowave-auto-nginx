@@ -108,7 +108,86 @@ behaviors:
     cases: [PO-INSTALL, PO-HOST, PO-API, PO-SQUAD]
     error_paths: [PO-SQUAD-REFUSED]
 
-  # ---------------------------------------------------------------- provisioning
+  - name: The public edge hides its build and hands the Panel only the peer address
+    area: installation
+    description: >-
+      The panel vhost answers a product route, and a path the Panel has no route
+      for with the frontend it serves there, without a version in `Server`, and
+      the error page NGINX writes for a request line past its header buffer names
+      no version either; a subscription request carrying any of the headers the
+      Panel prefers over the connection's peer has each of them replaced by the
+      address NGINX observed, so the Panel's own record of that request names the
+      peer and never the forged value; and the scanner targets the edge refuses —
+      dotfiles, package-manager and panel paths and the health endpoint — are
+      answered by dropping the connection with no bytes, while the same client on
+      every product route, the dashboard and both inbound transports included,
+      still reaches the Panel.
+    topology: [aio]
+    gate: pre-push
+    cases: [NGX-HYGIENE]
+    error_paths: [NGX-SCANNER]
+
+  - name: An incomplete install request is refused before the installed host is touched
+    area: installation
+    description: >-
+      The operator's install command, run again against the host it already
+      installed, refuses a partial argument list and a complete one carrying a
+      malformed ACME contact: each refusal names the input — quoting the rejected
+      value where there is one — and exits without stopping NGINX or rewriting a
+      managed unit file or the digested NGINX configuration, so the Panel still
+      answers its authenticated calls afterwards.
+    topology: [aio]
+    gate: pre-push
+    cases: [PRE-INPUTS]
+    error_paths: [PRE-INPUTS-BAD]
+
+  - name: A Cloudflare-proxied name is refused before any certificate request
+    area: installation
+    description: >-
+      The preflight check resolves the panel name, the camouflage/decoy name,
+      and every configured Vision name, and refuses any name whose address falls
+      inside the dated Cloudflare CIDR snapshot. The refusal names the domain,
+      the proxied address, and the CIDR it falls in, so the operator knows which
+      record to make DNS-only. An explicit GOWAVE_PREFLIGHT_ALLOW_PROXIED=1
+      records a decision to continue anyway. An unresolvable name is likewise
+      refused with the resolution failure named.
+    topology: [aio]
+    gate: pre-push
+    cases: [PRE-PROXY-CIDR]
+    error_paths: [PRE-PROXY-CIDR-OVERRIDE]
+
+  - name: A repeated install adopts an existing suffixed ACME lineage
+    area: installation
+    description: >-
+      The preflight check resolves every name the run will validate and the ACME
+      lineage selection prefers the exact-name lineage first, then the shortest
+      suffix. A lineage named after a suffix (e.g. panel.example.com-0001) that
+      covers the panel domain is adopted on re-install, preventing a second
+      lineage from being created beside the one the host already serves. The
+      adoption is deterministic: the same tree answers the same way on a second
+      call, and no exact-name lineage is created.
+    topology: [aio]
+    gate: pre-push
+    cases: [TLS-LINEAGE]
+    error_paths: [TLS-LINEAGE-BAD]
+
+  - name: The pinned artifact chain fetches with digest verification and stops on mismatch
+    area: installation
+    description: >-
+      The installer fetches the GoWave Node installer and the Panel release
+      assets from ordered hosts with a pinned SHA-256 digest. A host that cannot
+      deliver falls through to the next, a digest mismatch is terminal and the
+      next host is never tried, no host delivering leaves nothing behind, and
+      the destination file is replaced only after its bytes are verified. The
+      ERR trap with CURRENT_STEP prints a located failure naming the step, the
+      failing command and its status, prints it exactly once, and exits with the
+      step's status; a step that succeeds prints no report.
+    topology: [aio]
+    gate: pre-push
+    cases: [VERIFIED-ARTIFACT-FETCH, PINNED-INSTALLER-HOSTS, PANEL-ASSET-VERIFICATION]
+    error_paths: [FAIL-STEP]
+
+    # ---------------------------------------------------------------- provisioning
   - name: An install owns only what it created
     area: provisioning
     description: >-
@@ -209,6 +288,22 @@ behaviors:
     gate: pre-push
     cases: [SUB-SERVED, SUB-B64, SUB-JSON-SHAPES, SUB-02, SUB-03, SUB-04]
     error_paths: [SUB-01, SUB-UA-ABSENT, SUB-UA-BLANK]
+
+  - name: The public edge serves the subscription without advertising it
+    area: subscription-representations
+    description: >-
+      Read through the edge a pasted link lands on, a client is served the bytes
+      the Panel issued under no-store and an X-Robots-Tag, every link-preview
+      crawler is answered with an empty 204 carrying the same headers, and the
+      Panel's own 403 survives the proxy; the Panel's route counter stays still
+      across the crawler sweep and moves for a loopback control. A raw target
+      with a dot segment or an encoded separator is closed before it reaches the
+      Panel, and the access log records that refusal while holding no served
+      subscription line.
+    topology: [aio]
+    gate: pre-push
+    cases: [SUB-EDGE]
+    error_paths: [SUB-EDGE-BAD]
 
   # ------------------------------------------------------------------ data plane
   - name: Both pinned clients carry a payload through every All-in-One outbound
@@ -516,7 +611,7 @@ behaviors:
       forged credentials are refused without mutation.
     topology: [aio, multi-node]
     gate: pre-push
-    cases: [NEG-01, AIO-FAULT-DISK, AIO-FAULT-PANEL, AIO-FAULT-XRAY, AIO-FAULT-LATENCY, MN-OUTAGE, MN-RESTART, MN-SSH-DOWN, MN-DUP-ADD]
+    cases: [NEG-01, AIO-FAULT-DISK, AIO-FAULT-PANEL, AIO-FAULT-XRAY, AIO-FAULT-LATENCY, MN-OUTAGE, MN-RESTART, MN-SSH-DOWN, MN-DUP-ADD, MN-ENV-CONTRACT]
     error_paths: [NEG-02, NEG-03, NEG-04, NEG-05]
 
   - name: An interrupted mutation stays recoverable and its compensation is honest
