@@ -65,6 +65,30 @@ Panel-only or All-in-One on the Panel host plus remote Workers, each onboarded w
 
 ## Remote node onboarding over temporary access
 
+`node add` takes the same inputs from the environment as from positionals, so a scripted onboarding does
+not have to build an argument list:
+
+| Variable | Positional | Default |
+| --- | --- | --- |
+| `GOWAVE_NODE_NAME` | `<worker-name>` | required |
+| `GOWAVE_NODE_IP` | `<worker-ip>` | required |
+| `GOWAVE_WORKER_DOMAIN` | `<worker-domain>` | required |
+| `GOWAVE_REALITY_DOMAIN` | `<reality-domain>` | required |
+| `GOWAVE_SSH_USER` | `[ssh-user]` | `root` |
+| `GOWAVE_SSH_PORT` | `[ssh-port]` | `22` |
+| `GOWAVE_VISION_DOMAIN` | `--vision-domain <domain>` | none |
+
+A non-empty positional (or `--vision-domain`) wins over its variable, an empty variable counts as unset,
+and both paths validate the same fields through the same contract, so an invalid value is refused on the
+field it belongs to. No secret is accepted here: the Worker secret is read from the Panel's `.env` and
+passed to the remote side over stdin, never as an argument or an exported variable.
+
+```bash
+sudo GOWAVE_NODE_NAME=worker-1 GOWAVE_NODE_IP=203.0.113.10 \
+  GOWAVE_WORKER_DOMAIN=worker-1.example.com GOWAVE_REALITY_DOMAIN=cdn.example.com \
+  ./gowave-auto.sh node add
+```
+
 The wizard onboards each Worker without leaving a standing key behind:
 
 - The Worker's Ed25519 host-key SHA-256 fingerprint is shown and must be typed in full; a mismatch refuses

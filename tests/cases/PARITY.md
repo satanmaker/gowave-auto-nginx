@@ -205,6 +205,12 @@ be published.
 - **SUB-B64** — promotion target: Real Subscription Delivery and User-Agent Policy
 - **SUB-UA-ABSENT** — promotion target: Real Subscription Delivery and User-Agent Policy
 - **SUB-UA-BLANK** — promotion target: Real Subscription Delivery and User-Agent Policy
+- **SUB-EDGE** — promotion target: Real Subscription Delivery and User-Agent Policy
+- **SUB-EDGE-BAD** — promotion target: Real Subscription Delivery and User-Agent Policy
+- **NGX-HYGIENE** — promotion target: All-in-One Master VPS Installation Verification
+- **NGX-SCANNER** — promotion target: All-in-One Master VPS Installation Verification
+- **PRE-INPUTS** — promotion target: All-in-One Master VPS Installation Verification
+- **PRE-INPUTS-BAD** — promotion target: All-in-One Master VPS Installation Verification
 - **SUB-JSON-SHAPES** — promotion target: Real Subscription Delivery and User-Agent Policy
 - **AIO-REVOKE** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-RESTART** — promotion target: All-in-One Master VPS Installation Verification
@@ -265,11 +271,20 @@ be published.
 - **MN-ARGV-OBSERVER** — promotion target: Distributed Worker VPS Deployment Verification
 - **AIO-AUTH-NEG** — promotion target: Negative Scenario and Fault Injection Tests
 - **MN-DUP-ADD** — promotion target: Negative Scenario and Fault Injection Tests
+- **MN-ENV-CONTRACT** — promotion target: Distributed Worker VPS Deployment Verification
 - **PO-INSTALL** — promotion target: Independent Panel-only acceptance topology
 - **PO-HOST** — promotion target: Independent Panel-only acceptance topology
 - **PO-API** — promotion target: Independent Panel-only acceptance topology
 - **PO-SQUAD** — promotion target: Independent Panel-only acceptance topology
 - **PO-SQUAD-REFUSED** — promotion target: Independent Panel-only acceptance topology
+- **PRE-PROXY-CIDR** — promotion target: All-in-One Master VPS Installation Verification
+- **PRE-PROXY-CIDR-OVERRIDE** — promotion target: All-in-One Master VPS Installation Verification
+- **TLS-LINEAGE** — promotion target: All-in-One Master VPS Installation Verification
+- **TLS-LINEAGE-BAD** — promotion target: All-in-One Master VPS Installation Verification
+- **FAIL-STEP** — promotion target: All-in-One Master VPS Installation Verification
+- **PANEL-ASSET-VERIFICATION** — promotion target: All-in-One Master VPS Installation Verification
+- **PINNED-INSTALLER-HOSTS** — promotion target: All-in-One Master VPS Installation Verification
+- **VERIFIED-ARTIFACT-FETCH** — promotion target: All-in-One Master VPS Installation Verification
 - **AIO-DP-REALITY-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-REALITY-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-XHTTP-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints

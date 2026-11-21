@@ -415,35 +415,100 @@ generate_panel_https_vhost() {
     local panel_domain="$1"
     local out_file="${2:-/etc/nginx/conf.d/gowave-panel.conf}"
     local nginx_bin="${3:-nginx}"
+    # The lineage directory is an argument, not a derivation: a host whose
+    # certificate name carries a suffix serves from that lineage, and the
+    # /etc/letsencrypt/live/<domain> this used to spell would not exist there.
+    local live_dir="${4:-/etc/letsencrypt/live/$panel_domain}"
 
     mkdir -p "$(dirname "$out_file")"
     local listen_directive
     listen_directive=$(render_nginx_listen_ssl_http2 "127.0.0.1:7443" "proxy_protocol" "$nginx_bin")
 
+    # The Panel reads a client address from any of these headers before it falls
+    # back to the socket (internal/httpx.ClientIP), and the first one it finds
+    # wins. Two are set from $remote_addr below; the rest have to be emptied,
+    # because a header NGINX forwards untouched is an address the client chose.
+    local client_ip_clears=""
+    local trusted_header
+    for trusted_header in X-Remnawave-Real-IP X-Client-IP CF-Connecting-IP \
+                          Fastly-Client-Ip True-Client-Ip X-Cluster-Client-IP \
+                          X-Forwarded Forwarded-For; do
+        client_ip_clears+="        proxy_set_header ${trusted_header} \"\";"$'\n'
+    done
+
     cat > "$out_file" <<EOF
 # Managed by GoWave Auto NGINX: Panel HTTPS Listener & Transports
+# One classification for the subscription route: a messenger or crawler that
+# fetches a pasted link is answered empty, every other caller keeps the Panel's
+# own decision. An absent header stays on the default branch, so the Panel's own
+# refusal is still what the client observes.
+map \$http_user_agent \$gowave_sub_ua_class {
+    default                client;
+    ~*telegrambot          preview;
+    ~*whatsapp             preview;
+    ~*facebookexternalhit  preview;
+    ~*slackbot             preview;
+    ~*discordbot           preview;
+    ~*twitterbot           preview;
+    ~*googlebot            preview;
+    ~*bingbot              preview;
+    ~*yandex(bot|images)   preview;
+    ~*applebot             preview;
+    ~*ahrefsbot            preview;
+    ~*semrushbot           preview;
+}
+
+# Judged on the raw request target: \$uri is already normalised and decoded, so a
+# dot segment or an encoded separator cannot be observed there. First match wins.
+# The counted pattern is quoted because braces are block delimiters to the parser.
+# The first segment is the shortUuid, which the Panel issues from the base64url
+# alphabet: an upper-case letter or an underscore belongs to a real identifier, so
+# refusing it would close the edge to every subscription link the product prints.
+# Only the clientType segment is spelled in lower case.
+map \$request_uri \$gowave_sub_path_bad {
+    default                                            0;
+    "~^/api/sub/[A-Za-z0-9_-]+/[a-z0-9-]{17,}"         1;
+    ~^/api/sub/[A-Za-z0-9_-]*(/[a-z0-9-]+)?/?(\?.*)?\$ 0;
+    ~^/api/sub/                                        1;
+}
+
 server {
     $listen_directive
     server_name $panel_domain;
+    server_tokens off;
 
     set_real_ip_from 127.0.0.1;
     real_ip_header proxy_protocol;
 
-    ssl_certificate /etc/letsencrypt/live/$panel_domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$panel_domain/privkey.pem;
+    ssl_certificate $live_dir/fullchain.pem;
+    ssl_certificate_key $live_dir/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
 
-    # Subscriptions: headers preserved, User-Agent preserved, cache disabled
+    # Server level, so a raw target that normalises out of the prefix is still
+    # refused, and nothing reaches the Panel.
+    if (\$gowave_sub_path_bad) {
+        return 444;
+    }
+
+    # Subscriptions: the payload embeds credentials, so it is never cached and
+    # never indexed; the request line carries the shortUuid and stays out of the
+    # access log.
     location ^~ /api/sub/ {
         proxy_pass http://127.0.0.1:3000;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+${client_ip_clears}
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header User-Agent \$http_user_agent;
-        add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0";
+        add_header Cache-Control "no-store, private" always;
+        add_header X-Robots-Tag "noindex, nofollow, noarchive, nosnippet" always;
+        access_log off;
+        if (\$gowave_sub_ua_class = preview) {
+            return 204;
+        }
     }
 
     # GoWave REST API
@@ -452,8 +517,16 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+${client_ip_clears}
         proxy_set_header X-Forwarded-Proto https;
+    }
+
+    # Scanner targets: a closed, anchored set that no GoWave route and no
+    # dashboard asset occupies. A broad dotfile rule is deliberately avoided, so
+    # a future .well-known path or hashed asset is not shadowed.
+    location ~* ^/(?:\.env|\.git|\.ds_store|wp-login\.php|wp-admin|phpmyadmin|server-status|actuator)(/|\$) {
+        return 444;
     }
 
     # GoWave Web UI Frontend
@@ -462,7 +535,8 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+${client_ip_clears}
         proxy_set_header X-Forwarded-Proto https;
     }
 
@@ -478,7 +552,8 @@ server {
         proxy_send_timeout 1h;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+${client_ip_clears}
         access_log off;
     }
 
@@ -492,7 +567,8 @@ server {
         proxy_send_timeout 1h;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+${client_ip_clears}
         access_log off;
     }
 
@@ -514,6 +590,9 @@ generate_decoy_vhost() {
     local nginx_bin="${3:-nginx}"
     local cover_root="${4:-$COVER_REALITY_ROOT}"
     local cover_domain="${5:-}"
+    # Same reason as the panel vhost: the camouflage certificate can live in a
+    # lineage named differently from the name it covers.
+    local live_dir="${6:-/etc/letsencrypt/live/$reality_domain}"
 
     mkdir -p "$(dirname "$out_file")"
     if [[ "$(id -u)" -eq 0 ]] || [[ -w "/var/www" ]] || [[ -w "$(dirname "$cover_root")" ]] || [[ -d "$cover_root" && -w "$cover_root" ]]; then
@@ -539,8 +618,8 @@ server {
     real_ip_header proxy_protocol;
 
     ssl_protocols TLSv1.3;
-    ssl_certificate /etc/letsencrypt/live/$reality_domain/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$reality_domain/privkey.pem;
+    ssl_certificate $live_dir/fullchain.pem;
+    ssl_certificate_key $live_dir/privkey.pem;
 
     root $cover_root;
     index index.html;
@@ -1061,6 +1140,25 @@ validate_acme_server() {
     return 0
 }
 
+# renewal_directory CONF - print the ACME directory a renewal config was issued
+# against. An empty result means the file carries no readable `server` field, and
+# the caller has to fail closed: guessing the directory is what mixes staging and
+# production into one lineage.
+renewal_directory() {
+    local conf="$1"
+    local server=""
+    local key val
+    [[ -f "$conf" ]] || return 1
+    while IFS='=' read -r key val || [[ -n "$key" ]]; do
+        key=$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        if [[ "$key" == "server" ]]; then
+            server=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            break
+        fi
+    done < "$conf"
+    printf '%s' "$server"
+}
+
 check_acme_lineage() {
     local domain="$1"
     local target_server="${2:-https://acme-v02.api.letsencrypt.org/directory}"
@@ -1079,13 +1177,7 @@ check_acme_lineage() {
 
     if [[ -f "$renewal_conf" ]]; then
         local existing_server=""
-        while IFS='=' read -r key val || [[ -n "$key" ]]; do
-            key=$(echo "$key" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-            if [[ "$key" == "server" ]]; then
-                existing_server=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-                break
-            fi
-        done < "$renewal_conf"
+        existing_server=$(renewal_directory "$renewal_conf")
 
         if [[ -z "$existing_server" ]]; then
             echo "Error: Existing renewal lineage for $domain has no readable 'server' field in $renewal_conf; failing closed to prevent cross-lineage staging/production reuse." >&2
@@ -1136,6 +1228,120 @@ check_acme_lineage() {
     fi
 
     return 0
+}
+
+# select_acme_lineage NAME TARGET_SERVER [LETSENCRYPT_ROOT]
+#
+# Print the live directory of a lineage that already covers NAME, or nothing when
+# the name has to be issued a lineage of its own. Adoption is what keeps a repeat
+# install from growing a second lineage beside the one the host already serves:
+# certbot names a lineage after `--cert-name`, and a host whose certificate name
+# carries a suffix (`example.com-0001`) would otherwise be issued `example.com`
+# and end up with two.
+#
+# A lineage qualifies only when all three hold, because each one is a way to serve
+# the wrong certificate:
+#   * its renewal config names TARGET_SERVER (the existing isolation, unchanged);
+#   * its certificate has not expired;
+#   * its certificate covers NAME.
+# Order is deterministic — the exact-name lineage first, then the rest by
+# directory name ascending — so the same tree always yields the same answer.
+select_acme_lineage() {
+    local name="$1"
+    local target_server="${2:-https://acme-v02.api.letsencrypt.org/directory}"
+    local letsencrypt_root="${3:-/etc/letsencrypt}"
+    local live_root="${letsencrypt_root}/live"
+    local renewal_root="${letsencrypt_root}/renewal"
+
+    # An empty or unreadable tree is not an error: it is a host that has to be
+    # issued its first lineage.
+    [[ -d "$live_root" ]] || return 0
+
+    local -a order=()
+    local entry candidate
+    if [[ -d "${live_root}/${name}" && ! -L "${live_root}/${name}" ]]; then
+        order+=("$name")
+    fi
+    # `-type d` already excludes a symlinked entry: it reports the link, not its
+    # target, and a lineage directory certbot created is never a symlink.
+    while IFS= read -r entry; do
+        candidate=$(basename -- "$entry")
+        [[ "$candidate" == "$name" ]] && continue
+        order+=("$candidate")
+    done < <(find "$live_root" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | LC_ALL=C sort)
+
+    if (( ${#order[@]} == 0 )); then
+        return 0
+    fi
+
+    for candidate in "${order[@]}"; do
+        local live_dir="${live_root}/${candidate}"
+        local fullchain="${live_dir}/fullchain.pem"
+        local renewal_conf="${renewal_root}/${candidate}.conf"
+        [[ -s "$fullchain" && -f "$renewal_conf" ]] || continue
+
+        local issued_by
+        issued_by=$(renewal_directory "$renewal_conf")
+        if [[ "$issued_by" != "$target_server" ]]; then
+            echo "Not adopting the ACME lineage $candidate for $name: it was not issued by $target_server." >&2
+            continue
+        fi
+        if ! openssl x509 -checkend 0 -noout -in "$fullchain" >/dev/null 2>&1; then
+            echo "Not adopting the ACME lineage $candidate for $name: its certificate has expired." >&2
+            continue
+        fi
+        # OpenSSL builds differ in whether a mismatch reaches the exit status, so
+        # the explicit result text is inspected as well, exactly as
+        # verify_acme_certificate does.
+        local host_check
+        if ! host_check=$(openssl x509 -checkhost "$name" -noout -in "$fullchain" 2>&1); then
+            continue
+        fi
+        if [[ "$host_check" != "Hostname $name does match certificate" ]]; then
+            continue
+        fi
+
+        printf '%s\n' "$live_dir"
+        echo "Adopting the ACME lineage $candidate for $name: it covers the name and matches the ACME directory." >&2
+        return 0
+    done
+    return 0
+}
+
+# record_certificate_lineages STATE_FILE PANEL_LIVE_DIR REALITY_LIVE_DIR [VISION_LIVE_DIR]
+#
+# Record the directories the vhosts and the Vision inbound reference, so an
+# operator reading state.json sees which lineage serves which name and a later
+# re-render does not have to re-derive it. The file is written before issuance:
+# a run that dies mid-issuance still leaves the choice it made.
+record_certificate_lineages() {
+    local state_file="$1"
+    local panel_dir="$2"
+    local reality_dir="$3"
+    local vision_dir="${4:-}"
+
+    PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+        "$state_file" "$panel_dir" "$reality_dir" "$vision_dir" <<'PY'
+import json
+import os
+import sys
+
+from modules.api_client import atomic_write_state
+
+state_path, panel_dir, reality_dir, vision_dir = sys.argv[1:5]
+state = {}
+if os.path.exists(state_path):
+    with open(state_path, encoding="utf-8") as handle:
+        state = json.load(handle)
+if not isinstance(state, dict):
+    raise SystemExit("state.json is not an object; refusing to record certificate lineages.")
+lineages = {"panel": panel_dir, "reality": reality_dir}
+if vision_dir:
+    lineages["vision"] = vision_dir
+state["certificateLineages"] = lineages
+atomic_write_state(state, state_path)
+PY
+    echo "Recorded the selected certificate lineages in $state_file."
 }
 
 snapshot_acme_lineage() {

@@ -91,6 +91,7 @@ TESTS_DIR = REPO_ROOT / "tests"
 REPORT_PATH = REPO_ROOT / "docs" / "PODMAN_E2E_TRACEABILITY.md"
 MATRIX_PATH = REPO_ROOT / "tests" / "cases" / "matrix.yaml"
 LIVE_SPEC_PATH = REPO_ROOT / "openspec" / "specs" / "live-vps-e2e" / "spec.md"
+LIFECYCLE_SPEC_PATH = REPO_ROOT / "openspec" / "specs" / "lifecycle-management" / "spec.md"
 
 # The contracts this capability shares with the live acceptance capability, in
 # the ledger's own order. The table has to record every one of them and nothing
@@ -149,6 +150,22 @@ def parse_spec(path: Path = SPEC_PATH) -> List[Tuple[str, str]]:
                 raise ValueError(f"scenario before any requirement: {match.group(1)!r}")
             pairs.append((requirement, match.group(1)))
     return pairs
+
+
+def parse_lifecycle_spec(path: Path = LIFECYCLE_SPEC_PATH) -> Set[str]:
+    """All requirement names the lifecycle-management spec states.
+
+    The traceability table maps cases to requirements from both the podman-e2e
+    delta spec and the archived lifecycle-management spec. This function
+    extracts the requirement names so the audit accepts cases mapped to
+    lifecycle requirements.
+    """
+    requirements: Set[str] = set()
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        match = REQUIREMENT_RE.match(line)
+        if match:
+            requirements.add(match.group(1))
+    return requirements
 
 
 def load_table(path: Path = TABLE_PATH) -> Dict[str, Any]:
@@ -366,6 +383,7 @@ def validate(
             problems.append(f"no row for the scenario: {key[0]} / {key[1]}")
 
     requirements = {requirement for requirement, _scenario in stated}
+    requirements.update(parse_lifecycle_spec())
     mapped = {pair for row in rows(table) for pair in expand(row.get("cases") or [], declared)[0]}
     for entry in unstated(table):
         requirement = entry.get("requirement")

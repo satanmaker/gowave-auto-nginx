@@ -69,7 +69,13 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Requirement | Cases |
 | --- | --- |
 | Real Panel subscription lifecycle | `AIO-AUTH` |
+| Panel subscription representations | `SUB-EDGE`, `SUB-EDGE-BAD` |
+| Independent All-in-One acceptance topology | `NGX-HYGIENE`, `NGX-SCANNER` |
+| Independent All-in-One acceptance topology | `PRE-INPUTS`, `PRE-INPUTS-BAD` |
+| Independent All-in-One acceptance topology | `PRE-PROXY-CIDR`, `PRE-PROXY-CIDR-OVERRIDE` |
 | Camouflage decoy and certificate lineage | `NGX-05` |
+| Explicit ACME Endpoint Selection and Certificate Lineage Isolation | `TLS-LINEAGE` |
+| Explicit ACME Endpoint Selection and Certificate Lineage Isolation | `TLS-LINEAGE-BAD` |
 | Security and network isolation verification | `AIO-NEG-DEP` |
 | Failure injection and recovery | `AIO-FAULT-DISK`, `AIO-FAULT-PANEL`, `AIO-FAULT-XRAY`, `AIO-FAULT-LATENCY` |
 | Live scenario parity | `AIO-PKT-02`, `MN-PKT-03`, `AIO-NEG-PIN`, `GATE-TEARDOWN` |
@@ -94,6 +100,11 @@ them on CI. A `gap` row names the ledger task that still owns the work.
 | Live scenario parity | `REV-01`, `REV-02`, `BOOT-02` |
 | Live scenario parity | `NEG-01`, `NEG-04` |
 | Live scenario parity | `AIO-AUTH-NEG`, `MN-DUP-ADD`, `RED-01`, `RED-02`, `APIC-01` |
+| Independent Multi-Node acceptance topology | `MN-ENV-CONTRACT` |
+| Independent All-in-One acceptance topology | `VERIFIED-ARTIFACT-FETCH` |
+| Independent All-in-One acceptance topology | `PINNED-INSTALLER-HOSTS` |
+| Independent All-in-One acceptance topology | `PANEL-ASSET-VERIFICATION` |
+| Trustworthy result and diagnostics | `FAIL-STEP` |
 
 ## Named behaviours
 
@@ -107,6 +118,9 @@ answers what one promise rests on, not which scenario owns it.
 | A subscription request carrying a User-Agent is served | Real Panel subscription lifecycle | `user_agent.accepted` = `non-empty header` | `SUB-SERVED` | `test_podman_subscriptions.TestPanelSubscriptionProbe.test_each_representation_is_fetched_with_its_client_user_agent`, `test_podman_subscriptions.TestSubscriptionWiring.test_every_subscription_case_is_in_the_shared_catalog` | All-in-One Podman Acceptance, Multi-Node Podman Acceptance |
 | A subscription request without a User-Agent header is refused | Real Panel subscription lifecycle | `user_agent.absent` = `403` | `SUB-UA-ABSENT` | `test_podman_subscriptions.TestSubscriptionCases.test_absent_user_agent_case_is_refused_for_every_representation`, `test_podman_subscriptions.TestPanelSubscriptionProbe.test_an_absent_user_agent_is_a_request_without_the_header` | All-in-One Podman Acceptance |
 | A subscription request with a blank User-Agent header is refused | Real Panel subscription lifecycle | `user_agent.blank` = `403` | `SUB-UA-BLANK` | `test_podman_subscriptions.TestSubscriptionCases.test_blank_user_agent_case_is_a_separate_result`, `test_podman_subscriptions.TestPanelSubscriptionProbe.test_a_blank_user_agent_is_an_empty_header_not_a_missing_one` | All-in-One Podman Acceptance |
+| The public edge serves the subscription without advertising it | Panel subscription representations | — | `SUB-EDGE`, `SUB-EDGE-BAD` | `test_podman_subscriptions.TestSubscriptionEdgeCases.test_edge_case_names_what_the_client_and_the_crawlers_received`, `test_podman_subscriptions.TestSubscriptionEdgeCases.test_forgery_case_names_both_refusals_and_the_access_log`, `test_podman_subscriptions.TestPanelSubscriptionProbe.test_the_edge_contract_scope_asks_the_edge_for_every_published_family` | All-in-One Podman Acceptance |
+| The public edge hides its build and hands the Panel only the peer address | Independent All-in-One acceptance topology | — | `NGX-HYGIENE`, `NGX-SCANNER` | `test_podman_aio.TestHygieneCase.test_hygiene_case_names_the_server_the_page_the_peer_and_the_routes`, `test_podman_aio.TestHygieneCase.test_hygiene_case_rejects_a_peer_the_panel_did_not_record`, `test_podman_aio.TestHygieneCase.test_scanner_case_names_the_refused_set_and_the_control`, `test_nginx_routing.TestNginxRouting.test_panel_vhost_hands_the_panel_only_the_peer_address` | All-in-One Podman Acceptance |
+| An incomplete install request is refused before the installed host is touched | Independent All-in-One acceptance topology | — | `PRE-INPUTS`, `PRE-INPUTS-BAD` | `test_podman_aio.TestPreflightInputCase.test_missing_case_names_the_refusal_the_inventory_and_the_panel`, `test_podman_aio.TestPreflightInputCase.test_missing_case_rejects_a_host_it_rewrote`, `test_podman_aio.TestPreflightInputCase.test_bad_case_quotes_the_value_it_rejected`, `test_podman_aio.TestPreflightInputCase.test_the_probe_asks_without_a_terminal_and_reads_the_product_back`, `test_preflight.TestPreflightInputs.test_a_missing_panel_input_names_the_component_and_the_field` | All-in-One Podman Acceptance |
 | The base64 representation is the share-link list the inventory describes | Panel subscription representations | `representations.base64` = `/api/sub/{shortUuid}` | `SUB-B64` | `test_podman_subscriptions.TestSubscriptionCases.test_share_link_case_imports_the_decoded_list`, `test_podman_subscriptions.TestSubscriptionClientProbe.test_the_base64_list_decodes_and_a_json_body_does_not` | All-in-One Podman Acceptance, Multi-Node Podman Acceptance |
 | The Xray JSON representation is served as a bare object and as a list | Panel subscription representations | `representations.xray-json` = `/api/sub/{shortUuid}/v2ray-json` | `SUB-JSON-SHAPES` | `test_podman_subscriptions.TestSubscriptionCases.test_json_shape_case_loads_the_served_list_and_the_bare_object`, `test_podman_subscriptions.TestSubscriptionClientProbe.test_json_shapes_accepts_the_served_list_and_the_bare_object` | All-in-One Podman Acceptance |
 | Worker provisioning dials the Master's private run address | Podman-only Master address selection for Worker provisioning | — | `PODNET-MASTER-ADDR` | `test_podman_multi_node.TestMasterAddressCase.test_the_run_address_is_accepted_when_the_worker_uses_it`, `test_podman_address.TestPodmanAddressOverride.test_address_must_be_assigned_on_this_host`, `test_podman_multi_node.TestWorkerProvisioningCommand.test_the_command_is_the_operator_entrypoint_with_positional_roles` | Multi-Node Podman Acceptance |

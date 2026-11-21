@@ -7,8 +7,8 @@ counts:
   container: 111
   partial: 12
   live_only: 2
-  podman_first: 109
-  total: 234
+  podman_first: 124
+  total: 249
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -6627,6 +6627,170 @@ cases:
       driver: aio:case_user_agent_blank
       evidence: []
   promotion_target: Real Subscription Delivery and User-Agent Policy
+- id: SUB-EDGE
+  requirement: Panel subscription representations
+  live_scenario: null
+  assertion: A subscription read through the public edge answers a client with the bytes the Panel issued
+    plus no-store and the X-Robots-Tag, answers every link-preview crawler with an empty 204 carrying
+    the same headers, lets the Panel's own 403 through for an absent header, and closes the connection
+    for a dot-segment or an encoded-separator target; the Panel's route counter does not move for the
+    crawler sweep but moves for a control fetch, and the NGINX access log holds no served subscription
+    line while the refused targets are recorded.
+  assertion_sha256: c006be4ce2f23b59cc1cfa3261aa3d2219573fcde23147716508e993220c520e
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_subscription_edge
+      evidence:
+      - absent_status
+      - foreign_status
+      - panel_requests_added_by_control
+      - panel_requests_added_by_previews
+      - preview_bytes
+      - preview_count
+      - preview_statuses
+      - served_bytes
+      - served_cache_control
+      - served_status
+      - served_x_robots_tag
+  promotion_target: Real Subscription Delivery and User-Agent Policy
+- id: SUB-EDGE-BAD
+  requirement: Panel subscription representations
+  live_scenario: null
+  assertion: A raw request target a normalising client would never send — a dot segment inside the subscription
+    path and an encoded separator before the representation — is answered by closing the connection with
+    no bytes, and the NGINX access log records both refusals while holding no served /api/sub/<shortUuid>
+    line.
+  assertion_sha256: 19f639b96c23113e248ea22395817c322a5d9a33a50f2a1655b1a689d93781ec
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_subscription_edge_forgery
+      evidence:
+      - access_log_lines
+      - access_log_refused_lines
+      - access_log_served_lines
+      - refused_dot_segment
+      - refused_encoded_separator
+  promotion_target: Real Subscription Delivery and User-Agent Policy
+- id: NGX-HYGIENE
+  requirement: Independent All-in-One acceptance topology
+  live_scenario: null
+  assertion: The panel vhost answers from the edge without naming its build in Server or in the error
+    page NGINX writes for a request line past its header buffer, the Panel records the peer address for
+    a subscription request that carries each header it would otherwise prefer, with the forged address
+    appearing in no record, and every product surface — the REST API, the subscription route, the dashboard,
+    both inbound transports and the gRPC inbound — is still proxied.
+  assertion_sha256: 22e2ae28c7896bc6924e41e0c3af1443f73773173d2c2a8c14c8380383fc416e
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_ngx_hygiene
+      evidence:
+      - error_page_status
+      - headers_forged
+      - peer_recorded_ip
+      - probe_source_ip
+      - product_routes
+      - server_answered
+      - server_unmatched
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: NGX-SCANNER
+  requirement: Independent All-in-One acceptance topology
+  live_scenario: null
+  assertion: Every path in the shipped scanner set is answered by closing the connection with no bytes,
+    while the same client on a proxied route reaches the Panel and reads its own refusal, so a rule that
+    closed every request cannot pass as the scan defence.
+  assertion_sha256: e1fc90f9dc41a020d0a5ca51760da7e62faa8202ac413f70c90166af659d73d9
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_ngx_scanner
+      evidence:
+      - control_status
+      - refused
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: PRE-INPUTS
+  requirement: Independent All-in-One acceptance topology
+  live_scenario: null
+  assertion: 'The operator''s install command, run again against the installed host with the ACME contact
+    left out, is refused before the NGINX stop and before any managed path is written: the refusal names
+    the missing input, the host''s unit files and digested NGINX configuration are unchanged, and the
+    Panel still answers its documented authenticated calls.'
+  assertion_sha256: cff26ae3ce3ce1bdf3459304bd9af41239cffdffca80828347779700fb618357
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_preflight_inputs
+      evidence:
+      - inventory_unchanged
+      - missing_names
+      - missing_status
+      - nginx
+      - panel_api
+      - panel_login
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: PRE-INPUTS-BAD
+  requirement: Independent All-in-One acceptance topology
+  live_scenario: null
+  assertion: The same command carrying a complete argument list with a malformed ACME contact is refused
+    on that field, quoting the rejected value, while the same unchanged inventory and the same serving
+    Panel are read, so a contract that accepted any non-empty argument cannot pass as input validation.
+  assertion_sha256: 2ce7aa913a481a5d06aafdf4e3f823bc00bea99fceed352c5ebd6288d20d4a3b
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_preflight_inputs_bad
+      evidence:
+      - inventory_unchanged
+      - malformed_names
+      - malformed_status
+      - nginx
+      - panel_api
+      - panel_login
+  promotion_target: All-in-One Master VPS Installation Verification
 - id: SUB-JSON-SHAPES
   requirement: Panel subscription representations
   live_scenario: null
@@ -7086,6 +7250,8 @@ cases:
       - public_status_with_panel_down
       - representations_identical
       - rows_stable_with_panel_down
+      - subscription_cache_control_with_panel_down
+      - subscription_robots_tag_with_panel_down
       - subscription_status_with_panel_down
       - transfers_after
       - transfers_with_panel_down
@@ -8667,6 +8833,39 @@ cases:
       - state_nodes
       - state_unchanged
   promotion_target: Negative Scenario and Fault Injection Tests
+- id: MN-ENV-CONTRACT
+  requirement: Distributed Worker VPS Deployment Verification
+  live_scenario: null
+  assertion: A Worker onboarded through the environment contract (GOWAVE_NODE_NAME, GOWAVE_NODE_IP, GOWAVE_WORKER_DOMAIN,
+    GOWAVE_REALITY_DOMAIN, GOWAVE_SSH_USER, GOWAVE_SSH_PORT, GOWAVE_VISION_DOMAIN) instead of positional
+    arguments is registered by the Master, appears in the Panel with the correct endpoint, and reports
+    as connected.
+  assertion_sha256: fb9a9a807406d1eb1c448a20e0fec641b2684f65c5b73a5ab0eb4fcba43a870e
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_env_contract
+      evidence:
+      - env_worker_name
+      - environment_contract_used
+      - node_add_command
+      - node_add_duration_seconds
+      - node_add_returncode
+      - panel_hosts
+      - panel_node_connected
+      - panel_node_endpoints
+      - panel_node_names
+      - panel_nodes
+      - unauthenticated_nodes_status
+      - worker_endpoint
+  promotion_target: Distributed Worker VPS Deployment Verification
 - id: PO-INSTALL
   requirement: Independent Panel-only acceptance topology
   live_scenario: null
@@ -8798,6 +8997,207 @@ cases:
       driver: panel_only:case_refused_payload
       evidence: []
   promotion_target: Independent Panel-only acceptance topology
+- id: PRE-PROXY-CIDR
+  requirement: Independent All-in-One acceptance topology
+  live_scenario: null
+  assertion: 'A requested name that resolves to an address inside the dated Cloudflare CIDR snapshot is
+    refused before any certificate request: the preflight check names the domain, the proxied address,
+    and the CIDR it falls in, and HTTP-01 is not attempted. An override GOWAVE_PREFLIGHT_ALLOW_PROXIED=1
+    is honoured, and an unresolvable name is likewise refused with the resolution failure named.'
+  assertion_sha256: a16b1dec7774e27f8d6ef5ac4b104e6110da9d68293c0b4ea6fccf2928b847d3
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: preflight_cases:case_proxy_cidr_refused
+      evidence:
+      - panel_refusal
+      - proxied_address
+      - proxied_cidr
+      - reality_refusal
+      - snapshot_date
+      - unresolvable_refusal
+      - vision_refusal
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: PRE-PROXY-CIDR-OVERRIDE
+  requirement: Independent All-in-One acceptance topology
+  live_scenario: null
+  assertion: A name that resolves to a Cloudflare proxy address is accepted when GOWAVE_PREFLIGHT_ALLOW_PROXIED=1
+    is explicitly set, recording the operator's decision to continue despite the proxy. The same DNS check
+    passes, and the policy layer allows the request through.
+  assertion_sha256: c3fe6f12ffee44029adf7969fb55cd8e645ac322ec0f899ba426d27995456ec3
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: preflight_cases:case_proxy_cidr_override
+      evidence:
+      - override_honoured
+      - proxied_address
+      - refused_without_override
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: TLS-LINEAGE
+  requirement: Explicit ACME Endpoint Selection and Certificate Lineage Isolation
+  live_scenario: null
+  assertion: 'A repeated install adopts an existing suffixed ACME lineage (e.g. panel.example.com-0001)
+    that covers the panel domain instead of creating a second lineage: select_acme_lineage returns the
+    adopted lineage''s live directory, prints the adoption message, and the same tree answers the same
+    way on a second call.'
+  assertion_sha256: e475f229a1a0ba0146d43dff8aa4796ddf9ca3d3ca2e498d78c3b60ef4f158d5
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: preflight_cases:case_tls_lineage
+      evidence:
+      - adopted_directory
+      - adoption_message
+      - deterministic_repeat
+      - exact_lineage_absent
+      - panel_domain
+      - suffixed_lineage
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: TLS-LINEAGE-BAD
+  requirement: Explicit ACME Endpoint Selection and Certificate Lineage Isolation
+  live_scenario: null
+  assertion: 'An expired lineage or a lineage from a mismatched ACME directory is not adopted by select_acme_lineage:
+    the function returns empty stdout and prints a refusal message naming the expiry or directory mismatch.'
+  assertion_sha256: 66f52b1ad549bc2153f44ccfc2ad7eb8efdd5227e117bea2f4c225b7193324be
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: preflight_cases:case_tls_lineage_bad
+      evidence:
+      - directory_mismatch_message_contains
+      - directory_mismatch_refusal
+      - expired_message_contains
+      - expired_refusal
+      - panel_domain
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: FAIL-STEP
+  requirement: Independent All-in-One acceptance topology
+  live_scenario: null
+  assertion: The ERR trap with CURRENT_STEP prints a located failure naming the step, the failing command
+    and its status, prints it exactly once, and exits with the step's status; a step that succeeds prints
+    no report.
+  assertion_sha256: e6d80cbe24f18237a949209b36dfa9c5c8b162dd4189e4e7ee905d33fd9861c9
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_fail_step
+      evidence:
+      - command_named
+      - exit_status
+      - report_count
+      - silent_on_success
+      - status_named
+      - step_named
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: PANEL-ASSET-VERIFICATION
+  requirement: Independent All-in-One acceptance topology
+  live_scenario: null
+  assertion: A release asset is checked against SHA256SUMS before the next URL is tried; a mismatched
+    asset aborts without falling through, the binary is not left behind, and no release API fallback occurs.
+  assertion_sha256: 52ebed64020dfdfe0ede0e878c24f7927427e2f7f380aefc1d14c8907158171e
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_panel_asset_verification
+      evidence:
+      - binary_not_left
+      - mismatch_aborts
+      - no_release_api_fallback
+      - single_url_requested
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: PINNED-INSTALLER-HOSTS
+  requirement: Independent All-in-One acceptance topology
+  live_scenario: null
+  assertion: The commit is tried on GitHub first and jsDelivr second; the order is fixed and the environment
+    variable GOWAVE_NODE_INSTALLER_COMMIT selects the exact commit.
+  assertion_sha256: 0a2ec1e567f800ad5c0e4e7511a426255d320afce7ecd00ddec053c5563470a2
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_pinned_installer_hosts
+      evidence:
+      - github_first
+      - jsdelivr_second
+      - urls
+  promotion_target: All-in-One Master VPS Installation Verification
+- id: VERIFIED-ARTIFACT-FETCH
+  requirement: Independent All-in-One acceptance topology
+  live_scenario: null
+  assertion: A pinned artifact is fetched from ordered hosts; a host that cannot deliver falls through
+    to the next, a mismatch is terminal and the next host is never asked, no host delivering leaves nothing
+    behind, a destination is replaced only after its bytes are verified, an unusable digest is refused
+    before any download, and a missing host list is refused.
+  assertion_sha256: 2fd1dbf4839b7e79f898fcf86d702243b002f9fee0406d076fb06fcb5c49d3cd
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - aio
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    aio:
+      driver: aio:case_verified_artifact_fetch
+      evidence:
+      - atomic_replace
+      - fall_through_404
+      - missing_host_list_refused
+      - no_host_fails
+      - terminal_mismatch
+      - tests_passed
+      - unusable_digest_refused
+  promotion_target: All-in-One Master VPS Installation Verification
 - id: AIO-DP-REALITY-xray
   requirement: Real client data-plane verification
   live_scenario: null

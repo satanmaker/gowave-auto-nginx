@@ -8,6 +8,27 @@ STATE_FILE="${GOWAVE_STATE_FILE:-/var/lib/gowave-auto-nginx/state.json}"
 JOURNAL_FILE="/var/lib/gowave-auto-nginx/recovery/journal.json"
 CREDENTIALS_FILE="/root/gowave-credentials.txt"
 
+# The failure report names the phase, the command and the status, so a failed
+# run says where it stopped instead of exiting on a bare status. The handler
+# only reports: every compensation in this tree is explicit and already runs
+# inside the failing step, so rolling back here would double-compensate a
+# transaction that step had partially removed.
+CURRENT_STEP="initialization"
+on_error() {
+    local code=$?
+    trap - ERR
+    # `set -E` hands this trap to command substitutions and pipeline elements.
+    # They keep the code and stay quiet; the parent knows the phase and speaks
+    # once.
+    if [[ "${BASHPID:-$$}" != "$$" ]]; then
+        exit "$code"
+    fi
+    printf 'Error: step "%s" failed running "%s" (exit %s).\n' \
+        "${CURRENT_STEP:-unassigned}" "$BASH_COMMAND" "$code" >&2
+    exit "$code"
+}
+trap 'on_error' ERR
+
 # Source submodules
 source "$SCRIPT_DIR/modules/lock.sh"
 source "$SCRIPT_DIR/modules/tempdir.sh"
@@ -269,45 +290,49 @@ cmd_install() {
             read -r -p "Enter Vision domain (e.g. vision.example.com): " vision_domain
         fi
     fi
-    # Input validation and the camouflage probe need a handful of tools that
+    # The required-input contract is pure shell, so it runs before any tool is
+    # installed, before NGINX is stopped and before any managed path is written.
+    # The camouflage probe that follows does need a handful of tools that
     # install_prerequisites would install later; get them first so a bare host
     # fails for a product reason rather than a missing interpreter.
+    CURRENT_STEP="install: input contract"
+    preflight_require_inputs install "$panel_domain" "$reality_domain" "$admin_email" "$vision_domain" || return $?
+    preflight_require_direct_dns "$panel_domain" "$reality_domain" "$vision_domain" || return 1
     bootstrap_early_tools || return 1
-    python3 - "$panel_domain" "$reality_domain" "$vision_domain" <<'PY'
-import re, sys
-panel, reality, *extra = sys.argv[1:]
-vision = extra[0] if extra and extra[0] else None
-def validate_domain(domain):
-    if len(domain) > 253:
-        raise SystemExit(f"Invalid DNS hostname (too long): {domain}")
-    labels = domain.rstrip(".").split(".")
-    if len(labels) < 2 or any(
-        not label or len(label) > 63 or
-        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label)
-        for label in labels
-    ):
-        raise SystemExit(f"Invalid DNS hostname: {domain}")
-validate_domain(panel)
-validate_domain(reality)
-if panel.lower().rstrip(".") == reality.lower().rstrip("."):
-    raise SystemExit("Panel and REALITY domains must be different.")
-if vision:
-    validate_domain(vision)
-    if vision.lower().rstrip(".") in (panel.lower().rstrip("."), reality.lower().rstrip(".")):
-        raise SystemExit("Vision domain must differ from Panel and REALITY domains.")
-PY
-    if [[ ! "$admin_email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
-        echo "Error: a valid Let's Encrypt email address is required." >&2
-        return 2
-    fi
 
     validate_acme_server "${GOWAVE_ACME_SERVER:-}" || return 1
     local effective_acme_server="${GOWAVE_ACME_SERVER:-https://acme-v02.api.letsencrypt.org/directory}"
-    check_acme_lineage "$panel_domain" "$effective_acme_server" || return 1
-    check_acme_lineage "$reality_domain" "$effective_acme_server" || return 1
+    # A lineage that already covers a name is adopted instead of issuing a second
+    # one beside it: certbot names a lineage after --cert-name, so a host that
+    # already serves `example.com-0001` would otherwise gain `example.com` and the
+    # vhost would have to guess which one to point at. Selection only ever returns
+    # a directory whose renewal config names this ACME directory, so the staging /
+    # production isolation below still applies to the lineage actually picked.
+    local panel_live reality_live vision_live="" panel_lineage reality_lineage vision_lineage=""
+    panel_live=$(select_acme_lineage "$panel_domain" "$effective_acme_server") || return 1
+    reality_live=$(select_acme_lineage "$reality_domain" "$effective_acme_server") || return 1
     if [[ -n "$vision_domain" ]]; then
-        check_acme_lineage "$vision_domain" "$effective_acme_server" || return 1
+        vision_live=$(select_acme_lineage "$vision_domain" "$effective_acme_server") || return 1
     fi
+    panel_live="${panel_live:-/etc/letsencrypt/live/$panel_domain}"
+    reality_live="${reality_live:-/etc/letsencrypt/live/$reality_domain}"
+    if [[ -n "$vision_domain" ]]; then
+        vision_live="${vision_live:-/etc/letsencrypt/live/$vision_domain}"
+    fi
+    panel_lineage=$(basename -- "$panel_live")
+    reality_lineage=$(basename -- "$reality_live")
+    if [[ -n "$vision_domain" ]]; then
+        vision_lineage=$(basename -- "$vision_live")
+    fi
+    check_acme_lineage "$panel_domain" "$effective_acme_server" \
+        "/etc/letsencrypt/renewal/$panel_lineage.conf" "$panel_live" || return 1
+    check_acme_lineage "$reality_domain" "$effective_acme_server" \
+        "/etc/letsencrypt/renewal/$reality_lineage.conf" "$reality_live" || return 1
+    if [[ -n "$vision_domain" ]]; then
+        check_acme_lineage "$vision_domain" "$effective_acme_server" \
+            "/etc/letsencrypt/renewal/$vision_lineage.conf" "$vision_live" || return 1
+    fi
+    record_certificate_lineages "$STATE_FILE" "$panel_live" "$reality_live" "$vision_live" || return 1
 
     # The camouflage site lives on the registrable apex of the panel domain so
     # that a browser reaching for the bare domain lands on a plausible static
@@ -343,6 +368,7 @@ PY
     fi
 
     # Step 1: Preflight Environment Inspection
+    CURRENT_STEP="install: preflight"
     check_os
     # A repeat install finds NGINX already serving the managed stream config.
     # Taking it down there is downtime for a live target, and the ACME stage
@@ -357,31 +383,37 @@ PY
     run_preflight_panel
 
     # Step 2: System Prerequisites
+    CURRENT_STEP="install: prerequisites"
     install_prerequisites
 
     # Step 3: Host Security Hardening
+    CURRENT_STEP="install: host security"
     configure_ssh_and_fail2ban
     configure_swap
     configure_bbr_and_mtu "$STATE_FILE"
     configure_log_rotation
 
     # Step 4: Webroot ACME TLS Acquisition
+    CURRENT_STEP="install: certificates"
     local acme_tx_id="install_$(date +%s)"
     verify_deploy_hook_preflight "/etc/letsencrypt/renewal-hooks/deploy/gowave-nginx.sh" "$acme_tx_id" || return 1
-    snapshot_acme_lineage "$acme_tx_id" "$panel_domain"
-    snapshot_acme_lineage "$acme_tx_id" "$reality_domain"
+    # Snapshot under the lineage name, not the requested one: an adopted lineage
+    # is thereby recorded as pre-existing, which is what stops
+    # rollback_acme_lineages from deleting a certificate this run did not create.
+    snapshot_acme_lineage "$acme_tx_id" "$panel_lineage"
+    snapshot_acme_lineage "$acme_tx_id" "$reality_lineage"
     if [[ -n "$vision_domain" ]]; then
-        snapshot_acme_lineage "$acme_tx_id" "$vision_domain"
+        snapshot_acme_lineage "$acme_tx_id" "$vision_lineage"
     fi
 
     rollback_acme_lineages() {
         local rollback_failed=0
         echo "ACME acquisition or verification failed. Rolling back certificate lineages..." >&2
         rollback_managed_deploy_hook "$acme_tx_id" 2>/dev/null || rollback_failed=1
-        restore_acme_lineage "$acme_tx_id" "$panel_domain" 2>/dev/null || rollback_failed=1
-        restore_acme_lineage "$acme_tx_id" "$reality_domain" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$acme_tx_id" "$panel_lineage" 2>/dev/null || rollback_failed=1
+        restore_acme_lineage "$acme_tx_id" "$reality_lineage" 2>/dev/null || rollback_failed=1
         if [[ -n "$vision_domain" ]]; then
-            restore_acme_lineage "$acme_tx_id" "$vision_domain" 2>/dev/null || rollback_failed=1
+            restore_acme_lineage "$acme_tx_id" "$vision_lineage" 2>/dev/null || rollback_failed=1
         fi
         rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf || rollback_failed=1
         if [[ "$rollback_failed" -ne 0 ]]; then
@@ -425,7 +457,7 @@ PY
 
     echo "Acquiring Let's Encrypt TLS certificate for Panel ($panel_domain)..."
     if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" \
-        -d "$panel_domain" --cert-name "$panel_domain" \
+        -d "$panel_domain" --cert-name "$panel_lineage" \
         --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring \
         "${certbot_extra_args[@]}"; then
         rollback_acme_lineages
@@ -442,7 +474,7 @@ PY
         reality_cert_flags+=(--expand)
     fi
     if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" \
-        "${reality_cert_args[@]}" "${reality_cert_flags[@]}" --cert-name "$reality_domain" \
+        "${reality_cert_args[@]}" "${reality_cert_flags[@]}" --cert-name "$reality_lineage" \
         --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring \
         "${certbot_extra_args[@]}"; then
         rollback_acme_lineages
@@ -452,7 +484,7 @@ PY
     if [[ -n "$vision_domain" ]]; then
         echo "Acquiring Let's Encrypt TLS certificate for VLESS Vision ($vision_domain)..."
         if ! run_certbot certonly --webroot -w "$ACME_WEBROOT" \
-            -d "$vision_domain" --cert-name "$vision_domain" \
+            -d "$vision_domain" --cert-name "$vision_lineage" \
             --non-interactive --agree-tos -m "$admin_email" --keep-until-expiring \
             "${certbot_extra_args[@]}"; then
             rollback_acme_lineages
@@ -463,20 +495,21 @@ PY
     rm -f /etc/nginx/conf.d/00-bootstrap-acme.conf
 
     # Verify certificates cryptographically (refuse to proceed with invalid or missing certificates)
-    if ! verify_acme_certificate "$panel_domain" || \
-       ! verify_acme_certificate "$reality_domain" || \
-       { [[ -n "$cover_domain" ]] && ! verify_acme_certificate "$cover_domain" "/etc/letsencrypt/live/$reality_domain"; } || \
-       { [[ -n "$vision_domain" ]] && ! verify_acme_certificate "$vision_domain"; }; then
+    if ! verify_acme_certificate "$panel_domain" "$panel_live" || \
+       ! verify_acme_certificate "$reality_domain" "$reality_live" || \
+       { [[ -n "$cover_domain" ]] && ! verify_acme_certificate "$cover_domain" "$reality_live"; } || \
+       { [[ -n "$vision_domain" ]] && ! verify_acme_certificate "$vision_domain" "$vision_live"; }; then
         rollback_acme_lineages
         return 1
     fi
 
     # Step 5: NGINX Configuration
+    CURRENT_STEP="install: nginx"
     ensure_nginx_stream_block
     generate_stream_config "$panel_domain" "$reality_domain" "/etc/nginx/stream-enabled/gowave-stream.conf" "/proc/net/if_inet6" "$vision_domain" "$cover_domain" "$install_mode"
     generate_production_http_vhost "$panel_domain" "$reality_domain" "/etc/nginx/conf.d/gowave-http.conf" "/proc/net/if_inet6" "$vision_domain" "$cover_domain"
-    generate_panel_https_vhost "$panel_domain"
-    generate_decoy_vhost "$reality_domain" "/etc/nginx/conf.d/gowave-decoy.conf" nginx "$COVER_REALITY_ROOT" "$cover_domain"
+    generate_panel_https_vhost "$panel_domain" "/etc/nginx/conf.d/gowave-panel.conf" nginx "$panel_live"
+    generate_decoy_vhost "$reality_domain" "/etc/nginx/conf.d/gowave-decoy.conf" nginx "$COVER_REALITY_ROOT" "$cover_domain" "$reality_live"
     if [[ "$install_mode" == "all-in-one" && -n "$vision_domain" ]]; then
         generate_vision_fallback_vhost "$vision_domain"
     fi
@@ -485,6 +518,7 @@ PY
     reload_nginx_strict
 
     # Step 6: GoWave Panel Native Installation
+    CURRENT_STEP="install: panel"
     download_panel_release "$GOWAVE_DIR" "${GOWAVE_PANEL_VERSION:-$GOWAVE_DEFAULT_VERSION}"
     generate_panel_env "$GOWAVE_DIR" "$panel_domain" "$panel_domain/api/sub"
     configure_panel_systemd "$GOWAVE_DIR"
@@ -499,6 +533,7 @@ PY
     verify_public_tls_sni "$panel_domain"
 
     # Step 7: Local Node Installation (the traffic plane is absent in Panel-only)
+    CURRENT_STEP="install: local node"
     if [[ "$install_mode" == "all-in-one" ]]; then
         local secret_key
         secret_key=$(extract_secret_key "$GOWAVE_DIR")
@@ -510,6 +545,7 @@ PY
     fi
 
     # Step 9: REST API Provisioning
+    CURRENT_STEP="install: provisioning"
     echo "Executing REST API bootstrapping and MVP profile provisioning..."
     # A repeated install must keep the credentials the running Panel accepts: a
     # freshly generated password would be refused by the existing admin, and the
@@ -533,6 +569,7 @@ PY
         XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
         GOWAVE_MIHOMO_X25519="${GOWAVE_MIHOMO_X25519:-}" \
         GOWAVE_REALITY_FINGERPRINT="${GOWAVE_REALITY_FINGERPRINT:-}" \
+        GOWAVE_VISION_CERT_DIR="${vision_live}" \
         python3 - \
         "$SCRIPT_DIR" "$panel_domain" "$reality_domain" "$admin_user" \
         "$JOURNAL_FILE" "$STATE_FILE" "$CREDENTIALS_FILE" "$vision_domain" "$install_mode" 3<<< "$admin_pass" <<'PY'
@@ -641,7 +678,8 @@ else:
     short_ids = None
 raw_config = client.compile_config_profile(
     "local-node", reality_domain, x25519["privateKey"], short_ids=short_ids,
-    public_key=x25519.get("publicKey"), vision_domain=vision_domain, panel_domain=panel_domain
+    public_key=x25519.get("publicKey"), vision_domain=vision_domain, panel_domain=panel_domain,
+    vision_cert_dir=os.environ.get("GOWAVE_VISION_CERT_DIR") or None,
 )
 profile = client.provision_config_profile(PROFILE_NAME, raw_config)
 profile_uuid = profile["profile_uuid"]
@@ -799,6 +837,35 @@ PY
     return 0
 }
 
+# Resolves `node add` inputs: each field starts from its GOWAVE_* variable, a
+# non-empty positional overwrites it, and the result is validated by the same
+# contract the positional path uses. An empty variable is the same as unset.
+# The Worker secret is not an input of this command — it is read from the
+# Panel's .env and handed to the remote side over stdin — so this contract
+# cannot introduce it into argv or the environment.
+resolve_node_inputs() {
+    NODE_INPUT_NAME="${GOWAVE_NODE_NAME:-}"
+    NODE_INPUT_ADDRESS="${GOWAVE_NODE_IP:-}"
+    NODE_INPUT_WORKER_DOMAIN="${GOWAVE_WORKER_DOMAIN:-}"
+    NODE_INPUT_REALITY_DOMAIN="${GOWAVE_REALITY_DOMAIN:-}"
+    NODE_INPUT_SSH_USER="${GOWAVE_SSH_USER:-root}"
+    NODE_INPUT_SSH_PORT="${GOWAVE_SSH_PORT:-22}"
+    NODE_INPUT_VISION_DOMAIN="${GOWAVE_VISION_DOMAIN:-${VISION_DOMAIN:-}}"
+
+    if [[ -n "${1:-}" ]]; then NODE_INPUT_NAME="$1"; fi
+    if [[ -n "${2:-}" ]]; then NODE_INPUT_ADDRESS="$2"; fi
+    if [[ -n "${3:-}" ]]; then NODE_INPUT_WORKER_DOMAIN="$3"; fi
+    if [[ -n "${4:-}" ]]; then NODE_INPUT_REALITY_DOMAIN="$4"; fi
+    if [[ -n "${5:-}" ]]; then NODE_INPUT_SSH_USER="$5"; fi
+    if [[ -n "${6:-}" ]]; then NODE_INPUT_SSH_PORT="$6"; fi
+    if [[ -n "${7:-}" ]]; then NODE_INPUT_VISION_DOMAIN="$7"; fi
+
+    preflight_require_inputs node \
+        "$NODE_INPUT_NAME" "$NODE_INPUT_ADDRESS" "$NODE_INPUT_WORKER_DOMAIN" \
+        "$NODE_INPUT_REALITY_DOMAIN" "$NODE_INPUT_SSH_USER" "$NODE_INPUT_SSH_PORT" \
+        "$NODE_INPUT_VISION_DOMAIN"
+}
+
 cmd_node() {
     local subcmd="${1:-}"
     shift || true
@@ -829,17 +896,24 @@ cmd_node() {
                 esac
             done
 
-            local name="${positional_args[0]:-}"
-            local ip="${positional_args[1]:-}"
-            local worker_domain="${positional_args[2]:-}"
-            local reality_domain="${positional_args[3]:-}"
-            local ssh_user="${positional_args[4]:-root}"
-            local ssh_port="${positional_args[5]:-22}"
-
-            if [[ -z "$name" || -z "$ip" || -z "$worker_domain" || -z "$reality_domain" ]]; then
+            # A zero-argument invocation keeps its usage hint; when inputs were
+            # supplied, the contract below is what names a missing field.
+            if (( ${#positional_args[@]} == 0 )) && [[ -z "${GOWAVE_NODE_NAME:-}${GOWAVE_NODE_IP:-}${GOWAVE_WORKER_DOMAIN:-}${GOWAVE_REALITY_DOMAIN:-}" ]]; then
                 echo "Usage: gowave-auto.sh node add [--vision-domain <domain>] <worker-name> <worker-ip> <worker-domain> <reality-domain> [ssh-user] [ssh-port]" >&2
+                echo "Every input may also come from GOWAVE_NODE_NAME, GOWAVE_NODE_IP, GOWAVE_WORKER_DOMAIN, GOWAVE_REALITY_DOMAIN, GOWAVE_SSH_USER, GOWAVE_SSH_PORT and GOWAVE_VISION_DOMAIN." >&2
                 return 1
             fi
+            resolve_node_inputs \
+                "${positional_args[0]:-}" "${positional_args[1]:-}" "${positional_args[2]:-}" \
+                "${positional_args[3]:-}" "${positional_args[4]:-}" "${positional_args[5]:-}" \
+                "$vision_domain" || return $?
+            local name="$NODE_INPUT_NAME"
+            local ip="$NODE_INPUT_ADDRESS"
+            local worker_domain="$NODE_INPUT_WORKER_DOMAIN"
+            local reality_domain="$NODE_INPUT_REALITY_DOMAIN"
+            local ssh_user="$NODE_INPUT_SSH_USER"
+            local ssh_port="$NODE_INPUT_SSH_PORT"
+            vision_domain="$NODE_INPUT_VISION_DOMAIN"
 
             validate_acme_server "${GOWAVE_ACME_SERVER:-}" || return 1
 
@@ -1606,10 +1680,19 @@ main_menu() {
     esac
 }
 
+# Sourced by a fixture: the functions above are the subject, and the router below
+# belongs to an execution. `return` leaves a sourced file; an executed one never
+# reaches this branch, so the CLI is unchanged.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
 # CLI Entrypoint Router
 if [[ $# -eq 0 ]]; then
+    CURRENT_STEP="menu"
     main_menu
 else
+    CURRENT_STEP="${1:-unknown command}"
     case "${1:-}" in
         status) cmd_status ;;
         health) cmd_health ;;

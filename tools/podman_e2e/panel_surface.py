@@ -35,14 +35,16 @@ import hmac
 import http.client
 import json
 import os
+import re
 import secrets
+import socket
 import ssl
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 from uuid import uuid4
 
 CREDENTIALS_FILE = "/root/gowave-credentials.txt"
@@ -83,6 +85,89 @@ SINGBOX_USER_AGENT = "sing-box/1.10.0"
 # encodes no allowlist the product does not have: every representation has to
 # answer it with the same bytes it answers the family header.
 FOREIGN_USER_AGENT = "curl/8.5.0"
+
+# Every family the shipped vhost classifies as a link preview. The strings are
+# the ones those clients send in the wild, because the map is anchored on the
+# product name: an invented header would exercise no pattern and prove nothing.
+# A real client whose name merely contains one of these words is the risk the
+# list is short for, so adding a name here is a decision about who may be served.
+PREVIEW_USER_AGENTS: Sequence[str] = (
+    "TelegramBot (like TwitterBot)",
+    "WhatsApp/2.23.20.0",
+    "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+    "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)",
+    "Discordbot/2.0",
+    "Twitterbot/1.0",
+    "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
+    "Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)",
+    "Mozilla/5.0 (compatible; Applebot/0.1; +http://www.apple.com/go/applebot)",
+    "Mozilla/5.0 (compatible; AhrefsBot/7.0; +http://ahrefs.com/robot/)",
+    "Mozilla/5.0 (compatible; SemrushBot/7~bl; +http://www.semrush.com/bot.html)",
+)
+SUBSCRIPTION_PREVIEW_STATUS = 204
+# The Panel's own answer to a request with no User-Agent at all. The map's own
+# branch is the client branch, so this comes from the product, not the vhost.
+SUBSCRIPTION_ABSENT_HEADER_STATUS = 403
+# The router patterns the Panel counts its subscription requests under. The base
+# path and the per-client path are registered separately, so both are read.
+SUBSCRIPTION_ROUTE_PATTERNS: Sequence[str] = (
+    "GET /api/sub/{shortUuid}",
+    "GET /api/sub/{shortUuid}/{clientType}",
+)
+# Every header the Panel consults for the client address, in the order it reads
+# them (``internal/httpx.ClientIP``): the first non-empty one wins, so these are
+# the addresses a client can choose for itself unless the listener replaces or
+# removes them. Two are set from ``$remote_addr`` by the shipped vhost; the
+# others are emptied there, and this split is what the render test compares the
+# vhost with.
+PANEL_CLIENT_IP_HEADERS: Sequence[str] = (
+    "X-Remnawave-Real-IP",
+    "X-Client-IP",
+    "X-Forwarded-For",
+    "CF-Connecting-IP",
+    "Fastly-Client-Ip",
+    "True-Client-Ip",
+    "X-Real-IP",
+    "X-Cluster-Client-IP",
+    "X-Forwarded",
+    "Forwarded-For",
+)
+PANEL_FORWARDED_CLIENT_IP_HEADERS: Sequence[str] = ("X-Forwarded-For", "X-Real-IP")
+PANEL_CLEARED_CLIENT_IP_HEADERS: Sequence[str] = tuple(
+    header for header in PANEL_CLIENT_IP_HEADERS
+    if header not in PANEL_FORWARDED_CLIENT_IP_HEADERS
+)
+# An address no client in a run can hold, so a record that names it can only
+# have come from the header that carried it.
+FORGED_CLIENT_IP = "203.0.113.9"
+# Paths no GoWave Panel route and no dashboard asset can occupy. The list is the
+# shipped rule's own set (``modules/nginx.sh``), so probing another path would
+# prove nothing about this build.
+PANEL_SCANNER_PATHS: Sequence[str] = (
+    "/.env",
+    "/.git/config",
+    "/.DS_Store",
+    "/wp-login.php",
+    "/wp-admin/",
+    "/phpmyadmin/",
+    "/server-status",
+    "/actuator/health",
+)
+# The product surfaces the scanner rule must not shadow: a REST route, the
+# subscription route, the login route, both inbound transports, the gRPC
+# inbound, and the dashboard itself. Each is sent as a plain client would.
+PANEL_PRODUCT_ROUTE_PROBES: Sequence[tuple[str, str, str]] = (
+    ("rest-api", "/api/nodes", "GET"),
+    ("login", "/api/auth/login", "POST"),
+    ("web-ui", "/", "GET"),
+    ("xhttp-down", "/xhttp-down/health", "GET"),
+    ("websocket", "/ws", "GET"),
+    ("trojan-grpc", "/trojan-grpc", "POST"),
+)
+# What a versioned build prints in its own ``Server`` header and in NGINX's
+# error pages; ``server_tokens off`` removes the number and keeps the name.
+NGINX_VERSION = re.compile(r"(?i)\b(?:nginx|openresty)/\d")
 
 # name, path template, the client that consumes it. The order is the order the
 # representation inventory is documented in.
@@ -500,6 +585,31 @@ def fetch(
     the certificate the fixture ACME directory issued is the only one that
     verifies, so a run cannot pass by trusting a store the product never used.
     """
+    return request(base_url, path, user_agent, timeout=timeout, ca_file=ca_file)
+
+
+def request(
+    base_url: str,
+    path: str,
+    user_agent: Optional[str],
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
+    ca_file: Optional[str] = None,
+    tolerate_closed: bool = False,
+    method: str = "GET",
+    body: Optional[bytes] = None,
+    headers: Sequence[tuple[str, str]] = (),
+) -> Dict[str, Any]:
+    """Send one request and read the answer, or notice that no answer was sent.
+
+    ``path`` goes on the wire verbatim, which is what makes a traversal or an
+    encoded separator observable: a client library that normalised it first
+    would send a request the listener can no longer distinguish from a plain
+    one. ``tolerate_closed`` is for the refusal that closes the connection
+    without a response — a status of ``0`` with ``closed`` set is the honest
+    record of it, not an exception in the caller. ``headers`` is how a caller
+    carries a header the product reads and a well-behaved client would never
+    send, which is the whole point of a forgery.
+    """
     parsed = urllib.parse.urlsplit(base_url)
     if parsed.scheme == "https":
         context = ssl.create_default_context(cafile=ca_file or None)
@@ -509,23 +619,43 @@ def fetch(
     else:
         connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
     try:
-        connection.putrequest("GET", path, skip_accept_encoding=True)
+        connection.putrequest(method, path, skip_accept_encoding=True)
         connection.putheader("Accept", "*/*")
         connection.putheader("Connection", "close")
         if user_agent is not None:
             connection.putheader("User-Agent", user_agent)
-        connection.endheaders()
-        response = connection.getresponse()
-        body = response.read()
+        for name, value in headers:
+            connection.putheader(name, value)
+        if body is not None:
+            connection.putheader("Content-Length", str(len(body)))
+        connection.endheaders(body)
+        try:
+            response = connection.getresponse()
+            payload_bytes = response.read()
+        except (http.client.RemoteDisconnected, http.client.BadStatusLine, ConnectionResetError):
+            if not tolerate_closed:
+                raise
+            return {
+                "status": 0,
+                "closed": True,
+                "server": "",
+                "content_type": "",
+                "cache_control": "",
+                "x_robots_tag": "",
+                "body": b"",
+            }
         return {
             "status": response.status,
+            "closed": False,
+            "server": (response.getheader("Server") or ""),
             "content_type": (response.getheader("Content-Type") or ""),
             # What this vantage answered with. Read from both sides on purpose:
             # the Panel process answers none of it and the shipped vhost adds it,
             # so a case that only read the loopback URL would be asserting a
             # header no client ever sees.
             "cache_control": (response.getheader("Cache-Control") or ""),
-            "body": body,
+            "x_robots_tag": (response.getheader("X-Robots-Tag") or ""),
+            "body": payload_bytes,
         }
     finally:
         connection.close()
@@ -634,6 +764,12 @@ def subscriptions(
         path = template.format(short_uuid=short_uuid)
         response = fetch(panel.base_url, path, user_agent)
         body = response["body"]
+        # The payload is the Panel's own answer, so it is handed to the clients
+        # before the transport read below. A probe that died on the edge used to
+        # leave the payload directory empty, and every case that consumes those
+        # payloads then reported a missing file as if the Panel had not issued one.
+        if payload_dir is not None and response["status"] == 200 and body:
+            write_payload(payload_dir / f"{name}.payload", body)
         # The same path again with a header that names no client family. The
         # Panel requires a non-empty header, so this must be served, and with
         # the same bytes: anything else would mean the path selected a
@@ -670,8 +806,6 @@ def subscriptions(
             # The credentials every engine derives from the same user, reduced to
             # a digest: a repeated install must not rotate them.
             facts["credential_digest"] = subscription_credentials(body)
-        if payload_dir is not None and response["status"] == 200 and body:
-            write_payload(payload_dir / f"{name}.payload", body)
 
     # The records the subscription has to agree with. A client dials whatever the
     # Host record it was issued for says, so the address and SNI it is served are
@@ -710,6 +844,323 @@ def user_agent_policy(
         response = fetch(panel.base_url, template.format(short_uuid=short_uuid), user_agent)
         facts["representations"][name] = response["status"]
     return facts
+
+
+def subscription_edge_contract(
+    panel: Panel,
+    edge_base: str,
+    ca_file: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Read the subscription surface the way a link-preview crawler and a client do.
+
+    Three answers are read here and none of them is interchangeable. A client UA
+    gets the payload through the public edge, and it has to be the bytes the
+    Panel issued. A preview UA gets ``204`` with an empty body and the same
+    transport headers, because a pasted link must not unfurl into a working
+    subscription. A raw target with a dot segment or an encoded separator gets
+    the connection closed, because the rule runs before normalisation and a
+    listener that answered it would have proxied a path the Panel never saw.
+
+    The Panel's own route counters bracket the preview sweep: the Panel is the
+    process that would have served those requests, and it counts them whether or
+    not its request log is enabled. A loopback fetch between the two reads is the
+    control — it has to move the counter, or the sweep's silence proves nothing.
+    """
+    short_uuid = default_user_short_uuid(panel)
+    path = f"/api/sub/{short_uuid}"
+    loopback = fetch(panel.base_url, path, MOBILE_USER_AGENT)
+    served = fetch(edge_base, path, MOBILE_USER_AGENT, ca_file=ca_file)
+    foreign = fetch(edge_base, path, FOREIGN_USER_AGENT, ca_file=ca_file)
+    absent = fetch(edge_base, path, None, ca_file=ca_file)
+
+    facts: Dict[str, Any] = {
+        "short_uuid_length": len(short_uuid),
+        "loopback": _answer(loopback),
+        "served": _answer(served),
+        "served_identical_to_loopback": served["body"] == loopback["body"],
+        "foreign": _answer(foreign),
+        "foreign_identical": foreign["body"] == loopback["body"],
+        "absent": _answer(absent),
+        "previews": {},
+        "refused": {},
+        "counters": {},
+    }
+
+    before = http_route_counts(panel)
+    for agent in PREVIEW_USER_AGENTS:
+        facts["previews"][agent] = _answer(fetch(edge_base, path, agent, ca_file=ca_file))
+    after = http_route_counts(panel)
+    control = fetch(panel.base_url, path, MOBILE_USER_AGENT)
+    facts["counters"] = {
+        "before": before,
+        "after": after,
+        "control": http_route_counts(panel),
+        "control_status": control["status"],
+    }
+
+    for label, target in (
+        ("dot_segment", f"/api/sub/{short_uuid}/../x"),
+        ("encoded_separator", f"/api/sub/{short_uuid}%2Fv2ray-json"),
+    ):
+        refused = request(
+            edge_base, target, MOBILE_USER_AGENT, ca_file=ca_file, tolerate_closed=True,
+        )
+        facts["refused"][label] = {
+            "status": refused["status"],
+            "closed": refused["closed"],
+            "bytes": len(refused["body"]),
+        }
+    return facts
+
+
+def _user_record(panel: Panel, short_uuid: str) -> Dict[str, Any]:
+    """The client the shortUuid names, read from the API rather than a file."""
+    status, body = panel.call("GET", f"/api/users/by-short-uuid/{short_uuid}")
+    user = payload(body)
+    if status != 200 or not isinstance(user, dict) or not user.get("id"):
+        raise SystemExit(
+            f"GET /api/users/by-short-uuid/{short_uuid} returned {status} without a numeric id"
+        )
+    return user
+
+
+def _subscription_history(panel: Panel, user_id: Any) -> List[Dict[str, Any]]:
+    """The Panel's own record of who asked for a subscription, newest first."""
+    status, body = panel.call("GET", f"/api/users/{user_id}/subscription-request-history")
+    if status != 200:
+        raise SystemExit(
+            f"GET /api/users/{user_id}/subscription-request-history returned {status}"
+        )
+    rows = items(body, "records")
+    if not rows:
+        rows = items(body, "subscriptionRequestHistory")
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def wait_for_new_history_row(
+    panel: Panel,
+    user_id: Any,
+    seen: Set[Any],
+    timeout: float = 5.0,
+) -> Optional[Dict[str, Any]]:
+    """Wait for the row a just-served request added, and name it.
+
+    The Panel answers before its writer has inserted the row, so reading the
+    history once right after the response would race the writer and report an
+    empty address for a correct listener. The row's identity is what the wait is
+    for: a previous row cannot be mistaken for this request's.
+    """
+    deadline = time.monotonic() + timeout
+    result = None
+    while time.monotonic() < deadline:
+        fresh = [row for row in _subscription_history(panel, user_id) if row.get("id") not in seen]
+        if fresh:
+            result = max(fresh, key=lambda row: row.get("id") or 0)
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.1, remaining))
+    return result
+
+
+def local_source_address(base_url: str) -> str:
+    """The source address this process's own request to ``base_url`` will carry.
+
+    The probe runs on the Panel host — it needs the loopback API and the
+    credentials file — so its edge request leaves from that host's own address
+    rather than from the Control Machine's. Asking the kernel which source a
+    connection to the edge would use is what makes "the Panel recorded the peer"
+    a comparison against an observed address rather than against an assumed one.
+    A connected UDP socket selects the route without sending a packet.
+    """
+    parsed = urllib.parse.urlsplit(base_url)
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.settimeout(5)
+            probe.connect((host, port))
+            return str(probe.getsockname()[0])
+    except OSError:
+        return ""
+
+
+def panel_vhost_hygiene(
+    panel: Panel,
+    edge_base: str,
+    ca_file: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Read the panel vhost through the edge, from a client's side of it.
+
+    Three things are read and none of them is the same question. A version in
+    ``Server`` or in an error page is what an operator's scanner sorts hosts by,
+    so the answer has to name the software without the build — once from a route
+    the Panel answers and once from an error page NGINX writes itself, because
+    the two are produced by different code. The address the Panel records for a
+    request is the one it will rate-limit, log and notify about, so each header
+    the Panel would *prefer* over the socket address is carried by a request
+    that would never send it: the record has to name the peer, and the value a
+    client chose has to appear nowhere. A path no product route can occupy is
+    answered by a closed connection, and every product route is still proxied —
+    the second half matters, because a rule that answers everything would pass
+    the first one alone.
+    """
+    short_uuid = default_user_short_uuid(panel)
+    user = _user_record(panel, short_uuid)
+    facts: Dict[str, Any] = {
+        "short_uuid_length": len(short_uuid),
+        "server": {},
+        "error_page": {},
+        "client_ip": {},
+        "scanner": {},
+        "product_routes": {},
+    }
+
+    # A route the Panel answers itself, and a path it has no route for: the
+    # second is answered by the Panel's own frontend through the proxy, so it is
+    # a second producer of the answer rather than the listener's page — and a
+    # path the vhost stopped proxying would come back as NGINX's 404 instead.
+    for label, path in (("answered", "/api/system/health"), ("unmatched", "/api/no-such-route")):
+        answer = request(edge_base, path, None, ca_file=ca_file)
+        facts["server"][label] = {
+            "status": answer["status"],
+            "server": answer["server"],
+        }
+    # NGINX's own error page: a request line past the header buffer limit never
+    # reaches a route, so whatever the answer says about the build was written by
+    # the listener itself.
+    oversized = request(
+        edge_base, "/" + "a" * 16384, None, ca_file=ca_file, tolerate_closed=True,
+    )
+    body_text = oversized["body"].decode("utf-8", "replace")
+    facts["error_page"] = {
+        "status": oversized["status"],
+        "server": oversized["server"],
+        "version_in_body": bool(NGINX_VERSION.search(body_text)),
+        "bytes": len(oversized["body"]),
+    }
+
+    # The peer the Panel sees, established by a request that carries no forged
+    # header at all. Every later reading is compared with this, so the case does
+    # not need to know the address the harness happens to allocate. The rows the
+    # Panel already holds are read first: the writer may insert the control's own
+    # row before this process manages to ask, and a row that was already there
+    # would then be read as this request's. The source address this process's
+    # request carries is read from the kernel, because the probe runs on the
+    # Panel host and its own address is the peer that request will be recorded
+    # under.
+    facts["probe_source_ip"] = local_source_address(edge_base)
+    seen = {row.get("id") for row in _subscription_history(panel, user["id"])}
+    control = request(edge_base, f"/api/sub/{short_uuid}", MOBILE_USER_AGENT, ca_file=ca_file)
+    peer = ""
+    row = wait_for_new_history_row(panel, user["id"], seen) if control["status"] == 200 else None
+    if row is not None:
+        peer = str(row.get("requestIp") or "")
+        seen.add(row.get("id"))
+    facts["peer_recorded_ip"] = peer
+
+    # Every header the Panel reads before the socket address, forged one at a
+    # time so a listener that clears all but one is reported by name.
+    for header in PANEL_CLIENT_IP_HEADERS:
+        answer = request(
+            edge_base, f"/api/sub/{short_uuid}", MOBILE_USER_AGENT,
+            ca_file=ca_file, headers=((header, FORGED_CLIENT_IP),),
+        )
+        row = wait_for_new_history_row(panel, user["id"], seen) if answer["status"] == 200 else None
+        recorded = ""
+        if row is not None:
+            recorded = str(row.get("requestIp") or "")
+            seen.add(row.get("id"))
+        facts["client_ip"][header] = {
+            "status": answer["status"],
+            "recorded_ip": recorded,
+            "forged_was_recorded": recorded == FORGED_CLIENT_IP,
+            "recorded_is_peer": bool(recorded) and recorded == peer,
+        }
+
+    # A path no route occupies: the answer is a closed connection with no bytes.
+    # The control right after it is the same client on a proxied path, so "closed"
+    # cannot be the listener refusing everything.
+    for path in PANEL_SCANNER_PATHS:
+        answer = request(edge_base, path, None, ca_file=ca_file, tolerate_closed=True)
+        facts["scanner"][path] = {
+            "status": answer["status"],
+            "closed": answer["closed"],
+            "bytes": len(answer["body"]),
+        }
+    control_route = request(edge_base, "/api/nodes", None, ca_file=ca_file, tolerate_closed=True)
+    facts["scanner_control"] = {
+        "status": control_route["status"],
+        "closed": control_route["closed"],
+    }
+
+    # Every product surface the scanner rule must leave alone. A transport that
+    # answers with its own protocol error still proves it was proxied: the rule
+    # would have closed the connection instead.
+    for label, path, method in PANEL_PRODUCT_ROUTE_PROBES:
+        body = b"" if method != "POST" else b"{}"
+        extra: List[tuple[str, str]] = []
+        if label == "websocket":
+            extra = [
+                ("Upgrade", "websocket"),
+                ("Sec-WebSocket-Version", "13"),
+                ("Sec-WebSocket-Key", base64.b64encode(secrets.token_bytes(16)).decode()),
+            ]
+        elif label == "trojan-grpc":
+            extra = [("Content-Type", "application/grpc")]
+        answer = request(
+            edge_base, path, MOBILE_USER_AGENT, ca_file=ca_file,
+            tolerate_closed=True, method=method, body=body, headers=tuple(extra),
+        )
+        facts["product_routes"][label] = {
+            "status": answer["status"],
+            "closed": answer["closed"],
+            "content_type": media_type(answer["content_type"]),
+        }
+    subscribed = request(
+        edge_base, f"/api/sub/{short_uuid}", MOBILE_USER_AGENT,
+        ca_file=ca_file, tolerate_closed=True,
+    )
+    facts["product_routes"]["subscription"] = {
+        "status": subscribed["status"],
+        "closed": subscribed["closed"],
+        "content_type": media_type(subscribed["content_type"]),
+    }
+    return facts
+
+
+def _answer(response: Dict[str, Any]) -> Dict[str, Any]:
+    """What one answer is judged on, without the payload a client would keep."""
+    return {
+        "status": response["status"],
+        "content_type": media_type(response["content_type"]),
+        "cache_control": response["cache_control"],
+        "x_robots_tag": response["x_robots_tag"],
+        "bytes": len(response["body"]),
+        "sha256": hashlib.sha256(response["body"]).hexdigest(),
+    }
+
+
+def http_route_counts(panel: Panel) -> Dict[str, Any]:
+    """The Panel's own per-route counters for the two subscription routes.
+
+    ``GET /api/system/stats/http`` is the product's answer to "how many requests
+    did you serve", counted inside the router. It is read instead of a log
+    because request logging is off by default, and an assertion about a log the
+    product does not write would hold no matter what the listener did.
+    """
+    status, body = panel.call("GET", "/api/system/stats/http")
+    response = payload(body) if isinstance(body, dict) else {}
+    routes = (response or {}).get("routes") if isinstance(response, dict) else None
+    counts = {pattern: 0 for pattern in SUBSCRIPTION_ROUTE_PATTERNS}
+    for entry in routes or []:
+        if not isinstance(entry, dict):
+            continue
+        key = f"{entry.get('method')} {entry.get('route')}"
+        if key in counts:
+            counts[key] = int(entry.get("count") or 0)
+    return {"status": status, "counts": counts}
 
 
 def lifecycle(panel: Panel) -> Dict[str, Any]:
@@ -1425,8 +1876,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--scope",
         choices=(
             "surface", "cluster", "lifecycle", "subscriptions",
-            "ua-absent", "ua-blank", "revoke", "restore", "channel", "auth-negative",
-            "api-client", "all",
+            "ua-absent", "ua-blank", "edge-contract", "vhost-hygiene", "revoke", "restore", "channel",
+            "auth-negative", "api-client", "all",
         ),
         default="all",
     )
@@ -1488,6 +1939,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         facts["policy"] = user_agent_policy(panel, None, "absent")
     if args.scope == "ua-blank":
         facts["policy"] = user_agent_policy(panel, "", "blank")
+    if args.scope == "edge-contract":
+        if not args.edge_base:
+            raise SystemExit("the edge-contract scope reads the shipped vhost and needs --edge-base")
+        facts["edge"] = subscription_edge_contract(panel, args.edge_base, ca_file=args.ca or None)
+    if args.scope == "vhost-hygiene":
+        if not args.edge_base:
+            raise SystemExit("the vhost-hygiene scope reads the shipped vhost and needs --edge-base")
+        facts["hygiene"] = panel_vhost_hygiene(panel, args.edge_base, ca_file=args.ca or None)
     if args.scope == "revoke":
         directory = _revocation_dir(Path(args.payload_dir) if args.payload_dir else None)
         steps = {

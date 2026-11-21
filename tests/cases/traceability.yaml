@@ -467,12 +467,69 @@ cases_by_requirement:
       the documented admin login, its bearer token and the authenticated read
       surface are what every subscription call consumes; the spec states the
       subscription scenarios and not the token underneath them
+  - requirement: Panel subscription representations
+    cases: [SUB-EDGE, SUB-EDGE-BAD]
+    reason: >-
+      the requirement states the bytes a consuming client is served and says
+      nothing about the listener that stands between the Panel and that client:
+      the public edge is where a pasted link is read first, and it has to answer
+      a preview crawler with an empty 204, close a raw target no client would
+      send, and keep the credential out of its access log. No scenario of the
+      requirement states the edge contract
+  - requirement: Independent All-in-One acceptance topology
+    cases: [NGX-HYGIENE, NGX-SCANNER]
+    reason: >-
+      the requirement's scenarios state what the All-in-One install leaves
+      running and what a client is served, and nothing about the listener that
+      answers before the Panel: the edge has to keep its build out of every
+      answer it writes, hand the Panel the peer address rather than a
+      client-chosen one, and drop the scanner targets without a byte. No
+      scenario of the requirement states the listener's own hygiene
+  - requirement: Independent All-in-One acceptance topology
+    cases: [PRE-INPUTS, PRE-INPUTS-BAD]
+    reason: >-
+      the requirement states what the All-in-One install leaves running and what
+      a client is served, and no scenario states what happens to a request that
+      cannot be honoured: the installer has to refuse a partial or malformed
+      input before it stops NGINX or writes a managed path, and the refusal has
+      to name the input. The host the first install left serving is the control,
+      so one entry covers both the missing value and the value that is present
+      but invalid
+  - requirement: Independent All-in-One acceptance topology
+    cases: [PRE-PROXY-CIDR, PRE-PROXY-CIDR-OVERRIDE]
+    reason: >-
+      the requirement states what the All-in-One install leaves running and what
+      a client is served, and no scenario states the proxy CIDR preflight:
+      a name answering from the Cloudflare proxy CIDR snapshot is refused
+      before any certificate request, and GOWAVE_PREFLIGHT_ALLOW_PROXIED=1
+      records the operator's decision to continue anyway. Both cases serve the
+      same parity sentence for the preflight refusal that the live scenario
+      states.
   - requirement: Camouflage decoy and certificate lineage
     cases: [NGX-05]
     reason: >-
       `nginx -t` on the generated tree and the deploy hook's refusal to reload a
       broken snippet are the contract that keeps the decoy and its lineage
       serving; the spec states the rendered decoy and not the tree reloaded
+  - requirement: Explicit ACME Endpoint Selection and Certificate Lineage Isolation
+    cases: [TLS-LINEAGE]
+    reason: >-
+      the requirement states the ACME directory selection and certificate lineage
+      isolation; its scenarios cover ACME directory selection and lineage
+      adoption, but no scenario states the repeated-install adoption of an
+      existing suffixed lineage. This case serves that parity sentence by
+      driving select_acme_lineage with a pre-existing suffixed lineage and
+      verifying the adoption message, the returned directory, deterministic
+      repetition, and that no exact-name lineage is created.
+  - requirement: Explicit ACME Endpoint Selection and Certificate Lineage Isolation
+    cases: [TLS-LINEAGE-BAD]
+    reason: >-
+      the requirement states the ACME directory selection and certificate lineage
+      isolation; its scenarios cover ACME directory selection and lineage
+      adoption, but no scenario states the refusal of expired or mismatched
+      lineages. This case serves that parity sentence by driving
+      select_acme_lineage with an expired lineage and a mismatched-directory
+      lineage and verifying both are refused with the correct message.
   - requirement: Security and network isolation verification
     cases: [AIO-NEG-DEP]
     reason: >-
@@ -1161,6 +1218,59 @@ cases_by_requirement:
       assumed. The two shipped sources are then read for a bypass token, so an
       `allowInsecure` or a disabled hostname check added to either makes the
       other clauses describe a client nobody ships
+  - requirement: Independent Multi-Node acceptance topology
+    cases: [MN-ENV-CONTRACT]
+    reason: >-
+      the requirement states what the Worker registration leaves running and
+      what a client is served, and no scenario states the environment contract:
+      the operator's `node add` accepts all seven inputs through environment
+      variables instead of positional arguments, registers the Worker with the
+      Panel, and the Panel reports the correct endpoint and connected state. The
+      case serves that parity sentence by driving `node add` with the seven
+      environment variables and verifying the Panel's node, endpoint and host
+      inventory.
+  - requirement: Independent All-in-One acceptance topology
+    cases: [VERIFIED-ARTIFACT-FETCH]
+    reason: >-
+      the requirement states what the All-in-One install leaves running and what
+      a client is served, and no scenario states the pinned artifact chain:
+      the installer fetches the GoWave Node installer and the Panel release
+      assets from ordered hosts with a pinned SHA-256 digest; a host that
+      cannot deliver falls through to the next, a digest mismatch is terminal
+      and the next host is never tried, no host delivering leaves nothing
+      behind, and the destination file is replaced only after its bytes are
+      verified. This case serves that parity sentence by driving the
+      fetch_verified_artifact helper with a local test server.
+  - requirement: Independent All-in-One acceptance topology
+    cases: [PINNED-INSTALLER-HOSTS]
+    reason: >-
+      the requirement states what the All-in-One install leaves running and what
+      a client is served, and no scenario states the pinned installer URLs:
+      the commit is tried on GitHub first and jsDelivr second; the order is
+      fixed and the environment variable GOWAVE_NODE_INSTALLER_COMMIT selects
+      the exact commit. This case serves that parity sentence by driving the
+      pinned_node_installer_urls function.
+  - requirement: Independent All-in-One acceptance topology
+    cases: [PANEL-ASSET-VERIFICATION]
+    reason: >-
+      the requirement states what the All-in-One install leaves running and what
+      a client is served, and no scenario states the panel asset verification:
+      a release asset is checked against SHA256SUMS before the next URL is
+      tried; a mismatched asset aborts without falling through, the binary is
+      not left behind, and no release API fallback occurs. This case serves
+      that parity sentence by driving the download_panel_release function with
+      a mismatched checksum.
+  - requirement: Trustworthy result and diagnostics
+    cases: [FAIL-STEP]
+    reason: >-
+      the requirement states the secret redaction and unexpected skip
+      diagnostics, and no scenario states the ERR trap contract: the ERR trap
+      with CURRENT_STEP prints a located failure naming the step, the failing
+      command and its status, prints it exactly once, and exits with the step's
+      status, and a step that succeeds prints no report. This case serves that
+      parity sentence by sourcing gowave-auto.sh and forcing a step failure. The
+      handler's own double-compensation guard is proven by the unit suite
+      (tests/test_failure_report.py), not by this case.
 
 # What the published report has to cover, one declaration at a time. A plain
 # path is met by any behaviour that quotes it; `every_value` makes every element
@@ -1214,6 +1324,39 @@ behaviours:
     tests:
       - tests.test_podman_subscriptions.TestSubscriptionCases.test_blank_user_agent_case_is_a_separate_result
       - tests.test_podman_subscriptions.TestPanelSubscriptionProbe.test_a_blank_user_agent_is_an_empty_header_not_a_missing_one
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: The public edge serves the subscription without advertising it
+    requirement: Panel subscription representations
+    cases: [SUB-EDGE, SUB-EDGE-BAD]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_subscriptions.TestSubscriptionEdgeCases.test_edge_case_names_what_the_client_and_the_crawlers_received
+      - tests.test_podman_subscriptions.TestSubscriptionEdgeCases.test_forgery_case_names_both_refusals_and_the_access_log
+      - tests.test_podman_subscriptions.TestPanelSubscriptionProbe.test_the_edge_contract_scope_asks_the_edge_for_every_published_family
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: The public edge hides its build and hands the Panel only the peer address
+    requirement: Independent All-in-One acceptance topology
+    cases: [NGX-HYGIENE, NGX-SCANNER]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_aio.TestHygieneCase.test_hygiene_case_names_the_server_the_page_the_peer_and_the_routes
+      - tests.test_podman_aio.TestHygieneCase.test_hygiene_case_rejects_a_peer_the_panel_did_not_record
+      - tests.test_podman_aio.TestHygieneCase.test_scanner_case_names_the_refused_set_and_the_control
+      - tests.test_nginx_routing.TestNginxRouting.test_panel_vhost_hands_the_panel_only_the_peer_address
+    jobs: [All-in-One Podman Acceptance]
+
+  - behaviour: An incomplete install request is refused before the installed host is touched
+    requirement: Independent All-in-One acceptance topology
+    cases: [PRE-INPUTS, PRE-INPUTS-BAD]
+    topologies: [aio]
+    tests:
+      - tests.test_podman_aio.TestPreflightInputCase.test_missing_case_names_the_refusal_the_inventory_and_the_panel
+      - tests.test_podman_aio.TestPreflightInputCase.test_missing_case_rejects_a_host_it_rewrote
+      - tests.test_podman_aio.TestPreflightInputCase.test_bad_case_quotes_the_value_it_rejected
+      - tests.test_podman_aio.TestPreflightInputCase.test_the_probe_asks_without_a_terminal_and_reads_the_product_back
+      - tests.test_preflight.TestPreflightInputs.test_a_missing_panel_input_names_the_component_and_the_field
     jobs: [All-in-One Podman Acceptance]
 
   - behaviour: The base64 representation is the share-link list the inventory describes

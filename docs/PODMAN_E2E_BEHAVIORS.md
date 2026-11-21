@@ -13,19 +13,19 @@ behaviour with no case, a behaviour covered only on its happy path, an
 area the delta spec names but no entry covers, and a case no behaviour
 names (an orphan) or two behaviours claim.
 
-Behaviours: 38 across 9 areas, naming 234 of 234 catalog cases.
+Behaviours: 44 across 9 areas, naming 249 of 249 catalog cases.
 
 | Area | Behaviours | Cases | Error-path cases |
 |---|---:|---:|---:|
-| installation | 6 | 21 | 7 |
+| installation | 11 | 28 | 12 |
 | provisioning | 8 | 27 | 16 |
-| subscription-representations | 1 | 6 | 3 |
+| subscription-representations | 2 | 7 | 4 |
 | data-plane | 5 | 45 | 11 |
 | decoy | 2 | 7 | 2 |
 | tls-dns-acme | 5 | 7 | 9 |
 | network-policy | 2 | 6 | 6 |
 | lifecycle | 7 | 23 | 20 |
-| failure-injection | 2 | 11 | 7 |
+| failure-injection | 2 | 12 | 7 |
 
 ## installation
 
@@ -37,6 +37,11 @@ Behaviours: 38 across 9 areas, naming 234 of 234 catalog cases.
 | The Panel API answers its documented caller and refuses the rest | aio, multi-node | pre-push | `AIO-AUTH`, `AIO-CLIENT`, `APIC-01`, `AIO-AUTH-NEG` | `NEG-06` |
 | Every installed component reports its exact pinned version | aio, multi-node | pre-push | `VER-01`, `VER-03` | `VER-02`, `AIO-NEG-PIN` |
 | The Panel-only mode installs a Panel and a decoy and no traffic plane | panel-only | pr | `PO-INSTALL`, `PO-HOST`, `PO-API`, `PO-SQUAD` | `PO-SQUAD-REFUSED` |
+| The public edge hides its build and hands the Panel only the peer address | aio | pre-push | `NGX-HYGIENE` | `NGX-SCANNER` |
+| An incomplete install request is refused before the installed host is touched | aio | pre-push | `PRE-INPUTS` | `PRE-INPUTS-BAD` |
+| A Cloudflare-proxied name is refused before any certificate request | aio | pre-push | `PRE-PROXY-CIDR` | `PRE-PROXY-CIDR-OVERRIDE` |
+| A repeated install adopts an existing suffixed ACME lineage | aio | pre-push | `TLS-LINEAGE` | `TLS-LINEAGE-BAD` |
+| The pinned artifact chain fetches with digest verification and stops on mismatch | aio | pre-push | `VERIFIED-ARTIFACT-FETCH`, `PINNED-INSTALLER-HOSTS`, `PANEL-ASSET-VERIFICATION` | `FAIL-STEP` |
 
 ## provisioning
 
@@ -56,6 +61,7 @@ Behaviours: 38 across 9 areas, naming 234 of 234 catalog cases.
 | Behaviour | Topologies | Gate | Cases | Error paths |
 |---|---|---|---|---|
 | Every representation reaches the client family that consumes it | aio, multi-node | pre-push | `SUB-SERVED`, `SUB-B64`, `SUB-JSON-SHAPES`, `SUB-02`, `SUB-03`, `SUB-04` | `SUB-01`, `SUB-UA-ABSENT`, `SUB-UA-BLANK` |
+| The public edge serves the subscription without advertising it | aio | pre-push | `SUB-EDGE` | `SUB-EDGE-BAD` |
 
 ## data-plane
 
@@ -107,5 +113,5 @@ Behaviours: 38 across 9 areas, naming 234 of 234 catalog cases.
 
 | Behaviour | Topologies | Gate | Cases | Error paths |
 |---|---|---|---|---|
-| Every injected fault is survived or reported without collateral damage | aio, multi-node | pre-push | `NEG-01`, `AIO-FAULT-DISK`, `AIO-FAULT-PANEL`, `AIO-FAULT-XRAY`, `AIO-FAULT-LATENCY`, `MN-OUTAGE`, `MN-RESTART`, `MN-SSH-DOWN`, `MN-DUP-ADD` | `NEG-02`, `NEG-03`, `NEG-04`, `NEG-05` |
+| Every injected fault is survived or reported without collateral damage | aio, multi-node | pre-push | `NEG-01`, `AIO-FAULT-DISK`, `AIO-FAULT-PANEL`, `AIO-FAULT-XRAY`, `AIO-FAULT-LATENCY`, `MN-OUTAGE`, `MN-RESTART`, `MN-SSH-DOWN`, `MN-DUP-ADD`, `MN-ENV-CONTRACT` | `NEG-02`, `NEG-03`, `NEG-04`, `NEG-05` |
 | An interrupted mutation stays recoverable and its compensation is honest | aio, multi-node | pre-push | `AIO-INTERRUPT`, `HOOK-03` | `TXN-01`, `TXN-02`, `TXN-03` |

@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import signal
 import sqlite3
 import ssl
@@ -11,7 +12,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import types
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -201,6 +201,14 @@ class TestAioSuite(unittest.TestCase):
         self.assertEqual(len(podman.installs), 1)
         self.assertIs(product.require_installed(), product.host)
 
+    def test_the_artifact_cases_source_helpers_from_this_checkout(self):
+        """Four cases run the shipped shell helpers in-process, so the product names the checkout."""
+        product = aio.AioProduct(FakePodman(self.context))
+        self.assertEqual(product.repo, REPO_ROOT)
+        for relative in ("modules/artifact.sh", "modules/node.sh", "modules/panel.sh",
+                         "gowave-auto.sh"):
+            self.assertTrue((product.repo / relative).is_file(), relative)
+
     def test_later_cases_are_blocked_before_the_install(self):
         product = aio.AioProduct(FakePodman(self.context))
         with self.assertRaises(CaseBlocked) as caught:
@@ -298,6 +306,17 @@ class StubHost:
         self.client_calls = []
         self.install_attempts = []
         self.install_reports = []
+        self.plan = topology.NetworkPlan("203.0.114.0/24")
+        #: Every zone a case steered, in order, so a test can read what was
+        #: published for an attempt and that the fixture's own zone came back.
+        self.zones = []
+
+    def zone(self):
+        return topology.zone(self.plan)
+
+    def write_dns_zone(self, data):
+        """Record a steered zone; this host starts no resolver fixture."""
+        self.zones.append(json.loads(json.dumps(data)))
 
     def install_environment(self):
         return {"GOWAVE_ACME_TEST_CA_FILE": "/fixtures/ca/acme-trust.pem"}
@@ -1045,6 +1064,21 @@ class TestVisionFailureCase(unittest.TestCase):
         self.assertEqual(evidence["bootstrap_vhost"], "absent")
         self.assertEqual(evidence["public_panel"], 200)
         self.assertEqual(product.host.install_attempts, [aio.VISION_FAILURE_DOMAIN])
+
+    def test_the_failed_name_is_published_for_the_attempt_and_then_withdrawn(self):
+        # The attempt has to reach the Vision stage, and the direct-DNS preflight
+        # refuses a name that does not answer before ACME is reached, so the
+        # fixture zone answers for the name while the attempt runs and is put
+        # back afterwards: an answer left behind would steer the rest of the run.
+        _, product = self.run_case()
+        self.assertEqual(len(product.host.zones), 2)
+        steered, restored = product.host.zones
+        self.assertEqual(
+            steered["records"][aio.VISION_FAILURE_DOMAIN]["A"], ["203.0.114.250"],
+            "the failed name must answer at an unused address of the fixture subnet",
+        )
+        self.assertNotIn(aio.VISION_FAILURE_DOMAIN, restored["records"])
+        self.assertEqual(restored, topology.zone(product.host.plan))
 
     def test_the_case_fails_when_the_attempt_exits_zero(self):
         self.damage("exited 0", attempt=self.attempt(returncode=0))
@@ -4733,25 +4767,99 @@ class TestDecoyCase(unittest.TestCase):
             self.reports({url: decoy_report(url, 403, DECOY_404_SHA, [aio.PANEL_DOMAIN])}),
         )
 
-    def test_the_measured_paths_are_the_ones_the_panel_vhost_serves(self):
+    def panel_vhost(self):
         nginx = (REPO_ROOT / "modules" / "nginx.sh").read_text(encoding="utf-8")
-        vhost = nginx.split("generate_panel_https_vhost() {", 1)[1].split("\n}\n", 1)[0]
-        served = set()
-        for line in vhost.splitlines():
-            stripped = line.strip()
+        generator = nginx.split("generate_panel_https_vhost() {", 1)[1]
+        # The rendered file is the heredoc the generator writes. Slicing the
+        # shell function instead stops at the first flush-left brace, and the
+        # `map` blocks close there, so the slice would end before any location.
+        region = generator.split("\nEOF\n", 1)[0]
+        self.assertEqual(region.count("<<EOF\n"), 1, "the panel vhost is written by more than one heredoc")
+        return region.split("<<EOF\n", 1)[1]
+
+    @staticmethod
+    def vhost_locations(vhost):
+        for stripped in (line.strip() for line in vhost.splitlines()):
             if not stripped.startswith("location "):
                 continue
             parts = stripped.split(None, 1)[1].rstrip("{").split()
+            modifier = ""
             while parts and parts[0] in ("^~", "=", "~", "~*"):
-                parts.pop(0)
-            path = " ".join(parts)
-            if path == "/":
-                # The cover site's own front page is served there, and the case
-                # measures that separately from the paths it must refuse.
-                continue
-            served.add(path)
+                modifier = parts.pop(0)
+            yield modifier, " ".join(parts)
+
+    def test_the_measured_paths_are_the_ones_the_panel_vhost_serves(self):
+        served = {
+            path for modifier, path in self.vhost_locations(self.panel_vhost())
+            if modifier in ("", "^~", "=") and path != "/"
+        }
         self.assertTrue(served)
         self.assertEqual(served - set(aio.DECOY_MANAGEMENT_PATHS), set())
+
+    def test_every_scanner_pattern_the_panel_vhost_refuses_is_probed(self):
+        # A pattern location refuses a whole family of paths at once, so the
+        # list the case probes is the only thing that keeps its alternatives
+        # from drifting into names no request ever asks for.
+        patterns = [
+            path for modifier, path in self.vhost_locations(self.panel_vhost())
+            if modifier in ("~", "~*")
+        ]
+        self.assertTrue(patterns, "the panel vhost refuses no scanner path at all")
+        for pattern in patterns:
+            group = re.search(r"\(\?:([^)]*)\)", pattern)
+            self.assertIsNotNone(group, f"{pattern} names no alternative list")
+            alternatives = [term.replace("\\.", ".").replace("\\$", "$") for term in group.group(1).split("|")]
+            unprobed = [
+                term for term in alternatives
+                if not any(term in path for path in aio.DECOY_MANAGEMENT_PATHS)
+            ]
+            self.assertEqual(unprobed, [], "the vhost refuses a scanner path the case never probes")
+
+    def test_every_preview_family_the_probe_sends_is_classified_by_the_vhost(self):
+        # The probe's list is the only thing that decides which real clients a
+        # pasted link refuses to unfurl for, so it is compared with the map that
+        # makes that decision. A map entry wins by order, so an agent whose real
+        # header names two vendors (Telegram's own string names Twitter) is
+        # judged by its first match; what matters is the value that match gives.
+        vhost = self.panel_vhost()
+        lines = vhost.splitlines()
+        opening = [index for index, line in enumerate(lines)
+                   if line.strip().startswith("map ") and "gowave_sub_ua_class" in line]
+        self.assertEqual(len(opening), 1, "the panel vhost has no single subscription User-Agent map")
+        body = []
+        for line in lines[opening[0] + 1:]:
+            if line.strip() == "}":
+                break
+            body.append(line)
+        entries = []
+        fallback = None
+        for line in body:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = stripped.rstrip(";").split(None, 1)
+            if len(parts) != 2:
+                continue
+            pattern, value = parts[0], parts[1].strip()
+            if pattern == "default":
+                fallback = value
+            elif pattern.startswith("~*"):
+                entries.append((pattern[2:], value))
+        self.assertEqual(fallback, "client",
+                         "a caller with no User-Agent must keep the Panel's own answer")
+        self.assertTrue(entries, "the map classifies no preview family at all")
+        matched = set()
+        for agent in panel_surface.PREVIEW_USER_AGENTS:
+            with self.subTest(agent=agent):
+                hits = [(regex, value) for regex, value in entries
+                        if re.search(regex, agent, re.IGNORECASE)]
+                self.assertTrue(hits, f"{agent!r} matches no map pattern: the map answers the Panel")
+                self.assertEqual(hits[0][1], "preview",
+                                 f"{agent!r} is won by {hits[0][0]!r} which answers {hits[0][1]!r}")
+                matched.add(hits[0][0])
+        unexercised = [regex for regex, _ in entries if regex not in matched]
+        self.assertEqual(unexercised, [],
+                         "the map classifies a family the probe never sends, so nothing proves it")
 
     def test_the_unmapped_sni_is_resolved_by_the_run_zone(self):
         plan = topology.NetworkPlan("203.0.114.0/24")
@@ -4776,9 +4884,527 @@ class TestDecoyCase(unittest.TestCase):
         self.assertEqual(record["topology"], ["aio"])
 
 
+HYGIENE_PEER_IP = "172.30.0.2"
+HYGIENE_ROUTE_STATUSES = {
+    "rest-api": 401, "login": 400, "web-ui": 200,
+    "xhttp-down": 200, "websocket": 101, "trojan-grpc": 200, "subscription": 200,
+}
+
+
+def hygiene_block(overrides=None, mutate=None):
+    """The vhost-hygiene probe's block, with every reading as the shipped edge gives it."""
+    facts = {
+        "short_uuid_length": 16,
+        "server": {
+            "answered": {"status": 200, "server": "nginx"},
+            "unmatched": {"status": 200, "server": "nginx"},
+        },
+        "error_page": {
+            "status": 414, "server": "nginx", "version_in_body": False, "bytes": 176,
+        },
+        "peer_recorded_ip": HYGIENE_PEER_IP,
+        "probe_source_ip": HYGIENE_PEER_IP,
+        "client_ip": {
+            header: {"status": 200, "recorded_ip": HYGIENE_PEER_IP,
+                     "forged_was_recorded": False, "recorded_is_peer": True}
+            for header in panel_surface.PANEL_CLIENT_IP_HEADERS
+        },
+        "scanner": {
+            path: {"status": 0, "closed": True, "bytes": 0}
+            for path in panel_surface.PANEL_SCANNER_PATHS
+        },
+        "scanner_control": {"status": 401, "closed": False},
+        "product_routes": {
+            label: {"status": status, "closed": False, "content_type": "text/plain"}
+            for label, status in HYGIENE_ROUTE_STATUSES.items()
+        },
+    }
+    for path, value in (overrides or {}).items():
+        target = facts
+        *parents, leaf = path.split(".")
+        for name in parents:
+            target = target[name]
+        target[leaf] = value
+    if mutate is not None:
+        mutate(facts)
+    return facts
+
+
+class TestHygieneCase(unittest.TestCase):
+    """NGX-HYGIENE / NGX-SCANNER: what the panel vhost tells, and whom it believes.
+
+    Both cases read one probe block. The hygiene case compares the answers the
+    listener writes about itself and the address the Panel records with the peer
+    this run allocated; the scanner case compares a dropped connection with the
+    same client reaching the Panel on a proxied path. A fake that served the
+    probe but left any of those readings out is what these tests exist to name.
+    """
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def hygiene_product(self, overrides=None, mutate=None):
+        payload = hygiene_block(overrides, mutate)
+        product, podman = installed_product(
+            self.context, [(json.dumps({"hygiene": payload}), 0)]
+        )
+        return product, podman
+
+    def reject_hygiene(self, expected, overrides=None, mutate=None):
+        product, _ = self.hygiene_product(overrides, mutate)
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_ngx_hygiene(product)
+        self.assertIn(expected, str(caught.exception))
+
+    def reject_scanner(self, expected, overrides=None, mutate=None):
+        product, _ = self.hygiene_product(overrides, mutate)
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_ngx_scanner(product)
+        self.assertIn(expected, str(caught.exception))
+
+    # ------------------------------------------------------------ NGX-HYGIENE
+    def test_hygiene_case_names_the_server_the_page_the_peer_and_the_routes(self):
+        product, podman = self.hygiene_product()
+        evidence = aio.case_ngx_hygiene(product)
+        self.assertEqual(evidence["server_answered"], "nginx")
+        self.assertEqual(evidence["server_unmatched"], "nginx")
+        self.assertEqual(evidence["error_page_status"], 414)
+        self.assertEqual(evidence["peer_recorded_ip"], HYGIENE_PEER_IP)
+        self.assertEqual(evidence["probe_source_ip"], HYGIENE_PEER_IP)
+        self.assertEqual(
+            evidence["headers_forged"].split(),
+            sorted(panel_surface.PANEL_CLIENT_IP_HEADERS),
+        )
+        self.assertEqual(
+            evidence["product_routes"].split(),
+            sorted(f"{label}={status}" for label, status in HYGIENE_ROUTE_STATUSES.items()),
+        )
+        self.assertEqual(
+            podman.scripts[0],
+            f"python3 {aio.PANEL_SURFACE_SCRIPT} --scope vhost-hygiene "
+            f"--edge-base https://{aio.PANEL_DOMAIN} "
+            f"--ca {topology.CA_MOUNT}/{topology.ACME_CA_BUNDLE_NAME}",
+        )
+        for value in evidence.values():
+            self.assertIsInstance(
+                value, (str, int, float, bool, type(None)),
+                "evidence is flattened to strings by the runner, so it must hold primitives",
+            )
+
+    def test_hygiene_case_rejects_a_version_in_a_served_answer(self):
+        self.reject_hygiene("names the build in Server",
+                            {"server.answered.server": "nginx/1.24.0"})
+
+    def test_hygiene_case_rejects_a_version_in_the_frontend_answer(self):
+        self.reject_hygiene("names the build in Server",
+                            {"server.unmatched.server": "nginx/1.24.0"})
+
+    def test_hygiene_case_rejects_a_listener_page_for_a_path_the_panel_serves(self):
+        # A 404 there is NGINX's own page: the path stopped being proxied, so
+        # the answer says nothing about the Panel's frontend.
+        self.reject_hygiene("answering in the product's place",
+                            {"server.unmatched.status": 404})
+
+    def test_hygiene_case_rejects_an_error_page_it_could_not_read(self):
+        # A 400 or a connection close means this run read no page NGINX wrote
+        # itself, so the version clause would be satisfied by an absent page.
+        self.reject_hygiene("read no error page NGINX wrote itself",
+                            {"error_page.status": 400})
+
+    def test_hygiene_case_rejects_a_version_in_the_error_page_header(self):
+        self.reject_hygiene("carries its version in Server",
+                            {"error_page.server": "nginx/1.24.0"})
+
+    def test_hygiene_case_rejects_a_version_in_the_error_page_body(self):
+        self.reject_hygiene("states its version in the body",
+                            {"error_page.version_in_body": True})
+
+    def test_hygiene_case_rejects_a_peer_the_panel_did_not_record(self):
+        # The pre-fix vhost: X-Remnawave-Real-IP reaches the Panel untouched, so
+        # the address a client chooses becomes the address the Panel records.
+        self.reject_hygiene("the Panel recorded the address", {
+            "client_ip.X-Remnawave-Real-IP.forged_was_recorded": True,
+            "client_ip.X-Remnawave-Real-IP.recorded_ip": panel_surface.FORGED_CLIENT_IP,
+            "client_ip.X-Remnawave-Real-IP.recorded_is_peer": False,
+        })
+
+    def test_hygiene_case_rejects_a_header_that_was_not_served(self):
+        self.reject_hygiene("rather than served", {"client_ip.X-Client-IP.status": 403})
+
+    def test_hygiene_case_rejects_a_control_request_that_was_not_the_peers(self):
+        self.reject_hygiene("not the address that request's own connection carried",
+                            {"peer_recorded_ip": ""})
+
+    def test_hygiene_case_rejects_a_probe_that_could_not_name_its_own_source(self):
+        # Without the source the request carried there is nothing to compare the
+        # recorded address with, so an empty one may not read as agreement.
+        self.reject_hygiene("nothing to be compared with", {"probe_source_ip": ""})
+
+    def test_hygiene_case_rejects_a_route_the_scanner_rule_swallowed(self):
+        self.reject_hygiene("which is the scanner rule",
+                            {"product_routes.web-ui.status": 444})
+
+    def test_hygiene_case_rejects_a_route_that_was_closed(self):
+        self.reject_hygiene("was closed instead of proxied",
+                            {"product_routes.websocket.closed": True})
+
+    # ------------------------------------------------------------ NGX-SCANNER
+    def test_scanner_case_names_the_refused_set_and_the_control(self):
+        product, _ = self.hygiene_product()
+        evidence = aio.case_ngx_scanner(product)
+        self.assertEqual(evidence["refused"].split(), sorted(panel_surface.PANEL_SCANNER_PATHS))
+        self.assertEqual(evidence["control_status"], 401)
+
+    def test_scanner_case_rejects_a_target_that_was_answered(self):
+        self.reject_scanner(
+            "instead of a closed connection",
+            mutate=lambda facts: facts["scanner"]["/.env"].update(closed=False),
+        )
+
+    def test_scanner_case_rejects_a_target_that_was_answered_by_nginx(self):
+        # 444 is NGINX's own reply, which is one byte of protocol the scanner
+        # still reads; the shipped rule drops the connection instead.
+        self.reject_scanner(
+            "closed after sending",
+            mutate=lambda facts: facts["scanner"]["/server-status"].update(status=444),
+        )
+
+    def test_scanner_case_rejects_a_control_that_was_closed_too(self):
+        self.reject_scanner("so the refusals prove nothing",
+                            {"scanner_control.closed": True})
+
+    def test_scanner_case_rejects_a_control_that_was_not_the_panels_refusal(self):
+        self.reject_scanner("not the Panel's own refusal",
+                            {"scanner_control.status": 200})
+
+    def test_both_cases_are_registered_before_any_traffic_and_catalogued(self):
+        suite = aio.cases(ScriptedPodman(self.context, []))
+        cases = {case.id: case for case in suite}
+        for case_id in (aio.NGX_HYGIENE_CASE_ID, aio.NGX_SCANNER_CASE_ID):
+            self.assertIn(case_id, cases)
+            self.assertEqual(cases[case_id].topology, "aio")
+            self.assertEqual(cases[case_id].timeout_seconds, aio.NGX_HYGIENE_TIMEOUT_SECONDS)
+            record = {case["id"]: case for case in catalog.load_catalog()["cases"]}[case_id]
+            self.assertEqual(record["state"], "incubating")
+            self.assertEqual(record["runs_in"], ["podman"])
+            self.assertEqual(record["topology"], ["aio"])
+        ids = [case.id for case in suite]
+        # Both cases read a listener the install creates, so neither can be the
+        # case that proves the install.
+        self.assertGreater(ids.index(aio.NGX_HYGIENE_CASE_ID), ids.index("AIO-INSTALL"))
+        self.assertGreater(ids.index(aio.NGX_SCANNER_CASE_ID), ids.index("AIO-INSTALL"))
+
+
+INVENTORY_BASELINE = (
+    "==units\n"
+    "gowave.service enabled\n"
+    "nginx.service enabled\n"
+    "==unit-files\n"
+    "/etc/systemd/system/gowave.service\n"
+    "==nginx\n"
+    "6f0a9c9d1e  nginx.conf\n"
+    "==credentials\n"
+    "root 600\n"
+)
+
+PRE_INPUTS_MISSING_MESSAGE = (
+    "install requires the ACME contact email, which was not provided."
+)
+PRE_INPUTS_MALFORMED_MESSAGE = (
+    "install requires the ACME contact email; not-an-email is not valid."
+)
+
+
+def pre_inputs_output(overrides=None):
+    """The input-contract probe's stdout, with every reading as the product gives it."""
+    facts = {
+        "missing_rc": "2",
+        "missing_message": PRE_INPUTS_MISSING_MESSAGE,
+        "malformed_rc": "2",
+        "malformed_message": PRE_INPUTS_MALFORMED_MESSAGE,
+        "login": "200",
+        "api": "200",
+        "token_length": "64",
+        "nginx": "active",
+    }
+    facts.update(overrides or {})
+    return "".join(f"{key}={value}\n" for key, value in facts.items())
+
+
+class TestPreflightInputCase(unittest.TestCase):
+    """PRE-INPUTS / PRE-INPUTS-BAD: a request that cannot be honoured changes nothing.
+
+    Both cases re-run the operator's install against the host this run already
+    installed and compare three readings: the refusal the entrypoint printed, the
+    host inventory taken either side of it, and the Panel answering afterwards. A
+    fake that refused correctly but stopped NGINX, or rewrote a unit file, is what
+    these tests exist to name.
+    """
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def input_product(self, output=None, before=INVENTORY_BASELINE, after=INVENTORY_BASELINE):
+        results = [
+            (before, 0),
+            (output if output is not None else pre_inputs_output(), 0),
+            (after, 0),
+        ]
+        return installed_product(self.context, results)
+
+    def reject(self, case, expected, **kwargs):
+        product, _ = self.input_product(**kwargs)
+        with self.assertRaises(AssertionError) as caught:
+            case(product)
+        self.assertIn(expected, str(caught.exception))
+
+    # --------------------------------------------------------------- PRE-INPUTS
+    def test_missing_case_names_the_refusal_the_inventory_and_the_panel(self):
+        product, podman = self.input_product()
+        evidence = aio.case_preflight_inputs(product)
+        self.assertEqual(evidence["missing_status"], "2")
+        self.assertEqual(evidence["missing_names"], PRE_INPUTS_MISSING_MESSAGE)
+        self.assertEqual(evidence["nginx"], "active")
+        self.assertEqual(evidence["panel_login"], "200")
+        self.assertEqual(evidence["panel_api"], "200")
+        self.assertTrue(evidence["inventory_unchanged"])
+        for value in evidence.values():
+            self.assertIsInstance(
+                value, (str, int, float, bool, type(None)),
+                "evidence is flattened to strings by the runner, so it must hold primitives",
+            )
+        # The host is inventoried before the requests and once more after them,
+        # so the refusal is bracketed by the state it must not disturb.
+        self.assertIn("gowave-auto.sh install", podman.scripts[1])
+        self.assertEqual(podman.scripts[0], podman.scripts[2])
+
+    def test_missing_case_rejects_an_input_the_refusal_does_not_name(self):
+        self.reject(aio.case_preflight_inputs, "does not name the missing input",
+                    output=pre_inputs_output({"missing_message": "Error: install refused."}))
+
+    def test_missing_case_rejects_a_request_that_was_not_refused(self):
+        self.reject(aio.case_preflight_inputs, "instead of refusing",
+                    output=pre_inputs_output({"missing_rc": "0"}))
+
+    def test_missing_case_rejects_a_host_it_rewrote(self):
+        rewritten = INVENTORY_BASELINE.replace(
+            "6f0a9c9d1e  nginx.conf", "0000000000  nginx.conf")
+        self.reject(aio.case_preflight_inputs, "rewrote the host",
+                    after=rewritten)
+
+    def test_missing_case_rejects_a_listener_it_left_stopped(self):
+        self.reject(aio.case_preflight_inputs, "not still serving",
+                    output=pre_inputs_output({"nginx": "inactive"}))
+
+    def test_missing_case_rejects_a_panel_that_stopped_answering(self):
+        self.reject(aio.case_preflight_inputs, "the Panel answered",
+                    output=pre_inputs_output({"login": "000"}))
+
+    # ----------------------------------------------------------- PRE-INPUTS-BAD
+    def test_bad_case_quotes_the_value_it_rejected(self):
+        product, _ = self.input_product()
+        evidence = aio.case_preflight_inputs_bad(product)
+        self.assertEqual(evidence["malformed_status"], "2")
+        self.assertEqual(evidence["malformed_names"], PRE_INPUTS_MALFORMED_MESSAGE)
+        self.assertEqual(evidence["nginx"], "active")
+        self.assertTrue(evidence["inventory_unchanged"])
+
+    def test_bad_case_rejects_a_refusal_that_does_not_quote_the_value(self):
+        self.reject(aio.case_preflight_inputs_bad, "does not quote the rejected value",
+                    output=pre_inputs_output({"malformed_message": (
+                        "install requires the ACME contact email; the value is not valid.")}))
+
+    def test_bad_case_rejects_a_refusal_that_names_no_field(self):
+        self.reject(aio.case_preflight_inputs_bad, "does not name the rejected input",
+                    output=pre_inputs_output({"malformed_message": (
+                        "not-an-email is not valid.")}))
+
+    def test_bad_case_rejects_a_complete_list_that_was_accepted(self):
+        self.reject(aio.case_preflight_inputs_bad, "instead of refusing",
+                    output=pre_inputs_output({"malformed_rc": "0"}))
+
+    def test_bad_case_rejects_a_host_it_rewrote(self):
+        rewritten = INVENTORY_BASELINE.replace(
+            "/etc/systemd/system/gowave.service",
+            "/etc/systemd/system/gowave.service\n/etc/systemd/system/gowave.service.d/override.conf",
+        )
+        self.reject(aio.case_preflight_inputs_bad, "rewrote the host", after=rewritten)
+
+    def test_the_probe_asks_without_a_terminal_and_reads_the_product_back(self):
+        # A prompt under `set -e` with no terminal exits 1 and prints nothing, so
+        # the requests are fed /dev/null and the refusal has to arrive from the
+        # contract. The Panel read is what a run that stopped NGINX would fail.
+        script = aio.preflight_inputs_script()
+        self.assertEqual(script.count("ask missing "), 1)
+        self.assertEqual(script.count("ask malformed "), 1)
+        self.assertIn("not-an-email", script)
+        self.assertIn("</dev/null", script)
+        self.assertIn("/api/nodes", script)
+        self.assertIn("systemctl is-active nginx.service", script)
+
+    def test_both_cases_are_registered_before_any_traffic_and_catalogued(self):
+        suite = aio.cases(ScriptedPodman(self.context, []))
+        cases = {case.id: case for case in suite}
+        for case_id in (aio.PRE_INPUTS_CASE_ID, aio.PRE_INPUTS_BAD_CASE_ID):
+            self.assertIn(case_id, cases)
+            self.assertEqual(cases[case_id].topology, "aio")
+            self.assertEqual(cases[case_id].timeout_seconds, aio.PRE_INPUTS_TIMEOUT_SECONDS)
+            record = {case["id"]: case for case in catalog.load_catalog()["cases"]}[case_id]
+            self.assertEqual(record["state"], "incubating")
+            self.assertEqual(record["runs_in"], ["podman"])
+            self.assertEqual(record["topology"], ["aio"])
+        ids = [case.id for case in suite]
+        # Both cases read the host the install left serving, so neither can be
+        # the case that proves the install.
+        self.assertGreater(ids.index(aio.PRE_INPUTS_CASE_ID), ids.index("AIO-INSTALL"))
+        self.assertGreater(ids.index(aio.PRE_INPUTS_BAD_CASE_ID), ids.index("AIO-INSTALL"))
+
+
 VISION_ROUTED_SHA = "d" * 64
 VISION_OTHER_SHA = "e" * 64
 VISION_ROOT = "/var/www/gowave-auto-nginx/cover-reality"
+
+HYGIENE_SHORT_UUID = "a" * 36
+HYGIENE_USER_ID = "user-uuid"
+
+
+class FakeHygienePanel:
+    """The Panel's two reads the hygiene probe makes, over rows it keeps itself."""
+
+    def __init__(self):
+        self.rows: list = []
+
+    def call(self, method, path):
+        if path == f"/api/users/by-username/{panel_surface.DEFAULT_USER}":
+            return 200, {"response": {"id": HYGIENE_USER_ID, "shortUuid": HYGIENE_SHORT_UUID}}
+        if path == f"/api/users/by-short-uuid/{HYGIENE_SHORT_UUID}":
+            return 200, {"response": {"id": HYGIENE_USER_ID, "shortUuid": HYGIENE_SHORT_UUID}}
+        if path == f"/api/users/{HYGIENE_USER_ID}/subscription-request-history":
+            return 200, {"response": {"records": list(reversed(self.rows))}}
+        raise AssertionError(f"the probe asked for {path}")
+
+    def served(self, address):
+        self.rows.append({"id": len(self.rows) + 1, "requestIp": address})
+
+
+class TestVhostHygieneProbe(unittest.TestCase):
+    """The probe forges every header and attributes each record to the request that caused it.
+
+    The listener cannot be run here, so the probe is read against a vhost that
+    behaves as NGINX does: it derives the recorded address from the request it
+    received, appends one row per served subscription, and answers the scanner
+    set by closing the connection. A probe that read the newest row without
+    excluding the previous ones, or that carried one header for all ten, would
+    report a listener correct that had believed a forged address.
+    """
+
+    def probe(self, trusted=(), page_body=b"", scanner_answer=None, routes=None):
+        panel = FakeHygienePanel()
+        statuses = dict(HYGIENE_ROUTE_STATUSES, **{"login": 400, "web-ui": 200})
+        statuses.update(routes or {})
+        page_body = page_body or b"<html><head><title>414 Request-URI Too Large</title></head></html>"
+        refusals = {"/.env": 200} if scanner_answer else {}
+
+        def fake_request(base_url, path, user_agent, headers=(), tolerate_closed=False, **kwargs):
+            answer = {
+                "status": 200, "closed": False, "server": "nginx", "content_type": "",
+                "cache_control": "", "x_robots_tag": "", "body": b"",
+            }
+            if path in refusals:
+                return dict(answer, status=refusals[path], body=b"DB_PASSWORD=1" if refusals[path] == 200 else b"")
+            if path in panel_surface.PANEL_SCANNER_PATHS:
+                return dict(answer, status=0, closed=True)
+            if path.startswith("/api/sub/"):
+                forged = [value for name, value in headers if name in trusted]
+                panel.served(forged[0] if forged else "172.30.0.2")
+                return dict(answer, body=b"proxy-payload")
+            if path == "/api/system/health":
+                return dict(answer, status=200, body=b'{"response":{}}')
+            if path == "/api/no-such-route":
+                # The Panel's chi router ends in a catch-all that serves the
+                # frontend, so an unmatched path comes back as the product's own
+                # 200 rather than a 404.
+                return dict(answer, status=200, content_type="text/html", body=b"<html>")
+            if path == "/api/nodes":
+                return dict(answer, status=401, body=b'{"error":"Unauthorized"}')
+            if path == "/":
+                return dict(answer, status=200, content_type="text/html", body=b"<html>")
+            if len(path) > 4096:
+                return dict(answer, status=414, body=page_body)
+            label = {probe_path: name for name, probe_path, _ in panel_surface.PANEL_PRODUCT_ROUTE_PROBES}
+            return dict(answer, status=statuses.get(label.get(path, ""), 400), body=b"")
+
+        with mock.patch.object(panel_surface, "request", fake_request), \
+                mock.patch.object(panel_surface, "local_source_address", return_value="172.30.0.2"):
+            facts = panel_surface.panel_vhost_hygiene(
+                panel, f"https://{aio.PANEL_DOMAIN}", ca_file=None,
+            )
+        return panel, facts
+
+    def test_the_probe_reads_the_source_its_own_request_carries(self):
+        _, facts = self.probe()
+        self.assertEqual(facts["probe_source_ip"], "172.30.0.2")
+
+    def test_the_probe_records_the_peer_for_every_header_it_forges(self):
+        panel, facts = self.probe()
+        self.assertEqual(facts["short_uuid_length"], len(HYGIENE_SHORT_UUID))
+        self.assertEqual(facts["peer_recorded_ip"], "172.30.0.2")
+        self.assertEqual(set(facts["client_ip"]), set(panel_surface.PANEL_CLIENT_IP_HEADERS))
+        # One row per served request — the control, each forged header and the
+        # route sweep's own subscription fetch — and no request read a row some
+        # other request had written.
+        self.assertEqual(len(panel.rows), 2 + len(panel_surface.PANEL_CLIENT_IP_HEADERS))
+        for header, entry in facts["client_ip"].items():
+            self.assertEqual(entry["status"], 200, header)
+            self.assertEqual(entry["recorded_ip"], "172.30.0.2", header)
+            self.assertFalse(entry["forged_was_recorded"], header)
+            self.assertTrue(entry["recorded_is_peer"], header)
+
+    def test_the_probe_blames_the_header_a_listener_left_forwarded(self):
+        _, facts = self.probe(trusted=("X-Remnawave-Real-IP",))
+        blamed = [
+            header for header, entry in facts["client_ip"].items() if entry["forged_was_recorded"]
+        ]
+        self.assertEqual(blamed, ["X-Remnawave-Real-IP"])
+        self.assertEqual(
+            facts["client_ip"]["X-Remnawave-Real-IP"]["recorded_ip"],
+            panel_surface.FORGED_CLIENT_IP,
+        )
+        self.assertTrue(facts["client_ip"]["X-Forwarded-For"]["recorded_is_peer"])
+
+    def test_the_probe_reads_the_frontend_answer_for_an_unmatched_path(self):
+        _, facts = self.probe()
+        self.assertEqual(facts["server"]["answered"]["status"], 200)
+        self.assertEqual(facts["server"]["unmatched"]["status"], 200)
+        self.assertEqual(facts["server"]["unmatched"]["server"], "nginx")
+
+    def test_the_probe_reads_the_error_page_the_listener_wrote(self):
+        _, plain = self.probe()
+        self.assertEqual(plain["error_page"]["status"], 414)
+        self.assertFalse(plain["error_page"]["version_in_body"])
+        self.assertGreater(plain["error_page"]["bytes"], 0)
+        _, versioned = self.probe(page_body=b"<html><center>nginx/1.24.0</center></html>")
+        self.assertTrue(versioned["error_page"]["version_in_body"])
+
+    def test_the_probe_records_a_scanner_target_that_was_answered(self):
+        _, facts = self.probe(scanner_answer=True)
+        self.assertFalse(facts["scanner"]["/.env"]["closed"])
+        self.assertEqual(facts["scanner"]["/.env"]["bytes"], len(b"DB_PASSWORD=1"))
+        self.assertTrue(facts["scanner"]["/server-status"]["closed"])
+        self.assertFalse(facts["scanner_control"]["closed"])
+
+    def test_the_probe_reads_every_product_route_including_the_subscription(self):
+        _, facts = self.probe()
+        self.assertEqual(
+            set(facts["product_routes"]),
+            {label for label, _, _ in panel_surface.PANEL_PRODUCT_ROUTE_PROBES} | {"subscription"},
+        )
+        self.assertEqual(facts["product_routes"]["rest-api"]["status"], 401)
+        self.assertEqual(facts["product_routes"]["subscription"]["status"], 200)
 
 
 def vision_contour(
@@ -5321,6 +5947,42 @@ class TestFaultCases(unittest.TestCase):
         # A fault case that fails half-way must still hand the host back with its
         # control plane running, or every case after it reads a dead Panel.
         self.assertIn(f"systemctl start {aio.PANEL_SERVICE}", product.podman.scripts[-1])
+
+    def panel_outage(self, gateway_headers):
+        """A stopped Panel whose gateway answer carries the headers under test."""
+        product, _ = installed_product(self.context, [("inactive\n", 0), ("active\n", 0)])
+        down = json.loads(json.dumps(self.PANEL_STATE))
+        down["unit"] = {"ActiveState": "inactive", "SubState": "dead"}
+        down["health"] = "ConnectionRefusedError: [Errno 111] Connection refused"
+        product.host.client_reports = [
+            {"url": f"{aio.PUBLIC_PANEL}/", "returncode": 0, "stdout": "{}", "stderr": "",
+             "probe": {"status": aio.PANEL_FAULT_UNAVAILABLE_STATUS}},
+            {"url": f"{aio.PUBLIC_PANEL}/api/sub/000000000000", "returncode": 0,
+             "stdout": "{}", "stderr": "",
+             "probe": {"status": aio.PANEL_FAULT_UNAVAILABLE_STATUS,
+                       "headers": gateway_headers}},
+        ]
+        return product, down
+
+    def test_the_panel_outage_case_reads_the_transport_headers_on_the_gateway_answer(self):
+        # `add_header ... always` is what keeps these on a 502, and a pasted link
+        # is exactly what would be cached or indexed if they were dropped.
+        for headers, expected in (
+            ({}, "a cached 502"),
+            ({"cache-control": "no-store, private"}, "lost X-Robots-Tag"),
+        ):
+            with self.subTest(headers=headers):
+                product, down = self.panel_outage(headers)
+                with mock.patch.object(aio, "channel_state",
+                                       side_effect=[self.PANEL_STATE, down]), \
+                        mock.patch.object(aio, "channel_client_surface",
+                                          return_value={"readback_status": 200,
+                                                        "short_uuid_length": 4}), \
+                        mock.patch.object(product, "wait_tunnel_ready", return_value={}):
+                    with self.assertRaises(AssertionError) as caught:
+                        aio.case_panel_service_down(product)
+                self.assertIn(expected, str(caught.exception))
+                self.assertIn(f"systemctl start {aio.PANEL_SERVICE}", product.podman.scripts[-1])
 
     def test_the_fault_cases_are_registered_before_the_idempotent_case_and_catalogued(self):
         suite = aio.cases(ScriptedPodman(self.context, []))

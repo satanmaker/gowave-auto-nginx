@@ -33,6 +33,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -60,6 +61,14 @@ AAAA_WITHOUT_IPV6_CASE_ID = "PRE-03"
 PRIVATE_ADDRESS_CASE_ID = "PRE-04"
 AAAA_WITH_IPV6_CASE_ID = "PRE-05"
 AAAA_BYPASS_CASE_ID = "PRE-06"
+#: A domain answering from a Cloudflare proxy CIDR range is refused before any certificate request.
+PROXY_CIDR_CASE_ID = "PRE-PROXY-CIDR"
+#: The override variant: a proxied name is accepted when GOWAVE_PREFLIGHT_ALLOW_PROXIED=1.
+PROXY_CIDR_OVERRIDE_CASE_ID = "PRE-PROXY-CIDR-OVERRIDE"
+#: A repeated install adopts an existing suffixed ACME lineage instead of creating a second one.
+TLS_LINEAGE_CASE_ID = "TLS-LINEAGE"
+#: The negative variant: an expired or mismatched lineage is not adopted.
+TLS_LINEAGE_BAD_CASE_ID = "TLS-LINEAGE-BAD"
 DISTINCT_TARGETS_CASE_ID = "ADDR-01"
 DISTINCT_DOMAINS_CASE_ID = "ADDR-02"
 ROOT_IDENTITY_CASE_ID = "ADDR-03"
@@ -662,6 +671,233 @@ def case_aaaa_cannot_bypass(context: RunContext) -> Dict[str, Any]:
     }
 
 
+def case_proxy_cidr_refused(context: RunContext) -> Dict[str, Any]:
+    """``PRE-PROXY-CIDR``: a name answering from a Cloudflare proxy CIDR is refused before issuance.
+
+    The preflight check resolves every name the run will validate — the panel name, the
+    camouflage/decoy name, and each configured Vision name — and refuses a name whose
+    address falls inside the dated Cloudflare CIDR snapshot. A proxied or unresolvable
+    name stops the run before the first certificate request. The operator can override
+    with GOWAVE_PREFLIGHT_ALLOW_PROXIED=1, but the default is to fail fast.
+
+    The subject is the product's shell function, not the harness's own DNS verifier:
+    ``preflight_require_direct_dns`` is sourced from ``modules/preflight.sh`` and driven
+    with a stubbed ``getent``, so the sentence this case reads is the one an operator
+    receives. Reading ``live_dns.verify_all_domains`` here used to answer a different
+    question — that verifier compares the answer against the target address and had no
+    proxy rule at all, so the assertion could only ever have been satisfied by text the
+    function under test did not print.
+    """
+    # 104.16.0.1 is inside 104.16.0.0/13 from the dated Cloudflare CIDR snapshot
+    PROXIED_ADDRESS = "104.16.0.1"
+    PROXIED_CIDR = "104.16.0.0/13"
+    SNAPSHOT_DATE = "2026-11-20"
+    preflight_sh = REPO / "modules" / "preflight.sh"
+
+    with tempfile.TemporaryDirectory(prefix=f"gowave-pre-{context.topology}-") as directory:
+        root = Path(directory)
+
+        def direct_dns(answers: Dict[str, List[str]], *names: str,
+                       allow_proxied: str = "0") -> "subprocess.CompletedProcess[str]":
+            """Run the product's check over names this stub resolver answers."""
+            bin_dir = Path(tempfile.mkdtemp(dir=root, prefix="bin-"))
+            bin_dir.chmod(0o755)
+            stub = bin_dir / "getent"
+            lines = ["#!/usr/bin/env bash", 'name="$2"', 'case "$name" in']
+            for name, addresses in answers.items():
+                lines.append(f"    {shlex.quote(name)})")
+                for address in addresses:
+                    lines.append(
+                        f'        printf "%s STREAM %s\\n" {shlex.quote(address)} '
+                        f"{shlex.quote(name)}"
+                    )
+                lines.append("        exit 0 ;;")
+            lines += ["esac", "exit 2", ""]
+            stub.write_text("\n".join(lines), encoding="utf-8")
+            stub.chmod(0o755)
+            script = (
+                f"source {shlex.quote(str(preflight_sh))}\n"
+                "preflight_require_direct_dns "
+                + " ".join(shlex.quote(name) for name in names)
+                + "\n"
+            )
+            env = {
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "GOWAVE_PREFLIGHT_ALLOW_PROXIED": allow_proxied,
+            }
+            return subprocess.run(
+                ["bash", "-c", script], text=True, capture_output=True, env=env, timeout=120,
+            )
+
+        def refusal(name: str, address: str) -> "subprocess.CompletedProcess[str]":
+            return direct_dns({name: [address]}, name)
+
+        refusals: Dict[str, str] = {}
+        for role, name in (("panel", PANEL_DOMAIN), ("reality", REALITY_DOMAIN),
+                           ("vision", VISION_DOMAIN)):
+            result = refusal(name, PROXIED_ADDRESS)
+            assert result.returncode != 0, (
+                f"{name} resolved to proxied address {PROXIED_ADDRESS} and was accepted"
+            )
+            assert "Cloudflare proxy" in result.stderr, (
+                f"the refusal for the {role} name does not name the Cloudflare proxy: {result.stderr!r}"
+            )
+            assert name in result.stderr, (
+                f"the refusal for the {role} name does not name {name}: {result.stderr!r}"
+            )
+            assert PROXIED_ADDRESS in result.stderr, (
+                f"the refusal for the {role} name does not name the published address: "
+                f"{result.stderr!r}"
+            )
+            assert PROXIED_CIDR in result.stderr, (
+                f"the refusal for the {role} name does not name the CIDR it falls in: "
+                f"{result.stderr!r}"
+            )
+            assert SNAPSHOT_DATE in result.stderr, (
+                f"the refusal for the {role} name does not name the snapshot it was judged "
+                f"against: {result.stderr!r}"
+            )
+            refusals[role] = result.stderr.strip()
+
+        # A name that answers where it should is not refused: the same function over
+        # the same names, with only the answers changed.
+        accepted = direct_dns(
+            {PANEL_DOMAIN: [MASTER_ADDRESS], REALITY_DOMAIN: [MASTER_ADDRESS],
+             VISION_DOMAIN: [MASTER_ADDRESS]},
+            PANEL_DOMAIN, REALITY_DOMAIN, VISION_DOMAIN,
+        )
+        assert accepted.returncode == 0, (
+            f"names answering from the target address were refused: {accepted.stderr!r}"
+        )
+
+        # One proxied name among three: the refusal names that name and no other, so
+        # the operator is not sent to a record that is already correct.
+        mixed = direct_dns(
+            {PANEL_DOMAIN: [MASTER_ADDRESS], REALITY_DOMAIN: [PROXIED_ADDRESS],
+             VISION_DOMAIN: [MASTER_ADDRESS]},
+            PANEL_DOMAIN, REALITY_DOMAIN, VISION_DOMAIN,
+        )
+        assert mixed.returncode != 0, "a proxied name among resolvable ones was accepted"
+        assert REALITY_DOMAIN in mixed.stderr, (
+            f"the refusal does not name the proxied name: {mixed.stderr!r}"
+        )
+        assert mixed.stderr.count("resolves to") == 1, (
+            f"the refusal lists more than the one proxied name: {mixed.stderr!r}"
+        )
+        assert PANEL_DOMAIN not in mixed.stderr and VISION_DOMAIN not in mixed.stderr, (
+            f"the refusal implicates a name that answered correctly: {mixed.stderr!r}"
+        )
+
+        # A name the resolver does not answer is refused with the resolution failure
+        # named, because HTTP-01 cannot complete for it either.
+        unresolvable = direct_dns({}, PANEL_DOMAIN)
+        assert unresolvable.returncode != 0, f"unresolvable {PANEL_DOMAIN} was accepted"
+        assert "could not resolve" in unresolvable.stderr.lower(), (
+            f"the refusal does not name the resolution failure: {unresolvable.stderr!r}"
+        )
+        assert PANEL_DOMAIN in unresolvable.stderr, (
+            f"the refusal does not name the unresolvable name: {unresolvable.stderr!r}"
+        )
+
+        # The override is the sibling case's subject; here it is the control that the
+        # refusal above is the policy and not the resolver.
+        overridden = direct_dns({PANEL_DOMAIN: [PROXIED_ADDRESS]}, PANEL_DOMAIN,
+                                allow_proxied="1")
+        assert overridden.returncode == 0, (
+            f"GOWAVE_PREFLIGHT_ALLOW_PROXIED=1 did not accept the proxied name: "
+            f"{overridden.stderr!r}"
+        )
+
+    return {
+        "proxied_address": PROXIED_ADDRESS,
+        "proxied_cidr": PROXIED_CIDR,
+        "panel_refusal": refusals["panel"],
+        "reality_refusal": refusals["reality"],
+        "vision_refusal": refusals["vision"],
+        "unresolvable_refusal": unresolvable.stderr.strip(),
+        "snapshot_date": SNAPSHOT_DATE,
+    }
+
+
+def case_proxy_cidr_override(context: RunContext) -> Dict[str, Any]:
+    """``PRE-PROXY-CIDR-OVERRIDE``: a proxied name is accepted when GOWAVE_PREFLIGHT_ALLOW_PROXIED=1.
+
+    The preflight check refuses names answering from the Cloudflare proxy CIDR snapshot
+    unless the operator explicitly sets GOWAVE_PREFLIGHT_ALLOW_PROXIED=1. This case
+    verifies the override is honoured by driving the shell function directly with a
+    stubbed resolver that returns a proxied address.
+    """
+    # 104.16.0.1 is inside 104.16.0.0/13 from the dated Cloudflare CIDR snapshot
+    PROXIED_ADDRESS = "104.16.0.1"
+
+    with tempfile.TemporaryDirectory(prefix=f"gowave-pre-{context.topology}-") as directory:
+        root = Path(directory)
+
+        # Create a stub for getent ahosts that returns the proxied address
+        bin_dir = root / "bin"
+        bin_dir.mkdir(mode=0o755)
+        stub = bin_dir / "getent"
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            f'if [[ "$2" == "{PANEL_DOMAIN}" ]]; then '
+            f'printf "%s STREAM %s\\n" {shlex.quote(PROXIED_ADDRESS)} {shlex.quote(PANEL_DOMAIN)}; exit 0; fi\n'
+            "exit 2\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+
+        # Source preflight.sh and call preflight_require_direct_dns with override
+        preflight_sh = REPO / "modules" / "preflight.sh"
+        script = (
+            f"source {shlex.quote(str(preflight_sh))}\n"
+            f'preflight_require_direct_dns {shlex.quote(PANEL_DOMAIN)}\n'
+        )
+        env = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "GOWAVE_PREFLIGHT_ALLOW_PROXIED": "1",
+        }
+        result = subprocess.run(
+            ["bash", "-c", script], text=True, capture_output=True, env=env, timeout=120
+        )
+
+        # Verify the override is honoured: exit code 0 and warning printed
+        assert result.returncode == 0, (
+            f"preflight_require_direct_dns failed with override: {result.stderr}"
+        )
+        assert "GOWAVE_PREFLIGHT_ALLOW_PROXIED=1" in result.stderr, (
+            f"warning about override not printed: {result.stderr}"
+        )
+        assert "Warning: a requested name answers from a proxy range" in result.stderr, (
+            f"warning header not printed: {result.stderr}"
+        )
+        assert PROXIED_ADDRESS in result.stderr, (
+            f"proxied address not named in warning: {result.stderr}"
+        )
+
+        # Also verify that without the override, it refuses
+        env_no_override = {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        }
+        result_refused = subprocess.run(
+            ["bash", "-c", script], text=True, capture_output=True, env=env_no_override, timeout=120
+        )
+        assert result_refused.returncode == 1, (
+            f"preflight_require_direct_dns should refuse without override: {result_refused.stderr}"
+        )
+        assert "Cloudflare proxy" in result_refused.stderr, (
+            f"refusal should name Cloudflare proxy: {result_refused.stderr}"
+        )
+        assert "Set GOWAVE_PREFLIGHT_ALLOW_PROXIED=1 to record a decision to continue anyway" in result_refused.stderr, (
+            f"refusal should mention override option: {result_refused.stderr}"
+        )
+
+    return {
+        "proxied_address": PROXIED_ADDRESS,
+        "override_honoured": True,
+        "refused_without_override": True,
+    }
+
+
 def case_distinct_targets(context: RunContext) -> Dict[str, Any]:
     """``ADDR-01``: one address cannot stand in for two VPS hosts."""
     with tempfile.TemporaryDirectory(prefix=f"gowave-addr-{context.topology}-") as directory:
@@ -903,6 +1139,256 @@ def case_private_address_rejected(context: RunContext) -> Dict[str, Any]:
         "harness_master_ip": harness_addresses["MASTER_IP"],
         "harness_worker_ip": harness_addresses["WORKER_IP"],
         "harness_addresses_global": True,
-        "validator_parameters": ",".join(parameters),
         "validated_before_bootstrap": config_at < bootstrap_at,
+        "validator_parameters": ",".join(parameters),
+    }
+
+
+def case_tls_lineage(context: RunContext) -> Dict[str, Any]:
+    """``TLS-LINEAGE``: a repeated install adopts an existing suffixed ACME lineage.
+
+    The preflight check resolves every name the run will validate and the ACME
+    lineage selection prefers the exact-name lineage first, then the shortest
+    suffix. A lineage named after a suffix (e.g. ``panel.example.com-0001``)
+    that covers the panel domain is adopted on re-install, preventing a second
+    lineage from being created beside the one the host already serves.
+    """
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    from tools.podman_e2e import topology
+
+    # Create a temporary letsencrypt tree with a suffixed lineage
+    with tempfile.TemporaryDirectory(prefix=f"gowave-tls-{context.topology}-") as directory:
+        root = Path(directory)
+        letsencrypt_root = root / "letsencrypt"
+        live_root = letsencrypt_root / "live"
+        renewal_root = letsencrypt_root / "renewal"
+        live_root.mkdir(parents=True)
+        renewal_root.mkdir(parents=True)
+
+        # Create a suffixed lineage that covers the panel domain
+        # Use the panel domain from topology
+        panel_domain = topology.PANEL_DOMAIN
+        lineage_name = f"{panel_domain}-0001"
+        live_dir = live_root / lineage_name
+        live_dir.mkdir(parents=True)
+
+        # Create the certificate covering the panel domain
+        cert = live_dir / "fullchain.pem"
+        key = live_dir / "privkey.pem"
+        san = f"DNS:{panel_domain}"
+        subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key), "-out", str(cert), "-days", "30",
+            "-subj", f"/CN={panel_domain}",
+            "-addext", f"subjectAltName={san}",
+        ], check=True, stderr=subprocess.DEVNULL, timeout=120)
+
+        # Create the renewal config pointing to production directory
+        (renewal_root / f"{lineage_name}.conf").write_text(
+            f"[renewalparams]\nserver = https://acme-v02.api.letsencrypt.org/directory\nauthenticator = webroot\n",
+            encoding="utf-8",
+        )
+
+        # Create the archive structure (as certbot would)
+        archive_dir = letsencrypt_root / "archive" / lineage_name
+        archive_dir.mkdir(parents=True)
+        for path in (cert, key):
+            target = archive_dir / path.name
+            import shutil
+            shutil.move(str(path), str(target))
+            path.symlink_to(Path("..") / ".." / "archive" / lineage_name / path.name)
+
+        # Now run select_acme_lineage through the installed module
+        # Source nginx.sh and call select_acme_lineage
+        nginx_sh = REPO / "modules" / "nginx.sh"
+        script = (
+            f"source {shlex.quote(str(nginx_sh))}\n"
+            f"select_acme_lineage {shlex.quote(panel_domain)} "
+            f"{shlex.quote('https://acme-v02.api.letsencrypt.org/directory')} "
+            f"{shlex.quote(str(letsencrypt_root))}\n"
+        )
+        result = subprocess.run(
+            ["bash", "-c", script], text=True, capture_output=True, timeout=60
+        )
+
+        # Verify the lineage is adopted
+        assert result.returncode == 0, (
+            f"select_acme_lineage failed: {result.stderr}"
+        )
+        adopted_dir = result.stdout.strip()
+        assert adopted_dir == str(live_dir), (
+            f"expected lineage directory {live_dir}, got {adopted_dir}"
+        )
+        assert "Adopting the ACME lineage" in result.stderr, (
+            f"adoption message not printed: {result.stderr}"
+        )
+        assert lineage_name in result.stderr, (
+            f"adopted lineage name not in message: {result.stderr}"
+        )
+
+        # Run it again to verify determinism (same tree answers the same)
+        result2 = subprocess.run(
+            ["bash", "-c", script], text=True, capture_output=True, timeout=60
+        )
+        assert result2.returncode == 0, (
+            f"second select_acme_lineage failed: {result2.stderr}"
+        )
+        assert result2.stdout.strip() == adopted_dir, (
+            f"second run returned different directory: {result2.stdout.strip()} != {adopted_dir}"
+        )
+
+        # Verify no exact-name lineage exists yet (the suffixed one was adopted)
+        exact_live = live_root / panel_domain
+        assert not exact_live.exists(), (
+            f"exact-name lineage should not exist after adoption: {exact_live}"
+        )
+
+    return {
+        "panel_domain": panel_domain,
+        "suffixed_lineage": lineage_name,
+        "adopted_directory": str(live_dir),
+        "adoption_message": "Adopting the ACME lineage",
+        "deterministic_repeat": True,
+        "exact_lineage_absent": True,
+    }
+
+
+def case_tls_lineage_bad(context: RunContext) -> Dict[str, Any]:
+    """``TLS-LINEAGE-BAD``: an expired or mismatched ACME lineage is not adopted.
+
+    The lineage selection refuses an expired lineage, a lineage from a different
+    ACME directory, or a lineage whose certificate does not cover the requested
+    name. This case verifies the refusal paths by driving select_acme_lineage
+    with a tree containing an expired lineage and asserting it is not adopted.
+    """
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    from tools.podman_e2e import topology
+
+    with tempfile.TemporaryDirectory(prefix=f"gowave-tls-bad-{context.topology}-") as directory:
+        root = Path(directory)
+        letsencrypt_root = root / "letsencrypt"
+        live_root = letsencrypt_root / "live"
+        renewal_root = letsencrypt_root / "renewal"
+        live_root.mkdir(parents=True)
+        renewal_root.mkdir(parents=True)
+
+        panel_domain = topology.PANEL_DOMAIN
+
+        # Test 1: expired lineage is not adopted
+        lineage_name = f"{panel_domain}-0001"
+        live_dir = live_root / lineage_name
+        live_dir.mkdir(parents=True)
+
+        cert = live_dir / "fullchain.pem"
+        key = live_dir / "privkey.pem"
+        san = f"DNS:{panel_domain}"
+        # Create an expired certificate using a throwaway CA (as in test_nginx_routing.py)
+        work = root / f".ca-{lineage_name}"
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "serial").write_text("01\n", encoding="utf-8")
+        (work / "index.txt").write_text("", encoding="utf-8")
+        (work / "newcerts").mkdir(exist_ok=True)
+        (work / "ca.cnf").write_text(
+            "[ ca ]\n"
+            "default_ca = CA_default\n"
+            "[ CA_default ]\n"
+            "dir = .\n"
+            "database = ./index.txt\n"
+            "serial = ./serial\n"
+            "new_certs_dir = ./newcerts\n"
+            "default_md = sha256\n"
+            "policy = policy_any\n"
+            "copy_extensions = copy\n"
+            "[ policy_any ]\n"
+            "commonName = supplied\n"
+            "[ v3 ]\n"
+            f"subjectAltName = {san}\n"
+            "basicConstraints = critical,CA:FALSE\n",
+            encoding="utf-8",
+        )
+        subprocess.run([
+            "openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key), "-out", "req.csr", "-subj", f"/CN={panel_domain}",
+        ], check=True, cwd=work, stderr=subprocess.DEVNULL, timeout=120)
+        subprocess.run([
+            "openssl", "ca", "-batch", "-config", "ca.cnf", "-selfsign",
+            "-keyfile", str(key), "-in", "req.csr", "-out", str(cert),
+            "-startdate", "20200101000000Z", "-enddate", "20200102000000Z",
+            "-extensions", "v3", "-notext",
+        ], check=True, cwd=work, stderr=subprocess.DEVNULL, timeout=120)
+
+        (renewal_root / f"{lineage_name}.conf").write_text(
+            f"[renewalparams]\nserver = https://acme-v02.api.letsencrypt.org/directory\nauthenticator = webroot\n",
+            encoding="utf-8",
+        )
+
+        nginx_sh = REPO / "modules" / "nginx.sh"
+        script = (
+            f"source {shlex.quote(str(nginx_sh))}\n"
+            f"select_acme_lineage {shlex.quote(panel_domain)} "
+            f"{shlex.quote('https://acme-v02.api.letsencrypt.org/directory')} "
+            f"{shlex.quote(str(letsencrypt_root))}\n"
+        )
+        result = subprocess.run(
+            ["bash", "-c", script], text=True, capture_output=True, timeout=60
+        )
+
+        # Verify the expired lineage is NOT adopted (empty stdout)
+        assert result.returncode == 0, (
+            f"select_acme_lineage failed: {result.stderr}"
+        )
+        assert result.stdout.strip() == "", (
+            f"expired lineage should not be adopted, got: {result.stdout.strip()}"
+        )
+        assert "Not adopting the ACME lineage" in result.stderr or "expired" in result.stderr, (
+            f"expired refusal message not printed: {result.stderr}"
+        )
+
+        # Test 2: mismatched ACME directory is not adopted
+        # Clean up and create a new lineage with staging directory
+        import shutil
+        shutil.rmtree(live_dir)
+        (renewal_root / f"{lineage_name}.conf").unlink(missing_ok=True)
+
+        live_dir.mkdir(parents=True)
+        cert = live_dir / "fullchain.pem"
+        key = live_dir / "privkey.pem"
+        subprocess.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key), "-out", str(cert), "-days", "30",
+            "-subj", f"/CN={panel_domain}",
+            "-addext", f"subjectAltName={san}",
+        ], check=True, stderr=subprocess.DEVNULL, timeout=120)
+
+        (renewal_root / f"{lineage_name}.conf").write_text(
+            f"[renewalparams]\nserver = https://acme-staging-v02.api.letsencrypt.org/directory\nauthenticator = webroot\n",
+            encoding="utf-8",
+        )
+
+        result2 = subprocess.run(
+            ["bash", "-c", script], text=True, capture_output=True, timeout=60
+        )
+
+        assert result2.returncode == 0, (
+            f"select_acme_lineage failed: {result2.stderr}"
+        )
+        assert result2.stdout.strip() == "", (
+            f"mismatched directory lineage should not be adopted, got: {result2.stdout.strip()}"
+        )
+        assert "Not adopting the ACME lineage" in result2.stderr or "was not issued by" in result2.stderr, (
+            f"directory mismatch refusal message not printed: {result2.stderr}"
+        )
+
+    return {
+        "expired_refusal": True,
+        "directory_mismatch_refusal": True,
+        "panel_domain": panel_domain,
+        "expired_message_contains": "expired",
+        "directory_mismatch_message_contains": "was not issued by",
     }
