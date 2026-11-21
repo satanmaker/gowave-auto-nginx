@@ -3,7 +3,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Language selection precedes every other question
-The wizard SHALL ask for the display language, Russian or English, before any other question unless `GOWAVE_WIZARD_LANG` already names one of the two, apply the choice to every message it prints afterwards, and accept only one of the two offered answers. Every other command and every non-interactive invocation SHALL remain in English.
+The interactive entrypoint SHALL ask for the display language, Russian or English, before any other question and before displaying any menu, unless `GOWAVE_WIZARD_LANG` already names one of the two, apply the choice to every message the interactive surface prints afterwards, and accept only one of the two offered answers. Every non-interactive invocation and every command reached without the interactive menu SHALL remain in English.
 
 #### Scenario: Russian wizard prints Russian prompts
 - **GIVEN** the operator starts the wizard and chooses Russian
@@ -30,41 +30,13 @@ The wizard SHALL ask for the display language, Russian or English, before any ot
 - **WHEN** the interface starts
 - **THEN** it requests Russian or English before displaying any operation menu or other prompt
 
-### Requirement: Every collected name is validated in one plan
-The wizard SHALL collect a Panel or worker name, a camouflage name, and an optional Vision name per host, SHALL reject a value that is not a valid DNS hostname, SHALL reject a name that another host in the same plan already uses, and SHALL finish collecting every name before the first mutation.
-
-#### Scenario: A repeated name stops the plan
-- **GIVEN** a plan in which the second node is given the camouflage name already used by the first node
-- **WHEN** the wizard validates the plan
-- **THEN** it reports which two hosts collide and stops before installing anything or issuing any certificate
-
-#### Scenario: An invalid hostname is refused in place
-- **GIVEN** the operator enters a name with an empty label, a label longer than 63 characters, or a character outside letters, digits, and hyphen
-- **WHEN** the wizard validates that answer
-- **THEN** it names the offending value, repeats the question for that field, and keeps the answers already given
-
-#### Scenario: Vision stays optional per node
-- **GIVEN** a multi-node plan
-- **WHEN** the operator enables Vision for one node and declines it for another
-- **THEN** the plan records Vision for exactly one node and the wizard continues without requiring it elsewhere
-
-#### Scenario: Operator can return to a previous plan field
-- **GIVEN** the operator has entered several plan values but has not confirmed deployment
-- **WHEN** they choose to review or edit the plan
-- **THEN** they can select any collected field, change it, and see the updated plan without recollecting unrelated values or mutating a server
-
-#### Scenario: Back navigation does not undo server changes
-- **GIVEN** deployment has started and at least one phase has completed
-- **WHEN** the operator requests to go back
-- **THEN** the wizard does not claim to roll back completed phases and only offers edits or actions for work that has not yet run
-
 ### Requirement: Remote node onboarding uses temporary access
 The wizard SHALL onboard a remote node only after the operator confirms the presented host-key fingerprint by typing it in full, SHALL read the password without echo, SHALL authorise a temporary key that a host timer removes within two hours, SHALL run the existing node registration under that access, SHALL revoke the key and the timer when the registration ends, succeeds or not, and SHALL abort before any key is authorised when the timer cannot be installed or enabled.
 
 #### Scenario: An incompletely typed fingerprint stops onboarding
 - **GIVEN** the wizard presents the SHA-256 fingerprint of a node's host key
 - **WHEN** the operator answers with a different value, a prefix, or an empty line
-- **THEN** the wizard refuses that node, installs no key, runs no command on the node, and leaves the other hosts of the plan untouched
+- **THEN** that attempt authorises no key and runs no command on any host of the plan
 
 #### Scenario: A successful onboarding leaves no temporary access
 - **GIVEN** the fingerprint was confirmed and the node registration succeeded
@@ -79,24 +51,27 @@ The wizard SHALL onboard a remote node only after the operator confirms the pres
 #### Scenario: The password never reaches a process argument list
 - **GIVEN** the wizard is onboarding a node
 - **WHEN** the Panel host's process arguments are inspected while the password is held
-- **THEN** no argument of any spawned process contains the password, and the password is not written to a file that outlives the onboarding
+- **THEN** no argument of any spawned process contains the password, and the password is not written to a file that outlives that node's onboarding
 
 #### Scenario: Onboarding aborts when the expiry timer cannot be installed
 - **GIVEN** the wizard is onboarding a node whose expiry timer cannot be installed or enabled
 - **WHEN** the wizard reaches the point where the temporary key would be authorised
-- **THEN** it aborts that node before any key is written, leaves no temporary access or timer artefacts, and leaves the other hosts of the plan untouched
+- **THEN** it aborts that node before any key is written and leaves no temporary access or timer artefacts on any host
 
-#### Scenario: One failed node does not stop independent nodes
-- **GIVEN** a plan contains multiple remote nodes
-- **WHEN** onboarding of one node fails
-- **THEN** the wizard records that node's address, failed phase, and reason, continues onboarding the remaining independent nodes, and completes the Panel installation
+### Requirement: The wizard is the only interactive surface
+The interactive menu and the wizard it reaches SHALL be the only surfaces that ask questions. The positional `install` and `node add` commands SHALL keep their existing argument contract and SHALL perform no prompt when their arguments are complete. An invocation with no arguments and no terminal SHALL print the usage text and exit non-zero instead of printing a menu, blocking on input, or starting an installation with empty values.
 
-#### Scenario: Failed nodes are summarized and can be selectively retried
-- **GIVEN** one or more nodes failed while other planned work completed
-- **WHEN** the onboarding batch finishes
-- **THEN** the wizard lists each failed node with its address, phase, and reason and offers retry for selected failed nodes without rerunning successful nodes
+#### Scenario: A container drive never enters the wizard
+- **GIVEN** an acceptance run invokes `gowave-auto.sh install <panel> <reality> <email>` with stdin that is not a terminal
+- **WHEN** the install runs
+- **THEN** no wizard question is asked, the command behaves as it did before this change, and its output is English
 
-#### Scenario: Partial node state is inspected before retry
-- **GIVEN** retry is requested for a node whose prior attempt may have changed the Panel or remote VPS
-- **WHEN** the retry flow begins
-- **THEN** it diagnoses both sides, displays discovered residual state, and requires explicit operator confirmation before continuing or compensating; it performs no silent deletion
+#### Scenario: Missing arguments without a terminal fail fast
+- **GIVEN** `gowave-auto.sh install` is invoked with no arguments and stdin that is not a terminal
+- **WHEN** the command runs
+- **THEN** it exits non-zero with a usage message naming the expected arguments and modifies nothing on the host
+
+#### Scenario: A bare invocation without a terminal prints usage instead of the menu
+- **GIVEN** `gowave-auto.sh` is invoked with no arguments and stdin that is not a terminal
+- **WHEN** the command runs
+- **THEN** it prints the usage text, exits non-zero, and neither prints the menu nor blocks on input
