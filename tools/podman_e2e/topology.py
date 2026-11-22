@@ -24,6 +24,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import shlex
 import socket
 import time
 from dataclasses import dataclass, field
@@ -1675,17 +1676,44 @@ class MultiNodeTopology(AioTopology):
     # the registered node must not be handed the container's name.
     worker_node_name = WORKER_NODE_NAME
 
-    def node_add_script(self, name: str = WORKER_NODE_NAME) -> str:
+    def node_add_script(
+        self, name: str = WORKER_NODE_NAME, environment: Optional[Dict[str, str]] = None,
+        address: Optional[str] = None, worker_domain: Optional[str] = None,
+        reality_domain: Optional[str] = None, vision_domain: Optional[str] = None,
+    ) -> str:
+        """The operator's ``node add`` for one Worker, with optional inputs.
+
+        The defaults address the topology's own Worker; a case that provisions a
+        disposable second host passes that host's address and names instead. An
+        ``environment`` mapping becomes a command prefix, because a variable set
+        in the container's creation environment never reaches the Worker: the
+        Master's own shell is what forwards these over the SSH stdin stream.
+        """
+        address = address or self.plan.worker_ip
+        worker_domain = worker_domain or self.worker_domain
+        reality_domain = reality_domain or self.worker_reality_domain
+        if vision_domain is None:
+            vision_domain = self.worker_vision_domain
         arguments = [
             f"'{name}'",
-            f"'{self.plan.worker_ip}'",
-            f"'{self.worker_domain}'",
-            f"'{self.worker_reality_domain}'",
+            f"'{address}'",
+            f"'{worker_domain}'",
+            f"'{reality_domain}'",
         ]
-        vision = f"--vision-domain '{self.worker_vision_domain}' " if self.worker_vision_domain else ""
-        return f"bash {REPO_IN_CONTAINER}/gowave-auto.sh node add {vision}{' '.join(arguments)}"
+        vision = f"--vision-domain '{vision_domain}' " if vision_domain else ""
+        command = f"bash {REPO_IN_CONTAINER}/gowave-auto.sh node add {vision}{' '.join(arguments)}"
+        prefix = " ".join(
+            f"{key}={shlex.quote(value)}" for key, value in sorted((environment or {}).items())
+        )
+        return f"{prefix} {command}" if prefix else command
 
-    def node_add(self, name: str = WORKER_NODE_NAME) -> InstallOutcome:
+    def node_add(
+        self, name: str = WORKER_NODE_NAME, *,
+        environment: Optional[Dict[str, str]] = None,
+        address: Optional[str] = None, worker_domain: Optional[str] = None,
+        reality_domain: Optional[str] = None, vision_domain: Optional[str] = None,
+        observe: bool = True, evidence_prefix: Optional[str] = None,
+    ) -> InstallOutcome:
         """Provision the Worker through the operator's real ``node add`` path.
 
         The command runs on the Master, over the same SSH transport and Panel API
@@ -1699,14 +1727,25 @@ class MultiNodeTopology(AioTopology):
         observer that cannot be installed is recorded in the facts rather than
         raised — an unobserved deployment is still a deployment — and the case
         that needs the observation refuses without it.
+
+        ``observe=False`` runs the command without touching that trace, so a
+        dispatch that is not the deployment under observation cannot erase what
+        the deployment left behind.
         """
-        script = self.node_add_script(name)
-        self.argv_observer = argv_probe.ensure_strace(self.podman, self.target_name)
-        if self.argv_observer["ok"]:
-            self.podman.exec_bash(
-                self.target_name, argv_probe.trace_reset_script(), check=False,
-            )
-            script = argv_probe.strace_prefix(argv_probe.TRACE_PATH, self.argv_observer["limit"]) + script
+        script = self.node_add_script(
+            name, environment=environment, address=address,
+            worker_domain=worker_domain, reality_domain=reality_domain,
+            vision_domain=vision_domain,
+        )
+        if observe:
+            self.argv_observer = argv_probe.ensure_strace(self.podman, self.target_name)
+            if self.argv_observer["ok"]:
+                self.podman.exec_bash(
+                    self.target_name, argv_probe.trace_reset_script(), check=False,
+                )
+                script = argv_probe.strace_prefix(
+                    argv_probe.TRACE_PATH, self.argv_observer["limit"],
+                ) + script
         started = time.monotonic()
         proc = self.podman.exec_bash(
             self.target_name, script, check=False, timeout=NODE_ADD_TIMEOUT_SECONDS,
@@ -1718,8 +1757,9 @@ class MultiNodeTopology(AioTopology):
             duration=time.monotonic() - started,
             command=script,
         )
-        self.context.evidence_text(f"{self.node_add_evidence_prefix}.stdout.log", outcome.stdout)
-        self.context.evidence_text(f"{self.node_add_evidence_prefix}.stderr.log", outcome.stderr)
+        prefix = evidence_prefix or self.node_add_evidence_prefix
+        self.context.evidence_text(f"{prefix}.stdout.log", outcome.stdout)
+        self.context.evidence_text(f"{prefix}.stderr.log", outcome.stderr)
         return outcome
 
     def evidence(self, outcome: Optional[InstallOutcome] = None) -> Dict[str, Any]:

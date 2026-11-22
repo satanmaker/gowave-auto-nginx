@@ -2119,6 +2119,11 @@ remote_payload() {
         echo "Error: the required-input contract is missing at $preflight_module." >&2
         return 1
     fi
+    local artifact_module="$SCRIPT_DIR/modules/artifact.sh"
+    if [[ ! -f "$artifact_module" ]]; then
+        echo "Error: the pinned-artifact helper is missing at $artifact_module." >&2
+        return 1
+    fi
 
     # Validate node port and warn on host collisions if worker host matches panel IP
     if [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "$panel_ip" ]]; then
@@ -2172,6 +2177,12 @@ remote_payload() {
         # copy of it: the Worker refuses the same values the controller refused
         # because it runs the same function bodies.
         cat "$preflight_module"
+
+        # 1c. The pinned core is fetched and verified by the same body the
+        # controller runs, for the same reason: the Worker's own copy of the
+        # pinned step calls fetch_verified_artifact, and a payload that carried
+        # the call without the helper died on it at the pin.
+        cat "$artifact_module"
 
         # 2. Remote helper functions
         cat <<'RUNNER_FUNCS'
@@ -4918,6 +4929,151 @@ ensure_pinned_xray_core() {
     return 1
 }
 
+# The pinned core is placed before the upstream installer runs, because an
+# executable rw-core is what makes install.sh skip its own api.github.com
+# purchase. The table is a copy of modules/xray_core.sh: this payload is one
+# file streamed over SSH and cannot source modules/.
+GOWAVE_PINNED_XRAY_VERSION="26.11.9"
+GOWAVE_PINNED_XRAY_AMD64_URL="https://github.com/XTLS/Xray-core/releases/download/v26.11.9/Xray-linux-64.zip"
+GOWAVE_PINNED_XRAY_AMD64_SHA256="b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82"
+GOWAVE_PINNED_XRAY_ARM64_URL="https://github.com/XTLS/Xray-core/releases/download/v26.11.9/Xray-linux-arm64-v8a.zip"
+GOWAVE_PINNED_XRAY_ARM64_SHA256="64ed6858982a7f5eb85d88b811089063bd4f17561f4c8f44e0f1dc8e6f6430be"
+
+pinned_xray_artifact() {
+    local version="${1#v}"
+    local arch="$2"
+
+    [[ "$version" == "$GOWAVE_PINNED_XRAY_VERSION" ]] || return 1
+    case "$arch" in
+        amd64) printf '%s %s\n' "$GOWAVE_PINNED_XRAY_AMD64_URL" "$GOWAVE_PINNED_XRAY_AMD64_SHA256" ;;
+        arm64) printf '%s %s\n' "$GOWAVE_PINNED_XRAY_ARM64_URL" "$GOWAVE_PINNED_XRAY_ARM64_SHA256" ;;
+        *) return 1 ;;
+    esac
+}
+
+pinned_xray_arch() {
+    local m
+    m=$(uname -m)
+    case "$m" in
+        x86_64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *)
+            log_err "Unsupported architecture: $m"
+            return 1
+            ;;
+    esac
+}
+
+pinned_xray_fail() {
+    local reason="$1"
+    local artifact="${2:-}"
+    local subject="pinned Xray core $GOWAVE_PINNED_XRAY_VERSION"
+    local opt_out="Set XRAY_SERVER_VERSION=latest to let the upstream installer fetch a core instead."
+
+    if [[ -n "$artifact" ]]; then
+        log_err "$subject could not be installed from $artifact: $reason. $opt_out"
+    else
+        log_err "$subject could not be installed: $reason. $opt_out"
+    fi
+    return 1
+}
+
+pinned_xray_deliver() {
+    local scratch="$1"
+    local install_dir="$2"
+    local url="$3"
+    local digest="$4"
+    local zip="$scratch/Xray.zip"
+    local member="$scratch/xray"
+    local reported=""
+    local fetch_rc=0
+
+    fetch_verified_artifact "$zip" "Xray core $GOWAVE_PINNED_XRAY_VERSION" "$url" "$digest" || fetch_rc=$?
+    if (( fetch_rc == 2 )); then
+        pinned_xray_fail "the archive did not match the pinned SHA-256" "$url"
+        return 1
+    elif (( fetch_rc != 0 )); then
+        pinned_xray_fail "no artifact host delivered the archive" "$url"
+        return 1
+    fi
+
+    if ! python3 - "$zip" "$member" <<'PY'
+import sys
+import zipfile
+
+archive, dest = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(archive) as bundle, bundle.open("xray") as src, open(dest, "wb") as out:
+    out.write(src.read())
+PY
+    then
+        pinned_xray_fail "the archive carries no readable xray member" "$url"
+        return 1
+    fi
+
+    chmod 0755 "$member"
+    reported=$("$member" version 2>/dev/null || true)
+    if ! core_version_matches "$reported" "$GOWAVE_PINNED_XRAY_VERSION"; then
+        pinned_xray_fail "the extracted core reports ${reported:-nothing}, not $GOWAVE_PINNED_XRAY_VERSION" "$url"
+        return 1
+    fi
+
+    mkdir -p "$install_dir"
+    local staged="$install_dir/.rw-core.pinned.$$"
+    rm -f -- "$staged"
+    if ! install -m 0755 -- "$member" "$staged"; then
+        pinned_xray_fail "the verified core could not be staged in $install_dir" "$url"
+        return 1
+    fi
+    sync "$staged" 2>/dev/null || true
+    if ! mv -f -- "$staged" "$install_dir/rw-core"; then
+        rm -f -- "$staged" || true
+        pinned_xray_fail "the verified core could not be installed at $install_dir/rw-core" "$url"
+        return 1
+    fi
+    sync "$install_dir" 2>/dev/null || true
+
+    log_info "Installed pinned Xray core $GOWAVE_PINNED_XRAY_VERSION from $url (SHA-256 $digest)."
+}
+
+install_pinned_xray_core() {
+    local install_dir="${1:?an install directory is required}"
+    local requested="${XRAY_SERVER_VERSION:-}"
+    local version="${requested,,}"
+
+    if [[ -n "$version" ]]; then
+        version="${version#v}"
+        [[ "$version" == "$GOWAVE_PINNED_XRAY_VERSION" ]] || return 0
+    fi
+
+    local arch="" artifact=""
+    if ! arch=$(pinned_xray_arch 2>/dev/null); then
+        pinned_xray_fail "the host architecture is not described by the pin table"
+        return 1
+    fi
+    if ! artifact=$(pinned_xray_artifact "$GOWAVE_PINNED_XRAY_VERSION" "$arch"); then
+        pinned_xray_fail "no artifact is pinned for architecture $arch"
+        return 1
+    fi
+
+    local url="${artifact% *}"
+    local digest="${artifact##* }"
+    local dest="$install_dir/rw-core"
+
+    if [[ -x "$dest" ]]; then
+        local reported
+        reported=$("$dest" version 2>/dev/null || true)
+        if core_version_matches "$reported" "$GOWAVE_PINNED_XRAY_VERSION"; then
+            return 0
+        fi
+    fi
+
+    local scratch rc=0
+    scratch=$(mktemp -d "/tmp/gowave-xray-core-XXXXXX")
+    pinned_xray_deliver "$scratch" "$install_dir" "$url" "$digest" || rc=$?
+    rm -rf -- "$scratch"
+    return "$rc"
+}
+
 # gowave-node resolves the Xray core through one HTTPS GET to api.github.com with
 # a 10-second deadline and no retry of its own, so a single slow answer ends a
 # Worker whose whole provisioning then rolls back. A repeat is the only repair such
@@ -4985,6 +5141,9 @@ run_upstream_node_installer() {
         echo "Fatal: invalid pinned upstream installer SHA256: expected 64-hex digest." >&2
         return 1
     }
+    # The core goes in before the installer is even fetched, so a failed pin
+    # leaves no installer temp file behind.
+    install_pinned_xray_core "/opt/gowave-node" || return 1
     tmp_inst=$(mktemp "/tmp/gowave-node-install-XXXXXX.sh")
     if ! curl -fsSL --retry 2 --connect-timeout 15 --max-time 60 \
         "https://raw.githubusercontent.com/aaaSaZaN/gowave-node/$GOWAVE_NODE_INSTALLER_COMMIT/install.sh" -o "$tmp_inst"; then

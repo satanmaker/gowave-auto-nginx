@@ -3,15 +3,24 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NODE_SH = REPO_ROOT / "modules" / "node.sh"
+XRAY_CORE_SH = REPO_ROOT / "modules" / "xray_core.sh"
+OS_SH = REPO_ROOT / "modules" / "os.sh"
+PANEL_SH = REPO_ROOT / "modules" / "panel.sh"
+ARTIFACT_SH = REPO_ROOT / "modules" / "artifact.sh"
+PREFLIGHT_SH = REPO_ROOT / "modules" / "preflight.sh"
+NODE_AUTO_SH = REPO_ROOT / "gowave-node-auto.sh"
+MATRIX_YAML = REPO_ROOT / "tests" / "cases" / "matrix.yaml"
 
 
 def node_sh_without_bundle(directory: Path) -> Path:
@@ -1789,6 +1798,424 @@ class TestPinnedNodeInstaller(unittest.TestCase):
                     self.assertIn(message, result.stderr)
             self.assertFalse(args_log.exists(), "no download may start before the pin is validated")
             self.assertFalse(dest.exists())
+
+
+class TestPinnedXrayCore(unittest.TestCase):
+    """The pinned core is the bytes the harness, the product and the payload name.
+
+    The pin names the release archive; the installed rw-core is the member
+    extracted from it and has no digest of its own. The arm64 digest is confirmed
+    against the release's published .dgst and has no second in-tree witness, so
+    the guard checks its shape there and does not pretend to compare it to one.
+    """
+
+    VERSION = "26.11.9"
+    MEMBER = "#!/bin/sh\nprintf 'Xray 26.11.9 (Xray, Penetration)\\n'\n"
+    OTHER_MEMBER = "#!/bin/sh\nprintf 'Xray 1.2.3 (Xray, Penetration)\\n'\n"
+
+    # -- fixtures ---------------------------------------------------------
+
+    def _archive(self, directory: Path, member: str = MEMBER) -> tuple[Path, str]:
+        archive = directory / "Xray.zip"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            info = zipfile.ZipInfo("xray")
+            info.external_attr = 0o755 << 16
+            bundle.writestr(info, member)
+        return archive, hashlib.sha256(archive.read_bytes()).hexdigest()
+
+    def _stub_curl(self, directory: Path, archive: Path | None, exit_code: int = 0):
+        bin_dir = directory / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        args_log = directory / "curl-args.txt"
+        lines = ["#!/bin/sh", f'printf \'%s\\n\' "$@" >> "{args_log}"']
+        if exit_code != 0:
+            lines.append(f"exit {exit_code}")
+        else:
+            lines += [
+                'while [ "$#" -gt 0 ]; do',
+                '  if [ "$1" = "-o" ]; then',
+                f'    cp "{archive}" "$2"',
+                "  fi",
+                "  shift",
+                "done",
+            ]
+        curl = bin_dir / "curl"
+        curl.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        curl.chmod(0o755)
+        return bin_dir, args_log
+
+    def _install(self, directory: Path, bin_dir: Path, digest: str, *,
+                 version: str | None = None, install_dir: Path | None = None):
+        env = os.environ.copy()
+        env.pop("XRAY_SERVER_VERSION", None)
+        if version is not None:
+            env["XRAY_SERVER_VERSION"] = version
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+        env["FIXTURE_URL"] = "https://fixture.invalid/Xray-linux-64.zip"
+        env["FIXTURE_SHA"] = digest
+        env["FIXTURE_DIR"] = str(install_dir or (directory / "install"))
+        script = (
+            f'source "{XRAY_CORE_SH}" && '
+            'GOWAVE_PINNED_XRAY_AMD64_URL="$FIXTURE_URL" '
+            'GOWAVE_PINNED_XRAY_AMD64_SHA256="$FIXTURE_SHA" '
+            'install_pinned_xray_core "$FIXTURE_DIR"'
+        )
+        return subprocess.run(["bash", "-c", script], env=env,
+                              capture_output=True, text=True, timeout=120)
+
+    @staticmethod
+    def _urls(args_log: Path) -> list[str]:
+        if not args_log.exists():
+            return []
+        return [line for line in args_log.read_text(encoding="utf-8").splitlines()
+                if line.startswith("https://")]
+
+    def _installed_core(self, directory: Path) -> Path:
+        return directory / "install" / "rw-core"
+
+    # -- delivery --------------------------------------------------------
+
+    def test_a_matching_core_is_not_downloaded_again(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            archive, digest = self._archive(tmp)
+            bin_dir, args_log = self._stub_curl(tmp, archive)
+            install = tmp / "install"
+            install.mkdir()
+            core = install / "rw-core"
+            core.write_text(self.MEMBER, encoding="utf-8")
+            core.chmod(0o755)
+
+            result = self._install(tmp, bin_dir, digest)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self._urls(args_log), [], "a satisfied pin must not download")
+            self.assertEqual(core.read_text(encoding="utf-8"), self.MEMBER)
+
+    def test_a_foreign_core_is_replaced(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            archive, digest = self._archive(tmp)
+            bin_dir, args_log = self._stub_curl(tmp, archive)
+            install = tmp / "install"
+            install.mkdir()
+            core = install / "rw-core"
+            core.write_text(self.OTHER_MEMBER, encoding="utf-8")
+            core.chmod(0o755)
+
+            result = self._install(tmp, bin_dir, digest)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(core.read_text(encoding="utf-8"), self.MEMBER)
+            self.assertEqual(len(self._urls(args_log)), 1)
+            self.assertEqual(core.stat().st_mode & 0o777, 0o755)
+
+    def test_a_digest_mismatch_is_terminal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            archive, _ = self._archive(tmp)
+            bin_dir, args_log = self._stub_curl(tmp, archive)
+
+            result = self._install(tmp, bin_dir, "0" * 64)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("did not match the pinned SHA-256", result.stderr)
+            self.assertFalse(self._installed_core(tmp).exists())
+            self.assertEqual(len(self._urls(args_log)), 1,
+                             "a mismatch is terminal, so only one host may be tried")
+
+    def test_no_host_delivers_the_archive(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            archive, digest = self._archive(tmp)
+            bin_dir, _ = self._stub_curl(tmp, archive, exit_code=1)
+
+            result = self._install(tmp, bin_dir, digest)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("no artifact host delivered the archive", result.stderr)
+            self.assertFalse(self._installed_core(tmp).exists())
+
+    def test_a_member_reporting_another_version_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            archive, digest = self._archive(tmp, member=self.OTHER_MEMBER)
+            bin_dir, _ = self._stub_curl(tmp, archive)
+
+            result = self._install(tmp, bin_dir, digest)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("the extracted core reports", result.stderr)
+            self.assertIn("Xray 1.2.3", result.stderr)
+            self.assertFalse(self._installed_core(tmp).exists())
+
+    def test_the_pin_and_its_aliases_are_delivered_once(self):
+        for version in (None, "26.11.9", "v26.11.9"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                archive, digest = self._archive(tmp)
+                bin_dir, args_log = self._stub_curl(tmp, archive)
+
+                result = self._install(tmp, bin_dir, digest, version=version)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self._installed_core(tmp).read_text(encoding="utf-8"),
+                                 self.MEMBER)
+                self.assertEqual(len(self._urls(args_log)), 1)
+                self.assertIn(f"Installed pinned Xray core {self.VERSION}", result.stdout)
+                self.assertIn(digest, result.stdout)
+
+    def test_latest_and_foreign_versions_download_nothing(self):
+        for version in ("latest", "vlatest", "1.2.3", "v1.2.3"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                archive, digest = self._archive(tmp)
+                bin_dir, args_log = self._stub_curl(tmp, archive)
+
+                result = self._install(tmp, bin_dir, digest, version=version)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self._urls(args_log), [])
+                self.assertFalse(self._installed_core(tmp).exists())
+
+    def test_an_unsupported_architecture_abstains_and_names_the_opt_out(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            archive, digest = self._archive(tmp)
+            bin_dir, args_log = self._stub_curl(tmp, archive)
+            uname = bin_dir / "uname"
+            uname.write_text("#!/bin/sh\necho riscv64\n", encoding="utf-8")
+            uname.chmod(0o755)
+
+            result = self._install(tmp, bin_dir, digest)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("riscv64", result.stderr)
+            self.assertIn("XRAY_SERVER_VERSION=latest", result.stderr)
+            self.assertNotIn("https://", result.stderr,
+                             "no artifact exists for this architecture, so none is named")
+            self.assertFalse(self._installed_core(tmp).exists())
+            self.assertEqual(self._urls(args_log), [])
+
+    # -- parity with the payload and the acceptance matrix ----------------
+
+    @staticmethod
+    def _assignments(text: str) -> dict[str, str]:
+        return dict(re.findall(r'^(GOWAVE_PINNED_XRAY_[A-Z0-9_]+)="([^"]*)"$', text, re.M))
+
+    @staticmethod
+    def _matrix_artifact(text: str) -> dict[str, str]:
+        start = text.index("- id: xray")
+        end = text.find("\n  - id:", start)
+        block = text[start:end if end != -1 else len(text)]
+        url = re.search(r"^\s+url: (\S+)$", block, re.M)
+        sha = re.search(r'^\s+sha256: "?([0-9a-f]{64})"?$', block, re.M)
+        if url is None or sha is None:
+            raise AssertionError("the matrix has no xray artifact url/sha256")
+        return {"url": url.group(1), "sha256": sha.group(1)}
+
+    def _parity_problems(self, module_text: str, payload_text: str,
+                         matrix_text: str) -> list[str]:
+        module = self._assignments(module_text)
+        payload = self._assignments(payload_text)
+        matrix = self._matrix_artifact(matrix_text)
+        problems = []
+
+        for arch in ("AMD64", "ARM64"):
+            for field in ("URL", "SHA256"):
+                key = f"GOWAVE_PINNED_XRAY_{arch}_{field}"
+                if module.get(key) != payload.get(key):
+                    problems.append(
+                        f"{key}: module={module.get(key)!r} payload={payload.get(key)!r}")
+        version = module.get("GOWAVE_PINNED_XRAY_VERSION")
+        if payload.get("GOWAVE_PINNED_XRAY_VERSION") != version:
+            problems.append("the pinned version differs between the product copies")
+        if not version or f"/v{version}/" not in matrix["url"]:
+            problems.append("the matrix url does not name the pinned version")
+        if matrix["url"] != module.get("GOWAVE_PINNED_XRAY_AMD64_URL"):
+            problems.append("the matrix url differs from the amd64 row")
+        if matrix["sha256"] != module.get("GOWAVE_PINNED_XRAY_AMD64_SHA256"):
+            problems.append("the matrix digest differs from the amd64 row")
+        if "arm64" not in module.get("GOWAVE_PINNED_XRAY_ARM64_URL", ""):
+            problems.append("the arm64 row does not name arm64")
+        if not re.fullmatch(r"[0-9a-f]{64}",
+                            module.get("GOWAVE_PINNED_XRAY_ARM64_SHA256", "")):
+            problems.append("the arm64 row has no 64-hex digest")
+        return problems
+
+    def test_the_product_and_the_matrix_name_the_same_amd64_bytes(self):
+        problems = self._parity_problems(
+            XRAY_CORE_SH.read_text(encoding="utf-8"),
+            NODE_AUTO_SH.read_text(encoding="utf-8"),
+            MATRIX_YAML.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(problems, [])
+
+    def test_the_parity_guard_fails_on_its_own_damage(self):
+        module_text = XRAY_CORE_SH.read_text(encoding="utf-8")
+        payload_text = NODE_AUTO_SH.read_text(encoding="utf-8")
+        matrix_text = MATRIX_YAML.read_text(encoding="utf-8")
+        digest = self._assignments(module_text)["GOWAVE_PINNED_XRAY_AMD64_SHA256"]
+        matrix_sha = self._matrix_artifact(matrix_text)["sha256"]
+        flipped = ("0" if digest[0] != "0" else "1") + digest[1:]
+        matrix_flipped = ("0" if matrix_sha[0] != "0" else "1") + matrix_sha[1:]
+
+        damaged = {
+            "module": (module_text.replace(digest, flipped, 1), payload_text, matrix_text),
+            "payload": (module_text, payload_text.replace(digest, flipped, 1), matrix_text),
+            "matrix": (module_text, payload_text,
+                       matrix_text.replace(matrix_sha, matrix_flipped, 1)),
+        }
+        for name, texts in damaged.items():
+            with self.subTest(damaged=name):
+                self.assertNotEqual(self._parity_problems(*texts), [],
+                                    f"a one-character change in the {name} must be caught")
+
+    def test_detect_arch_lives_in_os_and_keeps_reaching_panel_callers(self):
+        os_text = OS_SH.read_text(encoding="utf-8")
+        panel_text = PANEL_SH.read_text(encoding="utf-8")
+        self.assertEqual(os_text.count("detect_arch() {"), 1)
+        self.assertIn("/os.sh", panel_text)
+        self.assertNotIn("detect_arch() {", panel_text)
+
+        for machine, expected in (("x86_64", "amd64"), ("aarch64", "arm64"),
+                                  ("arm64", "arm64")):
+            with self.subTest(machine=machine), tempfile.TemporaryDirectory() as tmpdir:
+                tmp = Path(tmpdir)
+                bin_dir = tmp / "bin"
+                bin_dir.mkdir()
+                uname = bin_dir / "uname"
+                uname.write_text(f"#!/bin/sh\necho {machine}\n", encoding="utf-8")
+                uname.chmod(0o755)
+                env = os.environ.copy()
+                env["PATH"] = f"{bin_dir}:{env['PATH']}"
+                result = subprocess.run(
+                    ["bash", "-c", f'source "{PANEL_SH}" && detect_arch'],
+                    env=env, capture_output=True, text=True, timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bin_dir = tmp / "bin"
+            bin_dir.mkdir()
+            uname = bin_dir / "uname"
+            uname.write_text("#!/bin/sh\necho riscv64\n", encoding="utf-8")
+            uname.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            result = subprocess.run(
+                ["bash", "-c", f'source "{PANEL_SH}" && detect_arch'],
+                env=env, capture_output=True, text=True, timeout=60,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("riscv64", result.stderr)
+
+    # -- source order ----------------------------------------------------
+
+    @staticmethod
+    def _function_slice(text: str, header: str) -> str:
+        start = text.index(header)
+        end = text.index("\n}\n", start) + len("\n}\n")
+        return text[start:end]
+
+    @staticmethod
+    def _order_problems(body: str, anchors: tuple[str, ...]) -> list[str]:
+        call = body.find("install_pinned_xray_core")
+        if call < 0:
+            return ["the pinned-core call is missing"]
+        problems = []
+        for anchor in anchors:
+            position = body.find(anchor)
+            if position < 0:
+                problems.append(f"anchor missing: {anchor}")
+            elif position < call:
+                problems.append(f"the pinned-core call follows {anchor}")
+        return problems
+
+    MODULE_ANCHORS = ("run_node_installer_with_retry",
+                      "raw.githubusercontent.com/aaaSaZaN/gowave-node/main/install.sh")
+    PAYLOAD_ANCHORS = ("run_node_installer_with_retry", "tmp_inst=$(mktemp")
+
+    def test_the_module_call_precedes_both_installers_inside_the_restart_branch(self):
+        body = self._function_slice(NODE_SH.read_text(encoding="utf-8"),
+                                    "install_local_node() {")
+        branch = body.index("if (( node_restart_required == 1 )); then")
+        call = body.index("install_pinned_xray_core")
+        self.assertLess(branch, call, "the call must sit inside the restart branch")
+        self.assertEqual(self._order_problems(body, self.MODULE_ANCHORS), [])
+        self.assertEqual(body.count("install_pinned_xray_core"), 1)
+
+    def test_the_payload_installs_python_before_the_step_can_run(self):
+        text = NODE_AUTO_SH.read_text(encoding="utf-8")
+        self.assertLess(text.index("setup_system_prereqs </dev/null"),
+                        text.index("run_upstream_node_installer </dev/null"),
+                        "python3 must be installed before the pinned step unpacks the archive")
+
+    def test_the_payload_call_precedes_the_installer_and_appears_once(self):
+        body = self._function_slice(NODE_AUTO_SH.read_text(encoding="utf-8"),
+                                    "run_upstream_node_installer() {")
+        self.assertEqual(self._order_problems(body, self.PAYLOAD_ANCHORS), [])
+        self.assertEqual(body.count("install_pinned_xray_core"), 1)
+
+    def test_the_order_guard_fails_when_the_call_moves_after_its_anchor(self):
+        body = self._function_slice(NODE_SH.read_text(encoding="utf-8"),
+                                    "install_local_node() {")
+        moved = body.replace("install_pinned_xray_core", "# placeholder", 1)
+        moved += "\ninstall_pinned_xray_core \"$GOWAVE_NODE_INSTALL_DIR\"\n"
+        self.assertNotEqual(self._order_problems(moved, self.MODULE_ANCHORS), [])
+
+    # -- the helper the payload's pinned step calls ----------------------
+
+    @staticmethod
+    def _heredoc(text: str, marker: str) -> str:
+        start = text.index(f"cat <<'{marker}'\n") + len(f"cat <<'{marker}'\n")
+        return text[start:text.index(f"\n{marker}\n", start)]
+
+    def _composed_payload(self, with_artifact: bool = True) -> str:
+        """The streamed Worker payload, assembled the way ``remote_payload`` does.
+
+        The two modules travel as their own text and the runner functions and
+        the entrypoint travel as heredocs, so a function the pinned step calls
+        resolves only when every part of the composition is present.
+        """
+        text = NODE_AUTO_SH.read_text(encoding="utf-8")
+        parts = [PREFLIGHT_SH.read_text(encoding="utf-8")]
+        if with_artifact:
+            parts.append(ARTIFACT_SH.read_text(encoding="utf-8"))
+        parts += [self._heredoc(text, "RUNNER_FUNCS"), self._heredoc(text, "REMOTE_EOF")]
+        return "\n".join(parts).replace(
+            'main "$@" </dev/null',
+            "declare -F fetch_verified_artifact install_pinned_xray_core pinned_xray_deliver",
+        )
+
+    def test_the_payload_carries_the_artifact_helper_as_its_module(self):
+        text = NODE_AUTO_SH.read_text(encoding="utf-8")
+        self.assertEqual(text.count("fetch_verified_artifact() {"), 0,
+                         "the payload must not carry its own copy of the helper")
+        self.assertIn('artifact_module="$SCRIPT_DIR/modules/artifact.sh"', text)
+        self.assertEqual(text.count('cat "$artifact_module"'), 1)
+
+    def test_the_artifact_helper_is_defined_before_the_functions_that_call_it(self):
+        text = NODE_AUTO_SH.read_text(encoding="utf-8")
+        self.assertLess(text.index('cat "$artifact_module"'),
+                        text.index("cat <<'RUNNER_FUNCS'"))
+
+    def test_the_composed_payload_resolves_every_function_its_pinned_step_calls(self):
+        result = subprocess.run(["bash", "-s"], input=self._composed_payload(),
+                                capture_output=True, text=True, timeout=180)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("fetch_verified_artifact", "install_pinned_xray_core",
+                     "pinned_xray_deliver"):
+            self.assertIn(name, result.stdout.split())
+
+    def test_the_composition_guard_fails_without_the_helper(self):
+        result = subprocess.run(["bash", "-s"],
+                                input=self._composed_payload(with_artifact=False),
+                                capture_output=True, text=True, timeout=180)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("fetch_verified_artifact", result.stdout.split())
 
 
 class TestLocalNodeIdempotency(unittest.TestCase):

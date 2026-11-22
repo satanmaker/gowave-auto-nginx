@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # its own; every module tolerates a second sourcing.
 source "$SCRIPT_DIR/modules/tempdir.sh"
 source "$SCRIPT_DIR/modules/artifact.sh"
+source "$SCRIPT_DIR/modules/xray_core.sh"
 GOWAVE_NODE_INSTALL_DIR="/opt/gowave-node"
 DEFAULT_NODE_PORT=3002
 
@@ -30,19 +31,6 @@ extract_secret_key() {
 
     # Print strictly the secret key to stdout
     printf '%s' "$secret"
-}
-
-core_version_matches() {
-    local reported="${1:-}"
-    local expected="${2:-}"
-    [[ -n "$expected" ]] || return 1
-    local token
-    for token in $reported; do
-        if [[ "$token" == "$expected" ]]; then
-            return 0
-        fi
-    done
-    return 1
 }
 
 ensure_pinned_xray_core() {
@@ -292,6 +280,10 @@ install_local_node() {
     fi
 
     if (( node_restart_required == 1 )); then
+        # Place the pinned core before the installer runs: an executable rw-core
+        # is what makes install.sh skip its own api.github.com core purchase.
+        install_pinned_xray_core "$GOWAVE_NODE_INSTALL_DIR" || return 1
+
         # Resolve the pinned installer only when the node actually has to restart,
         # so a serving node never triggers a pointless download.
         if [[ -z "$upstream_installer" && "$require_pinned_installer" == "1" ]]; then
