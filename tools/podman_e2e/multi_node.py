@@ -71,6 +71,10 @@ SSH_KEY_CASE_ID = "MN-SSHKEY"
 MATRIX_CASE_ID = "MN-MATRIX"
 EGRESS_CASE_ID = "MN-EGRESS"
 ENV_CONTRACT_CASE_ID = "MN-ENV-CONTRACT"
+# Partial success: one Worker fails, another succeeds, Panel continues.
+PARTIAL_SUCCESS_CASE_ID = "MN-PARTIAL-SUCCESS"
+# Add-node refused by Panel API verification failure.
+ADD_NODE_REFUSED_CASE_ID = "MN-ADD-NODE-REFUSED"
 # One requirement, one case id: the AIO suite runs the same contract on its own
 # host, and a cluster runs it on both roles.
 NGINX_CONFIG_CASE_ID = aio.NGX_CONFIG_CASE_ID
@@ -426,6 +430,12 @@ DUPLICATE_ADD_TIMEOUT_SECONDS = 300
 # by the probe's own timeout rather than by the deployment's.
 DUPLICATE_ADD_CASE_TIMEOUT_SECONDS = 900
 DUPLICATE_ADD_REFUSAL = "Worker name is already registered in state.json"
+
+# The two wizard-orchestration cases below run no Worker deployment: one stubs
+# the SSH onboarding at that boundary and the other points the flow at an
+# address nothing answers on. The ceiling is a hang guard, not a deployment
+# budget, so it stays far below the `node add` allowance.
+WIZARD_OFFLINE_TIMEOUT_SECONDS = 300
 
 NODE_PORT = 3002
 
@@ -2165,106 +2175,580 @@ def case_worker_registration(product: MultiNodeProduct) -> Dict[str, Any]:
     return evidence
 
 
-def case_env_contract(product: MultiNodeProduct) -> Dict[str, Any]:
-    """``MN-ENV-CONTRACT``: a Worker onboarded through the environment contract is registered correctly.
+ENV_CONTRACT_UNDO_SCRIPT = """
+import json, sys
+sys.path.insert(0, {repo!r})
+from modules.recovery import write_journal_atomically
+from modules.api_client import rollback_provisioning
 
-    The node add command accepts all seven inputs via environment variables
-    (GOWAVE_NODE_NAME, GOWAVE_NODE_IP, GOWAVE_WORKER_DOMAIN, GOWAVE_REALITY_DOMAIN,
-    GOWAVE_SSH_USER, GOWAVE_SSH_PORT, GOWAVE_VISION_DOMAIN). This case provisions
-    a second Worker using only the environment contract and verifies the Panel's
-    host record matches the inputs.
+journal_path, state_path, credentials, node_name = sys.argv[1:5]
+
+def read(path):
+    with open(path, encoding="utf-8") as stream:
+        return json.load(stream)
+
+journal = read(journal_path)
+# Only this case's own transaction is undone. A journal naming the pair's Worker
+# is the record the later cases read, and undoing that one would delete the node
+# the suite is about.
+if journal.get("state") != "NODE_ADD_COMMITTED" or journal.get("node_name") != node_name:
+    print(json.dumps({{
+        "refused": True,
+        "state": journal.get("state"),
+        "node_name": journal.get("node_name"),
+    }}, sort_keys=True))
+    raise SystemExit(3)
+
+# ``rollback_provisioning`` refuses a committed transaction by design. The label
+# is moved to the state that compensation reads, the shipped undo path runs, and
+# the case restores the journal's bytes afterwards, so nothing of this rewind
+# survives it.
+journal["state"] = "NODE_ADD_VERIFYING"
+write_journal_atomically(journal_path, journal)
+rolled_back = rollback_provisioning(journal_path, state_path, credentials)
+print(json.dumps({{
+    "refused": False,
+    "rolled_back": bool(rolled_back),
+    "state_after": read(journal_path).get("state"),
+}}, sort_keys=True))
+raise SystemExit(0 if rolled_back else 1)
+"""
+
+
+def env_contract_add_script(
+    name: str, address: str, worker_domain: str, reality_domain: str,
+) -> str:
+    """The operator's own ``node add`` with every input taken from the environment.
+
+    No positional argument is passed, so a Panel record carrying this name, address
+    and domains is evidence that the seven variables, and not argv defaults,
+    carried the values. The Vision name is exported empty on purpose: this node
+    publishes no Vision inbound, and asking for the run's Vision name would make
+    the second host compete with the Worker for a certificate that name answers for.
+    """
+    return (
+        f"export GOWAVE_NODE_NAME='{name}'\n"
+        f"export GOWAVE_NODE_IP='{address}'\n"
+        f"export GOWAVE_WORKER_DOMAIN='{worker_domain}'\n"
+        f"export GOWAVE_REALITY_DOMAIN='{reality_domain}'\n"
+        "export GOWAVE_SSH_USER='root'\n"
+        "export GOWAVE_SSH_PORT='22'\n"
+        "export GOWAVE_VISION_DOMAIN=''\n"
+        f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node add\n"
+    )
+
+
+def env_contract_undo_command(node_name: str) -> str:
+    arguments = " ".join(
+        shlex.quote(value) for value in (
+            NODE_ADD_JOURNAL, NODE_ADD_STATE, aio.CREDENTIALS_FILE, node_name,
+        )
+    )
+    script = ENV_CONTRACT_UNDO_SCRIPT.format(repo=topology.REPO_IN_CONTAINER)
+    return (
+        f"PYTHONPATH={topology.REPO_IN_CONTAINER} "
+        f"python3 - {arguments} <<'PY'\n{script}\nPY\n"
+    )
+
+
+def case_env_contract(product: MultiNodeProduct) -> Dict[str, Any]:
+    """``MN-ENV-CONTRACT``: the environment contract alone registers a Worker.
+
+    ``node add`` takes all seven inputs from ``GOWAVE_*`` variables. Nothing here is
+    positional, so a Panel record carrying this case's name, address and domains is
+    evidence that the variables reached the registration.
+
+    The registration needs a host the pair does not hold. The Panel keys a node by
+    its address, so re-registering the Worker's own address is refused — that
+    refusal is ``MN-DUP-ADD``'s subject, and this case was reaching it by accident:
+    it asked the Panel for ``worker-env`` at the Worker's address, got ``HTTP 400``,
+    and left the failed transaction's journal behind for a dozen later cases to
+    read.
+
+    So the case starts a clean Worker of its own, registers it, and takes it back
+    out again. The pair's inventory, its ``state.json`` and its recovery journal are
+    what the later cases read, and each is asserted to be exactly what it was: the
+    undo is the product's own ``rollback_provisioning``, reached by moving the
+    journal from the committed label to the one that compensation reads, and the
+    opened bytes of both record files are put back afterwards.
     """
     import time
 
+    case_id = ENV_CONTRACT_CASE_ID
     host = product.require_installed()
-
-    # Use a unique worker name for the environment contract test to avoid
-    # conflict with the regular node add (WRK-04) which uses WORKER_NODE_NAME.
+    master = host.target_name
     env_worker_name = "worker-env"
+    address = str(host.plan.second_node_ip)
+    worker_domain = SECOND_WORKER_DOMAIN
+    reality_domain = SECOND_WORKER_REALITY_DOMAIN
+    container = host.context.resource_name("worker-env")
 
-    # Build the node add command using environment variables instead of positional arguments
-    env_script = (
-        f"export GOWAVE_NODE_NAME='{env_worker_name}'\n"
-        f"export GOWAVE_NODE_IP='{host.plan.worker_ip}'\n"
-        f"export GOWAVE_WORKER_DOMAIN='{host.worker_domain}'\n"
-        f"export GOWAVE_REALITY_DOMAIN='{host.worker_reality_domain}'\n"
-        f"export GOWAVE_SSH_USER='root'\n"
-        f"export GOWAVE_SSH_PORT='22'\n"
-        f"export GOWAVE_VISION_DOMAIN='{host.worker_vision_domain}'\n"
-        f"bash {REPO_IN_CONTAINER}/gowave-auto.sh node add\n"
+    surface_before = product.panel_surface(case_id).get("surface") or {}
+    inventory_before = panel_inventory(surface_before)
+    record_before = aio.probe_json(
+        case_id, "the Master's registration record before the case",
+        product.podman.exec_bash(master, duplicate_add_state_command(), check=False, timeout=120),
+    )
+    journal_before = product.podman.exec(
+        master, ["cat", NODE_ADD_JOURNAL], check=False,
+    ).stdout
+    state_before = product.podman.exec(master, ["cat", NODE_ADD_STATE], check=False).stdout
+    require(
+        case_id,
+        bool(journal_before) and bool(state_before),
+        "the pair has no registration record to put back: "
+        f"{NODE_ADD_JOURNAL} and {NODE_ADD_STATE} must both exist",
+    )
+    zone_before = json.loads(host.dns_zone_file().read_text(encoding="utf-8"))
+    # The trust the harness pins for the second address is the case's own, and a
+    # known_hosts entry for a container that no longer exists would be a key the
+    # next case's pin of that address contradicts.
+    known_hosts_path = "/root/.ssh/known_hosts"
+    known_hosts_before = product.podman.exec(
+        master, ["cat", known_hosts_path], check=False,
+    ).stdout
+
+    def stop_host() -> None:
+        product.podman.stop(container)
+        product.podman.remove(container)
+
+    def restore_record() -> Dict[str, Any]:
+        """Put the pair's record files back and report the digests that follow."""
+        for path, content in (
+            (NODE_ADD_JOURNAL, journal_before), (NODE_ADD_STATE, state_before),
+            (known_hosts_path, known_hosts_before),
+        ):
+            product.podman.exec(
+                master,
+                ["bash", "-c", f"umask 077; cat > {shlex.quote(path)}"],
+                input_text=content,
+                timeout=120,
+            )
+        return aio.probe_json(
+            case_id, "the Master's registration record after the case",
+            product.podman.exec_bash(master, duplicate_add_state_command(), check=False, timeout=120),
+        )
+
+    evidence = {
+        "env_worker_name": env_worker_name,
+        "env_worker_address": address,
+        "worker_endpoint": f"{address}:{NODE_PORT}",
+        "node_add_command": "gowave-auto.sh node add (via environment variables)",
+        "environment_contract_used": True,
+        "panel_inventory_before": inventory_before,
+    }
+
+    try:
+        evidence["second_worker"] = host.start_secondary_worker(
+            container, address, (worker_domain, reality_domain),
+        )
+        evidence["second_worker"]["trust"] = host.pin_secondary_trust(container, address)
+
+        zone = copy.deepcopy(zone_before)
+        records = zone.setdefault("records", {})
+        records[worker_domain] = {"A": [address]}
+        records[reality_domain] = {"A": [address]}
+        records.pop(SECOND_WORKER_VISION_DOMAIN, None)
+        host.write_dns_zone(zone)
+        resolution = aio.probe_json(
+            case_id, "the Master's answer for the second node's names",
+            product.podman.exec_bash(master, name_resolution_command(), check=False, timeout=120),
+        )
+        evidence["second_worker"]["resolved"] = resolution
+        require(
+            case_id,
+            address in (resolution.get(worker_domain) or []),
+            f"the second Worker's name {worker_domain} does not answer with {address}: "
+            f"{resolution.get(worker_domain)!r}",
+        )
+
+        script = env_contract_add_script(
+            env_worker_name, address, worker_domain, reality_domain,
+        )
+        started = time.monotonic()
+        proc = product.podman.exec_bash(
+            master, script, check=False, timeout=NODE_ADD_TIMEOUT_SECONDS,
+        )
+        outcome = topology.InstallOutcome(
+            returncode=proc.returncode,
+            stdout=proc.stdout or "",
+            stderr=proc.stderr or "",
+            duration=time.monotonic() - started,
+            command="gowave-auto.sh node add (via environment variables)",
+        )
+        product.context.evidence_text("mn-node-add-env-contract.stdout.log", outcome.stdout)
+        product.context.evidence_text("mn-node-add-env-contract.stderr.log", outcome.stderr)
+        evidence["node_add_returncode"] = outcome.returncode
+        evidence["node_add_duration_seconds"] = (
+            round(outcome.duration, 1) if outcome.duration else 0
+        )
+        require(
+            case_id,
+            outcome.ok,
+            f"node add with environment contract failed with exit {outcome.returncode}:\n"
+            f"{outcome.tail(6000)}",
+        )
+
+        observed = product.wait_for_nodes(case_id, expected=3)
+        surface = product.panel_surface(case_id).get("surface") or {}
+        nodes = surface.get("nodes") or {}
+        hosts = surface.get("hosts") or {}
+        names = nodes.get("names") or []
+        endpoints = nodes.get("endpoints") or []
+        connected = nodes.get("connected") or {}
+        evidence["panel_nodes"] = observed.get("nodes", {})
+        evidence["panel_node_names"] = names
+        evidence["panel_node_endpoints"] = endpoints
+        evidence["panel_node_connected"] = connected
+        evidence["panel_hosts"] = {
+            "count": hosts.get("count"),
+            "security_layers": hosts.get("security_layers"),
+            "fingerprints": hosts.get("fingerprints"),
+        }
+        evidence["unauthenticated_nodes_status"] = surface.get("unauthenticated_nodes_status")
+        require(
+            case_id,
+            env_worker_name in names,
+            f"the Panel reports nodes {names or 'none'}, and none of them is the "
+            f"environment contract Worker {env_worker_name!r}",
+        )
+        require(
+            case_id,
+            evidence["worker_endpoint"] in endpoints,
+            f"the Panel reports endpoints {endpoints or 'none'} instead of registering the "
+            f"Worker at {evidence['worker_endpoint']}",
+        )
+        require(
+            case_id,
+            connected.get(env_worker_name) is True,
+            f"the Panel reports the Worker as {connected.get(env_worker_name)!r} "
+            f"rather than connected; observed {connected}",
+        )
+        require(
+            case_id,
+            hosts.get("count", 0) >= 3,
+            f"the Panel publishes {hosts.get('count')!r} hosts instead of one per node",
+        )
+    except BaseException as primary:
+        # A case that fails before its cleanup leaves a third node in a pair the
+        # remaining cases read, so the undo runs on the failure path too, and its
+        # own failure is reported beside the original one.
+        try:
+            stop_host()
+            product.podman.exec_bash(
+                master, env_contract_undo_command(env_worker_name),
+                check=False, timeout=NODE_ADD_TIMEOUT_SECONDS,
+            )
+            host.write_dns_zone(zone_before)
+            restore_record()
+        except Exception as secondary:
+            raise AssertionError(
+                f"{primary} — and the cleanup after it failed as well: {secondary}"
+            ) from primary
+        raise
+
+    stop_host()
+    undo_proc = product.podman.exec_bash(
+        master, env_contract_undo_command(env_worker_name),
+        check=False, timeout=NODE_ADD_TIMEOUT_SECONDS,
+    )
+    try:
+        undo = json.loads(undo_proc.stdout or "")
+    except json.JSONDecodeError:
+        undo = {"output": (undo_proc.stdout or undo_proc.stderr or "").strip()[-1500:]}
+    require(
+        case_id,
+        undo.get("refused") is False and undo.get("rolled_back") is True,
+        f"the product's compensation did not undo the registration (exit "
+        f"{undo_proc.returncode}): {undo}",
+    )
+    host.write_dns_zone(zone_before)
+    record_after = restore_record()
+    require(
+        case_id,
+        record_after.get("state_digest") == record_before.get("state_digest"),
+        f"the pair's state.json is not the file this case started with: {record_after}",
+    )
+    require(
+        case_id,
+        record_after.get("journal_digest") == record_before.get("journal_digest"),
+        f"the pair's recovery journal is not the one this case started with: {record_after}",
+    )
+    require(
+        case_id,
+        record_after.get("journal_state") == record_before.get("journal_state")
+        and record_after.get("journal_node_name") == record_before.get("journal_node_name"),
+        f"the restored journal reads {record_after.get('journal_state')!r} for "
+        f"{record_after.get('journal_node_name')!r} instead of "
+        f"{record_before.get('journal_state')!r} for "
+        f"{record_before.get('journal_node_name')!r}",
+    )
+    known_hosts_after = product.podman.exec(
+        master, ["cat", known_hosts_path], check=False,
+    ).stdout
+    require(
+        case_id,
+        known_hosts_after == known_hosts_before,
+        "the Master's known_hosts still carries the second address: "
+        f"it was {known_hosts_before.strip().splitlines()[-3:]} and is now "
+        f"{known_hosts_after.strip().splitlines()[-3:]}",
+    )
+    inventory_after = panel_inventory(product.panel_surface(case_id).get("surface") or {})
+    require(
+        case_id,
+        inventory_after == inventory_before,
+        f"the Panel's inventory is not what it was before the case: it was "
+        f"{inventory_before} and is now {inventory_after}",
+    )
+    restored = product.wait_for_nodes(case_id, expected=2)
+    evidence["cleanup"] = {
+        "container_removed": container not in {
+            str(item.get("name") or "") for item in product.podman.run_containers()
+        },
+        "undo": undo,
+        "state_digest_restored": record_after.get("state_digest")
+        == record_before.get("state_digest"),
+        "journal_digest_restored": record_after.get("journal_digest")
+        == record_before.get("journal_digest"),
+        "known_hosts_restored": known_hosts_after == known_hosts_before,
+        "inventory_restored": True,
+        "nodes_after": restored.get("nodes", {}),
+    }
+    evidence["panel_inventory_after"] = inventory_after
+    return evidence
+
+
+def partial_success_script(success_name: str, failed_name: str) -> str:
+    """The wizard's own onboarding loop, given one Worker that fails and one that does not.
+
+    ``wizard_onboard_nodes`` is the subject: it is the code that decides whether a
+    single failed Worker is fatal, prints the per-node summary and offers the
+    retry. Only the SSH hop is replaced — the stub answers the same ``PHASE:``
+    markers and the same catalog message the real onboarding emits, so the phase
+    and the diagnostic the summary prints are read from the shape the shipped
+    code produces rather than from a structure invented here.
+    """
+    return "\n".join([
+        "set -Eeuo pipefail",
+        f"source {topology.REPO_IN_CONTAINER}/gowave-auto.sh",
+        "trap - ERR",
+        "set +e",
+        "GOWAVE_STATE_DIR=$(mktemp -d)",
+        "export GOWAVE_STATE_DIR",
+        f"GOWAVE_PLAN_NODE_NAMES=('{success_name}' '{failed_name}')",
+        "GOWAVE_PLAN_NODE_CAMOUFLAGE=('cam-success.example' 'cam-failure.example')",
+        "GOWAVE_PLAN_NODE_VISION=('' '')",
+        "ssh_bootstrap_onboard_one() {",
+        "  case \"$1\" in",
+        f"    {success_name}) printf '==> Onboarding %s\\n' \"$1\"; return 0 ;;",
+        f"    {failed_name}) printf 'PHASE:scan\\n' >&2;",
+        "      printf 'Could not read the SSH host key of %s.\\n' \"$1\" >&2;",
+        "      return 1 ;;",
+        "  esac",
+        "  return 1",
+        "}",
+        # A single failed node makes the skip option choice 2.
+        "wizard_onboard_nodes <<< '2'",
+        "rc=$?",
+        "printf 'GOWAVE_ONBOARD_EXIT=%d\\n' \"$rc\"",
+        "exit \"$rc\"",
+    ])
+
+
+def case_partial_success(product: MultiNodeProduct) -> Dict[str, Any]:
+    """``MN-PARTIAL-SUCCESS``: one Worker fails, its sibling still counts, and the code says so.
+
+    What the deployment already proved — a real Panel, a real Worker registered
+    and connected — is read back from the Panel. This case adds the branch that
+    the install path only reaches when a Worker is broken: the failed node has to
+    be named with its phase and diagnostic, the successful one has to stay a
+    success, the retry has to be offered for the failed node alone, and the
+    command has to exit with the partial-success code instead of reporting a
+    clean install or a total failure.
+    """
+    facts = product.panel_surface(PARTIAL_SUCCESS_CASE_ID)
+    nodes = (facts.get("surface") or {}).get("nodes") or {}
+    connected = nodes.get("connected") or {}
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        topology.WORKER_NODE_NAME in (nodes.get("names") or []),
+        f"the deployed Worker {topology.WORKER_NODE_NAME!r} is absent before the partial run, "
+        f"so a surviving sibling cannot be observed: {nodes.get('names')!r}",
     )
 
-    # Run node add with environment variables
+    failed_name = "worker-2"
+    script = partial_success_script(topology.WORKER_NODE_NAME, failed_name)
     started = time.monotonic()
     proc = product.podman.exec_bash(
-        host.target_name, env_script, check=False, timeout=NODE_ADD_TIMEOUT_SECONDS,
+        product.require_installed().target_name, script, check=False,
+        timeout=WIZARD_OFFLINE_TIMEOUT_SECONDS,
     )
-    outcome = InstallOutcome(
+    outcome = topology.InstallOutcome(
         returncode=proc.returncode,
         stdout=proc.stdout or "",
         stderr=proc.stderr or "",
         duration=time.monotonic() - started,
-        command="gowave-auto.sh node add (via environment variables)",
+        command=script,
     )
+    output = f"{outcome.stdout}\n{outcome.stderr}"
 
     require(
-        ENV_CONTRACT_CASE_ID,
-        outcome.ok,
-        f"node add with environment contract failed with exit {outcome.returncode}:\n{outcome.tail(6000)}",
+        PARTIAL_SUCCESS_CASE_ID,
+        outcome.returncode == 2,
+        f"one failed Worker and one successful sibling must exit 2, the partial-success code "
+        f"distinct from a clean install (0) and from a failed Panel deployment (1); the "
+        f"command exited {outcome.returncode}:\n{output[-4000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        f"{topology.WORKER_NODE_NAME}: success" in output,
+        f"the per-node summary lost the successful sibling:\n{output[-4000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        f"{failed_name}: failed" in output,
+        f"the per-node summary lost the failed Worker:\n{output[-4000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        "phase: scan" in output,
+        f"the failed Worker is recorded without the phase that failed:\n{output[-4000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        f"reason: Could not read the SSH host key of {failed_name}." in output,
+        f"the failed Worker is recorded without its diagnostic:\n{output[-4000:]}",
     )
 
-    # Verify the Panel surface shows the correct host record
-    observed = product.wait_for_nodes(ENV_CONTRACT_CASE_ID, expected=3)  # Master + 2 Workers
-    facts = product.panel_surface(ENV_CONTRACT_CASE_ID)
-    surface = facts.get("surface") or {}
-    hosts = surface.get("hosts") or {}
-    nodes = surface.get("nodes") or {}
-    names = nodes.get("names") or []
-    endpoints = nodes.get("endpoints") or []
-    connected = nodes.get("connected") or {}
-    worker_endpoint = f"{host.plan.worker_ip}:{NODE_PORT}"
+    offer_marker = "Some nodes failed. Select a node to retry, or skip:"
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        offer_marker in output,
+        f"no selective retry was offered after a partial success:\n{output[-4000:]}",
+    )
+    offer = output.split(offer_marker, 1)[1]
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        failed_name in offer,
+        f"the retry offer does not name the failed Worker:\n{offer[-2000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        topology.WORKER_NODE_NAME not in offer,
+        f"the retry offer names the Worker that succeeded:\n{offer[-2000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        "Retry skipped." in offer,
+        f"the skip choice produced no operator-visible confirmation:\n{offer[-2000:]}",
+    )
 
+    after = product.panel_surface(PARTIAL_SUCCESS_CASE_ID)
+    nodes_after = (after.get("surface") or {}).get("nodes") or {}
+    connected_after = nodes_after.get("connected") or {}
     require(
-        ENV_CONTRACT_CASE_ID,
-        env_worker_name in names,
-        f"the Panel reports nodes {names or 'none'}, and none of them is the "
-        f"environment contract Worker {env_worker_name!r}",
+        PARTIAL_SUCCESS_CASE_ID,
+        nodes_after.get("names") == nodes.get("names"),
+        f"the partial failure changed the Panel's node list: "
+        f"{nodes.get('names')!r} -> {nodes_after.get('names')!r}",
     )
     require(
-        ENV_CONTRACT_CASE_ID,
-        worker_endpoint in endpoints,
-        f"the Panel reports endpoints {endpoints or 'none'} instead of registering the "
-        f"Worker at {worker_endpoint}",
-    )
-    require(
-        ENV_CONTRACT_CASE_ID,
-        connected.get(env_worker_name) is True,
-        f"the Panel reports the Worker as {connected.get(env_worker_name)!r} "
-        f"rather than connected; observed {connected}",
-    )
-    require(
-        ENV_CONTRACT_CASE_ID,
-        hosts.get("count", 0) >= 3,
-        f"the Panel publishes {hosts.get('count')!r} hosts instead of one per node",
+        PARTIAL_SUCCESS_CASE_ID,
+        connected_after.get(topology.WORKER_NODE_NAME) is True,
+        f"the successful Worker stopped being connected after its sibling failed; "
+        f"observed {connected_after}",
     )
 
     return {
-        "node_add_returncode": outcome.returncode,
-        "node_add_duration_seconds": round(outcome.duration, 1) if outcome.duration else 0,
-        "node_add_command": "gowave-auto.sh node add (via environment variables)",
-        "panel_nodes": observed.get("nodes", {}),
-        "panel_node_names": names,
-        "panel_node_endpoints": endpoints,
-        "panel_node_connected": connected,
-        "worker_endpoint": worker_endpoint,
-        "env_worker_name": env_worker_name,
-        "panel_hosts": {
-            "count": hosts.get("count"),
-            "security_layers": hosts.get("security_layers"),
-            "fingerprints": hosts.get("fingerprints"),
-        },
-        "unauthenticated_nodes_status": surface.get("unauthenticated_nodes_status"),
-        "environment_contract_used": True,
+        "partial_success_exit_code": outcome.returncode,
+        "successful_sibling": topology.WORKER_NODE_NAME,
+        "failed_node": failed_name,
+        "failed_phase": "scan",
+        "selective_retry_named_only_the_failed_node": True,
+        "panel_node_names": nodes_after.get("names"),
+        "successful_sibling_connected_before": connected.get(topology.WORKER_NODE_NAME),
+        "successful_sibling_connected_after": connected_after.get(topology.WORKER_NODE_NAME),
+        "output_tail": outcome.tail(4000),
+    }
+
+
+def case_add_node_refused(product: MultiNodeProduct) -> Dict[str, Any]:
+    """``MN-ADD-NODE-REFUSED``: the wizard refuses an unverifiable Panel before mutating.
+
+    The Master already runs a Panel, so the flow is pointed at an address that
+    cannot answer a verified API — the operator's mistake of naming the wrong
+    Panel for an existing deployment. The attempt has to stop inside the
+    verification step: no Worker deployment is reached, no Worker credentials are
+    collected for the unverified address, and the Panel's own node list is what
+    it was before.
+    """
+    product.require_installed()
+    before = product.panel_surface(ADD_NODE_REFUSED_CASE_ID)
+    nodes_before = (before.get("surface") or {}).get("nodes") or {}
+
+    script = aio.add_node_refusal_script()
+    started = time.monotonic()
+    proc = product.podman.exec_bash(
+        product.require_installed().target_name, script, check=False,
+        timeout=WIZARD_OFFLINE_TIMEOUT_SECONDS,
+    )
+    outcome = topology.InstallOutcome(
+        returncode=proc.returncode,
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
+        duration=time.monotonic() - started,
+        command=script,
+    )
+    output = f"{outcome.stdout}\n{outcome.stderr}"
+
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        not outcome.ok,
+        f"the wizard accepted a Panel address it could not verify and exited "
+        f"{outcome.returncode}:\n{output[-4000:]}",
+    )
+    reported = [marker for marker in aio.PANEL_VERIFICATION_FAILURES if marker in output]
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        bool(reported),
+        "the refusal named no verification failure, so it stopped for some other reason "
+        f"(expected one of {list(aio.PANEL_VERIFICATION_FAILURES)}):\n{output[-4000:]}",
+    )
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        "GOWAVE_CMD_NODE_CALLED" not in output,
+        "the refused attempt reached the Worker deployment boundary, so a mutation began "
+        f"before the Panel was verified:\n{output[-4000:]}",
+    )
+    # `read -p` prints its prompt only when stdin is a terminal, so the absence of
+    # a credential prompt would prove nothing here. The sentinel above is the real
+    # reading: Worker credentials are collected before `cmd_node add` and handed to
+    # it, so a boundary that was never crossed received none of them.
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        f"Verifying Panel API at {aio.ADD_NODE_REFUSED_PANEL}..." in output,
+        "the flow never reached the verification step for the address it was given, so the "
+        f"refusal below cannot be attributed to Panel verification:\n{output[-4000:]}",
+    )
+
+    after = product.panel_surface(ADD_NODE_REFUSED_CASE_ID)
+    nodes_after = (after.get("surface") or {}).get("nodes") or {}
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        nodes_after.get("names") == nodes_before.get("names"),
+        f"the refused attempt changed the Panel's node list: "
+        f"{nodes_before.get('names')!r} -> {nodes_after.get('names')!r}",
+    )
+
+    return {
+        "panel_address": aio.ADD_NODE_REFUSED_PANEL,
+        "verification_failure_reported": reported,
+        "wizard_returncode": outcome.returncode,
+        "mutation_boundary_reached": "GOWAVE_CMD_NODE_CALLED" in output,
+        "verification_step_reached": True,
+        "panel_node_names_before": nodes_before.get("names"),
+        "panel_node_names_after": nodes_after.get("names"),
+        "output_tail": outcome.tail(2000),
     }
 
 
@@ -8592,6 +9076,12 @@ def cases(
         # instead of positional arguments is registered correctly.
         Case(ENV_CONTRACT_CASE_ID, "multi-node", lambda context: case_env_contract(product),
              timeout_seconds=NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
+        # Partial success: one Worker fails, another succeeds, Panel continues.
+        Case(PARTIAL_SUCCESS_CASE_ID, "multi-node", lambda context: case_partial_success(product),
+             timeout_seconds=WIZARD_OFFLINE_TIMEOUT_SECONDS),
+        # Add-node refused by Panel API verification failure.
+        Case(ADD_NODE_REFUSED_CASE_ID, "multi-node", lambda context: case_add_node_refused(product),
+             timeout_seconds=WIZARD_OFFLINE_TIMEOUT_SECONDS),
         # The dispatch that case just ran was traced; this case reads the trace,
         # proves the observer can see a sentinel whole, and removes the file.
         Case(ARGV_OBSERVER_CASE_ID, "multi-node", lambda context: case_argv_observer(product),

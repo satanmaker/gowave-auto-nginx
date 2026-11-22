@@ -14,6 +14,9 @@ source "$_wizard_dir/i18n.sh"
 # uses, so the same answer is refused on both.
 # shellcheck source=modules/preflight.sh
 source "$_wizard_dir/preflight.sh"
+# SSH bootstrap for unauthenticated reachability check
+# shellcheck source=modules/ssh_bootstrap.sh
+source "$_wizard_dir/ssh_bootstrap.sh"
 
 GOWAVE_PLAN_VARIANT=""
 GOWAVE_PLAN_SHARED_DOMAIN="no"
@@ -403,6 +406,136 @@ wizard_check_plan_names() {
     return 0
 }
 
+# Checks SSH reachability for all worker nodes in the plan using ssh-keyscan.
+# Returns 0 if all reachable, 1 if any unreachable. Prints status for each.
+# Only runs during interactive wizard flow; the positional path never calls this.
+wizard_check_ssh_reachable() {
+    local i host port scanned expected
+    local -a failed=()
+
+    for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
+        host="${GOWAVE_PLAN_NODE_NAMES[$i]}"
+        port="${GOWAVE_SSH_PORT:-22}"
+
+        printf '%s\n' "$(tf ssh_reach.prompt "$host")"
+        if ! scanned=$(ssh_bootstrap_scan "$host" "$port" 2>&1); then
+            # Distinguish timeout/refused from other errors
+            case "$scanned" in
+                *"timed out"*|*"Timeout"*)
+                    printf '%s\n' "$(tf ssh_reach.timeout "$host")" >&2
+                    ;;
+                *"refused"*|*"Connection refused"*)
+                    printf '%s\n' "$(tf ssh_reach.refused "$host")" >&2
+                    ;;
+                *"banner"*)
+                    printf '%s\n' "$(t ssh_reach.banner)" >&2
+                    ;;
+                *)
+                    printf '%s\n' "$(tf ssh_reach.fail "$host")" >&2
+                    ;;
+            esac
+            failed+=("$host")
+            continue
+        fi
+
+        expected=$(printf '%s\n' "$scanned" | ssh_bootstrap_fingerprint)
+        if [[ -z "$expected" ]]; then
+            printf '%s\n' "$(t ssh_reach.banner)" >&2
+            failed+=("$host")
+            continue
+        fi
+
+        # If the plan carries a fingerprint, verify it matches
+        if [[ -n "${GOWAVE_SSH_FINGERPRINT:-}" ]]; then
+            if ! ssh_bootstrap_fingerprint_matches "$GOWAVE_SSH_FINGERPRINT" "$expected"; then
+                printf '%s\n' "$(tf ssh_reach.mismatch "$GOWAVE_SSH_FINGERPRINT" "$host")" >&2
+                failed+=("$host")
+                continue
+            fi
+        fi
+
+        printf '%s\n' "$(tf ssh_reach.ok "$host")"
+    done
+
+    if (( ${#failed[@]} > 0 )); then
+        return 1
+    fi
+    return 0
+}
+
+# Verify Panel API reachability and identity.
+# For non-loopback addresses, requires HTTPS with certificate validation
+# or explicit fingerprint confirmation.
+# Args: panel_address (domain or IP)
+# Returns 0 if verified, 1 otherwise.
+wizard_verify_panel_api() {
+    local panel_address="$1"
+    local panel_url=""
+    local verify_mode=""
+
+    # Determine URL and verification mode
+    if [[ "$panel_address" == "127.0.0.1" || "$panel_address" == "localhost" ]]; then
+        # Local Panel - use HTTP
+        panel_url="http://127.0.0.1:3000"
+        verify_mode="local"
+    elif [[ "$panel_address" == *:* ]]; then
+        # IPv6 address with port
+        panel_url="https://[$panel_address]:3000"
+        verify_mode="remote"
+    else
+        # Domain or IPv4 address
+        panel_url="https://$panel_address:3000"
+        verify_mode="remote"
+    fi
+
+    printf '%s\n' "$(tf wizard.panel_verify.checking "$panel_address")"
+
+    # For remote panels, verify TLS certificate or ask for fingerprint confirmation
+    if [[ "$verify_mode" == "remote" ]]; then
+        local ssl_verify=0
+        local fingerprint=""
+
+        # Try to verify with system CA bundle
+        if openssl s_client -connect "$panel_address:3000" -servername "$panel_address" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | grep -q "SHA256 Fingerprint="; then
+            ssl_verify=1
+        fi
+
+        if (( ssl_verify == 1 )); then
+            printf '%s\n' "$(t wizard.panel_verify.tls_ok)"
+        else
+            # Certificate verification failed - ask for fingerprint confirmation
+            printf '%s\n' "$(t wizard.panel_verify.tls_failed)"
+            fingerprint=$(openssl s_client -connect "$panel_address:3000" -servername "$panel_address" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
+            if [[ -n "$fingerprint" ]]; then
+                printf '%s\n' "$(tf wizard.panel_verify.fingerprint "$fingerprint")"
+                read -r -p "$(t wizard.panel_verify.confirm_fingerprint)" confirm
+                if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                    printf '%s\n' "$(t wizard.panel_verify.cancelled)" >&2
+                    return 1
+                fi
+            else
+                printf '%s\n' "$(t wizard.panel_verify.no_cert)" >&2
+                return 1
+            fi
+        fi
+
+        # Test API endpoint with verified TLS
+        if ! curl -fsS --max-time 10 "$panel_url/api/health" >/dev/null 2>&1; then
+            printf '%s\n' "$(t wizard.panel_verify.api_unreachable)" >&2
+            return 1
+        fi
+    else
+        # Local Panel - test HTTP endpoint
+        if ! curl -fsS --max-time 10 "$panel_url/api/health" >/dev/null 2>&1; then
+            printf '%s\n' "$(t wizard.panel_verify.api_unreachable)" >&2
+            return 1
+        fi
+    fi
+
+    printf '%s\n' "$(tf wizard.panel_verify.success "$panel_address")"
+    return 0
+}
+
 wizard_plan_summary() {
     local i vision
     printf '%s\n' "$(t wizard.plan.summary)"
@@ -471,6 +604,260 @@ wizard_collect_plan() {
     return 0
 }
 
+# Plan review screen: displays the collected plan, allows editing any field,
+# re-runs dependent validations, and returns only when the operator confirms.
+wizard_review_plan() {
+    local choice field new_value node_idx
+
+    while true; do
+        printf '\n%s\n' "$(t plan_review.title)"
+        wizard_plan_summary
+        printf '\n'
+
+        # Build the list of editable fields - fixed order for predictability
+        local -a field_keys=() field_labels=()
+        field_keys+=("variant")
+        field_labels+=("$(t plan_review.field.variant)")
+        field_keys+=("panel_domain")
+        field_labels+=("$(t plan_review.field.panel_domain)")
+        field_keys+=("camouflage_domain")
+        field_labels+=("$(t plan_review.field.camouflage_domain)")
+        field_keys+=("vision_domain")
+        field_labels+=("$(t plan_review.field.vision_domain)")
+        field_keys+=("email")
+        field_labels+=("$(t plan_review.field.email)")
+        field_keys+=("shared_domain")
+        field_labels+=("$(t plan_review.field.shared_domain)")
+
+        if (( GOWAVE_PLAN_NODE_COUNT > 0 )); then
+            field_keys+=("node_count")
+            field_labels+=("$(t plan_review.field.node_count)")
+            for ((node_idx = 0; node_idx < GOWAVE_PLAN_NODE_COUNT; node_idx++)); do
+                field_keys+=("node_name_$node_idx")
+                field_labels+=("$(tf plan_review.field.node_name "$((node_idx + 1))")")
+                field_keys+=("node_camouflage_$node_idx")
+                field_labels+=("$(tf plan_review.field.node_camouflage "$((node_idx + 1))")")
+                field_keys+=("node_vision_$node_idx")
+                field_labels+=("$(tf plan_review.field.node_vision "$((node_idx + 1))")")
+            done
+        fi
+
+        # Display menu
+        for ((choice = 0; choice < ${#field_keys[@]}; choice++)); do
+            local current=""
+            case "${field_keys[$choice]}" in
+                variant) current="$GOWAVE_PLAN_VARIANT" ;;
+                panel_domain) current="$GOWAVE_PLAN_PANEL_NAME" ;;
+                camouflage_domain) current="$GOWAVE_PLAN_CAMOUFLAGE_NAME" ;;
+                vision_domain) current="${GOWAVE_PLAN_VISION_NAME:-}" ;;
+                email) current="$GOWAVE_PLAN_EMAIL" ;;
+                shared_domain) current="$GOWAVE_PLAN_SHARED_DOMAIN" ;;
+                node_count) current="$GOWAVE_PLAN_NODE_COUNT" ;;
+                node_name_*) current="${GOWAVE_PLAN_NODE_NAMES[${field_keys[$choice]#node_name_}]}" ;;
+                node_camouflage_*) current="${GOWAVE_PLAN_NODE_CAMOUFLAGE[${field_keys[$choice]#node_camouflage_}]}" ;;
+                node_vision_*) current="${GOWAVE_PLAN_NODE_VISION[${field_keys[$choice]#node_vision_}]:-}" ;;
+            esac
+            printf '  %d) %s [%s]\n' "$((choice + 1))" "${field_labels[$choice]}" "$current"
+        done
+        printf '  0) %s\n' "$(t plan_review.confirm)"
+
+        # Read choice
+        choice=$(_wizard_prompt_read "$(t plan_review.edit_field)") || return 1
+        if [[ "$choice" == "0" ]]; then
+            return 0
+        fi
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#field_keys[@]} )); then
+            printf '%s\n' "$(t plan_review.invalid_choice)" >&2
+            continue
+        fi
+
+        local idx=$((choice - 1))
+        field="${field_keys[$idx]}"
+        local current_value=""
+        case "$field" in
+            variant) current_value="$GOWAVE_PLAN_VARIANT" ;;
+            panel_domain) current_value="$GOWAVE_PLAN_PANEL_NAME" ;;
+            camouflage_domain) current_value="$GOWAVE_PLAN_CAMOUFLAGE_NAME" ;;
+            vision_domain) current_value="${GOWAVE_PLAN_VISION_NAME:-}" ;;
+            email) current_value="$GOWAVE_PLAN_EMAIL" ;;
+            shared_domain) current_value="$GOWAVE_PLAN_SHARED_DOMAIN" ;;
+            node_count) current_value="$GOWAVE_PLAN_NODE_COUNT" ;;
+            node_name_*) current_value="${GOWAVE_PLAN_NODE_NAMES[${field#node_name_}]}" ;;
+            node_camouflage_*) current_value="${GOWAVE_PLAN_NODE_CAMOUFLAGE[${field#node_camouflage_}]}" ;;
+            node_vision_*) current_value="${GOWAVE_PLAN_NODE_VISION[${field#node_vision_}]:-}" ;;
+        esac
+
+        printf '%s\n' "$(tf plan_review.current_value "$current_value")"
+        new_value=$(_wizard_prompt_read "$(t plan_review.enter_new)") || return 1
+
+        # Empty input means "keep current" for most fields, but for vision fields
+        # it means "remove vision". Handle this in the field-specific logic.
+        if [[ -z "$new_value" && "$field" != "vision_domain" && "$field" != node_vision_* ]]; then
+            continue
+        fi
+
+        # Apply the change and re-run validations
+        case "$field" in
+            variant)
+                case "${new_value,,}" in
+                    1|all-in-one|all_in_one|aio) new_value="all-in-one" ;;
+                    2|panel-only|panel_only|panel) new_value="panel-only" ;;
+                    3|multi-node|multi_node|multi) new_value="multi-node" ;;
+                    *) printf '%s\n' "$(t wizard.variant.invalid)" >&2; continue ;;
+                esac
+                GOWAVE_PLAN_VARIANT="$new_value"
+                ;;
+            panel_domain)
+                if ! wizard_validate_hostname "$new_value"; then
+                    printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
+                    continue
+                fi
+                # Skip duplicate check if value unchanged (avoids self-detection)
+                if [[ "$new_value" != "$GOWAVE_PLAN_PANEL_NAME" ]]; then
+                    if taken=$(wizard_plan_name_owner "$new_value"); then
+                        :
+                    else
+                        printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
+                        continue
+                    fi
+                fi
+                GOWAVE_PLAN_PANEL_NAME="$new_value"
+                ;;
+            camouflage_domain)
+                if ! wizard_validate_hostname "$new_value"; then
+                    printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
+                    continue
+                fi
+                if [[ "$new_value" != "$GOWAVE_PLAN_CAMOUFLAGE_NAME" ]]; then
+                    if taken=$(wizard_plan_name_owner "$new_value"); then
+                        :
+                    else
+                        printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
+                        continue
+                    fi
+                fi
+                GOWAVE_PLAN_CAMOUFLAGE_NAME="$new_value"
+                ;;
+            vision_domain)
+                if [[ -n "$new_value" ]] && ! wizard_validate_hostname "$new_value"; then
+                    printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
+                    continue
+                fi
+                if [[ -n "$new_value" && "$new_value" != "$GOWAVE_PLAN_VISION_NAME" ]]; then
+                    if taken=$(wizard_plan_name_owner "$new_value"); then
+                        :
+                    else
+                        printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
+                        continue
+                    fi
+                fi
+                GOWAVE_PLAN_VISION_NAME="$new_value"
+                if [[ -n "$new_value" ]]; then
+                    GOWAVE_PLAN_PANEL_VISION="yes"
+                else
+                    GOWAVE_PLAN_PANEL_VISION="no"
+                fi
+                ;;
+            email)
+                if ! wizard_validate_email "$new_value"; then
+                    printf '%s\n' "$(t wizard.email.invalid)" >&2
+                    continue
+                fi
+                GOWAVE_PLAN_EMAIL="$new_value"
+                ;;
+            shared_domain)
+                case "${new_value,,}" in
+                    y|yes|д|да) new_value="yes" ;;
+                    n|no|н|нет) new_value="no" ;;
+                    *) printf '%s\n' "$(t wizard.yes_no.invalid)" >&2; continue ;;
+                esac
+                GOWAVE_PLAN_SHARED_DOMAIN="$new_value"
+                ;;
+            node_count)
+                if ! [[ "$new_value" =~ ^[0-9]+$ ]] || (( 10#$new_value < 1 )); then
+                    printf '%s\n' "$(t wizard.nodes.invalid)" >&2
+                    continue
+                fi
+                new_value=$((10#$new_value))
+                # Adjust node arrays if count changed
+                if (( new_value > GOWAVE_PLAN_NODE_COUNT )); then
+                    for ((node_idx = GOWAVE_PLAN_NODE_COUNT + 1; node_idx <= new_value; node_idx++)); do
+                        local node_name node_camouflage node_vision=""
+                        node_name=$(wizard_read_hostname "$(tf wizard.name.worker "$node_idx")") || return 1
+                        node_camouflage=$(wizard_read_hostname "$(tf wizard.name.worker_camouflage "$node_idx")") || return 1
+                        if wizard_read_yes_no "$(tf wizard.vision.prompt "$node_name")" no; then
+                            node_vision=$(wizard_read_hostname "$(t wizard.name.vision)" yes) || return 1
+                        fi
+                        if ! wizard_register_host worker "$node_name" "$node_camouflage" "$node_vision"; then
+                            return 1
+                        fi
+                    done
+                elif (( new_value < GOWAVE_PLAN_NODE_COUNT )); then
+                    # Truncate arrays
+                    GOWAVE_PLAN_NODE_NAMES=("${GOWAVE_PLAN_NODE_NAMES[@]:0:new_value}")
+                    GOWAVE_PLAN_NODE_CAMOUFLAGE=("${GOWAVE_PLAN_NODE_CAMOUFLAGE[@]:0:new_value}")
+                    GOWAVE_PLAN_NODE_VISION=("${GOWAVE_PLAN_NODE_VISION[@]:0:new_value}")
+                fi
+                GOWAVE_PLAN_NODE_COUNT="$new_value"
+                ;;
+            node_name_*)
+                node_idx="${field#node_name_}"
+                if ! wizard_validate_hostname "$new_value"; then
+                    printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
+                    continue
+                fi
+                if [[ "$new_value" != "${GOWAVE_PLAN_NODE_NAMES[$node_idx]}" ]]; then
+                    if taken=$(wizard_plan_name_owner "$new_value"); then
+                        :
+                    else
+                        printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
+                        continue
+                    fi
+                fi
+                GOWAVE_PLAN_NODE_NAMES[$node_idx]="$new_value"
+                ;;
+            node_camouflage_*)
+                node_idx="${field#node_camouflage_}"
+                if ! wizard_validate_hostname "$new_value"; then
+                    printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
+                    continue
+                fi
+                if [[ "$new_value" != "${GOWAVE_PLAN_NODE_CAMOUFLAGE[$node_idx]}" ]]; then
+                    if taken=$(wizard_plan_name_owner "$new_value"); then
+                        :
+                    else
+                        printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
+                        continue
+                    fi
+                fi
+                GOWAVE_PLAN_NODE_CAMOUFLAGE[$node_idx]="$new_value"
+                ;;
+            node_vision_*)
+                node_idx="${field#node_vision_}"
+                if [[ -n "$new_value" ]] && ! wizard_validate_hostname "$new_value"; then
+                    printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
+                    continue
+                fi
+                if [[ -n "$new_value" && "$new_value" != "${GOWAVE_PLAN_NODE_VISION[$node_idx]}" ]]; then
+                    if taken=$(wizard_plan_name_owner "$new_value"); then
+                        :
+                    else
+                        printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
+                        continue
+                    fi
+                fi
+                GOWAVE_PLAN_NODE_VISION[$node_idx]="$new_value"
+                ;;
+        esac
+
+        # Re-run dependent validations
+        wizard_certificate_preflight || continue
+        wizard_check_plan_names || continue
+
+        printf '%s\n' "$(t plan_review.updated)"
+    done
+}
+
 # Hands the panel host to cmd_install exactly as the positional path would.
 wizard_apply_plan() {
     GOWAVE_INSTALL_POSITIONAL=()
@@ -500,15 +887,294 @@ wizard_missing_terminal() {
 
 # One worker at a time: the Panel host holds the mutation lock and the
 # temporary-access lifecycle is per host.
+# Returns 0 if all nodes succeeded, 1 if all nodes failed, 2 if partial success.
+# Prints a per-node summary to stdout.
 wizard_onboard_nodes() {
-    local i host camouflage vision rc=0
+    local i host camouflage vision
+    local -a node_results=()
+    local any_succeeded=0 any_failed=0
+    local scratch stderr_file
+
+    # A tracked scratch directory, not a bare file: the cleanup helper removes
+    # the directory it is given, so handing it `dirname` of a /tmp file would
+    # delete /tmp itself when the onboarding finishes.
+    scratch=$(mktemp -d "${TMPDIR:-/tmp}/wizard_onboard.XXXXXX")
+    stderr_file="$scratch/stderr"
+    : > "$stderr_file"
+    if declare -F track_temp_dir >/dev/null 2>&1; then
+        track_temp_dir "$scratch"
+    fi
+
     for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
         host="${GOWAVE_PLAN_NODE_NAMES[$i]}"
         camouflage="${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}"
         vision="${GOWAVE_PLAN_NODE_VISION[$i]:-}"
-        if ! ssh_bootstrap_onboard_one "$host" "$camouflage" "$vision"; then
-            rc=1
+
+        # Capture stdout and stderr separately to extract phase info
+        local stdout_output stderr_output
+        stdout_output=$(ssh_bootstrap_onboard_one "$host" "$camouflage" "$vision" 2>"$stderr_file")
+        local result=$?
+        stderr_output=$(cat "$stderr_file" 2>/dev/null || true)
+        : > "$stderr_file"
+
+        # Extract the last phase from stderr (PHASE: markers)
+        local failed_phase=""
+        if (( result != 0 )); then
+            failed_phase=$(printf '%s\n' "$stderr_output" | grep '^PHASE:' | tail -1 | cut -d: -f2)
+            [[ -n "$failed_phase" ]] || failed_phase="unknown"
+        fi
+
+        # Combine output for operator display
+        local output
+        output=$(printf '%s\n%s' "$stdout_output" "$stderr_output" | sed '/^PHASE:/d')
+
+        if (( result == 0 )); then
+            node_results+=("$host:SUCCESS")
+            any_succeeded=1
+        else
+            any_failed=1
+            # Extract a safe diagnostic from the output (last non-empty non-PHASE line)
+            local diagnostic
+            diagnostic=$(printf '%s\n' "$output" | grep -v '^==' | grep -v '^PHASE:' | tail -1)
+            [[ -n "$diagnostic" ]] || diagnostic="onboarding failed"
+            # Redact any potential secrets from diagnostic
+            diagnostic=$(_redact_secrets "$diagnostic")
+            node_results+=("$host:FAILED:phase=$failed_phase:$diagnostic")
+        fi
+
+        # Print the output so operator sees progress (redacted)
+        printf '%s\n' "$(_redact_secrets "$output")"
+    done
+
+    if declare -F release_temp_dir >/dev/null 2>&1; then
+        release_temp_dir "$scratch"
+    else
+        rm -rf -- "$scratch"
+    fi
+
+    # Print detailed summary
+    _print_onboarding_summary node_results
+
+    # Store node results for potential retry
+    _store_node_results node_results
+
+    # Offer the retry only for the partial case: with every node failed there is
+    # nothing a per-node retry can add over running the installation again.
+    if (( any_succeeded > 0 && any_failed > 0 )); then
+        _offer_selective_retry node_results
+    fi
+
+    if (( any_succeeded == 0 )); then
+        return 1  # all failed
+    elif (( any_failed == 0 )); then
+        return 0  # all succeeded
+    else
+        return 2  # partial success
+    fi
+}
+
+# Redact secrets from output.
+# Args: text
+_redact_secrets() {
+    local text="$1"
+    # Redact SSH passwords (common patterns)
+    text=$(printf '%s\n' "$text" | sed -E 's/(password|secret|token|key)=[^[:space:]]+/\1=***REDACTED***/gi')
+    # Redact private key content
+    text=$(printf '%s\n' "$text" | sed -E 's/-----BEGIN [A-Z ]+PRIVATE KEY-----[^-]*-----END [A-Z ]+PRIVATE KEY-----/***PRIVATE KEY REDACTED***/g')
+    # Redact SSH private key files
+    text=$(printf '%s\n' "$text" | sed -E 's/ssh-ed25519 [A-Za-z0-9+/=]+/ssh-ed25519 ***REDACTED***/g')
+    printf '%s' "$text"
+}
+
+# Print a detailed onboarding summary.
+# Args: array_name (reference to array of results)
+_print_onboarding_summary() {
+    local -n results="$1"
+    printf '\n=== Node Onboarding Summary ===\n'
+    local result
+    for result in "${results[@]}"; do
+        if [[ "$result" == *:SUCCESS ]]; then
+            printf '  %s: %s\n' "${result%%:*}" "$(t wizard.summary.success)"
+        else
+            local host="${result%%:*}"
+            local rest="${result#*:}"
+            local phase="${rest#*phase=}"
+            phase="${phase%%:*}"
+            local diagnostic="${rest#*:}"
+            diagnostic="${diagnostic#*:}"
+            printf '  %s: %s (phase: %s, reason: %s)\n' "$host" "$(t wizard.summary.failed)" "$phase" "$diagnostic"
         fi
     done
-    return "$rc"
+}
+
+# Store node results for potential retry.
+# Args: array_name (reference to array of results)
+_store_node_results() {
+    local -n results="$1"
+    local state_file="${GOWAVE_STATE_DIR:-/opt/gowave}/wizard_node_results"
+    printf '%s\n' "${results[@]}" > "$state_file"
+    chmod 600 "$state_file"
+}
+
+# Retry a single failed node.
+# Args: host
+_retry_single_node() {
+    local host="$1"
+    local i
+    for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
+        if [[ "${GOWAVE_PLAN_NODE_NAMES[$i]}" == "$host" ]]; then
+            local camouflage="${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}"
+            local vision="${GOWAVE_PLAN_NODE_VISION[$i]:-}"
+            local stdout_output stderr_output
+            local stderr_file
+            stderr_file=$(mktemp "${TMPDIR:-/tmp}/wizard_onboard_stderr.XXXXXX")
+            stdout_output=$(ssh_bootstrap_onboard_one "$host" "$camouflage" "$vision" 2>"$stderr_file")
+            local result=$?
+            stderr_output=$(cat "$stderr_file" 2>/dev/null || true)
+            rm -f "$stderr_file"
+
+            local output
+            output=$(printf '%s\n%s' "$stdout_output" "$stderr_output" | sed '/^PHASE:/d')
+            printf '%s\n' "$output"
+
+            if (( result == 0 )); then
+                printf '%s\n' "$(tf wizard.retry.succeeded "$host")"
+            else
+                printf '%s\n' "$(tf wizard.retry.failed "$host")" >&2
+            fi
+            return "$result"
+        fi
+    done
+    printf '%s\n' "$(tf wizard.retry.not_found "$host")" >&2
+    return 1
+}
+
+# Read-only retry diagnostics for a failed node.
+# Reads the recovery journal through modules/recovery.py and checks VPS reachability.
+# Args: host
+_retry_diagnostics() {
+    local host="$1"
+    local journal_file="${GOWAVE_JOURNAL_FILE:-/opt/gowave/recovery/journal.json}"
+    local state_file="${GOWAVE_STATE_FILE:-/opt/gowave/state.json}"
+    local credentials_file="${GOWAVE_CREDENTIALS_FILE:-/root/gowave-credentials.txt}"
+
+    printf '\n%s\n' "$(tf wizard.diagnostics.header "$host")"
+
+    # 1. Check Panel registration state via recovery journal
+    if [[ -f "$journal_file" ]]; then
+        printf '%s\n' "$(t wizard.diagnostics.journal_found)"
+        local journal_output
+        if journal_output=$(PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
+import sys
+sys.path.insert(0, '$SCRIPT_DIR')
+from modules.recovery import load_journal_file, validate_journal
+try:
+    data = load_journal_file('$journal_file')
+    validate_journal(data)
+    print('STATE=' + data.get('state', 'UNKNOWN'))
+    print('OP=' + data.get('op', 'UNKNOWN'))
+    if 'entities' in data:
+        for entity in data['entities']:
+            if entity.get('type') == 'node' and entity.get('uuid') == '$host':
+                print('NODE_STATE=' + entity.get('action', 'UNKNOWN'))
+                break
+except Exception as e:
+    print('ERROR=' + str(e))
+" 2>&1); then
+            local state=$(printf '%s\n' "$journal_output" | grep '^STATE=' | cut -d= -f2)
+            local op=$(printf '%s\n' "$journal_output" | grep '^OP=' | cut -d= -f2)
+            local node_state=$(printf '%s\n' "$journal_output" | grep '^NODE_STATE=' | cut -d= -f2)
+            local error=$(printf '%s\n' "$journal_output" | grep '^ERROR=' | cut -d= -f2-)
+
+            if [[ -n "$error" ]]; then
+                printf '%s\n' "$(tf wizard.diagnostics.journal_error "$error")"
+            else
+                printf '%s\n' "$(tf wizard.diagnostics.journal_state "$op" "$state")"
+                if [[ -n "$node_state" ]]; then
+                    printf '%s\n' "$(tf wizard.diagnostics.node_state "$node_state")"
+                fi
+            fi
+        else
+            printf '%s\n' "$(t wizard.diagnostics.journal_unreadable)"
+        fi
+    else
+        printf '%s\n' "$(t wizard.diagnostics.journal_missing)"
+    fi
+
+    # 2. Check VPS SSH reachability (unauthenticated scan)
+    printf '%s\n' "$(t wizard.diagnostics.ssh_check)"
+    local port="${GOWAVE_SSH_PORT:-22}"
+    local scanned
+    if scanned=$(ssh_bootstrap_scan "$host" "$port" 2>/dev/null); then
+        local fingerprint
+        fingerprint=$(printf '%s\n' "$scanned" | ssh_bootstrap_fingerprint)
+        if [[ -n "$fingerprint" ]]; then
+            printf '%s\n' "$(tf wizard.diagnostics.ssh_ok "$host" "$fingerprint")"
+        else
+            printf '%s\n' "$(t wizard.diagnostics.ssh_banner)"
+        fi
+    else
+        printf '%s\n' "$(tf wizard.diagnostics.ssh_unreachable "$host")"
+    fi
+
+    # 3. Check if VPS has managed state (basic connectivity)
+    printf '%s\n' "$(t wizard.diagnostics.vps_check)"
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -p "$port" "root@$host" 'true' 2>/dev/null; then
+        printf '%s\n' "$(t wizard.diagnostics.vps_managed)"
+    else
+        printf '%s\n' "$(t wizard.diagnostics.vps_unmanaged)"
+    fi
+
+    printf '%s\n' "$(t wizard.diagnostics.footer)"
+}
+
+# Offer selective retry of failed nodes.
+# Args: array_name (reference to array of results)
+_offer_selective_retry() {
+    local -n results="$1"
+    local -a failed_nodes=()
+    local result host
+
+    for result in "${results[@]}"; do
+        if [[ "$result" != *:SUCCESS ]]; then
+            host="${result%%:*}"
+            failed_nodes+=("$host")
+        fi
+    done
+
+    if (( ${#failed_nodes[@]} == 0 )); then
+        return 0
+    fi
+
+    # Show diagnostics for each failed node
+    for host in "${failed_nodes[@]}"; do
+        _retry_diagnostics "$host"
+    done
+
+    printf '\n%s\n' "$(t wizard.retry.offer)"
+    local i=1
+    for host in "${failed_nodes[@]}"; do
+        printf '  %d) %s\n' "$i" "$host"
+        ((i++))
+    done
+    printf '  %d) %s\n' "$i" "$(t wizard.retry.skip)"
+
+    local choice
+    while true; do
+        printf '%s' "$(t wizard.retry.prompt)"
+        if ! IFS= read -r choice; then
+            printf '\n'
+            return 1
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#failed_nodes[@]} )); then
+            local retry_host="${failed_nodes[choice-1]}"
+            printf '%s\n' "$(tf wizard.retry.retrying "$retry_host")"
+            _retry_single_node "$retry_host"
+        elif (( choice == ${#failed_nodes[@]} + 1 )); then
+            printf '%s\n' "$(t wizard.retry.skipped)"
+            return 0
+        else
+            printf '%s\n' "$(t wizard.retry.invalid)"
+        fi
+    done
 }

@@ -22,7 +22,8 @@ GOWAVE_SSH_TIMER_ID=""
 GOWAVE_SSH_LIFETIME_MINUTES=115
 
 ssh_bootstrap_fingerprint() {
-    ssh-keygen -lf - -E sha256 2>/dev/null | awk 'NR == 1 { print $2 }'
+    # ssh-keygen fails on non-key input; prevent set -e from aborting.
+    ssh-keygen -lf - -E sha256 2>/dev/null | awk 'NR == 1 { print $2 }' || true
 }
 
 # The operator's typed value is authoritative; it has to equal what the host
@@ -123,15 +124,26 @@ fi"
 }
 
 ssh_bootstrap_scan() {
-    local host="$1" port="$2" output
+    local host="$1" port="$2" output banner_line
     if ! output=$(ssh-keyscan -T 10 -p "$port" -t ed25519 "$host" 2>/dev/null); then
         return 1
     fi
     # OpenSSH 9.x leads with a banner comment ("# host:port SSH-2.0-..."); only
     # the key line carries a key, and a fingerprint of the comment is empty.
+    # Capture the banner line (if any) before filtering.
+    banner_line=$(printf '%s\n' "$output" | awk '/^[[:space:]]*#/ { print; exit }')
     output=$(printf '%s\n' "$output" | awk '!/^[[:space:]]*#/ && NF > 0 { print; exit }')
-    [[ -n "$output" ]] || return 1
-    printf '%s' "$output"
+    if [[ -n "$output" ]]; then
+        printf '%s' "$output"
+        return 0
+    fi
+    # No key line found; if a banner line was present, return it for detection.
+    if [[ -n "$banner_line" ]]; then
+        # Strip leading # and whitespace for the caller to detect.
+        printf '%s' "${banner_line#*# }"
+        return 0
+    fi
+    return 1
 }
 
 ssh_bootstrap_prepare_key() {
@@ -305,52 +317,102 @@ ssh_bootstrap_onboard_one() {
     local host="$1" camouflage="$2" vision="${3:-}"
     local port="${GOWAVE_SSH_PORT:-22}"
     local ip="" scanned="" expected="" password_file="" rc=0
+    local phase=""
 
+    # Phase tracking: print phase markers to stderr for the caller to capture
+    _ssh_phase() {
+        phase="$1"
+        printf 'PHASE:%s\n' "$phase" >&2
+    }
+
+    _ssh_phase "prepare_key"
     printf '==> Onboarding %s\n' "$host"
     if ! ssh_bootstrap_prepare_key; then
         printf '%s\n' "$(tf wizard.ssh.failed "$host")" >&2
         return 1
     fi
+
+    _ssh_phase "scan"
     if ! scanned=$(ssh_bootstrap_scan "$host" "$port"); then
         printf '%s\n' "$(tf wizard.ssh.scan_failed "$host")" >&2
         return 1
     fi
+
+    _ssh_phase "fingerprint"
     expected=$(printf '%s\n' "$scanned" | ssh_bootstrap_fingerprint)
     if [[ -z "$expected" ]]; then
         printf '%s\n' "$(tf wizard.ssh.scan_failed "$host")" >&2
         return 1
     fi
+
+    _ssh_phase "confirm_fingerprint"
     if ! ssh_bootstrap_confirm_fingerprint "$host" "$expected"; then
-        return 1
-    fi
-    if ! ip=$(wizard_resolve_ipv4 "$host"); then
-        printf '%s\n' "$(tf wizard.dns.failed "$host")" >&2
-        return 1
-    fi
-    ssh_bootstrap_pin_host_key "$scanned" "$ip" "$port"
-    if ! password_file=$(ssh_bootstrap_prepare_password "$host"); then
-        return 1
-    fi
-    if ! ssh_bootstrap_authorise "$host" "$port" "$password_file"; then
-        return 1
-    fi
-    if ! ssh_bootstrap_start_agent; then
-        ssh_bootstrap_revoke "$host" "$port" "$password_file" || true
+        _release_ssh_temp
         return 1
     fi
 
+    _ssh_phase "resolve_ip"
+    if ! ip=$(wizard_resolve_ipv4 "$host"); then
+        printf '%s\n' "$(tf wizard.dns.failed "$host")" >&2
+        _release_ssh_temp
+        return 1
+    fi
+
+    _ssh_phase "pin_host_key"
+    ssh_bootstrap_pin_host_key "$scanned" "$ip" "$port"
+
+    _ssh_phase "prepare_password"
+    if ! password_file=$(ssh_bootstrap_prepare_password "$host"); then
+        _release_ssh_temp
+        return 1
+    fi
+
+    _ssh_phase "authorise"
+    if ! ssh_bootstrap_authorise "$host" "$port" "$password_file"; then
+        _release_ssh_temp
+        return 1
+    fi
+
+    _ssh_phase "start_agent"
+    if ! ssh_bootstrap_start_agent; then
+        ssh_bootstrap_revoke "$host" "$port" "$password_file" || true
+        _release_ssh_temp
+        return 1
+    fi
+
+    _ssh_phase "add_node"
     local -a add_args=(add "$host" "$ip" "$host" "$camouflage")
     if [[ -n "$vision" ]]; then
         add_args=(add --vision-domain "$vision" "$host" "$ip" "$host" "$camouflage")
     fi
     SSH_KNOWN_HOSTS="$GOWAVE_SSH_KNOWN_HOSTS" cmd_node "${add_args[@]}" || rc=1
 
+    _ssh_phase "revoke"
     ssh_bootstrap_revoke "$host" "$port" "$password_file" || rc=1
+
+    _ssh_phase "stop_agent"
     ssh_bootstrap_stop_agent
+    _release_ssh_temp
+
     if (( rc == 0 )); then
         printf '%s\n' "$(tf wizard.ssh.registered "$host")"
     else
         printf '%s\n' "$(tf wizard.ssh.failed "$host")" >&2
     fi
     return "$rc"
+}
+
+# Release the SSH temp directory immediately after onboarding completes.
+# This ensures passwords and keys are not retained on the Panel host.
+_release_ssh_temp() {
+    if [[ -n "${GOWAVE_SSH_TEMP_ROOT:-}" ]]; then
+        if declare -F release_temp_dir >/dev/null 2>&1; then
+            release_temp_dir "$GOWAVE_SSH_TEMP_ROOT"
+        fi
+        GOWAVE_SSH_TEMP_ROOT=""
+        GOWAVE_SSH_KEY=""
+        GOWAVE_SSH_KNOWN_HOSTS=""
+        GOWAVE_SSH_MARKER=""
+        GOWAVE_SSH_TIMER_ID=""
+    fi
 }

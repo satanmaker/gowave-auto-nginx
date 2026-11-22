@@ -67,6 +67,18 @@ requirements:
           - tests.test_podman_argv_observer.TestArgvObserverCase
           - tests.test_podman_argv_observer.TestObserverDocumentation
         jobs: [Multi-Node Podman Acceptance]
+      - scenario: Multi-Node deployment with one failed node and partial success
+        cases: [MN-PARTIAL-SUCCESS]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestPartialSuccessCase
+        jobs: [Multi-Node Podman Acceptance]
+      - scenario: Add-node refused by Panel API verification failure
+        cases: [MN-ADD-NODE-REFUSED]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestAddNodeRefusedCase
+        jobs: [Multi-Node Podman Acceptance]
 
   - requirement: Independent Panel-only acceptance topology
     scenarios:
@@ -85,6 +97,12 @@ requirements:
         tests:
           - tests.test_podman_panel_only.TestPanelOnlySquadCase
           - tests.test_podman_panel_only.TestPanelOnlyRefusalProbe
+        jobs: [Panel-only Podman Acceptance]
+      - scenario: Add-node refused by Panel API verification failure
+        cases: [MN-ADD-NODE-REFUSED]
+        topologies: [panel-only]
+        tests:
+          - tests.test_podman_panel_only.TestPanelOnlyAddNodeRefusedCase
         jobs: [Panel-only Podman Acceptance]
 
   - requirement: Real Panel subscription lifecycle

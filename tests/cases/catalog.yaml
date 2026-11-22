@@ -7,8 +7,8 @@ counts:
   container: 111
   partial: 12
   live_only: 2
-  podman_first: 124
-  total: 249
+  podman_first: 126
+  total: 251
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -8853,16 +8853,21 @@ cases:
     multi-node:
       driver: multi_node:case_env_contract
       evidence:
+      - cleanup
+      - env_worker_address
       - env_worker_name
       - environment_contract_used
       - node_add_command
       - node_add_duration_seconds
       - node_add_returncode
       - panel_hosts
+      - panel_inventory_after
+      - panel_inventory_before
       - panel_node_connected
       - panel_node_endpoints
       - panel_node_names
       - panel_nodes
+      - second_worker
       - unauthenticated_nodes_status
       - worker_endpoint
   promotion_target: Distributed Worker VPS Deployment Verification
@@ -9198,6 +9203,76 @@ cases:
       - tests_passed
       - unusable_digest_refused
   promotion_target: All-in-One Master VPS Installation Verification
+- id: MN-PARTIAL-SUCCESS
+  requirement: Distributed Worker VPS Deployment Verification
+  live_scenario: null
+  assertion: A multi-node deployment where one Worker fails onboarding continues the Panel deployment
+    and the successful sibling, records the failed node with its target, phase and diagnostic reason,
+    exits with the partial-success code distinct from a failed Panel installation, and prints a per-node
+    summary that distinguishes successful and failed nodes.
+  assertion_sha256: d7f46cb8110aab6e6c49aae18ccd75f1b0e32ea08627d9858a87a725f7f51f72
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_partial_success
+      evidence:
+      - failed_node
+      - failed_phase
+      - output_tail
+      - panel_node_names
+      - partial_success_exit_code
+      - selective_retry_named_only_the_failed_node
+      - successful_sibling
+      - successful_sibling_connected_after
+      - successful_sibling_connected_before
+  promotion_target: Distributed Worker VPS Deployment Verification
+- id: MN-ADD-NODE-REFUSED
+  requirement: Distributed Worker VPS Deployment Verification
+  live_scenario: null
+  assertion: An add-node attempt against a Panel whose API identity or reachability verification fails
+    reports the failed verification and does not begin any remote node mutation; no Worker-side deployment
+    is attempted and no credentials are transmitted.
+  assertion_sha256: da36a931b31941e32946487559c7833be9cb29529b49c1390c2349220d8b5e7e
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  - panel-only
+  gate: pr
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_add_node_refused
+      evidence:
+      - mutation_boundary_reached
+      - output_tail
+      - panel_address
+      - panel_node_names_after
+      - panel_node_names_before
+      - verification_failure_reported
+      - verification_step_reached
+      - wizard_returncode
+    panel-only:
+      driver: panel_only:case_add_node_refused
+      evidence:
+      - mutation_boundary_reached
+      - output_tail
+      - panel_address
+      - panel_node_names_after
+      - panel_node_names_before
+      - verification_failure_reported
+      - verification_step_reached
+      - wizard_returncode
+  promotion_target: Distributed Worker VPS Deployment Verification
 - id: AIO-DP-REALITY-xray
   requirement: Real client data-plane verification
   live_scenario: null

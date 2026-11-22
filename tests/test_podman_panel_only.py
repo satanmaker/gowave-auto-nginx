@@ -303,11 +303,11 @@ class TestPanelOnlySuite(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.addCleanup(self.context.run_cleanup)
 
-    def test_the_suite_declares_the_five_cases_in_run_order(self):
+    def test_the_suite_declares_the_six_cases_in_run_order(self):
         suite = panel_only.cases(FakePodman(self.context))
         self.assertEqual(
             [case.id for case in suite],
-            ["PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED"],
+            ["PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED", "MN-ADD-NODE-REFUSED"],
         )
         self.assertEqual({case.topology for case in suite}, {"panel-only"})
         self.assertEqual(
@@ -370,7 +370,7 @@ class TestPanelOnlySuite(unittest.TestCase):
             entry = by_id.get(case.id)
             self.assertIsNotNone(entry, f"{case.id} must be in the shared case catalog")
             self.assertEqual(entry["runs_in"], ["podman"], case.id)
-            self.assertEqual(entry["topology"], ["panel-only"], case.id)
+            self.assertIn("panel-only", entry["topology"], f"{case.id} must run in panel-only topology")
             self.assertEqual(entry["gate"], "pr", case.id)
 
     def test_every_section_the_host_case_parses_is_a_section_the_probe_prints(self):
@@ -773,6 +773,102 @@ class TestPanelOnlyRefusalProbe(unittest.TestCase):
         self.assertLess(control, null, "a control after the probe proves nothing")
         self.assertIn('"isDisabled": False', script)
         self.assertIn("refused_body_keys", script)
+
+
+def node_surface(names=()):
+    """The Panel surface read, reduced to the node list the refusal case compares."""
+    return json.dumps({
+        "surface": {
+            "nodes": {"status": 200, "count": len(names), "names": list(names)},
+        },
+    })
+
+
+def refusal_output(*, sentinel=False, verification=True):
+    """What the shipped add-node wizard prints when the Panel cannot be verified.
+
+    The sample is the one a live run produced against a loopback alias with no
+    listener: the local-Panel branch is skipped, the address is verified, the
+    certificate step fails and the flow returns before any Worker prompt.
+    """
+    lines = ["No local Panel found on this host."]
+    if verification:
+        lines += [
+            f"Verifying Panel API at {aio.ADD_NODE_REFUSED_PANEL}...",
+            "TLS certificate verification failed.",
+            "Could not retrieve certificate.",
+        ]
+    if sentinel:
+        lines.append("GOWAVE_CMD_NODE_CALLED")
+    return "\n".join(lines) + "\n"
+
+
+class TestPanelOnlyAddNodeRefusedCase(unittest.TestCase):
+    """PO-ADD-NODE-REFUSED (MN-ADD-NODE-REFUSED): refused before any Worker mutation."""
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def refused(self, *, before=("worker-1",), after=("worker-1",), wizard=None,
+                wizard_returncode=1):
+        product, host, podman = installed(self.context)
+        podman.results = [
+            (node_surface(before), 0),
+            (wizard if wizard is not None else refusal_output(), wizard_returncode),
+            (node_surface(after), 0),
+        ]
+        return panel_only.case_add_node_refused(product), host, podman
+
+    def test_a_refused_attempt_reports_verification_and_leaves_the_panel_alone(self):
+        facts, host, podman = self.refused()
+        self.assertEqual(facts.get("panel_address"), aio.ADD_NODE_REFUSED_PANEL)
+        self.assertTrue(facts.get("verification_failure_reported"))
+        self.assertEqual(facts.get("wizard_returncode"), 1)
+        self.assertFalse(facts.get("mutation_boundary_reached"))
+        self.assertTrue(facts.get("verification_step_reached"))
+        self.assertEqual(facts.get("panel_node_names_before"), ["worker-1"])
+        self.assertEqual(facts.get("panel_node_names_after"), ["worker-1"])
+        self.assertEqual(host.node_add_attempts, 0, "the host ran a real node add")
+        # The middle read is the wizard itself; the last one is the surface it
+        # had to leave unchanged, not a `node add`.
+        self.assertIn("wizard_add_node_to_panel", podman.scripts[1])
+        self.assertNotIn("node add", podman.scripts[1])
+
+    def test_the_case_drives_the_shipped_wizard_and_stubs_only_the_mutation(self):
+        _facts, _host, podman = self.refused()
+        script = podman.scripts[1]
+        self.assertIn(aio.ADD_NODE_REFUSED_PANEL, script)
+        self.assertIn("cmd_node() {", script)
+        self.assertIn("detect_local_panel() { return 1; }", script)
+        self.assertLess(
+            script.index("cmd_node() {"),
+            script.index("wizard_add_node_to_panel"),
+            "the sentinel must be defined before the flow that could call it",
+        )
+
+    def test_a_reached_mutation_boundary_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.refused(wizard=refusal_output(sentinel=True))
+        self.assertIn("mutation began", str(caught.exception))
+
+    def test_a_refusal_without_a_verification_message_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.refused(wizard=refusal_output(verification=False))
+        self.assertIn("verification failure", str(caught.exception))
+
+    def test_a_changed_panel_node_list_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.refused(after=("worker-1", "worker-invalid"))
+        self.assertIn("changed the Panel's node list", str(caught.exception))
+
+    def test_the_case_is_declared_in_the_suite(self):
+        suite = panel_only.cases(FakePodman(self.context))
+        ids = [case.id for case in suite]
+        self.assertIn(panel_only.ADD_NODE_REFUSED_CASE_ID, ids)
+        # The case runs after the refusal probe
+        self.assertLess(ids.index(panel_only.SQUAD_REFUSED_CASE_ID), ids.index(panel_only.ADD_NODE_REFUSED_CASE_ID))
 
 
 if __name__ == "__main__":

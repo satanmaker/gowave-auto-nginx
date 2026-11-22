@@ -16,6 +16,7 @@ has no local node and a registration no host could receive proves nothing.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 from tools.live_vps.versions import output_matches_expected_version, version_token
@@ -29,6 +30,7 @@ HOST_CASE_ID = "PO-HOST"
 API_CASE_ID = "PO-API"
 SQUAD_CASE_ID = "PO-SQUAD"
 SQUAD_REFUSED_CASE_ID = "PO-SQUAD-REFUSED"
+ADD_NODE_REFUSED_CASE_ID = "MN-ADD-NODE-REFUSED"
 
 # The install downloads releases, resolves packages and issues two certificates.
 INSTALL_TIMEOUT_SECONDS = aio.INSTALL_TIMEOUT_SECONDS
@@ -828,6 +830,86 @@ def case_refused_payload(product: PanelOnlyProduct) -> Dict[str, Any]:
     return facts
 
 
+def case_add_node_refused(product: PanelOnlyProduct) -> Dict[str, Any]:
+    """``MN-ADD-NODE-REFUSED``: the wizard refuses an unverifiable Panel before mutating.
+
+    The scenario is the operator's second and third mistake in one flow: a Panel
+    address that does not answer a verified API, entered for a deployment that
+    already exists. The attempt must stop at the verification step, so the case
+    reads three independent facts — the verification message on the operator's
+    stream, the absence of the mutation sentinel and of the credential prompt,
+    and a Panel surface whose node list is byte-for-byte the one it had before.
+    """
+    host = product.require_installed()
+
+    before = aio.panel_probe(product, ADD_NODE_REFUSED_CASE_ID, "surface")
+    nodes_before = (before.get("surface") or {}).get("nodes") or {}
+
+    script = aio.add_node_refusal_script()
+    started = time.monotonic()
+    proc = product.podman.exec_bash(
+        host.target_name, script, check=False, timeout=PROBE_TIMEOUT_SECONDS,
+    )
+    outcome = topology.InstallOutcome(
+        returncode=proc.returncode,
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
+        duration=time.monotonic() - started,
+        command=script,
+    )
+    output = f"{outcome.stdout}\n{outcome.stderr}"
+
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        not outcome.ok,
+        f"the wizard accepted a Panel address that cannot be verified and exited "
+        f"{outcome.returncode}:\n{output[-4000:]}",
+    )
+    reported = [marker for marker in aio.PANEL_VERIFICATION_FAILURES if marker in output]
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        bool(reported),
+        "the refusal named no verification failure, so it stopped for some other reason "
+        f"(expected one of {list(aio.PANEL_VERIFICATION_FAILURES)}):\n{output[-4000:]}",
+    )
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        "GOWAVE_CMD_NODE_CALLED" not in output,
+        "the refused attempt reached the Worker deployment boundary, so a mutation began "
+        f"before the Panel was verified:\n{output[-4000:]}",
+    )
+    # `read -p` prints its prompt only when stdin is a terminal, so the absence of
+    # a credential prompt would prove nothing here. The sentinel above is the real
+    # reading: Worker credentials are collected before `cmd_node add` and handed to
+    # it, so a boundary that was never crossed received none of them.
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        f"Verifying Panel API at {aio.ADD_NODE_REFUSED_PANEL}..." in output,
+        "the flow never reached the verification step for the address it was given, so the "
+        f"refusal below cannot be attributed to Panel verification:\n{output[-4000:]}",
+    )
+
+    after = aio.panel_probe(product, ADD_NODE_REFUSED_CASE_ID, "surface")
+    nodes_after = (after.get("surface") or {}).get("nodes") or {}
+    require(
+        ADD_NODE_REFUSED_CASE_ID,
+        (nodes_after.get("names") or []) == (nodes_before.get("names") or []),
+        f"the refused attempt changed the Panel's node list: "
+        f"{nodes_before.get('names')!r} -> {nodes_after.get('names')!r}",
+    )
+
+    return {
+        "panel_address": aio.ADD_NODE_REFUSED_PANEL,
+        "verification_failure_reported": reported,
+        "wizard_returncode": outcome.returncode,
+        "mutation_boundary_reached": "GOWAVE_CMD_NODE_CALLED" in output,
+        "verification_step_reached": True,
+        "panel_node_names_before": nodes_before.get("names"),
+        "panel_node_names_after": nodes_after.get("names"),
+        "output_tail": outcome.tail(2000),
+    }
+
+
 def cases(podman: Any, distribution: str = "ubuntu-24.04") -> List[Case]:
     """The Panel-only suite in run order.
 
@@ -848,5 +930,8 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04") -> List[Case]:
              timeout_seconds=REGISTRATION_TIMEOUT_SECONDS),
         Case(SQUAD_REFUSED_CASE_ID, "panel-only",
              lambda context: case_refused_payload(product),
+             timeout_seconds=PROBE_TIMEOUT_SECONDS),
+        Case(ADD_NODE_REFUSED_CASE_ID, "panel-only",
+             lambda context: case_add_node_refused(product),
              timeout_seconds=PROBE_TIMEOUT_SECONDS),
     ]

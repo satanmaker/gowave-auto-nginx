@@ -240,6 +240,8 @@ cmd_install() {
     local install_mode
     if wizard_should_run "$@"; then
         wizard_collect_plan || return 1
+        wizard_review_plan || return 1
+        wizard_check_ssh_reachable || return 1
         wizard_apply_plan || return 1
         install_mode="$GOWAVE_INSTALL_MODE"
     else
@@ -771,7 +773,19 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
         multi-node | panel-only)
             echo ""
             echo "Onboarding the planned remote nodes..."
-            wizard_onboard_nodes || return 1
+            local onboard_rc=0
+            wizard_onboard_nodes || onboard_rc=$?
+            # Return code 2 means partial success (some nodes succeeded, some failed).
+            # The Panel deployment and the successful nodes are kept: this is not a
+            # rollback. The command still exits with that code so an operator, and
+            # anything driving the install, can tell it apart from a clean install
+            # (0) and from a failed Panel deployment (1).
+            if (( onboard_rc == 1 )); then
+                return 1
+            fi
+            if (( onboard_rc == 2 )); then
+                return 2
+            fi
             ;;
     esac
 }
@@ -1629,55 +1643,161 @@ cmd_user_links() {
     echo "================================================================================"
 }
 
+# Detect local Panel installation and return its domain if found.
+# Returns 0 and prints the Panel domain if exactly one local Panel is found.
+# Returns 1 if no local Panel or ambiguous (multiple).
+# Returns 2 if Panel service is not active.
+detect_local_panel() {
+    # Check if Panel service is active
+    if ! systemctl is-active --quiet gowave.service 2>/dev/null; then
+        return 2
+    fi
+
+    # Try to get Panel domain from NGINX config
+    local panel_domain=""
+    if [[ -f /etc/nginx/conf.d/gowave-panel.conf ]]; then
+        panel_domain=$(grep -E '^[[:space:]]*server_name[[:space:]]' /etc/nginx/conf.d/gowave-panel.conf 2>/dev/null | head -1 | awk '{print $2}' | sed 's/;//')
+    fi
+
+    # Fallback: try to get from state.json
+    if [[ -z "$panel_domain" && -f /opt/gowave/state.json ]]; then
+        panel_domain=$(python3 -c "
+import json, sys
+try:
+    data = json.load(open('/opt/gowave/state.json'))
+    panel = data.get('panel', {})
+    if isinstance(panel, dict):
+        print(panel.get('domain', ''))
+except Exception:
+    pass
+" 2>/dev/null)
+    fi
+
+    # Fallback: try to get from Panel's .env
+    if [[ -z "$panel_domain" && -f /opt/gowave/.env ]]; then
+        panel_domain=$(grep '^PANEL_DOMAIN=' /opt/gowave/.env 2>/dev/null | cut -d= -f2-)
+    fi
+
+    if [[ -n "$panel_domain" ]]; then
+        printf '%s\n' "$panel_domain"
+        return 0
+    fi
+
+    return 1
+}
+
+# Interactive add-node flow with local Panel detection and verification.
+wizard_add_node_to_panel() {
+    local panel_domain
+    local detected_rc=0
+
+    # Try to detect local Panel
+    panel_domain=$(detect_local_panel)
+    detected_rc=$?
+
+    case $detected_rc in
+        0)
+            # Exactly one local Panel found
+            printf '%s\n' "$(tf wizard.add_node.local_detected "$panel_domain")"
+            read -r -p "$(t wizard.add_node.confirm_local)" confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                printf '%s\n' "$(t wizard.add_node.cancelled)"
+                return 1
+            fi
+            ;;
+        2)
+            # Panel service not active
+            printf '%s\n' "$(t wizard.add_node.no_local_service)"
+            ;;
+        1|*)
+            # No local Panel or ambiguous
+            printf '%s\n' "$(t wizard.add_node.no_local)"
+            ;;
+    esac
+
+    # If we didn't confirm a local Panel, ask for Panel address
+    if [[ $detected_rc -ne 0 ]] || [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        printf '%s\n' "$(t wizard.add_node.enter_panel)"
+        read -r -p "$(t menu.prompt.worker_name)" panel_domain
+    fi
+
+    # Verify Panel API identity and reachability before collecting SSH credentials
+    # or mutating the Worker.
+    if ! wizard_verify_panel_api "$panel_domain"; then
+        return 1
+    fi
+
+    # Now prompt for worker details
+    read -r -p "$(t menu.prompt.worker_name)" wname
+    read -r -p "$(t menu.prompt.worker_ip)" wip
+    read -r -p "$(t menu.prompt.worker_domain)" wdom
+    read -r -p "$(t menu.prompt.camouflage_domain)" rdom
+    cmd_node add "$wname" "$wip" "$wdom" "$rdom"
+}
+
 main_menu() {
+    local lang
+    lang=$(wizard_language)
     clear
-    echo "================================================================================"
-    echo "                      GoWave Auto NGINX Manager                                 "
-    echo "================================================================================"
-    echo " 1) Show status & health"
-    echo " 2) Install All-in-One GoWave stack"
-    echo " 3) Add Distributed Edge Worker Node"
-    echo " 4) Change domains"
-    echo " 5) Switch channel (stable <-> dev)"
-    echo " 6) Create Backup"
-    echo " 7) Restore Backup"
-    echo " 8) Show User Subscription Links"
-    echo " 9) Uninstall"
-    echo " 0) Exit"
-    echo "================================================================================"
-    read -r -p "Select option [0-9]: " choice
+    tf menu.title
+    echo ""
+    printf ' 1) %s\n' "$(t menu.option.status)"
+    printf ' 2) %s\n' "$(t menu.option.install)"
+    printf ' 3) %s\n' "$(t menu.option.add_node)"
+    printf ' 4) %s\n' "$(t menu.option.change_domains)"
+    printf ' 5) %s\n' "$(t menu.option.switch_channel)"
+    printf ' 6) %s\n' "$(t menu.option.backup)"
+    printf ' 7) %s\n' "$(t menu.option.restore)"
+    printf ' 8) %s\n' "$(t menu.option.user_links)"
+    printf ' 9) %s\n' "$(t menu.option.uninstall)"
+    printf ' 0) %s\n' "$(t menu.option.exit)"
+    echo ""
+    local choice
+    read -r -p "$(t menu.prompt)" choice
     case "$choice" in
         1) cmd_status ;;
         2) cmd_install ;;
-        3)
-            read -r -p "Worker Name: " wname
-            read -r -p "Worker IP: " wip
-            read -r -p "Worker Domain: " wdom
-            read -r -p "Camouflage Domain: " rdom
-            cmd_node add "$wname" "$wip" "$wdom" "$rdom"
-            ;;
+        3) wizard_add_node_to_panel ;;
         4)
-            read -r -p "New Panel Domain: " np
-            read -r -p "New Camouflage Domain: " nr
+            read -r -p "$(t menu.prompt.new_panel_domain)" np
+            read -r -p "$(t menu.prompt.new_camouflage_domain)" nr
             cmd_domain_change "$np" "$nr"
             ;;
         5)
-            read -r -p "Target Channel (stable|dev): " tch
+            read -r -p "$(t menu.prompt.target_channel)" tch
             switch_channel "$tch"
             ;;
         6) "$SCRIPT_DIR/assets/backup/gowave-backup.sh" backup ;;
         7)
-            read -r -p "Path to archive.tar.gz: " arch_path
+            read -r -p "$(t menu.prompt.archive_path)" arch_path
             "$SCRIPT_DIR/assets/backup/gowave-backup.sh" restore "$arch_path"
             ;;
         8)
-            read -r -p "Username or ShortUUID [default-user]: " uid
+            read -r -p "$(t menu.prompt.username)" uid
             cmd_user_links "${uid:-default-user}"
             ;;
         9) cmd_uninstall ;;
         0) exit 0 ;;
         *) echo "Invalid option." ;;
     esac
+}
+
+# Interactive entrypoint: select language first, then show menu
+cmd_interactive() {
+    # If language is not pre-configured and no terminal, print usage and exit non-zero
+    local configured="${GOWAVE_WIZARD_LANG:-}"
+    if [[ -z "$configured" || ! $(wizard_language_for "$configured" >/dev/null 2>&1; echo $?) -eq 0 ]]; then
+        if [[ ! -t 0 ]]; then
+            printf 'Usage: gowave-auto.sh {status|health|install|node|channel|domain-change|backup|restore|uninstall|user links <id>|recover}\n' >&2
+            return 2
+        fi
+    fi
+    # Select language before any menu
+    wizard_select_language || return 1
+    # Loop the menu until the operator exits
+    while true; do
+        main_menu
+    done
 }
 
 # Sourced by a fixture: the functions above are the subject, and the router below
@@ -1690,7 +1810,7 @@ fi
 # CLI Entrypoint Router
 if [[ $# -eq 0 ]]; then
     CURRENT_STEP="menu"
-    main_menu
+    cmd_interactive
 else
     CURRENT_STEP="${1:-unknown command}"
     case "${1:-}" in

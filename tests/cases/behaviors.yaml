@@ -102,11 +102,12 @@ behaviors:
       `state.json` names the mode with an empty node array and no local-node
       fields. The first registration after that install resolves a squad and
       every host record names it, while a null squad entry never becomes the
-      operator's own grant.
+      operator's own grant. An add-node attempt whose Panel API verification
+      fails reports the failure and does not begin any remote mutation.
     topology: [panel-only]
     gate: pr
     cases: [PO-INSTALL, PO-HOST, PO-API, PO-SQUAD]
-    error_paths: [PO-SQUAD-REFUSED]
+    error_paths: [PO-SQUAD-REFUSED, MN-ADD-NODE-REFUSED]
 
   - name: The public edge hides its build and hands the Panel only the peer address
     area: installation
@@ -270,11 +271,14 @@ behaviors:
       The Worker is provisioned over an SSH stdin pipeline with no secret in
       argv and no abbreviated payload, the Panel registers it and the cluster
       inventory describes it, and a duplicate registration or an unapproved
-      Master address is refused.
+      Master address is refused. A multi-node deployment where one Worker fails
+      continues the Panel and the successful sibling, records the failed node
+      with its phase and diagnostic, exits with the partial-success code, and
+      prints a per-node summary.
     topology: [multi-node]
     gate: pre-push
     cases: [MN-INSTALL, MN-ARGV-OBSERVER, WRK-01, WRK-04, WRK-05, WRK-06, CLUS-01, CLUS-02, CLUS-03]
-    error_paths: [WRK-02, WRK-03, PODNET-MASTER-ADDR]
+    error_paths: [WRK-02, WRK-03, PODNET-MASTER-ADDR, MN-PARTIAL-SUCCESS]
 
   # ------------------------------------------------ subscription representations
   - name: Every representation reaches the client family that consumes it

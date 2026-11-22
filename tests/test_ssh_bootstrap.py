@@ -90,10 +90,17 @@ class TestHostKeyScan(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, key_line)
 
-    def test_a_comment_only_answer_is_refused(self):
+    def test_a_comment_only_answer_is_reported_for_detection(self):
+        # A banner-only response is now returned (stripped of #) for the caller
+        # to detect and handle, rather than being silently refused. The fingerprint
+        # will be empty, which the caller treats as a banner case.
         result = self._scan([self.BANNER])
-        self.assertNotEqual(result.returncode, 0, "a banner is not a host key")
-        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("127.0.0.1:2222 SSH-2.0-OpenSSH_9.6p1", result.stdout)
+        # The fingerprint of a banner line is empty
+        result_fp = self._scan([self.BANNER], tail=" | ssh_bootstrap_fingerprint")
+        self.assertEqual(result_fp.returncode, 0, result_fp.stderr)
+        self.assertEqual(result_fp.stdout.strip(), "")
 
     def test_the_scanned_line_yields_a_fingerprint(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -357,6 +357,19 @@ class Podman:
         ):
             raise RuntimeError(f"{host}:{port} was not reachable from {name} within {timeout_seconds}s")
 
+    def stop(self, name: str, timeout_seconds: int = 30) -> int:
+        """Stop one run container, reporting the exit code instead of raising.
+
+        A container that is already stopped or gone is a stop that succeeded;
+        what the caller has to see is a container that refuses to stop, so the
+        code comes back rather than an exception.
+        """
+        return self._run(["stop", "--time", str(timeout_seconds), name], check=False).returncode
+
+    def remove(self, name: str) -> int:
+        """Remove one container the run created, leaving the rest of the run intact."""
+        return self._run(["rm", "-f", name], check=False).returncode
+
     def address(self, name: str, network: Optional[str] = None) -> str:
         fmt = (
             '{{range $k, $v := .NetworkSettings.Networks}}'
