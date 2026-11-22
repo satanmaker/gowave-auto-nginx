@@ -4,12 +4,12 @@
 
 ### Requirement: Pinned Xray Core Delivery Before the Upstream Installer
 
-Before the upstream GoWave Node installer runs, the orchestrator SHALL install the pinned Xray core at `<install_dir>/rw-core` from a release artifact whose SHA-256 matches the pin for the host architecture. Because an executable `rw-core` makes the upstream installer skip its own core installation, a node install SHALL complete without any request to `api.github.com`.
+On an installation that restarts the node, the orchestrator SHALL install the pinned Xray core at `<install_dir>/rw-core` before the upstream installer runs, from an artifact whose SHA-256 matches the pin for the host architecture. An executable `rw-core` makes the upstream installer skip its own core installation, so a node installation on the default version SHALL complete without any request to `api.github.com`. `XRAY_SERVER_VERSION=latest` is the specified exception.
 
 #### Scenario: Node installation completes while the GitHub API is unreachable
 
 - **GIVEN** a host where `api.github.com` is unreachable and no Xray core is installed
-- **WHEN** node installation runs with `XRAY_SERVER_VERSION` unset
+- **WHEN** node installation runs with `XRAY_SERVER_VERSION` unset or naming the pin
 - **THEN** installation succeeds, `<install_dir>/rw-core` reports the pinned version, and no `core install` request is made
 
 #### Scenario: The upstream installer finds a runnable core and does not fetch one
@@ -26,13 +26,19 @@ Before the upstream GoWave Node installer runs, the orchestrator SHALL install t
 
 ### Requirement: Single Meaning for Each XRAY_SERVER_VERSION Value
 
-`XRAY_SERVER_VERSION` SHALL have exactly one meaning per value: unset installs the pinned core; `latest` delegates the core to the upstream installer as an explicit opt-out; any other version is left to the upstream installer and the existing explicit-version path. The pin SHALL be Xray 26.11.9, the release verified against mihomo 1.19.34 for REALITY.
+`XRAY_SERVER_VERSION` SHALL have exactly one meaning per value: unset, or naming the pin itself, installs the pinned core; `latest` delegates the core to the upstream installer as an explicit opt-out; any other version is left to the upstream installer and the existing explicit-version path. The pin SHALL be Xray 26.11.9, the release verified against mihomo 1.19.34 for REALITY.
 
 #### Scenario: An unset version installs the pin
 
 - **GIVEN** `XRAY_SERVER_VERSION` is unset or empty
 - **WHEN** node installation runs
 - **THEN** the installed core is 26.11.9 and the upstream core installation is skipped
+
+#### Scenario: An explicit value naming the pin installs the pin
+
+- **GIVEN** `XRAY_SERVER_VERSION` is `26.11.9` or `v26.11.9`
+- **WHEN** node installation runs
+- **THEN** the pinned step installs 26.11.9 and no upstream core installation is attempted
 
 #### Scenario: latest opts out of the pin
 
@@ -48,12 +54,12 @@ Before the upstream GoWave Node installer runs, the orchestrator SHALL install t
 
 ### Requirement: Version-Based Idempotency of the Pinned Core Step
 
-The pinned core step SHALL treat an installed core as satisfied only when its reported version contains the pinned version. A core whose version differs SHALL be replaced, and a repeat installation that already finds the pinned version SHALL not download the artifact again.
+On an installation that restarts the node, the pinned core step SHALL treat an installed core as satisfied only when its reported version names the pinned version as a version token, not as a substring. A core whose version differs SHALL be replaced, and a repeat installation that already finds the pinned version SHALL not download the artifact again.
 
 #### Scenario: A repeat installation does not download the core again
 
 - **GIVEN** a host whose `rw-core` already reports the pinned version
-- **WHEN** node installation runs again
+- **WHEN** node installation restarts the node
 - **THEN** no artifact is downloaded and the running core is left untouched
 
 #### Scenario: A foreign core is replaced instead of accepted
@@ -76,11 +82,11 @@ When the pinned artifact cannot be delivered or fails verification, node install
 
 - **GIVEN** the pinned artifact cannot be delivered
 - **WHEN** node installation fails
-- **THEN** the run reports the failing step and its exit status exactly once, as the installer's other failures do
+- **THEN** the installation log carries one message naming the pinned version and `XRAY_SERVER_VERSION=latest`, the run exits non-zero, and no upstream `core install` attempt follows
 
 ### Requirement: One Authoritative Core Pin Table
 
-The product SHALL keep one table mapping a supported (version, architecture) pair to an artifact URL and SHA-256 digest, the same digest the acceptance matrix pins for that client. An unknown version or architecture SHALL make the pinned step abstain rather than select a near-matching artifact.
+The product SHALL keep one table mapping a supported (version, architecture) pair to an artifact URL and SHA-256 digest — for each architecture the acceptance matrix also names, the same digest that matrix pins. An unknown version or architecture SHALL make the pinned step abstain rather than select a near-matching artifact.
 
 #### Scenario: The product pin and the acceptance matrix name the same bytes
 
