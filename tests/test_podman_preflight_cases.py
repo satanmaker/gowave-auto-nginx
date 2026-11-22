@@ -203,6 +203,15 @@ def _namespace_command(argv):
     unshare = shutil.which("unshare")
     if unshare is None:
         return None
+    # Probe: some CI runners (GitHub Actions ubuntu-24.04) have unshare but deny
+    # user namespace mapping (unshare -rn). Test it once up front.
+    probe = subprocess.run(
+        [unshare, "-rn", "true"],
+        capture_output=True,
+        timeout=10,
+    )
+    if probe.returncode != 0:
+        return None
     inner = "ip link set lo up && exec " + " ".join(
         subprocess.list2cmdline([argument]) for argument in argv
     )
@@ -342,8 +351,8 @@ class TestPreflightDnsCases(unittest.TestCase):
         if argv is None:
             self.skipTest(
                 "the resolver pair binds :53 and this runner is neither root nor able to "
-                "create a network namespace (unshare is missing), so these four cases and "
-                "their damage probes were not run"
+                "create a user+network namespace (unshare -rn not permitted), so these "
+                "four cases and their damage probes were not run"
             )
         completed = subprocess.run(
             argv, capture_output=True, text=True, timeout=600,
