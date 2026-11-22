@@ -572,7 +572,13 @@ class TestJustifiedExclusions(unittest.TestCase):
         owned = {case["id"] for case in self.document["cases"]
                  if "panel-only" in (case.get("topology") or [])}
         self.assertEqual(
-            owned, {"PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED"},
+            owned,
+            {
+                "PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED",
+                # The add-node refusal runs in this topology too: the Panel exists
+                # here and the mutation boundary is crossed nowhere.
+                "MN-ADD-NODE-REFUSED",
+            },
         )
 
     def stub_run(self, argv, executed):
@@ -664,7 +670,7 @@ class TestJustifiedExclusions(unittest.TestCase):
 class TestPodmanFirstPromotion(unittest.TestCase):
     """A Podman-first case is a promise to promote, and the promise names an owner.
 
-    The catalog incubates 124 cases that no live scenario covers yet. Each one
+    The catalog incubates 126 cases that no live scenario covers yet. Each one
     states the requirement it belongs to here and the live requirement it is
     being promoted into; both are read from the specs, so a renamed
     requirement orphans its cases loudly instead of leaving them pointing at a
@@ -698,7 +704,7 @@ class TestPodmanFirstPromotion(unittest.TestCase):
     def test_every_podman_first_case_names_an_owner_and_a_target_the_specs_state(self):
         vocabulary = self.vocabulary()
         self.assertEqual(len(self.extras), self.document["counts"]["podman_first"])
-        self.assertEqual(len(self.extras), 124)
+        self.assertEqual(len(self.extras), 126)
         for case in self.extras:
             self.assertEqual(case["runs_in"], ["podman"], case["id"])
             self.assertEqual(case["state"], "incubating", case["id"])

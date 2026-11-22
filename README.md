@@ -131,7 +131,7 @@ Three limits are part of the policy, not implementation details:
 ## Specification-driven with real acceptance runs
 
 The behaviour is pinned by OpenSpec specifications in `openspec/specs/`: the specs carry
-**56 requirements / 187 GIVEN-WHEN-THEN acceptance scenarios**. Each scenario is executed by one of two
+**69 requirements / 233 GIVEN-WHEN-THEN acceptance scenarios**. Each scenario is executed by one of two
 runners rather than only eyeballed in code review:
 
 - **Podman E2E** (`tools/run_podman_e2e.py`) — a rootful 4-distribution container testbed that

@@ -1447,14 +1447,12 @@ class MultiNodeTopology(AioTopology):
         self.started.append(self.untrusted_name)
 
     # ------------------------------------------------------------------- trust
-    def pin_worker_trust(self) -> Dict[str, Any]:
-        """Give the Master key access to the Worker and pin the Worker's host key.
+    def _master_public_key(self) -> str:
+        """The Master's own SSH identity, created once and reused by every pin.
 
-        The operator refuses an unpinned host key on purpose, so the run pins one:
-        the key is read from the Worker's own filesystem, which is the trusted
-        local control plane here, exactly as an operator would verify it out of
-        band before adding the node. Nothing is learned from an unauthenticated
-        ``ssh-keyscan``.
+        Key generation is idempotent on purpose: a host the run pins later must be
+        reached with the key the earlier pins already carry, not a fresh one that
+        replaces it.
         """
         self.podman.exec_bash(
             self.target_name,
@@ -1467,7 +1465,19 @@ class MultiNodeTopology(AioTopology):
             self.target_name, ["cat", "/root/.ssh/id_ed25519.pub"],
         ).stdout.strip()
         if not public_key:
-            raise TopologyError("the Master did not produce an SSH identity for the Worker")
+            raise TopologyError("the Master did not produce an SSH identity for the pins")
+        return public_key
+
+    def pin_worker_trust(self) -> Dict[str, Any]:
+        """Give the Master key access to the Worker and pin the Worker's host key.
+
+        The operator refuses an unpinned host key on purpose, so the run pins one:
+        the key is read from the Worker's own filesystem, which is the trusted
+        local control plane here, exactly as an operator would verify it out of
+        band before adding the node. Nothing is learned from an unauthenticated
+        ``ssh-keyscan``.
+        """
+        public_key = self._master_public_key()
         # The key travels over stdin: an argv copy would be visible in the
         # container's process list for as long as the exec lasts.
         self.podman.exec(
@@ -1550,6 +1560,98 @@ class MultiNodeTopology(AioTopology):
             )
         self._worker_host_key = worker_host_key
         return entry.strip()
+
+    # -------------------------------------------------- secondary Worker host
+    def start_secondary_worker(
+        self, container: str, address: str, domains: Sequence[str],
+    ) -> Dict[str, Any]:
+        """Start a clean systemd host beside the Worker, for a second registration.
+
+        ``MN-ENV-CONTRACT`` drives the product's own ``node add`` a second time, and
+        the Panel keys a node by its address, so that registration needs a host the
+        first one does not already hold. The container gets the run's image,
+        resolver and SSH preparation the Worker had — the product's preflight reads
+        both hosts the same way — but it is not one of the topology's declared
+        roles: the case that needs it creates it, and its own teardown removes it.
+        """
+        image_tag = target_image.build(self.podman, self.distribution)
+        self.podman.run(
+            name=container,
+            image_alias=image_tag,
+            network=self.network,
+            aliases=tuple(domains),
+            privileged=True,
+            environment={"DEBIAN_FRONTEND": "noninteractive"},
+            systemd="always",
+            extra_args=(
+                "--ip", address,
+                "--dns", self.plan.dns_ip,
+                *[option for resolver in self.egress_resolvers for option in ("--dns", resolver)],
+            ),
+        )
+        self.started.append(container)
+        self.podman.wait_systemd(container, timeout_seconds=180)
+        # The second Worker is IPv4-only like the first one, so the product takes
+        # the same branch on both hosts rather than one the runtime chose.
+        self.podman.exec_bash(container, DISABLE_IPV6_SCRIPT, timeout=120)
+        self.podman.exec_bash(container, WORKER_SSH_SETUP_SCRIPT, timeout=120)
+        return {
+            "container": container,
+            "address": address,
+            "domains": sorted(domains),
+            "systemd": "ready",
+        }
+
+    def pin_secondary_trust(self, container: str, address: str) -> Dict[str, str]:
+        """Give the Master access to a second Worker host and pin its host key.
+
+        The rule the first Worker is held to applies to every address the operator
+        provisions: the key is read from the host's own filesystem, pinned under
+        the address the registration will use, and read back — an append that never
+        arrived exits 0 and leaves an empty file.
+        """
+        public_key = self._master_public_key()
+        self.podman.exec(
+            container,
+            ["bash", "-c",
+             "umask 077; mkdir -p /root/.ssh; chmod 0700 /root/.ssh; "
+             "cat >> /root/.ssh/authorized_keys; chmod 0600 /root/.ssh/authorized_keys"],
+            input_text=public_key + "\n",
+            timeout=120,
+        )
+        authorized = self.podman.exec(
+            container, ["cat", "/root/.ssh/authorized_keys"], check=False,
+        ).stdout
+        if self._key_blob(public_key) not in authorized:
+            raise TopologyError(
+                f"the Master key did not land in {container}:/root/.ssh/authorized_keys"
+            )
+        host_key = self.podman.exec(
+            container, ["cat", "/etc/ssh/ssh_host_ed25519_key.pub"],
+        ).stdout.strip()
+        if not host_key.startswith("ssh-ed25519 "):
+            raise TopologyError(f"{container} has no ed25519 host key to pin for {address}")
+        entry = f"{address} {host_key}\n"
+        self.podman.exec(
+            self.target_name,
+            ["bash", "-c", "umask 077; mkdir -p /root/.ssh; cat >> /root/.ssh/known_hosts"],
+            input_text=entry,
+            timeout=120,
+        )
+        pinned = self.podman.exec(
+            self.target_name, ["cat", "/root/.ssh/known_hosts"], check=False,
+        ).stdout
+        if entry.strip() not in pinned:
+            raise TopologyError(
+                f"{address} with the {container} host key did not land in "
+                f"{self.target_name}:/root/.ssh/known_hosts"
+            )
+        return {
+            "container": container,
+            "address": address,
+            "host_key_fingerprint": self._key_fingerprint(host_key),
+            "master_key_fingerprint": self._key_fingerprint(public_key),
+        }
 
     @staticmethod
     def _key_fingerprint(public_key: str) -> str:

@@ -111,18 +111,28 @@ GATE_TIERS: Sequence[str] = ("pre-push", "pr")
 
 
 def case_gate(topologies: Sequence[str], manifest: Dict[str, Any]) -> str:
-    """The earliest tier every one of ``topologies`` is gated at."""
-    declared = {
-        str(tier)
-        for topology in topologies
-        for tier in (((manifest.get("topologies") or {}).get(str(topology)) or {}).get("gate") or [])
-    }
+    """The earliest tier every one of ``topologies`` is gated at (intersection of all topologies' gates)."""
+    # Start with all tiers from the first topology, then intersect with each subsequent topology
+    common_tiers: Optional[Set[str]] = None
+    for topology in topologies:
+        tiers = {
+            str(tier)
+            for tier in (((manifest.get("topologies") or {}).get(str(topology)) or {}).get("gate") or [])
+        }
+        if common_tiers is None:
+            common_tiers = tiers
+        else:
+            common_tiers &= tiers
+    if not common_tiers:
+        raise CatalogError(
+            f"no common tier runs all topologies {sorted(str(name) for name in topologies)}, so a case "
+            "there would claim a gate no tier honours"
+        )
     for tier in GATE_TIERS:
-        if tier in declared:
+        if tier in common_tiers:
             return tier
     raise CatalogError(
-        f"no tier runs the topologies {sorted(str(name) for name in topologies)}, so a case "
-        "there would claim a gate no tier honours"
+        f"no tier in {GATE_TIERS} is common to all topologies {sorted(str(name) for name in topologies)}"
     )
 
 
@@ -872,6 +882,20 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "assertion": "A pinned artifact is fetched from ordered hosts; a host that cannot deliver falls through to the next, a mismatch is terminal and the next host is never asked, no host delivering leaves nothing behind, a destination is replaced only after its bytes are verified, an unusable digest is refused before any download, and a missing host list is refused.",
         "topology": ["aio"],
         "promotion_target": "All-in-One Master VPS Installation Verification",
+    },
+    {
+        "id": "MN-PARTIAL-SUCCESS",
+        "requirement": "Distributed Worker VPS Deployment Verification",
+        "assertion": "A multi-node deployment where one Worker fails onboarding continues the Panel deployment and the successful sibling, records the failed node with its target, phase and diagnostic reason, exits with the partial-success code distinct from a failed Panel installation, and prints a per-node summary that distinguishes successful and failed nodes.",
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
+    {
+        "id": "MN-ADD-NODE-REFUSED",
+        "requirement": "Distributed Worker VPS Deployment Verification",
+        "assertion": "An add-node attempt against a Panel whose API identity or reachability verification fails reports the failed verification and does not begin any remote node mutation; no Worker-side deployment is attempted and no credentials are transmitted.",
+        "topology": ["multi-node", "panel-only"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
     },
 ]
 

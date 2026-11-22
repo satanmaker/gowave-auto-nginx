@@ -1798,8 +1798,8 @@ class TestContourBoundary(unittest.TestCase):
         environments = {}
         for case in catalog["cases"]:
             environments[case["environment"]] = environments.get(case["environment"], 0) + 1
-        self.assertEqual(len(catalog["cases"]), 249, "the catalog changed size; the page quotes its total")
-        self.assertEqual(environments, {"container": 235, "partial": 12, "live-only": 2})
+        self.assertEqual(len(catalog["cases"]), 251, "the catalog changed size; the page quotes its total")
+        self.assertEqual(environments, {"container": 237, "partial": 12, "live-only": 2})
         self.assertIn(f"The catalog holds {len(catalog['cases'])} entries",
                       " ".join(boundary_section().split()),
                       "the page states a total the catalog does not have")

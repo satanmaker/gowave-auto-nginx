@@ -2485,6 +2485,48 @@ def panel_probe(product: AioProduct, case_id: str, scope: str, extra: str = "") 
         return {}
 
 
+# The address the add-node refusal case points the wizard at. A loopback alias
+# with nothing bound to its HTTPS port refuses the connection at once, so the
+# case fails on the verification step instead of waiting out a connect timeout
+# on a documentation-range address no route reaches.
+ADD_NODE_REFUSED_PANEL = "127.0.0.2"
+
+# Every message ``wizard_verify_panel_api`` prints on a path that ends in
+# ``return 1``. The case accepts the set rather than one string: which step
+# fails depends on whether the address answers at all and whether what it
+# answers with is a certificate, and the claim under test is only that the flow
+# stops inside the verification step.
+PANEL_VERIFICATION_FAILURES = (
+    "TLS certificate verification failed.",
+    "Could not retrieve certificate.",
+    "Panel API unreachable.",
+    "Panel verification cancelled.",
+)
+
+
+def add_node_refusal_script() -> str:
+    """The operator's add-node wizard, run against a Panel it cannot verify.
+
+    ``detect_local_panel`` is overridden because the host under test does run a
+    Panel: the mistake being refused is pointing the flow at some other address,
+    not failing to detect the local one. ``cmd_node`` is the mutation boundary,
+    so it is replaced by a printed sentinel — whether that line appears is the
+    fact that says the refused attempt never reached the Worker deployment.
+    """
+    return "\n".join([
+        "set -Eeuo pipefail",
+        f"source {topology.REPO_IN_CONTAINER}/gowave-auto.sh",
+        "trap - ERR",
+        "set +e",
+        "detect_local_panel() { return 1; }",
+        "cmd_node() { printf 'GOWAVE_CMD_NODE_CALLED\\n'; }",
+        f"wizard_add_node_to_panel <<< '{ADD_NODE_REFUSED_PANEL}'",
+        "wizard_rc=$?",
+        "printf 'GOWAVE_WIZARD_EXIT=%d\\n' \"$wizard_rc\"",
+        "exit \"$wizard_rc\"",
+    ])
+
+
 def case_panel_auth(product: AioProduct) -> Dict[str, Any]:
     """AIO-AUTH: the documented admin login opens the real, consistent read surface.
 

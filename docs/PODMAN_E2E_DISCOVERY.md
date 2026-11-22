@@ -874,16 +874,16 @@ image.
 
 `tests/cases/catalog.yaml` defines each scenario once and stamps it with an
 `environment`, so the boundary between the contours is a checked field rather
-than a sentence in a document. The catalog holds 249 entries:
+than a sentence in a document. The catalog holds 251 entries:
 
 | Environment | Entries | Which contour answers it |
 | --- | ---: | --- |
-| `container` | 235 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
+| `container` | 237 | A rootful Podman run on a pinned image, because nothing in the case needs a provider, a reboot or a public address. The run executes the subset its gates select, and an entry whose driver is still planned appears in no `result.json` case list — `python3 -m tools.podman_e2e.catalog gaps` keeps that visible rather than letting it read as a pass. |
 | `partial` | 12 | Both: the container half runs here against a fixture, and the live half stays in `live-vps-e2e`. The sentence that splits each one is generated from the catalog into `tests/cases/PARITY.md` (§Partial splits), not copied into this page. |
 | `live-only` | 2 | Only the live suite. Every Podman run prints both as justified exclusions and records them in `result.json` as `environment.justified_exclusions`, each carrying the catalog's own limitation; `tools/podman_e2e/catalog.py` refuses a catalog that lets one run here, or that leaves one without a written reason. |
 
 Of the 125 live scenarios projected into this catalog, 111 are container, 12 are
-partial and 2 are live-only; the other 124 entries are Podman-first cases with a
+partial and 2 are live-only; the other 126 entries are Podman-first cases with a
 promotion target, which `tests/cases/PARITY.md` lists separately. That file also
 answers per scenario rather than per group: one row names the live scenario, the
 catalog case that covers it, the environment classification and the gate that

@@ -58,9 +58,9 @@ class TestTraceabilityRules(unittest.TestCase):
         )
 
     def test_every_spec_scenario_has_exactly_one_row(self):
-        self.assertEqual(len(self.spec), 48, "the delta spec states 48 scenarios")
-        self.assertEqual(len(trace.rows(self.table)), 48)
-        self.assertEqual(len({tuple(row) for row in self.spec}), 48)
+        self.assertEqual(len(self.spec), 51, "the spec states 51 scenarios")
+        self.assertEqual(len(trace.rows(self.table)), 51)
+        self.assertEqual(len({tuple(row) for row in self.spec}), 51)
 
     def test_every_declared_case_is_mapped_or_serves_a_requirement(self):
         mapped = {
@@ -406,8 +406,8 @@ class TestTraceabilityRules(unittest.TestCase):
             problems = trace.run_count_problems(directory)
         self.assertTrue(
             any(
-                "the panel-only suite declares 5 cases" in p
-                and "executed 4" in p
+                "the panel-only suite declares 6 cases" in p
+                and "executed 5" in p
                 and "PO-SQUAD-REFUSED did not run" in p
                 for p in problems
             ),
@@ -462,10 +462,10 @@ class TestTraceabilityRules(unittest.TestCase):
     def test_the_audit_entrypoint_reads_the_checked_in_table(self):
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(trace.main(["--check"]), 0)
-        self.assertIn("48 scenarios, 48 rows", printed.getvalue())
+        self.assertIn("51 scenarios, 51 rows", printed.getvalue())
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(trace.main(["--strict"]), 0)
-        self.assertIn("48 scenarios, 48 rows, 0 gaps", printed.getvalue())
+        self.assertIn("51 scenarios, 51 rows, 0 gaps", printed.getvalue())
 
     def test_the_audit_entrypoint_refuses_a_drifted_report(self):
         with tempfile.TemporaryDirectory() as directory:

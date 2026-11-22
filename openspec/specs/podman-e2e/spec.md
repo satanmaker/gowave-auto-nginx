@@ -57,6 +57,22 @@ The test framework MUST provide distinct Control, Master/Panel, and Worker roles
 - **AND** the observation covers the Master-side process tree only, not the remote Worker beyond the
   SSH boundary
 
+#### Scenario: Multi-Node deployment with one failed node and partial success
+
+- **GIVEN** a Multi-Node deployment with multiple Workers planned
+- **WHEN** one Worker fails onboarding while the Panel installation and another Worker succeed
+- **THEN** the Panel deployment and the successful Worker onboarding continue
+- **AND** the failed Worker is recorded with its target, phase and diagnostic reason
+- **AND** the command exits with the partial-success code distinct from a failed Panel installation
+- **AND** the per-node summary distinguishes successful and failed nodes
+
+#### Scenario: Add-node refused by Panel API verification failure
+
+- **GIVEN** an existing Panel whose API identity or reachability verification fails
+- **WHEN** an add-node attempt is made against that Panel
+- **THEN** the attempt reports the failed verification and does not begin any remote node mutation
+- **AND** no Worker-side deployment is attempted and no credentials are transmitted
+
 ### Requirement: Independent Panel-only acceptance topology
 
 The test framework MUST provide an isolated Panel-only topology that installs the Panel and the static camouflage site on one clean supported image through the repository's real `gowave-auto.sh install --panel-only` command, provisioning no traffic plane — no local node, no backend listener, no Vision inbound — and MUST verify the resulting host and Panel state through the real API.
@@ -74,6 +90,13 @@ The test framework MUST provide an isolated Panel-only topology that installs th
 - **WHEN** the Panel-only Master registers a Worker through the real `gowave-auto.sh node add`
 - **THEN** the Panel holds one internal squad that allows an inbound, one host record per matching inbound whose `ALLOW_ONLY` squad list names the identifier `state.json` stored, and the registered Worker as its only node
 - **AND** a host record carrying a null squad entry either is refused by the Panel with the host count unchanged, or is stored without naming that identifier, and the probe removes whatever it created
+
+#### Scenario: Add-node refused by Panel API verification failure
+
+- **GIVEN** an existing Panel whose API identity or reachability verification fails
+- **WHEN** an add-node attempt is made against that Panel
+- **THEN** the attempt reports the failed verification and does not begin any remote node mutation
+- **AND** no Worker-side deployment is attempted and no credentials are transmitted
 
 ### Requirement: Real Panel subscription lifecycle
 

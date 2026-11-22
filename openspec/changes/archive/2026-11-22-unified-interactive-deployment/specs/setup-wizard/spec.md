@@ -1,6 +1,10 @@
 # Spec Delta
 
-## MODIFIED Requirements
+## Purpose
+
+Defines the operator-facing setup wizard behind `docs/SETUP_WIZARD.md`: the language-first question order, the editable deployment plan and its preflight boundary, Panel discovery and API identity verification for adding nodes, and the Russian and English prompt catalog every interactive message renders through.
+
+## ADDED Requirements
 
 ### Requirement: Language selection precedes every other question
 The interactive entrypoint SHALL ask for the display language, Russian or English, before any other question and before displaying any menu, unless `GOWAVE_WIZARD_LANG` already names one of the two, apply the choice to every message the interactive surface prints afterwards, and accept only one of the two offered answers. Every non-interactive invocation and every command reached without the interactive menu SHALL remain in English.

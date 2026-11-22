@@ -13,12 +13,12 @@ behaviour with no case, a behaviour covered only on its happy path, an
 area the delta spec names but no entry covers, and a case no behaviour
 names (an orphan) or two behaviours claim.
 
-Behaviours: 44 across 9 areas, naming 249 of 249 catalog cases.
+Behaviours: 44 across 9 areas, naming 251 of 251 catalog cases.
 
 | Area | Behaviours | Cases | Error-path cases |
 |---|---:|---:|---:|
-| installation | 11 | 28 | 12 |
-| provisioning | 8 | 27 | 16 |
+| installation | 11 | 28 | 13 |
+| provisioning | 8 | 27 | 17 |
 | subscription-representations | 2 | 7 | 4 |
 | data-plane | 5 | 45 | 11 |
 | decoy | 2 | 7 | 2 |
@@ -36,7 +36,7 @@ Behaviours: 44 across 9 areas, naming 249 of 249 catalog cases.
 | The installed host keeps serving across a restart and a repeated install | aio, multi-node | pre-push | `AIO-01`, `AIO-02`, `AIO-03`, `AIO-04`, `AIO-05`, `AIO-RESTART`, `AIO-IDEMPOTENT` | `AIO-NEG-DEP` |
 | The Panel API answers its documented caller and refuses the rest | aio, multi-node | pre-push | `AIO-AUTH`, `AIO-CLIENT`, `APIC-01`, `AIO-AUTH-NEG` | `NEG-06` |
 | Every installed component reports its exact pinned version | aio, multi-node | pre-push | `VER-01`, `VER-03` | `VER-02`, `AIO-NEG-PIN` |
-| The Panel-only mode installs a Panel and a decoy and no traffic plane | panel-only | pr | `PO-INSTALL`, `PO-HOST`, `PO-API`, `PO-SQUAD` | `PO-SQUAD-REFUSED` |
+| The Panel-only mode installs a Panel and a decoy and no traffic plane | panel-only | pr | `PO-INSTALL`, `PO-HOST`, `PO-API`, `PO-SQUAD` | `PO-SQUAD-REFUSED`, `MN-ADD-NODE-REFUSED` |
 | The public edge hides its build and hands the Panel only the peer address | aio | pre-push | `NGX-HYGIENE` | `NGX-SCANNER` |
 | An incomplete install request is refused before the installed host is touched | aio | pre-push | `PRE-INPUTS` | `PRE-INPUTS-BAD` |
 | A Cloudflare-proxied name is refused before any certificate request | aio | pre-push | `PRE-PROXY-CIDR` | `PRE-PROXY-CIDR-OVERRIDE` |
@@ -54,7 +54,7 @@ Behaviours: 44 across 9 areas, naming 249 of 249 catalog cases.
 | Temporary access is bounded by an armed remote expiry | aio, multi-node | pre-push | `TSSH-01`, `BOOT-02` | `TSSH-02` |
 | Target credentials stay on the control machine and are revoked | aio, multi-node | pre-push | `LOCAL-01`, `LOCAL-02`, `REV-01` | `REV-02` |
 | Each Vision domain is provisioned per node or refuses the host | aio, multi-node | pre-push | `VIS-01`, `VIS-02`, `VIS-03`, `VIS-07`, `VIS-08`, `MN-VISION` | `VIS-04`, `VIS-CONFIG`, `VIS-05`, `VIS-06` |
-| A Worker is deployed without a secret and registered as it runs | multi-node | pre-push | `MN-INSTALL`, `MN-ARGV-OBSERVER`, `WRK-01`, `WRK-04`, `WRK-05`, `WRK-06`, `CLUS-01`, `CLUS-02`, `CLUS-03` | `WRK-02`, `WRK-03`, `PODNET-MASTER-ADDR` |
+| A Worker is deployed without a secret and registered as it runs | multi-node | pre-push | `MN-INSTALL`, `MN-ARGV-OBSERVER`, `WRK-01`, `WRK-04`, `WRK-05`, `WRK-06`, `CLUS-01`, `CLUS-02`, `CLUS-03` | `WRK-02`, `WRK-03`, `PODNET-MASTER-ADDR`, `MN-PARTIAL-SUCCESS` |
 
 ## subscription-representations
 

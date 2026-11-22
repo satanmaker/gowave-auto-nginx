@@ -84,4 +84,15 @@ Unit tests mock the diagnostic provider and assert request construction, country
 
 ## Open Questions
 
-- Exact Globalping probe availability for RU, CN, and IR and whether the service permits the proposed low-volume preflight pattern must be confirmed during the provider spike before its integration is enabled.
+- ~~Exact Globalping probe availability for RU, CN, and IR and whether the service permits the proposed low-volume preflight pattern must be confirmed during the provider spike before its integration is enabled.~~ **Resolved 2026-11-22 — see below.**
+
+## Provider spike outcome (D4)
+
+Evidence: [`evidence/globalping-spike-2026-11-22.md`](evidence/globalping-spike-2026-11-22.md).
+
+- Probe coverage in the target countries exists: RU 175, CN 50, IR 11 (5603 probes, 123 countries). Country-scoped DNS measurements finished from RU, CN, and IR.
+- Bounded polling works: `in-progress` → `finished`/`failed`, typically finished within about one second.
+- Unauthenticated limits allow the low-volume pattern: 250 tests/hour per IP, 50 probes per measurement; measurements are public and retained about six months, so the consent/disclosure notice is mandatory.
+- **The blocking criterion fails:** Globalping has no raw TCP measurement type. Its allowed types are `ping, traceroute, dns, mtr, http`; the `http` type accepts a port but returns an HTTP verdict. On an SSH port the probe reports `failed`/`failureSource=target` even when `timings.tcp` shows a completed connect, so the timing field is an undocumented side channel, not a TCP verdict.
+
+**Decision: the optional provider stays disabled.** No third-party request is made by any shipped script, and installation remains independent of Globalping. The non-verdict classes (`insufficient`, `unavailable`) remain the contract for any future provider that can perform the required served-port TCP check.

@@ -285,6 +285,8 @@ be published.
 - **PANEL-ASSET-VERIFICATION** — promotion target: All-in-One Master VPS Installation Verification
 - **PINNED-INSTALLER-HOSTS** — promotion target: All-in-One Master VPS Installation Verification
 - **VERIFIED-ARTIFACT-FETCH** — promotion target: All-in-One Master VPS Installation Verification
+- **MN-PARTIAL-SUCCESS** — promotion target: Distributed Worker VPS Deployment Verification
+- **MN-ADD-NODE-REFUSED** — promotion target: Distributed Worker VPS Deployment Verification
 - **AIO-DP-REALITY-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-REALITY-mihomo** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
 - **AIO-DP-XHTTP-xray** — promotion target: Data Plane E2E Traffic Through All VPN Endpoints
