@@ -9814,8 +9814,12 @@ def case_fail_step(product: AioProduct) -> Dict[str, Any]:
             f"the report does not name the failing command: {report!r}")
     require(FAIL_STEP_CASE_ID, "(exit 1)" in report,
             f"the report does not name the status: {report!r}")
-    require(FAIL_STEP_CASE_ID, report.count('Error: step "') == 1,
-            f"the report was printed {report.count('Error: step \"')} times, so the handler "
+    # Counted before the message: an f-string may not carry a backslash in its
+    # expression part before Python 3.12, and the Debian 12 guest that runs this
+    # suite has 3.11.
+    report_count = report.count('Error: step "')
+    require(FAIL_STEP_CASE_ID, report_count == 1,
+            f"the report was printed {report_count} times, so the handler "
             f"re-entered itself: {report!r}")
     require(FAIL_STEP_CASE_ID, "SHOULD_NOT_REACH" not in result.stdout,
             "the run continued past the failing command")
@@ -9831,7 +9835,7 @@ def case_fail_step(product: AioProduct) -> Dict[str, Any]:
         "step_named": "test-step" in report,
         "command_named": 'running "false"' in report,
         "status_named": "(exit 1)" in report,
-        "report_count": report.count('Error: step "'),
+        "report_count": report_count,
         "exit_status": result.returncode,
         "silent_on_success": "Error: step " not in control.stderr,
     }
