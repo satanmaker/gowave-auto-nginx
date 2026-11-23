@@ -30,6 +30,12 @@ The working tree is shared and usually holds unrelated uncommitted edits: `colle
 
 Python floor is 3.10+; prefer the standard library, and treat PyYAML as available (CI installs it, and the catalog/matrix code imports it).
 
+## The harness has source guards of its own
+
+`tests/test_podman_readiness.py` walks the AST of `tools/podman_e2e/*.py` and fails on three shapes, whatever the code does at runtime: a bare `while True`, a `time.sleep` call outside a function whose name starts with `wait_`, and a subprocess call with no timeout. Run that module before the suite whenever an edit adds a loop, a wait or a command — a hang guard is written as a bounded loop (`while <condition>:` naming its deadline) or as a `wait_` helper, not as `while True` with a `break` inside.
+
+`tools/` is otherwise covered only by `tools/tests` and by the nonroot suite's `py_compile` pass, so a harness module broken at runtime is caught by its own tests or not at all.
+
 ## Commands
 
 ```bash
