@@ -206,6 +206,63 @@ if [[ -d "$dir" ]]; then printf 'LEAK\\n'; else printf 'GONE\\n'; fi
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(res.stdout.strip(), "GONE", "release_temp_dir left the directory behind")
 
+    def test_caller_scratch_dir_survives_a_callee_that_tracks_its_own(self):
+        """A child's EXIT trap must not delete the directory its caller is still reading.
+
+        `wizard_onboard_nodes` captures the Worker's output through a tracked
+        scratch directory and reads the stderr file afterwards. The callee that
+        tracks a directory of its own installs an EXIT trap inside the command
+        substitution, so an unscoped cleanup runs over the caller's entries and
+        takes the Worker's diagnostic with it.
+        """
+        script = """
+set -Eeuo pipefail
+on_error() {
+    local code=$?
+    trap - ERR
+    if [[ "${BASHPID:-$$}" != "$$" ]]; then
+        exit "$code"
+    fi
+    exit "$code"
+}
+trap 'on_error' ERR
+source "$REPO/modules/tempdir.sh"
+callee() {
+    local own
+    own=$(mktemp -d /tmp/gowave-tempdir-child.XXXXXX)
+    track_temp_dir "$own"
+    printf 'PHASE:ssh\\n' >&2
+    return 1
+}
+outer() {
+    local dir="$1"
+    local stderr_file="$1/stderr"
+    : > "$stderr_file"
+    track_temp_dir "$dir"
+    local out=""
+    out=$(callee 2>"$stderr_file")
+    local rc=$?
+    local captured
+    captured=$(cat "$stderr_file" 2>/dev/null || true)
+    : > "$stderr_file" || { printf 'BROKEN\\n'; return 1; }
+    printf 'RC=%s ERR=[%s] OUT=[%s]\\n' "$rc" "$captured" "$out"
+}
+# cmd_install tests the status of the onboarding call, which is what keeps
+# errexit from abandoning the body at the failing assignment.
+outer "$1" || printf 'OUTER_RC=%s\\n' "$?"
+"""
+        env = dict(os.environ, REPO=str(REPO_ROOT))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            parent = Path(tmp_dir) / "scratch"
+            parent.mkdir()
+            res = subprocess.run(["bash", "-c", script, "probe", str(parent)],
+                                 env=env, capture_output=True, text=True)
+        self.assertNotIn("BROKEN", res.stdout,
+                         f"the caller's scratch file was deleted: {res.stderr}")
+        self.assertIn("RC=1", res.stdout, res.stdout)
+        self.assertIn("ERR=[PHASE:ssh]", res.stdout,
+                      f"the callee's stderr did not survive: {res.stdout}")
+
     def test_tree_guard_refuses_paths_outside_the_owned_root(self):
         """`realpath` guard rejects the cases `${var:?}` lets through."""
         text = (REPO_ROOT / "gowave-node-auto.sh").read_text()

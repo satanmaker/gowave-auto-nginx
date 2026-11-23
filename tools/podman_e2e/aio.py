@@ -65,7 +65,9 @@ from . import (
     hosts_block,
 )
 from .podman import wait_until
-from .runner import Case, CaseBlocked, CaseIncomplete, PASS, CaseResult, redaction_audit, require
+from .runner import (
+    Case, CaseBlocked, CaseIncomplete, CaseTimeout, PASS, CaseResult, redaction_audit, require,
+)
 # One version rule for both contours: the live runner interrogates the same three
 # binaries over SSH, and a second copy would let the two disagree about what a
 # pin means.
@@ -254,6 +256,14 @@ TUNNEL_READY_INTERVAL_SECONDS = 5
 # One warm-up attempt starts an engine per profile and sends one request through
 # each; it must not inherit the deadline of the whole matrix.
 TUNNEL_READY_ATTEMPT_TIMEOUT_SECONDS = 180
+# The positive matrix a revocation case runs before it revokes anything is a
+# precondition, not a verdict: the Panel re-pushes the node's users while the case
+# runs, and a transfer that loses that race comes back with no endpoint record at
+# all — the probe exits without facts instead of reporting a refusal. Re-running
+# it under this deadline leaves every assertion that follows untouched, and an
+# exhausted deadline still fails the case on its own message.
+REVOCATION_TRANSFER_TIMEOUT_SECONDS = 120
+REVOCATION_TRANSFER_INTERVAL_SECONDS = 5
 
 # The host resources a repeated install must neither duplicate nor rewrite. The
 # Nginx section carries a digest per file, so a regenerated-but-different config
@@ -2988,6 +2998,7 @@ def case_diagnostic_artifacts(product: AioProduct) -> Dict[str, Any]:
     duration — is read back below, and the report-side half is proven by the
     runner's own tests rather than by a file that does not exist yet.
     """
+    product.require_installed()
     placeholder = CaseResult(DIAGNOSTICS_CASE_ID, product.context.topology, PASS)
     written = diagnostics.collect(product.context, product.podman, placeholder)
     bundle: Dict[str, str] = {}
@@ -3068,6 +3079,57 @@ def case_client_lifecycle(product: AioProduct) -> Dict[str, Any]:
     return facts
 
 
+def transfer_matrix_carried(facts: Dict[str, Any], expected: int) -> bool:
+    """Whether the matrix finished: every transport delivered and the endpoint recorded it.
+
+    Two unfinished observations are worth a second run — a matrix that reported
+    fewer transfers than the subscription owes, and a request id the endpoint's
+    log never recorded. Both are what a Panel that re-pushes the node's users
+    mid-case leaves behind, and neither is a verdict this case can rest on.
+    """
+    return (
+        int(facts.get("transfer_count") or 0) == expected
+        and int(facts.get("missing_request_ids") or 0) == 0
+    )
+
+
+def transfer_matrix_until_carried(
+    attempt, expected: int, deadline_seconds: float, interval_seconds: float,
+    clock=time.monotonic, sleep=time.sleep,
+) -> Dict[str, Any]:
+    """Run the positive matrix until every transport carries its payload, or the deadline passes.
+
+    ``attempt`` returns the probe's facts, or raises the ``AssertionError`` that
+    ``probe_json`` builds when the probe exited without them. Nothing else can
+    assert while the matrix is being taken — the tunnel readiness check has
+    already passed by then — so the only failure this loop retries is the probe's
+    own, and a spent deadline re-raises it with its message intact. The attempt
+    count travels with the facts, so a matrix that needed a second try says so in
+    the case's evidence instead of looking like one that carried first time.
+    """
+    deadline = clock() + deadline_seconds
+    attempts = 0
+    last_error: Optional[AssertionError] = None
+    facts: Dict[str, Any] = {}
+    # The first attempt is taken whatever the clock says, and every further one has
+    # to start before the deadline: the loop is bounded by time, and the wait after
+    # an attempt never carries it past the deadline it is waiting for.
+    while attempts == 0 or clock() < deadline:
+        attempts += 1
+        try:
+            facts = attempt()
+        except AssertionError as exc:
+            last_error, facts = exc, {}
+        else:
+            last_error = None
+            if transfer_matrix_carried(facts, expected):
+                break
+        sleep(interval_seconds)
+    if last_error is not None and not facts:
+        raise last_error
+    return {**facts, "positive_attempts": attempts}
+
+
 def case_revocation(
     product: AioProduct, case_id: str = "AIO-REVOKE",
     expected_sources: Optional[Sequence[str]] = None,
@@ -3119,8 +3181,13 @@ def case_revocation(
 
     try:
         tunnel = product.wait_tunnel_ready(case_id, payload_dir=payload_dir)
-        positive = product.traffic_facts(case_id, "traffic", payload_dir=payload_dir)
         expected = product.subscription_inbound_count * len(TRAFFIC_ENGINES)
+        positive = transfer_matrix_until_carried(
+            lambda: product.traffic_facts(case_id, "traffic", payload_dir=payload_dir),
+            expected,
+            deadline_seconds=REVOCATION_TRANSFER_TIMEOUT_SECONDS,
+            interval_seconds=REVOCATION_TRANSFER_INTERVAL_SECONDS,
+        )
         require(case_id, int(positive.get("transfer_count") or 0) == expected,
                 f"the issued client transferred through {positive.get('transfer_count')!r} "
                 f"transports, expected {expected}")
@@ -3180,6 +3247,7 @@ def case_revocation(
         "patch_status": issue.get("patch_status"),
         "readiness_network": tunnel.get("network"),
         "positive_transfer_count": positive.get("transfer_count"),
+        "positive_attempts": positive.get("positive_attempts"),
         "positive_source_ips": ",".join(positive.get("source_ips") or []),
         "expected_source_ips": ",".join(sorted(sources)),
         "revoke_status": applied.get("revoke_status"),
@@ -4875,12 +4943,17 @@ def _restore_nginx_configuration(
 
     This runs from a ``finally`` block, so it reports its own failure instead of
     raising: the case's primary assertion is what the operator needs to read.
+    The runner's deadline is the exception — it says the harness, not the
+    product, ran out of time, so it passes through and the case is finished by
+    the runner's budget branch instead of being turned into a restore failure.
     """
     try:
         result = podman.exec_bash(
             container, ngx_config_script("restore", primary_domain), check=False,
             timeout=NGX_CONFIG_PROBE_TIMEOUT_SECONDS,
         )
+    except CaseTimeout:
+        raise
     except Exception as error:  # noqa: BLE001 - cleanup must not hide the primary finding
         return {"error": f"{type(error).__name__}: {error}"}
     detail = (result.stderr or result.stdout or "").strip()[-600:]
@@ -10073,7 +10146,11 @@ def cases(podman: Any, distribution: str = "ubuntu-24.04", vision: bool = False)
     ))
     suite.extend([
         Case("AIO-REVOKE", "aio", lambda context: case_revocation(product),
-             timeout_seconds=TUNNEL_READY_TIMEOUT_SECONDS + 2 * TRAFFIC_TIMEOUT_SECONDS),
+             # The positive matrix is re-run inside a fixed window when the probe
+             # reported nothing, so the ceiling carries that window on top of the
+             # two probe budgets this case already declared.
+             timeout_seconds=TUNNEL_READY_TIMEOUT_SECONDS + 2 * TRAFFIC_TIMEOUT_SECONDS
+             + REVOCATION_TRANSFER_TIMEOUT_SECONDS),
         Case("AIO-RESTART", "aio", lambda context: case_restart(product),
              timeout_seconds=RESTART_TIMEOUT_SECONDS + TUNNEL_READY_TIMEOUT_SECONDS
              + TRAFFIC_TIMEOUT_SECONDS),

@@ -1664,6 +1664,28 @@ class TestMatrixCase(unittest.TestCase):
 
 
 
+class InterruptedTrafficHost(StubEngineHost):
+    """The positive matrix once interrupted, as a lost race against the Panel leaves it.
+
+    The probe exits without facts the way it does when the Panel re-pushes the
+    node's users between the send and the endpoint report, so a case that read the
+    first attempt as a verdict would call access it had not revoked yet a refusal.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.traffic_calls = 0
+
+    def traffic_facts(self, scope, timeout=900, payload_dir=None):
+        self.scopes.append(scope)
+        self.payload_dirs.append(payload_dir)
+        if scope == "traffic":
+            self.traffic_calls += 1
+            if self.traffic_calls == 1:
+                return self._probe("", 1)
+        return self._probe(json.dumps(self.bodies[scope]), 0)
+
+
 class TestRevocationCase(unittest.TestCase):
     """AIO-REVOKE judges revocation by what the endpoint refused to record."""
 
@@ -1726,7 +1748,7 @@ class TestRevocationCase(unittest.TestCase):
         }
 
     def run_case(self, positive=None, negative=None, steps=None, calls=None, readiness=None,
-                 expected_sources=None):
+                 expected_sources=None, host_class=None):
         overrides = steps or {}
         bodies = {
             "warmup": readiness or {
@@ -1737,6 +1759,8 @@ class TestRevocationCase(unittest.TestCase):
             "revoked": self.revoked_facts() if negative is None else negative,
         }
         product, _ = installed_product(self.context, bodies=bodies)
+        if host_class is not None:
+            product.host = host_class(bodies=bodies)
         answers = {
             "issue": self.issue(),
             "apply": self.applied(),
@@ -1756,8 +1780,12 @@ class TestRevocationCase(unittest.TestCase):
             ), calls, product
 
     def reject(self, expected, **kwargs):
-        with self.assertRaises(AssertionError) as caught:
-            self.run_case(**kwargs)
+        # A counter-example is judged on the matrix the probe reported, so the
+        # retry deadline is spent in one attempt here: what the case says about a
+        # wrong transfer count must not wait two minutes to be said.
+        with mock.patch.object(aio, "REVOCATION_TRANSFER_TIMEOUT_SECONDS", 0):
+            with self.assertRaises(AssertionError) as caught:
+                self.run_case(**kwargs)
         self.assertIn(expected, str(caught.exception))
 
     def test_the_case_accepts_access_the_endpoint_refused_to_record(self):
@@ -1785,6 +1813,18 @@ class TestRevocationCase(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("not every served outbound carried a payload", message)
         self.assertIn("HTTP 503 without an endpoint report", message)
+
+    def test_the_positive_matrix_is_re_run_when_the_probe_reported_nothing(self):
+        with mock.patch.object(aio, "REVOCATION_TRANSFER_INTERVAL_SECONDS", 0):
+            facts, calls, product = self.run_case(host_class=InterruptedTrafficHost)
+        self.assertEqual(
+            product.host.scopes, ["warmup", "traffic", "traffic", "revoked"],
+            "the interrupted matrix is taken again before anything is revoked",
+        )
+        self.assertEqual(facts["positive_attempts"], 2)
+        self.assertEqual(facts["positive_transfer_count"], len(traffic_facts()["transfers"]))
+        self.assertEqual(calls, ["issue", "apply", "cleanup"])
+        self.assertEqual(facts["revoked_delivered"], 0)
 
     def test_the_case_fails_when_the_client_could_not_be_created(self):
         self.reject("instead of 201", steps={"issue": {"create_status": 409}})
@@ -1851,8 +1891,11 @@ class TestRevocationCase(unittest.TestCase):
         data = traffic_facts()
         data["transfer_count"] = 0
         calls = []
-        with self.assertRaises(AssertionError) as caught:
-            self.run_case(positive=data, calls=calls)
+        # The retry window is spent in a single attempt here; this test is about
+        # the cleanup, not about how long the case waits before it gives up.
+        with mock.patch.object(aio, "REVOCATION_TRANSFER_TIMEOUT_SECONDS", 0):
+            with self.assertRaises(AssertionError) as caught:
+                self.run_case(positive=data, calls=calls)
         self.assertIn("transferred through 0 transports", str(caught.exception))
         self.assertEqual(calls, ["issue", "cleanup"],
                          "the failed run must still delete the client it created")
@@ -1863,7 +1906,8 @@ class TestRevocationCase(unittest.TestCase):
         self.assertIn("AIO-REVOKE", cases)
         self.assertEqual(cases["AIO-REVOKE"].topology, "aio")
         self.assertEqual(cases["AIO-REVOKE"].timeout_seconds,
-                         aio.TUNNEL_READY_TIMEOUT_SECONDS + 2 * aio.TRAFFIC_TIMEOUT_SECONDS)
+                         aio.TUNNEL_READY_TIMEOUT_SECONDS + 2 * aio.TRAFFIC_TIMEOUT_SECONDS
+                         + aio.REVOCATION_TRANSFER_TIMEOUT_SECONDS)
 
 
 class RecordingPodman:

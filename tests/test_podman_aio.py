@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Suite nonroot: the All-in-One suite installs once with the real operator."""
+import ast
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -11,6 +13,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import unittest
 from contextlib import redirect_stdout
@@ -35,7 +38,7 @@ from tools.podman_e2e import (  # noqa: E402
     target_image,
     topology,
 )
-from tools.podman_e2e.runner import Case, CaseBlocked, RunContext  # noqa: E402
+from tools.podman_e2e.runner import Case, CaseBlocked, CaseTimeout, RunContext  # noqa: E402
 
 MATRIX_INBOUNDS = len(matrix.inbounds(matrix.load(), vision=False))
 
@@ -3710,6 +3713,68 @@ def acme_served_report(after: dict, **overrides) -> dict:
     return tls_report(not_before=not_before, not_after=certificate_day(60), **overrides)
 
 
+class TestRestoreDeadlineCase(unittest.TestCase):
+    """NGX-05's cleanup: the runner's deadline is not a restore failure.
+
+    The restore runs from a ``finally``, so the broad handler there turns every
+    unexpected error into a report the case then asserts about. That is right for
+    a probe that broke and wrong for a run that ran out of time: the deadline has
+    to leave the helper untouched, or the budget kill is published as a product
+    finding about the configuration.
+    """
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def product(self, restore_error):
+        class RestoreRaises(ScriptedPodman):
+            def exec_bash(inner, name, script, check=True, input_text=None, timeout=300):
+                if script.startswith("python3 - restore "):
+                    raise restore_error
+                return super().exec_bash(name, script, check=check, input_text=input_text, timeout=timeout)
+
+        phases = (
+            nginx_probe("before"),
+            nginx_probe("break", test=1, tail=BROKEN_TAIL, present=True),
+            nginx_probe("restore", after_workers=("5100", "5101")),
+        )
+        podman = RestoreRaises(self.context, [(json.dumps(phase), 0) for phase in phases])
+        product = aio.AioProduct(podman)
+        product.host = StubHost()
+        product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
+        return product, podman
+
+    def test_a_deadline_inside_the_restore_probe_leaves_by_exception(self):
+        product, podman = self.product(CaseTimeout("case exceeded its declared timeout"))
+        with self.assertRaises(CaseTimeout):
+            aio.case_nginx_config(product)
+        self.assertEqual(len(podman.scripts), 2,
+                         "the restore was attempted and no restored-configuration assertion ran")
+
+    def test_a_restore_that_fails_on_its_own_still_fails_the_case(self):
+        product, _podman = self.product(RuntimeError("podman exec did not answer"))
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_nginx_config(product)
+        self.assertIn("the restoring probe produced no report", str(caught.exception))
+        self.assertIn("RuntimeError", str(caught.exception))
+
+    def test_the_deadline_is_named_before_the_broad_handler(self):
+        """Pinned at the function itself, not inside a window of its text."""
+        source = inspect.getsource(aio._restore_nginx_configuration)
+        tree = ast.parse(textwrap.dedent(source))
+        handlers = next(node for node in ast.walk(tree) if isinstance(node, ast.Try)).handlers
+        first, last = handlers[0], handlers[-1]
+        self.assertIsInstance(first.type, ast.Name)
+        self.assertEqual(first.type.id, "CaseTimeout",
+                         "a deadline inside the restore probe must be recognised first")
+        self.assertEqual(len(first.body), 1)
+        self.assertIsInstance(first.body[0], ast.Raise)
+        self.assertIsInstance(last.type, ast.Name)
+        self.assertEqual(last.type.id, "Exception")
+
+
 class TestAcmeRenewalCase(unittest.TestCase):
     """ACME-01: the certificate is issued and renewed through the webroot route."""
 
@@ -6520,7 +6585,25 @@ class TestDiagnosticArtifactsCase(unittest.TestCase):
 
     def run_case(self, **overrides):
         product = aio.AioProduct(BundlePodman(self.context, override=overrides))
+        product.host = StubHost()
+        product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
         return aio.case_diagnostic_artifacts(product)
+
+    def test_a_run_without_a_successful_install_collects_nothing(self):
+        # The bundle is a reading of a host the installer produced. Before the
+        # install the collector would record a half-built container and the case
+        # would report an assertion failure about a machine that does not exist.
+        product = aio.AioProduct(BundlePodman(self.context))
+        product.host = StubHost()
+        product.outcome = topology.InstallOutcome(1, "", "install refused", 1.0, "install")
+        with self.assertRaises(CaseBlocked) as caught:
+            aio.case_diagnostic_artifacts(product)
+        self.assertIn("AIO-INSTALL", str(caught.exception))
+        self.assertIn("the install failed", str(caught.exception))
+        self.assertFalse(
+            (self.context.artifact_dir / "evidence" / "diagnostics").exists(),
+            "a blocked case must not leave a bundle behind",
+        )
 
     def reject(self, *expected, **overrides):
         with self.assertRaises(AssertionError) as caught:
@@ -6589,6 +6672,8 @@ class TestDiagnosticArtifactsCase(unittest.TestCase):
                 return path
 
         product = aio.AioProduct(BundlePodman(self.context))
+        product.host = StubHost()
+        product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
         product.context = WorldReadable(self.context)
         with self.assertRaises(AssertionError) as caught:
             aio.case_diagnostic_artifacts(product)
@@ -6598,10 +6683,127 @@ class TestDiagnosticArtifactsCase(unittest.TestCase):
         product = aio.AioProduct(BundlePodman(
             self.context, raising={"aio-1": TimeoutError("podman exec did not answer")},
         ))
+        product.host = StubHost()
+        product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
         with self.assertRaises(AssertionError) as caught:
             aio.case_diagnostic_artifacts(product)
         self.assertIn("the operator file does not carry the kernel", str(caught.exception))
         self.assertIn("[probe could not run: TimeoutError", self.read("operator"))
+
+
+class FakeClock:
+    """A monotonic clock the test moves by hand, so a deadline costs no wall time."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class TestRevocationTransferRetry(unittest.TestCase):
+    """The positive matrix AIO-REVOKE takes before it revokes anything.
+
+    MN-REVOKE went red on GitHub because one transfer lost the race against the
+    Panel re-pushing the node's users: the probe exited without facts, and the
+    case read that as a refusal of access it had not revoked yet. The retry has
+    to re-run only that unfinished matrix and leave every assertion after it
+    alone, so these tests pin what it re-runs, what it refuses to re-run, and the
+    message a spent deadline still carries.
+    """
+
+    def setUp(self):
+        self.clock = FakeClock()
+
+    def carried(self, transfers=4):
+        return {"transfer_count": transfers, "missing_request_ids": 0}
+
+    def run_until_carried(self, attempt, expected=4, deadline=120.0, interval=5.0):
+        return aio.transfer_matrix_until_carried(
+            attempt, expected, deadline_seconds=deadline, interval_seconds=interval,
+            clock=self.clock, sleep=self.clock.sleep,
+        )
+
+    def test_a_matrix_that_carried_first_time_is_not_re_run(self):
+        calls = []
+
+        def attempt():
+            calls.append(1)
+            return self.carried()
+
+        facts = self.run_until_carried(attempt)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(facts["positive_attempts"], 1)
+        self.assertEqual(self.clock.sleeps, [], "a carried matrix must not spend the interval")
+
+    def test_the_matrix_is_re_run_after_the_probe_exited_without_facts(self):
+        message = (
+            "AIO-REVOKE: the traffic probe exited 1: the xray transfer through grpc "
+            "returned HTTP 503 without an endpoint report"
+        )
+        calls = []
+
+        def attempt():
+            calls.append(1)
+            if len(calls) == 1:
+                raise AssertionError(message)
+            return self.carried()
+
+        facts = self.run_until_carried(attempt)
+        self.assertEqual(facts["positive_attempts"], 2)
+        self.assertEqual(facts["transfer_count"], 4)
+        self.assertEqual(self.clock.sleeps, [5.0], "the second attempt is spaced, not immediate")
+
+    def test_a_payload_the_endpoint_did_not_record_is_re_run(self):
+        calls = []
+
+        def attempt():
+            calls.append(1)
+            if len(calls) == 1:
+                return {"transfer_count": 4, "missing_request_ids": 1}
+            return self.carried()
+
+        facts = self.run_until_carried(attempt)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(facts["positive_attempts"], 2)
+
+    def test_a_spent_deadline_re_raises_the_probes_own_message(self):
+        message = "AIO-REVOKE: the traffic probe exited 1: the endpoint never answered"
+        calls = []
+
+        def attempt():
+            calls.append(1)
+            raise AssertionError(message)
+
+        with self.assertRaises(AssertionError) as caught:
+            self.run_until_carried(attempt)
+        self.assertEqual(str(caught.exception), message)
+        self.assertEqual(
+            len(calls), 24,
+            "120 s at one try per 5 s, and the wait after the last try lands on the deadline",
+        )
+        self.assertEqual(self.clock.sleeps, [5.0] * 24)
+
+    def test_a_short_matrix_reaches_the_callers_own_assertion(self):
+        def attempt():
+            return {"transfer_count": 3, "missing_request_ids": 0}
+
+        facts = self.run_until_carried(attempt)
+        self.assertEqual(facts["transfer_count"], 3)
+        self.assertEqual(len(self.clock.sleeps), 24, "the deadline is not a verdict either")
+
+    def test_an_error_that_is_not_the_probes_is_not_retried(self):
+        def attempt():
+            raise topology.TopologyError("the engine client is gone")
+
+        with self.assertRaises(topology.TopologyError):
+            self.run_until_carried(attempt)
+        self.assertEqual(self.clock.sleeps, [])
 
 
 if __name__ == "__main__":

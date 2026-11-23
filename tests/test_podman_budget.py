@@ -12,9 +12,13 @@ runs, and the probe's report is refused when any of the facts it demonstrates
 goes missing.
 """
 import contextlib
+import inspect
 import io
+import json
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -23,8 +27,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from tools import run_podman_e2e  # noqa: E402
-from tools.podman_e2e import budget, matrix  # noqa: E402
-from tools.podman_e2e.runner import RunContext  # noqa: E402
+from tools.podman_e2e import budget, matrix, podman as podman_module  # noqa: E402
+from tools.podman_e2e.runner import BudgetExhausted, RunContext  # noqa: E402
 
 
 class TestDeclaredBudget(unittest.TestCase):
@@ -213,6 +217,109 @@ class TestEntrypointBudget(unittest.TestCase):
         status, _out, _err, seen = self.main(["--topology", "aio", "--budget-seconds", "60"])
         self.assertEqual(status, 0)
         self.assertEqual(seen["budget_seconds"], 60)
+
+
+class TestOperationCeilings(unittest.TestCase):
+    """The image pull and the image build are bounded by the work, not by a probe.
+
+    ``podman-acceptance.yml`` run 45161440198 killed ``AIO-INSTALL`` at 311.2 s
+    and ``PO-INSTALL`` at 306.8 s because both rode the 300-second probe default,
+    so these tests hold the two sites that carry the install: each names its own
+    ceiling, each ceiling is capped by what the run has left, and every other
+    caller keeps the probe default.
+    """
+
+    DIGEST = "sha256:" + "a" * 64
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def context(self, budget_seconds=10 ** 6):
+        context = RunContext(
+            "aio", Path(self.tmp.name),
+            budget_seconds=budget_seconds, run_id="podman-aio-ceilings-abcdef12",
+        )
+        self.addCleanup(context.run_cleanup)
+        return context
+
+    def podman(self, context):
+        """A ``Podman`` with the binary lookup and the run identity stubbed out."""
+        instance = podman_module.Podman.__new__(podman_module.Podman)
+        instance.context = context
+        instance.binary = "podman"
+        instance._built_images = set()
+        instance._started_epoch = 0
+        return instance
+
+    def recorder(self):
+        """Every ``podman`` invocation with the timeout it was given."""
+        calls = []
+        pinned = f"docker.io/library/ubuntu@{self.DIGEST}"
+
+        def run(argv, **kwargs):
+            calls.append((list(argv), kwargs.get("timeout")))
+            if list(argv)[1:2] == ["image"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps([pinned]), "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        return calls, run, pinned
+
+    def test_the_pull_gets_its_own_ceiling(self):
+        calls, run, pinned = self.recorder()
+        with mock.patch.object(podman_module, "resolve", return_value=pinned), \
+                mock.patch.object(podman_module.subprocess, "run", side_effect=run):
+            self.podman(self.context()).ensure_image("ubuntu-2404")
+        pull = [entry for entry in calls if entry[0][1:2] == ["pull"]]
+        self.assertEqual(len(pull), 1, f"expected exactly one pull, saw {calls}")
+        self.assertEqual(pull[0][1], podman_module.PULL_CEILING_SECONDS)
+        # Task 4.2 measured it: the pull costs at most 11.2 s of the 311.2 s that a
+        # 300 s build kill ended, and 1 s on a cold local store, so the kill that
+        # reddened AIO-INSTALL belonged to the build and the pull is left on the
+        # probe default it already had.
+        self.assertEqual(podman_module.PULL_CEILING_SECONDS, podman_module.DEFAULT_COMMAND_TIMEOUT,
+                         "the pull measures in seconds, so it keeps the probe default rather than a larger floor")
+        self.assertGreater(podman_module.PULL_CEILING_SECONDS, 11.2)
+
+    def test_the_build_gets_its_own_ceiling(self):
+        calls, run, _pinned = self.recorder()
+        instance = self.podman(self.context())
+        with mock.patch.object(podman_module.Podman, "ensure_image",
+                               lambda _self, alias: f"base@{self.DIGEST}"), \
+                mock.patch.object(podman_module.subprocess, "run", side_effect=run):
+            instance.build("target:test", "ubuntu-2404", Path("/tmp/Containerfile.target"),
+                           Path("/tmp"))
+        build = [entry for entry in calls if entry[0][1:2] == ["build"]]
+        self.assertEqual(len(build), 1, f"expected exactly one build, saw {calls}")
+        self.assertEqual(build[0][1], podman_module.BUILD_CEILING_SECONDS)
+        self.assertGreater(podman_module.BUILD_CEILING_SECONDS, 311.2,
+                           "a 14 s cold build still outlasted 300 s on the runner, so the floor stays above that")
+
+    def test_a_ceiling_is_capped_by_what_the_run_has_left(self):
+        context = self.context(budget_seconds=600)
+        context.started -= 589.5
+        timeout = podman_module.operation_timeout(context, podman_module.PULL_CEILING_SECONDS, "podman pull x")
+        self.assertEqual(timeout, 10, "a run with ten seconds left hands the command ten seconds")
+        self.assertLess(timeout, podman_module.PULL_CEILING_SECONDS)
+
+    def test_a_spent_budget_refuses_before_the_command_starts(self):
+        context = self.context(budget_seconds=60)
+        context.started -= 61
+        _calls, run, _pinned = self.recorder()
+        with mock.patch.object(podman_module.subprocess, "run", side_effect=run) as started:
+            with self.assertRaises(BudgetExhausted) as caught:
+                podman_module.operation_timeout(context, podman_module.BUILD_CEILING_SECONDS, "podman build x")
+        self.assertIn("podman build x", str(caught.exception))
+        self.assertFalse(started.called, "a command that cannot finish must not be started")
+
+    def test_every_other_caller_keeps_the_probe_default(self):
+        for name in ("_run", "exec", "exec_bash"):
+            with self.subTest(name=name):
+                signature = inspect.signature(getattr(podman_module.Podman, name))
+                self.assertEqual(signature.parameters["timeout"].default,
+                                 podman_module.DEFAULT_COMMAND_TIMEOUT,
+                                 f"{name} lost the probe default")
+        self.assertEqual(podman_module.DEFAULT_COMMAND_TIMEOUT, 300)
 
 
 if __name__ == "__main__":

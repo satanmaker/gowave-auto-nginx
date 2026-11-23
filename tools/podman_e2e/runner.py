@@ -142,6 +142,21 @@ class BudgetExhausted(Exception):
     pass
 
 
+class HarnessLimit(Exception):
+    """A container command outlasted the ceiling the harness gave it.
+
+    Reported as INCOMPLETE rather than FAIL: the command was not allowed to
+    finish, so what the case saw cannot decide anything about the product. The
+    message names the command and the ceiling, because the limit is a fact about
+    the harness and the operator has to be able to see which one fired.
+    """
+
+    def __init__(self, command: str, ceiling: float) -> None:
+        super().__init__(f"{command} did not finish within {ceiling:.0f}s")
+        self.command = command
+        self.ceiling = ceiling
+
+
 class CaseBlocked(Exception):
     """The case could not observe the product because its prerequisite failed.
 
@@ -359,6 +374,8 @@ class Runner:
                 except CaseIncomplete as exc:
                     result = CaseResult(case.id, case.topology, INCOMPLETE, message=str(exc))
                 except BudgetExhausted as exc:
+                    result = CaseResult(case.id, case.topology, INCOMPLETE, message=str(exc))
+                except HarnessLimit as exc:
                     result = CaseResult(case.id, case.topology, INCOMPLETE, message=str(exc))
                 except Exception as exc:  # unexpected harness error is never PASS
                     result = CaseResult(

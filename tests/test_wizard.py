@@ -720,8 +720,12 @@ class TestOnboardingOutcomes(unittest.TestCase):
         "GOWAVE_PLAN_NODE_VISION=('' '')\n"
     )
 
-    def onboard(self, outcomes, stdin="2\n"):
-        """Run the loop over two Workers; ``outcomes`` maps name to success."""
+    def onboard(self, outcomes, stdin="2\n", callee=None):
+        """Run the loop over two Workers; ``outcomes`` maps name to success.
+
+        ``callee`` replaces the generated stub with a body that models the SSH
+        hop's own side effects — the real one tracks a key directory of its own.
+        """
         stubs = [
             "ssh_bootstrap_onboard_one() {",
             '  case "$1" in',
@@ -734,6 +738,8 @@ class TestOnboardingOutcomes(unittest.TestCase):
                 stubs.append(f"      printf 'Could not read the SSH host key of %s.\\n' \"$1\" >&2;")
                 stubs.append("      return 1 ;;")
         stubs += ["  esac", "  return 1", "}"]
+        if callee is not None:
+            stubs = [callee]
         script = (
             f"source {shlex.quote(str(I18N_SH))}\n"
             f"source {shlex.quote(str(REPO_ROOT / 'modules' / 'tempdir.sh'))}\n"
@@ -783,6 +789,32 @@ class TestOnboardingOutcomes(unittest.TestCase):
         # touching, and it is still there afterwards.
         _result, survived = self.onboard({"worker-ok": True, "worker-bad": False})
         self.assertEqual(survived, "a file the cleanup must not reach\n")
+
+    def test_a_callee_tracking_its_own_scratch_keeps_the_failure_reason(self):
+        # The real ssh_bootstrap_onboard_one tracks an SSH key directory of its
+        # own inside the command substitution and releases it before returning.
+        # An unlevelled cleanup then ran over the caller's entries on the way
+        # out and deleted the stderr file the loop had not read yet, so a real
+        # Worker failure was reported as "phase: unknown" with the cause gone.
+        callee = (
+            "ssh_bootstrap_onboard_one() {\n"
+            "  local own\n"
+            '  own=$(mktemp -d "${TMPDIR:-/tmp}/gowave-wizard-ssh.XXXXXX")\n'
+            '  track_temp_dir "$own"\n'
+            "  printf '==> Onboarding %s\\n' \"$1\"\n"
+            "  printf 'PHASE:scan\\n' >&2\n"
+            "  printf 'Could not read the SSH host key.\\n' >&2\n"
+            '  release_temp_dir "$own"\n'
+            "  return 1\n"
+            "}\n"
+        )
+        result, _survived = self.onboard(
+            {"worker-ok": False, "worker-bad": False}, callee=callee)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("No such file or directory", result.stderr,
+                         f"the caller's scratch file was deleted: {result.stderr}")
+        self.assertIn("phase: scan", result.stdout)
+        self.assertIn("reason: Could not read the SSH host key.", result.stdout)
 
 
 class TestWizardDocumentation(unittest.TestCase):

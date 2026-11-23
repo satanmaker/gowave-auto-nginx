@@ -9814,7 +9814,10 @@ def cases(
                  product.master, REVOCATION_CASE_ID,
                  expected_sources=product.expected_egress_sources(),
              ),
-             timeout_seconds=aio.TUNNEL_READY_TIMEOUT_SECONDS + 2 * aio.TRAFFIC_TIMEOUT_SECONDS),
+             # Same body as AIO-REVOKE, so the same window on top of the two probe
+             # budgets: the positive matrix is re-run when the probe reported nothing.
+             timeout_seconds=aio.TUNNEL_READY_TIMEOUT_SECONDS + 2 * aio.TRAFFIC_TIMEOUT_SECONDS
+             + aio.REVOCATION_TRANSFER_TIMEOUT_SECONDS),
         Case(OUTAGE_CASE_ID, "multi-node", lambda context: case_worker_outage(product),
              timeout_seconds=OUTAGE_CASE_TIMEOUT_SECONDS),
         Case(RESTART_CASE_ID, "multi-node", lambda context: case_worker_restart(product),

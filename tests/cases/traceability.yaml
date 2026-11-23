@@ -395,6 +395,34 @@ requirements:
           - Multi-Node Lifecycle and Recovery Acceptance
           - Lint, Completeness, and Suite Nonroot
 
+  - requirement: Harness ceilings never decide a product verdict
+    scenarios:
+      - scenario: A slow legitimate step keeps its ceiling
+        cases: [AIO-INSTALL, PO-INSTALL]
+        topologies: [aio, panel-only]
+        tests:
+          - tests.test_podman_budget.TestOperationCeilings
+        jobs:
+          - All-in-One Podman Acceptance
+          - Panel-only Podman Acceptance
+          - Lint, Completeness, and Suite Nonroot
+      - scenario: A budget kill inside a cleanup probe stays INCOMPLETE
+        tests:
+          - tests.test_podman_aio.TestRestoreDeadlineCase
+          - tests.test_podman_runner.TestResultSemantics
+        jobs:
+          - All-in-One Podman Acceptance
+          - Lint, Completeness, and Suite Nonroot
+      - scenario: A ceiling that fires names its own limit
+        cases: [AIO-INSTALL, MN-INSTALL]
+        topologies: [aio, multi-node]
+        tests:
+          - tests.test_podman_runner.TestHarnessLimitVerdict
+        jobs:
+          - All-in-One Podman Acceptance
+          - Multi-Node Podman Acceptance
+          - Lint, Completeness, and Suite Nonroot
+
   - requirement: Coverage completeness and error paths
     scenarios:
       - scenario: Unmapped behavior or orphan case fails the audit
@@ -464,6 +492,12 @@ requirements:
         jobs:
           - All-in-One Podman Acceptance
           - Multi-Node Podman Acceptance
+      - scenario: Install-dependent case without a successful installation
+        tests:
+          - tests.test_podman_aio.TestDiagnosticArtifactsCase
+        jobs:
+          - All-in-One Podman Acceptance
+          - Lint, Completeness, and Suite Nonroot
 
   - requirement: Safe isolation and cleanup
     scenarios:
