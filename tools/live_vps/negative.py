@@ -103,7 +103,13 @@ def run_neg_04_dns_missing_aaaa() -> Dict[str, Any]:
     }
 
 
-def run_neg_05_acme_install_failure(master_ssh: SSHClient, lease_token: Optional[str] = None) -> Dict[str, Any]:
+def run_neg_05_acme_install_failure(
+    master_ssh: SSHClient,
+    lease_token: Optional[str] = None,
+    *,
+    panel_domain: str,
+    reality_domain: str,
+) -> Dict[str, Any]:
     """NEG-05: ACME lineage guard / invalid ACME directory rejects installation before changing NGINX.
 
     The install under test is a mutation like any other, so it presents the
@@ -112,9 +118,20 @@ def run_neg_05_acme_install_failure(master_ssh: SSHClient, lease_token: Optional
     reads `GOWAVE_ACME_SERVER`. Measured in `run-20261120-112133-fb7bcb`: the
     probe reported FAIL while the host was answering the lock sentence, and the
     ACME refusal it was looking for appears only once the lock admits the call.
+
+    The domains are the run's own, and they have to be: `install` validates
+    direct DNS before it reads `GOWAVE_ACME_SERVER`, so a placeholder name is
+    refused for the wrong reason and the probe proves nothing about the ACME
+    guard. Measured in `run-20261123-135152-bc7b1786`, where
+    `invalid.example.com` stopped the run at "preflight could not resolve
+    invalid.example.com".
     """
     # Call gowave-auto.sh install with invalid ACME directory URL
-    bad_cmd = "GOWAVE_ACME_SERVER=https://invalid-acme-directory.example.com/directory /opt/gowave-auto-nginx/gowave-auto.sh install invalid.example.com reality.example.com admin@example.com"
+    bad_cmd = (
+        "GOWAVE_ACME_SERVER=https://invalid-acme-directory.example.com/directory "
+        "/opt/gowave-auto-nginx/gowave-auto.sh install "
+        f"{shlex.quote(panel_domain)} {shlex.quote(reality_domain)} admin@example.com"
+    )
     r = master_ssh.run(
         bad_cmd,
         input_data=f"GOWAVE_LEASE: {lease_token}\n" if lease_token else None,
@@ -968,7 +985,12 @@ def run_negative_suite(
 
     # Execute live / mock scenarios
     if master_ssh:
-        neg05 = run_neg_05_acme_install_failure(master_ssh, lease_token=master_lease_token)
+        neg05 = run_neg_05_acme_install_failure(
+            master_ssh,
+            lease_token=master_lease_token,
+            panel_domain=config.master_panel_domain,
+            reality_domain=config.master_reality_domain,
+        )
         scenarios.append(neg05)
         if neg05.get("status") != "PASS":
             for index in range(6, 16):

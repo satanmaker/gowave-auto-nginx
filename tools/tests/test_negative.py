@@ -519,7 +519,12 @@ class TestNeg05PresentsTheRunsLease(unittest.TestCase):
     def test_the_probe_hands_the_runs_lease_to_the_install_over_stdin(self):
         ssh = LeaseRecordingSSH(ACME_REFUSAL)
 
-        result = run_neg_05_acme_install_failure(ssh, lease_token="token-of-this-run")
+        result = run_neg_05_acme_install_failure(
+            ssh,
+            lease_token="token-of-this-run",
+            panel_domain="panel.gowave.test",
+            reality_domain="reality.gowave.test",
+        )
 
         self.assertEqual(len(ssh.calls), 1)
         self.assertEqual(ssh.calls[0]["input_data"], "GOWAVE_LEASE: token-of-this-run\n")
@@ -528,10 +533,23 @@ class TestNeg05PresentsTheRunsLease(unittest.TestCase):
         self.assertTrue(result["lease_presented"])
         self.assertEqual(result["exit_code"], 1)
 
+    def test_the_install_is_given_the_runs_own_domains_not_an_unresolvable_placeholder(self):
+        ssh = LeaseRecordingSSH(ACME_REFUSAL)
+
+        result = run_neg_05_acme_install_failure(
+            ssh, panel_domain="panel.gowave.test", reality_domain="reality.gowave.test"
+        )
+
+        self.assertEqual(result["status"], "PASS")
+        self.assertIn("install panel.gowave.test reality.gowave.test", ssh.calls[0]["cmd"])
+        self.assertNotIn("invalid.example.com", ssh.calls[0]["cmd"])
+
     def test_a_lock_refusal_is_reported_as_a_failure_not_as_the_acme_rejection(self):
         ssh = LeaseRecordingSSH(LOCK_REFUSAL)
 
-        result = run_neg_05_acme_install_failure(ssh)
+        result = run_neg_05_acme_install_failure(
+            ssh, panel_domain="panel.gowave.test", reality_domain="reality.gowave.test"
+        )
 
         self.assertIsNone(ssh.calls[0]["input_data"])
         self.assertEqual(result["status"], "FAIL")
@@ -548,13 +566,20 @@ class TestNeg05PresentsTheRunsLease(unittest.TestCase):
     ):
         config = MagicMock()
         config.test_negative_suite = True
+        config.master_panel_domain = "panel.gowave.test"
+        config.master_reality_domain = "reality.gowave.test"
         master_ssh = MagicMock()
 
         run_negative_suite(
             config, master_ssh=master_ssh, master_lease_token="lease-of-this-run"
         )
 
-        neg05.assert_called_once_with(master_ssh, lease_token="lease-of-this-run")
+        neg05.assert_called_once_with(
+            master_ssh,
+            lease_token="lease-of-this-run",
+            panel_domain="panel.gowave.test",
+            reality_domain="reality.gowave.test",
+        )
 
 
 class TestMutatingScenariosStageTheRunsLease(unittest.TestCase):
