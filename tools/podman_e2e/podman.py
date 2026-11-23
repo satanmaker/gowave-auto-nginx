@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .images import ImageLockError, resolve
-from .runner import RunContext
+from .runner import BudgetExhausted, HarnessLimit, RunContext
 
 
 class PodmanUnavailable(RuntimeError):
@@ -47,6 +47,29 @@ def require_rootful() -> None:
 
 STALE_AFTER_SECONDS = 6 * 3600
 DEFAULT_COMMAND_TIMEOUT = 300
+# Short probes keep the 300-second default, because a wedged probe that is given
+# more time is only a more expensive wedge. The two network-bound image steps do
+# not: on ``podman-acceptance.yml`` run 45161440198 the digest-pinned pull plus
+# the Containerfile build died at 311.2 s on ``AIO-INSTALL`` and 306.8 s on
+# ``PO-INSTALL``, so a probe-sized ceiling killed an install that was working.
+# Both values are floors to be replaced by the durations a run records (tasks
+# 4.1/4.2), and the run's remaining budget caps whichever one is about to fire.
+PULL_CEILING_SECONDS = 600
+BUILD_CEILING_SECONDS = 1800
+
+
+def operation_timeout(context: RunContext, ceiling: int, command: str) -> int:
+    """One container command's ceiling, capped by the run's remaining budget.
+
+    A ceiling longer than the budget left would outlive the run and be killed
+    from outside, where nothing can name what happened. Capping it keeps the
+    limit inside the run: the command either finishes or fires as a harness
+    limit that the runner publishes as INCOMPLETE.
+    """
+    remaining = context.remaining()
+    if remaining < 1:
+        raise BudgetExhausted(f"{command} refused: {remaining:.1f}s of the run's budget left")
+    return max(1, min(ceiling, int(remaining)))
 
 
 def wait_until(
@@ -103,9 +126,7 @@ class Podman:
                 capture_output=True, text=True, input=input_text, check=False, timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError(
-                f"podman {' '.join(args)} did not finish within {timeout}s"
-            ) from exc
+            raise HarnessLimit(f"podman {' '.join(args)}", timeout) from exc
         if check and proc.returncode != 0:
             raise RuntimeError(f"podman {' '.join(args)} failed: {proc.stderr.strip() or proc.stdout.strip()}")
         return proc
@@ -236,7 +257,10 @@ class Podman:
         except ImageLockError as exc:
             raise UnpinnedImageError(str(exc)) from exc
         repository, digest = pinned.rsplit("@", 1)
-        self._run(["pull", pinned])
+        self._run(
+            ["pull", pinned],
+            timeout=operation_timeout(self.context, PULL_CEILING_SECONDS, f"podman pull {pinned}"),
+        )
         inspected = self._run(["image", "inspect", "--format", "{{json .RepoDigests}}", pinned])
         digests = json.loads(inspected.stdout or "[]")
         if not any(str(entry).endswith(f"@{digest}") for entry in digests):
@@ -259,12 +283,15 @@ class Podman:
         arguments = ["--build-arg", f"BASE_IMAGE={base}"]
         for key, value in (build_args or {}).items():
             arguments += ["--build-arg", f"{key}={value}"]
-        self._run([
-            "build", "-t", tag, "-f", str(containerfile),
-            *self._ownership_labels(),
-            *arguments,
-            str(context_dir),
-        ])
+        self._run(
+            [
+                "build", "-t", tag, "-f", str(containerfile),
+                *self._ownership_labels(),
+                *arguments,
+                str(context_dir),
+            ],
+            timeout=operation_timeout(self.context, BUILD_CEILING_SECONDS, f"podman build {tag}"),
+        )
         self.context.add_cleanup(lambda: self._run(["rmi", "-f", tag], check=False))
         self._built_images.add(tag)
         return tag

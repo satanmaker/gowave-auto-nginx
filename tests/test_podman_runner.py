@@ -27,6 +27,8 @@ from tools.podman_e2e.runner import (  # noqa: E402
     CaseIncomplete,
     CaseNotApplicable,
     CaseResult,
+    CaseTimeout,
+    HarnessLimit,
     RunAborted,
     RunContext,
     Runner,
@@ -176,6 +178,24 @@ class TestPodmanRunnerContract(unittest.TestCase):
         context = self.context(budget_seconds=1)
         runner = Runner(context)
         runner.add(Case("AIO-SLOW", "aio", lambda ctx: time.sleep(5), timeout_seconds=30))
+        self.assertEqual(runner.execute(), 1)
+        self.assertEqual(runner.results[0].status, INCOMPLETE)
+        self.assertIn("budget", runner.results[0].message)
+
+    def test_a_deadline_raised_from_the_cleanup_block_is_still_incomplete(self):
+        # NGX-05 restores the configuration from a ``finally``; a deadline that
+        # fires there is raised through the helper rather than returned as a
+        # restore report, and the runner — not the restore assertion — decides it.
+        context = self.context(budget_seconds=1)
+
+        def restore_ran_out(ctx):
+            try:
+                raise AssertionError("the primary finding")
+            finally:
+                raise CaseTimeout("case exceeded its declared timeout")
+
+        runner = Runner(context)
+        runner.add(Case("NGX-05", "aio", restore_ran_out, timeout_seconds=30))
         self.assertEqual(runner.execute(), 1)
         self.assertEqual(runner.results[0].status, INCOMPLETE)
         self.assertIn("budget", runner.results[0].message)
@@ -386,6 +406,50 @@ class TestResultSemantics(unittest.TestCase):
         report = self.report(context)
         self.assertEqual(report["overall"], PASS)
         self.assertEqual([case["status"] for case in report["cases"]], [PASS, NOT_APPLICABLE])
+
+
+class TestHarnessLimitVerdict(unittest.TestCase):
+    """A ceiling the harness gave a command is a fact about the harness, not the product."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def context(self) -> RunContext:
+        return RunContext(
+            "aio", Path(self.tmp.name),
+            budget_seconds=600, run_id="podman-aio-limit-abcdef12",
+        )
+
+    def report(self, context) -> dict:
+        return json.loads((context.artifact_dir / "result.json").read_text())
+
+    def test_a_fired_ceiling_is_incomplete_and_names_the_limit(self):
+        context = self.context()
+
+        def outlasted(ctx):
+            raise HarnessLimit("podman build -t target:test", 1800)
+
+        runner = Runner(context)
+        runner.add(Case("AIO-INSTALL", "aio", outlasted))
+        self.assertEqual(runner.execute(), 1)
+        case = self.report(context)["cases"][0]
+        self.assertEqual(case["status"], INCOMPLETE)
+        self.assertIn("podman build -t target:test", case["message"])
+        self.assertIn("1800s", case["message"])
+        self.assertNotIn("Traceback", case["message"])
+
+    def test_a_ceiling_that_fires_is_not_reported_as_a_product_failure(self):
+        context = self.context()
+
+        def outlasted(ctx):
+            raise HarnessLimit("podman pull docker.io/library/ubuntu@sha256:" + "a" * 64, 600)
+
+        runner = Runner(context)
+        runner.add(Case("PO-INSTALL", "aio", outlasted))
+        runner.execute()
+        self.assertEqual(runner.results[0].status, INCOMPLETE)
+        self.assertEqual(self.report(context)["overall"], INCOMPLETE)
 
 
 class TestPodmanRunOwnership(unittest.TestCase):

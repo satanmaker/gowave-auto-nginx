@@ -2,30 +2,30 @@
 
 ## 1. Ceilings sized to their work (`tools/podman_e2e/podman.py`)
 
-- [ ] 1.1 Add two named ceilings beside `DEFAULT_COMMAND_TIMEOUT` (`podman.py:49`): `PULL_CEILING_SECONDS` and
+- [x] 1.1 Add two named ceilings beside `DEFAULT_COMMAND_TIMEOUT` (`podman.py:49`): `PULL_CEILING_SECONDS` and
   `BUILD_CEILING_SECONDS`, each with a comment naming the runs it is sized from (`podman-acceptance.yml`
   `45161440198`: pull-plus-build died at 311.2 s on `AIO-INSTALL` and 306.8 s on `PO-INSTALL`). `DEFAULT_COMMAND_TIMEOUT`
   keeps its value and its role as the ceiling of short probes.
   Verify: `grep -c 'DEFAULT_COMMAND_TIMEOUT = 300' tools/podman_e2e/podman.py` returns 1.
-- [ ] 1.2 Pass the ceilings at the two call sites, each capped by the run's remaining budget so the ceiling cannot
+- [x] 1.2 Pass the ceilings at the two call sites, each capped by the run's remaining budget so the ceiling cannot
   outlive the run: the `pull` inside `ensure_image` (`podman.py:239`) and the build argv inside `build`
   (`podman.py:263`). Take the cap from the run context the class already holds (`self.context.remaining()`,
   `runner.py:246`). When nothing is left, raise the suite's existing budget exception instead of starting a command
   that cannot finish.
   Verify: the unit test in 1.4, and a read of `ensure_image`/`build` showing an explicit `timeout=` on both `_run`
   calls.
-- [ ] 1.3 Do not widen `exec`/`exec_bash`. A probe that legitimately needs longer already passes its own timeout
+- [x] 1.3 Do not widen `exec`/`exec_bash`. A probe that legitimately needs longer already passes its own timeout
   (`NGX_CONFIG_PROBE_TIMEOUT_SECONDS` and its siblings), and a wider default would turn a wedged probe into a
   silently expensive one.
   Verify: `grep -c 'timeout: int = DEFAULT_COMMAND_TIMEOUT' tools/podman_e2e/podman.py` still prints 3.
-- [ ] 1.4 Add `TestOperationCeilings` beside `TestDeclaredBudget` in `tests/test_podman_budget.py`: the pull and the
+- [x] 1.4 Add `TestOperationCeilings` beside `TestDeclaredBudget` in `tests/test_podman_budget.py`: the pull and the
   build are given a timeout no smaller than the measured cost and no larger than the remaining budget; a context with
   10 s left yields 10 s, not the declared floor; a spent budget refuses before the command starts; every other caller
   still gets 300 s. Register the class in `tests/run_ci.py`'s `SUITES` in the same commit — `collect()` refuses an
   unassigned class before suite selection (`run_ci.py:410-413`), so an unregistered class turns
   `--check-completeness` and every suite run red.
-  Verify: `python3 -m unittest -v tests.test_podman_budget` and `python3 -m tests.run_ci.py --check-completeness`.
-- [ ] 1.5 Make a fired ceiling a harness limit instead of an unexpected error: replace the bare `RuntimeError` in
+  Verify: `python3 -m unittest -v tests.test_podman_budget` and `python3 tests/run_ci.py --check-completeness`.
+- [x] 1.5 Make a fired ceiling a harness limit instead of an unexpected error: replace the bare `RuntimeError` in
   `_run` (`podman.py:105-108`) with a dedicated exception carrying the command and the ceiling that fired, and map it
   in `Runner.execute` to INCOMPLETE ahead of the final `except Exception` (`runner.py:363-369`), which today publishes
   it as FAIL with a bare traceback. Import it through runner's existing exception block, next to `BudgetExhausted`.
@@ -37,38 +37,42 @@
 
 ## 2. A deadline is not a defect (`tools/podman_e2e/aio.py`)
 
-- [ ] 2.1 Re-raise `CaseTimeout` in `_restore_nginx_configuration` (`aio.py:4871`) ahead of its broad handler, importing
+- [x] 2.1 Re-raise `CaseTimeout` in `_restore_nginx_configuration` (`aio.py:4871`) ahead of its broad handler, importing
   it through the module's existing `.runner` import block rather than adding a second one.
   Verify: a restore probe that raises `CaseTimeout` no longer returns a `{"error": …}` dictionary (test in 2.3).
-- [ ] 2.2 Change nothing downstream in `nginx_config_reload_contract`: no `None` initialisation of the restore report
+- [x] 2.2 Change nothing downstream in `nginx_config_reload_contract`: no `None` initialisation of the restore report
   and no report-presence guard around `require_reload_after_restore`. Neither is reachable — when the `try` body or the
   `finally` raises, the code after the `finally` does not run, and `_restore_nginx_configuration` returns a dictionary
   on every non-deadline path, so the existing "the restoring probe produced no report" assertion is already the one
   that fails for a bad exit code, non-JSON output or another exception. A guard here would only make the deadline path
   quieter while breaking the FAIL path the same task requires.
   Verify: the 2.3 negative test — a `RuntimeError` from the restore probe still ends as FAIL.
-- [ ] 2.3 Prove both directions at the cheapest layer: in `tests/test_podman_runner.py` beside `TestResultSemantics`,
+- [x] 2.3 Prove both directions at the cheapest layer: in `tests/test_podman_runner.py` beside `TestResultSemantics`,
   a `CaseTimeout` raised during a case capped by the budget ends as INCOMPLETE; in `tests/test_podman_aio.py`,
   `TestRestoreDeadlineCase` shows a deadline inside the restore probe leaving `nginx_config_reload_contract` by
   exception with no assertion about the restored configuration, while a `RuntimeError` from the same probe still ends
   as FAIL carrying the case's primary message. Register both classes in `tests/run_ci.py`'s `SUITES`.
   Verify: `python3 -m unittest -v tests.test_podman_runner tests.test_podman_aio` and
-  `python3 -m tests.run_ci.py --check-completeness`.
-- [ ] 2.4 Pin the handler order with a source-level test that anchors on the call site, not on a character window: the
+  `python3 tests/run_ci.py --check-completeness`.
+- [x] 2.4 Pin the handler order with a source-level test that anchors on the call site, not on a character window: the
   deadline is named before the broad handler inside `_restore_nginx_configuration`. Nothing else is pinned — 2.2 keeps
   that function's guard structure unchanged, so a test asserting a report-presence guard would pass on dead code.
   Verify: the new test fails when 2.1 is reverted.
 
 ## 3. An install-dependent case gates on the install (`tools/podman_e2e/aio.py`)
 
-- [ ] 3.1 `case_diagnostic_artifacts` (`aio.py:2973`, `RED-02`) begins with `product.require_installed()`, so a failed or
+- [x] 3.1 `case_diagnostic_artifacts` (`aio.py:2973`, `RED-02`) begins with `product.require_installed()`, so a failed or
   absent install yields BLOCKED naming `AIO-INSTALL` instead of an assertion about a host that was never installed.
-- [ ] 3.2 Audit the rest of the suite for the same omission: enumerate the public `case_*` functions that read the host
+- [x] 3.2 Audit the rest of the suite for the same omission: enumerate the public `case_*` functions that read the host
   or call `diagnostics.collect` without reaching `require_installed()`/`require_worker()` first, and record the list in
   this task. The expected result is `RED-02` alone; any other name is a second instance of this defect and gets its own
   gate.
+  Result: `case_diagnostic_artifacts` alone. It was the only public `case_*` in `aio.py`, `multi_node.py` and
+  `panel_only.py` that reached `diagnostics.collect` or `product.podman` without a gate; the 47 cases whose bodies name
+  neither reach the host through `AioProduct.host_script()`, which calls `require_installed()` itself, and the
+  `multi_node` ones through `require_worker()`. Re-checked after 3.1: no such function is left.
   Verify: the recorded enumeration, plus 3.3.
-- [ ] 3.3 Extend `TestDiagnosticArtifactsCase` (`tests/test_podman_aio.py:6513`): a product whose install outcome is not
+- [x] 3.3 Extend `TestDiagnosticArtifactsCase` (`tests/test_podman_aio.py:6513`): a product whose install outcome is not
   ok raises `CaseBlocked` naming the install case and `diagnostics.collect` is never called; a healthy product still
   produces the bundle.
   Verify: `python3 -m unittest -v tests.test_podman_aio`.
@@ -105,11 +109,16 @@
   install paths. Use no `gap`: `trace.py` reads the ledger of `podman-full-e2e` (`trace.py:61`) and refuses a gap
   naming a task of another change, and by archive time every row has a passing test.
   Verify: `python3 -m tools.podman_e2e.trace --strict` lists the four new rows and reports no problem.
-- [ ] 5.2 If `docs/PODMAN_E2E_DISCOVERY.md` or `tests/cases/behaviors.yaml` states that a timed-out case is a product
+- [x] 5.2 If `docs/PODMAN_E2E_DISCOVERY.md` or `tests/cases/behaviors.yaml` states that a timed-out case is a product
   FAIL, bring the sentence in line with the new verdict.
-  Verify: `python3 -m unittest -v tests.test_podman_docs tests.test_podman_behaviors`.
-- [ ] 5.3 Validate the change and the tree: `openspec validate podman-ci-throughput --strict`, then
+  Result: nothing to align. Neither page calls a timed-out case a product FAIL, and neither states a ceiling for the
+  pull or the build. The sentences that do touch a lost case already sit on the new side — `behaviors.yaml` «FAIL or
+  INCOMPLETE naming the case instead of PASS» and «an exhausted budget reports INCOMPLETE» — while the discovery
+  page's verdict vocabulary section describes the live reporter's statuses, not this harness's.
+  Verify: `python3 -m unittest -v tests.test_podman_docs tests.test_podman_behaviors` — 122 tests OK.
+- [x] 5.3 Validate the change and the tree: `openspec validate podman-ci-throughput --strict`, then
   `openspec validate --all --strict`.
+  Result: `Change 'podman-ci-throughput' is valid`; the tree-wide run passed 10, failed 0.
 - [ ] 5.4 Regenerate the traceability report after 5.1 — `python3 -m tools.podman_e2e.trace --markdown` — and commit
   `docs/PODMAN_E2E_TRACEABILITY.md`: `trace.py:1203-1206` refuses a report that differs from the table's own render.
   Verify: `python3 -m tools.podman_e2e.trace --strict` passes twice in a row.

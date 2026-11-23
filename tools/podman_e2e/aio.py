@@ -65,7 +65,9 @@ from . import (
     hosts_block,
 )
 from .podman import wait_until
-from .runner import Case, CaseBlocked, CaseIncomplete, PASS, CaseResult, redaction_audit, require
+from .runner import (
+    Case, CaseBlocked, CaseIncomplete, CaseTimeout, PASS, CaseResult, redaction_audit, require,
+)
 # One version rule for both contours: the live runner interrogates the same three
 # binaries over SSH, and a second copy would let the two disagree about what a
 # pin means.
@@ -2988,6 +2990,7 @@ def case_diagnostic_artifacts(product: AioProduct) -> Dict[str, Any]:
     duration — is read back below, and the report-side half is proven by the
     runner's own tests rather than by a file that does not exist yet.
     """
+    product.require_installed()
     placeholder = CaseResult(DIAGNOSTICS_CASE_ID, product.context.topology, PASS)
     written = diagnostics.collect(product.context, product.podman, placeholder)
     bundle: Dict[str, str] = {}
@@ -4875,12 +4878,17 @@ def _restore_nginx_configuration(
 
     This runs from a ``finally`` block, so it reports its own failure instead of
     raising: the case's primary assertion is what the operator needs to read.
+    The runner's deadline is the exception — it says the harness, not the
+    product, ran out of time, so it passes through and the case is finished by
+    the runner's budget branch instead of being turned into a restore failure.
     """
     try:
         result = podman.exec_bash(
             container, ngx_config_script("restore", primary_domain), check=False,
             timeout=NGX_CONFIG_PROBE_TIMEOUT_SECONDS,
         )
+    except CaseTimeout:
+        raise
     except Exception as error:  # noqa: BLE001 - cleanup must not hide the primary finding
         return {"error": f"{type(error).__name__}: {error}"}
     detail = (result.stderr or result.stdout or "").strip()[-600:]

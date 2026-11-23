@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Suite nonroot: the All-in-One suite installs once with the real operator."""
+import ast
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -11,6 +13,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import unittest
 from contextlib import redirect_stdout
@@ -35,7 +38,7 @@ from tools.podman_e2e import (  # noqa: E402
     target_image,
     topology,
 )
-from tools.podman_e2e.runner import Case, CaseBlocked, RunContext  # noqa: E402
+from tools.podman_e2e.runner import Case, CaseBlocked, CaseTimeout, RunContext  # noqa: E402
 
 MATRIX_INBOUNDS = len(matrix.inbounds(matrix.load(), vision=False))
 
@@ -3710,6 +3713,68 @@ def acme_served_report(after: dict, **overrides) -> dict:
     return tls_report(not_before=not_before, not_after=certificate_day(60), **overrides)
 
 
+class TestRestoreDeadlineCase(unittest.TestCase):
+    """NGX-05's cleanup: the runner's deadline is not a restore failure.
+
+    The restore runs from a ``finally``, so the broad handler there turns every
+    unexpected error into a report the case then asserts about. That is right for
+    a probe that broke and wrong for a run that ran out of time: the deadline has
+    to leave the helper untouched, or the budget kill is published as a product
+    finding about the configuration.
+    """
+
+    def setUp(self):
+        self.context, self.tmp = make_context()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.context.run_cleanup)
+
+    def product(self, restore_error):
+        class RestoreRaises(ScriptedPodman):
+            def exec_bash(inner, name, script, check=True, input_text=None, timeout=300):
+                if script.startswith("python3 - restore "):
+                    raise restore_error
+                return super().exec_bash(name, script, check=check, input_text=input_text, timeout=timeout)
+
+        phases = (
+            nginx_probe("before"),
+            nginx_probe("break", test=1, tail=BROKEN_TAIL, present=True),
+            nginx_probe("restore", after_workers=("5100", "5101")),
+        )
+        podman = RestoreRaises(self.context, [(json.dumps(phase), 0) for phase in phases])
+        product = aio.AioProduct(podman)
+        product.host = StubHost()
+        product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
+        return product, podman
+
+    def test_a_deadline_inside_the_restore_probe_leaves_by_exception(self):
+        product, podman = self.product(CaseTimeout("case exceeded its declared timeout"))
+        with self.assertRaises(CaseTimeout):
+            aio.case_nginx_config(product)
+        self.assertEqual(len(podman.scripts), 2,
+                         "the restore was attempted and no restored-configuration assertion ran")
+
+    def test_a_restore_that_fails_on_its_own_still_fails_the_case(self):
+        product, _podman = self.product(RuntimeError("podman exec did not answer"))
+        with self.assertRaises(AssertionError) as caught:
+            aio.case_nginx_config(product)
+        self.assertIn("the restoring probe produced no report", str(caught.exception))
+        self.assertIn("RuntimeError", str(caught.exception))
+
+    def test_the_deadline_is_named_before_the_broad_handler(self):
+        """Pinned at the function itself, not inside a window of its text."""
+        source = inspect.getsource(aio._restore_nginx_configuration)
+        tree = ast.parse(textwrap.dedent(source))
+        handlers = next(node for node in ast.walk(tree) if isinstance(node, ast.Try)).handlers
+        first, last = handlers[0], handlers[-1]
+        self.assertIsInstance(first.type, ast.Name)
+        self.assertEqual(first.type.id, "CaseTimeout",
+                         "a deadline inside the restore probe must be recognised first")
+        self.assertEqual(len(first.body), 1)
+        self.assertIsInstance(first.body[0], ast.Raise)
+        self.assertIsInstance(last.type, ast.Name)
+        self.assertEqual(last.type.id, "Exception")
+
+
 class TestAcmeRenewalCase(unittest.TestCase):
     """ACME-01: the certificate is issued and renewed through the webroot route."""
 
@@ -6520,7 +6585,25 @@ class TestDiagnosticArtifactsCase(unittest.TestCase):
 
     def run_case(self, **overrides):
         product = aio.AioProduct(BundlePodman(self.context, override=overrides))
+        product.host = StubHost()
+        product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
         return aio.case_diagnostic_artifacts(product)
+
+    def test_a_run_without_a_successful_install_collects_nothing(self):
+        # The bundle is a reading of a host the installer produced. Before the
+        # install the collector would record a half-built container and the case
+        # would report an assertion failure about a machine that does not exist.
+        product = aio.AioProduct(BundlePodman(self.context))
+        product.host = StubHost()
+        product.outcome = topology.InstallOutcome(1, "", "install refused", 1.0, "install")
+        with self.assertRaises(CaseBlocked) as caught:
+            aio.case_diagnostic_artifacts(product)
+        self.assertIn("AIO-INSTALL", str(caught.exception))
+        self.assertIn("the install failed", str(caught.exception))
+        self.assertFalse(
+            (self.context.artifact_dir / "evidence" / "diagnostics").exists(),
+            "a blocked case must not leave a bundle behind",
+        )
 
     def reject(self, *expected, **overrides):
         with self.assertRaises(AssertionError) as caught:
@@ -6589,6 +6672,8 @@ class TestDiagnosticArtifactsCase(unittest.TestCase):
                 return path
 
         product = aio.AioProduct(BundlePodman(self.context))
+        product.host = StubHost()
+        product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
         product.context = WorldReadable(self.context)
         with self.assertRaises(AssertionError) as caught:
             aio.case_diagnostic_artifacts(product)
@@ -6598,6 +6683,8 @@ class TestDiagnosticArtifactsCase(unittest.TestCase):
         product = aio.AioProduct(BundlePodman(
             self.context, raising={"aio-1": TimeoutError("podman exec did not answer")},
         ))
+        product.host = StubHost()
+        product.outcome = topology.InstallOutcome(0, "", "", 1.0, "install")
         with self.assertRaises(AssertionError) as caught:
             aio.case_diagnostic_artifacts(product)
         self.assertIn("the operator file does not carry the kernel", str(caught.exception))
