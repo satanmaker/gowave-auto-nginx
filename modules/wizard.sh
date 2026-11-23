@@ -463,73 +463,111 @@ wizard_check_ssh_reachable() {
     return 0
 }
 
-# Verify Panel API reachability and identity.
-# For non-loopback addresses, requires HTTPS with certificate validation
-# or explicit fingerprint confirmation.
-# Args: panel_address (domain or IP)
+# A name is the only thing a certificate can be checked against. A bare
+# address is refused rather than probed: the Panel's certificate names its
+# domain, and the stream demultiplexer answers a connection with no SNI from
+# the decoy, so there is nothing on 443 an address could be verified with.
+wizard_panel_address_is_bare() {
+    local address="$1"
+    [[ -n "$address" ]] || return 1
+    case "$address" in
+        *:*) return 0 ;;        # IPv6 literal, with or without a port
+        *[!0-9.]*) return 1 ;;  # any other character makes it a name
+        *[0-9]*) return 0 ;;    # digits and dots only: an IPv4 literal
+        *) return 1 ;;
+    esac
+}
+
+# The SHA-256 fingerprint of the certificate the host serves on 443. Empty when
+# the handshake produces no certificate at all.
+wizard_panel_certificate_fingerprint() {
+    local address="$1"
+    openssl s_client -connect "$address:443" -servername "$address" </dev/null 2>/dev/null \
+        | openssl x509 -noout -fingerprint -sha256 2>/dev/null \
+        | cut -d= -f2
+}
+
+# Verify Panel API identity and reachability.
+#
+# The Panel answers plaintext HTTP on 3000 and NGINX terminates TLS on 443 in
+# front of it, so TLS has to be checked on 443 and the probe has to name the
+# Panel's own health route. Speaking TLS to 3000 could never succeed, and
+# /api/health is not a route the Panel answers, so an existing Panel could not
+# be verified at all.
+# Args: panel_address (domain or IP), panel_is_local (`yes` when the Panel
+# service runs on this host, in which case the loopback answers without TLS)
 # Returns 0 if verified, 1 otherwise.
 wizard_verify_panel_api() {
-    local panel_address="$1"
-    local panel_url=""
-    local verify_mode=""
+    local panel_address="$1" panel_is_local="${2:-no}"
+    local panel_url="" verify_mode="" fingerprint="" confirm="" rc=0
+    local health="/api/system/health"
 
-    # Determine URL and verification mode
-    if [[ "$panel_address" == "127.0.0.1" || "$panel_address" == "localhost" ]]; then
-        # Local Panel - use HTTP
+    if [[ -z "$panel_address" ]]; then
+        printf '%s\n' "$(t wizard.add_node.enter_panel)" >&2
+        return 1
+    fi
+
+    if [[ "$panel_is_local" == "yes" || "$panel_address" == "127.0.0.1" || "$panel_address" == "localhost" ]]; then
         panel_url="http://127.0.0.1:3000"
         verify_mode="local"
-    elif [[ "$panel_address" == *:* ]]; then
-        # IPv6 address with port
-        panel_url="https://[$panel_address]:3000"
-        verify_mode="remote"
+    elif wizard_panel_address_is_bare "$panel_address"; then
+        printf '%s\n' "$(tf wizard.panel_verify.needs_domain "$panel_address")" >&2
+        return 1
     else
-        # Domain or IPv4 address
-        panel_url="https://$panel_address:3000"
+        panel_url="https://$panel_address"
         verify_mode="remote"
     fi
 
     printf '%s\n' "$(tf wizard.panel_verify.checking "$panel_address")"
 
-    # For remote panels, verify TLS certificate or ask for fingerprint confirmation
-    if [[ "$verify_mode" == "remote" ]]; then
-        local ssl_verify=0
-        local fingerprint=""
-
-        # Try to verify with system CA bundle
-        if openssl s_client -connect "$panel_address:3000" -servername "$panel_address" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | grep -q "SHA256 Fingerprint="; then
-            ssl_verify=1
-        fi
-
-        if (( ssl_verify == 1 )); then
-            printf '%s\n' "$(t wizard.panel_verify.tls_ok)"
-        else
-            # Certificate verification failed - ask for fingerprint confirmation
-            printf '%s\n' "$(t wizard.panel_verify.tls_failed)"
-            fingerprint=$(openssl s_client -connect "$panel_address:3000" -servername "$panel_address" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)
-            if [[ -n "$fingerprint" ]]; then
-                printf '%s\n' "$(tf wizard.panel_verify.fingerprint "$fingerprint")"
-                read -r -p "$(t wizard.panel_verify.confirm_fingerprint)" confirm
-                if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-                    printf '%s\n' "$(t wizard.panel_verify.cancelled)" >&2
-                    return 1
-                fi
-            else
-                printf '%s\n' "$(t wizard.panel_verify.no_cert)" >&2
-                return 1
-            fi
-        fi
-
-        # Test API endpoint with verified TLS
-        if ! curl -fsS --max-time 10 "$panel_url/api/health" >/dev/null 2>&1; then
+    if [[ "$verify_mode" == "local" ]]; then
+        if ! curl -fsS --max-time 10 -o /dev/null "$panel_url$health" 2>/dev/null; then
             printf '%s\n' "$(t wizard.panel_verify.api_unreachable)" >&2
             return 1
         fi
-    else
-        # Local Panel - test HTTP endpoint
-        if ! curl -fsS --max-time 10 "$panel_url/api/health" >/dev/null 2>&1; then
-            printf '%s\n' "$(t wizard.panel_verify.api_unreachable)" >&2
-            return 1
-        fi
+        printf '%s\n' "$(tf wizard.panel_verify.success "$panel_address")"
+        return 0
+    fi
+
+    # curl's own answer separates a certificate the trust store rejects (60, 51)
+    # from an API that does not answer at all; the first is the case the
+    # operator can settle by comparing a fingerprint.
+    curl -fsS --max-time 10 -o /dev/null "$panel_url$health" 2>/dev/null || rc=$?
+    if (( rc == 0 )); then
+        printf '%s\n' "$(t wizard.panel_verify.tls_ok)"
+        printf '%s\n' "$(tf wizard.panel_verify.success "$panel_address")"
+        return 0
+    fi
+    if (( rc != 60 && rc != 51 )); then
+        printf '%s\n' "$(t wizard.panel_verify.api_unreachable)" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$(t wizard.panel_verify.tls_failed)"
+    fingerprint=$(wizard_panel_certificate_fingerprint "$panel_address")
+    if [[ -z "$fingerprint" ]]; then
+        printf '%s\n' "$(t wizard.panel_verify.no_cert)" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$(tf wizard.panel_verify.fingerprint "$fingerprint")"
+    if ! read -r -p "$(t wizard.panel_verify.confirm_fingerprint)" confirm; then
+        printf '\n'
+        return 1
+    fi
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        printf '%s\n' "$(t wizard.panel_verify.cancelled)" >&2
+        return 1
+    fi
+    # Read the certificate again after the answer: confirming one value must
+    # not authorise a request to whatever answers next.
+    if [[ "$(wizard_panel_certificate_fingerprint "$panel_address")" != "$fingerprint" ]]; then
+        printf '%s\n' "$(tf wizard.panel_verify.certificate_changed "$panel_address")" >&2
+        return 1
+    fi
+    if ! curl -fsSk --max-time 10 -o /dev/null "$panel_url$health" 2>/dev/null; then
+        printf '%s\n' "$(t wizard.panel_verify.api_unreachable)" >&2
+        return 1
     fi
 
     printf '%s\n' "$(tf wizard.panel_verify.success "$panel_address")"

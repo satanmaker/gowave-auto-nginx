@@ -343,7 +343,12 @@ ssh_bootstrap_pin_host_key() {
 
 ssh_bootstrap_onboard_one() {
     local host="$1" camouflage="$2" vision="${3:-}"
+    local node_name="${4:-}" node_ip="${5:-}"
     local port="${GOWAVE_SSH_PORT:-22}"
+    # The SSH target is the address when the caller knows it: a Worker that is
+    # being added before its name resolves is reachable by address, and the host
+    # key that gets pinned belongs to that address either way.
+    local target="${node_ip:-$host}"
     local ip="" scanned="" expected="" password_file="" rc=0
     local phase=""
 
@@ -361,7 +366,7 @@ ssh_bootstrap_onboard_one() {
     fi
 
     _ssh_phase "scan"
-    if ! scanned=$(ssh_bootstrap_scan "$host" "$port"); then
+    if ! scanned=$(ssh_bootstrap_scan "$target" "$port"); then
         printf '%s\n' "$(tf wizard.ssh.scan_failed "$host")" >&2
         return 1
     fi
@@ -380,7 +385,9 @@ ssh_bootstrap_onboard_one() {
     fi
 
     _ssh_phase "resolve_ip"
-    if ! ip=$(wizard_resolve_ipv4 "$host"); then
+    if [[ -n "$node_ip" ]]; then
+        ip="$node_ip"
+    elif ! ip=$(wizard_resolve_ipv4 "$host"); then
         printf '%s\n' "$(tf wizard.dns.failed "$host")" >&2
         _release_ssh_temp
         return 1
@@ -396,27 +403,27 @@ ssh_bootstrap_onboard_one() {
     fi
 
     _ssh_phase "authorise"
-    if ! ssh_bootstrap_authorise "$host" "$port" "$password_file"; then
+    if ! ssh_bootstrap_authorise "$target" "$port" "$password_file"; then
         _release_ssh_temp
         return 1
     fi
 
     _ssh_phase "start_agent"
     if ! ssh_bootstrap_start_agent; then
-        ssh_bootstrap_revoke "$host" "$port" "$password_file" || true
+        ssh_bootstrap_revoke "$target" "$port" "$password_file" || true
         _release_ssh_temp
         return 1
     fi
 
     _ssh_phase "add_node"
-    local -a add_args=(add "$host" "$ip" "$host" "$camouflage")
+    local -a add_args=(add "${node_name:-$host}" "$ip" "$host" "$camouflage")
     if [[ -n "$vision" ]]; then
-        add_args=(add --vision-domain "$vision" "$host" "$ip" "$host" "$camouflage")
+        add_args=(add --vision-domain "$vision" "${node_name:-$host}" "$ip" "$host" "$camouflage")
     fi
     SSH_KNOWN_HOSTS="$GOWAVE_SSH_KNOWN_HOSTS" cmd_node "${add_args[@]}" || rc=1
 
     _ssh_phase "revoke"
-    ssh_bootstrap_revoke "$host" "$port" "$password_file" || rc=1
+    ssh_bootstrap_revoke "$target" "$port" "$password_file" || rc=1
 
     _ssh_phase "stop_agent"
     ssh_bootstrap_stop_agent

@@ -669,15 +669,30 @@ class TestWizardEntry(unittest.TestCase):
             "a shipped script outside the wizard renders a translated string",
         )
 
-    def test_the_ssh_helper_is_reached_only_through_a_collected_plan(self):
+    def test_the_ssh_helper_is_reached_only_through_the_wizard_and_the_add_node_menu(self):
         # The definition lives in that module; every other mention is a caller.
-        callers = [
+        callers = sorted(
             path.relative_to(REPO_ROOT).as_posix()
             for path in SHIPPING_SCRIPTS
             if path.name not in ("wizard.sh", "ssh_bootstrap.sh")
             and "ssh_bootstrap_onboard_one" in path.read_text(encoding="utf-8")
-        ]
-        self.assertEqual(callers, [], "a shipped script outside the wizard onboards a node")
+        )
+        self.assertEqual(
+            callers,
+            ["gowave-auto.sh"],
+            "a shipped script outside the wizard onboards a node",
+        )
+        # The menu may run it, the positional paths may not: every mention in
+        # the entrypoint belongs to the interactive add-node flow.
+        source = GOWAVE_AUTO.read_text(encoding="utf-8")
+        start = source.index("wizard_add_node_to_panel() {")
+        body = source[start : source.index("\n}\n", start)]
+        self.assertIn("ssh_bootstrap_onboard_one", body)
+        self.assertEqual(
+            source.count("ssh_bootstrap_onboard_one"),
+            body.count("ssh_bootstrap_onboard_one"),
+            "an entrypoint path outside the add-node menu onboards a node",
+        )
 
     def test_a_complete_argument_list_collects_a_plan_without_the_catalog(self):
         result = bash(
@@ -1132,6 +1147,177 @@ class TestSSHReachability(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("SSH_CHECK_CALLED", result.stderr)
+
+
+class TestPanelApiVerification(unittest.TestCase):
+    """wizard_verify_panel_api talks to the address the Panel actually serves.
+
+    The Panel answers plaintext HTTP on 3000 and NGINX terminates TLS on 443, so
+    a probe that speaks TLS to 3000 can never succeed, and /api/health is not a
+    route the Panel answers. Both facts are observed here rather than read from
+    the source: the fake ``curl`` records the URL it was handed.
+    """
+
+    CURL = """#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_LOG/curl"
+n=0
+[ -f "$FAKE_LOG/curl.count" ] && n=$(cat "$FAKE_LOG/curl.count")
+n=$((n + 1))
+printf '%s\\n' "$n" > "$FAKE_LOG/curl.count"
+if [ "$n" -eq 1 ]; then exit "${FAKE_CURL_FIRST:-0}"; fi
+exit "${FAKE_CURL_REST:-0}"
+"""
+
+    OPENSSL = """#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_LOG/openssl"
+case "$*" in
+    *s_client*) printf '%s\\n' '-----BEGIN CERTIFICATE-----'; exit 0 ;;
+    *x509*)
+        n=0
+        [ -f "$FAKE_LOG/x509.count" ] && n=$(cat "$FAKE_LOG/x509.count")
+        n=$((n + 1))
+        printf '%s\\n' "$n" > "$FAKE_LOG/x509.count"
+        if [ "${FAKE_NO_CERT:-0}" = 1 ]; then exit 1; fi
+        if [ -n "${FAKE_SECOND_FINGERPRINT:-}" ] && [ "$n" -ge 2 ]; then
+            printf 'sha256 Fingerprint=%s\\n' "$FAKE_SECOND_FINGERPRINT"
+            exit 0
+        fi
+        printf 'sha256 Fingerprint=%s\\n' "${FAKE_FINGERPRINT:-AA:BB:CC}"
+        exit 0 ;;
+esac
+exit 0
+"""
+
+    def verify(self, address, local="no", stdin="", first=0, rest=0, env=None):
+        with tempfile.TemporaryDirectory() as directory:
+            bin_dir = Path(directory) / "bin"
+            log_dir = Path(directory) / "log"
+            bin_dir.mkdir()
+            log_dir.mkdir()
+            for name, body in (("curl", self.CURL), ("openssl", self.OPENSSL)):
+                path = bin_dir / name
+                path.write_text(body, encoding="utf-8")
+                path.chmod(0o755)
+            merged = {
+                "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                "FAKE_LOG": str(log_dir),
+                "FAKE_CURL_FIRST": str(first),
+                "FAKE_CURL_REST": str(rest),
+            }
+            merged.update(env or {})
+            result = bash(
+                SOURCE_WIZARD
+                + f"set +e\nwizard_verify_panel_api {shlex.quote(address)} {local}\nprintf 'RC=%d\\n' \"$?\"\n",
+                stdin=stdin,
+                env=merged,
+            )
+            curls = (log_dir / "curl").read_text(encoding="utf-8").splitlines() if (log_dir / "curl").exists() else []
+            openssls = (
+                (log_dir / "openssl").read_text(encoding="utf-8").splitlines()
+                if (log_dir / "openssl").exists()
+                else []
+            )
+        return result, curls, openssls
+
+    def test_a_local_panel_is_verified_over_the_loopback_without_tls(self):
+        result, curls, openssls = self.verify("panel.example.com", local="yes")
+        self.assertIn("RC=0", result.stdout, result.stderr)
+        self.assertIn("Panel API verified: panel.example.com", result.stdout)
+        self.assertEqual(len(curls), 1, curls)
+        self.assertEqual(curls[0].split()[-1], "http://127.0.0.1:3000/api/system/health")
+        self.assertEqual(openssls, [], "a loopback Panel needs no certificate check")
+
+    def test_a_remote_panel_is_verified_on_443_with_the_health_route(self):
+        result, curls, _openssls = self.verify("panel.example.com")
+        self.assertIn("RC=0", result.stdout, result.stderr)
+        self.assertEqual(curls[0].split()[-1], "https://panel.example.com/api/system/health")
+        self.assertNotIn(":3000", curls[0], "TLS was pointed at the plaintext Panel port")
+
+    def test_a_rejected_certificate_is_confirmed_then_accepted(self):
+        result, curls, _openssls = self.verify("panel.example.com", stdin="y\n", first=60, rest=0)
+        self.assertIn("RC=0", result.stdout, result.stderr)
+        self.assertIn("TLS certificate verification failed.", result.stdout)
+        self.assertIn("Certificate fingerprint: AA:BB:CC", result.stdout)
+        self.assertEqual(len(curls), 2, curls)
+        self.assertIn("-fsSk", curls[1], "the confirmed request was not repeated without validation")
+
+    def test_a_rejected_certificate_is_refused_without_an_answer(self):
+        result, curls, _openssls = self.verify("panel.example.com", stdin="n\n", first=60)
+        self.assertIn("RC=1", result.stdout, result.stderr)
+        self.assertIn("Panel verification cancelled.", result.stderr)
+        self.assertEqual(len(curls), 1, curls)
+
+    def test_a_certificate_that_changes_during_the_question_is_refused(self):
+        result, curls, _openssls = self.verify(
+            "panel.example.com", stdin="y\n", first=60, env={"FAKE_SECOND_FINGERPRINT": "DD:EE:FF"}
+        )
+        self.assertIn("RC=1", result.stdout, result.stderr)
+        self.assertIn("changed while the confirmation was open", result.stderr)
+        self.assertEqual(len(curls), 1, "the request ran despite the changed certificate")
+
+    def test_an_absent_certificate_refuses_before_any_question(self):
+        result, _curls, _openssls = self.verify(
+            "panel.example.com", stdin="y\n", first=60, env={"FAKE_NO_CERT": "1"}
+        )
+        self.assertIn("RC=1", result.stdout, result.stderr)
+        self.assertIn("Could not retrieve certificate.", result.stderr)
+        self.assertNotIn("Certificate fingerprint:", result.stdout)
+
+    def test_a_bare_address_is_refused_as_unverifiable(self):
+        result, curls, openssls = self.verify("10.1.2.3")
+        self.assertIn("RC=1", result.stdout, result.stderr)
+        self.assertIn("the address 10.1.2.3 cannot be verified", result.stderr)
+        self.assertEqual(curls, [], "a bare address was probed")
+        self.assertEqual(openssls, [], "a bare address was probed for a certificate")
+
+    def test_an_unreachable_api_is_not_reported_as_a_certificate_problem(self):
+        result, _curls, _openssls = self.verify("panel.example.com", first=7)
+        self.assertIn("RC=1", result.stdout, result.stderr)
+        self.assertIn("Panel API unreachable.", result.stderr)
+        self.assertNotIn("TLS certificate verification failed.", result.stdout)
+
+    def test_the_menu_add_node_runs_the_temporary_access_onboarding(self):
+        # `node add` alone refuses a Worker whose host key is not already pinned
+        # and whose access is password-only, so the menu has to reach the same
+        # onboarding the install runs instead of calling it directly.
+        script = (
+            f"source {shlex.quote(str(GOWAVE_AUTO))}\n"
+            "detect_local_panel() { printf 'panel.example.com'; return 0; }\n"
+            "wizard_verify_panel_api() { printf 'VERIFY=%s/%s\\n' \"$1\" \"$2\"; return 0; }\n"
+            "ssh_bootstrap_onboard_one() {"
+            " printf 'ONBOARD host=%s cam=%s vision=[%s] name=%s ip=%s\\n'"
+            " \"$1\" \"$2\" \"${3-}\" \"${4-}\" \"${5-}\"; return 0; }\n"
+            "cmd_node() { printf 'CMD_NODE=%s\\n' \"$*\"; return 0; }\n"
+            "set +e\n"
+            "wizard_add_node_to_panel\n"
+            "printf 'RC=%d\\n' \"$?\"\n"
+        )
+        result = bash(
+            script,
+            stdin="y\nworker-one\n10.1.2.3\nnode.example.com\ncdn.example.com\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("VERIFY=panel.example.com/yes", result.stdout)
+        self.assertIn(
+            "ONBOARD host=node.example.com cam=cdn.example.com vision=[] name=worker-one ip=10.1.2.3",
+            result.stdout,
+        )
+        self.assertNotIn("CMD_NODE=", result.stdout, "the menu bypassed the temporary-access onboarding")
+
+    def test_the_menu_asks_for_a_panel_domain_when_nothing_runs_locally(self):
+        script = (
+            f"source {shlex.quote(str(GOWAVE_AUTO))}\n"
+            "detect_local_panel() { return 1; }\n"
+            "wizard_verify_panel_api() { printf 'VERIFY=%s/%s\\n' \"$1\" \"$2\"; return 1; }\n"
+            "set +e\n"
+            "if wizard_add_node_to_panel; then printf 'RC=0\\n'; else printf 'RC=1\\n'; fi\n"
+        )
+        # No local Panel: one line for the address, nothing else is reached
+        # because the verification refuses.
+        result = bash(script, stdin="panel.example.com\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("VERIFY=panel.example.com/no", result.stdout)
+        self.assertIn("RC=1", result.stdout)
 
 
 if __name__ == "__main__":

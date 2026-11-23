@@ -523,6 +523,40 @@ class TestOnboardingLifecycle(unittest.TestCase):
         self.assertIn("NODE add worker.example.com", log)
         self.assertNotIn("--vision-domain", log)
 
+    def test_an_explicit_name_and_address_are_used_instead_of_the_domain(self):
+        # The add-node menu collects a name and an address, and a Worker added
+        # before its name resolves is reachable only by that address, so the
+        # onboarding has to scan and reach it rather than resolve the domain.
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "stub.log"
+            password = Path(directory) / "password"
+            password.write_text("s3cret\n", encoding="utf-8")
+            password.chmod(0o600)
+            result = bash(
+                SOURCE
+                + self.STUB
+                + "ssh_bootstrap_scan() {"
+                ' printf \'SCAN %s\\n\' "$1" >> "$STUB_LOG"; echo "$1 ssh-ed25519 AAAA"; }\n'
+                "wizard_resolve_ipv4() {"
+                ' printf \'RESOLVED %s\\n\' "$1" >> "$STUB_LOG"; echo 203.0.113.7; }\n'
+                "if ssh_bootstrap_onboard_one node.example.com cdn.example.com ''"
+                " worker-one 10.1.2.3; then echo RESULT_OK; else echo RESULT_FAILED; fi\n",
+                env={
+                    "STUB_ROOT": directory,
+                    "STUB_LOG": str(log),
+                    "STUB_PASSWORD": str(password),
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("RESULT_OK", result.stdout)
+            written = log.read_text(encoding="utf-8")
+        self.assertIn("SCAN 10.1.2.3", written)
+        self.assertNotIn("RESOLVED", written, "the domain was resolved although an address was given")
+        self.assertIn(
+            "NODE add worker-one 10.1.2.3 node.example.com cdn.example.com",
+            written,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
