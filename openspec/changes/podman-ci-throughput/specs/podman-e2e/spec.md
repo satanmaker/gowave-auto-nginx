@@ -4,7 +4,7 @@
 
 ### Requirement: Harness ceilings never decide a product verdict
 
-A container command ceiling MUST be sized to the work it bounds and MUST be capped by the run's remaining budget, so it can fire inside the run. A ceiling or budget that fires MUST be published as INCOMPLETE or a named harness limit, never as a product FAIL, and a case whose evidence a timeout cut short MUST NOT assert about that evidence.
+A container command ceiling MUST be sized to the work it bounds and MUST be capped by the run's remaining budget, so it can fire inside the run. A ceiling or budget that fires MUST be published as INCOMPLETE naming the command and the limit that fired, never as a product FAIL — the command-level counterpart of *Budget overrun is not a truncated pass* — and a case whose evidence a timeout cut short MUST NOT assert about that evidence.
 
 #### Scenario: A slow legitimate step keeps its ceiling
 

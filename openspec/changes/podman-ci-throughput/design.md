@@ -20,13 +20,14 @@ The declared floors start at the measured cost of the failing runs (311.2 s and 
 
 ### 2. `CaseTimeout` passes through the cleanup probe
 
-`_restore_nginx_configuration` re-raises `CaseTimeout` before its broad handler, and `nginx_config_reload_contract` skips `require_reload_after_restore` when the helper produced no report. The restore is still attempted from the `finally`, so a killed case leaves the host no worse than a failing one.
+`_restore_nginx_configuration` re-raises `CaseTimeout` before its broad handler; nothing else changes. `nginx_config_reload_contract` needs no report-presence guard, because the code after its `finally` is unreachable when the `finally` raises — that is exactly how the deadline leaves, so the restore is still attempted and no assertion about the restored configuration is reached. Every other restore failure still reaches `require_reload_after_restore`, because the helper returns a dictionary for a bad exit code, non-JSON output and any other exception.
 
 Alternatives considered:
 
 - Narrow `except Exception` to transport errors. Rejected: the probe's own gate failures surface as `RuntimeError`, so a narrowed handler would let a real cleanup crash escape the `finally` and replace the case's primary message with a traceback. The broad handler earns its keep for everything except the runner's own deadline.
 - Clear the alarm before entering the cleanup. Rejected: it makes the last seconds of a case unbounded, and the budget that fired is exactly the thing the operator needs named in the verdict.
 - Skip the restore on a timeout. Rejected: the host stays with the planted invalid snippet, and the next case inherits a broken configuration.
+- Initialise the restore report to `None` and assert only when a report exists. Rejected: dead code — a `None` report cannot be observed after the `finally`, and the guard would suppress the very FAIL that a genuine restore failure must produce.
 
 A genuine cleanup failure still fails the case: only `CaseTimeout` is passed through, and `require_reload_after_restore`'s own assertions are unchanged.
 
@@ -40,10 +41,18 @@ Alternative considered: a new exception type for "prerequisite failed". Rejected
 
 The per-case declared caps and the per-topology budgets are not touched here. The study's sample (37 local runs, 20 CI runs) measured the failures, not the post-fix cost, so any new number would be a second guess. The same applies to the 20-minute `Lint, Completeness, and Suite` job cap: it is a decision for after the measured run, and it may need no change at all if the run fits.
 
+### 5. A ceiling that fires is a harness limit, not an unexpected error
+
+`_run` raises a dedicated exception carrying the command and the ceiling instead of a bare `RuntimeError`, and `Runner.execute` maps it to INCOMPLETE before its final `except Exception`. Without that branch a ceiling that fires with budget still left reaches the broad handler and is published as FAIL with a traceback — the shape the measured runs already have — so sizing the ceilings without naming the verdict would leave the requirement true only for the cases where nothing fires.
+
+Alternative considered: add a new verdict state alongside `PASS/FAIL/SKIP/BLOCKED/INCOMPLETE/NOT_APPLICABLE`. Rejected: INCOMPLETE already means "what was seen cannot decide the question", the aggregate gate already treats it as not-green, and a seventh state would have to be taught to every report, matcher and dashboard. What the requirement adds is not a new state but a named reason inside the existing one.
+
+A declared per-case cap is out of scope: `CaseTimeout` with `capped_by_budget` false is the case's own statement about how long its own work may take, and the change leaves that branch as it is.
+
 ## Risks
 
 - **A generous ceiling hides a genuine hang.** The verdict names the command and its ceiling, the ceiling is capped by the run's remaining budget, and a hang therefore ends as INCOMPLETE inside the budget rather than as a truncated pass.
-- **The passthrough skips the restore assertion.** Only the assertion about the restore is skipped; the restore itself still runs, and the run's teardown removes the container. A restore that fails on its own still reaches `require_reload_after_restore`.
+- **The passthrough skips the restore assertion.** Only the assertion about the restore is skipped, and only because the deadline leaves the function before it; the restore itself still runs and the run's teardown removes the container. A restore that fails on its own still reaches `require_reload_after_restore`.
 - **A case that used to fail now blocks.** That is the intent, and a blocked required case still fails the aggregate gate, so nothing becomes greener than the evidence allows.
 
 ## Migration

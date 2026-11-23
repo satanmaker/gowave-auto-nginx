@@ -8,38 +8,55 @@
   keeps its value and its role as the ceiling of short probes.
   Verify: `grep -c 'DEFAULT_COMMAND_TIMEOUT = 300' tools/podman_e2e/podman.py` returns 1.
 - [ ] 1.2 Pass the ceilings at the two call sites, each capped by the run's remaining budget so the ceiling cannot
-  outlive the run: `ensure_image`'s `pull` (`podman.py:242`) and `build`'s `build` (`podman.py:268`). Take the cap from
-  the run context the class already holds (`self.context.remaining()`, `runner.py:246`). When nothing is left, raise
-  the suite's existing budget exception instead of starting a command that cannot finish.
+  outlive the run: the `pull` inside `ensure_image` (`podman.py:239`) and the build argv inside `build`
+  (`podman.py:263`). Take the cap from the run context the class already holds (`self.context.remaining()`,
+  `runner.py:246`). When nothing is left, raise the suite's existing budget exception instead of starting a command
+  that cannot finish.
   Verify: the unit test in 1.4, and a read of `ensure_image`/`build` showing an explicit `timeout=` on both `_run`
   calls.
 - [ ] 1.3 Do not widen `exec`/`exec_bash`. A probe that legitimately needs longer already passes its own timeout
   (`NGX_CONFIG_PROBE_TIMEOUT_SECONDS` and its siblings), and a wider default would turn a wedged probe into a
   silently expensive one.
-  Verify: `grep -c 'timeout: int = DEFAULT_COMMAND_TIMEOUT' tools/podman_e2e/podman.py` is unchanged.
-- [ ] 1.4 Add a test class beside `TestDeclaredBudget` in `tests/test_podman_budget.py`: the pull and the build are
-  given a timeout no smaller than the measured cost and no larger than the remaining budget; a context with 10 s left
-  yields 10 s, not the declared floor; a spent budget refuses before the command starts; every other caller still gets
-  300 s.
-  Verify: `python3 -m unittest -v tests.test_podman_budget`.
+  Verify: `grep -c 'timeout: int = DEFAULT_COMMAND_TIMEOUT' tools/podman_e2e/podman.py` still prints 3.
+- [ ] 1.4 Add `TestOperationCeilings` beside `TestDeclaredBudget` in `tests/test_podman_budget.py`: the pull and the
+  build are given a timeout no smaller than the measured cost and no larger than the remaining budget; a context with
+  10 s left yields 10 s, not the declared floor; a spent budget refuses before the command starts; every other caller
+  still gets 300 s. Register the class in `tests/run_ci.py`'s `SUITES` in the same commit — `collect()` refuses an
+  unassigned class before suite selection (`run_ci.py:410-413`), so an unregistered class turns
+  `--check-completeness` and every suite run red.
+  Verify: `python3 -m unittest -v tests.test_podman_budget` and `python3 -m tests.run_ci.py --check-completeness`.
+- [ ] 1.5 Make a fired ceiling a harness limit instead of an unexpected error: replace the bare `RuntimeError` in
+  `_run` (`podman.py:105-108`) with a dedicated exception carrying the command and the ceiling that fired, and map it
+  in `Runner.execute` to INCOMPLETE ahead of the final `except Exception` (`runner.py:363-369`), which today publishes
+  it as FAIL with a bare traceback. Import it through runner's existing exception block, next to `BudgetExhausted`.
+  The message names the command and the limit, and a declared per-case cap is out of scope: that branch keeps its
+  current FAIL/INCOMPLETE split.
+  Verify: `TestHarnessLimitVerdict` in `tests/test_podman_runner.py` — a `HarnessLimit` raised inside a case ends as
+  INCOMPLETE, and the published reason names both the command and the ceiling — registered in `run_ci.py` with the
+  rest of section 1; `python3 -m unittest -v tests.test_podman_runner`.
 
 ## 2. A deadline is not a defect (`tools/podman_e2e/aio.py`)
 
 - [ ] 2.1 Re-raise `CaseTimeout` in `_restore_nginx_configuration` (`aio.py:4871`) ahead of its broad handler, importing
   it through the module's existing `.runner` import block rather than adding a second one.
   Verify: a restore probe that raises `CaseTimeout` no longer returns a `{"error": …}` dictionary (test in 2.3).
-- [ ] 2.2 In `nginx_config_reload_contract`, initialise the restore report to `None`, keep the restore in the `finally`,
-  and call `require_reload_after_restore` only when a report exists. A restore that fails on its own — bad exit code,
-  non-JSON output, an exception other than the deadline — still reaches the assertion and still FAILs.
+- [ ] 2.2 Change nothing downstream in `nginx_config_reload_contract`: no `None` initialisation of the restore report
+  and no report-presence guard around `require_reload_after_restore`. Neither is reachable — when the `try` body or the
+  `finally` raises, the code after the `finally` does not run, and `_restore_nginx_configuration` returns a dictionary
+  on every non-deadline path, so the existing "the restoring probe produced no report" assertion is already the one
+  that fails for a bad exit code, non-JSON output or another exception. A guard here would only make the deadline path
+  quieter while breaking the FAIL path the same task requires.
+  Verify: the 2.3 negative test — a `RuntimeError` from the restore probe still ends as FAIL.
 - [ ] 2.3 Prove both directions at the cheapest layer: in `tests/test_podman_runner.py` beside `TestResultSemantics`,
-  a `CaseTimeout` raised during a case capped by the budget ends as INCOMPLETE; in `tests/test_podman_aio.py` beside
-  `TestNginxConfigCase`, a deadline inside the restore probe leaves the restore attempted, evaluates no assertion about
-  the restored configuration, and a `RuntimeError` from the same probe still ends as FAIL carrying the case's primary
-  message.
-  Verify: `python3 -m unittest -v tests.test_podman_runner tests.test_podman_aio`.
+  a `CaseTimeout` raised during a case capped by the budget ends as INCOMPLETE; in `tests/test_podman_aio.py`,
+  `TestRestoreDeadlineCase` shows a deadline inside the restore probe leaving `nginx_config_reload_contract` by
+  exception with no assertion about the restored configuration, while a `RuntimeError` from the same probe still ends
+  as FAIL carrying the case's primary message. Register both classes in `tests/run_ci.py`'s `SUITES`.
+  Verify: `python3 -m unittest -v tests.test_podman_runner tests.test_podman_aio` and
+  `python3 -m tests.run_ci.py --check-completeness`.
 - [ ] 2.4 Pin the handler order with a source-level test that anchors on the call site, not on a character window: the
-  deadline is named before the broad handler inside `_restore_nginx_configuration`, and `require_reload_after_restore`
-  is guarded by the report's presence.
+  deadline is named before the broad handler inside `_restore_nginx_configuration`. Nothing else is pinned — 2.2 keeps
+  that function's guard structure unchanged, so a test asserting a report-presence guard would pass on dead code.
   Verify: the new test fails when 2.1 is reverted.
 
 ## 3. An install-dependent case gates on the install (`tools/podman_e2e/aio.py`)
@@ -58,8 +75,11 @@
 
 ## 4. Measure, then set the numbers
 
-- [ ] 4.1 Run one full local acceptance run on this change's commit over the affected topologies and record the run
-  directory and its per-case durations in this task.
+- [ ] 4.1 Run one full local acceptance run on this change's commit over the three topologies that carry the measured
+  paths, and record the run directory and its per-case durations in this task: `aio` (`AIO-INSTALL` builds and pulls,
+  `NGX-05` owns the restore, `RED-02` owns the install gate), `panel-only` (`PO-INSTALL` is the second measured build
+  kill), and `multi-node` (`NGX-05` and `ENV-02` are where the budget was spent and reported as a defect). Record the
+  pull and build durations separately from the case durations — 4.2 needs the former, 4.3 the latter.
 - [ ] 4.2 Replace the initial `PULL_CEILING_SECONDS` and `BUILD_CEILING_SECONDS` with values derived from 4.1, keeping
   the rule "declared floor sized to the work, capped by the remaining budget", and record the measured pull and build
   durations beside the constants.
@@ -74,21 +94,30 @@
 
 ## 5. Traceability and the pages that state verdicts
 
-- [ ] 5.1 Add the traceability rows for the delta's scenarios at archive time: the two ceiling scenarios cite
-  `tests.test_podman_budget` and `tests.test_podman_runner`, the install-gate scenario cites `tests.test_podman_aio`, and
-  all three cite the job that runs them. A scenario with no row is an audit gap, and the gap must name the task whose
-  box is still open.
-  Verify: `python3 -m tools.podman_e2e.trace --strict` reports 0 gaps and `tests/test_podman_traceability.py` passes.
+- [ ] 5.1 Add one traceability row per scenario of the delta at archive time — the three ADDED ones and
+  `Install-dependent case without a successful installation` — using full ids that exist by then, never a
+  two-segment module id: `tests.test_podman_budget.TestOperationCeilings` (a slow legitimate step keeps its ceiling),
+  `tests.test_podman_runner.TestHarnessLimitVerdict` (a ceiling that fires names its own limit),
+  `tests.test_podman_aio.TestRestoreDeadlineCase` (a budget kill inside a cleanup probe stays INCOMPLETE) and
+  `tests.test_podman_aio.TestDiagnosticArtifactsCase` (the install gate). Each row names the job that runs its proof:
+  `Lint, Completeness, and Suite Nonroot` for the unit tests, `All-in-One Podman Acceptance` and
+  `Panel-only Podman Acceptance` for the two measured ceiling sites, `Multi-Node Podman Acceptance` for the budget and
+  install paths. Use no `gap`: `trace.py` reads the ledger of `podman-full-e2e` (`trace.py:61`) and refuses a gap
+  naming a task of another change, and by archive time every row has a passing test.
+  Verify: `python3 -m tools.podman_e2e.trace --strict` lists the four new rows and reports no problem.
 - [ ] 5.2 If `docs/PODMAN_E2E_DISCOVERY.md` or `tests/cases/behaviors.yaml` states that a timed-out case is a product
   FAIL, bring the sentence in line with the new verdict.
   Verify: `python3 -m unittest -v tests.test_podman_docs tests.test_podman_behaviors`.
 - [ ] 5.3 Validate the change and the tree: `openspec validate podman-ci-throughput --strict`, then
   `openspec validate --all --strict`.
+- [ ] 5.4 Regenerate the traceability report after 5.1 — `python3 -m tools.podman_e2e.trace --markdown` — and commit
+  `docs/PODMAN_E2E_TRACEABILITY.md`: `trace.py:1203-1206` refuses a report that differs from the table's own render.
+  Verify: `python3 -m tools.podman_e2e.trace --strict` passes twice in a row.
 
 ## 6. Close
 
 - [ ] 6.1 Re-read one red Podman run produced before this change and one after 4.1, and account for every verdict
-  difference: each must be either the same product finding or one of the three harness paths this change names. A
+  difference: each must be either the same product finding or one of the harness paths this change names. A
   difference that is neither is a finding this change did not intend.
 - [ ] 6.2 Archive the change only after 6.1, and only with 4.3/4.4 decided or explicitly carried forward as their own
   change.
