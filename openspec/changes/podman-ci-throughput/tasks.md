@@ -173,8 +173,29 @@
 
 ## 6. Close
 
-- [ ] 6.1 Re-read one red Podman run produced before this change and one after 4.1, and account for every verdict
+- [x] 6.1 Re-read one red Podman run produced before this change and one after 4.1, and account for every verdict
   difference: each must be either the same product finding or one of the harness paths this change names. A
   difference that is neither is a finding this change did not intend.
+  Result: two pairs, and each pair carries an identical case set (117 for `aio`, 127 for `multi-node`), so every
+  difference is a status change on the same id rather than a case that appeared or vanished.
+  - `podman-aio-20261122T204058-30530910` (FAIL, 3 FAIL / 64 BLOCKED / 50 PASS, 306.9 s) against
+    `podman-aio-20261123T193952-2d80cddc` (FAIL, 2 FAIL / 8 INCOMPLETE / 107 PASS, 985.1 s). `AIO-INSTALL` failed in
+    25.5 s on «the hosts entry for api.github.com (install) did not print JSON», so the 64 BLOCKED cases were the
+    install gate naming `AIO-INSTALL` — and `RED-02` was the case that did not: it FAILed on «the operator file does
+    not carry the package version» about a host no install had touched, which is the defect 3.1 closed. After the
+    run, the install succeeds and `RED-02` passes; `ENV-01`'s FAIL, on the install case not having succeeded, goes the
+    same way. The ten cases left non-PASS are the eight `AIO-DP-*` INCOMPLETE and their two dependants `AIO-MATRIX`
+    and `AIO-PKT-02`, and no case moved from PASS to anything else.
+  - `podman-multi-node-20261122T144401-ab045897` (FAIL, 5 FAIL / 8 INCOMPLETE / 114 PASS, 2037.2 s) against
+    `podman-multi-node-20261123T195857-3adaabde` (FAIL, 2 FAIL / 8 INCOMPLETE / 117 PASS, 1826.9 s): 19 status changes.
+    The eight empty-capture INCOMPLETE changed host — they were the eight `MN-DP-worker-*` cases and are now the eight
+    `MN-DP-master-*` ones — so the count of that signature is unchanged and the sixteen are one finding observed on
+    either side of the pair. `MN-DUP-ADD` (recovery journal left at `NODE_ADD_ROLLBACK_REQUIRED`), `MN-ENV-CONTRACT`
+    (node add exited 1) and `MN-PKT-03` (a request the master did not carry) pass after the commits that fixed them
+    landed between the two runs, not because of anything here.
+  - Neither side carries a verdict from this change: no `HarnessLimit` and no budget-exhaustion INCOMPLETE appears in
+    any of the four runs, and their 306.9 / 985.1 / 2037.2 / 1826.9 s sit far inside 2700 / 4500 / 4500. The only
+    PASS-to-non-PASS movement is those eight master captures, and the same signature is in the before side itself and
+    a day earlier in `podman-aio-20261121T141243-9d32338c`, so it is not something this change introduced.
 - [ ] 6.2 Archive the change only after 6.1, and only with 4.3/4.4 decided or explicitly carried forward as their own
   change.
