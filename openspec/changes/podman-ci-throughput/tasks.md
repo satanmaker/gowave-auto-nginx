@@ -119,11 +119,24 @@
   `DEFAULT_COMMAND_TIMEOUT` and keeps the assertion that the floor outlasts the 11.2 s observation.
   Verify: `python3 -m unittest -v tests.test_podman_budget` — `Ran 23 tests`, OK; 1 s < 300 s and 14 s < 1800 s, so
   both recorded durations are shorter than their floors.
-- [ ] 4.3 Decide with the user whether the per-case declared caps (6000–11400 s) and the per-topology run budgets
+- [x] 4.3 Decide with the user whether the per-case declared caps (6000–11400 s) and the per-topology run budgets
   (2700/4500/4500 s) move. If they do, that is its own change with 4.1 as evidence: the post-fix cost is what decides
   them, and this change does not measure it before 4.1.
-- [ ] 4.4 Decide the same for the 20-minute `Lint, Completeness, and Suite` job cap after 4.3, and record either the new
+  Result: both stay, decided by the operator on the 4.1 numbers. Measured cost is 985.1 s of 2700 (36 %), 158.7 s of
+  4500 (3.5 %) and 1826.9 s of 4500 (41 %), and one full pass is 2971 s against the 9000 s the pull-request tier
+  declares for two passes (66 %); the 59 % left on Multi-Node is the margin a slower runner spends, since the same
+  build takes 14 s here and outlasted 300 s there. `pre_push_total_seconds = 7200` is the All-in-One and Multi-Node
+  budgets summed and does not move either. The per-case caps stay inert — larger than the budget that caps them, so
+  they cannot fire, the defect `design.md` names — and correcting them is its own change with 4.1 as its evidence, as
+  this task requires.
+- [x] 4.4 Decide the same for the 20-minute `Lint, Completeness, and Suite` job cap after 4.3, and record either the new
   value or the measured margin that makes the current value sufficient.
+  Result: the cap stays at 90 minutes, and the task's 20 minutes is stale — `.github/workflows/lint-and-nonroot.yml:25`
+  already declares `timeout-minutes: 90`, raised in `podman-full-e2e` after the 20-minute cap ended every run as
+  `cancelled`. 4.5 measured the suite at 3128.777 s, 52.1 minutes, so the job carries 37.9 minutes (42 %) for checkout,
+  dependencies and the completeness pass: the same headroom the Multi-Node acceptance job carries. No workflow change,
+  and the job is not in `tests/cases/gates.yaml`, so `gate --check` has no statement about it to reconcile.
+  Verify: `sed -n '18,26p' .github/workflows/lint-and-nonroot.yml` shows the 90 and the comment that explains it.
 - [x] 4.5 Run the non-root suite — `python3 tests/run_ci.py --suite nonroot` — and record the verdict read from the
   run, not from the log tail, which does not carry it.
   Result: `Ran 3077 tests in 3128.777s` — `OK (skipped=1)`, exit 0, zero `ERROR:`/`FAIL:` lines. Read from the
