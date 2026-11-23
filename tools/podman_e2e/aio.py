@@ -2610,16 +2610,16 @@ def panel_probe(product: AioProduct, case_id: str, scope: str, extra: str = "") 
 
 # The Panel the add-node refusal case names. A bare address never reaches the
 # probe the case is about — the wizard refuses it first, because a certificate
-# names a domain — so the operator's mistake is spelled as a name, steered
-# inside the container at an address nothing serves. The flow then reaches the
-# API check and is refused there, which is the step under test; the loopback
-# alias is kept because the host's own NGINX answers 127.0.0.1:443.
-ADD_NODE_REFUSED_PANEL = "panel-unverifiable.testbed.internal"
-ADD_NODE_REFUSED_BLOCK_ADDRESS = PINNED_CORE_BLOCK_ADDRESS
-ADD_NODE_REFUSED_BLOCK_MARKER = "gowave-e2e-add-node-refused-block"
-# One /etc/hosts rewrite and one refused connect; the ceiling guards a stalled
-# script, not the expected cost.
-ADD_NODE_REFUSED_BLOCK_TIMEOUT_SECONDS = 120
+# names a domain — and a name pointed at a loopback alias would not be refused
+# either: the product's own NGINX listens on 443 of every local address, so the
+# flow would meet that listener and report its certificate. The name is left to
+# resolve nowhere, which the ``.invalid`` TLD reserves: the API check then fails
+# on reachability, which is the step under test.
+ADD_NODE_REFUSED_PANEL = "panel-unverifiable.invalid"
+ADD_NODE_REFUSED_PROBE_MARKER = "gowave-e2e-add-node-refused-probe"
+# One resolution query in the container; the ceiling guards a stalled script,
+# not the expected cost.
+ADD_NODE_REFUSED_PROBE_TIMEOUT_SECONDS = 120
 
 # Every message ``wizard_verify_panel_api`` prints on a path that ends in
 # ``return 1``. The case accepts the set rather than one string: which step
@@ -2657,55 +2657,43 @@ def add_node_refusal_script() -> str:
     ])
 
 
-def add_node_refused_block(podman, container: str, case_id: str, mode: str = "install") -> Dict[str, Any]:
-    """Place or drop the /etc/hosts entry that steers the refusal probe's name.
+def add_node_refused_resolution(podman, container: str, case_id: str) -> Dict[str, Any]:
+    """Ask the container what the refusal case's Panel name resolves to.
 
-    The entry is what makes ``ADD_NODE_REFUSED_PANEL`` a Panel that cannot be
-    verified rather than a name nobody knows, so the case reads the probe's
-    report — the resolution and the refused connection, both measured inside the
-    container — instead of assuming the premise. ``mode`` is ``install`` or
-    ``remove``; ``remove`` leaves ``/etc/hosts`` as it was before the case. The
-    marker is this case's own, because the writer drops every line it matched:
-    sharing the pinned-core marker would delete that entry on the way in.
+    The probe is the shared hosts-block script in ``remove`` mode: it drops any
+    entry this case wrote into a container that is reused across cases, then
+    reports what ``getent`` answers for the name with nothing steered. Its own
+    request reading is not asked for — a name that resolves at all is the
+    failure this probe exists to catch.
     """
     script = hosts_block_script(
-        mode, ADD_NODE_REFUSED_PANEL, ADD_NODE_REFUSED_BLOCK_ADDRESS,
-        marker=ADD_NODE_REFUSED_BLOCK_MARKER,
+        "remove", ADD_NODE_REFUSED_PANEL, marker=ADD_NODE_REFUSED_PROBE_MARKER,
     )
     result = podman.exec_bash(
-        container, script, check=False, timeout=ADD_NODE_REFUSED_BLOCK_TIMEOUT_SECONDS,
+        container, script, check=False, timeout=ADD_NODE_REFUSED_PROBE_TIMEOUT_SECONDS,
     )
-    return probe_json(case_id, f"the hosts entry for {ADD_NODE_REFUSED_PANEL} ({mode})", result)
+    return probe_json(case_id, f"the resolution of {ADD_NODE_REFUSED_PANEL}", result)
 
 
 def require_add_node_refused_premise(case_id: str, report: Dict[str, Any]) -> None:
-    """Refuse the case when its Panel name resolves anywhere but the dead address.
+    """Refuse the case when its Panel name resolves anywhere at all.
 
-    A name that answers is not the mistake under test: the flow would verify it
-    or fail somewhere of its own, and the refusal the case reads would belong to
-    something else.
+    A name that answers is not the mistake under test: whatever it reaches holds
+    a certificate, so the verification the flow reports would be a refusal of
+    that certificate rather than of a Panel that cannot be found.
     """
     resolution = str(report.get("resolution") or "")
-    request = report.get("request") or {}
     require(
         case_id,
-        report.get("mode") == "install"
-        and report.get("address") == ADD_NODE_REFUSED_BLOCK_ADDRESS,
-        f"{ADD_NODE_REFUSED_PANEL} was not steered at {ADD_NODE_REFUSED_BLOCK_ADDRESS}: "
-        f"the probe reports {report.get('mode')!r} for {report.get('address')!r}",
+        report.get("mode") == "remove",
+        f"the resolution probe reports {report.get('mode')!r}, so a steered entry may still "
+        f"be in force for {ADD_NODE_REFUSED_PANEL}",
     )
     require(
         case_id,
-        ADD_NODE_REFUSED_BLOCK_ADDRESS in resolution,
-        f"{ADD_NODE_REFUSED_PANEL} resolves to {resolution!r} instead of "
-        f"{ADD_NODE_REFUSED_BLOCK_ADDRESS}, so the flow could reach a Panel that answers",
-    )
-    require(
-        case_id,
-        request.get("returncode") not in (0, None),
-        f"{ADD_NODE_REFUSED_PANEL} answered (exit {request.get('returncode')!r}) although "
-        f"nothing serves {ADD_NODE_REFUSED_BLOCK_ADDRESS}, so the probe would not measure "
-        "a refused Panel API",
+        not resolution,
+        f"{ADD_NODE_REFUSED_PANEL} resolves to {resolution!r}, so the flow could reach a "
+        "Panel that answers instead of a name nothing can verify",
     )
 
 

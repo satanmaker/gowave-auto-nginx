@@ -210,25 +210,22 @@ class FakePodman:
         self.version_report = version_report
         self.scripts = []
         self.execs = []
-        # Overrides the install report the hosts-block probe would print, so a
-        # test can put the case's premise out of force.
-        self.block_report = None
-        # A write the container could not finish: there is no report to read, so
+        # Overrides the resolution the probe reports for the refusal case's
+        # Panel name, so a test can take the case's premise out of force.
+        self.resolution_report = None
+        # A probe the container could not finish: there is no report to read, so
         # the case fails instead of judging a premise it never measured.
-        self.block_returncode = 0
+        self.probe_returncode = 0
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
         self.scripts.append(script)
         if script == aio.INSTALLED_VERSION_SCRIPT:
             report = self.version_report or installed_version_report()
             return subprocess.CompletedProcess(["bash", "-lc", script], 0, report, "")
-        if aio.ADD_NODE_REFUSED_BLOCK_MARKER in script:
-            mode = "remove" if "MODE=remove" in script else "install"
-            report = self.block_report if mode == "install" and self.block_report else None
-            returncode = self.block_returncode if mode == "install" else 0
+        if aio.ADD_NODE_REFUSED_PROBE_MARKER in script:
             return subprocess.CompletedProcess(
-                ["bash", "-lc", script], returncode,
-                report or refused_block_report(mode=mode), "",
+                ["bash", "-lc", script], self.probe_returncode,
+                self.resolution_report or refused_resolution_report(), "",
             )
         stdout, returncode = self.results.pop(0)
         return subprocess.CompletedProcess(["bash", "-lc", script], returncode, stdout, "")
@@ -798,27 +795,21 @@ def node_surface(names=()):
     })
 
 
-def refused_block_report(mode="install", address=None, resolution=None, request_returncode=1):
-    """What the hosts-block probe prints for the refusal case's own name.
+def refused_resolution_report(resolution="", mode="remove"):
+    """What the resolution probe prints for the refusal case's own name.
 
-    ``install`` writes the entry and measures the request it makes; ``remove``
-    drops the entry and measures nothing. The case reads the first report as its
-    premise, so the default is an entry in force and a refused connection.
+    The probe runs in ``remove`` mode: it drops any entry this case wrote into a
+    container that is reused across cases, then reports what ``getent`` answers.
+    The default is the premise the case needs — nothing answers the name — and a
+    test overrides ``resolution`` to make the name reach something.
     """
-    installed = mode == "install"
     return json.dumps({
         "mode": mode,
         "host": aio.ADD_NODE_REFUSED_PANEL,
-        "address": (aio.ADD_NODE_REFUSED_BLOCK_ADDRESS if address is None else address)
-        if installed else "",
-        "resolution": (f"{aio.ADD_NODE_REFUSED_BLOCK_ADDRESS} {aio.ADD_NODE_REFUSED_PANEL}"
-                       if resolution is None else resolution) if installed else "",
-        "marker_count": 1 if installed else 0,
-        "request": {
-            "returncode": request_returncode,
-            "stdout": "bash: connect: Connection refused",
-            "stderr": "",
-        } if installed else None,
+        "address": "",
+        "resolution": resolution,
+        "marker_count": 0,
+        "request": None,
     })
 
 
@@ -826,8 +817,8 @@ def refusal_output(*, sentinel=False, verification=True):
     """What the shipped add-node wizard prints when the Panel cannot be verified.
 
     The sample is the one the live case produces: the local-Panel branch is
-    skipped, the name is verified, nothing answers the address it resolves to and
-    the flow returns before any Worker prompt.
+    skipped, the name is probed, no resolver answers it and the flow returns
+    before any Worker prompt.
     """
     lines = ["No local Panel found on this host."]
     if verification:
@@ -857,15 +848,15 @@ class TestPanelOnlyAddNodeRefusedCase(unittest.TestCase):
         self.addCleanup(self.context.run_cleanup)
 
     def refused(self, *, before=("worker-1",), after=("worker-1",), wizard=None,
-                wizard_returncode=1, block=None, block_returncode=0):
+                wizard_returncode=1, resolution=None, probe_returncode=0):
         product, host, podman = installed(self.context)
         podman.results = [
             (node_surface(before), 0),
             (wizard if wizard is not None else refusal_output(), wizard_returncode),
             (node_surface(after), 0),
         ]
-        podman.block_report = block
-        podman.block_returncode = block_returncode
+        podman.resolution_report = resolution
+        podman.probe_returncode = probe_returncode
         return panel_only.case_add_node_refused(product), host, podman
 
     def test_a_refused_attempt_reports_verification_and_leaves_the_panel_alone(self):
@@ -882,15 +873,15 @@ class TestPanelOnlyAddNodeRefusedCase(unittest.TestCase):
         # between can have touched the Panel, and it is not a `node add`.
         self.assertNotIn("node add", wizard_script(podman))
 
-    def test_the_case_steers_the_panel_name_at_a_dead_address_and_takes_it_back(self):
+    def test_the_case_asks_the_container_what_its_panel_name_resolves_to(self):
         _facts, _host, podman = self.refused()
-        block = [s for s in podman.scripts if aio.ADD_NODE_REFUSED_BLOCK_MARKER in s]
-        self.assertEqual(len(block), 2, "the entry is written once and removed once")
-        self.assertIn("MODE=install", block[0])
-        self.assertIn("MODE=remove", block[1])
+        probes = [s for s in podman.scripts if aio.ADD_NODE_REFUSED_PROBE_MARKER in s]
+        self.assertEqual(len(probes), 1, "the premise is read once, before the wizard")
+        self.assertIn("MODE=remove", probes[0])
+        self.assertIn(aio.ADD_NODE_REFUSED_PANEL, probes[0])
         self.assertLess(
-            podman.scripts.index(block[0]), podman.scripts.index(wizard_script(podman)),
-            "the name has to point at the dead address before the wizard resolves it",
+            podman.scripts.index(probes[0]), podman.scripts.index(wizard_script(podman)),
+            "a name that resolves has to fail the case before the wizard is pointed at it",
         )
 
     def test_the_case_drives_the_shipped_wizard_and_stubs_only_the_mutation(self):
@@ -920,23 +911,23 @@ class TestPanelOnlyAddNodeRefusedCase(unittest.TestCase):
             self.refused(after=("worker-1", "worker-invalid"))
         self.assertIn("changed the Panel's node list", str(caught.exception))
 
-    def test_a_name_that_resolves_past_the_dead_address_fails_the_case(self):
+    def test_a_panel_name_that_resolves_fails_the_case(self):
         with self.assertRaises(AssertionError) as caught:
-            self.refused(block=refused_block_report(
-                resolution="10.89.0.11 panel-unverifiable.testbed.internal",
+            self.refused(resolution=refused_resolution_report(
+                resolution=f"10.89.0.11 {aio.ADD_NODE_REFUSED_PANEL}",
             ))
-        self.assertIn("instead of", str(caught.exception))
+        self.assertIn("resolves to", str(caught.exception))
 
-    def test_a_name_whose_address_answers_fails_the_case(self):
+    def test_a_probe_that_reports_the_name_still_steered_fails_the_case(self):
         with self.assertRaises(AssertionError) as caught:
-            self.refused(block=refused_block_report(request_returncode=0))
-        self.assertIn("answered", str(caught.exception))
+            self.refused(resolution=refused_resolution_report(mode="install"))
+        self.assertIn("may still", str(caught.exception))
 
-    def test_a_hosts_entry_the_container_could_not_write_fails_the_case(self):
+    def test_a_resolution_the_container_could_not_measure_fails_the_case(self):
         # No report means no premise: the case must say so, not read an empty
-        # document as an entry in force.
+        # document as a name that resolves nowhere.
         with self.assertRaises(AssertionError) as caught:
-            self.refused(block_returncode=9)
+            self.refused(probe_returncode=9)
         self.assertIn("exited 9", str(caught.exception))
 
     def test_the_case_is_declared_in_the_suite(self):

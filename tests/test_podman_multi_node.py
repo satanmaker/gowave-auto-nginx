@@ -7828,21 +7828,19 @@ GOWAVE_WIZARD_EXIT=1
 """
 
 
-def refused_block_report(mode="install"):
-    """What the hosts-block probe prints for the refusal case's own name."""
-    installed = mode == "install"
+def refused_resolution_report(resolution="", mode="remove"):
+    """What the resolution probe prints for the refusal case's own name.
+
+    The probe runs in ``remove`` mode and reports what ``getent`` answers; the
+    default is the premise the case needs — nothing answers the name.
+    """
     return json.dumps({
         "mode": mode,
         "host": aio.ADD_NODE_REFUSED_PANEL,
-        "address": aio.ADD_NODE_REFUSED_BLOCK_ADDRESS if installed else "",
-        "resolution": (f"{aio.ADD_NODE_REFUSED_BLOCK_ADDRESS} {aio.ADD_NODE_REFUSED_PANEL}"
-                       if installed else ""),
-        "marker_count": 1 if installed else 0,
-        "request": {
-            "returncode": 1,
-            "stdout": "bash: connect: Connection refused",
-            "stderr": "",
-        } if installed else None,
+        "address": "",
+        "resolution": resolution,
+        "marker_count": 0,
+        "request": None,
     })
 
 
@@ -7860,10 +7858,9 @@ class _WizardCasePodman:
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
         self.scripts.append(script)
-        if aio.ADD_NODE_REFUSED_BLOCK_MARKER in script:
-            mode = "remove" if "MODE=remove" in script else "install"
+        if aio.ADD_NODE_REFUSED_PROBE_MARKER in script:
             return subprocess.CompletedProcess(
-                ["bash", "-lc", script], 0, refused_block_report(mode=mode), "",
+                ["bash", "-lc", script], 0, refused_resolution_report(), "",
             )
         return subprocess.CompletedProcess(["bash", "-lc", script], self.returncode, self.stdout, "")
 
@@ -7996,12 +7993,13 @@ class TestAddNodeRefusedCase(unittest.TestCase):
         self.assertEqual(facts.get("panel_node_names_after"), ["worker-1"])
         self.assertNotIn("node add", self.wizard_script(product))
 
-    def test_the_case_takes_the_hosts_entry_back_after_the_attempt(self):
+    def test_the_case_reads_the_resolution_before_it_drives_the_wizard(self):
         _facts, product = self.refused()
-        block = [s for s in product.podman.scripts if aio.ADD_NODE_REFUSED_BLOCK_MARKER in s]
-        self.assertEqual([("MODE=remove" in s) for s in block], [False, True])
+        probes = [s for s in product.podman.scripts if aio.ADD_NODE_REFUSED_PROBE_MARKER in s]
+        self.assertEqual(len(probes), 1, "the premise is read once, before the wizard")
+        self.assertIn(aio.ADD_NODE_REFUSED_PANEL, probes[0])
         self.assertLess(
-            product.podman.scripts.index(block[0]),
+            product.podman.scripts.index(probes[0]),
             product.podman.scripts.index(self.wizard_script(product)),
         )
 

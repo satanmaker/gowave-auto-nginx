@@ -2980,26 +2980,23 @@ def case_add_node_refused(product: MultiNodeProduct) -> Dict[str, Any]:
     it was before.
 
     The Panel is named, not addressed: the wizard refuses a bare address before
-    it probes anything, so the name is steered at an address nothing serves for
-    the duration of the attempt and the flow is refused at the API check itself.
+    it probes anything, so the case names one no resolver can answer and the flow
+    is refused at the API check itself.
     """
     product.require_installed()
     before = product.panel_surface(ADD_NODE_REFUSED_CASE_ID)
     nodes_before = (before.get("surface") or {}).get("nodes") or {}
 
     container = product.require_installed().target_name
-    block = aio.add_node_refused_block(product.podman, container, ADD_NODE_REFUSED_CASE_ID)
-    try:
-        aio.require_add_node_refused_premise(ADD_NODE_REFUSED_CASE_ID, block)
-        script = aio.add_node_refusal_script()
-        started = time.monotonic()
-        proc = product.podman.exec_bash(
-            container, script, check=False, timeout=WIZARD_OFFLINE_TIMEOUT_SECONDS,
-        )
-    finally:
-        aio.add_node_refused_block(
-            product.podman, container, ADD_NODE_REFUSED_CASE_ID, mode="remove",
-        )
+    resolution = aio.add_node_refused_resolution(
+        product.podman, container, ADD_NODE_REFUSED_CASE_ID,
+    )
+    aio.require_add_node_refused_premise(ADD_NODE_REFUSED_CASE_ID, resolution)
+    script = aio.add_node_refusal_script()
+    started = time.monotonic()
+    proc = product.podman.exec_bash(
+        container, script, check=False, timeout=WIZARD_OFFLINE_TIMEOUT_SECONDS,
+    )
     outcome = topology.InstallOutcome(
         returncode=proc.returncode,
         stdout=proc.stdout or "",
