@@ -6691,5 +6691,117 @@ class TestDiagnosticArtifactsCase(unittest.TestCase):
         self.assertIn("[probe could not run: TimeoutError", self.read("operator"))
 
 
+class FakeClock:
+    """A monotonic clock the test moves by hand, so a deadline costs no wall time."""
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class TestRevocationTransferRetry(unittest.TestCase):
+    """The positive matrix AIO-REVOKE takes before it revokes anything.
+
+    MN-REVOKE went red on GitHub because one transfer lost the race against the
+    Panel re-pushing the node's users: the probe exited without facts, and the
+    case read that as a refusal of access it had not revoked yet. The retry has
+    to re-run only that unfinished matrix and leave every assertion after it
+    alone, so these tests pin what it re-runs, what it refuses to re-run, and the
+    message a spent deadline still carries.
+    """
+
+    def setUp(self):
+        self.clock = FakeClock()
+
+    def carried(self, transfers=4):
+        return {"transfer_count": transfers, "missing_request_ids": 0}
+
+    def run_until_carried(self, attempt, expected=4, deadline=120.0, interval=5.0):
+        return aio.transfer_matrix_until_carried(
+            attempt, expected, deadline_seconds=deadline, interval_seconds=interval,
+            clock=self.clock, sleep=self.clock.sleep,
+        )
+
+    def test_a_matrix_that_carried_first_time_is_not_re_run(self):
+        calls = []
+
+        def attempt():
+            calls.append(1)
+            return self.carried()
+
+        facts = self.run_until_carried(attempt)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(facts["positive_attempts"], 1)
+        self.assertEqual(self.clock.sleeps, [], "a carried matrix must not spend the interval")
+
+    def test_the_matrix_is_re_run_after_the_probe_exited_without_facts(self):
+        message = (
+            "AIO-REVOKE: the traffic probe exited 1: the xray transfer through grpc "
+            "returned HTTP 503 without an endpoint report"
+        )
+        calls = []
+
+        def attempt():
+            calls.append(1)
+            if len(calls) == 1:
+                raise AssertionError(message)
+            return self.carried()
+
+        facts = self.run_until_carried(attempt)
+        self.assertEqual(facts["positive_attempts"], 2)
+        self.assertEqual(facts["transfer_count"], 4)
+        self.assertEqual(self.clock.sleeps, [5.0], "the second attempt is spaced, not immediate")
+
+    def test_a_payload_the_endpoint_did_not_record_is_re_run(self):
+        calls = []
+
+        def attempt():
+            calls.append(1)
+            if len(calls) == 1:
+                return {"transfer_count": 4, "missing_request_ids": 1}
+            return self.carried()
+
+        facts = self.run_until_carried(attempt)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(facts["positive_attempts"], 2)
+
+    def test_a_spent_deadline_re_raises_the_probes_own_message(self):
+        message = "AIO-REVOKE: the traffic probe exited 1: the endpoint never answered"
+
+        def attempt():
+            raise AssertionError(message)
+
+        with self.assertRaises(AssertionError) as caught:
+            self.run_until_carried(attempt)
+        self.assertEqual(str(caught.exception), message)
+        self.assertEqual(
+            self.clock.sleeps, [5.0] * 24,
+            "25 attempts inside 120 s at one try per 5 s, and the last one has no wait left",
+        )
+
+    def test_a_short_matrix_reaches_the_callers_own_assertion(self):
+        def attempt():
+            return {"transfer_count": 3, "missing_request_ids": 0}
+
+        facts = self.run_until_carried(attempt)
+        self.assertEqual(facts["transfer_count"], 3)
+        self.assertEqual(len(self.clock.sleeps), 24, "the deadline is not a verdict either")
+
+    def test_an_error_that_is_not_the_probes_is_not_retried(self):
+        def attempt():
+            raise topology.TopologyError("the engine client is gone")
+
+        with self.assertRaises(topology.TopologyError):
+            self.run_until_carried(attempt)
+        self.assertEqual(self.clock.sleeps, [])
+
+
 if __name__ == "__main__":
     unittest.main()

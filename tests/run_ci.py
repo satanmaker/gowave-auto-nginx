@@ -114,6 +114,7 @@ SUITES = {
         "test_podman_aio.TestPacketEvidenceCase",
         "test_podman_aio.TestRedactedCredentialsCase",
         "test_podman_aio.TestDiagnosticArtifactsCase",
+        "test_podman_aio.TestRevocationTransferRetry",
         "test_podman_dns.TestDnsProbe",
         "test_podman_dns.TestDnsZoneStore",
         "test_podman_dns.TestDnsCase",

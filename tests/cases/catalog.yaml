@@ -6846,6 +6846,7 @@ cases:
       - new_subscription_status
       - old_subscription_status
       - patch_status
+      - positive_attempts
       - positive_source_ips
       - positive_transfer_count
       - readiness_network
@@ -8439,6 +8440,7 @@ cases:
       - new_subscription_status
       - old_subscription_status
       - patch_status
+      - positive_attempts
       - positive_source_ips
       - positive_transfer_count
       - readiness_network
