@@ -179,7 +179,7 @@
 - [x] 5.3 Validate the change and the tree: `openspec validate podman-ci-throughput --strict`, then
   `openspec validate --all --strict`.
   Result: `Change 'podman-ci-throughput' is valid`; the tree-wide run passed 10, failed 0.
-- [ ] 5.4 Regenerate the traceability report after 5.1 — `python3 -m tools.podman_e2e.trace --markdown` — and commit
+- [x] 5.4 Regenerate the traceability report after 5.1 — `python3 -m tools.podman_e2e.trace --markdown` — and commit
   `docs/PODMAN_E2E_TRACEABILITY.md`: `trace.py:1203-1206` refuses a report that differs from the table's own render.
   Verify: `python3 -m tools.podman_e2e.trace --strict` passes twice in a row.
   Result: `traceability: wrote docs/PODMAN_E2E_TRACEABILITY.md`, then `--strict` passed twice on the same tree with
@@ -211,5 +211,12 @@
     any of the four runs, and their 306.9 / 985.1 / 2037.2 / 1826.9 s sit far inside 2700 / 4500 / 4500. The only
     PASS-to-non-PASS movement is those eight master captures, and the same signature is in the before side itself and
     a day earlier in `podman-aio-20261121T141243-9d32338c`, so it is not something this change introduced.
-- [ ] 6.2 Archive the change only after 6.1, and only with 4.3/4.4 decided or explicitly carried forward as their own
+- [x] 6.2 Archive the change only after 6.1, and only with 4.3/4.4 decided or explicitly carried forward as their own
   change.
+  Result: archived to `openspec/changes/archive/2026-11-23-podman-ci-throughput` with 23 of 23 boxes closed, after the
+  delta was synced into `openspec/specs/podman-e2e/spec.md` and the four traceability rows landed.
+  `openspec validate --all --strict` now reports 9 passed, 0 failed, and `python3 -m tools.podman_e2e.trace --strict`
+  still reads `55 scenarios, 55 rows, 0 gaps` from the archived tree. 4.3 and 4.4 are decided, not carried forward:
+  the topology budgets stay at 2700/4500/4500 and the lint job's 90-minute cap stays. One debt is recorded rather than
+  fixed here — the per-case caps larger than the budgets that cap them — and 4.3 says correcting it is its own change
+  with 4.1 as evidence.
