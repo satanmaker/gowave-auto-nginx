@@ -2,6 +2,21 @@
 # modules/os.sh - Base OS, package inventory, and environment detection
 set -Eeuo pipefail
 
+# detect_arch - print the architecture the pinned artifacts are keyed by, or
+# refuse an architecture this product ships nothing for.
+detect_arch() {
+    local m
+    m=$(uname -m)
+    case "$m" in
+        x86_64) echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *)
+            echo "Unsupported architecture: $m" >&2
+            return 1
+            ;;
+    esac
+}
+
 detect_os() {
     local os_release="${1:-/etc/os-release}"
     local key value

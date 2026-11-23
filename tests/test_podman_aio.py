@@ -39,19 +39,57 @@ from tools.podman_e2e.runner import Case, CaseBlocked, RunContext  # noqa: E402
 
 MATRIX_INBOUNDS = len(matrix.inbounds(matrix.load(), vision=False))
 
+# The line the pinned-core step prints, from the values this checkout pins: the
+# install case compares that line with the module's own table, so a fake that
+# invented a digest would fail the comparison it is supposed to satisfy.
+XRAY_PIN = str(matrix.product(matrix.load())["xray_version"])
+XRAY_DIGEST = aio.pinned_core_digests()[0]
+PINNED_CORE_LINE = (
+    f"Installed pinned Xray core {XRAY_PIN} from "
+    f"https://github.com/XTLS/Xray-core/releases/download/v{XRAY_PIN}/Xray-linux-64.zip "
+    f"(SHA-256 {XRAY_DIGEST}).\n"
+)
+
 INSTALL_OUTPUT = (
     "Configured /opt/gowave/.env with mode 0640.\n"
-    "GoWave Panel is healthy and listening on http://127.0.0.1:3000.\n"
+    + PINNED_CORE_LINE
+    + "GoWave Panel is healthy and listening on http://127.0.0.1:3000.\n"
     "GoWave Auto NGINX Installation Complete\n"
 )
 
 
+def hosts_block_report(mode="install") -> str:
+    """What the hosts-entry probe prints, for the one container it was asked about."""
+    installing = mode == "install"
+    return json.dumps({
+        "mode": mode,
+        "host": aio.PINNED_CORE_BLOCKED_HOST,
+        "address": aio.PINNED_CORE_BLOCK_ADDRESS if installing else "",
+        "resolution": (
+            f"{aio.PINNED_CORE_BLOCK_ADDRESS}  {aio.PINNED_CORE_BLOCKED_HOST}"
+            if installing else "4.225.11.201    api.github.com"
+        ),
+        "marker_count": 1 if installing else 0,
+        "request": (
+            {"returncode": 3, "stdout": "ConnectionRefusedError: [Errno 111]", "stderr": ""}
+            if installing else None
+        ),
+    }, sort_keys=True)
+
+
+def is_hosts_block_probe(script: str) -> bool:
+    return aio.PINNED_CORE_BLOCK_MARKER in script and "set_host_entry" in script
+
+
 class FakePodman:
-    def __init__(self, context, install_returncode=0, install_output=INSTALL_OUTPUT):
+    def __init__(self, context, install_returncode=0, install_output=INSTALL_OUTPUT,
+                 hosts_block_output=None):
         self.context = context
         self.install_returncode = install_returncode
         self.install_output = install_output
+        self.hosts_block_output = hosts_block_output
         self.installs = []
+        self.hosts_blocks = []
         self.networks = []
         self.connects = []
         self.started = []
@@ -93,6 +131,16 @@ class FakePodman:
         if script == aio.INSTALLED_VERSION_SCRIPT:
             return subprocess.CompletedProcess(
                 ["bash", "-lc", script], 0, json.dumps(installed_version_report()), ""
+            )
+        if is_hosts_block_probe(script):
+            # The block is applied before the install, so it answers with the
+            # probe's own report instead of the install's transcript.
+            self.hosts_blocks.append((name, script))
+            mode = "restore" if "'restore' " in script else "install"
+            output = self.hosts_block_output
+            return subprocess.CompletedProcess(
+                ["bash", "-lc", script], 0,
+                output if output is not None else hosts_block_report(mode), "",
             )
         self.installs.append((name, script))
         return subprocess.CompletedProcess(
@@ -160,6 +208,41 @@ def make_context() -> tuple[RunContext, tempfile.TemporaryDirectory]:
     return context, tmp
 
 
+class TestHostsBlock(unittest.TestCase):
+    """The block's own two readings, and the ways a fake block would pass them."""
+
+    def _facts(self, **overrides):
+        facts = json.loads(hosts_block_report())
+        facts.update(overrides)
+        return facts
+
+    def test_the_reported_entry_is_accepted(self):
+        recorded = aio.require_host_blocked("AIO-INSTALL", "the host", self._facts())
+        self.assertEqual(recorded["address"], aio.PINNED_CORE_BLOCK_ADDRESS)
+        self.assertEqual(recorded["request_returncode"], 3)
+
+    def test_a_restored_entry_is_not_a_block(self):
+        with self.assertRaises(AssertionError) as caught:
+            aio.require_host_blocked("AIO-INSTALL", "the host", self._facts(
+                mode="restore", address="", resolution="4.225.11.201  api.github.com",
+            ))
+        self.assertIn("is not in force", str(caught.exception))
+
+    def test_a_name_that_resolves_elsewhere_is_not_a_block(self):
+        with self.assertRaises(AssertionError) as caught:
+            aio.require_host_blocked("AIO-INSTALL", "the host", self._facts(
+                resolution="4.225.11.201  api.github.com",
+            ))
+        self.assertIn("instead of the block address", str(caught.exception))
+
+    def test_a_request_that_was_answered_is_not_a_block(self):
+        with self.assertRaises(AssertionError) as caught:
+            aio.require_host_blocked("AIO-INSTALL", "the host", self._facts(
+                request={"returncode": 0, "stdout": "", "stderr": ""},
+            ))
+        self.assertIn("a request to api.github.com answered", str(caught.exception))
+
+
 class TestAioSuite(unittest.TestCase):
     def setUp(self):
         self.context, self.tmp = make_context()
@@ -190,6 +273,51 @@ class TestAioSuite(unittest.TestCase):
         self.assertIn("GoWave Panel is healthy", stdout.read_text(encoding="utf-8"))
         self.assertEqual(stdout.stat().st_mode & 0o777, 0o600)
         self.assertTrue(stderr.is_file())
+
+    def test_the_install_records_the_block_and_the_pinned_core_line(self):
+        podman = FakePodman(self.context)
+        product = aio.AioProduct(podman)
+        evidence = product.install()
+        self.assertTrue(podman.hosts_blocks, "the release API must be blocked before the install")
+        self.assertEqual(podman.hosts_blocks[0][0], product.host.target_name)
+        self.assertEqual(evidence["core_host_block"]["address"],
+                         aio.PINNED_CORE_BLOCK_ADDRESS)
+        self.assertEqual(evidence["core_host_block"]["request_returncode"], 3)
+        self.assertEqual(evidence["pinned_core_step_version"], XRAY_PIN)
+        self.assertEqual(evidence["pinned_core_step_sha256"], XRAY_DIGEST)
+        self.assertIn(PINNED_CORE_LINE.strip(), evidence["pinned_core_step_line"])
+
+    def test_an_install_that_placed_no_pinned_core_is_refused(self):
+        podman = FakePodman(
+            self.context, install_output=INSTALL_OUTPUT.replace(PINNED_CORE_LINE, ""),
+        )
+        with self.assertRaises(AssertionError) as caught:
+            aio.AioProduct(podman).install()
+        self.assertIn("pinned-core success lines", str(caught.exception))
+
+    def test_a_pinned_core_line_with_a_foreign_digest_is_refused(self):
+        podman = FakePodman(
+            self.context, install_output=INSTALL_OUTPUT.replace(XRAY_DIGEST, "0" * 64),
+        )
+        with self.assertRaises(AssertionError) as caught:
+            aio.AioProduct(podman).install()
+        self.assertIn("not an archive digest this checkout pins", str(caught.exception))
+
+    def test_a_block_the_container_did_not_keep_stops_the_install(self):
+        # The block is read before the install runs: a host whose name still
+        # resolves to the release API would make the run prove nothing.
+        podman = FakePodman(self.context, hosts_block_output=json.dumps({
+            "mode": "install",
+            "host": aio.PINNED_CORE_BLOCKED_HOST,
+            "address": aio.PINNED_CORE_BLOCK_ADDRESS,
+            "resolution": "4.225.11.201  api.github.com",
+            "marker_count": 1,
+            "request": {"returncode": 0, "stdout": "", "stderr": ""},
+        }))
+        with self.assertRaises(AssertionError) as caught:
+            aio.AioProduct(podman).install()
+        self.assertIn("instead of the block address", str(caught.exception))
+        self.assertEqual(podman.installs, [])
 
     def test_install_is_not_repeated_for_later_cases(self):
         podman = FakePodman(self.context)

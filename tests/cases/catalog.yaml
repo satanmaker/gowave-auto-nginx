@@ -1699,7 +1699,7 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:case_worker_registration
-      evidence: []
+      evidence: [core_hole_control]
   promotion_target: null
 - id: WRK-05
   requirement: Distributed Worker VPS Deployment Verification

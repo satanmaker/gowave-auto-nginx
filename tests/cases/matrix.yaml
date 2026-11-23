@@ -2,9 +2,10 @@
 # The matrix is consumed by the Podman runner and validated by catalog.py.
 # It is not a second source of truth: every field is derived from the shipped
 # inbound templates, the Panel subscription contracts, and the client releases
-# pinned by digest below. The live runner follows the release instead
-# (tools/live_vps_config.env.example records `latest` for both clients), so a
-# version here is a statement about this harness, not about the live one.
+# pinned by digest below. The live runner names the same client builds
+# (tools/live_vps_config.env.example pins both clients), so both sides now name
+# the same client builds; the container suite remains the place where a specific
+# build is executed.
 #
 # `host_record` is the Host record `modules/api_client.py` posts for the
 # inbound (`host_projection`): the address a client dials, the SNI it presents,

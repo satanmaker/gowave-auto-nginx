@@ -676,21 +676,20 @@ class TestLiveContractReconciliation(unittest.TestCase):
         self.assertIn("MATCH,\u2192 GoWave", template)
         self.assertNotIn("GEOIP,private,DIRECT,no-resolve", template)
 
-    def test_the_engine_pinning_difference_is_recorded(self):
-        self.assertIn("pinned differently", self.prose)
-        self.assertIn("reads `latest`", self.prose)
+    def test_the_engine_pinning_names_the_same_build_on_both_sides(self):
+        self.assertIn("both sides now name the same client builds", self.prose)
         product = self.manifest["product"]
         for name in ("xray_client_version", "mihomo_client_version"):
             with self.subTest(version=name):
                 self.assertIn(str(product[name]), self.prose)
         live = LIVE_CONFIG.read_text(encoding="utf-8")
-        self.assertIn("XRAY_CLIENT_VERSION=latest", live)
-        self.assertIn("MIHOMO_CLIENT_VERSION=latest", live)
-        header = MATRIX.read_text(encoding="utf-8").splitlines()
-        self.assertFalse(
-            any("pinned client" in line and "live_vps_config" in line for line in header[:10]),
-            "the manifest still claims its pinned clients are the ones the live runner records",
-        )
+        self.assertIn(f"XRAY_CLIENT_VERSION={product['xray_client_version']}", live)
+        self.assertIn(f"MIHOMO_CLIENT_VERSION={product['mihomo_client_version']}", live)
+        self.assertNotIn("XRAY_CLIENT_VERSION=latest", live)
+        self.assertNotIn("MIHOMO_CLIENT_VERSION=latest", live)
+        header = "\n".join(MATRIX.read_text(encoding="utf-8").splitlines()[:10])
+        self.assertIn("same client builds", header,
+                      "the matrix header still describes the live runner as following the release")
 
     def test_the_cache_control_contract_is_asserted_where_the_page_says(self):
         self.assertIn("`Cache-Control: no-store`", self.prose)

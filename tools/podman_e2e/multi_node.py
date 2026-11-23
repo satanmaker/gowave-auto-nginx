@@ -469,6 +469,7 @@ def worker_control_script() -> str:
 # CLI's version and status commands, the config the node actually loaded, and the
 # settings file it was installed with. Nothing here is written by the harness, and
 # the Panel secret in `/opt/gowave-node/.env` is never read out.
+WORKER_CORE_BINARY = "/opt/gowave-node/rw-core"
 WORKER_STATE_SCRIPT = r"""
 python3 - <<'PY'
 import json
@@ -1119,8 +1120,19 @@ class MultiNodeProduct:
 
     # --------------------------------------------------------------- node add
     def add_worker(self) -> Dict[str, Any]:
-        """Register and deploy the Worker through the operator's own command."""
+        """Register and deploy the Worker through the operator's own command.
+
+        The release API is blocked in the Worker before the operator's command
+        runs, so the core it serves is the one the pinned step placed: an install
+        that fell back to the upstream download could not finish here.
+        """
         host = self.require_installed()
+        block = aio.require_host_blocked(
+            NODE_ADD_CASE_ID, "the Worker",
+            aio.hosts_block_facts(
+                self.podman, host.worker_name, NODE_ADD_CASE_ID, role="Worker",
+            ),
+        )
         outcome = host.node_add()
         self.node_add_outcome = outcome
         require(
@@ -1135,7 +1147,262 @@ class MultiNodeProduct:
             "worker_ip": host.plan.worker_ip,
             "worker_domain": host.worker_domain,
             "worker_reality_domain": host.worker_reality_domain,
+            "core_host_block": block,
         }
+
+    def worker_core_binary(self, case_id: str) -> Dict[str, Any]:
+        """What the Worker's core file reports, read by running it on the Worker.
+
+        ``worker_core_version`` reads the node's own self-report; this runs the
+        binary the node supervises, so one reading cannot stand in for the other.
+        """
+        host = self.require_worker()
+        proc = self.podman.exec(
+            host.worker_name, [WORKER_CORE_BINARY, "version"], check=False, timeout=120,
+        )
+        output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
+        require(
+            case_id,
+            proc.returncode == 0 and bool(version_token(output)),
+            f"the Worker's own {WORKER_CORE_BINARY} reports nothing usable (exit "
+            f"{proc.returncode}): {output[:300]!r}",
+        )
+        return {
+            "binary": WORKER_CORE_BINARY,
+            "returncode": proc.returncode,
+            "version": version_token(output),
+            "output": output[:400],
+        }
+
+    def worker_core_control(self, case_id: str) -> Dict[str, Any]:
+        """The same ``node add`` on a disposable host, with the block on and the pin off.
+
+        A Worker that installs with the release API blocked proves the step placed
+        a core, but not that the block is what made the step necessary: with
+        ``XRAY_SERVER_VERSION=latest`` the step abstains, and the upstream
+        installer is the one that has to buy a core. Blocked, it must fail and say
+        which name it could not reach; unblocked it would succeed, which is how
+        this probe's own reach is confirmed.
+
+        The variable goes on the Master's command, not into the container's
+        environment: the Master's shell is what forwards it to the Worker over the
+        SSH stdin stream, so a variable set in the creation environment changes
+        nothing. The disposable host, its trust pin, the zone records and the
+        pair's registration files are all this case's own, and each is removed or
+        restored before it returns; the trace the observed deployment left is
+        checked to be the same bytes afterwards.
+        """
+        host = self.require_installed()
+        master = host.target_name
+        name = "worker-core-hole"
+        address = str(host.plan.second_node_ip)
+        worker_domain = SECOND_WORKER_DOMAIN
+        reality_domain = SECOND_WORKER_REALITY_DOMAIN
+        container = host.context.resource_name("worker-core-hole")
+        environment = {"XRAY_SERVER_VERSION": "latest"}
+
+        record_before = aio.probe_json(
+            case_id, "the Master's registration record before the control",
+            self.podman.exec_bash(master, duplicate_add_state_command(), check=False, timeout=120),
+        )
+        journal_before = self.podman.exec(master, ["cat", NODE_ADD_JOURNAL], check=False).stdout
+        state_before = self.podman.exec(master, ["cat", NODE_ADD_STATE], check=False).stdout
+        require(
+            case_id,
+            bool(journal_before) and bool(state_before),
+            "the pair has no registration record to put back: "
+            f"{NODE_ADD_JOURNAL} and {NODE_ADD_STATE} must both exist",
+        )
+        zone_before = json.loads(host.dns_zone_file().read_text(encoding="utf-8"))
+        known_hosts_path = "/root/.ssh/known_hosts"
+        known_hosts_before = self.podman.exec(
+            master, ["cat", known_hosts_path], check=False,
+        ).stdout
+        trace_before = self.argv_trace_digest(master)
+
+        evidence: Dict[str, Any] = {
+            "node_name": name,
+            "node_address": address,
+            "worker_domain": worker_domain,
+            "worker_reality_domain": reality_domain,
+            "operator_environment": environment,
+            "journal_state_before": record_before.get("journal_state"),
+            "argv_trace_untouched": False,
+        }
+
+        def stop_host() -> None:
+            self.podman.stop(container)
+            self.podman.remove(container)
+
+        def restore_records() -> Dict[str, Any]:
+            for path, content in (
+                (NODE_ADD_JOURNAL, journal_before), (NODE_ADD_STATE, state_before),
+                (known_hosts_path, known_hosts_before),
+            ):
+                self.podman.exec(
+                    master,
+                    ["bash", "-c", f"umask 077; cat > {shlex.quote(path)}"],
+                    input_text=content,
+                    timeout=120,
+                )
+            return aio.probe_json(
+                case_id, "the Master's registration record after the control",
+                self.podman.exec_bash(
+                    master, duplicate_add_state_command(), check=False, timeout=120,
+                ),
+            )
+
+        try:
+            evidence["control_host"] = host.start_secondary_worker(
+                container, address, (worker_domain, reality_domain),
+            )
+            evidence["control_host"]["trust"] = host.pin_secondary_trust(container, address)
+
+            zone = copy.deepcopy(zone_before)
+            records = zone.setdefault("records", {})
+            records[worker_domain] = {"A": [address]}
+            records[reality_domain] = {"A": [address]}
+            records.pop(SECOND_WORKER_VISION_DOMAIN, None)
+            host.write_dns_zone(zone)
+            resolution = aio.probe_json(
+                case_id, "the Master's answer for the control host's names",
+                self.podman.exec_bash(master, name_resolution_command(), check=False, timeout=120),
+            )
+            evidence["control_host"]["resolved"] = resolution
+            require(
+                case_id,
+                address in (resolution.get(worker_domain) or []),
+                f"the control host's name {worker_domain} does not answer with {address}: "
+                f"{resolution.get(worker_domain)!r}",
+            )
+            evidence["core_host_block"] = aio.require_host_blocked(
+                case_id, "the control host",
+                aio.hosts_block_facts(self.podman, container, case_id, role="control host"),
+            )
+
+            script = host.node_add_script(
+                name, environment=environment, address=address,
+                worker_domain=worker_domain, reality_domain=reality_domain,
+                vision_domain="",
+            )
+            require(
+                case_id,
+                "XRAY_SERVER_VERSION=latest" in script,
+                f"the control command does not carry the opt-out: {script}",
+            )
+            started = time.monotonic()
+            proc = self.podman.exec_bash(
+                master, script, check=False, timeout=topology.NODE_ADD_TIMEOUT_SECONDS,
+            )
+            outcome = topology.InstallOutcome(
+                returncode=proc.returncode,
+                stdout=proc.stdout or "",
+                stderr=proc.stderr or "",
+                duration=time.monotonic() - started,
+                command=script,
+            )
+            self.context.evidence_text("mn-core-hole-control.stdout.log", outcome.stdout)
+            self.context.evidence_text("mn-core-hole-control.stderr.log", outcome.stderr)
+            combined = f"{outcome.stdout}\n{outcome.stderr}"
+            named = [
+                line.strip() for line in combined.splitlines()
+                if aio.PINNED_CORE_BLOCKED_HOST in line
+            ]
+            evidence.update({
+                "control_command": script,
+                "control_returncode": outcome.returncode,
+                "control_duration_seconds": round(outcome.duration, 1),
+                "control_matched_lines": named[-4:],
+            })
+            require(
+                case_id,
+                not outcome.ok,
+                "the control's node add succeeded with the release API blocked and the pin "
+                f"opted out, so nothing proved the block was in force: {outcome.tail(2000)}",
+            )
+            require(
+                case_id,
+                bool(named),
+                f"the control's node add failed with exit {outcome.returncode} without naming "
+                f"{aio.PINNED_CORE_BLOCKED_HOST}, so the failure is not the block: "
+                f"{outcome.tail(2000)}",
+            )
+            core_path = self.podman.exec(
+                container,
+                ["bash", "-c", f"test -e {WORKER_CORE_BINARY} && echo present || echo absent"],
+                check=False, timeout=60,
+            )
+            evidence["control_core_path"] = (core_path.stdout or "").strip()
+            require(
+                case_id,
+                evidence["control_core_path"] == "absent",
+                f"the control host holds {WORKER_CORE_BINARY} although its installer failed at "
+                f"the release API: {evidence['control_core_path']!r}",
+            )
+        except BaseException as primary:
+            # A control that failed before its own cleanup would leave a third
+            # node's records in the pair the remaining cases read.
+            try:
+                stop_host()
+                host.write_dns_zone(zone_before)
+                restore_records()
+            except Exception as secondary:
+                raise AssertionError(
+                    f"{primary} — and the cleanup after it failed as well: {secondary}"
+                ) from primary
+            raise
+
+        stop_host()
+        host.write_dns_zone(zone_before)
+        record_after = restore_records()
+        trace_after = self.argv_trace_digest(master)
+        evidence["argv_trace_untouched"] = trace_after == trace_before
+        inventory_after = panel_inventory(self.panel_surface(case_id).get("surface") or {})
+        restored = self.wait_for_nodes(case_id, expected=2)
+        evidence["cleanup"] = {
+            "container_removed": container not in {
+                str(item.get("name") or "") for item in self.podman.run_containers()
+            },
+            "state_digest_restored": record_after.get("state_digest")
+            == record_before.get("state_digest"),
+            "journal_digest_restored": record_after.get("journal_digest")
+            == record_before.get("journal_digest"),
+            "known_hosts_restored": self.podman.exec(
+                master, ["cat", known_hosts_path], check=False,
+            ).stdout == known_hosts_before,
+            "argv_trace_untouched": evidence["argv_trace_untouched"],
+            "nodes_after": restored.get("nodes", {}),
+        }
+        evidence["panel_inventory_after"] = inventory_after
+        require(
+            case_id,
+            evidence["cleanup"]["state_digest_restored"]
+            and evidence["cleanup"]["journal_digest_restored"],
+            f"the pair's registration files are not the ones this control started with: "
+            f"{evidence['cleanup']}",
+        )
+        require(
+            case_id,
+            evidence["cleanup"]["known_hosts_restored"],
+            "the Master's known_hosts still carries the control host's address",
+        )
+        require(
+            case_id,
+            evidence["argv_trace_untouched"],
+            f"the control's dispatch changed the trace the observed deployment left: it was "
+            f"{trace_before!r} and is now {trace_after!r}",
+        )
+        return evidence
+
+    def argv_trace_digest(self, master: str) -> str:
+        """The digest of the Master-side trace, or ``missing`` when there is none."""
+        proc = self.podman.exec(
+            master,
+            ["bash", "-c",
+             f"sha256sum {shlex.quote(argv_probe.TRACE_PATH)} 2>/dev/null || echo missing"],
+            check=False, timeout=60,
+        )
+        return (proc.stdout or "").strip()
 
     # ---------------------------------------------------------------- probes
     def panel_surface(self, case_id: str) -> Dict[str, Any]:
@@ -2118,6 +2385,12 @@ def case_worker_registration(product: MultiNodeProduct) -> Dict[str, Any]:
     A total node count cannot tell a registered Worker from a second copy of the
     Master, so the case names both nodes and their endpoints, and it reads the
     Worker's own connection state from the Panel rather than inferring it.
+
+    The release API is blocked in the Worker before that command runs, and the
+    core is read there twice, so "the Worker serves the pinned core" is a fact
+    about the Worker instead of an inference from the Master. A control on a
+    disposable host repeats the command with the pin opted out: blocked, it must
+    fail and name the host it could not reach.
     """
     host = product.require_installed()
     evidence = product.add_worker()
@@ -2172,6 +2445,30 @@ def case_worker_registration(product: MultiNodeProduct) -> Dict[str, Any]:
         },
         "unauthenticated_nodes_status": surface.get("unauthenticated_nodes_status"),
     })
+    # The Worker's core is read twice: as the node's own status reports it, and by
+    # running the file the node supervises. One reading cannot stand for the other,
+    # and the release API was blocked when the installer ran, so both have to name
+    # the version the pin supplies. The reads follow the registration, because the
+    # status the node reports is only settled once the Panel lists it as connected.
+    core_expected = matrix_data.product(product.matrix).get("xray_version", "")
+    core_reported = product.worker_core_version(NODE_ADD_CASE_ID)
+    core_binary = product.worker_core_binary(NODE_ADD_CASE_ID)
+    for label, reported in (("status", core_reported), ("binary", core_binary["version"])):
+        require(
+            NODE_ADD_CASE_ID,
+            output_matches_expected_version(reported, core_expected),
+            f"the Worker's {label} reports {reported!r} as the core it runs while this "
+            f"deployment configured {core_expected!r}",
+        )
+    evidence.update({
+        "worker_core_version_from_status": core_reported,
+        "worker_core_version_from_binary": core_binary["version"],
+        "worker_core_version_expected": core_expected,
+        "worker_core_binary": core_binary,
+    })
+    # The positive outcome alone cannot say the blocked API was what made the step
+    # necessary; the control runs the same command with the pin opted out.
+    evidence["core_hole_control"] = product.worker_core_control(NODE_ADD_CASE_ID)
     return evidence
 
 
@@ -9070,8 +9367,10 @@ def cases(
         # runs: a wrong pin and a rotated host key must both stop the controller.
         Case(SSH_KEY_CASE_ID, "multi-node", lambda context: case_ssh_host_key(product),
              timeout_seconds=SSH_TRUST_TIMEOUT_SECONDS),
+        # Two dispatches: the deployment the case is about, and the control that
+        # repeats it on a disposable host with the pin opted out.
         Case(NODE_ADD_CASE_ID, "multi-node", lambda context: case_worker_registration(product),
-             timeout_seconds=NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
+             timeout_seconds=2 * topology.NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
         # The environment contract: a Worker onboarded via environment variables
         # instead of positional arguments is registered correctly.
         Case(ENV_CONTRACT_CASE_ID, "multi-node", lambda context: case_env_contract(product),

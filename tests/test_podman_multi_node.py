@@ -537,6 +537,34 @@ class TestWorkerProvisioningCommand(unittest.TestCase):
         for forbidden in ("SECRET_KEY", "ADMIN_PASSWORD", "accessToken"):
             self.assertNotIn(forbidden, script)
 
+    def test_an_operator_environment_is_written_before_the_product_command(self):
+        # The Master's shell is what forwards the variable over the SSH stdin
+        # stream, so the control's opt-out has to be on this line rather than in
+        # the container's creation environment.
+        host = topology.MultiNodeTopology(self.podman, egress_resolvers=["192.0.2.53"])
+        script = host.node_add_script(
+            "worker-core-hole", environment={"XRAY_SERVER_VERSION": "latest"},
+        )
+        self.assertTrue(script.startswith("XRAY_SERVER_VERSION=latest "))
+        self.assertIn(f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node add", script)
+
+    def test_a_command_without_an_environment_is_the_operator_command_alone(self):
+        host = topology.MultiNodeTopology(self.podman, egress_resolvers=["192.0.2.53"])
+        self.assertTrue(host.node_add_script().startswith("bash "))
+
+    def test_another_hosts_address_and_names_replace_the_topology_defaults(self):
+        host = topology.MultiNodeTopology(self.podman, egress_resolvers=["192.0.2.53"])
+        script = host.node_add_script(
+            "worker-core-hole", address="203.0.113.9",
+            worker_domain="hole.example", reality_domain="hole-reality.example",
+            vision_domain="",
+        )
+        self.assertIn("'203.0.113.9'", script)
+        self.assertIn("'hole.example'", script)
+        self.assertIn("'hole-reality.example'", script)
+        self.assertNotIn("--vision-domain", script)
+        self.assertNotIn(str(host.plan.worker_ip), script)
+
 
 class TestWorkerControlReport(unittest.TestCase):
     """The Worker's own report is the evidence the Master address case asserts on."""
@@ -694,16 +722,28 @@ class TestMasterAddressCase(unittest.TestCase):
 
 
 class _RegistrationProduct:
-    """A product stub: it reports the Panel's node table and nothing else."""
+    """A product stub: it reports the Panel's node table and the Worker's core."""
 
     combination = "neither"
     expected_inbound_total = 8
 
     def __init__(self, hosts=2, name=None, connected=True, endpoint_port=3002,
-                 inbound_count=8):
+                 inbound_count=8, core_status=None, core_binary=None, control=None):
         plan = topology.allocate_plan([])
         self.topology = type("Host", (), {"plan": plan})()
         name = name or topology.WORKER_NODE_NAME
+        self.matrix = matrix.load()
+        pin = matrix.product(self.matrix).get("xray_version", "")
+        # Both readings default to the pin the matrix configures, so a test has to
+        # name the value it wants to see rejected instead of relying on a typo.
+        self.core_status = pin if core_status is None else core_status
+        self.core_binary = pin if core_binary is None else core_binary
+        self.control = control if control is not None else {
+            "control_returncode": 1,
+            "control_matched_lines": ["dial tcp: api.github.com"],
+            "control_core_path": "absent",
+            "cleanup": {"nodes_after": {"count": 2}},
+        }
         self.surface = {
             "nodes": {
                 "names": sorted(["local-node", name]),
@@ -726,6 +766,15 @@ class _RegistrationProduct:
 
     def add_worker(self):
         return {"node_add_returncode": 0}
+
+    def worker_core_version(self, case_id):
+        return self.core_status
+
+    def worker_core_binary(self, case_id):
+        return {"binary": "/opt/gowave-node/rw-core", "version": self.core_binary}
+
+    def worker_core_control(self, case_id):
+        return self.control
 
     def wait_for_nodes(self, case_id, expected):
         return {"nodes": {"count": 2, "connected_count": 2}}
@@ -767,6 +816,28 @@ class TestWorkerRegistrationCase(unittest.TestCase):
         with self.assertRaises(AssertionError) as caught:
             self._evidence(_RegistrationProduct(inbound_count=7))
         self.assertIn("active inbounds in total", str(caught.exception))
+
+    def test_the_worker_core_is_read_from_both_the_status_and_the_binary(self):
+        product = _RegistrationProduct()
+        evidence = self._evidence(product)
+        pin = matrix.product(product.matrix)["xray_version"]
+        self.assertEqual(evidence["worker_core_version_from_status"], pin)
+        self.assertEqual(evidence["worker_core_version_from_binary"], pin)
+        self.assertEqual(evidence["worker_core_binary"]["binary"],
+                         multi_node.WORKER_CORE_BINARY)
+        self.assertEqual(evidence["core_hole_control"], product.control)
+
+    def test_a_worker_status_naming_another_core_is_rejected(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._evidence(_RegistrationProduct(core_status="Xray 25.1.1"))
+        message = str(caught.exception)
+        self.assertIn("the Worker's status reports", message)
+        self.assertIn("25.1.1", message)
+
+    def test_a_worker_binary_naming_another_core_is_rejected(self):
+        with self.assertRaises(AssertionError) as caught:
+            self._evidence(_RegistrationProduct(core_binary="26.11.90"))
+        self.assertIn("the Worker's binary reports", str(caught.exception))
 
 
 class TestRunnerEntrypoint(unittest.TestCase):

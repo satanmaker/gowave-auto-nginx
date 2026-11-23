@@ -77,6 +77,7 @@ not have to build an argument list:
 | `GOWAVE_SSH_USER` | `[ssh-user]` | `root` |
 | `GOWAVE_SSH_PORT` | `[ssh-port]` | `22` |
 | `GOWAVE_VISION_DOMAIN` | `--vision-domain <domain>` | none |
+| `XRAY_SERVER_VERSION` | — | `26.11.9` (unset installs the pin; `latest` opts out) |
 
 A non-empty positional (or `--vision-domain`) wins over its variable, an empty variable counts as unset,
 and both paths validate the same fields through the same contract, so an invalid value is refused on the
@@ -99,6 +100,20 @@ The wizard onboards each Worker without leaving a standing key behind:
 - A systemd timer on the Worker removes the temporary `authorized_keys` entry within two hours. The same
   entry is revoked at the end of `node add`, on success and on failure, and the timer is disabled and
   deleted with it.
+
+### The pinned Xray core
+
+A node installation places the pinned Xray core (`<install_dir>/rw-core`) before the upstream installer
+runs, so a default installation makes no `api.github.com` request and the version the node runs is the one
+this repository pins. Three consequences are worth knowing before an install:
+
+- An undeliverable or unverifiable pinned archive stops the installation, naming the artifact and the
+  pinned version, instead of falling back to the upstream download. `XRAY_SERVER_VERSION=latest` is the
+  way out: it restores the previous behaviour and lets the installer fetch its own core.
+- On a host that never had a managed core installation, `gowave-node core reset` answers
+  `no managed stock core is available`; the file this installer places has no `.stock` backup behind it.
+- The release archive and the geodata files still come from `github.com`. That path costs no API quota,
+  and this installer does not remove it.
 
 ## Domain and certificate policy
 

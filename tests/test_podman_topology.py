@@ -457,7 +457,13 @@ class TestPanelOnlyTopology(unittest.TestCase):
         suite = panel_only.cases(FakePodman())
         self.assertEqual(
             [case.id for case in suite],
-            ["PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED", "MN-ADD-NODE-REFUSED"],
+            [
+                "PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED",
+                # The add-node refusal needs a Panel and no Worker, so both
+                # topologies run it: Panel-only is where the mutation boundary it
+                # asserts stays crossed by construction.
+                "MN-ADD-NODE-REFUSED",
+            ],
         )
         self.assertEqual({case.topology for case in suite}, {"panel-only"})
 
@@ -488,7 +494,10 @@ class TestPanelOnlyTopology(unittest.TestCase):
         )
         self.assertEqual(
             [case.id for case in suite],
-            ["PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED", "MN-ADD-NODE-REFUSED"],
+            [
+                "PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED",
+                "MN-ADD-NODE-REFUSED",
+            ],
         )
         self.assertEqual(run_podman_e2e.TOPOLOGIES, ("aio", "multi-node", "panel-only"))
 

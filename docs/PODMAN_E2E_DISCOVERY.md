@@ -521,18 +521,18 @@ between the two reads, in a window that followed `AIO-RESTART`'s
 `systemctl restart gowave.service`), although the failed backup had published
 nothing: the case, not the product, was measuring the Panel's own writes.
 
-**The engines are the same binaries, pinned differently.** Both suites validate
-with the real Xray and Mihomo, and neither substitutes a parser for the engine:
-`mihomo -t` and `xray run -test` are what accept a representation, and the
-Python readers only count what the engines accepted. The container matrix pins
-`xray` 26.11.9 and `mihomo` 1.19.34 with the artifact digest and sha256 of each
-(`product.xray_client_version`, `product.mihomo_client_version`), because a
-container image has to be reproducible from the tree; the live runner takes
-`XRAY_CLIENT_VERSION` and `MIHOMO_CLIENT_VERSION` from
-`tools/live_vps_config.env.example`, which reads `latest`, so the live side
-follows the release. The shared contract is therefore "accepted by the real
-engine", not "accepted by this exact build", and the container suite is the
-place where a specific build is named.
+**The engines are the same binaries, and both sides now name the same client
+builds.** Both suites validate with the real Xray and Mihomo, and neither
+substitutes a parser for the engine: `mihomo -t` and `xray run -test` are what
+accept a representation, and the Python readers only count what the engines
+accepted. The container matrix pins `xray` 26.11.9 and `mihomo` 1.19.34 with the
+artifact digest and sha256 of each (`product.xray_client_version`,
+`product.mihomo_client_version`), because a container image has to be
+reproducible from the tree; the live runner takes `XRAY_CLIENT_VERSION` and
+`MIHOMO_CLIENT_VERSION` from `tools/live_vps_config.env.example`, which pins the
+same two builds, so both sides now name the same client builds. The shared
+contract is still "accepted by the real engine", not "accepted by this exact
+build", and the container suite is the place where a specific build is named.
 
 ### The version contract: a configured pin is read through its own binary
 
@@ -965,12 +965,15 @@ declares five, and `base64` and `singbox` are driven only by this contour —
 divergence: both name the same paths for the three they share, which is what
 `tests/test_podman_docs.py` checks rather than comparing counts.
 
-**The engine pinning is the divergence that stays recorded.** Both suites
-validate with the real Xray and Mihomo and neither substitutes a parser, but
-this contour pins `26.11.9`/`1.19.34` while the live runner reads `latest`; the
-shared contract is "accepted by the real engine", and the pinned build is named
-only where a run has to be reproducible. It is recorded in §The live contract,
-capability by capability instead of being resolved by weakening either side.
+**The engine pinning names the same builds on both sides.** Both suites validate
+with the real Xray and Mihomo and neither substitutes a parser, and both name
+`26.11.9`/`1.19.34`: the container matrix in
+`product.xray_client_version`/`product.mihomo_client_version` and the live
+runner in `tools/live_vps_config.env.example`. The shared contract is still
+"accepted by the real engine", and a pinned build is named wherever a run has to
+be reproducible; a run that needs another build sets the version explicitly
+instead of letting one side follow a channel. It is recorded in §The live
+contract, capability by capability.
 
 ## How the Master's own command line is observed
 

@@ -4,25 +4,13 @@ set -Eeuo pipefail
 
 # Sourced here as well as by the entrypoint so the download path can be tested
 # by sourcing this module alone; both modules tolerate a second sourcing.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/os.sh"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tempdir.sh"
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/artifact.sh"
 
 GOWAVE_INSTALL_DIR="/opt/gowave"
 GOWAVE_DEFAULT_VERSION="latest"
 GOWAVE_REPO="aaaSaZaN/gowave"
-
-detect_arch() {
-    local m
-    m=$(uname -m)
-    case "$m" in
-        x86_64) echo "amd64" ;;
-        aarch64|arm64) echo "arm64" ;;
-        *)
-            echo "Unsupported architecture: $m" >&2
-            return 1
-            ;;
-    esac
-}
 
 ensure_gowave_user() {
     if ! id -u gowave >/dev/null 2>&1; then

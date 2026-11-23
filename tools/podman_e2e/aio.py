@@ -14,6 +14,7 @@ product code on it.
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import time
 import uuid
@@ -61,6 +62,7 @@ from . import (
     # ``cases()`` takes a ``vision`` boolean, so the module is imported under a
     # name the parameter cannot shadow.
     vision as vision_policy,
+    hosts_block,
 )
 from .podman import wait_until
 from .runner import Case, CaseBlocked, CaseIncomplete, PASS, CaseResult, redaction_audit, require
@@ -1069,6 +1071,37 @@ def acme_renewal_script(
     )
 
 
+# The /etc/hosts rewrite the ACME fixture uses: the probe keeps the directory
+# unreachable. A container's /etc/hosts is a bind mount, so the file is rewritten
+# in place — renaming a file over it would leave the mount pointing at a deleted
+# inode and the next process would read the host's view instead of this one's.
+# This one stays python because it runs after the install, when the product has
+# already supplied python3; the pinned-core block runs before it and speaks shell
+# for the same reason it exists.
+HOSTS_REWRITE_HELPERS = '''def hosts_lines():
+    try:
+        with open(HOSTS, encoding="utf-8") as handle:
+            return handle.read().splitlines()
+    except OSError:
+        return []
+
+
+def write_hosts(lines):
+    with open(HOSTS, "w", encoding="utf-8") as handle:
+        handle.write("\\n".join(lines) + "\\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def set_host_entry(host, address, marker):
+    """Install one entry, or drop this marker's own line when address is empty."""
+    lines = [line for line in hosts_lines() if marker not in line]
+    if address:
+        lines.append("%s %s  # %s" % (address, host, marker))
+    write_hosts(lines)
+'''
+
+
 ACME_OUTAGE_SCRIPT = r"""python3 - MODE_PLACEHOLDER WEBROOT_PLACEHOLDER PRIOR_OCTAL_PLACEHOLDER HOST_PLACEHOLDER MARKER_PLACEHOLDER HOSTS_PLACEHOLDER <<'PY'
 import json
 import os
@@ -1101,32 +1134,16 @@ def resolution():
     return (run(("getent", "hosts", HOST))["stdout"] or "").strip()
 
 
-def hosts_lines():
-    try:
-        with open(HOSTS, encoding="utf-8") as handle:
-            return handle.read().splitlines()
-    except OSError:
-        return []
-
-
-def write_hosts(lines):
-    # /etc/hosts is a bind mount inside the container, so it is rewritten in
-    # place: renaming a file over it would leave the mount pointing at a deleted
-    # inode and the next process reading the host's view instead of this one's.
-    with open(HOSTS, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+HOSTS_HELPERS_PLACEHOLDER
 
 
 def blackhole():
-    write_hosts([line for line in hosts_lines() if MARKER not in line]
-                + ["127.0.0.1 %s  # %s" % (HOST, MARKER)])
+    set_host_entry(HOST, "127.0.0.1", MARKER)
     return resolution()
 
 
 def unblackhole():
-    write_hosts([line for line in hosts_lines() if MARKER not in line])
+    set_host_entry(HOST, "", MARKER)
     return resolution()
 
 
@@ -1169,7 +1186,29 @@ def acme_outage_script(
         .replace("HOST_PLACEHOLDER", acme_fixture.FIXTURE_HOST)
         .replace("MARKER_PLACEHOLDER", ACME_BLACKHOLE_MARKER)
         .replace("HOSTS_PLACEHOLDER", shlex.quote(hosts_file))
+        .replace("HOSTS_HELPERS_PLACEHOLDER", HOSTS_REWRITE_HELPERS)
     )
+
+
+# The name and the address the pinned-core proofs block. ``api.github.com`` is the
+# release API the upstream installer spends to buy a core that the pin supplies;
+# The line the step prints when it placed the core, matched against the install's
+# own output so the run quotes what the step verified instead of inferring it.
+PINNED_CORE_STEP_PATTERN = re.compile(
+    r"Installed pinned Xray core (?P<version>\S+) from (?P<url>\S+)"
+    r" \(SHA-256 (?P<digest>[0-9a-f]{64})\)"
+)
+
+# The hosts block constants and functions are now in hosts_block.py; import them
+# from there so both AIO and Multi-Node use the same implementation.
+from .hosts_block import (
+    PINNED_CORE_BLOCKED_HOST,
+    PINNED_CORE_BLOCK_ADDRESS,
+    PINNED_CORE_BLOCK_MARKER,
+    hosts_block_script,
+    hosts_block_facts,
+    require_host_blocked,
+)
 
 
 TLS_CASE_ID = "TLS-01"
@@ -1546,6 +1585,27 @@ def probe_json(case_id: str, label: str, result: Any) -> Dict[str, Any]:
         return {}
 
 
+def hosts_block_facts(
+    podman: Any, container: str, case_id: str, mode: str = "install",
+    role: str = "", host: str = PINNED_CORE_BLOCKED_HOST,
+    address: str = PINNED_CORE_BLOCK_ADDRESS, timeout: int = 120,
+) -> Dict[str, Any]:
+    """Apply or remove the block in one container and report what the name answers.
+
+    The report comes from inside the container, so it describes the resolution and
+    the request that this host makes rather than the ones the harness can make.
+    """
+    result = podman.exec_bash(
+        container, hosts_block_script(mode, host, address), check=False, timeout=timeout,
+    )
+    return probe_json(
+        case_id, f"the {role or container} hosts entry for {host} ({mode})", result,
+    )
+
+
+from .hosts_block import pinned_core_digests
+
+
 class AioProduct:
     """One disposable AIO host, installed once by the real operator."""
 
@@ -1635,6 +1695,13 @@ class AioProduct:
             )
             host.create()
         self.host = host
+        # The block goes on before the install: with the release API answered by
+        # nothing, a core the step failed to place cannot be covered by the
+        # installer's own download, which is the only thing this case can see.
+        core_block = require_host_blocked(
+            self.install_case_id, "the installed host",
+            hosts_block_facts(self.podman, host.target_name, self.install_case_id),
+        )
         self.outcome = host.install()
         require(
             self.install_case_id,
@@ -1643,11 +1710,57 @@ class AioProduct:
             f"{self.outcome.tail(6000)}",
         )
         record = host.evidence(self.outcome)
+        record["core_host_block"] = core_block
         # The install is not complete until the binaries it deployed are asked
         # what they are: a host that answers health checks while running a version
         # nobody configured is the failure this case exists to report.
         record.update(self.require_configured_versions())
+        # The step's own account of what it placed, quoted beside the core the
+        # container reports: one is what the installer verified, the other is
+        # what the file is now.
+        record.update(self.pinned_core_step())
         return record
+
+    def pinned_core_step(self) -> Dict[str, Any]:
+        """The pinned-core step's success line, read from the install's output.
+
+        The step names the version and the archive digest it verified, so the run
+        can quote the verification instead of inferring it from a file that is
+        there afterwards. Exactly one line is expected: a second would mean the
+        step ran twice on one install.
+        """
+        stdout = self.outcome.stdout if self.outcome is not None else ""
+        matched = [
+            (line.strip(), PINNED_CORE_STEP_PATTERN.search(line))
+            for line in stdout.splitlines()
+            if PINNED_CORE_STEP_PATTERN.search(line)
+        ]
+        require(
+            self.install_case_id,
+            len(matched) == 1,
+            f"the install printed {len(matched)} pinned-core success lines instead of one "
+            f"for the core it placed",
+        )
+        line, match = matched[0]
+        expected = matrix.product(self.matrix).get("xray_version", "")
+        require(
+            self.install_case_id,
+            match.group("version") == expected,
+            f"the pinned-core step installed {match.group('version')!r} while this "
+            f"deployment configured {expected!r}",
+        )
+        require(
+            self.install_case_id,
+            match.group("digest") in pinned_core_digests(),
+            f"the pinned-core step verified {match.group('digest')} which is not an archive "
+            "digest this checkout pins",
+        )
+        return {
+            "pinned_core_step_line": line,
+            "pinned_core_step_version": match.group("version"),
+            "pinned_core_step_artifact": match.group("url"),
+            "pinned_core_step_sha256": match.group("digest"),
+        }
 
     def reinstall(self, case_id: str) -> Dict[str, Any]:
         """Run the operator's install command a second time against the same host.

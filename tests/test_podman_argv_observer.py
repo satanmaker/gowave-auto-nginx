@@ -374,8 +374,23 @@ class _StubHost:
     def _evidence(self, name, text):
         self.evidence_files.append(name)
 
-    def node_add_script(self, name):
-        return f"bash /repo/gowave-auto.sh node add '{name}' '10.89.0.12' 'worker.testbed.internal'"
+    # Mirrors the topology's signature rather than a narrower one a stub could
+    # get away with: ``node_add`` forwards every optional input, so a fake that
+    # lacks one would fail a real dispatch the test claims to exercise.
+    def node_add_script(
+        self, name, environment=None, address=None, worker_domain=None,
+        reality_domain=None, vision_domain=None,
+    ):
+        address = address or "10.89.0.12"
+        vision = f"--vision-domain '{vision_domain}' " if vision_domain else ""
+        command = (
+            f"bash /repo/gowave-auto.sh node add {vision}'{name}' "
+            f"'{address}' 'worker.testbed.internal'"
+        )
+        prefix = " ".join(
+            f"{key}={value}" for key, value in sorted((environment or {}).items())
+        )
+        return f"{prefix} {command}" if prefix else command
 
 
 class TestNodeAddIsTraced(unittest.TestCase):

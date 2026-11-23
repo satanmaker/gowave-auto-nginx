@@ -82,12 +82,14 @@ above the declared budget, exit `2` before any container is created.
 
 `panel-only` drives the operator's own command — `gowave-auto.sh install
 --panel-only <panel> <camouflage> <email>`, with no fourth positional argument
-— and declares five cases against it: the install (`PO-INSTALL`), the shape of
+— and declares six cases against it: the install (`PO-INSTALL`), the shape of
 the host it leaves (`PO-HOST`), the Panel's read surface and `state.json`
-(`PO-API`), the squad the first registration creates (`PO-SQUAD`), and the
-Panel's answer to a null squad entry (`PO-SQUAD-REFUSED`). The registration runs
-through the operator's own `node add` against a second clean host, because a
-Panel-only deployment has no local node whose squad could be read.
+(`PO-API`), the squad the first registration creates (`PO-SQUAD`), the Panel's
+answer to a null squad entry (`PO-SQUAD-REFUSED`), and the wizard's refusal to
+add a node to an unverifiable Panel (`MN-ADD-NODE-REFUSED`, which the topology
+runs beside the Multi-Node suite). The registration runs through the operator's
+own `node add` against a second clean host, because a Panel-only deployment has
+no local node whose squad could be read.
 
 The deadline is the `runtime_budget_seconds` the manifest declares for the
 topology — 2700 s, 4500 s and 4500 s — and it is a ceiling rather than a
