@@ -58,9 +58,12 @@ class TestTraceabilityRules(unittest.TestCase):
         )
 
     def test_every_spec_scenario_has_exactly_one_row(self):
-        self.assertEqual(len(self.spec), 51, "the spec states 51 scenarios")
-        self.assertEqual(len(trace.rows(self.table)), 51)
-        self.assertEqual(len({tuple(row) for row in self.spec}), 51)
+        # 55 = the 51 the capability stated before `podman-ci-throughput` plus the
+        # four its delta adds: three under *Harness ceilings never decide a product
+        # verdict* and *Install-dependent case without a successful installation*.
+        self.assertEqual(len(self.spec), 55, "the spec states 55 scenarios")
+        self.assertEqual(len(trace.rows(self.table)), 55)
+        self.assertEqual(len({tuple(row) for row in self.spec}), 55)
 
     def test_every_declared_case_is_mapped_or_serves_a_requirement(self):
         mapped = {
@@ -462,10 +465,10 @@ class TestTraceabilityRules(unittest.TestCase):
     def test_the_audit_entrypoint_reads_the_checked_in_table(self):
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(trace.main(["--check"]), 0)
-        self.assertIn("51 scenarios, 51 rows", printed.getvalue())
+        self.assertIn("55 scenarios, 55 rows", printed.getvalue())
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(trace.main(["--strict"]), 0)
-        self.assertIn("51 scenarios, 51 rows, 0 gaps", printed.getvalue())
+        self.assertIn("55 scenarios, 55 rows, 0 gaps", printed.getvalue())
 
     def test_the_audit_entrypoint_refuses_a_drifted_report(self):
         with tempfile.TemporaryDirectory() as directory:

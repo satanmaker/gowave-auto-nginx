@@ -146,7 +146,7 @@
 
 ## 5. Traceability and the pages that state verdicts
 
-- [ ] 5.1 Add one traceability row per scenario of the delta at archive time — the three ADDED ones and
+- [x] 5.1 Add one traceability row per scenario of the delta at archive time — the three ADDED ones and
   `Install-dependent case without a successful installation` — using full ids that exist by then, never a
   two-segment module id: `tests.test_podman_budget.TestOperationCeilings` (a slow legitimate step keeps its ceiling),
   `tests.test_podman_runner.TestHarnessLimitVerdict` (a ceiling that fires names its own limit),
@@ -157,6 +157,18 @@
   install paths. Use no `gap`: `trace.py` reads the ledger of `podman-full-e2e` (`trace.py:61`) and refuses a gap
   naming a task of another change, and by archive time every row has a passing test.
   Verify: `python3 -m tools.podman_e2e.trace --strict` lists the four new rows and reports no problem.
+  Result: four rows, 55 scenarios against 55 rows, 0 gaps. The delta had to reach
+  `openspec/specs/podman-e2e/spec.md` first — `trace.py` compares the table with the capability spec, not with the
+  delta — so the archive's sync step ran before the rows: the ADDED requirement is inserted after *Pre-push and
+  pull-request acceptance gate*, whose *Budget overrun is not a truncated pass* scenario it names as its sibling, and
+  `Trustworthy result and diagnostics` takes the delta's description and its third scenario verbatim. Two rows carry
+  tests and no cases: `NGX-05` and `RED-02` already serve scenario-less requirements in the `unstated:` block, and the
+  audit refuses a case mapped to two places, so a case column there would have had to steal the redaction and decoy
+  mappings. That is the same shape the table already uses for *Secret redaction* and *Cleanup after failure*, and
+  `TestOperationCeilings` and `TestHarnessLimitVerdict` rows do name cases — `AIO-INSTALL` with `PO-INSTALL`, and
+  `AIO-INSTALL` with `MN-INSTALL` — because the measured ceiling sites are install cases. The count the table states
+  moved with it, so `tests/test_podman_traceability.py` now pins 55 in both places, with a comment naming the 51 plus
+  the delta's four.
 - [x] 5.2 If `docs/PODMAN_E2E_DISCOVERY.md` or `tests/cases/behaviors.yaml` states that a timed-out case is a product
   FAIL, bring the sentence in line with the new verdict.
   Result: nothing to align. Neither page calls a timed-out case a product FAIL, and neither states a ceiling for the
@@ -170,6 +182,8 @@
 - [ ] 5.4 Regenerate the traceability report after 5.1 — `python3 -m tools.podman_e2e.trace --markdown` — and commit
   `docs/PODMAN_E2E_TRACEABILITY.md`: `trace.py:1203-1206` refuses a report that differs from the table's own render.
   Verify: `python3 -m tools.podman_e2e.trace --strict` passes twice in a row.
+  Result: `traceability: wrote docs/PODMAN_E2E_TRACEABILITY.md`, then `--strict` passed twice on the same tree with
+  `55 scenarios, 55 rows, 0 gaps` each time. The report carries the four new rows and the two new requirements.
 
 ## 6. Close
 
