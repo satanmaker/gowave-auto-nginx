@@ -79,22 +79,57 @@
 
 ## 4. Measure, then set the numbers
 
-- [ ] 4.1 Run one full local acceptance run on this change's commit over the three topologies that carry the measured
+- [x] 4.1 Run one full local acceptance run on this change's commit over the three topologies that carry the measured
   paths, and record the run directory and its per-case durations in this task: `aio` (`AIO-INSTALL` builds and pulls,
   `NGX-05` owns the restore, `RED-02` owns the install gate), `panel-only` (`PO-INSTALL` is the second measured build
   kill), and `multi-node` (`NGX-05` and `ENV-02` are where the budget was spent and reported as a defect). Record the
   pull and build durations separately from the case durations — 4.2 needs the former, 4.3 the latter.
-- [ ] 4.2 Replace the initial `PULL_CEILING_SECONDS` and `BUILD_CEILING_SECONDS` with values derived from 4.1, keeping
+  Result: three runs on `05e23ee`, `tree: dirty` only by this file and the untracked `artifacts/`:
+  - `artifacts/podman-e2e/podman-aio-20261123T193952-2d80cddc` — FAIL, 985.1 s of 2700 (36 %): 107 PASS,
+    8 INCOMPLETE, 2 FAIL. `AIO-INSTALL` PASS 83.0 s, `RED-02` 34.4 s, `NGX-05` 2.9 s.
+  - `artifacts/podman-e2e/podman-panel-only-20261123T195617-1664ab7e` — PASS, 6 of 6, 158.7 s of 4500 (3.5 %).
+    `PO-INSTALL` 72.1 s, `PO-SQUAD` 58.3 s, `MN-ADD-NODE-REFUSED` 0.8 s.
+  - `artifacts/podman-e2e/podman-multi-node-20261123T195857-3adaabde` — FAIL, 1826.9 s of 4500 (41 %): 117 PASS,
+    8 INCOMPLETE, 2 FAIL. `MN-INSTALL` 82.5 s, `WRK-04` 124.4 s, `MN-ENV-CONTRACT` 94.3 s, `ENV-02` 20.2 s,
+    `NGX-05` 6.1 s; the slowest PASS is `NGX-COVER-UNRESOLVED` at 202.1 s.
+
+  Every non-PASS verdict is one signature this change does not touch: the eight `AIO-DP-*` and `MN-DP-master-*`
+  data-plane cases report INCOMPLETE with «the local host captured nothing on port 443» while their request facts
+  hold, and `AIO-MATRIX`, `AIO-PKT-02`, `MN-MATRIX`, `MN-EGRESS` fail on that same capture. No `HarnessLimit` fired
+  and no case reported a budget exhaustion in any topology, and the two cases that used to hold 4165 s of the
+  multi-node run now take 218.7 s together.
+  The pull and the build are measured apart from the cases, cold, on this workstation: the acceptance runs reused the
+  pre-existing rootful store `/home/podman-rootful` (dated Jul 11) and so neither pulled nor built the base. After
+  removing `localhost/gowave-e2e-target:ubuntu-24.04`, `localhost/probe-target:latest` and the pinned digest, the
+  digest pull took 1 s and `podman build --no-cache` 14 s, with all ten Containerfile steps run and zero
+  `Using cache` lines. `AIO-INSTALL` 83.0 s, `PO-INSTALL` 72.1 s and `MN-INSTALL` 82.5 s are warm-store numbers and
+  say nothing about the pull or the build.
+- [x] 4.2 Replace the initial `PULL_CEILING_SECONDS` and `BUILD_CEILING_SECONDS` with values derived from 4.1, keeping
   the rule "declared floor sized to the work, capped by the remaining budget", and record the measured pull and build
   durations beside the constants.
   Verify: the 1.4 test still passes with the new numbers, and the recorded durations are shorter than the floors.
+  Result: `PULL_CEILING_SECONDS = 300` (from 600) and `BUILD_CEILING_SECONDS = 1800` (unchanged), each with its
+  measured duration in the comment above it. Only the pull moved, because the measurement divides what one 311.2 s
+  kill had charged to both commands: the pull is at most 11.2 s and 1 s cold, it was never the command that ran long,
+  and 600 s was 53x that — headroom charged for the build's overrun. The probe default the pull already had is 27x
+  the observation and the honest floor, so the pull keeps `DEFAULT_COMMAND_TIMEOUT` instead of a number of its own.
+  The build keeps 1800 s: 14 s cold here, but the same ten steps outlasted 300 s on the runner and were still
+  climbing, so the floor stays 6x that lower bound; a build that wedges is stopped by the run's remaining budget
+  either way. `tests.test_podman_budget.TestOperationCeilings.test_the_pull_gets_its_own_ceiling` now pins the pull to
+  `DEFAULT_COMMAND_TIMEOUT` and keeps the assertion that the floor outlasts the 11.2 s observation.
+  Verify: `python3 -m unittest -v tests.test_podman_budget` — `Ran 23 tests`, OK; 1 s < 300 s and 14 s < 1800 s, so
+  both recorded durations are shorter than their floors.
 - [ ] 4.3 Decide with the user whether the per-case declared caps (6000–11400 s) and the per-topology run budgets
   (2700/4500/4500 s) move. If they do, that is its own change with 4.1 as evidence: the post-fix cost is what decides
   them, and this change does not measure it before 4.1.
 - [ ] 4.4 Decide the same for the 20-minute `Lint, Completeness, and Suite` job cap after 4.3, and record either the new
   value or the measured margin that makes the current value sufficient.
-- [ ] 4.5 Run the non-root suite — `python3 -m tests.run_ci.py --suite nonroot` — and record the verdict read from the
+- [x] 4.5 Run the non-root suite — `python3 tests/run_ci.py --suite nonroot` — and record the verdict read from the
   run, not from the log tail, which does not carry it.
+  Result: `Ran 3077 tests in 3128.777s` — `OK (skipped=1)`, exit 0, zero `ERROR:`/`FAIL:` lines. Read from the
+  runner's own summary line on commit `05e23ee`, not from the size of the log. The one skip is the local sample's
+  normal count (CI skips 24 where the workstation lacks a container-only capability).
+  Verify: `grep -nE '^(Ran [0-9]+ tests|OK|FAILED)' /tmp/nonroot-suite-4.5.log` and the shell's exit status.
 
 ## 5. Traceability and the pages that state verdicts
 

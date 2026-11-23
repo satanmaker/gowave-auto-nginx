@@ -273,8 +273,13 @@ class TestOperationCeilings(unittest.TestCase):
         pull = [entry for entry in calls if entry[0][1:2] == ["pull"]]
         self.assertEqual(len(pull), 1, f"expected exactly one pull, saw {calls}")
         self.assertEqual(pull[0][1], podman_module.PULL_CEILING_SECONDS)
-        self.assertGreater(podman_module.PULL_CEILING_SECONDS, 311.2,
-                           "the floor must outlast the 311.2 s at which the probe default killed it")
+        # Task 4.2 measured it: the pull costs at most 11.2 s of the 311.2 s that a
+        # 300 s build kill ended, and 1 s on a cold local store, so the kill that
+        # reddened AIO-INSTALL belonged to the build and the pull is left on the
+        # probe default it already had.
+        self.assertEqual(podman_module.PULL_CEILING_SECONDS, podman_module.DEFAULT_COMMAND_TIMEOUT,
+                         "the pull measures in seconds, so it keeps the probe default rather than a larger floor")
+        self.assertGreater(podman_module.PULL_CEILING_SECONDS, 11.2)
 
     def test_the_build_gets_its_own_ceiling(self):
         calls, run, _pinned = self.recorder()
@@ -287,7 +292,8 @@ class TestOperationCeilings(unittest.TestCase):
         build = [entry for entry in calls if entry[0][1:2] == ["build"]]
         self.assertEqual(len(build), 1, f"expected exactly one build, saw {calls}")
         self.assertEqual(build[0][1], podman_module.BUILD_CEILING_SECONDS)
-        self.assertGreater(podman_module.BUILD_CEILING_SECONDS, 311.2)
+        self.assertGreater(podman_module.BUILD_CEILING_SECONDS, 311.2,
+                           "a 14 s cold build still outlasted 300 s on the runner, so the floor stays above that")
 
     def test_a_ceiling_is_capped_by_what_the_run_has_left(self):
         context = self.context(budget_seconds=600)

@@ -49,12 +49,24 @@ STALE_AFTER_SECONDS = 6 * 3600
 DEFAULT_COMMAND_TIMEOUT = 300
 # Short probes keep the 300-second default, because a wedged probe that is given
 # more time is only a more expensive wedge. The two network-bound image steps do
-# not: on ``podman-acceptance.yml`` run 45161440198 the digest-pinned pull plus
-# the Containerfile build died at 311.2 s on ``AIO-INSTALL`` and 306.8 s on
-# ``PO-INSTALL``, so a probe-sized ceiling killed an install that was working.
-# Both values are floors to be replaced by the durations a run records (tasks
-# 4.1/4.2), and the run's remaining budget caps whichever one is about to fire.
-PULL_CEILING_SECONDS = 600
+# not: on ``podman-acceptance.yml`` run 45161440198 the install died at 311.2 s on
+# ``AIO-INSTALL`` and 306.8 s on ``PO-INSTALL``, and the command a probe-sized
+# ceiling killed was the build, so the install was still working.
+#
+# Measured for tasks 4.1/4.2 on the three-topology run of 2026-11-23, cold on this
+# workstation with the local image store pruned first: the digest-pinned pull took
+# 1 s and the Containerfile build 14 s under ``--no-cache`` with no cache hit. A CI
+# runner is far slower than that -- the same build outlasted 300 s there -- so
+# neither floor is the local cost:
+#   pull 300 s: the slowest observation of it is at most 11.2 s, by subtracting
+#        the 311.2 s case that a 300 s build kill ended. That is 27x, and no higher
+#        than the probe default the pull already had: 600 s was charged for a kill
+#        that belonged to the build.
+#   build 1800 s: 6x the 311.2 s the runner had already spent and was still
+#        climbing at, 128x the measured cost. A build that wedges is stopped by the
+#        run's remaining budget, which caps whichever floor is about to fire, so a
+#        tighter number would only move the false red back onto a slow runner.
+PULL_CEILING_SECONDS = 300
 BUILD_CEILING_SECONDS = 1800
 
 

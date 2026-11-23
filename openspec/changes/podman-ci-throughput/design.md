@@ -16,7 +16,7 @@ Alternatives considered:
 - Move the ceiling into the Containerfile. Rejected: the ceiling is the harness's statement about how long its own work takes; a build file cannot express it, and CI would have no number to report.
 - Only fix the build and leave the pull. Rejected: both were measured under the same constant, and a cold pull of the pinned base is the same kind of work.
 
-The declared floors start at the measured cost of the failing runs (311.2 s and 306.8 s, both still climbing when the ceiling fired) with room for a slower runner, and task 4.2 replaces them with the durations of the measured run this change produces. The cap by `remaining()` is what keeps a ceiling from becoming a limit that cannot fire inside the run — the error the per-case caps already make.
+The declared floors start at the measured cost of the failing runs (311.2 s and 306.8 s, both still climbing when the ceiling fired) with room for a slower runner, and task 4.2 replaces them with the durations of the measured run this change produces. That measurement, taken cold on 2026-11-23, separates what the 311.2 s kill had charged to both: the pull costs 1 s and never more than 11.2 s, so it goes back to the 300 s probe default it always had, while the build — 14 s cold here, past 300 s on the runner — keeps 1800 s. The cap by `remaining()` is what keeps a ceiling from becoming a limit that cannot fire inside the run — the error the per-case caps already make.
 
 ### 2. `CaseTimeout` passes through the cleanup probe
 
