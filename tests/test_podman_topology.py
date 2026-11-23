@@ -453,11 +453,11 @@ class TestPanelOnlyTopology(unittest.TestCase):
         self.assertEqual(record["install_command"], instance.install_script())
         self.assertEqual(record["vision_domain"], "")
 
-    def test_the_topology_declares_the_five_panel_only_cases(self):
+    def test_the_topology_declares_the_six_panel_only_cases(self):
         suite = panel_only.cases(FakePodman())
         self.assertEqual(
             [case.id for case in suite],
-            ["PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED"],
+            ["PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED", "MN-ADD-NODE-REFUSED"],
         )
         self.assertEqual({case.topology for case in suite}, {"panel-only"})
 
@@ -488,7 +488,7 @@ class TestPanelOnlyTopology(unittest.TestCase):
         )
         self.assertEqual(
             [case.id for case in suite],
-            ["PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED"],
+            ["PO-INSTALL", "PO-HOST", "PO-API", "PO-SQUAD", "PO-SQUAD-REFUSED", "MN-ADD-NODE-REFUSED"],
         )
         self.assertEqual(run_podman_e2e.TOPOLOGIES, ("aio", "multi-node", "panel-only"))
 
