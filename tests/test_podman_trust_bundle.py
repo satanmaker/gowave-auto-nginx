@@ -24,6 +24,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from tools.live_vps import tls  # noqa: E402
 from tools.podman_e2e import catalog, trust_bundle  # noqa: E402
 
 TOPOLOGIES = ("aio", "multi-node")
@@ -122,9 +123,10 @@ def _damages(workdir):
     }
 
 
-def run_case(topology="aio", damage=None, workdir=None):
+def run_case(topology="aio", damage=None, workdir=None, extra_patches=()):
     """Run the case, optionally with one damaged behaviour; return (facts, refusal)."""
-    patchers = _damages(workdir)[damage] if damage else []
+    patchers = list(_damages(workdir)[damage]) if damage else []
+    patchers.extend(extra_patches)
     for patcher in patchers:
         patcher.start()
     try:
@@ -205,6 +207,31 @@ class TestTrustBundleDamage(unittest.TestCase):
 
     def test_a_pinned_name_that_collides_with_a_public_root_is_refused(self):
         self.assert_refused("staging-cn-collides")
+
+    def test_the_collision_is_read_from_the_certificates_not_the_bundle_text(self):
+        """A Debian/Ubuntu bundle is plain PEM, with no ``# <name>`` line per certificate.
+
+        Arch's bundle prepends those comments, Debian's and Ubuntu's do not, so a
+        check that searches the file's text for a subject name sees the collision
+        on one distribution and not the other. The names have to come out of the
+        certificates, and the collision must then be refused on both shapes.
+        """
+        real = trust_bundle.find_system_ca_bundle().read_bytes()
+        plain = self.workdir / "plain-ca-bundle.pem"
+        plain.write_bytes(
+            b"\n".join(line for line in real.splitlines() if not line.startswith(b"#")) + b"\n")
+        self.assertNotIn(b"ISRG Root X1", plain.read_bytes(),
+                         "the stripped bundle still names the root in its text")
+        _, refusal = run_case(
+            damage="staging-cn-collides",
+            workdir=self.workdir,
+            extra_patches=[
+                mock.patch.object(trust_bundle, "find_system_ca_bundle", lambda: plain),
+                mock.patch.object(tls, "find_system_ca_bundle", lambda: plain),
+            ],
+        )
+        self.assertIsNotNone(refusal, "a comment-less bundle hid the collision")
+        self.assertIn(EXPECTED_REFUSALS["staging-cn-collides"], refusal)
 
     def test_a_verifier_that_trusts_the_staging_root_in_production_is_refused(self):
         self.assert_refused("staging-trusted-in-production")

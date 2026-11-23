@@ -71,6 +71,30 @@ def _subject(certificate: Path) -> str:
     return completed.stdout.strip()
 
 
+def _bundle_subject_names(bundle: Path) -> list[str]:
+    """Every certificate subject the bundle carries, parsed from the DER.
+
+    The names have to come out of the certificates themselves: a PEM body is
+    base64, so a subject never appears in the file's bytes. Some distributions
+    prepend a human-readable ``# <name>`` comment per certificate (Arch does)
+    and some do not (Debian, Ubuntu), so a substring search over the text
+    answers "is this name in the bundle" only where the comments exist.
+    """
+    der = subprocess.run(
+        ["openssl", "crl2pkcs7", "-nocrl", "-certfile", str(bundle)],
+        capture_output=True, check=True, timeout=120,
+    ).stdout
+    listing = subprocess.run(
+        ["openssl", "pkcs7", "-print_certs", "-noout"],
+        input=der, capture_output=True, check=True, timeout=120,
+    ).stdout.decode("utf-8", errors="replace")
+    return [
+        line.split("=", 1)[1].strip()
+        for line in listing.splitlines()
+        if line.strip().lower().startswith("subject=")
+    ]
+
+
 def _public_root(bundle: Path, directory: Path) -> Tuple[Path, str]:
     """One public root lifted out of the production bundle, with its subject.
 
@@ -105,6 +129,7 @@ def case_production_bundle_excludes_staging(product: Any, context: Any) -> Dict[
         staging = build_runtime_ca_bundle("staging", output_path=root / "staging.pem")
 
         public_bundle = find_system_ca_bundle()
+        public_subjects = _bundle_subject_names(public_bundle)
         production_bytes = production.read_bytes()
         staging_bytes = staging.read_bytes()
         require(
@@ -122,7 +147,8 @@ def case_production_bundle_excludes_staging(product: Any, context: Any) -> Dict[
         production_text = production_bytes.decode("utf-8", errors="replace")
         require(
             DP12_CASE_ID,
-            STAGING_MARKER not in production_text and STAGING_SUBJECT not in production_text,
+            STAGING_MARKER not in production_text
+            and not any(STAGING_SUBJECT in name for name in public_subjects),
             "the production bundle carries a Let's Encrypt Staging marker, so a Staging root "
             "could have been added without the marker being the only trace of it",
         )
@@ -137,7 +163,11 @@ def case_production_bundle_excludes_staging(product: Any, context: Any) -> Dict[
             f"the staging bundle names {len(verified)} pinned roots and "
             f"{'carries' if STAGING_MARKER in staging_text else 'omits'} the marker",
         )
-        absent = [meta["subject_cn"] for _path, meta in verified if meta["subject_cn"] not in production_text]
+        absent = [
+            meta["subject_cn"]
+            for _path, meta in verified
+            if not any(meta["subject_cn"] in name for name in public_subjects)
+        ]
         require(
             DP12_CASE_ID,
             len(absent) == len(verified),
