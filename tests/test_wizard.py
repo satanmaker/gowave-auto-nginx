@@ -26,8 +26,8 @@ WIZARD_SH = REPO_ROOT / "modules" / "wizard.sh"
 SHIPPING_SCRIPTS = [
     REPO_ROOT / "gowave-auto.sh",
     REPO_ROOT / "gowave-node-auto.sh",
-    *sorted((REPO_ROOT / "modules").glob("*.sh")),
-    *sorted((REPO_ROOT / "assets").rglob("*.sh")),
+    *sorted(p for p in (REPO_ROOT / "modules").glob("*.sh") if p.exists()),
+    *sorted(p for p in (REPO_ROOT / "assets").rglob("*.sh") if p.exists()),
 ]
 # Every catalog key is namespaced `wizard.` or `menu.`, so a lookup is a `t` or `tf` call
 # that names one, in a command substitution or not.
