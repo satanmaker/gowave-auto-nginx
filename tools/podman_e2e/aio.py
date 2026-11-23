@@ -3111,7 +3111,10 @@ def transfer_matrix_until_carried(
     attempts = 0
     last_error: Optional[AssertionError] = None
     facts: Dict[str, Any] = {}
-    while True:
+    # The first attempt is taken whatever the clock says, and every further one has
+    # to start before the deadline: the loop is bounded by time, and the wait after
+    # an attempt never carries it past the deadline it is waiting for.
+    while attempts == 0 or clock() < deadline:
         attempts += 1
         try:
             facts = attempt()
@@ -3119,10 +3122,8 @@ def transfer_matrix_until_carried(
             last_error, facts = exc, {}
         else:
             last_error = None
-        if facts and transfer_matrix_carried(facts, expected):
-            break
-        if clock() >= deadline:
-            break
+            if transfer_matrix_carried(facts, expected):
+                break
         sleep(interval_seconds)
     if last_error is not None and not facts:
         raise last_error

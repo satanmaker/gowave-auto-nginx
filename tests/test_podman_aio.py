@@ -6774,17 +6774,20 @@ class TestRevocationTransferRetry(unittest.TestCase):
 
     def test_a_spent_deadline_re_raises_the_probes_own_message(self):
         message = "AIO-REVOKE: the traffic probe exited 1: the endpoint never answered"
+        calls = []
 
         def attempt():
+            calls.append(1)
             raise AssertionError(message)
 
         with self.assertRaises(AssertionError) as caught:
             self.run_until_carried(attempt)
         self.assertEqual(str(caught.exception), message)
         self.assertEqual(
-            self.clock.sleeps, [5.0] * 24,
-            "25 attempts inside 120 s at one try per 5 s, and the last one has no wait left",
+            len(calls), 24,
+            "120 s at one try per 5 s, and the wait after the last try lands on the deadline",
         )
+        self.assertEqual(self.clock.sleeps, [5.0] * 24)
 
     def test_a_short_matrix_reaches_the_callers_own_assertion(self):
         def attempt():
