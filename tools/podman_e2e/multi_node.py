@@ -2978,17 +2978,28 @@ def case_add_node_refused(product: MultiNodeProduct) -> Dict[str, Any]:
     verification step: no Worker deployment is reached, no Worker credentials are
     collected for the unverified address, and the Panel's own node list is what
     it was before.
+
+    The Panel is named, not addressed: the wizard refuses a bare address before
+    it probes anything, so the name is steered at an address nothing serves for
+    the duration of the attempt and the flow is refused at the API check itself.
     """
     product.require_installed()
     before = product.panel_surface(ADD_NODE_REFUSED_CASE_ID)
     nodes_before = (before.get("surface") or {}).get("nodes") or {}
 
-    script = aio.add_node_refusal_script()
-    started = time.monotonic()
-    proc = product.podman.exec_bash(
-        product.require_installed().target_name, script, check=False,
-        timeout=WIZARD_OFFLINE_TIMEOUT_SECONDS,
-    )
+    container = product.require_installed().target_name
+    block = aio.add_node_refused_block(product.podman, container, ADD_NODE_REFUSED_CASE_ID)
+    try:
+        aio.require_add_node_refused_premise(ADD_NODE_REFUSED_CASE_ID, block)
+        script = aio.add_node_refusal_script()
+        started = time.monotonic()
+        proc = product.podman.exec_bash(
+            container, script, check=False, timeout=WIZARD_OFFLINE_TIMEOUT_SECONDS,
+        )
+    finally:
+        aio.add_node_refused_block(
+            product.podman, container, ADD_NODE_REFUSED_CASE_ID, mode="remove",
+        )
     outcome = topology.InstallOutcome(
         returncode=proc.returncode,
         stdout=proc.stdout or "",

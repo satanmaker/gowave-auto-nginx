@@ -2608,11 +2608,18 @@ def panel_probe(product: AioProduct, case_id: str, scope: str, extra: str = "") 
         return {}
 
 
-# The address the add-node refusal case points the wizard at. A loopback alias
-# with nothing bound to its HTTPS port refuses the connection at once, so the
-# case fails on the verification step instead of waiting out a connect timeout
-# on a documentation-range address no route reaches.
-ADD_NODE_REFUSED_PANEL = "127.0.0.2"
+# The Panel the add-node refusal case names. A bare address never reaches the
+# probe the case is about — the wizard refuses it first, because a certificate
+# names a domain — so the operator's mistake is spelled as a name, steered
+# inside the container at an address nothing serves. The flow then reaches the
+# API check and is refused there, which is the step under test; the loopback
+# alias is kept because the host's own NGINX answers 127.0.0.1:443.
+ADD_NODE_REFUSED_PANEL = "panel-unverifiable.testbed.internal"
+ADD_NODE_REFUSED_BLOCK_ADDRESS = PINNED_CORE_BLOCK_ADDRESS
+ADD_NODE_REFUSED_BLOCK_MARKER = "gowave-e2e-add-node-refused-block"
+# One /etc/hosts rewrite and one refused connect; the ceiling guards a stalled
+# script, not the expected cost.
+ADD_NODE_REFUSED_BLOCK_TIMEOUT_SECONDS = 120
 
 # Every message ``wizard_verify_panel_api`` prints on a path that ends in
 # ``return 1``. The case accepts the set rather than one string: which step
@@ -2648,6 +2655,58 @@ def add_node_refusal_script() -> str:
         "printf 'GOWAVE_WIZARD_EXIT=%d\\n' \"$wizard_rc\"",
         "exit \"$wizard_rc\"",
     ])
+
+
+def add_node_refused_block(podman, container: str, case_id: str, mode: str = "install") -> Dict[str, Any]:
+    """Place or drop the /etc/hosts entry that steers the refusal probe's name.
+
+    The entry is what makes ``ADD_NODE_REFUSED_PANEL`` a Panel that cannot be
+    verified rather than a name nobody knows, so the case reads the probe's
+    report — the resolution and the refused connection, both measured inside the
+    container — instead of assuming the premise. ``mode`` is ``install`` or
+    ``remove``; ``remove`` leaves ``/etc/hosts`` as it was before the case. The
+    marker is this case's own, because the writer drops every line it matched:
+    sharing the pinned-core marker would delete that entry on the way in.
+    """
+    script = hosts_block_script(
+        mode, ADD_NODE_REFUSED_PANEL, ADD_NODE_REFUSED_BLOCK_ADDRESS,
+        marker=ADD_NODE_REFUSED_BLOCK_MARKER,
+    )
+    result = podman.exec_bash(
+        container, script, check=False, timeout=ADD_NODE_REFUSED_BLOCK_TIMEOUT_SECONDS,
+    )
+    return probe_json(case_id, f"the hosts entry for {ADD_NODE_REFUSED_PANEL} ({mode})", result)
+
+
+def require_add_node_refused_premise(case_id: str, report: Dict[str, Any]) -> None:
+    """Refuse the case when its Panel name resolves anywhere but the dead address.
+
+    A name that answers is not the mistake under test: the flow would verify it
+    or fail somewhere of its own, and the refusal the case reads would belong to
+    something else.
+    """
+    resolution = str(report.get("resolution") or "")
+    request = report.get("request") or {}
+    require(
+        case_id,
+        report.get("mode") == "install"
+        and report.get("address") == ADD_NODE_REFUSED_BLOCK_ADDRESS,
+        f"{ADD_NODE_REFUSED_PANEL} was not steered at {ADD_NODE_REFUSED_BLOCK_ADDRESS}: "
+        f"the probe reports {report.get('mode')!r} for {report.get('address')!r}",
+    )
+    require(
+        case_id,
+        ADD_NODE_REFUSED_BLOCK_ADDRESS in resolution,
+        f"{ADD_NODE_REFUSED_PANEL} resolves to {resolution!r} instead of "
+        f"{ADD_NODE_REFUSED_BLOCK_ADDRESS}, so the flow could reach a Panel that answers",
+    )
+    require(
+        case_id,
+        request.get("returncode") not in (0, None),
+        f"{ADD_NODE_REFUSED_PANEL} answered (exit {request.get('returncode')!r}) although "
+        f"nothing serves {ADD_NODE_REFUSED_BLOCK_ADDRESS}, so the probe would not measure "
+        "a refused Panel API",
+    )
 
 
 def case_panel_auth(product: AioProduct) -> Dict[str, Any]:

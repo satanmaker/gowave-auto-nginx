@@ -210,12 +210,26 @@ class FakePodman:
         self.version_report = version_report
         self.scripts = []
         self.execs = []
+        # Overrides the install report the hosts-block probe would print, so a
+        # test can put the case's premise out of force.
+        self.block_report = None
+        # A write the container could not finish: there is no report to read, so
+        # the case fails instead of judging a premise it never measured.
+        self.block_returncode = 0
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
         self.scripts.append(script)
         if script == aio.INSTALLED_VERSION_SCRIPT:
             report = self.version_report or installed_version_report()
             return subprocess.CompletedProcess(["bash", "-lc", script], 0, report, "")
+        if aio.ADD_NODE_REFUSED_BLOCK_MARKER in script:
+            mode = "remove" if "MODE=remove" in script else "install"
+            report = self.block_report if mode == "install" and self.block_report else None
+            returncode = self.block_returncode if mode == "install" else 0
+            return subprocess.CompletedProcess(
+                ["bash", "-lc", script], returncode,
+                report or refused_block_report(mode=mode), "",
+            )
         stdout, returncode = self.results.pop(0)
         return subprocess.CompletedProcess(["bash", "-lc", script], returncode, stdout, "")
 
@@ -784,23 +798,54 @@ def node_surface(names=()):
     })
 
 
+def refused_block_report(mode="install", address=None, resolution=None, request_returncode=1):
+    """What the hosts-block probe prints for the refusal case's own name.
+
+    ``install`` writes the entry and measures the request it makes; ``remove``
+    drops the entry and measures nothing. The case reads the first report as its
+    premise, so the default is an entry in force and a refused connection.
+    """
+    installed = mode == "install"
+    return json.dumps({
+        "mode": mode,
+        "host": aio.ADD_NODE_REFUSED_PANEL,
+        "address": (aio.ADD_NODE_REFUSED_BLOCK_ADDRESS if address is None else address)
+        if installed else "",
+        "resolution": (f"{aio.ADD_NODE_REFUSED_BLOCK_ADDRESS} {aio.ADD_NODE_REFUSED_PANEL}"
+                       if resolution is None else resolution) if installed else "",
+        "marker_count": 1 if installed else 0,
+        "request": {
+            "returncode": request_returncode,
+            "stdout": "bash: connect: Connection refused",
+            "stderr": "",
+        } if installed else None,
+    })
+
+
 def refusal_output(*, sentinel=False, verification=True):
     """What the shipped add-node wizard prints when the Panel cannot be verified.
 
-    The sample is the one a live run produced against a loopback alias with no
-    listener: the local-Panel branch is skipped, the address is verified, the
-    certificate step fails and the flow returns before any Worker prompt.
+    The sample is the one the live case produces: the local-Panel branch is
+    skipped, the name is verified, nothing answers the address it resolves to and
+    the flow returns before any Worker prompt.
     """
     lines = ["No local Panel found on this host."]
     if verification:
         lines += [
             f"Verifying Panel API at {aio.ADD_NODE_REFUSED_PANEL}...",
-            "TLS certificate verification failed.",
-            "Could not retrieve certificate.",
+            "Panel API unreachable.",
         ]
     if sentinel:
         lines.append("GOWAVE_CMD_NODE_CALLED")
     return "\n".join(lines) + "\n"
+
+
+def wizard_script(podman):
+    """The one script the case ran as the operator's add-node wizard."""
+    matches = [script for script in podman.scripts if "wizard_add_node_to_panel" in script]
+    if len(matches) != 1:
+        raise AssertionError(f"the case ran {len(matches)} wizard scripts, not one")
+    return matches[0]
 
 
 class TestPanelOnlyAddNodeRefusedCase(unittest.TestCase):
@@ -812,13 +857,15 @@ class TestPanelOnlyAddNodeRefusedCase(unittest.TestCase):
         self.addCleanup(self.context.run_cleanup)
 
     def refused(self, *, before=("worker-1",), after=("worker-1",), wizard=None,
-                wizard_returncode=1):
+                wizard_returncode=1, block=None, block_returncode=0):
         product, host, podman = installed(self.context)
         podman.results = [
             (node_surface(before), 0),
             (wizard if wizard is not None else refusal_output(), wizard_returncode),
             (node_surface(after), 0),
         ]
+        podman.block_report = block
+        podman.block_returncode = block_returncode
         return panel_only.case_add_node_refused(product), host, podman
 
     def test_a_refused_attempt_reports_verification_and_leaves_the_panel_alone(self):
@@ -831,14 +878,24 @@ class TestPanelOnlyAddNodeRefusedCase(unittest.TestCase):
         self.assertEqual(facts.get("panel_node_names_before"), ["worker-1"])
         self.assertEqual(facts.get("panel_node_names_after"), ["worker-1"])
         self.assertEqual(host.node_add_attempts, 0, "the host ran a real node add")
-        # The middle read is the wizard itself; the last one is the surface it
-        # had to leave unchanged, not a `node add`.
-        self.assertIn("wizard_add_node_to_panel", podman.scripts[1])
-        self.assertNotIn("node add", podman.scripts[1])
+        # The surface is read before and after the attempt; only the wizard in
+        # between can have touched the Panel, and it is not a `node add`.
+        self.assertNotIn("node add", wizard_script(podman))
+
+    def test_the_case_steers_the_panel_name_at_a_dead_address_and_takes_it_back(self):
+        _facts, _host, podman = self.refused()
+        block = [s for s in podman.scripts if aio.ADD_NODE_REFUSED_BLOCK_MARKER in s]
+        self.assertEqual(len(block), 2, "the entry is written once and removed once")
+        self.assertIn("MODE=install", block[0])
+        self.assertIn("MODE=remove", block[1])
+        self.assertLess(
+            podman.scripts.index(block[0]), podman.scripts.index(wizard_script(podman)),
+            "the name has to point at the dead address before the wizard resolves it",
+        )
 
     def test_the_case_drives_the_shipped_wizard_and_stubs_only_the_mutation(self):
         _facts, _host, podman = self.refused()
-        script = podman.scripts[1]
+        script = wizard_script(podman)
         self.assertIn(aio.ADD_NODE_REFUSED_PANEL, script)
         self.assertIn("cmd_node() {", script)
         self.assertIn("detect_local_panel() { return 1; }", script)
@@ -862,6 +919,25 @@ class TestPanelOnlyAddNodeRefusedCase(unittest.TestCase):
         with self.assertRaises(AssertionError) as caught:
             self.refused(after=("worker-1", "worker-invalid"))
         self.assertIn("changed the Panel's node list", str(caught.exception))
+
+    def test_a_name_that_resolves_past_the_dead_address_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.refused(block=refused_block_report(
+                resolution="10.89.0.11 panel-unverifiable.testbed.internal",
+            ))
+        self.assertIn("instead of", str(caught.exception))
+
+    def test_a_name_whose_address_answers_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.refused(block=refused_block_report(request_returncode=0))
+        self.assertIn("answered", str(caught.exception))
+
+    def test_a_hosts_entry_the_container_could_not_write_fails_the_case(self):
+        # No report means no premise: the case must say so, not read an empty
+        # document as an entry in force.
+        with self.assertRaises(AssertionError) as caught:
+            self.refused(block_returncode=9)
+        self.assertIn("exited 9", str(caught.exception))
 
     def test_the_case_is_declared_in_the_suite(self):
         suite = panel_only.cases(FakePodman(self.context))

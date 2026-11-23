@@ -7820,13 +7820,30 @@ Choice: Retry skipped.
 GOWAVE_ONBOARD_EXIT=2
 """
 
-REFUSED_OUTPUT = """\
+REFUSED_OUTPUT = f"""\
 No local Panel found on this host.
-Verifying Panel API at 127.0.0.2...
-TLS certificate verification failed.
-Could not retrieve certificate.
+Verifying Panel API at {aio.ADD_NODE_REFUSED_PANEL}...
+Panel API unreachable.
 GOWAVE_WIZARD_EXIT=1
 """
+
+
+def refused_block_report(mode="install"):
+    """What the hosts-block probe prints for the refusal case's own name."""
+    installed = mode == "install"
+    return json.dumps({
+        "mode": mode,
+        "host": aio.ADD_NODE_REFUSED_PANEL,
+        "address": aio.ADD_NODE_REFUSED_BLOCK_ADDRESS if installed else "",
+        "resolution": (f"{aio.ADD_NODE_REFUSED_BLOCK_ADDRESS} {aio.ADD_NODE_REFUSED_PANEL}"
+                       if installed else ""),
+        "marker_count": 1 if installed else 0,
+        "request": {
+            "returncode": 1,
+            "stdout": "bash: connect: Connection refused",
+            "stderr": "",
+        } if installed else None,
+    })
 
 
 class _WizardCaseTarget:
@@ -7843,6 +7860,11 @@ class _WizardCasePodman:
 
     def exec_bash(self, name, script, check=True, input_text=None, timeout=300):
         self.scripts.append(script)
+        if aio.ADD_NODE_REFUSED_BLOCK_MARKER in script:
+            mode = "remove" if "MODE=remove" in script else "install"
+            return subprocess.CompletedProcess(
+                ["bash", "-lc", script], 0, refused_block_report(mode=mode), "",
+            )
         return subprocess.CompletedProcess(["bash", "-lc", script], self.returncode, self.stdout, "")
 
 
@@ -7956,6 +7978,13 @@ class TestAddNodeRefusedCase(unittest.TestCase):
         )
         return multi_node.case_add_node_refused(product), product
 
+    @staticmethod
+    def wizard_script(product):
+        matches = [s for s in product.podman.scripts if "wizard_add_node_to_panel" in s]
+        if len(matches) != 1:
+            raise AssertionError(f"the case ran {len(matches)} wizard scripts, not one")
+        return matches[0]
+
     def test_a_refused_attempt_reports_verification_and_leaves_the_panel_alone(self):
         facts, product = self.refused()
         self.assertEqual(facts.get("panel_address"), aio.ADD_NODE_REFUSED_PANEL)
@@ -7965,8 +7994,16 @@ class TestAddNodeRefusedCase(unittest.TestCase):
         self.assertTrue(facts.get("verification_step_reached"))
         self.assertEqual(facts.get("panel_node_names_before"), ["worker-1"])
         self.assertEqual(facts.get("panel_node_names_after"), ["worker-1"])
-        self.assertIn("wizard_add_node_to_panel", product.podman.scripts[-1])
-        self.assertNotIn("node add", product.podman.scripts[-1])
+        self.assertNotIn("node add", self.wizard_script(product))
+
+    def test_the_case_takes_the_hosts_entry_back_after_the_attempt(self):
+        _facts, product = self.refused()
+        block = [s for s in product.podman.scripts if aio.ADD_NODE_REFUSED_BLOCK_MARKER in s]
+        self.assertEqual([("MODE=remove" in s) for s in block], [False, True])
+        self.assertLess(
+            product.podman.scripts.index(block[0]),
+            product.podman.scripts.index(self.wizard_script(product)),
+        )
 
     def test_a_reached_mutation_boundary_fails_the_case(self):
         with self.assertRaises(AssertionError) as caught:

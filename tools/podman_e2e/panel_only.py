@@ -839,17 +839,30 @@ def case_add_node_refused(product: PanelOnlyProduct) -> Dict[str, Any]:
     reads three independent facts — the verification message on the operator's
     stream, the absence of the mutation sentinel and of the credential prompt,
     and a Panel surface whose node list is byte-for-byte the one it had before.
+
+    The Panel is named, not addressed: the wizard refuses a bare address before
+    it probes anything, so the name is steered at an address nothing serves for
+    the duration of the attempt and the flow is refused at the API check itself.
     """
     host = product.require_installed()
 
     before = aio.panel_probe(product, ADD_NODE_REFUSED_CASE_ID, "surface")
     nodes_before = (before.get("surface") or {}).get("nodes") or {}
 
-    script = aio.add_node_refusal_script()
-    started = time.monotonic()
-    proc = product.podman.exec_bash(
-        host.target_name, script, check=False, timeout=PROBE_TIMEOUT_SECONDS,
+    block = aio.add_node_refused_block(
+        product.podman, host.target_name, ADD_NODE_REFUSED_CASE_ID,
     )
+    try:
+        aio.require_add_node_refused_premise(ADD_NODE_REFUSED_CASE_ID, block)
+        script = aio.add_node_refusal_script()
+        started = time.monotonic()
+        proc = product.podman.exec_bash(
+            host.target_name, script, check=False, timeout=PROBE_TIMEOUT_SECONDS,
+        )
+    finally:
+        aio.add_node_refused_block(
+            product.podman, host.target_name, ADD_NODE_REFUSED_CASE_ID, mode="remove",
+        )
     outcome = topology.InstallOutcome(
         returncode=proc.returncode,
         stdout=proc.stdout or "",
