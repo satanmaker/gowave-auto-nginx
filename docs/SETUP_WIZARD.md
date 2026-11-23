@@ -70,7 +70,10 @@ deployed. The flow is:
 ## Temporary SSH access for remote nodes
 
 The wizard authorises an Ed25519 key on a Worker only after the operator types the Worker's host-key
-fingerprint in full. Two variables provide the non-interactive inputs:
+fingerprint in full. The flow prints the fingerprint the Worker presents, then asks for it, so the operator
+confirms that value against the one the provider's console shows; the question and the password prompt are
+written to the terminal, not to the captured diagnostic stream. Two variables provide the non-interactive
+inputs:
 
 - `GOWAVE_SSH_FINGERPRINT` — the SHA-256 fingerprint the operator read from the Worker. It must equal the
   key the Worker presents; a mismatch refuses the onboarding before `authorized_keys` is touched.
@@ -100,7 +103,10 @@ to English.
 ## Temporary SSH access for remote nodes
 
 The wizard authorises an Ed25519 key on a Worker only after the operator types the Worker's host-key
-fingerprint in full. Two variables provide the non-interactive inputs:
+fingerprint in full. The flow prints the fingerprint the Worker presents, then asks for it, so the operator
+confirms that value against the one the provider's console shows; the question and the password prompt are
+written to the terminal, not to the captured diagnostic stream. Two variables provide the non-interactive
+inputs:
 
 - `GOWAVE_SSH_FINGERPRINT` — the SHA-256 fingerprint the operator read from the Worker. It must equal the
   key the Worker presents; a mismatch refuses the onboarding before `authorized_keys` is touched.

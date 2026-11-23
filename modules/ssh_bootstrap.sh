@@ -21,6 +21,24 @@ GOWAVE_SSH_MARKER=""
 GOWAVE_SSH_TIMER_ID=""
 GOWAVE_SSH_LIFETIME_MINUTES=115
 
+# Where an interactive prompt writes.
+#
+# Onboarding captures each node's stderr into a file so the phase and the
+# failure reason survive, which means a prompt written to fd 2 never reaches the
+# operator: the run sits waiting for an answer nobody was asked for. The
+# terminal is the only stream the operator is looking at, so prompt text goes
+# there and falls back to fd 2 where there is no controlling terminal (tests,
+# non-interactive runs). Answers keep coming from stdin, so a run whose input is
+# redirected still reads the input it was given.
+GOWAVE_SSH_PROMPT_OUT=/dev/stderr
+
+_ssh_bootstrap_bind_terminal() {
+    if { : >/dev/tty; } 2>/dev/null; then
+        GOWAVE_SSH_PROMPT_OUT=/dev/tty
+    fi
+    return 0
+}
+
 ssh_bootstrap_fingerprint() {
     # ssh-keygen fails on non-key input; prevent set -e from aborting.
     ssh-keygen -lf - -E sha256 2>/dev/null | awk 'NR == 1 { print $2 }' || true
@@ -181,12 +199,13 @@ ssh_bootstrap_prepare_password() {
         return 0
     fi
     local secret="$directory/password" password=""
-    printf '%s' "$(tf wizard.ssh.password "$host")" >&2
+    _ssh_bootstrap_bind_terminal
+    printf '%s' "$(tf wizard.ssh.password "$host")" > "$GOWAVE_SSH_PROMPT_OUT"
     if ! IFS= read -r -s password; then
-        printf '\n' >&2
+        printf '\n' > "$GOWAVE_SSH_PROMPT_OUT"
         return 1
     fi
-    printf '\n' >&2
+    printf '\n' > "$GOWAVE_SSH_PROMPT_OUT"
     printf '%s' "$password" > "$secret"
     chmod 600 "$secret"
     unset password
@@ -224,15 +243,24 @@ ssh_bootstrap_exec() {
 
 ssh_bootstrap_confirm_fingerprint() {
     local host="$1" expected="$2" provided="${GOWAVE_SSH_FINGERPRINT:-}" typed=""
+    local prompted=0
     if [[ -z "$provided" ]]; then
-        printf '%s' "$(tf wizard.ssh.fingerprint "$host")" >&2
+        # The operator compares this with the value the provider's console
+        # shows. A prompt that asks for the fingerprint without presenting the
+        # one the host actually offers asks for a value nobody can know, and
+        # spec interactive-deployment requires the flow to present it.
+        prompted=1
+        _ssh_bootstrap_bind_terminal
+        printf '%s\n' "$(tf wizard.ssh.fingerprint_presented "$host" "$expected")" > "$GOWAVE_SSH_PROMPT_OUT"
+        printf '%s' "$(tf wizard.ssh.fingerprint "$host")" > "$GOWAVE_SSH_PROMPT_OUT"
         if ! IFS= read -r typed; then
-            printf '\n' >&2
+            printf '\n' > "$GOWAVE_SSH_PROMPT_OUT"
             return 1
         fi
         provided="$typed"
     fi
     if ! ssh_bootstrap_fingerprint_matches "$provided" "$expected"; then
+        (( prompted )) && printf '\n' > "$GOWAVE_SSH_PROMPT_OUT"
         printf '%s\n' "$(tf wizard.ssh.fingerprint_mismatch "$host")" >&2
         return 1
     fi
