@@ -1688,16 +1688,19 @@ except Exception:
 
 # Interactive add-node flow with local Panel detection and verification.
 wizard_add_node_to_panel() {
-    local panel_domain
+    local panel_domain="" panel_is_local="no" confirm=""
     local detected_rc=0
+    local wname="" wip="" wdom="" rdom=""
 
-    # Try to detect local Panel
-    panel_domain=$(detect_local_panel)
-    detected_rc=$?
+    # Try to detect local Panel. The helper reports "no local Panel" through
+    # its status, so a bare assignment would end the menu under errexit.
+    detected_rc=0
+    panel_domain=$(detect_local_panel) || detected_rc=$?
 
     case $detected_rc in
         0)
             # Exactly one local Panel found
+            panel_is_local="yes"
             printf '%s\n' "$(tf wizard.add_node.local_detected "$panel_domain")"
             read -r -p "$(t wizard.add_node.confirm_local)" confirm
             if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
@@ -1716,14 +1719,14 @@ wizard_add_node_to_panel() {
     esac
 
     # If we didn't confirm a local Panel, ask for Panel address
-    if [[ $detected_rc -ne 0 ]] || [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    if [[ "$panel_is_local" != "yes" ]]; then
         printf '%s\n' "$(t wizard.add_node.enter_panel)"
-        read -r -p "$(t menu.prompt.worker_name)" panel_domain
+        read -r -p "$(t wizard.add_node.panel_address)" panel_domain
     fi
 
     # Verify Panel API identity and reachability before collecting SSH credentials
     # or mutating the Worker.
-    if ! wizard_verify_panel_api "$panel_domain"; then
+    if ! wizard_verify_panel_api "$panel_domain" "$panel_is_local"; then
         return 1
     fi
 
@@ -1732,7 +1735,12 @@ wizard_add_node_to_panel() {
     read -r -p "$(t menu.prompt.worker_ip)" wip
     read -r -p "$(t menu.prompt.worker_domain)" wdom
     read -r -p "$(t menu.prompt.camouflage_domain)" rdom
-    cmd_node add "$wname" "$wip" "$wdom" "$rdom"
+
+    # The same temporary-access onboarding the install runs: the operator types
+    # the Worker's host-key fingerprint, the key is authorised with the password
+    # and revoked when the registration ends. `node add` on its own cannot do
+    # that — it requires the host key already pinned and key-only authentication.
+    ssh_bootstrap_onboard_one "$wdom" "$rdom" "" "$wname" "$wip"
 }
 
 main_menu() {

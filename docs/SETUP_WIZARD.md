@@ -54,15 +54,22 @@ deployed. The flow is:
 1. **Local Panel detection** — If a `gowave.service` is active on this host, its domain is read from
    NGINX config, `state.json`, or `.env` and offered for confirmation.
 2. **Panel address entry** — If no local Panel is found or the operator declines it, the Panel
-   address (domain or IP) is prompted.
+   domain is prompted. An address is not accepted: the certificate the Panel serves names its
+   domain, so a bare IP offers nothing to verify.
 3. **Panel API verification** — Before any SSH credentials are collected or the Worker is mutated,
    the Panel API is verified:
-   - For `127.0.0.1`/`localhost`: HTTP to `:3000/api/health`
-   - For remote addresses: HTTPS to `:3000/api/health` with TLS certificate validation against the
-     system CA bundle; if validation fails, the certificate fingerprint (SHA-256) is displayed and
-     the operator must explicitly confirm it.
-   - A wrong target, an unverified certificate without confirmation, or a plaintext remote address
-     are all rejected before any Worker access or credential transmission.
+   - For a Panel running on this host, and for `127.0.0.1`/`localhost`: plaintext HTTP to
+     `127.0.0.1:3000/api/system/health`. The Panel itself speaks plaintext on 3000; TLS is
+     terminated by the NGINX in front of it.
+   - For a remote domain: HTTPS to `https://<domain>/api/system/health` on 443, validated against
+     the system CA bundle. If validation fails, the certificate fingerprint (SHA-256) is displayed
+     and the operator must confirm it; the certificate is read again after the answer, and a
+     changed one refuses the request.
+   - A bare IP address is refused: the certificate names the Panel's domain, and the stream
+     demultiplexer answers a connection carrying no name from the decoy, so an address has no
+     identity to verify.
+   - A wrong target, an unverified certificate without confirmation, a bare address, and an
+     unreachable API are all rejected before any Worker access or credential transmission.
 4. **Worker details** — Worker name, IP, domain, and camouflage domain are prompted.
 5. **Onboarding** — The Worker is registered via the Panel API and provisioned over SSH with
    temporary key authorisation (same process as initial deployment).
