@@ -4,10 +4,15 @@
 The remote side is stubbed at the `ssh_bootstrap_exec` seam, so the test
 observes the order of timer, key and revoke payloads without a network.
 """
+import fcntl
 import os
+import pty
+import select
 import shlex
 import subprocess
 import tempfile
+import termios
+import time
 import unittest
 from pathlib import Path
 
@@ -29,6 +34,9 @@ def bash(script, stdin="", env=None):
         capture_output=True,
         env=merged,
         timeout=120,
+        # A run under a terminal would let a prompt bind to the runner's tty
+        # instead of the captured stream; these cases assert the fallback path.
+        start_new_session=True,
     )
 
 
@@ -66,6 +74,138 @@ class TestFingerprintConfirmation(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "ACCEPTED")
+        self.assertNotIn("presents", result.stderr,
+                         "a provided fingerprint must not be asked for again")
+
+    def test_the_prompt_presents_the_fingerprint_the_host_offers(self):
+        """Spec interactive-deployment: the flow presents the fingerprint it asks for.
+
+        The confirmation only means something when the operator can compare the
+        value the host offers with the one the provider's console shows. Asking
+        for it blind — as the flow did until 2026-11-23 — demands a value nobody
+        can know, and a live onboarding died on it with
+        "phase: confirm_fingerprint".
+        """
+        result = bash(
+            SOURCE
+            + "if ssh_bootstrap_confirm_fingerprint worker.example.com 'SHA256:scanned';"
+            " then echo ACCEPTED; else echo REFUSED; fi\n",
+            stdin="SHA256:scanned\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ACCEPTED", result.stdout)
+        self.assertIn("SHA256:scanned", result.stderr,
+                      "the flow asked for a fingerprint it never displayed")
+
+    def test_a_mismatch_reason_is_not_glued_to_the_prompt(self):
+        """The summary quotes the last stderr line as the reason.
+
+        The prompt carries no trailing newline, so an answer that does not match
+        used to leave "Type the SHA-256 fingerprint ...: The fingerprint does not
+        match" as one line — a reason that opens with the question it answers.
+        """
+        result = bash(
+            SOURCE
+            + "if ssh_bootstrap_confirm_fingerprint worker.example.com 'SHA256:scanned';"
+            " then echo ACCEPTED; else echo REFUSED; fi\n",
+            stdin="SHA256:typed\n",
+        )
+        self.assertIn("REFUSED", result.stdout)
+        reason = [line for line in result.stderr.splitlines() if "does not match" in line]
+        self.assertTrue(reason, result.stderr)
+        self.assertNotIn("in full:", reason[-1],
+                         "the reported reason repeats the prompt instead of the failure")
+
+
+class TestPromptStreams(unittest.TestCase):
+    """Onboarding captures each node's stderr, so a prompt must own the terminal.
+
+    `wizard_onboard_nodes` runs the per-node body with `2>"$stderr_file"` to keep
+    the phase and the failure reason. A prompt written to fd 2 therefore lands in
+    that file, and the run waits for an answer the operator was never asked for.
+    These cases drive the real function over a pseudo-terminal and check that the
+    question appears there while the captured stderr stays a diagnostic stream.
+    """
+
+    @staticmethod
+    def _attach_controlling_terminal():
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+    @staticmethod
+    def _read_until(fd, marker, timeout=20.0):
+        deadline = time.time() + timeout
+        buffer = b""
+        while marker not in buffer:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise AssertionError(f"timed out waiting for {marker!r}; read {buffer!r}")
+            ready, _, _ = select.select([fd], [], [], min(0.2, remaining))
+            if not ready:
+                continue
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                raise AssertionError(f"stream closed while waiting for {marker!r}; read {buffer!r}")
+            buffer += chunk
+        return buffer
+
+    def _run_on_pty(self, script, exchanges, stderr_path):
+        merged = dict(os.environ)
+        merged.pop("GOWAVE_SSH_PASSWORD_FILE", None)
+        merged.pop("GOWAVE_SSH_FINGERPRINT", None)
+        master, slave = pty.openpty()
+        with open(stderr_path, "wb") as captured:
+            process = subprocess.Popen(
+                ["bash", "-c", script],
+                stdin=slave, stdout=slave, stderr=captured,
+                env=merged,
+                preexec_fn=self._attach_controlling_terminal,
+            )
+        os.close(slave)
+        seen = b""
+        try:
+            for answer, marker in exchanges:
+                seen += self._read_until(master, marker)
+                os.write(master, answer)
+            seen += self._read_until(master, b"RC=")
+            process.wait(timeout=20)
+        finally:
+            os.close(master)
+        return seen, process
+
+    def test_the_fingerprint_prompt_owns_the_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            captured = Path(directory) / "stderr"
+            seen, process = self._run_on_pty(
+                SOURCE + "ssh_bootstrap_confirm_fingerprint worker.example.com 'SHA256:scanned'\n"
+                "echo RC=$?\n",
+                [(b"SHA256:scanned\n", b"in full:")],
+                captured,
+            )
+            self.assertEqual(process.returncode, 0, seen)
+            self.assertIn(b"SHA256:scanned", seen,
+                          "the prompt hid the fingerprint it asked for")
+            self.assertIn(b"RC=0", seen)
+            self.assertNotIn(b"in full:", captured.read_bytes(),
+                             "the question was written into the captured stream")
+
+    def test_the_password_prompt_owns_the_terminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            captured = Path(directory) / "stderr"
+            seen, process = self._run_on_pty(
+                SOURCE + "GOWAVE_SSH_TEMP_ROOT=$(mktemp -d)\n"
+                "file=$(ssh_bootstrap_prepare_password worker.example.com)\n"
+                "cat \"$file\"\n"
+                "echo\n"
+                "echo RC=$?\n",
+                [(b"secretpw\n", b"SSH password")],
+                captured,
+            )
+            self.assertEqual(process.returncode, 0, seen)
+            self.assertIn(b"secretpw", seen)
+            self.assertIn(b"RC=0", seen)
+            self.assertNotIn(b"SSH password", captured.read_bytes(),
+                             "the password prompt was written into the captured stream")
 
 
 class TestHostKeyScan(unittest.TestCase):
