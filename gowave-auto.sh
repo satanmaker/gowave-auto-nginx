@@ -674,9 +674,13 @@ existing_cc = existing_state.get("congestionControl", "bbr")
 # nothing keeps the answer an earlier run stored, so a positional rerun cannot
 # erase a label the operator already confirmed.
 previous_local_country = ""
+previous_local_hosts = []
 for known in existing_state.get("nodes") or []:
     if isinstance(known, dict) and known.get("name") == local_node_name:
         previous_local_country = str(known.get("country") or "")
+        recorded_hosts = known.get("hostUuids")
+        if isinstance(recorded_hosts, list):
+            previous_local_hosts = [str(u) for u in recorded_hosts if u]
 local_country = confirmed_country(
     os.environ.get("GOWAVE_LOCAL_COUNTRY"), previous_local_country
 )
@@ -744,9 +748,10 @@ squad_uuid = client.provision_internal_squad("Default MVP Squad", inbound_uuids)
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
 
-client.provision_hosts(
+host_uuids = client.provision_hosts(
     profile_uuid, inbounds, node_uuid, squad_uuid,
-    panel_domain, reality_domain, node_name=local_node_name, vision_domain=vision_domain
+    panel_domain, reality_domain, node_name=local_node_name, vision_domain=vision_domain,
+    known_host_uuids=previous_local_hosts,
 )
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
@@ -769,6 +774,10 @@ local_node_entry = {
 }
 if local_country:
     local_node_entry["country"] = local_country
+if host_uuids:
+    # The records this run owns. The next run reconciles by these identities
+    # first, so a label that moved does not turn into a second set of Hosts.
+    local_node_entry["hostUuids"] = list(host_uuids)
 
 state = {
     "schemaVersion": 2,
@@ -1119,12 +1128,18 @@ if not isinstance(nodes, list):
 # — a positional `node add`, a retry with no terminal — keeps that answer rather
 # than dropping the operator's confirmed label from the managed identity.
 previous_country = ""
-for known in nodes:
+previous_hosts = []
+existing_index = None
+for index, known in enumerate(nodes):
     if not isinstance(known, dict) or known.get("name") != name:
         continue
     # The same node answering again: the retry keeps its uuid and its address.
     if str(known.get("address") or "") == address:
         previous_country = str(known.get("country") or "")
+        recorded_hosts = known.get("hostUuids")
+        if isinstance(recorded_hosts, list):
+            previous_hosts = [str(u) for u in recorded_hosts if u]
+        existing_index = index
         break
     raise SystemExit(
         f"state.json already registers the name {name} for the node at "
@@ -1207,10 +1222,11 @@ state_data["squadUuid"] = squad_uuid
 client.attach_squad_to_user("default-user", squad_uuid)
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
-client.provision_hosts(
+host_uuids = client.provision_hosts(
     profile_uuid, inbounds, node_uuid, squad_uuid,
     worker_domain, reality_domain, name,
-    vision_domain=vision_domain or None
+    vision_domain=vision_domain or None,
+    known_host_uuids=previous_hosts,
 )
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
@@ -1227,7 +1243,19 @@ if vision_domain:
     node_entry["visionDomain"] = vision_domain
 if node_country:
     node_entry["country"] = node_country
-nodes.append(node_entry)
+if host_uuids:
+    node_entry["hostUuids"] = list(host_uuids)
+# A retry of a node this file already registers updates that record. Appending a
+# second entry for one identity would make every later read of `nodes` ambiguous
+# about which record is the node, and would lose whatever the retry did not
+# restate.
+if existing_index is not None:
+    merged = {**nodes[existing_index], **node_entry}
+    if "visionDomain" not in node_entry:
+        merged.pop("visionDomain", None)
+    nodes[existing_index] = merged
+else:
+    nodes.append(node_entry)
 state_data["nodes"] = nodes
 atomic_write_state(state_data, state_path)
 

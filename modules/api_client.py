@@ -152,6 +152,41 @@ class GoWaveNodeNameTaken(GoWaveAPIError):
     """
 
 
+class GoWaveHostConflict(GoWaveAPIError):
+    """A Host record this run would have to relabel cannot be proven its own.
+
+    A remark is a label: the wizard writes a country flag and a node name into
+    it, so it changes between runs, and an operator can type one by hand. A
+    record that no recorded UUID and no unique inbound/node pairing claims is
+    therefore left alone, and the run stops before it writes a duplicate or
+    adopts a stranger's Host.
+    """
+
+
+def host_ownership(record):
+    """The pairing that proves a Host belongs to one inbound of one node.
+
+    ``None`` when the record does not carry all three parts: a partial pairing
+    matches too much to be a proof of ownership.
+    """
+    if not isinstance(record, dict):
+        return None
+    inbound = record.get("inbound")
+    inbound = inbound if isinstance(inbound, dict) else {}
+    profile = str(inbound.get("configProfileUuid") or "")
+    inbound_uuid = str(inbound.get("configProfileInboundUuid") or "")
+    node_ids = []
+    for item in record.get("nodes") or []:
+        if isinstance(item, dict):
+            node_ids.append(str(item.get("uuid") or item.get("id") or ""))
+        else:
+            node_ids.append(str(item))
+    node_ids = tuple(sorted(node_id for node_id in node_ids if node_id))
+    if not (profile and inbound_uuid and node_ids):
+        return None
+    return (profile, inbound_uuid, node_ids)
+
+
 def _extract_list(res, key):
     data = res.get("response", res) if isinstance(res, dict) else res
     if isinstance(data, list):
@@ -688,16 +723,18 @@ class GoWaveClient:
 
         return squad_uuid
 
-    def provision_hosts(self, profile_uuid, inbounds_list, node_uuid, squad_uuid, panel_domain, reality_domain, node_name="local-node", vision_domain=None):
+    def provision_hosts(self, profile_uuid, inbounds_list, node_uuid, squad_uuid, panel_domain, reality_domain, node_name="local-node", vision_domain=None, known_host_uuids=None):
         proto_map = host_projection(panel_domain, reality_domain, node_name, vision_domain)
 
-        # Check existing hosts
+        # Every Host the Panel holds is considered, because the remark is a label
+        # and not an identity: it carries the country flag and the node name the
+        # wizard confirmed, so a relabelled node arrives here with remarks that no
+        # existing record holds, and a hand-typed remark can equal ours.
         hosts_res = self.request("GET", "/api/hosts")
         existing_hosts = _extract_list(hosts_res, "hosts")
-        existing_by_remark = {}
-        if isinstance(existing_hosts, list):
-            for h in existing_hosts:
-                existing_by_remark[h.get("remark")] = h
+        if not isinstance(existing_hosts, list):
+            existing_hosts = []
+        recorded = {str(u) for u in (known_host_uuids or []) if u}
 
         created_host_uuids = []
         for inb in inbounds_list:
@@ -739,8 +776,8 @@ class GoWaveClient:
             if "mihomoX25519" in cfg:
                 payload["mihomoX25519"] = cfg["mihomoX25519"]
 
-            if remark in existing_by_remark:
-                existing = existing_by_remark[remark]
+            existing = self._owned_host(existing_hosts, payload, recorded)
+            if existing is not None:
                 host_uuid = existing.get("uuid")
                 before_fields = [
                     "inbound", "nodes", "remark", "address", "port", "sni",
@@ -766,6 +803,40 @@ class GoWaveClient:
             created_host_uuids.append(host_uuid)
 
         return created_host_uuids
+
+    def _owned_host(self, existing_hosts, payload, recorded):
+        """The existing Host this payload relabels, or ``None`` to create one.
+
+        A recorded UUID settles the question even when two records claim the same
+        inbound: the operator's own identity outranks a pairing. Without one, the
+        pairing must be unique. Anything else is a conflict this run refuses to
+        resolve by guessing, and a remark that already exists on a record it
+        cannot claim is a conflict too — writing a second Host with the same label
+        would leave two entries nothing can tell apart afterwards.
+        """
+        wanted = host_ownership(payload)
+        matches = [h for h in existing_hosts if wanted is not None and host_ownership(h) == wanted]
+        chosen = next((h for h in matches if str(h.get("uuid")) in recorded), None)
+        if chosen is None and len(matches) > 1:
+            listed = ", ".join(sorted(str(h.get("uuid")) for h in matches))
+            raise GoWaveHostConflict(
+                f"{len(matches)} Host records claim inbound "
+                f"{payload['inbound']['configProfileInboundUuid']} on node "
+                f"{', '.join(payload['nodes'])}; refusing to relabel any of them "
+                f"({listed}) until the duplicates are resolved."
+            )
+        if chosen is None and matches:
+            chosen = matches[0]
+        if chosen is None:
+            taken = [h for h in existing_hosts if h.get("remark") == payload["remark"]]
+            if taken:
+                held_by = sorted(str(h.get("uuid")) for h in taken)
+                raise GoWaveHostConflict(
+                    f"The remark {payload['remark']!r} is held by Host "
+                    f"{', '.join(held_by)}, which this run cannot prove it manages; "
+                    "rename or remove that Host before retrying."
+                )
+        return chosen
 
     def provision_user(self, username, squad_uuid, expire_at="2099-01-01T00:00:00.000Z"):
         # Check existing user

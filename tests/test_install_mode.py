@@ -98,6 +98,8 @@ class GoWaveClient:
 
     def provision_hosts(self, profile_uuid, inbounds, node_uuid, squad_uuid, *args, **kwargs):
         _log("provision_hosts", squad_uuid)
+        if kwargs.get("known_host_uuids"):
+            _log("provision_hosts_known", *kwargs["known_host_uuids"])
         return ["host-stub"]
 
     def provision_user(self, username, squad_uuid, **kwargs):
@@ -402,6 +404,17 @@ class TestInstallProvisioning(unittest.TestCase):
         self.assertEqual(document["squadUuid"], "squad-stub")
         self.assertEqual([node["name"] for node in document["nodes"]], ["local-node"])
 
+    def test_the_state_records_the_hosts_the_run_owns(self):
+        finished, calls, state, _credentials = self.run_install_heredoc("all-in-one")
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        document = json.loads(state)
+        self.assertEqual(document["nodes"][0]["hostUuids"], ["host-stub"])
+        self.assertEqual(
+            [call["name"] for call in calls if call["name"] == "provision_hosts_known"],
+            [],
+            "a first install has no recorded Hosts to reconcile",
+        )
+
     def test_panel_only_stops_after_admin_token_and_default_user(self):
         finished, calls, state, credentials = self.run_install_heredoc("panel-only")
         self.assertEqual(finished.returncode, 0, finished.stderr)
@@ -482,6 +495,28 @@ class TestNodeSquadProvisioning(unittest.TestCase):
         self.assertEqual(attach[0]["args"], ["'default-user'", "'squad-new'"])
         self.assertLess(order.index("provision_internal_squad"), order.index("attach_squad_to_user"))
         self.assertLess(order.index("attach_squad_to_user"), order.index("provision_hosts"))
+
+    def test_a_retry_reconciles_the_hosts_and_the_country_it_recorded(self):
+        recorded = {
+            "schemaVersion": 2,
+            "installationMode": "all-in-one",
+            "nodes": [{
+                "name": "worker-1",
+                "address": "203.0.113.10",
+                "port": 3002,
+                "uuid": "node-1",
+                "country": "DE",
+                "hostUuids": ["host-old"],
+            }],
+        }
+        finished, calls, state = self.run_node_add(recorded, "squad-new")
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        known = [call for call in calls if call["name"] == "provision_hosts_known"]
+        self.assertEqual([call["args"] for call in known], [["'host-old'"]])
+        entry = json.loads(state)["nodes"][0]
+        self.assertEqual(len(json.loads(state)["nodes"]), 1, "a retry updates its record, it does not add one")
+        self.assertEqual(entry["hostUuids"], ["host-stub"])
+        self.assertEqual(entry["country"], "DE", "a run that asked nothing keeps the confirmed country")
 
     def test_an_already_assigned_user_does_not_stop_the_worker(self):
         # An All-in-One node add finds the user already holding the squad, so the

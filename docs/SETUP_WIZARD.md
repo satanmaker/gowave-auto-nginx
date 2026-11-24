@@ -261,6 +261,13 @@ host asks nothing because it runs no traffic node of its own; its Workers are as
 onboarded. The plan review names the country as still to come rather than opening SSH to a server
 before the operator starts the deployment.
 
+The label is carried by the node's Host records, so changing it — a country, a node name — updates
+the records the deployment already published instead of adding a second set. The deployment
+recognises its own Hosts by the UUIDs it recorded in `state.json` and, for records written before it
+kept them, by the profile inbound and node they belong to; a remark on its own proves nothing. A
+Host it cannot claim that way stops the run and names it, and the rollback puts the previous labels
+back, so a refused relabel leaves the Panel as it was.
+
 ## Temporary SSH access for remote nodes
 
 The wizard authorises an Ed25519 key on a Worker only after the operator types the Worker's host-key

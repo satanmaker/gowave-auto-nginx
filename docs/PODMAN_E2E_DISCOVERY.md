@@ -179,11 +179,11 @@ creating a second one.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| authentication | `POST /api/auth/register` | `internal/server/server.go:514` | `modules/api_client.py:350` `register_initial_admin` |
-| authentication | `POST /api/auth/login` | `internal/server/server.go:513` | `modules/api_client.py:362` `login` |
-| authentication | `POST /api/tokens` | `internal/server/server.go:534` | `modules/api_client.py:851` `issue_api_token` |
-| authentication | `GET /api/tokens` | `internal/server/server.go:533` | `modules/api_client.py:875` `ensure_api_token` |
-| authentication | `DELETE /api/tokens/{uuid}` | `internal/server/server.go:535` | `modules/api_client.py:860` `delete_token` |
+| authentication | `POST /api/auth/register` | `internal/server/server.go:514` | `modules/api_client.py:385` `register_initial_admin` |
+| authentication | `POST /api/auth/login` | `internal/server/server.go:513` | `modules/api_client.py:397` `login` |
+| authentication | `POST /api/tokens` | `internal/server/server.go:534` | `modules/api_client.py:922` `issue_api_token` |
+| authentication | `GET /api/tokens` | `internal/server/server.go:533` | `modules/api_client.py:946` `ensure_api_token` |
+| authentication | `DELETE /api/tokens/{uuid}` | `internal/server/server.go:535` | `modules/api_client.py:931` `delete_token` |
 
 **Node registration.** The node record and its REALITY key material are made
 through the Panel, which is why `AIO-INSTALL`, `AIO-IDEMPOTENT` and `MN-INSTALL`
@@ -193,11 +193,11 @@ provisions the Worker.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| node registration | `GET /api/system/tools/x25519/generate` | `internal/stubs/stubs.go:218` | `modules/api_client.py:373` `generate_x25519` |
-| node registration | `GET /api/nodes` | `internal/server/server.go:590` | `modules/api_client.py:605` `associate_node` |
-| node registration | `POST /api/nodes` | `internal/server/server.go:593` | `modules/api_client.py:656` `associate_node` |
-| node registration | `PATCH /api/nodes/{uuid}` | `internal/server/server.go:599` | `modules/api_client.py:613` `associate_node` |
-| node registration | `DELETE /api/nodes/{uuid}` | `internal/server/server.go:600` | `modules/api_client.py:913` `delete_node` |
+| node registration | `GET /api/system/tools/x25519/generate` | `internal/stubs/stubs.go:218` | `modules/api_client.py:408` `generate_x25519` |
+| node registration | `GET /api/nodes` | `internal/server/server.go:590` | `modules/api_client.py:640` `associate_node` |
+| node registration | `POST /api/nodes` | `internal/server/server.go:593` | `modules/api_client.py:691` `associate_node` |
+| node registration | `PATCH /api/nodes/{uuid}` | `internal/server/server.go:599` | `modules/api_client.py:648` `associate_node` |
+| node registration | `DELETE /api/nodes/{uuid}` | `internal/server/server.go:600` | `modules/api_client.py:984` `delete_node` |
 
 **Provisioning.** Hosts, internal squads and config profiles are the Panel
 objects an install creates before a client can be served: the host record links
@@ -209,20 +209,20 @@ through `rollback_provisioning`.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| provisioning | `GET /api/hosts` | `internal/server/server.go:612` | `modules/api_client.py:695` `provision_hosts` |
-| provisioning | `POST /api/hosts` | `internal/server/server.go:613` | `modules/api_client.py:761` `provision_hosts` |
-| provisioning | `PATCH /api/hosts` | `internal/server/server.go:615` | `modules/api_client.py:758` `provision_hosts` |
-| provisioning | `DELETE /api/hosts/{uuid}` | `internal/server/server.go:616` | `modules/api_client.py:897` `delete_host` |
-| provisioning | `GET /api/internal-squads` | `internal/server/server.go:638` | `modules/api_client.py:665` `provision_internal_squad` |
-| provisioning | `POST /api/internal-squads` | `internal/server/server.go:639` | `modules/api_client.py:684` `provision_internal_squad` |
-| provisioning | `PATCH /api/internal-squads` | `internal/server/server.go:641` | `modules/api_client.py:681` `provision_internal_squad` |
-| provisioning | `DELETE /api/internal-squads/{uuid}` | `internal/server/server.go:642` | `modules/api_client.py:905` `delete_internal_squad` |
-| provisioning | `GET /api/config-profiles` | `internal/server/server.go:628` | `modules/api_client.py:529` `provision_config_profile` |
-| provisioning | `POST /api/config-profiles` | `internal/server/server.go:629` | `modules/api_client.py:551` `provision_config_profile` |
-| provisioning | `PATCH /api/config-profiles/{uuid}` | `internal/server/server.go:632` | `modules/api_client.py:547` `provision_config_profile` |
-| provisioning | `DELETE /api/config-profiles/{uuid}` | `internal/server/server.go:633` | `modules/api_client.py:921` `delete_config_profile` |
-| provisioning | `GET /api/config-profiles/{uuid}/inbounds` | `internal/server/server.go:635` | `modules/api_client.py:574` `provision_config_profile` |
-| provisioning | `GET /api/config-profiles/{uuid}/computed-config` | `internal/server/server.go:636` | `modules/api_client.py:557` `provision_config_profile` |
+| provisioning | `GET /api/hosts` | `internal/server/server.go:612` | `modules/api_client.py:733` `provision_hosts` |
+| provisioning | `POST /api/hosts` | `internal/server/server.go:613` | `modules/api_client.py:798` `provision_hosts` |
+| provisioning | `PATCH /api/hosts` | `internal/server/server.go:615` | `modules/api_client.py:795` `provision_hosts` |
+| provisioning | `DELETE /api/hosts/{uuid}` | `internal/server/server.go:616` | `modules/api_client.py:968` `delete_host` |
+| provisioning | `GET /api/internal-squads` | `internal/server/server.go:638` | `modules/api_client.py:700` `provision_internal_squad` |
+| provisioning | `POST /api/internal-squads` | `internal/server/server.go:639` | `modules/api_client.py:719` `provision_internal_squad` |
+| provisioning | `PATCH /api/internal-squads` | `internal/server/server.go:641` | `modules/api_client.py:716` `provision_internal_squad` |
+| provisioning | `DELETE /api/internal-squads/{uuid}` | `internal/server/server.go:642` | `modules/api_client.py:976` `delete_internal_squad` |
+| provisioning | `GET /api/config-profiles` | `internal/server/server.go:628` | `modules/api_client.py:564` `provision_config_profile` |
+| provisioning | `POST /api/config-profiles` | `internal/server/server.go:629` | `modules/api_client.py:586` `provision_config_profile` |
+| provisioning | `PATCH /api/config-profiles/{uuid}` | `internal/server/server.go:632` | `modules/api_client.py:582` `provision_config_profile` |
+| provisioning | `DELETE /api/config-profiles/{uuid}` | `internal/server/server.go:633` | `modules/api_client.py:992` `delete_config_profile` |
+| provisioning | `GET /api/config-profiles/{uuid}/inbounds` | `internal/server/server.go:635` | `modules/api_client.py:609` `provision_config_profile` |
+| provisioning | `GET /api/config-profiles/{uuid}/computed-config` | `internal/server/server.go:636` | `modules/api_client.py:592` `provision_config_profile` |
 
 **Client lifecycle.** A client is a Panel user with a subscription: `AIO-CLIENT`
 creates one and fetches its links, `AIO-REVOKE` and `MN-REVOKE` delete one and
@@ -232,25 +232,25 @@ duplicating it.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| client lifecycle | `POST /api/users` | `internal/server/server.go:554` | `modules/api_client.py:794` `provision_user` |
-| client lifecycle | `GET /api/users/by-username/{username}` | `internal/server/server.go:581` | `modules/api_client.py:773` `provision_user` |
-| client lifecycle | `DELETE /api/users/{userId}` | `internal/server/server.go:579` | `modules/api_client.py:889` `delete_user` |
+| client lifecycle | `POST /api/users` | `internal/server/server.go:554` | `modules/api_client.py:865` `provision_user` |
+| client lifecycle | `GET /api/users/by-username/{username}` | `internal/server/server.go:581` | `modules/api_client.py:844` `provision_user` |
+| client lifecycle | `DELETE /api/users/{userId}` | `internal/server/server.go:579` | `modules/api_client.py:960` `delete_user` |
 
 **Update operations.** The pinned Panel exposes an update for every object an
 install creates, and the suite drives the configuration one: the journal writes
 back the profile, node, squad and host it changed when it rolls a failed
-provisioning step back (`modules/api_client.py:1197`-`1184`), and
+provisioning step back (`modules/api_client.py:1303`-`1311`), and
 `provision_config_profile` patches an existing profile instead of replacing it.
 API-04's `configuration update` is that path.
 
 | Area | Endpoint | Declared at | Client caller |
 | --- | --- | --- | --- |
-| update | `PATCH /api/config-profiles/{uuid}` | `internal/server/server.go:632` | `modules/api_client.py:1233` `rollback_provisioning` |
-| update | `PATCH /api/nodes/{uuid}` | `internal/server/server.go:599` | `modules/api_client.py:1235` `rollback_provisioning` |
-| update | `PATCH /api/internal-squads` | `internal/server/server.go:641` | `modules/api_client.py:1237` `rollback_provisioning` |
-| update | `PATCH /api/hosts` | `internal/server/server.go:615` | `modules/api_client.py:1239` `rollback_provisioning` |
+| update | `PATCH /api/config-profiles/{uuid}` | `internal/server/server.go:632` | `modules/api_client.py:1304` `rollback_provisioning` |
+| update | `PATCH /api/nodes/{uuid}` | `internal/server/server.go:599` | `modules/api_client.py:1306` `rollback_provisioning` |
+| update | `PATCH /api/internal-squads` | `internal/server/server.go:641` | `modules/api_client.py:1308` `rollback_provisioning` |
+| update | `PATCH /api/hosts` | `internal/server/server.go:615` | `modules/api_client.py:1310` `rollback_provisioning` |
 | update | `PATCH /api/users` | `internal/server/server.go:555` | none — coverage gap, not `NOT_APPLICABLE` |
-| update | `PATCH /api/users/{userId}` | `internal/server/server.go:578` | `modules/api_client.py:833` `attach_squad_to_user`, `modules/api_client.py:1241` `rollback_provisioning` |
+| update | `PATCH /api/users/{userId}` | `internal/server/server.go:578` | `modules/api_client.py:904` `attach_squad_to_user`, `modules/api_client.py:1312` `rollback_provisioning` |
 
 **Subscription contracts.** A subscription is fetched without a token, by short
 UUID, so the route is the contract: one path per representation, the
