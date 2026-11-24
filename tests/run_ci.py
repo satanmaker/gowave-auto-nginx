@@ -66,6 +66,7 @@ SUITES = {
         "test_ssh_bootstrap.TestTimerGate",
         "test_ssh_bootstrap.TestOnboardingLifecycle",
         "test_ssh_bootstrap.TestPromptStreams",
+        "test_ssh_bootstrap.TestStageNotices",
         "test_nonroot_lint.TestNonrootLint",
         "test_nonroot_lint.TestShellFailurePaths",
         "test_backup_format_v1.TestBackupFormatV1",

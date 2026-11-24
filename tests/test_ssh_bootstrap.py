@@ -7,6 +7,7 @@ observes the order of timer, key and revoke payloads without a network.
 import fcntl
 import os
 import pty
+import re
 import select
 import shlex
 import subprocess
@@ -38,6 +39,54 @@ def bash(script, stdin="", env=None):
         # instead of the captured stream; these cases assert the fallback path.
         start_new_session=True,
     )
+
+
+def _attach_controlling_terminal():
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+
+def _read_until(fd, marker, timeout=20.0):
+    deadline = time.time() + timeout
+    buffer = b""
+    while marker not in buffer:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise AssertionError(f"timed out waiting for {marker!r}; read {buffer!r}")
+        ready, _, _ = select.select([fd], [], [], min(0.2, remaining))
+        if not ready:
+            continue
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            raise AssertionError(f"stream closed while waiting for {marker!r}; read {buffer!r}")
+        buffer += chunk
+    return buffer
+
+
+def _run_on_pty(script, exchanges, stderr_path, env=None):
+    merged = dict(os.environ)
+    merged.pop("GOWAVE_SSH_PASSWORD_FILE", None)
+    merged.pop("GOWAVE_SSH_FINGERPRINT", None)
+    merged.update(env or {})
+    master, slave = pty.openpty()
+    with open(stderr_path, "wb") as captured:
+        process = subprocess.Popen(
+            ["bash", "-c", script],
+            stdin=slave, stdout=slave, stderr=captured,
+            env=merged,
+            preexec_fn=_attach_controlling_terminal,
+        )
+    os.close(slave)
+    seen = b""
+    try:
+        for answer, marker in exchanges:
+            seen += _read_until(master, marker)
+            os.write(master, answer)
+        seen += _read_until(master, b"RC=")
+        process.wait(timeout=20)
+    finally:
+        os.close(master)
+    return seen, process
 
 
 class TestFingerprintConfirmation(unittest.TestCase):
@@ -129,49 +178,14 @@ class TestPromptStreams(unittest.TestCase):
 
     @staticmethod
     def _attach_controlling_terminal():
-        os.setsid()
-        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+        _attach_controlling_terminal()
 
     @staticmethod
     def _read_until(fd, marker, timeout=20.0):
-        deadline = time.time() + timeout
-        buffer = b""
-        while marker not in buffer:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                raise AssertionError(f"timed out waiting for {marker!r}; read {buffer!r}")
-            ready, _, _ = select.select([fd], [], [], min(0.2, remaining))
-            if not ready:
-                continue
-            chunk = os.read(fd, 4096)
-            if not chunk:
-                raise AssertionError(f"stream closed while waiting for {marker!r}; read {buffer!r}")
-            buffer += chunk
-        return buffer
+        return _read_until(fd, marker, timeout)
 
     def _run_on_pty(self, script, exchanges, stderr_path):
-        merged = dict(os.environ)
-        merged.pop("GOWAVE_SSH_PASSWORD_FILE", None)
-        merged.pop("GOWAVE_SSH_FINGERPRINT", None)
-        master, slave = pty.openpty()
-        with open(stderr_path, "wb") as captured:
-            process = subprocess.Popen(
-                ["bash", "-c", script],
-                stdin=slave, stdout=slave, stderr=captured,
-                env=merged,
-                preexec_fn=self._attach_controlling_terminal,
-            )
-        os.close(slave)
-        seen = b""
-        try:
-            for answer, marker in exchanges:
-                seen += self._read_until(master, marker)
-                os.write(master, answer)
-            seen += self._read_until(master, b"RC=")
-            process.wait(timeout=20)
-        finally:
-            os.close(master)
-        return seen, process
+        return _run_on_pty(script, exchanges, stderr_path)
 
     def test_the_fingerprint_prompt_owns_the_terminal(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -556,6 +570,161 @@ class TestOnboardingLifecycle(unittest.TestCase):
             "NODE add worker-one 10.1.2.3 node.example.com cdn.example.com",
             written,
         )
+
+
+class TestStageNotices(unittest.TestCase):
+    """A running step names its stage on the terminal, not only in the capture.
+
+    `wizard_onboard_nodes` prints a worker's captured output after the worker
+    returns, so a run that waits on SSH looks frozen. The notice is a catalog
+    sentence for a stage the code knows by name — the allowlist is the catalog,
+    not whatever a subprocess printed — and it must reach the operator before the
+    wait it describes, with no secret in it.
+    """
+
+    KEY_STUB = (
+        "ssh_bootstrap_prepare_key() { GOWAVE_SSH_TEMP_ROOT=$STUB_ROOT;"
+        " GOWAVE_SSH_KEY=$STUB_ROOT/id; : > \"$GOWAVE_SSH_KEY.pub\";"
+        " GOWAVE_SSH_KNOWN_HOSTS=$STUB_ROOT/known_hosts; : > \"$GOWAVE_SSH_KNOWN_HOSTS\"; }\n"
+    )
+
+    @staticmethod
+    def _env(**extra):
+        merged = dict(os.environ)
+        merged.pop("GOWAVE_SSH_PASSWORD_FILE", None)
+        merged.pop("GOWAVE_SSH_FINGERPRINT", None)
+        merged.update({key: str(value) for key, value in extra.items()})
+        return merged
+
+    def test_a_stage_reaches_the_terminal_while_its_step_is_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            release = Path(directory) / "release"
+            captured = Path(directory) / "stderr"
+            script = (
+                SOURCE
+                + self.KEY_STUB
+                + "ssh_bootstrap_scan() {"
+                ' while [ ! -e "$RELEASE" ]; do sleep 0.05; done; return 1; }\n'
+                "if ssh_bootstrap_onboard_one worker.example.com cdn.example.com; then"
+                " echo RESULT_OK; else echo RESULT_FAILED; fi\n"
+                "echo RC=0\n"
+            )
+            master, slave = pty.openpty()
+            try:
+                with open(captured, "wb") as sink:
+                    process = subprocess.Popen(
+                        ["bash", "-c", script],
+                        stdin=slave,
+                        stdout=slave,
+                        stderr=sink,
+                        env=self._env(STUB_ROOT=directory, RELEASE=release),
+                        preexec_fn=_attach_controlling_terminal,
+                    )
+                os.close(slave)
+                seen = _read_until(master, b"Reading the SSH host key of worker.example.com")
+                self.assertFalse(release.exists(), "the step ended before its stage was named")
+                release.touch()
+                seen += _read_until(master, b"RESULT_")
+                process.wait(timeout=20)
+            finally:
+                os.close(master)
+            self.assertIn(b"RESULT_FAILED", seen)
+            self.assertIn(b"PHASE:scan", captured.read_bytes())
+
+    def test_the_stage_sentence_follows_the_chosen_language(self):
+        seen, process = _run_on_pty(
+            SOURCE
+            + "_ssh_bootstrap_bind_terminal\n"
+            "ssh_bootstrap_phase_notice scan worker.example.com\n"
+            "echo RC=0\n",
+            [],
+            self._stderr_sink(),
+            env=self._env(GOWAVE_WIZARD_LANG="ru"),
+        )
+        self.assertEqual(process.returncode, 0, seen)
+        self.assertIn("Читаю SSH-ключ хоста worker.example.com".encode(), seen)
+
+    def test_a_stage_the_catalog_does_not_know_prints_nothing(self):
+        seen, process = _run_on_pty(
+            SOURCE
+            + "_ssh_bootstrap_bind_terminal\n"
+            "ssh_bootstrap_phase_notice not_a_stage worker.example.com\n"
+            "echo RC=0\n",
+            [],
+            self._stderr_sink(),
+        )
+        self.assertEqual(process.returncode, 0, seen)
+        self.assertNotIn(b"wizard.phase", seen)
+        self.assertNotIn(b"not_a_stage", seen)
+
+    def test_the_typed_password_is_not_echoed_and_lands_in_a_private_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = Path(directory) / "pointer"
+            seen, process = _run_on_pty(
+                SOURCE
+                + f"GOWAVE_SSH_TEMP_ROOT={shlex.quote(directory)}\n"
+                "ssh_bootstrap_prepare_password worker.example.com >"
+                f" {shlex.quote(str(pointer))}\n"
+                "echo RC=0\n",
+                [(b"hunter2\n", b"SSH password for worker.example.com")],
+                Path(directory) / "stderr",
+            )
+            self.assertEqual(process.returncode, 0, seen)
+            self.assertNotIn(b"hunter2", seen, "the terminal echoed the password")
+            secret = Path(pointer.read_text(encoding="utf-8"))
+            self.assertEqual(secret.read_text(encoding="utf-8"), "hunter2")
+            self.assertEqual(oct(secret.stat().st_mode & 0o777), "0o600")
+
+    def test_no_stage_or_prompt_line_carries_the_password(self):
+        with tempfile.TemporaryDirectory() as directory:
+            password = Path(directory) / "password"
+            password.write_text("s3cret-passphrase\n", encoding="utf-8")
+            password.chmod(0o600)
+            captured = Path(directory) / "stderr"
+            script = (
+                SOURCE
+                + self.KEY_STUB
+                + "ssh_bootstrap_scan() { echo 'worker.example.com ssh-ed25519 AAAA'; }\n"
+                "ssh_bootstrap_fingerprint() { echo 'SHA256:test'; }\n"
+                "ssh_bootstrap_confirm_fingerprint() { return 0; }\n"
+                "ssh_bootstrap_authorise() { return 0; }\n"
+                "ssh_bootstrap_start_agent() { return 0; }\n"
+                "ssh_bootstrap_stop_agent() { return 0; }\n"
+                "ssh_bootstrap_revoke() { return 0; }\n"
+                "wizard_resolve_ipv4() { echo 203.0.113.7; }\n"
+                "cmd_node() { printf 'NODE %s\\n' \"$*\"; return 0; }\n"
+                "ssh_bootstrap_onboard_one worker.example.com cdn.example.com || true\n"
+                "echo RC=0\n"
+            )
+            seen, process = _run_on_pty(
+                script,
+                [],
+                captured,
+                env=self._env(
+                    STUB_ROOT=directory, GOWAVE_SSH_PASSWORD_FILE=password
+                ),
+            )
+            self.assertEqual(process.returncode, 0, seen)
+            self.assertIn(b"Preparing a temporary key for worker.example.com", seen)
+            self.assertNotIn(b"s3cret-passphrase", seen)
+            self.assertNotIn(b"s3cret-passphrase", captured.read_bytes())
+
+    def test_every_reported_stage_has_a_sentence_in_both_catalogs(self):
+        source = SSH_BOOTSTRAP_SH.read_text(encoding="utf-8")
+        stages = sorted(set(re.findall(r'_ssh_phase "([a-z_]+)"', source)))
+        self.assertTrue(stages, "no stage is reported at all")
+        catalog = (REPO_ROOT / "modules" / "i18n.sh").read_text(encoding="utf-8")
+        self.assertIn("GOWAVE_I18N_RU", catalog)
+        english, russian = catalog.split("GOWAVE_I18N_RU", 1)
+        for stage in stages:
+            self.assertIn(f"[wizard.phase.{stage}]=", english, f"{stage} has no English sentence")
+            self.assertIn(f"[wizard.phase.{stage}]=", russian, f"{stage} has no Russian sentence")
+
+    def _stderr_sink(self):
+        handle = tempfile.NamedTemporaryFile(delete=False)
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        return Path(handle.name)
 
 
 if __name__ == "__main__":

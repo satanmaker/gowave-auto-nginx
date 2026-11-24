@@ -32,10 +32,39 @@ GOWAVE_SSH_LIFETIME_MINUTES=115
 # redirected still reads the input it was given.
 GOWAVE_SSH_PROMPT_OUT=/dev/stderr
 
+# Where an allowlisted stage notice writes.
+#
+# The whole point of the notice is that the operator sees the stage while the
+# step runs: onboarding captures each node's streams and prints them afterwards,
+# so a notice on stderr would arrive only once the wait it describes is over.
+# There is no terminal in a captured or non-interactive run, and then the
+# machine-readable `PHASE:<id>` marker on stderr is the whole record.
+GOWAVE_SSH_NOTICE_OUT=/dev/null
+
 _ssh_bootstrap_bind_terminal() {
     if { : >/dev/tty; } 2>/dev/null; then
         GOWAVE_SSH_PROMPT_OUT=/dev/tty
+        GOWAVE_SSH_NOTICE_OUT=/dev/tty
     fi
+    return 0
+}
+
+# Print the localized sentence for a stage id, and nothing for an id the
+# catalog does not know. The allowlist is the catalog itself: a stage reaches
+# the operator only because someone wrote its sentence in both languages,
+# never because a subprocess happened to print something.
+#
+# Args: stage id, node as the operator knows it
+ssh_bootstrap_phase_notice() {
+    local id="$1" node="$2"
+    local text
+    text="$(t "wizard.phase.$id")"
+    if [[ "$text" == "wizard.phase.$id" ]]; then
+        return 0
+    fi
+    # The format string is a catalog entry, never operator input.
+    # shellcheck disable=SC2059
+    printf "$text\n" "$node" > "$GOWAVE_SSH_NOTICE_OUT" 2>/dev/null || true
     return 0
 }
 
@@ -352,10 +381,15 @@ ssh_bootstrap_onboard_one() {
     local ip="" scanned="" expected="" password_file="" rc=0
     local phase=""
 
+    # The terminal is bound before the first stage so every notice below has
+    # somewhere the operator is actually looking.
+    _ssh_bootstrap_bind_terminal
+
     # Phase tracking: print phase markers to stderr for the caller to capture
     _ssh_phase() {
         phase="$1"
         printf 'PHASE:%s\n' "$phase" >&2
+        ssh_bootstrap_phase_notice "$phase" "$host"
     }
 
     _ssh_phase "prepare_key"
