@@ -1,10 +1,9 @@
 name: Lint and Nonroot Verification
 
+# A push to a feature branch is a draft; only a pull request into develop is gated.
 on:
-  push:
-    branches: [main, "feature/**"]
   pull_request:
-    branches: [main, "feature/**"]
+    branches: [develop]
   workflow_dispatch:
 
 permissions:

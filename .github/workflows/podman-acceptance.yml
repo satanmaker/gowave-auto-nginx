@@ -5,11 +5,10 @@ name: Podman Product Acceptance
 # They get their own workflow so a red acceptance run cannot hide behind the
 # fast lint contour, and so each product topology reports as its own check
 # rather than one aggregate the others could mask.
+# A push to a feature branch is a draft; only a pull request into develop is gated.
 on:
-  push:
-    branches: [main, "feature/**"]
   pull_request:
-    branches: [main, "feature/**"]
+    branches: [develop]
   workflow_dispatch:
 
 permissions:
