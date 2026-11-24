@@ -11,16 +11,16 @@ schema: gowave-podman-gates/v1
 repository: satanmaker/gowave-auto-nginx
 workflow: podman-acceptance.yml
 
-# The live shape of ruleset 27258177, copied rather than paraphrased, because
+# The live shape of ruleset 28024450, copied rather than paraphrased, because
 # `--live` compares these fields with what the API returns. `include` is exactly
-# the two branches: on any other ref the checks are informational only.
+# the integration line: on any other ref the checks are informational only, and
+# `main` is guarded by its own ruleset rather than by these five.
 ruleset:
-  id: 27258177
+  id: 28024450
   name: GoWave Podman acceptance
   enforcement: active
   include:
-    - refs/heads/main
-    - refs/heads/feature/podman-full-e2e
+    - refs/heads/develop
   do_not_enforce_on_create: false
   strict_required_status_checks_policy: false
   bypass_actors:
@@ -38,8 +38,9 @@ ruleset:
 # matrix the job proves; the audit reads them back out of the job's own command
 # line, so a job that runs the other topology fails here rather than in a
 # review. `events` is what the job's `if:` must allow: the three full suites run
-# on every push as well, the two recovery jobs only where a review can stop the
-# merge, because a push already spends the minutes on the full set.
+# on the two events that are a merge — the push that lands a feature branch on
+# `develop` and the pull request that asks for it. The two recovery jobs run on
+# the review only, because the push already spends the minutes on the full set.
 #
 # `timeout_minutes` has to outlive the suite it runs: the suite stops at the
 # `runtime_budget_seconds` the matrix declares and reports what it did not run,

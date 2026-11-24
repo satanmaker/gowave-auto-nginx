@@ -5,8 +5,15 @@ name: Podman Product Acceptance
 # They get their own workflow so a red acceptance run cannot hide behind the
 # fast lint contour, and so each product topology reports as its own check
 # rather than one aggregate the others could mask.
-# A push to a feature branch is a draft; only a pull request into develop is gated.
+# A push to a feature branch is a draft; nothing runs for it. What runs is the
+# merge into develop and the review before it: this workflow alone keeps the
+# push trigger because the ruleset publishes these five checks on `develop`
+# itself, and the merge from a feature branch is the push that lands there.
+# `tests/cases/gates.yaml` records that, and `gate --check` refuses a contract
+# whose checks promise an event this block does not subscribe to.
 on:
+  push:
+    branches: [develop]
   pull_request:
     branches: [develop]
   workflow_dispatch:
