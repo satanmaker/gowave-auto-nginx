@@ -782,34 +782,49 @@ sys.exit(0 if rollback_provisioning('$JOURNAL_FILE', '$STATE_FILE', '$CREDENTIAL
         cleanup_acme_snapshot "$acme_tx_id" "$vision_domain"
     fi
 
+    # A plan that still has nodes to onboard has not finished installing: the
+    # Panel reaches a serving state first, and "Installation Complete" over it
+    # was the banner an operator read while the run was still waiting on SSH.
+    # The Panel therefore gets its own line, and the completion banner below is
+    # reached only when nothing remains.
+    local nodes_planned=0
+    case "${GOWAVE_PLAN_VARIANT:-}" in
+        multi-node | panel-only) nodes_planned=1 ;;
+    esac
+
+    if (( nodes_planned == 1 )); then
+        wizard_panel_installed_notice "https://$panel_domain"
+        echo "Panel Web UI:        https://$panel_domain"
+        echo "Admin Username:      $admin_user"
+        echo "Saved Credentials:   $CREDENTIALS_FILE (mode 0600)"
+        echo ""
+        cmd_user_links default-user
+        echo ""
+        echo "Onboarding the planned remote nodes..."
+        local onboard_rc=0
+        wizard_onboard_nodes "https://$panel_domain" "127.0.0.1" "yes" || onboard_rc=$?
+        # Return code 2 means partial success (some nodes succeeded, some failed).
+        # The Panel deployment and the successful nodes are kept: this is not a
+        # rollback. The command still exits with that code so an operator, and
+        # anything driving the install, can tell it apart from a clean install
+        # (0) and from a failed Panel deployment (1). The summary above already
+        # names the failed stages and what to do next.
+        if (( onboard_rc != 0 )); then
+            return "$onboard_rc"
+        fi
+        echo ""
+    fi
+
     echo "================================================================================"
     echo "                   GoWave Auto NGINX Installation Complete                      "
     echo "================================================================================"
-    echo "Panel Web UI:        https://$panel_domain"
-    echo "Admin Username:      $admin_user"
-    echo "Saved Credentials:   $CREDENTIALS_FILE (mode 0600)"
-    echo ""
-    cmd_user_links default-user
-
-    case "${GOWAVE_PLAN_VARIANT:-}" in
-        multi-node | panel-only)
-            echo ""
-            echo "Onboarding the planned remote nodes..."
-            local onboard_rc=0
-            wizard_onboard_nodes || onboard_rc=$?
-            # Return code 2 means partial success (some nodes succeeded, some failed).
-            # The Panel deployment and the successful nodes are kept: this is not a
-            # rollback. The command still exits with that code so an operator, and
-            # anything driving the install, can tell it apart from a clean install
-            # (0) and from a failed Panel deployment (1).
-            if (( onboard_rc == 1 )); then
-                return 1
-            fi
-            if (( onboard_rc == 2 )); then
-                return 2
-            fi
-            ;;
-    esac
+    if (( nodes_planned == 0 )); then
+        echo "Panel Web UI:        https://$panel_domain"
+        echo "Admin Username:      $admin_user"
+        echo "Saved Credentials:   $CREDENTIALS_FILE (mode 0600)"
+        echo ""
+        cmd_user_links default-user
+    fi
 }
 
 # Compensate a failed `node add` on both sides and record what each one reached.
@@ -1802,7 +1817,28 @@ wizard_add_node_to_panel() {
     # the Worker's host-key fingerprint, the key is authorised with the password
     # and revoked when the registration ends. `node add` on its own cannot do
     # that — it requires the host key already pinned and key-only authentication.
-    ssh_bootstrap_onboard_one "$wdom" "$rdom" "" "$wname" "$wip"
+    #
+    # The outcome is this node's, not the Panel's: the Panel was installed
+    # before this action and its state is untouched here. A registration the
+    # Panel will not confirm is reported as what it is, never as a success.
+    local record="" state="" first="" second="" add_rc=0
+    _wizard_onboard_record record "$wdom" "$rdom" "" "$wname" "$wip" \
+        "$panel_domain" "$panel_is_local" || add_rc=$?
+    state=""
+    IFS=$'\t' read -r _ state first second <<< "$record"
+    case "$state" in
+        VERIFIED)
+            printf '%s\n' "$(tf wizard.add_node.result_verified "$wname" "$first" "$second")"
+            ;;
+        UNVERIFIED)
+            printf '%s\n' "$(tf wizard.add_node.result_unverified "$wname")"
+            ;;
+        *)
+            printf '%s\n' "$(tf wizard.add_node.result_failed "$wname" \
+                "${first:-unknown}" "$(_wizard_failure_reason "${first:-unknown}" "$second")")" >&2
+            ;;
+    esac
+    return "$add_rc"
 }
 
 # An interactive screen stays on screen until the operator acknowledges it: the

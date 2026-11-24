@@ -21,6 +21,11 @@ GOWAVE_SSH_MARKER=""
 GOWAVE_SSH_TIMER_ID=""
 GOWAVE_SSH_LIFETIME_MINUTES=115
 
+# The node API port `cmd_node add` registers. It is fixed in the entrypoint: a
+# Worker never shares the Panel's 3000, and a Worker on the Panel's own address
+# is forced to the same value.
+GOWAVE_SSH_NODE_PORT=3002
+
 # Where an interactive prompt writes.
 #
 # Onboarding captures each node's stderr into a file so the phase and the
@@ -450,6 +455,12 @@ ssh_bootstrap_onboard_one() {
     fi
 
     _ssh_phase "add_node"
+    # The identity `node add` is about to register, so the caller reads this
+    # node back by exactly the name, address and port the Panel was told. A
+    # marker rather than a second lookup: re-resolving the name here would
+    # compare the Panel against a different answer than the one it was given.
+    printf 'NODE-IDENTITY:%s\t%s\t%s\n' \
+        "${node_name:-$host}" "$ip" "$GOWAVE_SSH_NODE_PORT" >&2
     local -a add_args=(add "${node_name:-$host}" "$ip" "$host" "$camouflage")
     if [[ -n "$vision" ]]; then
         add_args=(add --vision-domain "$vision" "${node_name:-$host}" "$ip" "$host" "$camouflage")

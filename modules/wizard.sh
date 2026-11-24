@@ -1116,7 +1116,8 @@ wizard_apply_plan() {
     return 0
 }
 
-# The nodes the Panel already holds, one "name<TAB>address" per line.
+# The nodes the Panel already holds, one "name<TAB>address<TAB>port<TAB>uuid"
+# per line.
 #
 # Only a Panel on this host can be read: its bearer token lives in this host's
 # credentials file, and a remote Panel's token is not this installer's to hold.
@@ -1152,8 +1153,63 @@ except (GoWaveAPIError, OSError):
     raise SystemExit(1)
 for node in nodes:
     if isinstance(node, dict) and node.get("name"):
-        print("%s\t%s" % (node["name"], node.get("address") or "-"))
+        print("%s\t%s\t%s\t%s" % (
+            node["name"],
+            node.get("address") or "-",
+            node.get("port") or "-",
+            node.get("uuid") or "-",
+        ))
 PY
+}
+
+# Read one node back from the Panel that was just told about it.
+#
+# 0 — the Panel lists the name with a uuid, at the address and port the
+#     registration used; prints that uuid.
+# 1 — the Panel answered and the node is not there as registered; prints
+#     `missing`, or `moved<TAB>address<TAB>port` for the identity it holds.
+# 2 — no readable inventory here (a remote Panel, or a local one that did not
+#     answer), so nothing about this node was disproved.
+#
+# The Panel is the authority on what it registered: `node add` exiting 0 is a
+# claim about a command, and only this read makes it a claim about the Panel.
+wizard_verify_node_registration() {
+    local name="$1" address="${2:-}" port="${3:-}"
+    local panel_address="$4" panel_is_local="${5:-no}"
+    local inventory="" rc=0 line held_address held_port held_uuid reason
+
+    inventory=$(wizard_panel_inventory_names "$panel_address" "$panel_is_local") || rc=$?
+    if (( rc != 0 )); then
+        return 2
+    fi
+    if [[ -z "$name" ]]; then
+        printf 'missing'
+        return 1
+    fi
+    line=$(printf '%s\n' "$inventory" | awk -F'\t' -v want="$name" \
+        'tolower($1) == tolower(want) { print; exit }')
+    if [[ -z "$line" ]]; then
+        printf 'missing'
+        return 1
+    fi
+    IFS=$'\t' read -r _ held_address held_port held_uuid <<< "$line"
+    reason=""
+    if [[ -n "$address" && "$held_address" != "-" && "$held_address" != "$address" ]]; then
+        reason="moved"
+    fi
+    if [[ -n "$port" && "$held_port" != "-" && "$held_port" != "$port" ]]; then
+        reason="moved"
+    fi
+    if [[ -n "$reason" ]]; then
+        printf 'moved\t%s\t%s' "$held_address" "$held_port"
+        return 1
+    fi
+    if [[ -z "$held_uuid" || "$held_uuid" == "-" ]]; then
+        printf 'missing'
+        return 1
+    fi
+    printf '%s' "$held_uuid"
+    return 0
 }
 
 # Asks for the Worker name with the Panel's own inventory in hand.
@@ -1208,13 +1264,88 @@ wizard_missing_terminal() {
 
 # One worker at a time: the Panel host holds the mutation lock and the
 # temporary-access lifecycle is per host.
-# Returns 0 if all nodes succeeded, 1 if all nodes failed, 2 if partial success.
+#
+# Args: [panel display] [panel address] [panel is local]
+# Returns 0 if every node registered, 1 if none did, 2 if some did.
 # Prints a per-node summary to stdout.
 wizard_onboard_nodes() {
-    local i host camouflage vision label
+    local panel_display="${1:-}"
+    local panel_address="${2:-127.0.0.1}"
+    local panel_is_local="${3:-yes}"
+    local i host camouflage vision label state
     local -a node_results=()
     local any_succeeded=0 any_failed=0
-    local scratch stderr_file
+    local record=""
+
+    for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
+        host="${GOWAVE_PLAN_NODE_NAMES[$i]}"
+        camouflage="${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}"
+        vision="${GOWAVE_PLAN_NODE_VISION[$i]:-}"
+        label="${GOWAVE_PLAN_NODE_LABELS[$i]:-}"
+
+        record=""
+        if ! _wizard_onboard_record record "$host" "$camouflage" "$vision" "$label" "" \
+            "$panel_address" "$panel_is_local"; then
+            : # the record carries the outcome; the failing status is not needed here
+        fi
+        state=""
+        IFS=$'\t' read -r _ state _ _ <<< "$record"
+        node_results+=("$record")
+        if [[ "$state" == "FAILED" ]]; then
+            any_failed=1
+        else
+            any_succeeded=1
+        fi
+    done
+
+    # Print detailed summary
+    _print_onboarding_summary node_results "$panel_display"
+
+    # Store node results for potential retry
+    _store_node_results node_results
+
+    # Offer the retry only for the partial case: with every node failed there is
+    # nothing a per-node retry can add over running the installation again.
+    if (( any_succeeded > 0 && any_failed > 0 )); then
+        _offer_selective_retry node_results "$panel_address" "$panel_is_local"
+    fi
+
+    if (( any_succeeded == 0 )); then
+        return 1  # all failed
+    elif (( any_failed == 0 )); then
+        return 0  # all succeeded
+    else
+        return 2  # partial success
+    fi
+}
+
+# Run one Worker's onboarding and read the registration back from the Panel.
+#
+# The Worker's own output is printed for the operator (redacted); the outcome
+# travels in `result_var` as one tab-separated record:
+#
+#   <node>  VERIFIED    <uuid>          <address>:<port>
+#   <node>  UNVERIFIED  unreadable      <address>:<port>
+#   <node>  FAILED      <phase>         <reason>
+#
+# VERIFIED means the Panel's own node list answered with this name, address,
+# port and uuid. UNVERIFIED means the Panel could not be read from this host,
+# so nothing about the node was disproved — a remote Panel's token is not this
+# host's to hold. FAILED with phase `verify` means the Panel was read and does
+# not hold what `node add` just claimed, so the claim lost.
+#
+# The record is data because the summary localizes it; the display keeps the
+# Worker's lines, with the machine markers that carried the identity stripped.
+#
+# Args: result variable, node, camouflage, vision, label, address, panel
+# address, panel is local
+# Returns 0 for VERIFIED and UNVERIFIED, 1 for FAILED.
+_wizard_onboard_record() {
+    local -n record_out="$1"
+    local host="$2" camouflage="$3" vision="${4:-}" label="${5:-}" node_ip="${6:-}"
+    local panel_address="${7:-127.0.0.1}" panel_is_local="${8:-yes}"
+    local scratch stderr_file stdout_output stderr_output output result identity
+    local node_name node_address node_port phase detail readback readback_rc
 
     # A tracked scratch directory, not a bare file: the cleanup helper removes
     # the directory it is given, so handing it `dirname` of a /tmp file would
@@ -1226,73 +1357,89 @@ wizard_onboard_nodes() {
         track_temp_dir "$scratch"
     fi
 
-    for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
-        host="${GOWAVE_PLAN_NODE_NAMES[$i]}"
-        camouflage="${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}"
-        vision="${GOWAVE_PLAN_NODE_VISION[$i]:-}"
-        label="${GOWAVE_PLAN_NODE_LABELS[$i]:-}"
-
-        # Capture stdout and stderr separately to extract phase info
-        local stdout_output stderr_output
-        stdout_output=$(ssh_bootstrap_onboard_one "$host" "$camouflage" "$vision" "$label" 2>"$stderr_file")
-        local result=$?
-        stderr_output=$(cat "$stderr_file" 2>/dev/null || true)
-        : > "$stderr_file"
-
-        # Extract the last phase from stderr (PHASE: markers)
-        local failed_phase=""
-        if (( result != 0 )); then
-            failed_phase=$(printf '%s\n' "$stderr_output" | grep '^PHASE:' | tail -1 | cut -d: -f2)
-            [[ -n "$failed_phase" ]] || failed_phase="unknown"
-        fi
-
-        # Combine output for operator display
-        local output
-        output=$(printf '%s\n%s' "$stdout_output" "$stderr_output" | sed '/^PHASE:/d')
-
-        if (( result == 0 )); then
-            node_results+=("$host:SUCCESS")
-            any_succeeded=1
-        else
-            any_failed=1
-            # Extract a safe diagnostic from the output (last non-empty non-PHASE line)
-            local diagnostic
-            diagnostic=$(printf '%s\n' "$output" | grep -v '^==' | grep -v '^PHASE:' | tail -1)
-            [[ -n "$diagnostic" ]] || diagnostic="onboarding failed"
-            # Redact any potential secrets from diagnostic
-            diagnostic=$(_redact_secrets "$diagnostic")
-            node_results+=("$host:FAILED:phase=$failed_phase:$diagnostic")
-        fi
-
-        # Print the output so operator sees progress (redacted)
-        printf '%s\n' "$(_redact_secrets "$output")"
-    done
-
+    # The assignment is guarded rather than followed by `$?`: a bare failing
+    # assignment ends the run under `set -e` as soon as no caller happens to
+    # hold this function in a `||` list.
+    result=0
+    stdout_output=$(ssh_bootstrap_onboard_one "$host" "$camouflage" "$vision" "$label" "$node_ip" \
+        2>"$stderr_file") || result=$?
+    stderr_output=$(cat "$stderr_file" 2>/dev/null || true)
+    : > "$stderr_file"
     if declare -F release_temp_dir >/dev/null 2>&1; then
         release_temp_dir "$scratch"
     else
         rm -rf -- "$scratch"
     fi
 
-    # Print detailed summary
-    _print_onboarding_summary node_results
+    identity=$(printf '%s\n' "$stderr_output" | sed -n 's/^NODE-IDENTITY://p' | tail -1)
+    output=$(printf '%s\n%s' "$stdout_output" "$stderr_output" \
+        | sed -e '/^PHASE:/d' -e '/^NODE-IDENTITY:/d')
+    printf '%s\n' "$(_redact_secrets "$output")"
 
-    # Store node results for potential retry
-    _store_node_results node_results
-
-    # Offer the retry only for the partial case: with every node failed there is
-    # nothing a per-node retry can add over running the installation again.
-    if (( any_succeeded > 0 && any_failed > 0 )); then
-        _offer_selective_retry node_results
+    if (( result != 0 )); then
+        phase=$(printf '%s\n' "$stderr_output" | grep '^PHASE:' | tail -1 | cut -d: -f2)
+        [[ -n "$phase" ]] || phase="unknown"
+        detail=$(printf '%s\n' "$output" | grep -v '^==' | grep -v '^PHASE:' | tail -1)
+        [[ -n "$detail" ]] || detail="onboarding failed"
+        record_out=$(printf '%s\t%s\t%s\t%s' "$host" "FAILED" "$phase" "$(_redact_secrets "$detail")")
+        return 1
     fi
 
-    if (( any_succeeded == 0 )); then
-        return 1  # all failed
-    elif (( any_failed == 0 )); then
-        return 0  # all succeeded
+    node_name="${label:-$host}"
+    node_address=""
+    node_port=""
+    if [[ -n "$identity" ]]; then
+        IFS=$'\t' read -r node_name node_address node_port <<< "$identity"
+    fi
+    readback=""
+    readback_rc=0
+    readback=$(wizard_verify_node_registration "$node_name" "$node_address" "$node_port" \
+        "$panel_address" "$panel_is_local") || readback_rc=$?
+    case "$readback_rc" in
+        0)
+            record_out=$(printf '%s\t%s\t%s\t%s' "$host" "VERIFIED" "$readback" \
+                "${node_address}:${node_port}")
+            return 0
+            ;;
+        2)
+            record_out=$(printf '%s\t%s\t%s\t%s' "$host" "UNVERIFIED" "unreadable" \
+                "${node_address}:${node_port}")
+            return 0
+            ;;
+        *)
+            : # the Panel answered and contradicts the registration
+            ;;
+    esac
+    if [[ "$readback" == moved* ]]; then
+        detail="moved ${readback#moved$'\t'}"
+        detail="${detail//$'\t'/:}"
     else
-        return 2  # partial success
+        detail="missing"
     fi
+    record_out=$(printf '%s\t%s\t%s\t%s' "$host" "FAILED" "verify" "$detail")
+    return 1
+}
+
+# The operator-facing reason for a FAILED record: a localized sentence when the
+# Panel contradicted the registration, the Worker's own redacted line otherwise.
+_wizard_failure_reason() {
+    local phase="$1" detail="$2"
+    if [[ "$phase" == "verify" ]]; then
+        if [[ "$detail" == moved* ]]; then
+            printf '%s' "$(tf wizard.summary.moved "${detail#moved }")"
+        else
+            printf '%s' "$(t wizard.summary.not_listed)"
+        fi
+        return 0
+    fi
+    printf '%s' "$detail"
+}
+
+# The Panel step is done and the nodes are not: said in its own words, because
+# an "installation complete" banner over a node that still has to be onboarded
+# is the screen that made a running install look finished.
+wizard_panel_installed_notice() {
+    printf '%s\n' "$(tf wizard.summary.panel "$1")"
 }
 
 # Redact secrets from output.
@@ -1309,24 +1456,51 @@ _redact_secrets() {
 }
 
 # Print a detailed onboarding summary.
-# Args: array_name (reference to array of results)
+#
+# Each node is one line: the verified ones with the uuid the Panel answered
+# with, the unconfirmed ones as such, and the failed ones with the stage and a
+# reason the operator can act on. The count is what the install's completion
+# line depends on, and the last line says what to do next, because the summary
+# is the final screen of a run that stopped at a node.
+#
+# Args: array_name (reference to array of results), panel display
 _print_onboarding_summary() {
     local -n results="$1"
-    printf '\n=== Node Onboarding Summary ===\n'
-    local result
+    local panel_display="${2:-}"
+    local result host state first second reason
+    local verified=0 failed=0 total=0
+
+    printf '\n%s\n' "$(t wizard.summary.header)"
+    if [[ -n "$panel_display" ]]; then
+        printf '  %s\n' "$(tf wizard.summary.panel "$panel_display")"
+    fi
     for result in "${results[@]}"; do
-        if [[ "$result" == *:SUCCESS ]]; then
-            printf '  %s: %s\n' "${result%%:*}" "$(t wizard.summary.success)"
-        else
-            local host="${result%%:*}"
-            local rest="${result#*:}"
-            local phase="${rest#*phase=}"
-            phase="${phase%%:*}"
-            local diagnostic="${rest#*:}"
-            diagnostic="${diagnostic#*:}"
-            printf '  %s: %s (phase: %s, reason: %s)\n' "$host" "$(t wizard.summary.failed)" "$phase" "$diagnostic"
-        fi
+        total=$((total + 1))
+        IFS=$'\t' read -r host state first second <<< "$result"
+        case "$state" in
+            VERIFIED)
+                verified=$((verified + 1))
+                printf '  %s: %s\n' "$host" "$(tf wizard.summary.success "$first")"
+                ;;
+            UNVERIFIED)
+                printf '  %s: %s\n' "$host" "$(t wizard.summary.unverified)"
+                ;;
+            *)
+                failed=$((failed + 1))
+                reason=$(_wizard_failure_reason "$first" "$second")
+                printf '  %s: %s (phase: %s, reason: %s)\n' \
+                    "$host" "$(t wizard.summary.failed)" "$first" "$reason"
+                ;;
+        esac
     done
+    printf '  %s\n' "$(tf wizard.summary.count "$verified" "$total")"
+    if (( failed > 0 )); then
+        if (( verified > 0 )); then
+            printf '%s\n' "$(t wizard.summary.next_partial)"
+        else
+            printf '%s\n' "$(t wizard.summary.next_all_failed)"
+        fi
+    fi
 }
 
 # Store node results for potential retry.
@@ -1339,33 +1513,28 @@ _store_node_results() {
 }
 
 # Retry a single failed node.
-# Args: host
+# Args: host, panel address, panel is local
 _retry_single_node() {
-    local host="$1"
-    local i
+    local host="$1" panel_address="${2:-127.0.0.1}" panel_is_local="${3:-yes}"
+    local i state record
     for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
         if [[ "${GOWAVE_PLAN_NODE_NAMES[$i]}" == "$host" ]]; then
-            local camouflage="${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}"
-            local vision="${GOWAVE_PLAN_NODE_VISION[$i]:-}"
-            local label="${GOWAVE_PLAN_NODE_LABELS[$i]:-}"
-            local stdout_output stderr_output
-            local stderr_file
-            stderr_file=$(mktemp "${TMPDIR:-/tmp}/wizard_onboard_stderr.XXXXXX")
-            stdout_output=$(ssh_bootstrap_onboard_one "$host" "$camouflage" "$vision" "$label" 2>"$stderr_file")
-            local result=$?
-            stderr_output=$(cat "$stderr_file" 2>/dev/null || true)
-            rm -f "$stderr_file"
-
-            local output
-            output=$(printf '%s\n%s' "$stdout_output" "$stderr_output" | sed '/^PHASE:/d')
-            printf '%s\n' "$output"
-
-            if (( result == 0 )); then
-                printf '%s\n' "$(tf wizard.retry.succeeded "$host")"
-            else
-                printf '%s\n' "$(tf wizard.retry.failed "$host")" >&2
-            fi
-            return "$result"
+            record=""
+            _wizard_onboard_record record "$host" "${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}" \
+                "${GOWAVE_PLAN_NODE_VISION[$i]:-}" "${GOWAVE_PLAN_NODE_LABELS[$i]:-}" "" \
+                "$panel_address" "$panel_is_local" || true
+            state=""
+            IFS=$'\t' read -r _ state _ _ <<< "$record"
+            case "$state" in
+                VERIFIED | UNVERIFIED)
+                    printf '%s\n' "$(tf wizard.retry.succeeded "$host")"
+                    return 0
+                    ;;
+                *)
+                    printf '%s\n' "$(tf wizard.retry.failed "$host")" >&2
+                    return 1
+                    ;;
+            esac
         fi
     done
     printf '%s\n' "$(tf wizard.retry.not_found "$host")" >&2
@@ -1452,15 +1621,17 @@ except Exception as e:
 }
 
 # Offer selective retry of failed nodes.
-# Args: array_name (reference to array of results)
+# Args: array_name (reference to array of results), panel address, panel is local
 _offer_selective_retry() {
     local -n results="$1"
+    local panel_address="${2:-127.0.0.1}" panel_is_local="${3:-yes}"
     local -a failed_nodes=()
-    local result host
+    local result host state
 
     for result in "${results[@]}"; do
-        if [[ "$result" != *:SUCCESS ]]; then
-            host="${result%%:*}"
+        state=""
+        IFS=$'\t' read -r host state _ _ <<< "$result"
+        if [[ "$state" == "FAILED" ]]; then
             failed_nodes+=("$host")
         fi
     done
@@ -1492,7 +1663,7 @@ _offer_selective_retry() {
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#failed_nodes[@]} )); then
             local retry_host="${failed_nodes[choice-1]}"
             printf '%s\n' "$(tf wizard.retry.retrying "$retry_host")"
-            _retry_single_node "$retry_host"
+            _retry_single_node "$retry_host" "$panel_address" "$panel_is_local"
         elif (( choice == ${#failed_nodes[@]} + 1 )); then
             printf '%s\n' "$(t wizard.retry.skipped)"
             return 0

@@ -9211,8 +9211,9 @@ cases:
   assertion: A multi-node deployment where one Worker fails onboarding continues the Panel deployment
     and the successful sibling, records the failed node with its target, phase and diagnostic reason,
     exits with the partial-success code distinct from a failed Panel installation, and prints a per-node
-    summary that distinguishes successful and failed nodes.
-  assertion_sha256: d7f46cb8110aab6e6c49aae18ccd75f1b0e32ea08627d9858a87a725f7f51f72
+    summary that names the successful node as registered and verified only with the uuid the Panel's own
+    node list answered for it, while the failed node keeps its stage and reason.
+  assertion_sha256: 9299d5fd592014ef11b0f78de5ab64e25eb292415a2a3f3d32eb1612f9ad5037
   runs_in:
   - podman
   state: incubating

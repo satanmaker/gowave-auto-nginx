@@ -371,6 +371,12 @@ def surface(panel: Panel) -> Dict[str, Any]:
         "connected": {
             str(node.get("name", "")): node.get("isConnected") is True for node in nodes
         },
+        # The uuid the Panel minted for each name. A result screen that quotes a
+        # uuid is only quoting the Panel when the value can be compared with the
+        # one the Panel answers on its own.
+        "uuids": {
+            str(node.get("name", "")): str(node.get("uuid") or "") for node in nodes
+        },
     }
 
     status, body = panel.call("GET", "/api/config-profiles")

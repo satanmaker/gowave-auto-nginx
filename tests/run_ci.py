@@ -56,6 +56,8 @@ SUITES = {
         "test_wizard.TestWizardDocumentation",
         "test_wizard.TestSSHReachability",
         "test_wizard.TestOnboardingOutcomes",
+        "test_wizard.TestNodeRegistrationReadback",
+        "test_wizard.TestInstallCompletionScreen",
         "test_wizard.TestPanelApiVerification",
         "test_wizard.TestPanelWorkerName",
         "test_wizard.TestPanelInventoryRead",

@@ -2815,15 +2815,21 @@ def case_env_contract(product: MultiNodeProduct) -> Dict[str, Any]:
     return evidence
 
 
-def partial_success_script(success_name: str, failed_name: str) -> str:
+def partial_success_script(success_name: str, failed_name: str, success_address: str) -> str:
     """The wizard's own onboarding loop, given one Worker that fails and one that does not.
 
     ``wizard_onboard_nodes`` is the subject: it is the code that decides whether a
     single failed Worker is fatal, prints the per-node summary and offers the
     retry. Only the SSH hop is replaced — the stub answers the same ``PHASE:``
-    markers and the same catalog message the real onboarding emits, so the phase
-    and the diagnostic the summary prints are read from the shape the shipped
-    code produces rather than from a structure invented here.
+    marker, the same identity marker and the same catalog message the real
+    onboarding emits, so the phase, the diagnostic and the identity the summary
+    prints are read from the shape the shipped code produces rather than from a
+    structure invented here.
+
+    The successful stub names the Worker the deployment really registered, at the
+    address the Panel holds it at, so the shipped readback runs against the live
+    Panel and the summary carries the Panel's own uuid rather than a value this
+    case wrote.
     """
     return "\n".join([
         "set -Eeuo pipefail",
@@ -2837,7 +2843,9 @@ def partial_success_script(success_name: str, failed_name: str) -> str:
         "GOWAVE_PLAN_NODE_VISION=('' '')",
         "ssh_bootstrap_onboard_one() {",
         "  case \"$1\" in",
-        f"    {success_name}) printf '==> Onboarding %s\\n' \"$1\"; return 0 ;;",
+        f"    {success_name}) printf '==> Onboarding %s\\n' \"$1\";",
+        f"      printf 'NODE-IDENTITY:%s\\t{success_address}\\t{NODE_PORT}\\n' \"$1\" >&2;",
+        "      return 0 ;;",
         f"    {failed_name}) printf 'PHASE:scan\\n' >&2;",
         "      printf 'Could not read the SSH host key of %s.\\n' \"$1\" >&2;",
         "      return 1 ;;",
@@ -2872,12 +2880,25 @@ def case_partial_success(product: MultiNodeProduct) -> Dict[str, Any]:
         f"the deployed Worker {topology.WORKER_NODE_NAME!r} is absent before the partial run, "
         f"so a surviving sibling cannot be observed: {nodes.get('names')!r}",
     )
+    # The Panel's own uuid for that Worker, read here and not written by the
+    # script: what the summary prints has to be this value or the screen is
+    # quoting the case rather than the Panel.
+    panel_uuid = (nodes.get("uuids") or {}).get(topology.WORKER_NODE_NAME) or ""
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        bool(panel_uuid),
+        f"the Panel reports no uuid for {topology.WORKER_NODE_NAME!r}, so the verified "
+        f"line cannot be told apart from a value the case wrote: {nodes.get('uuids')!r}",
+    )
 
     failed_name = "worker-2"
-    script = partial_success_script(topology.WORKER_NODE_NAME, failed_name)
+    host = product.require_installed()
+    script = partial_success_script(
+        topology.WORKER_NODE_NAME, failed_name, str(host.plan.worker_ip),
+    )
     started = time.monotonic()
     proc = product.podman.exec_bash(
-        product.require_installed().target_name, script, check=False,
+        host.target_name, script, check=False,
         timeout=WIZARD_OFFLINE_TIMEOUT_SECONDS,
     )
     outcome = topology.InstallOutcome(
@@ -2898,8 +2919,21 @@ def case_partial_success(product: MultiNodeProduct) -> Dict[str, Any]:
     )
     require(
         PARTIAL_SUCCESS_CASE_ID,
-        f"{topology.WORKER_NODE_NAME}: success" in output,
-        f"the per-node summary lost the successful sibling:\n{output[-4000:]}",
+        f"{topology.WORKER_NODE_NAME}: registered and verified in the Panel (uuid " in output,
+        f"the per-node summary lost the successful sibling, or claimed it without the "
+        f"Panel's own uuid:\n{output[-4000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        f"{topology.WORKER_NODE_NAME}: registered and verified in the Panel "
+        f"(uuid {panel_uuid})" in output,
+        f"the summary claims a registration with a uuid the Panel did not answer for "
+        f"{topology.WORKER_NODE_NAME!r} (Panel uuid {panel_uuid!r}):\n{output[-4000:]}",
+    )
+    require(
+        PARTIAL_SUCCESS_CASE_ID,
+        "Registered and verified in the Panel: 1 of 2." in output,
+        f"the summary did not count one verified node of two:\n{output[-4000:]}",
     )
     require(
         PARTIAL_SUCCESS_CASE_ID,

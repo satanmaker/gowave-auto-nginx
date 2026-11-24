@@ -943,12 +943,11 @@ class TestWizardEntry(unittest.TestCase):
             CATALOG_CALL,
             "cmd_install renders a catalog entry of its own; only the wizard may",
         )
-        # The guard captures the onboarding status and gives each outcome its own
-        # exit code: a partial success is neither a clean install nor a failed one.
-        self.assertIn('wizard_onboard_nodes || onboard_rc=$?', install_body)
-        self.assertIn('onboard_rc == 1', install_body)
-        self.assertIn('onboard_rc == 2', install_body)
-        self.assertIn('return 2', install_body)
+        # The guard captures the onboarding status and hands it back unchanged:
+        # the loop already distinguishes a clean run (0), a partial one (2) and
+        # a failed one (1), and the install's exit status is that same code.
+        self.assertIn('wizard_onboard_nodes "https://$panel_domain" "127.0.0.1" "yes" || onboard_rc=$?', install_body)
+        self.assertIn('return "$onboard_rc"', install_body)
         self.assertLess(
             install_body.index('case "${GOWAVE_PLAN_VARIANT:-}" in'),
             install_body.index("wizard_onboard_nodes"),
@@ -981,18 +980,19 @@ class TestWizardEntry(unittest.TestCase):
         )
         self.assertEqual(
             callers,
-            ["gowave-auto.sh"],
-            "a shipped script outside the wizard onboards a node",
+            [],
+            "a shipped script outside the wizard onboards a node directly",
         )
-        # The menu may run it, the positional paths may not: every mention in
-        # the entrypoint belongs to the interactive add-node flow.
+        # The menu reaches the SSH hop through the wizard's own runner: it is
+        # that runner which captures the identity, reads the registration back
+        # and produces the record the result line is printed from.
         source = GOWAVE_AUTO.read_text(encoding="utf-8")
         start = source.index("wizard_add_node_to_panel() {")
         body = source[start : source.index("\n}\n", start)]
-        self.assertIn("ssh_bootstrap_onboard_one", body)
+        self.assertIn("_wizard_onboard_record", body)
         self.assertEqual(
-            source.count("ssh_bootstrap_onboard_one"),
-            body.count("ssh_bootstrap_onboard_one"),
+            source.count("_wizard_onboard_record"),
+            body.count("_wizard_onboard_record"),
             "an entrypoint path outside the add-node menu onboards a node",
         )
 
@@ -1022,13 +1022,14 @@ class TestWizardEntry(unittest.TestCase):
 
 
 class TestOnboardingOutcomes(unittest.TestCase):
-    """wizard_onboard_nodes: three outcomes, one retry offer, one scratch tree.
+    """wizard_onboard_nodes: the exit codes, the verified readback, one scratch tree.
 
     The loop decides whether a single broken Worker is fatal, so the exit code it
     returns is the contract the install's own exit status carries. The outcomes
-    are driven by replacing the SSH hop — the only step that needs a second host
-    — and leaving the summary, the retry offer and the scratch cleanup to the
-    shipped code.
+    are driven by replacing two boundaries — the SSH hop, which needs a second
+    host, and the Panel readback, which needs a registration the stub never
+    performed — and leaving the summary, the retry offer and the scratch cleanup
+    to the shipped code.
     """
 
     PLAN = (
@@ -1037,11 +1038,15 @@ class TestOnboardingOutcomes(unittest.TestCase):
         "GOWAVE_PLAN_NODE_VISION=('' '')\n"
     )
 
-    def onboard(self, outcomes, stdin="2\n", callee=None):
+    VERIFIER = "wizard_verify_node_registration() { printf 'uuid-%s' \"$1\"; return 0; }\n"
+
+    def onboard(self, outcomes, stdin="2\n", callee=None, verifier=VERIFIER):
         """Run the loop over two Workers; ``outcomes`` maps name to success.
 
         ``callee`` replaces the generated stub with a body that models the SSH
         hop's own side effects — the real one tracks a key directory of its own.
+        ``verifier`` replaces the Panel readback, which would otherwise read a
+        real Panel that never saw the stub's node.
         """
         stubs = [
             "ssh_bootstrap_onboard_one() {",
@@ -1049,7 +1054,12 @@ class TestOnboardingOutcomes(unittest.TestCase):
         ]
         for name, succeeds in outcomes.items():
             if succeeds:
-                stubs.append(f"    {name}) printf '==> Onboarding %s\\n' \"$1\"; return 0 ;;")
+                # The identity marker is what the real onboarding writes before
+                # `node add`, and the readback is keyed on it.
+                stubs.append(
+                    f"    {name}) printf '==> Onboarding %s\\n' \"$1\";"
+                    f" printf 'NODE-IDENTITY:%s\\t203.0.113.7\\t3002\\n' \"$1\" >&2; return 0 ;;"
+                )
             else:
                 stubs.append(f"    {name}) printf 'PHASE:scan\\n' >&2;")
                 stubs.append(f"      printf 'Could not read the SSH host key of %s.\\n' \"$1\" >&2;")
@@ -1064,7 +1074,9 @@ class TestOnboardingOutcomes(unittest.TestCase):
             + "GOWAVE_STATE_DIR=$(mktemp -d)\n"
             + self.PLAN
             + "\n".join(stubs)
-            + "\nset +e\nwizard_onboard_nodes\nrc=$?\nprintf 'RC=%d\\n' \"$rc\"\n"
+            + "\n"
+            + verifier
+            + "set +e\nwizard_onboard_nodes\nrc=$?\nprintf 'RC=%d\\n' \"$rc\"\n"
         )
         with tempfile.TemporaryDirectory() as scratch:
             sentinel = Path(scratch) / "keep-me"
@@ -1077,11 +1089,15 @@ class TestOnboardingOutcomes(unittest.TestCase):
         result, _survived = self.onboard({"worker-ok": True, "worker-bad": False})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("RC=2", result.stdout)
-        self.assertIn("  worker-ok: success", result.stdout)
+        self.assertIn(
+            "  worker-ok: registered and verified in the Panel (uuid uuid-worker-ok)",
+            result.stdout,
+        )
         self.assertIn(
             "  worker-bad: failed (phase: scan, reason: Could not read the SSH host key of worker-bad.)",
             result.stdout,
         )
+        self.assertIn("Registered and verified in the Panel: 1 of 2.", result.stdout)
         offer = result.stdout.split("Some nodes failed. Select a node to retry, or skip:", 1)[1]
         self.assertNotIn("worker-ok", offer, "the retry offer named a node that succeeded")
         self.assertIn("worker-bad", offer)
@@ -1091,12 +1107,59 @@ class TestOnboardingOutcomes(unittest.TestCase):
         result, _survived = self.onboard({"worker-ok": True, "worker-bad": True})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("RC=0", result.stdout)
+        self.assertIn("Registered and verified in the Panel: 2 of 2.", result.stdout)
         self.assertNotIn("Some nodes failed", result.stdout)
+        self.assertNotIn("installation again", result.stdout, "a complete run carried a retry line")
 
     def test_every_node_failing_exits_one_without_a_retry_offer(self):
         result, _survived = self.onboard({"worker-ok": False, "worker-bad": False})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("RC=1", result.stdout)
+        self.assertIn("Registered and verified in the Panel: 0 of 2.", result.stdout)
+        self.assertIn(
+            "No node was registered. The Panel is installed and serving;",
+            result.stdout,
+            "an all-failed run did not say what remains",
+        )
+        self.assertNotIn("Some nodes failed", result.stdout)
+
+    def test_a_panel_that_does_not_list_the_node_fails_it_at_the_verify_step(self):
+        # `node add` exited 0, but the Panel's own list is the authority: the
+        # registration is reported against the stage that did not hold, not as
+        # a success that only a process exit code supports.
+        verifier = "wizard_verify_node_registration() { printf 'missing'; return 1; }\n"
+        result, _survived = self.onboard({"worker-ok": True, "worker-bad": True}, verifier=verifier)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("RC=1", result.stdout)
+        self.assertIn(
+            "  worker-ok: failed (phase: verify, reason: the Panel's node list does not hold this node)",
+            result.stdout,
+        )
+        self.assertIn("Registered and verified in the Panel: 0 of 2.", result.stdout)
+
+    def test_a_name_the_panel_holds_at_another_address_names_that_address(self):
+        verifier = (
+            "wizard_verify_node_registration() {"
+            " printf 'moved\\t198.51.100.4\\t3002'; return 1; }\n"
+        )
+        result, _survived = self.onboard({"worker-ok": True, "worker-bad": True}, verifier=verifier)
+        self.assertIn(
+            "reason: the Panel lists it at 198.51.100.4:3002",
+            result.stdout,
+        )
+
+    def test_an_unreadable_panel_is_reported_as_unconfirmed_not_as_a_failure(self):
+        # A remote Panel's token is not this host's to hold: nothing about the
+        # node was disproved, so the run keeps its clean exit code and says so.
+        verifier = "wizard_verify_node_registration() { return 2; }\n"
+        result, _survived = self.onboard({"worker-ok": True, "worker-bad": True}, verifier=verifier)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("RC=0", result.stdout)
+        self.assertIn(
+            "  worker-ok: registered; a Panel on another host cannot confirm it from here",
+            result.stdout,
+        )
+        self.assertIn("Registered and verified in the Panel: 0 of 2.", result.stdout)
         self.assertNotIn("Some nodes failed", result.stdout)
 
     def test_the_scratch_directory_never_widens_to_its_parent(self):
@@ -1134,8 +1197,152 @@ class TestOnboardingOutcomes(unittest.TestCase):
         self.assertIn("reason: Could not read the SSH host key.", result.stdout)
 
 
+class TestNodeRegistrationReadback(unittest.TestCase):
+    """wizard_verify_node_registration: the Panel's list decides, not the exit code.
+
+    The three answers are what the summary and the single-add flow build their
+    sentences from, so each one is read here on its own: a Panel that holds the
+    node, a Panel that answered without it, and a Panel nobody can read.
+    """
+
+    def verify(self, inventory, name, address, port, panel_address, panel_is_local):
+        args = " ".join(shlex.quote(value) for value in
+                        (name, address, port, panel_address, panel_is_local))
+        script = (
+            SOURCE_WIZARD
+            + f"wizard_panel_inventory_names() {{ {inventory}; }}\n"
+            + f"if out=$(wizard_verify_node_registration {args}); then rc=0; else rc=$?; fi\n"
+            + "printf 'RC=%d\\nOUT=%s\\n' \"$rc\" \"$(printf '%s' \"$out\" | tr '\\t' '|')\"\n"
+        )
+        return bash(script)
+
+    def test_a_listed_node_at_the_registered_identity_is_verified(self):
+        result = self.verify(
+            "printf 'ams-01\\t203.0.113.7\\t3002\\tuuid-ams\\n'",
+            "ams-01", "203.0.113.7", "3002", "panel.example.com", "yes",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("RC=0", result.stdout)
+        self.assertIn("OUT=uuid-ams", result.stdout)
+
+    def test_the_panel_name_comparison_ignores_case(self):
+        result = self.verify(
+            "printf 'AMS-01\\t203.0.113.7\\t3002\\tuuid-ams\\n'",
+            "ams-01", "203.0.113.7", "3002", "panel.example.com", "yes",
+        )
+        self.assertIn("RC=0", result.stdout)
+        self.assertIn("OUT=uuid-ams", result.stdout)
+
+    def test_a_name_the_panel_does_not_list_is_missing(self):
+        result = self.verify(
+            "printf 'fra-01\\t203.0.113.9\\t3002\\tuuid-fra\\n'",
+            "ams-01", "203.0.113.7", "3002", "panel.example.com", "yes",
+        )
+        self.assertIn("RC=1", result.stdout)
+        self.assertIn("OUT=missing", result.stdout)
+
+    def test_the_same_name_at_another_address_reports_the_held_identity(self):
+        result = self.verify(
+            "printf 'ams-01\\t198.51.100.4\\t3002\\tuuid-other\\n'",
+            "ams-01", "203.0.113.7", "3002", "panel.example.com", "yes",
+        )
+        self.assertIn("RC=1", result.stdout)
+        self.assertIn("OUT=moved|198.51.100.4|3002", result.stdout)
+
+    def test_an_unreadable_inventory_disproves_nothing(self):
+        for stub in ("return 2", "return 1"):
+            with self.subTest(stub=stub):
+                result = self.verify(
+                    stub, "ams-01", "203.0.113.7", "3002", "panel.example.com", "yes",
+                )
+                self.assertIn("RC=2", result.stdout)
+                self.assertIn("OUT=", result.stdout)
+                self.assertNotIn("OUT=missing", result.stdout)
+
+    def test_a_row_without_a_uuid_is_not_a_registration(self):
+        result = self.verify(
+            "printf 'ams-01\\t203.0.113.7\\t3002\\t-\\n'",
+            "ams-01", "203.0.113.7", "3002", "panel.example.com", "yes",
+        )
+        self.assertIn("RC=1", result.stdout)
+        self.assertIn("OUT=missing", result.stdout)
+
+
+class TestInstallCompletionScreen(unittest.TestCase):
+    """The install tail: Panel progress first, completion only when nothing remains.
+
+    The banner used to be printed before the remote nodes were onboarded, so a
+    run that was still waiting on SSH had already announced itself as complete.
+    """
+
+    def install_body(self):
+        source = GOWAVE_AUTO.read_text(encoding="utf-8")
+        start = source.index("cmd_install() {")
+        return source[start : source.index("\ncmd_node() {", start)]
+
+    def test_the_completion_banner_follows_the_node_onboarding(self):
+        body = self.install_body()
+        self.assertLess(
+            body.index("wizard_panel_installed_notice"),
+            body.index('echo "Onboarding the planned remote nodes..."'),
+        )
+        self.assertLess(
+            body.index("wizard_onboard_nodes"),
+            body.index("GoWave Auto NGINX Installation Complete"),
+            "the install announced completion before onboarding the nodes",
+        )
+
+    def test_a_node_failure_returns_before_the_completion_banner(self):
+        body = self.install_body()
+        failure = body.index('return "$onboard_rc"')
+        self.assertLess(failure, body.index("GoWave Auto NGINX Installation Complete"))
+        self.assertGreater(failure, body.index("wizard_onboard_nodes"))
+
+    def test_a_failed_panel_step_returns_before_the_panel_notice(self):
+        # "Panel installed" is a success statement for the Panel step, so the
+        # Panel's failure path has to return above it: a run that failed on the
+        # Panel prints no Panel line and reaches no banner.
+        body = self.install_body()
+        failure = body.index("Initial API provisioning failed")
+        notice = body.index("wizard_panel_installed_notice")
+        self.assertLess(failure, notice, "the Panel's failure path is below its own success line")
+        self.assertIn("return 1", body[failure:notice])
+
+    def test_the_panel_statement_names_the_wizard_catalog(self):
+        source = WIZARD_SH.read_text(encoding="utf-8")
+        start = source.index("wizard_panel_installed_notice() {")
+        body = source[start : source.index("\n}\n", start)]
+        self.assertIn("wizard.summary.panel", body)
+
+    def test_the_panel_step_is_printed_for_a_plan_that_still_has_nodes(self):
+        body = self.install_body()
+        guard = body.index('case "${GOWAVE_PLAN_VARIANT:-}" in')
+        self.assertLess(guard, body.index("wizard_panel_installed_notice"))
+        self.assertIn("multi-node | panel-only", body[guard:body.index("wizard_panel_installed_notice")])
+
+
 class TestWizardDocumentation(unittest.TestCase):
     """The three domain limits and the two SSH variables are policy, not prose."""
+
+    def test_the_operator_document_names_every_summary_state(self):
+        # The result screen is a claim about the Panel, so the page that
+        # describes it has to name the same sentences the screen prints. The
+        # fragments are read from the catalog rather than retyped here, and each
+        # is cut at its first interpolated value.
+        document = (REPO_ROOT / "docs/SETUP_WIZARD.md").read_text(encoding="utf-8")
+        result = bash(
+            f"source {shlex.quote(str(I18N_SH))}\n"
+            "GOWAVE_WIZARD_LANG=en\n"
+            "for key in wizard.summary.success wizard.summary.unverified "
+            "wizard.summary.count; do\n"
+            "  printf '%s\\n' \"$(t \"$key\")\"\n"
+            "done\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fragments = [line.split("%s")[0].strip() for line in result.stdout.splitlines() if line]
+        self.assertEqual(len(fragments), 3, f"the catalog did not answer three lines: {result.stdout!r}")
+        for fragment in fragments:
+            self.assertIn(fragment, document, f"the operator page does not name {fragment!r}")
 
     def test_the_readme_names_the_three_limits_and_both_variables(self):
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8").lower()
@@ -1755,14 +1962,19 @@ exit 0
             f"source {shlex.quote(str(GOWAVE_AUTO))}\n"
             "detect_local_panel() { printf 'panel.example.com'; return 0; }\n"
             "wizard_verify_panel_api() { printf 'VERIFY=%s/%s\\n' \"$1\" \"$2\"; return 0; }\n"
-            "wizard_panel_inventory_names() { printf 'worker-old\\t10.9.9.9\\n'; return 0; }\n"
+            "wizard_panel_inventory_names() {"
+            " printf 'worker-old\\t10.9.9.9\\t3002\\tuuid-old\\n'; return 0; }\n"
             "ssh_bootstrap_onboard_one() {"
             " printf 'ONBOARD host=%s cam=%s vision=[%s] name=%s ip=%s\\n'"
-            " \"$1\" \"$2\" \"${3-}\" \"${4-}\" \"${5-}\"; return 0; }\n"
+            " \"$1\" \"$2\" \"${3-}\" \"${4-}\" \"${5-}\";"
+            " printf 'NODE-IDENTITY:%s\\t10.1.2.3\\t3002\\n' \"${4-}\" >&2; return 0; }\n"
+            "wizard_verify_node_registration() {"
+            " printf 'VERIFIED_READBACK=%s/%s/%s' \"$1\" \"$2\" \"$3\"; return 0; }\n"
             "cmd_node() { printf 'CMD_NODE=%s\\n' \"$*\"; return 0; }\n"
-            "set +e\n"
-            "wizard_add_node_to_panel\n"
-            "printf 'RC=%d\\n' \"$?\"\n"
+            # The menu calls every action through `menu_action`, whose OR-list
+            # keeps a failing action from ending the session; the harness reads
+            # the same status the same way.
+            "if wizard_add_node_to_panel; then printf 'RC=0\\n'; else printf 'RC=%d\\n' \"$?\"; fi\n"
         )
         result = bash(
             script,
@@ -1776,6 +1988,64 @@ exit 0
             result.stdout,
         )
         self.assertNotIn("CMD_NODE=", result.stdout, "the menu bypassed the temporary-access onboarding")
+        # The registration is read back by the identity the onboarding wrote,
+        # and reported as this node's addition with the Panel's answer.
+        self.assertIn(
+            "Node worker-one was added to the Panel and read back from it "
+            "(uuid VERIFIED_READBACK=worker-one/10.1.2.3/3002, 10.1.2.3:3002).",
+            result.stdout,
+        )
+        self.assertIn("RC=0", result.stdout)
+
+    def test_a_registration_the_panel_does_not_confirm_is_reported_as_a_failure(self):
+        # The Panel answered and does not hold the node `node add` claimed: the
+        # menu names the stage that did not hold instead of reporting success.
+        script = (
+            f"source {shlex.quote(str(GOWAVE_AUTO))}\n"
+            "detect_local_panel() { printf 'panel.example.com'; return 0; }\n"
+            "wizard_verify_panel_api() { return 0; }\n"
+            "wizard_panel_inventory_names() { return 0; }\n"
+            "ssh_bootstrap_onboard_one() {"
+            " printf 'Node registered.\\n';"
+            " printf 'NODE-IDENTITY:%s\\t10.1.2.3\\t3002\\n' \"${4-}\" >&2; return 0; }\n"
+            "wizard_verify_node_registration() { printf 'missing'; return 1; }\n"
+            "if wizard_add_node_to_panel; then printf 'RC=0\\n'; else printf 'RC=%d\\n' \"$?\"; fi\n"
+        )
+        result = bash(
+            script,
+            stdin="y\nworker-one\n10.1.2.3\nnode.example.com\ncdn.example.com\n",
+        )
+        self.assertIn(
+            "Node worker-one was not added (phase: verify, reason: "
+            "the Panel's node list does not hold this node).",
+            result.stderr,
+        )
+        self.assertIn("RC=1", result.stdout)
+        self.assertNotIn("was added to the Panel", result.stdout)
+
+    def test_a_remote_panel_leaves_the_add_node_result_unconfirmed(self):
+        # Nothing about the node was disproved, so the menu does not call it a
+        # failure — and does not call it verified either.
+        script = (
+            f"source {shlex.quote(str(GOWAVE_AUTO))}\n"
+            "detect_local_panel() { return 1; }\n"
+            "wizard_verify_panel_api() { return 0; }\n"
+            "wizard_panel_inventory_names() { return 2; }\n"
+            "ssh_bootstrap_onboard_one() {"
+            " printf 'NODE-IDENTITY:%s\\t10.1.2.3\\t3002\\n' \"${4-}\" >&2; return 0; }\n"
+            "wizard_verify_node_registration() { return 2; }\n"
+            "if wizard_add_node_to_panel; then printf 'RC=0\\n'; else printf 'RC=%d\\n' \"$?\"; fi\n"
+        )
+        result = bash(
+            script,
+            stdin="panel.example.com\nworker-one\n10.1.2.3\nnode.example.com\ncdn.example.com\n",
+        )
+        self.assertIn(
+            "Node worker-one was registered, but a Panel on another host cannot be read "
+            "from here. Check the Panel's node list before relying on it.",
+            result.stdout,
+        )
+        self.assertIn("RC=0", result.stdout)
 
     def test_the_menu_add_node_refuses_a_name_the_panel_already_holds(self):
         # The menu has the Panel's inventory in hand before the SSH session
@@ -1784,11 +2054,12 @@ exit 0
             f"source {shlex.quote(str(GOWAVE_AUTO))}\n"
             "detect_local_panel() { printf 'panel.example.com'; return 0; }\n"
             "wizard_verify_panel_api() { return 0; }\n"
-            "wizard_panel_inventory_names() { printf 'worker-one\\t10.9.9.9\\n'; return 0; }\n"
-            "ssh_bootstrap_onboard_one() { printf 'ONBOARD name=%s\\n' \"$4\"; return 0; }\n"
-            "set +e\n"
-            "wizard_add_node_to_panel\n"
-            "printf 'RC=%d\\n' \"$?\"\n"
+            "wizard_panel_inventory_names() {"
+            " printf 'worker-one\\t10.9.9.9\\t3002\\tuuid-one\\n'; return 0; }\n"
+            "ssh_bootstrap_onboard_one() { printf 'ONBOARD name=%s\\n' \"$4\";"
+            " printf 'NODE-IDENTITY:%s\\t10.1.2.3\\t3002\\n' \"${4-}\" >&2; return 0; }\n"
+            "wizard_verify_node_registration() { printf 'uuid-%s' \"$1\"; return 0; }\n"
+            "if wizard_add_node_to_panel; then printf 'RC=0\\n'; else printf 'RC=%d\\n' \"$?\"; fi\n"
         )
         result = bash(
             script,
@@ -1800,6 +2071,7 @@ exit 0
             result.stderr,
         )
         self.assertIn("ONBOARD name=worker-two", result.stdout)
+        self.assertIn("Node worker-two was added to the Panel and read back from it", result.stdout)
 
     def test_the_menu_asks_for_a_panel_domain_when_nothing_runs_locally(self):
         script = (

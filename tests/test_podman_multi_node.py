@@ -7796,14 +7796,18 @@ class TestVisionCompensationCase(unittest.TestCase):
         self.damage("could not be started on the Master")
 
 
-PARTIAL_SUCCESS_OUTPUT = """\
+PARTIAL_SUCCESS_UUID = "3d5c9a71-6f24-4b8e-9c07-2a1f5e8d4b63"
+
+PARTIAL_SUCCESS_OUTPUT = f"""\
 ==> Onboarding worker-1
 
 Could not read the SSH host key of worker-2.
 
 === Node Onboarding Summary ===
-  worker-1: success
+  worker-1: registered and verified in the Panel (uuid {PARTIAL_SUCCESS_UUID})
   worker-2: failed (phase: scan, reason: Could not read the SSH host key of worker-2.)
+  Registered and verified in the Panel: 1 of 2.
+The Panel and the verified nodes stay as they are. Retry the failed ones by running the installation again, or add one from the menu (option 3).
 
 === Retry Diagnostics for worker-2 ===
 No recovery journal found at /opt/gowave/recovery/journal.json
@@ -7846,6 +7850,10 @@ def refused_resolution_report(resolution="", mode="remove"):
 
 class _WizardCaseTarget:
     target_name = "master-test"
+    # The address the deployment plan registered its Worker under. The script
+    # the wizard cases run is text, so the value only has to be an address the
+    # identity marker can carry.
+    plan = topology.NetworkPlan(subnet="10.99.1.0/24")
 
 
 class _WizardCasePodman:
@@ -7886,13 +7894,16 @@ class _WizardCaseProduct:
         return self._surfaces.pop(0)
 
 
-def panel_nodes(names, connected=None):
+def panel_nodes(names, connected=None, uuids=None):
     return {
         "surface": {
             "nodes": {
                 "status": 200,
                 "names": list(names),
                 "connected": dict(connected or {}),
+                "uuids": dict(uuids if uuids is not None else {
+                    name: PARTIAL_SUCCESS_UUID for name in names
+                }),
             },
         },
     }
@@ -7903,12 +7914,12 @@ class TestPartialSuccessCase(unittest.TestCase):
 
     def partial(self, *, stdout=PARTIAL_SUCCESS_OUTPUT, returncode=2,
                 before=("worker-1",), after=("worker-1",),
-                connected_before=None, connected_after=None):
+                connected_before=None, connected_after=None, uuids=None):
         product = _WizardCaseProduct(
             stdout,
             returncode,
             surfaces=[
-                panel_nodes(before, connected_before or {"worker-1": True}),
+                panel_nodes(before, connected_before or {"worker-1": True}, uuids),
                 panel_nodes(after, connected_after or {"worker-1": True}),
             ],
         )
@@ -7927,6 +7938,9 @@ class TestPartialSuccessCase(unittest.TestCase):
         self.assertIn("wizard_onboard_nodes", script)
         self.assertIn("ssh_bootstrap_onboard_one()", script)
         self.assertIn("GOWAVE_PLAN_NODE_NAMES=(", script)
+        self.assertIn("NODE-IDENTITY:", script)
+        self.assertNotIn(PARTIAL_SUCCESS_UUID, script,
+                         "the case wrote the uuid it then requires, so the summary proves nothing")
 
     def test_a_clean_exit_code_for_a_partial_failure_fails_the_case(self):
         with self.assertRaises(AssertionError) as caught:
@@ -7940,6 +7954,37 @@ class TestPartialSuccessCase(unittest.TestCase):
         with self.assertRaises(AssertionError) as caught:
             self.partial(stdout=damaged)
         self.assertIn("without the phase", str(caught.exception))
+
+    def test_a_summary_that_calls_the_sibling_a_success_fails_the_case(self):
+        damaged = PARTIAL_SUCCESS_OUTPUT.replace(
+            f"worker-1: registered and verified in the Panel (uuid {PARTIAL_SUCCESS_UUID})",
+            "worker-1: success",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.partial(stdout=damaged)
+        self.assertIn("Panel's own uuid", str(caught.exception))
+
+    def test_a_uuid_the_panel_did_not_answer_for_fails_the_case(self):
+        damaged = PARTIAL_SUCCESS_OUTPUT.replace(
+            PARTIAL_SUCCESS_UUID, "00000000-0000-4000-8000-000000000000",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.partial(stdout=damaged)
+        self.assertIn("uuid the Panel did not answer", str(caught.exception))
+
+    def test_a_summary_that_counts_the_failed_node_as_verified_fails_the_case(self):
+        damaged = PARTIAL_SUCCESS_OUTPUT.replace(
+            "Registered and verified in the Panel: 1 of 2.",
+            "Registered and verified in the Panel: 2 of 2.",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.partial(stdout=damaged)
+        self.assertIn("did not count one verified node", str(caught.exception))
+
+    def test_a_panel_that_answers_no_uuid_leaves_nothing_to_compare(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.partial(uuids={"worker-1": ""})
+        self.assertIn("reports no uuid", str(caught.exception))
 
     def test_a_retry_offer_that_names_the_successful_sibling_fails_the_case(self):
         damaged = PARTIAL_SUCCESS_OUTPUT.replace(

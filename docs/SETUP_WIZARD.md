@@ -146,6 +146,58 @@ Panel that is already deployed. The flow is:
    before any profile, inbound or Host record exists, so a collision that appeared since the
    question costs no rollback.
 
+## The result screen
+
+The install does not announce completion because the Panel started. The Panel step is reported in its
+own words (`Panel installed: …`), then every planned Worker is onboarded and the run ends with a
+summary that states what the Panel itself holds:
+
+```
+=== Node Onboarding Summary ===
+  Panel installed: https://panel.example.com
+  ams-01: registered and verified in the Panel (uuid 3d5c9a71-6f24-4b8e-9c07-2a1f5e8d4b63)
+  fra-01: failed (phase: scan, reason: Could not read the SSH host key of fra-01.)
+  Registered and verified in the Panel: 1 of 2.
+The Panel and the verified nodes stay as they are. Retry the failed ones by running the installation
+again, or add one from the menu (option 3).
+```
+
+Each node is one of three states:
+
+- **registered and verified in the Panel** — `node add` succeeded *and* the Panel's own `/api/nodes`
+  list, read from this host with this host's token, answered with the same name, address and port, and
+  its own uuid. The uuid on the screen is that answer, not a value the installer chose.
+- **registered; a Panel on another host cannot confirm it from here** — `node add` succeeded but the
+  Panel is remote, so no read-back is possible: its token is not this host's to hold. Nothing was
+  disproved, so the node is not a failure and the run keeps its exit status.
+- **failed, with the stage and a reason** — the Worker's own failing stage (`prepare_key`, `scan`,
+  `fingerprint`, `confirm_fingerprint`, `resolve_ip`, `pin_host_key`, `prepare_password`,
+  `authorise`, `start_agent`, `add_node`, `revoke`, `stop_agent`), or the stage `verify` when the Panel
+  answered and does not hold what `node add` claimed — either the name is absent
+  (`the Panel's node list does not hold this node`) or it is held at another address
+  (`the Panel lists it at <address>:<port>`).
+
+The `Registered and verified in the Panel: N of M.` line counts only the first state. The install
+exits `0` when every node is verified or unconfirmed, `2` when some nodes were registered and some
+failed, and `1` when none was registered; the completion banner is printed only for `0`. The exit codes
+are the same as before this screen, so a script that branches on them keeps working.
+
+A `verify` failure is a real failure: the Panel is the authority on what it registered, and a read-back
+that contradicts `node add` means the traffic path the operator expects does not exist. A node reported
+this way may still need a manual `node rollback` before it is retried.
+
+Registration evidence has a stated limit: it proves the Panel lists the node at that name, address,
+port and uuid. It does not prove that a client's traffic crossed that node — `node add` connects the
+node's control plane, and the data path is proved by a client request, which the summary does not
+attempt.
+
+After a partial failure the wizard offers a retry that names only the failed nodes; a successful
+sibling is not offered, and choosing the skip entry leaves the completed work alone.
+
+Menu option 3 prints its own outcome in the same vocabulary — a node addition that the Panel confirmed,
+one it could not confirm, or one that failed at a named stage — and never a Panel installation
+statement.
+
 ## Temporary SSH access for remote nodes
 
 The wizard authorises an Ed25519 key on a Worker only after the operator types the Worker's host-key
