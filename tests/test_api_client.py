@@ -22,6 +22,7 @@ import modules.api_client as api_client
 from modules.api_client import (
     GoWaveAPIError,
     GoWaveClient,
+    GoWaveNodeNameTaken,
     atomic_write_state,
     save_credentials,
     rollback_provisioning,
@@ -636,6 +637,106 @@ class TestAPIClient(unittest.TestCase):
         self.assertEqual(node_uuid, "node-1")
         self.assertIn(("PATCH", "/api/nodes/node-1"), calls)
         self.assertEqual(client.transaction_entities[0]["before"]["configProfile"], node["configProfile"])
+
+    def test_a_name_held_by_another_address_is_refused_without_a_patch(self):
+        # The Panel is the authority on names. Updating the node it lists under
+        # this name would rewrite that server's address and move another
+        # deployment's traffic endpoint, so the registration refuses instead.
+        node = {
+            "uuid": "node-other",
+            "name": "ams-01",
+            "address": "10.9.9.9",
+            "port": 3002,
+            "configProfile": {
+                "activeConfigProfileUuid": "profile-other",
+                "activeInbounds": [{"uuid": "inbound-other"}],
+            },
+        }
+        client = GoWaveClient("http://panel.example.test")
+        calls = []
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            calls.append((method, endpoint))
+            if endpoint == "/api/nodes":
+                return {"response": {"nodes": [node]}}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client.request = fake_request
+        with self.assertRaises(GoWaveNodeNameTaken) as raised:
+            client.associate_node("ams-01", "10.1.2.3", 3002, "profile-new", ["inbound-new"])
+        self.assertIn("10.9.9.9:3002", str(raised.exception))
+        self.assertIn("not 10.1.2.3:3002", str(raised.exception))
+        self.assertEqual([c for c in calls if c[0] != "GET"], [], "a foreign node was written")
+        self.assertEqual(client.transaction_entities, [], "a refused adoption was journalled as an update")
+
+    def test_the_same_address_and_port_is_the_node_being_reinstalled(self):
+        # A repeated install of one server meets its own name; that is the
+        # identity to reconcile, not a collision.
+        node = {
+            "uuid": "node-1",
+            "name": "ams-01",
+            "address": "10.1.2.3",
+            "port": 3002,
+            "configProfile": {
+                "activeConfigProfileUuid": "profile-1",
+                "activeInbounds": [{"uuid": "inbound-1"}],
+            },
+        }
+        client = GoWaveClient("http://panel.example.test")
+        calls = []
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            calls.append((method, endpoint))
+            if endpoint == "/api/nodes":
+                return {"response": {"nodes": [node]}}
+            if method == "PATCH":
+                return {"response": {}}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client.request = fake_request
+        node_uuid = client.associate_node("ams-01", "10.1.2.3", 3002, "profile-2", ["inbound-1"])
+        self.assertEqual(node_uuid, "node-1")
+        self.assertIn(("PATCH", "/api/nodes/node-1"), calls)
+
+    def test_an_explicit_uuid_retries_the_node_without_looking_it_up_by_name(self):
+        node = {
+            "uuid": "node-1",
+            "name": "renamed-on-the-panel",
+            "address": "10.1.2.3",
+            "port": 3002,
+            "configProfile": {
+                "activeConfigProfileUuid": "profile-1",
+                "activeInbounds": [{"uuid": "inbound-1"}],
+            },
+        }
+        client = GoWaveClient("http://panel.example.test")
+        calls = []
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            calls.append((method, endpoint))
+            if endpoint == "/api/nodes":
+                return {"response": {"nodes": [node]}}
+            if method == "PATCH":
+                return {"response": {}}
+            raise AssertionError(f"unexpected request {method} {endpoint}")
+
+        client.request = fake_request
+        node_uuid = client.associate_node(
+            "ams-01", "10.1.2.3", 3002, "profile-2", ["inbound-1"], existing_node_uuid="node-1",
+        )
+        self.assertEqual(node_uuid, "node-1")
+        self.assertIn(("PATCH", "/api/nodes/node-1"), calls)
+
+    def test_list_nodes_reads_the_panels_inventory(self):
+        client = GoWaveClient("http://panel.example.test")
+        nodes = [{"uuid": "node-1", "name": "ams-01", "address": "10.1.2.3"}]
+
+        def fake_request(method, endpoint, data=None, headers=None, authenticate=True):
+            self.assertEqual((method, endpoint), ("GET", "/api/nodes"))
+            return {"response": {"nodes": nodes}}
+
+        client.request = fake_request
+        self.assertEqual(client.list_nodes(), nodes)
 
     def test_parse_core_version(self):
         self.assertEqual(parse_core_version("v26.11.9"), (26, 11, 9))

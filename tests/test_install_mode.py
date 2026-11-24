@@ -44,6 +44,10 @@ def _log(name, *args):
         handle.write(json.dumps({"name": name, "args": [repr(arg) for arg in args]}) + "\n")
 
 
+class GoWaveNodeNameTaken(Exception):
+    pass
+
+
 class GoWaveClient:
     def __init__(self, base_url):
         self.base_url = base_url
@@ -81,6 +85,11 @@ class GoWaveClient:
     def associate_node(self, *args):
         _log("associate_node", *args)
         return "node-stub"
+
+    def list_nodes(self):
+        # The registration reads the Panel's inventory before it writes; this
+        # stub Panel holds no nodes, which is the state a first add meets.
+        return []
 
     def provision_internal_squad(self, *args):
         _log("provision_internal_squad", *args)
@@ -142,7 +151,10 @@ def _quote(*values):
 def _heredoc_after(marker):
     text = GOWAVE_AUTO.read_text(encoding="utf-8")
     at = text.index(marker)
-    start = text.index("<<'PY'\n", at) + len("<<'PY'\n")
+    opener = text.index("<<'PY'", at) + len("<<'PY'")
+    # The opener line may carry a status capture after the redirection
+    # (`<<'PY' || register_rc=$?`), so the body starts after that line ends.
+    start = text.index("\n", opener) + 1
     end = text.index("\nPY\n", start)
     return text[start:end]
 

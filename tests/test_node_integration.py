@@ -795,11 +795,39 @@ class TestNodeIntegration(unittest.TestCase):
             auto_script.index('client.provision_config_profile(f"GoWave Worker {name} Profile"', callback_at),
         )
 
+    def test_node_add_refuses_a_foreign_name_before_the_first_panel_write(self):
+        """A name another server holds is refused before the journal, not adopted."""
+        script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        guard_at = script.index("for held in client.list_nodes():")
+        login_at = script.rindex("client.login(admin_user, admin_password)", 0, guard_at)
+        journal_at = script.index('"state": "NODE_ADD_PREPARED"', guard_at)
+        profile_at = script.index(
+            'client.provision_config_profile(f"GoWave Worker {name} Profile"', journal_at
+        )
+        self.assertLess(login_at, guard_at)
+        self.assertLess(guard_at, journal_at, "the inventory check must precede the journal")
+        self.assertLess(journal_at, profile_at)
+        guard = script[guard_at:journal_at]
+        # The retry of this very node is not a collision; a different address is.
+        self.assertIn('str(held.get("address") or "") == address', guard)
+        self.assertIn("raise SystemExit(3)", guard)
+
+    def test_a_refused_worker_name_returns_without_a_rollback(self):
+        """Exit 3 means nothing was written, so no rollback may be attempted."""
+        script = (REPO_ROOT / "gowave-auto.sh").read_text()
+        branch_at = script.index("if (( register_rc == 3 )); then")
+        returned_at = script.index("return 1", branch_at)
+        rollback_at = script.index("rollback_provisioning(", returned_at)
+        self.assertLess(returned_at, rollback_at, "a name refusal reached the rollback")
+        self.assertIn("not changed", script[branch_at:returned_at])
+
     def test_node_add_pre_dispatch_failures_stay_inside_api_rollback_boundary(self):
         """Resolve local prerequisites early and persist VERIFYING inside the guarded API transaction."""
         worker_script = (REPO_ROOT / "gowave-auto.sh").read_text()
         secret_index = worker_script.index('if ! secret_key=$(extract_secret_key "$GOWAVE_DIR")')
-        api_index = worker_script.index("if ! PYTHONPATH=", secret_index)
+        api_index = worker_script.index(
+            "# 2. Register the node using argv for data and FD 3 for the password.", secret_index
+        )
         dispatch_index = worker_script.index('if ! ACME_TX_ID="$acme_tx_id" PANEL_IP="$panel_ip" PANEL_IPV6="$panel_ipv6" NODE_PORT="$node_port" SECRET_KEY="$secret_key"', api_index)
         self.assertLess(secret_index, api_index)
         self.assertLess(api_index, dispatch_index)

@@ -8,11 +8,16 @@ reads its refusal, and the guarded reachability of the catalog is asserted
 against the shipped scripts, where a lookup could be added outside a function
 a test can call.
 """
+import fcntl
 import os
+import pty
 import re
+import select
 import shlex
 import subprocess
 import tempfile
+import termios
+import time
 import unittest
 from pathlib import Path
 
@@ -151,15 +156,15 @@ class TestWizardCatalog(unittest.TestCase):
         result = bash(
             f"source {shlex.quote(str(I18N_SH))}\n"
             "GOWAVE_WIZARD_LANG=en\n"
-            "english=$(t wizard.confirm)\n"
-            "unset 'GOWAVE_I18N_RU[wizard.confirm]'\n"
+            "english=$(t wizard.name.panel)\n"
+            "unset 'GOWAVE_I18N_RU[wizard.name.panel]'\n"
             "GOWAVE_WIZARD_LANG=ru\n"
-            "fallback=$(t wizard.confirm)\n"
+            "fallback=$(t wizard.name.panel)\n"
             "printf '%s\\n%s\\n' \"$english\" \"$fallback\"\n"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         english, fallback = result.stdout.splitlines()
-        self.assertNotEqual(english, "wizard.confirm")
+        self.assertNotEqual(english, "wizard.name.panel")
         self.assertEqual(fallback, english)
 
     def test_an_unknown_key_returns_its_own_name(self):
@@ -189,7 +194,7 @@ class TestWizardCatalog(unittest.TestCase):
         result = bash(
             f"source {shlex.quote(str(I18N_SH))}\n"
             "GOWAVE_WIZARD_LANG=ru\n"
-            "t wizard.confirm\n"
+            "t wizard.name.panel\n"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stdout, "[А-Яа-я]")
@@ -237,7 +242,7 @@ class TestWizardCatalog(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotEqual(result.stdout.strip(), "menu.option.status")
-        self.assertRegex(result.stdout, "Show status")
+        self.assertRegex(result.stdout, "Show installation status")
 
     def test_a_third_script_with_catalog_lookup_is_still_rejected(self):
         # Create a temporary script that uses a catalog lookup and verify
@@ -365,26 +370,31 @@ DUMP_PLAN = (
     "printf 'camouflage=%s\\n' \"$GOWAVE_PLAN_CAMOUFLAGE_NAME\"\n"
     "printf 'vision=%s\\n' \"$GOWAVE_PLAN_VISION_NAME\"\n"
     "printf 'email=%s\\n' \"$GOWAVE_PLAN_EMAIL\"\n"
+    "printf 'local_label=%s\\n' \"$GOWAVE_PLAN_LOCAL_LABEL\"\n"
     "printf 'shared=%s\\n' \"$GOWAVE_PLAN_SHARED_DOMAIN\"\n"
     "printf 'node_count=%s\\n' \"$GOWAVE_PLAN_NODE_COUNT\"\n"
     "printf 'cert_count=%s\\n' \"$(wizard_plan_certificate_count)\"\n"
     "for i in \"${!GOWAVE_PLAN_NODE_NAMES[@]}\"; do\n"
     "  printf 'node=%s|%s|%s\\n' \"${GOWAVE_PLAN_NODE_NAMES[$i]}\""
     " \"${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}\" \"${GOWAVE_PLAN_NODE_VISION[$i]:-}\"\n"
+    "  printf 'node_label=%s\\n' \"${GOWAVE_PLAN_NODE_LABELS[$i]:-}\"\n"
     "done\n"
 )
 
 
 class TestCollectPlan(unittest.TestCase):
-    def _collect(self, answers, failing=()):
+    def _collect(self, answers, failing=(), lang=None):
         with tempfile.TemporaryDirectory() as directory:
             resolver = write_resolver(directory, failing)
+            env = {"GOWAVE_WIZARD_RESOLVER": resolver}
+            if lang:
+                env["GOWAVE_WIZARD_LANG"] = lang
             result = bash(
                 SOURCE_WIZARD
-                + "if wizard_collect_plan >/dev/null; then echo CONFIRMED; else echo REFUSED; fi\n"
+                + "if wizard_collect_plan >/dev/null; then echo COLLECTED; else echo REFUSED; fi\n"
                 + DUMP_PLAN,
                 stdin=answers,
-                env={"GOWAVE_WIZARD_RESOLVER": resolver},
+                env=env,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.splitlines()
@@ -396,10 +406,11 @@ class TestCollectPlan(unittest.TestCase):
     def test_all_in_one_collects_a_panel_host_with_vision(self):
         verdict, values, nodes, _ = self._collect(
             "en\n1\npanel.example.com\ncdn.example.com\ny\nvision.example.com\n"
-            "admin@example.com\nn\ny\n"
+            "local-01\nadmin@example.com\nn\n"
         )
-        self.assertEqual(verdict, "CONFIRMED")
+        self.assertEqual(verdict, "COLLECTED")
         self.assertEqual(values["variant"], "all-in-one")
+        self.assertEqual(values["local_label"], "local-01")
         self.assertEqual(values["panel"], "panel.example.com")
         self.assertEqual(values["camouflage"], "cdn.example.com")
         self.assertEqual(values["vision"], "vision.example.com")
@@ -413,11 +424,12 @@ class TestCollectPlan(unittest.TestCase):
         # traffic plane and the plan has to ask for them.
         verdict, values, nodes, _ = self._collect(
             "en\n2\npanel.example.com\ncdn.example.com\nadmin@example.com\n2\n"
-            "node1.example.com\ncdn1.example.com\nn\n"
-            "node2.example.com\ncdn2.example.com\ny\nvision2.example.com\nn\ny\n"
+            "node1.example.com\ncdn1.example.com\nn\nams-01\n"
+            "node2.example.com\ncdn2.example.com\ny\nvision2.example.com\nfra-01\nn\n"
         )
-        self.assertEqual(verdict, "CONFIRMED")
+        self.assertEqual(verdict, "COLLECTED")
         self.assertEqual(values["variant"], "panel-only")
+        self.assertEqual(values["local_label"], "")
         self.assertEqual(values["vision"], "")
         self.assertEqual(values["cert_count"], "7")
         self.assertEqual(
@@ -428,12 +440,12 @@ class TestCollectPlan(unittest.TestCase):
     def test_multi_node_collects_every_worker_and_its_optional_vision(self):
         verdict, values, nodes, _ = self._collect(
             "en\n3\npanel.example.com\ncdn.example.com\ny\nvision.example.com\n"
-            "admin@example.com\n2\n"
-            "node1.example.com\ncdn1.example.com\nn\n"
+            "local-01\nadmin@example.com\n2\n"
+            "node1.example.com\ncdn1.example.com\nn\nams-01\n"
             "node2.example.com\ncdn2.example.com\ny\nvision2.example.com\n"
-            "n\ny\n"
+            "fra-01\nn\n"
         )
-        self.assertEqual(verdict, "CONFIRMED")
+        self.assertEqual(verdict, "COLLECTED")
         self.assertEqual(values["variant"], "multi-node")
         self.assertEqual(values["cert_count"], "8")
         self.assertEqual(
@@ -441,9 +453,10 @@ class TestCollectPlan(unittest.TestCase):
             ["node1.example.com|cdn1.example.com|", "node2.example.com|cdn2.example.com|vision2.example.com"],
         )
 
-    def test_a_plan_with_an_unresolvable_name_is_refused_before_confirmation(self):
+    def test_a_plan_with_an_unresolvable_name_is_refused_before_collection_ends(self):
         verdict, values, nodes, stderr = self._collect(
-            "en\n1\npanel.example.com\nmissing.example.com\nn\nadmin@example.com\nn\ny\n",
+            "en\n1\npanel.example.com\nmissing.example.com\nn\nlocal-01\n"
+            "admin@example.com\nn\n",
             failing=("missing.example.com",),
         )
         self.assertEqual(verdict, "REFUSED")
@@ -454,17 +467,306 @@ class TestCollectPlan(unittest.TestCase):
 
     def test_a_rejected_variant_answer_and_a_bad_node_count_repeat_the_question(self):
         verdict, values, _, _ = self._collect(
-            "en\n9\n1\npanel.example.com\ncdn.example.com\nn\nadmin@example.com\nn\ny\n"
+            "en\n9\n1\npanel.example.com\ncdn.example.com\nn\nlocal-01\nadmin@example.com\nn\n"
         )
-        self.assertEqual(verdict, "CONFIRMED")
+        self.assertEqual(verdict, "COLLECTED")
         self.assertEqual(values["variant"], "all-in-one")
 
         verdict, values, _, _ = self._collect(
-            "en\n3\npanel.example.com\ncdn.example.com\nn\nadmin@example.com\n0\n1\n"
-            "node1.example.com\ncdn1.example.com\nn\nn\ny\n"
+            "en\n3\npanel.example.com\ncdn.example.com\nn\nlocal-01\nadmin@example.com\n0\n1\n"
+            "node1.example.com\ncdn1.example.com\nn\nams-01\nn\n"
         )
-        self.assertEqual(verdict, "CONFIRMED")
+        self.assertEqual(verdict, "COLLECTED")
         self.assertEqual(values["cert_count"], "4")
+
+    def test_a_duplicate_cover_domain_is_corrected_before_the_next_question(self):
+        """The refused name is re-asked alone, so the Panel and node 1 survive it."""
+        verdict, values, nodes, stderr = self._collect(
+            "en\n3\npanel.example.com\ncdn.example.com\nn\nlocal-01\nadmin@example.com\n2\n"
+            "node1.example.com\ncdn1.example.com\nn\nams-01\n"
+            # node 2's cover domain repeats node 1's, then is corrected in place.
+            "node2.example.com\ncdn1.example.com\ncdn2.example.com\nn\nfra-01\nn\n"
+        )
+        self.assertEqual(verdict, "COLLECTED")
+        self.assertEqual(
+            nodes,
+            ["node1.example.com|cdn1.example.com|", "node2.example.com|cdn2.example.com|"],
+        )
+        refusal = "cdn1.example.com is already used by node 1 camouflage domain in this plan."
+        self.assertIn(refusal, stderr)
+        # The correction happens before Vision for that node is asked, and
+        # nothing already answered is asked again.
+        self.assertLess(stderr.index(refusal), stderr.index("Enable Vision for node2.example.com"))
+        self.assertEqual(stderr.count("Select deployment scheme"), 1)
+        self.assertEqual(stderr.count("Panel domain ("), 1)
+        self.assertEqual(stderr.count("Node 2 primary domain"), 1)
+        self.assertEqual(stderr.count("Node 2 camouflage domain"), 2)
+
+    def test_a_duplicate_names_its_owner_in_the_selected_language(self):
+        """The owner of a taken name is translated, not left as an English fragment."""
+        verdict, values, nodes, stderr = self._collect(
+            "3\n"
+            # The Panel camouflage repeats the Panel domain of the same card.
+            "panel.example.com\npanel.example.com\ncdn.example.com\nn\nlocal-01\n"
+            "admin@example.com\n1\n"
+            # The node's cover domain repeats the Panel camouflage of the plan.
+            "node1.example.com\ncdn.example.com\ncdn1.example.com\nn\nams-01\nn\n",
+            lang="ru",
+        )
+        self.assertEqual(verdict, "COLLECTED")
+        self.assertEqual(values["camouflage"], "cdn.example.com")
+        self.assertEqual(nodes, ["node1.example.com|cdn1.example.com|"])
+        self.assertIn("уже используется", stderr)
+        self.assertIn("ответ, который вы уже дали в этой карточке", stderr)
+        self.assertIn("домен прикрытия панели", stderr)
+        self.assertNotIn("in this plan", stderr)
+
+    def test_a_blank_node_name_is_refused_and_the_question_repeats(self):
+        """A name nobody typed is not a name; only the field is asked again."""
+        verdict, values, _, stderr = self._collect(
+            "en\n1\npanel.example.com\ncdn.example.com\nn\n\nlocal-01\n"
+            "admin@example.com\nn\n"
+        )
+        self.assertEqual(verdict, "COLLECTED")
+        self.assertEqual(values["local_label"], "local-01")
+        self.assertEqual(stderr.count("A node name is required."), 1)
+        # Every other answer survived the refusal.
+        self.assertEqual(values["panel"], "panel.example.com")
+        self.assertEqual(values["email"], "admin@example.com")
+
+    def test_a_padded_node_name_is_stored_without_its_spaces(self):
+        """Surrounding whitespace is typing, not part of the name."""
+        verdict, values, nodes, stderr = self._collect(
+            "en\n3\npanel.example.com\ncdn.example.com\nn\n  local-01  \n"
+            "admin@example.com\n1\n"
+            "node1.example.com\ncdn1.example.com\nn\n  ams-01\t\nn\n"
+        )
+        self.assertEqual(verdict, "COLLECTED")
+        self.assertEqual(values["local_label"], "local-01")
+        self.assertEqual(values["node_label"], "ams-01")
+        self.assertEqual(nodes, ["node1.example.com|cdn1.example.com|"])
+        self.assertNotIn("already used", stderr)
+
+    def test_a_case_only_difference_is_the_same_name(self):
+        """AMS-01 and ams-01 are one server to the Panel, so they collide here."""
+        verdict, values, _, stderr = self._collect(
+            "en\n3\npanel.example.com\ncdn.example.com\nn\nlocal-01\n"
+            "admin@example.com\n2\n"
+            "node1.example.com\ncdn1.example.com\nn\nams-01\n"
+            "node2.example.com\ncdn2.example.com\nn\nAMS-01\nfra-01\nn\n"
+        )
+        self.assertEqual(verdict, "COLLECTED")
+        self.assertEqual(values["node_label"], "fra-01")
+        self.assertIn("Node name AMS-01 is already used by node 1.", stderr)
+        # The correction costs one question, not the earlier cards.
+        self.assertEqual(stderr.count("Node 1 primary domain"), 1)
+        self.assertEqual(stderr.count("Panel domain ("), 1)
+
+    def test_the_summary_shows_each_servers_own_name(self):
+        """Two nodes keep two different names all the way to the confirmation."""
+        with tempfile.TemporaryDirectory() as directory:
+            result = bash(
+                SOURCE_WIZARD
+                + "wizard_collect_plan >/dev/null || exit 1\n"
+                + "wizard_plan_summary\n",
+                stdin=(
+                    "en\n3\npanel.example.com\ncdn.example.com\nn\nlocal-01\n"
+                    "admin@example.com\n2\n"
+                    "node1.example.com\ncdn1.example.com\nn\nams-01\n"
+                    "node2.example.com\ncdn2.example.com\nn\nfra-01\nn\n"
+                ),
+                env={"GOWAVE_WIZARD_RESOLVER": write_resolver(directory)},
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Panel (local-01): panel=panel.example.com", result.stdout)
+        self.assertIn("node 1 (ams-01): panel=node1.example.com", result.stdout)
+        self.assertIn("node 2 (fra-01): panel=node2.example.com", result.stdout)
+        self.assertEqual(result.stdout.count("(ams-01)"), 1)
+        self.assertEqual(result.stdout.count("(fra-01)"), 1)
+
+
+class TestVariantMenu(unittest.TestCase):
+    """The scheme menu states where the Panel and the nodes run, in both languages.
+
+    The placement is the whole question: an operator who reads "All-in-One"
+    learns nothing about what lives on this server, and the answer decides
+    whether a lost host takes a client endpoint with it.
+    """
+
+    OPTION = re.compile(r"^[123]\) ")
+
+    def _select(self, stdin, lang="en"):
+        result = bash(
+            SOURCE_WIZARD
+            + "if wizard_select_variant; then printf 'variant=%s\\n' \"$GOWAVE_PLAN_VARIANT\";"
+            " else echo REFUSED; fi\n",
+            stdin=stdin,
+            env={"GOWAVE_WIZARD_LANG": lang},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def options(self, stderr):
+        return [line for line in stderr.splitlines() if self.OPTION.match(line)]
+
+    def test_each_scheme_names_where_the_panel_and_the_nodes_run(self):
+        result = self._select("1\n")
+        lines = self.options(result.stderr)
+        self.assertEqual(len(lines), 3, result.stderr)
+        one, two, three = lines
+        self.assertIn("this server", one)
+        self.assertEqual(lines[1], two)
+        self.assertIn("separate servers", two)
+        self.assertIn("recommended", two)
+        self.assertNotIn("not recommended", two.lower())
+        self.assertIn("elsewhere", three)
+        self.assertIn("not recommended", three.lower())
+
+    def test_the_menu_states_that_no_scheme_fails_over_by_itself(self):
+        result = self._select("1\n")
+        self.assertIn("moves clients between nodes automatically", result.stderr)
+
+    def test_enter_selects_no_scheme_and_repeats_the_question(self):
+        result = self._select("\n2\n")
+        self.assertEqual(result.stdout.strip(), "variant=panel-only")
+        self.assertEqual(len(self.options(result.stderr)), 6, result.stderr)
+        self.assertIn("1, 2 or 3", result.stderr)
+
+    def test_the_russian_menu_states_the_same_three_placements(self):
+        result = self._select("3\n", lang="ru")
+        lines = self.options(result.stderr)
+        self.assertEqual(len(lines), 3, result.stderr)
+        self.assertIn("рекомендуется", lines[1])
+        self.assertNotIn("не рекомендуется", lines[1])
+        self.assertIn("не рекомендуется", lines[2])
+
+    def test_the_guide_names_every_menu_action_and_the_recommendation(self):
+        keys = (
+            "status", "install", "add_node", "change_domains", "switch_channel",
+            "backup", "restore", "user_links", "uninstall", "exit",
+        )
+        lookups = "".join(f"printf '%s\\n' \"$(t menu.option.{key})\"\n" for key in keys)
+        result = bash(
+            f"source {shlex.quote(str(I18N_SH))}\n"
+            "GOWAVE_WIZARD_LANG=en\n" + lookups
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = (REPO_ROOT / "docs/SETUP_WIZARD.md").read_text(encoding="utf-8")
+        for label in result.stdout.splitlines():
+            self.assertIn(label, document, f"the guide does not name the menu action: {label}")
+        lowered = re.sub(r"\s+", " ", document.lower())
+        self.assertIn("the recommended shape is panel-only", lowered)
+        self.assertIn("not recommended", lowered)
+        self.assertIn("no scheme moves clients between nodes automatically", lowered)
+
+
+class TestInteractiveMenu(unittest.TestCase):
+    """The menu holds a result on screen until Enter, then redraws once.
+
+    Drives the real CLI over a pseudo-terminal, so the screen observed here is
+    the one an operator reads. TERM is removed: a menu that dies because `clear`
+    cannot find a terminal type is the same defect as a screen erased before it
+    was read.
+    """
+
+    MENU_TITLE = b"GoWave Auto NGINX Manager"
+    PAUSE = b"Press Enter to return to the menu"
+
+    @staticmethod
+    def _attach_controlling_terminal():
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+    @staticmethod
+    def _read_until(fd, marker, timeout=30.0):
+        deadline = time.time() + timeout
+        buffer = b""
+        while marker not in buffer:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise AssertionError(f"timed out waiting for {marker!r}; read {buffer!r}")
+            ready, _, _ = select.select([fd], [], [], min(0.2, remaining))
+            if not ready:
+                continue
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                raise AssertionError(f"the terminal closed while waiting for {marker!r}: {buffer!r}")
+            buffer += chunk
+        return buffer
+
+    def _spawn(self):
+        merged = {k: v for k, v in os.environ.items() if k != "TERM"}
+        merged["GOWAVE_WIZARD_LANG"] = "en"
+        master, slave = pty.openpty()
+        process = subprocess.Popen(
+            ["bash", str(GOWAVE_AUTO)],
+            stdin=slave, stdout=slave, stderr=slave,
+            env=merged,
+            cwd=str(REPO_ROOT),
+            preexec_fn=self._attach_controlling_terminal,
+        )
+        os.close(slave)
+        self.addCleanup(process.kill)
+        self.addCleanup(self._close_quietly, master)
+        return master, process
+
+    @staticmethod
+    def _close_quietly(fd):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def test_the_status_screen_waits_for_enter_and_the_menu_redraws_once(self):
+        master, process = self._spawn()
+        initial = self._read_until(master, b"Select option")
+        self.assertEqual(initial.count(self.MENU_TITLE), 1, initial.decode(errors="replace"))
+
+        os.write(master, b"1\n")
+        held = self._read_until(master, self.PAUSE)
+        self.assertNotIn(self.MENU_TITLE, held,
+                         "the menu was redrawn before the operator acknowledged the status")
+        for header in (b"GoWave Auto NGINX Service Status", b"--- Systemd Services ---",
+                       b"--- Port Listeners ---", b"--- Certificate Lineages ---"):
+            self.assertIn(header, held, held.decode(errors="replace"))
+        self.assertIn(b"Port 443", held)
+        # The terminal translates the line feed, so match the rule and the
+        # question as one unit instead of pinning the newline spelling.
+        self.assertIsNotNone(
+            re.search(rb"={20,}\r?\n" + re.escape(self.PAUSE), held),
+            "the pause does not follow the end of the status report",
+        )
+
+        os.write(master, b"\n")
+        redrawn = self._read_until(master, b"Select option")
+        self.assertEqual(redrawn.count(self.MENU_TITLE), 1,
+                         "Enter produced no single redraw of the menu")
+
+        os.write(master, b"0\n")
+        self.assertEqual(process.wait(timeout=30), 0)
+
+    def test_end_of_input_leaves_the_menu_cleanly(self):
+        master, process = self._spawn()
+        self._read_until(master, b"Select option")
+        os.write(master, b"\x04")
+        self.assertEqual(process.wait(timeout=30), 0,
+                         "end of input must leave the menu the way option 0 does")
+
+    def test_a_positional_status_never_waits_for_an_answer(self):
+        process = subprocess.Popen(
+            ["bash", str(GOWAVE_AUTO), "status"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=str(REPO_ROOT),
+        )
+        self.addCleanup(process.kill)
+        try:
+            process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            self.fail("a positional status waited for input that no operator was asked for")
+        stdout, stderr = process.communicate()
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertIn("GoWave Auto NGINX Service Status", stdout)
+        self.assertNotIn("Press Enter", stdout + stderr)
 
 
 class TestCertificateBudget(unittest.TestCase):
@@ -861,7 +1163,32 @@ class TestWizardDocumentation(unittest.TestCase):
 
 
 class TestPlanReview(unittest.TestCase):
-    """Tests for the plan review screen that allows editing any field."""
+    """The review screen: start, edit the Panel, edit one node, or cancel.
+
+    The action list numbers the nodes, so editing node 2 cannot reach node 1's
+    fields, and cancel is a reported outcome rather than an error. The last case
+    proves a cancelled plan never reaches the lock or the mutation steps.
+    """
+
+    # Collection order: scheme, Panel card, local node name, email, node count,
+    # node cards (each followed by its own name), shared domain.
+    ALL_IN_ONE = (
+        "en\n1\npanel.example.com\ncdn.example.com\ny\nvision.example.com\n"
+        "local-01\nadmin@example.com\nn\n"
+    )
+    ONE_NODE = (
+        "en\n3\npanel.example.com\ncdn.example.com\nn\nlocal-01\nadmin@example.com\n1\n"
+        "node1.example.com\ncdn1.example.com\nn\nams-01\nn\n"
+    )
+    TWO_NODES = (
+        "en\n3\npanel.example.com\ncdn.example.com\nn\nlocal-01\nadmin@example.com\n2\n"
+        "node1.example.com\ncdn1.example.com\nn\nams-01\n"
+        "node2.example.com\ncdn2.example.com\nn\nfra-01\nn\n"
+    )
+
+    # Review actions: 1 starts, 2 edits the Panel and plan settings, 3 + index
+    # edits that node, 0 cancels. Inside a group the fields are numbered as the
+    # group lists them and 0 returns to the action list.
 
     def _review(self, initial_answers, review_answers, failing=()):
         """Run wizard_collect_plan then wizard_review_plan and return the final plan."""
@@ -870,9 +1197,9 @@ class TestPlanReview(unittest.TestCase):
             result = bash(
                 SOURCE_WIZARD
                 + "wizard_collect_plan >/dev/null\n"
-                + "wizard_review_plan >/dev/null\n"
+                + "wizard_review_plan >/dev/null || true\n"
                 + DUMP_PLAN,
-                stdin=initial_answers + "\n" + review_answers,
+                stdin=initial_answers + review_answers,
                 env={"GOWAVE_WIZARD_RESOLVER": resolver},
             )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -883,14 +1210,10 @@ class TestPlanReview(unittest.TestCase):
 
     def test_review_plan_can_change_panel_domain_and_preserves_other_fields(self):
         """Changing the panel domain preserves variant, email, camouflage, and nodes."""
-        # Menu: 1=variant, 2=panel_domain, 3=camouflage_domain, 4=vision_domain,
-        # 5=email, 6=shared_domain
         values, nodes, _ = self._review(
-            # Initial collection: all-in-one with panel, camouflage, vision, email
-            "en\n1\npanel.example.com\ncdn.example.com\ny\nvision.example.com\n"
-            "admin@example.com\nn\ny\n",
-            # Review: change panel domain (2), then confirm (0)
-            "2\nnewpanel.example.com\n0\n"
+            self.ALL_IN_ONE,
+            # Edit the Panel ("2"), field 2, the new value, back, start.
+            "2\n2\nnewpanel.example.com\n0\n1\n",
         )
         self.assertEqual(values["variant"], "all-in-one")
         self.assertEqual(values["panel"], "newpanel.example.com")
@@ -901,128 +1224,273 @@ class TestPlanReview(unittest.TestCase):
 
     def test_review_plan_can_change_email_and_preserves_other_fields(self):
         """Changing the email preserves all other fields."""
-        # Menu: 1=variant, 2=panel_domain, 3=camouflage_domain, 4=vision_domain,
-        # 5=email, 6=shared_domain
         values, nodes, _ = self._review(
-            "en\n1\npanel.example.com\ncdn.example.com\nn\nold@example.com\nn\ny\n",
-            "5\nnew@example.com\n0\n"
+            "en\n1\npanel.example.com\ncdn.example.com\nn\nlocal-01\n"
+            "old@example.com\nn\n",
+            "2\n6\nnew@example.com\n0\n1\n",
         )
         self.assertEqual(values["email"], "new@example.com")
         self.assertEqual(values["panel"], "panel.example.com")
         self.assertEqual(values["camouflage"], "cdn.example.com")
 
     def test_review_plan_rejects_invalid_hostname(self):
-        """An invalid hostname in review is rejected and the original value is kept."""
+        """An invalid hostname is refused and the field keeps its old value."""
         values, nodes, stderr = self._review(
-            "en\n1\npanel.example.com\ncdn.example.com\nn\nadmin@example.com\nn\ny\n",
-            "2\nnot-a-valid-hostname\n2\npanel2.example.com\n0\n"
+            self.ALL_IN_ONE,
+            # A refused answer keeps the editor open, so the second attempt is
+            # a field choice again, not a new action.
+            "2\n2\nnot-a-valid-hostname\n2\npanel2.example.com\n0\n1\n",
         )
         self.assertEqual(values["panel"], "panel2.example.com")
         self.assertIn("not-a-valid-hostname", stderr)
 
     def test_review_plan_rejects_duplicate_name(self):
-        """A duplicate name in review is rejected and the original value is kept."""
+        """A duplicate name is refused with its owner and the old value is kept."""
         values, nodes, stderr = self._review(
-            "en\n1\npanel.example.com\ncdn.example.com\nn\nadmin@example.com\nn\ny\n",
-            "2\ncdn.example.com\n2\npanel2.example.com\n0\n"
+            self.ALL_IN_ONE,
+            "2\n2\ncdn.example.com\n2\npanel2.example.com\n0\n1\n",
         )
         self.assertEqual(values["panel"], "panel2.example.com")
         self.assertIn("already used", stderr)
 
     def test_review_plan_can_change_node_count_and_adds_nodes(self):
-        """Increasing node count prompts for new node details."""
-        # Menu for 1 node: 1=variant, 2=panel, 3=camouflage, 4=vision(panel),
-        # 5=email, 6=shared, 7=node_count, 8=node1_name, 9=node1_camouflage, 10=node1_vision
+        """Raising the node count asks for the new node's whole card."""
         values, nodes, _ = self._review(
-            "en\n3\npanel.example.com\ncdn.example.com\ny\nvision.example.com\n"
-            "admin@example.com\n1\n"
-            "node1.example.com\ncdn1.example.com\nn\nn\ny\n",
-            # Change node count from 1 to 2 (7), then enter new node details
-            "7\n2\nnode2.example.com\ncdn2.example.com\nn\n0\n"
+            self.ONE_NODE,
+            "2\n8\n2\nnode2.example.com\ncdn2.example.com\nn\nbcn-01\n0\n1\n",
         )
         self.assertEqual(values["node_count"], "2")
         self.assertEqual(len(nodes), 2)
+        self.assertEqual(values["node_label"], "bcn-01")
         self.assertIn("node1.example.com|cdn1.example.com|", nodes)
         self.assertIn("node2.example.com|cdn2.example.com|", nodes)
 
     def test_review_plan_can_decrease_node_count(self):
-        """Decreasing node count truncates the node arrays."""
-        # Menu for 2 nodes: 1=variant, 2=panel, 3=camouflage, 4=vision(panel),
-        # 5=email, 6=shared, 7=node_count, 8=node1_name, 9=node1_camouflage, 10=node1_vision,
-        # 11=node2_name, 12=node2_camouflage, 13=node2_vision
-        values, nodes, _ = self._review(
-            "en\n3\npanel.example.com\ncdn.example.com\nn\nadmin@example.com\n2\n"
-            "node1.example.com\ncdn1.example.com\nn\n"
-            "node2.example.com\ncdn2.example.com\nn\nn\ny\n",
-            "7\n1\n0\n"
-        )
+        """Lowering the node count truncates the node arrays."""
+        values, nodes, _ = self._review(self.TWO_NODES, "2\n8\n1\n0\n1\n")
         self.assertEqual(values["node_count"], "1")
         self.assertEqual(len(nodes), 1)
         self.assertIn("node1.example.com|cdn1.example.com|", nodes)
         self.assertNotIn("node2.example.com", str(nodes))
 
-    def test_review_plan_can_change_node_name(self):
-        """Changing a node's name preserves other fields."""
-        # Menu for 1 node: 1=variant, 2=panel, 3=camouflage, 4=vision(panel),
-        # 5=email, 6=shared, 7=node_count, 8=node1_name, 9=node1_camouflage, 10=node1_vision
+    def test_the_panel_group_lists_every_field_with_its_label_and_value(self):
+        """A nameless row would still be selectable, so every row must be labelled."""
+        with tempfile.TemporaryDirectory() as directory:
+            resolver = write_resolver(directory)
+            result = bash(
+                SOURCE_WIZARD
+                + "wizard_collect_plan >/dev/null\n"
+                + "review_rc=0\n"
+                + "wizard_review_plan || review_rc=$?\n"
+                + "printf 'review_rc=%s\\n' \"$review_rc\"\n",
+                # Open the Panel group, go back, cancel.
+                stdin=self.ONE_NODE + "2\n0\n0\n",
+                env={"GOWAVE_WIZARD_RESOLVER": resolver},
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("unbound variable", result.stderr)
+        for label in (
+            "Deployment scheme",
+            "Panel domain",
+            "Panel camouflage domain",
+            "Panel Vision domain",
+            "Local node name",
+            "Let's Encrypt email",
+            "Shared registered domain",
+            "Number of remote nodes",
+        ):
+            self.assertIn(f"{label} [", result.stdout)
+        rows = [line for line in result.stdout.splitlines() if re.match(r"^\s+\d+\) .+ \[.*\]$", line)]
+        self.assertEqual(len(rows), 8, rows)
+
+    def test_review_plan_can_rename_the_local_node_and_a_worker(self):
+        """Both name rows are editable and the plan keeps what was accepted."""
         values, nodes, _ = self._review(
-            "en\n3\npanel.example.com\ncdn.example.com\nn\nadmin@example.com\n1\n"
-            "node1.example.com\ncdn1.example.com\nn\nn\ny\n",
-            "8\nnode1-renamed.example.com\n0\n"
+            self.TWO_NODES,
+            # Panel group, local node name; then node 2, its name; back, start.
+            "2\n5\nlocal-02\n0\n4\n4\nfra-02\n0\n1\n",
         )
-        self.assertEqual(len(nodes), 1)
-        self.assertIn("node1-renamed.example.com|cdn1.example.com|", nodes)
+        self.assertEqual(values["local_label"], "local-02")
+        self.assertEqual(values["node_label"], "fra-02")
+        self.assertEqual(values["panel"], "panel.example.com")
+        self.assertEqual(
+            nodes,
+            ["node1.example.com|cdn1.example.com|", "node2.example.com|cdn2.example.com|"],
+        )
+
+    def test_review_plan_refuses_a_name_another_server_already_has(self):
+        """The review reuses the collection rule instead of trusting the editor."""
+        values, nodes, stderr = self._review(
+            self.TWO_NODES,
+            "2\n5\nfra-01\n5\nlocal-02\n0\n1\n",
+        )
+        self.assertEqual(values["local_label"], "local-02")
+        self.assertIn("Node name fra-01 is already used by node 2.", stderr)
+
+    def test_review_plan_refuses_a_blank_name_instead_of_keeping_it(self):
+        """Blank means "nothing typed", so the empty answer is refused, not kept."""
+        values, _, stderr = self._review(self.ONE_NODE, "3\n4\n   \n4\nams-02\n0\n1\n")
+        self.assertEqual(values["node_label"], "ams-02")
+        self.assertIn("A node name is required.", stderr)
+
+    def test_editing_the_second_node_leaves_its_sibling_unchanged(self):
+        """Node 2 is action 4, and its editor lists only that node's fields."""
+        values, nodes, _ = self._review(
+            self.TWO_NODES,
+            "4\n1\nnode2-renamed.example.com\n0\n1\n",
+        )
+        self.assertEqual(
+            nodes,
+            ["node1.example.com|cdn1.example.com|", "node2-renamed.example.com|cdn2.example.com|"],
+        )
+        self.assertEqual(values["panel"], "panel.example.com")
+        self.assertEqual(values["camouflage"], "cdn.example.com")
+        self.assertEqual(values["email"], "admin@example.com")
+
+    def test_review_plan_can_change_node_name(self):
+        """Changing a node's name preserves its other fields."""
+        values, nodes, _ = self._review(
+            self.ONE_NODE,
+            "3\n1\nnode1-renamed.example.com\n0\n1\n",
+        )
+        self.assertEqual(nodes, ["node1-renamed.example.com|cdn1.example.com|"])
 
     def test_review_plan_can_change_node_vision(self):
         """Adding Vision to a node that didn't have it."""
-        # Menu for 1 node: 1=variant, 2=panel, 3=camouflage, 4=vision(panel),
-        # 5=email, 6=shared, 7=node_count, 8=node1_name, 9=node1_camouflage, 10=node1_vision
         values, nodes, _ = self._review(
-            "en\n3\npanel.example.com\ncdn.example.com\nn\nadmin@example.com\n1\n"
-            "node1.example.com\ncdn1.example.com\nn\nn\ny\n",
-            "10\nvision1.example.com\n0\n"
+            self.ONE_NODE,
+            "3\n3\nvision1.example.com\n0\n1\n",
         )
-        self.assertEqual(len(nodes), 1)
-        self.assertIn("node1.example.com|cdn1.example.com|vision1.example.com", nodes)
+        self.assertEqual(nodes, ["node1.example.com|cdn1.example.com|vision1.example.com"])
 
     def test_review_plan_can_remove_node_vision(self):
-        """Removing Vision from a node that had it."""
-        # Menu for 1 node with vision: same structure, node1_vision is field 10
+        """An empty Vision answer removes Vision instead of keeping it."""
         values, nodes, _ = self._review(
-            "en\n3\npanel.example.com\ncdn.example.com\nn\nadmin@example.com\n1\n"
-            "node1.example.com\ncdn1.example.com\ny\nvision1.example.com\nn\ny\n",
-            "10\n\n0\n"
+            "en\n3\npanel.example.com\ncdn.example.com\nn\nlocal-01\nadmin@example.com\n1\n"
+            "node1.example.com\ncdn1.example.com\ny\nvision1.example.com\nams-01\nn\n",
+            "3\n3\n\n0\n1\n",
         )
-        self.assertEqual(len(nodes), 1)
-        self.assertIn("node1.example.com|cdn1.example.com|", nodes)
+        self.assertEqual(nodes, ["node1.example.com|cdn1.example.com|"])
         self.assertNotIn("vision1.example.com", str(nodes))
 
-    def test_review_plan_re_runs_certificate_preflight(self):
-        """Changing shared_domain to yes re-runs certificate budget check."""
-        # Menu: 1=variant, 2=panel, 3=camouflage, 4=vision(panel), 5=email, 6=shared_domain
-        # Need two "y": one for shared_domain value, one for preflight confirmation
+    def test_review_plan_asks_for_shared_domain_consent_once(self):
+        """Start re-checks the budget but does not repeat consent for the same count."""
         values, nodes, stderr = self._review(
-            "en\n1\npanel.example.com\ncdn.example.com\nn\nadmin@example.com\nn\ny\n",
-            # Change shared_domain to yes (6), confirm preflight (y), then confirm exit (0)
-            "6\ny\ny\n0\n"
+            self.ALL_IN_ONE,
+            # Shared domain yes, one consent answer, back, start.
+            "2\n7\ny\ny\n0\n1\n",
         )
         self.assertEqual(values["shared"], "yes")
-        # Should have passed preflight (only 2 certs needed)
         self.assertNotIn("exceed the ceiling", stderr)
+        self.assertEqual(stderr.count("budget is shared by the whole cluster"), 1)
 
     def test_review_plan_rejects_shared_domain_over_ceiling(self):
-        """Shared domain with too many certificates is rejected."""
-        # Start with multi-node, 25 nodes (2 certs each + 2 panel = 52 certs)
-        # Then change to shared_domain=yes which exceeds 50
-        # Menu for 25 nodes is large, shared_domain is field 6
-        values, nodes, stderr = self._review(
-            "en\n3\npanel.example.com\ncdn.example.com\nn\nadmin@example.com\n25\n"
-            + "\n".join(f"node{i}.example.com\ncdn{i}.example.com\nn" for i in range(1, 26))
-            + "\nn\ny\n",
-            "6\ny\n0\n"
+        """A shared domain over the ceiling is refused, and start cannot bypass it."""
+        plan = (
+            "en\n3\npanel.example.com\ncdn.example.com\nn\nlocal-01\nadmin@example.com\n25\n"
+            + "\n".join(
+                f"node{i}.example.com\ncdn{i}.example.com\nn\nnode-{i:02d}" for i in range(1, 26)
+            )
+            + "\nn\n"
         )
-        # This should fail preflight because 2 + 2*25 = 52 certs > 50
-        self.assertIn("exceed the ceiling", stderr)
+        # Two refusals — one while editing, one at start — then the operator
+        # cancels, because no answer in the review makes 52 certificates fit.
+        values, nodes, stderr = self._review(plan, "2\n7\ny\n0\n1\n0\n")
+        self.assertEqual(stderr.count("exceed the ceiling"), 2)
+
+    def test_cancelling_at_review_reports_the_code_and_changes_no_answer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            resolver = write_resolver(directory)
+            result = bash(
+                SOURCE_WIZARD
+                + "wizard_collect_plan >/dev/null\n"
+                + "review_rc=0\n"
+                + "wizard_review_plan || review_rc=$?\n"
+                + "printf 'review_rc=%s\\n' \"$review_rc\"\n"
+                + DUMP_PLAN,
+                stdin=self.TWO_NODES + "0\n",
+                env={"GOWAVE_WIZARD_RESOLVER": resolver},
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("review_rc=3", result.stdout)
+        self.assertIn("Deployment cancelled. No server was changed.", result.stdout)
+        lines = result.stdout.splitlines()
+        nodes = [line.split("=", 1)[1] for line in lines if line.startswith("node=")]
+        self.assertEqual(
+            nodes,
+            ["node1.example.com|cdn1.example.com|", "node2.example.com|cdn2.example.com|"],
+        )
+
+    def test_cancelling_at_review_reaches_no_lock_and_no_install_step(self):
+        """A cancelled plan returns from cmd_install before the lock is taken."""
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / "mutations"
+            resolver = write_resolver(directory)
+            result = bash(
+                f"source {shlex.quote(str(GOWAVE_AUTO))}\n"
+                # Stdin is a pipe here, so the terminal gate is answered by the
+                # test and every step after the lock records that it was reached.
+                "wizard_should_run() { return 0; }\n"
+                "set +e\n"
+                "acquire_lock() { printf 'lock\\n' >> \"$MARKER\"; }\n"
+                "preflight_require_inputs() { printf 'inputs\\n' >> \"$MARKER\"; }\n"
+                "preflight_require_direct_dns() { printf 'dns\\n' >> \"$MARKER\"; }\n"
+                "bootstrap_early_tools() { printf 'bootstrap\\n' >> \"$MARKER\"; }\n"
+                "select_acme_lineage() { printf 'acme\\n' >> \"$MARKER\"; }\n"
+                "cmd_install\n"
+                "printf 'rc=%s\\n' \"$?\"\n",
+                stdin=self.ONE_NODE + "0\n",
+                env={"GOWAVE_WIZARD_RESOLVER": resolver, "MARKER": str(marker)},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("rc=0", result.stdout)
+            self.assertIn("Deployment cancelled. No server was changed.", result.stdout)
+            self.assertFalse(
+                marker.exists() and marker.read_text(encoding="utf-8"),
+                "a cancelled plan reached a mutation step",
+            )
+
+
+class TestLocalNodeName(unittest.TestCase):
+    """The accepted local name is what provisioning registers, not a constant.
+
+    A positional or scripted install collects no plan, and its state, profile
+    tags and Host remarks must stay what earlier versions wrote — otherwise a
+    repeated install would leave the node it registered last time behind.
+    """
+
+    # cmd_install's locals are visible inside the functions it calls: bash scopes
+    # them dynamically, so `acquire_lock` can report what provisioning would use.
+    PROBE = "acquire_lock() { printf 'name=%s\\n' \"$local_node_name\"; exit 0; }\n"
+
+    def _planned_name(self, wizard=False, plan_label=""):
+        collect = (
+            "wizard_should_run() { return 0; }\n"
+            f"wizard_collect_plan() {{ GOWAVE_PLAN_LOCAL_LABEL={shlex.quote(plan_label)}; return 0; }}\n"
+            "wizard_review_plan() { return 0; }\n"
+            "wizard_check_ssh_reachable() { return 0; }\n"
+            # The plan is what fills the positional list on this path; without it
+            # the non-terminal gate refuses before anything is collected.
+            "wizard_apply_plan() { GOWAVE_INSTALL_MODE=all-in-one;"
+            " GOWAVE_INSTALL_POSITIONAL=(panel.example.com cdn.example.com admin@example.com '');"
+            " return 0; }\n"
+            if wizard
+            else "wizard_should_run() { return 1; }\n"
+        )
+        result = bash(
+            f"source {shlex.quote(str(GOWAVE_AUTO))}\n"
+            + collect
+            + self.PROBE
+            + "cmd_install panel.example.com cdn.example.com admin@example.com\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_a_plan_without_a_collected_name_keeps_the_historical_one(self):
+        self.assertEqual(self._planned_name(), "name=local-node")
+
+    def test_the_collected_name_is_what_provisioning_registers(self):
+        self.assertEqual(self._planned_name(wizard=True, plan_label="ams-01"), "name=ams-01")
 
 
 class TestSSHReachability(unittest.TestCase):
@@ -1036,6 +1504,7 @@ class TestSSHReachability(unittest.TestCase):
             "panel.example.com",
             "cdn.example.com",
             "n",
+            "local-01",
             "admin@example.com",
             str(node_count),
         ]
@@ -1044,9 +1513,11 @@ class TestSSHReachability(unittest.TestCase):
                 f"node{i}.example.com",
                 f"cdn{i}.example.com",
                 "n",
+                f"node-{i:02d}",
             ])
-        answers.extend(["n", "y"])
-        # Ensure trailing newline so the final read gets the "y"
+        # The last answer is the shared-domain question; the plan is complete
+        # once the node cards are read.
+        answers.append("n")
         return "\n".join(answers) + "\n"
 
     def _run_ssh_check(self, plan_answers, failing=(), reachable=(), banner_for=(), env=None):
@@ -1284,6 +1755,7 @@ exit 0
             f"source {shlex.quote(str(GOWAVE_AUTO))}\n"
             "detect_local_panel() { printf 'panel.example.com'; return 0; }\n"
             "wizard_verify_panel_api() { printf 'VERIFY=%s/%s\\n' \"$1\" \"$2\"; return 0; }\n"
+            "wizard_panel_inventory_names() { printf 'worker-old\\t10.9.9.9\\n'; return 0; }\n"
             "ssh_bootstrap_onboard_one() {"
             " printf 'ONBOARD host=%s cam=%s vision=[%s] name=%s ip=%s\\n'"
             " \"$1\" \"$2\" \"${3-}\" \"${4-}\" \"${5-}\"; return 0; }\n"
@@ -1298,11 +1770,36 @@ exit 0
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("VERIFY=panel.example.com/yes", result.stdout)
+        self.assertIn("The Panel lists 1 node(s)", result.stderr)
         self.assertIn(
             "ONBOARD host=node.example.com cam=cdn.example.com vision=[] name=worker-one ip=10.1.2.3",
             result.stdout,
         )
         self.assertNotIn("CMD_NODE=", result.stdout, "the menu bypassed the temporary-access onboarding")
+
+    def test_the_menu_add_node_refuses_a_name_the_panel_already_holds(self):
+        # The menu has the Panel's inventory in hand before the SSH session
+        # opens, so a collision is refused there instead of after registration.
+        script = (
+            f"source {shlex.quote(str(GOWAVE_AUTO))}\n"
+            "detect_local_panel() { printf 'panel.example.com'; return 0; }\n"
+            "wizard_verify_panel_api() { return 0; }\n"
+            "wizard_panel_inventory_names() { printf 'worker-one\\t10.9.9.9\\n'; return 0; }\n"
+            "ssh_bootstrap_onboard_one() { printf 'ONBOARD name=%s\\n' \"$4\"; return 0; }\n"
+            "set +e\n"
+            "wizard_add_node_to_panel\n"
+            "printf 'RC=%d\\n' \"$?\"\n"
+        )
+        result = bash(
+            script,
+            stdin="y\nworker-one\nworker-two\n10.1.2.3\nnode.example.com\ncdn.example.com\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "The Panel already has a node named worker-one at 10.9.9.9",
+            result.stderr,
+        )
+        self.assertIn("ONBOARD name=worker-two", result.stdout)
 
     def test_the_menu_asks_for_a_panel_domain_when_nothing_runs_locally(self):
         script = (
@@ -1318,6 +1815,123 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("VERIFY=panel.example.com/no", result.stdout)
         self.assertIn("RC=1", result.stdout)
+
+
+class TestPanelWorkerName(unittest.TestCase):
+    """The name question holds the Panel's inventory, not a guess.
+
+    A name the Panel already holds belongs to another node, and registering it
+    again rewrites that node's address — the traffic endpoint of a server this
+    operator does not own. The inventory read is the only thing that can tell
+    the two apart, so what it returns decides the question.
+    """
+
+    def read(self, inventory, stdin="", address="panel.example.com", local="yes"):
+        script = (
+            SOURCE_WIZARD
+            + inventory
+            + "set +e\n"
+            f"name=$(wizard_read_panel_worker_name {shlex.quote(address)} {local})\n"
+            "rc=$?\n"
+            "printf 'RC=%d NAME=[%s]\\n' \"$rc\" \"$name\"\n"
+        )
+        return bash(script, stdin=stdin)
+
+    def test_a_name_the_panel_already_holds_is_refused_and_the_question_repeats(self):
+        result = self.read(
+            "wizard_panel_inventory_names() { printf 'ams-01\\t10.1.2.3\\n'; return 0; }\n",
+            stdin="ams-01\nams-02\n",
+        )
+        self.assertIn("RC=0 NAME=[ams-02]", result.stdout, result.stderr)
+        self.assertIn("The Panel lists 1 node(s)", result.stderr)
+        self.assertIn("The Panel already has a node named ams-01 at 10.1.2.3", result.stderr)
+
+    def test_the_panel_name_comparison_ignores_case(self):
+        result = self.read(
+            "wizard_panel_inventory_names() { printf 'AMS-01\\t10.1.2.3\\n'; return 0; }\n",
+            stdin="ams-01\nams-02\n",
+        )
+        self.assertIn("RC=0 NAME=[ams-02]", result.stdout, result.stderr)
+        self.assertIn("The Panel already has a node named ams-01 at 10.1.2.3", result.stderr)
+
+    def test_a_remote_panel_says_the_name_is_unverified_and_asks_for_it(self):
+        result = self.read(
+            "wizard_panel_inventory_names() { return 2; }\n",
+            stdin="worker-one\n",
+            local="no",
+        )
+        self.assertIn("RC=0 NAME=[worker-one]", result.stdout, result.stderr)
+        self.assertIn("cannot be read from this host", result.stderr)
+        self.assertNotIn("The Panel lists", result.stderr, "an unread inventory claimed a count")
+
+    def test_an_unreadable_local_panel_asks_before_giving_up(self):
+        result = self.read(
+            "wizard_panel_inventory_names() { return 1; }\n",
+            stdin="n\n",
+        )
+        self.assertIn("RC=1 NAME=[]", result.stdout, result.stderr)
+        self.assertIn("Could not read the node list from the Panel: panel.example.com", result.stderr)
+        self.assertIn("Add node cancelled.", result.stderr)
+
+    def test_a_retried_inventory_read_replaces_the_failed_one(self):
+        # The inventory read runs in a command substitution, so a counter held
+        # in a shell variable would reset on every call: the stub counts in a file.
+        result = self.read(
+            "_wpn_calls=$(mktemp)\n"
+            "wizard_panel_inventory_names() {\n"
+            "  local n\n"
+            "  n=$(cat \"$_wpn_calls\")\n"
+            "  n=$((n + 1))\n"
+            "  printf '%s' \"$n\" > \"$_wpn_calls\"\n"
+            "  if [ \"$n\" -eq 1 ]; then return 1; fi\n"
+            "  printf 'worker-old\\t10.9.9.9\\n'\n"
+            "  return 0\n"
+            "}\n",
+            stdin="y\nworker-old\nworker-new\n",
+        )
+        self.assertIn("RC=0 NAME=[worker-new]", result.stdout, result.stderr)
+        self.assertIn("The Panel lists 1 node(s)", result.stderr)
+        self.assertIn("The Panel already has a node named worker-old at 10.9.9.9", result.stderr)
+
+    def test_the_panel_address_and_its_locality_reach_the_inventory_read(self):
+        result = self.read(
+            "wizard_panel_inventory_names() { printf 'READ=%s/%s\\n' \"$1\" \"$2\" >&2; return 0; }\n",
+            stdin="worker-one\n",
+            address="panel.example.com",
+            local="no",
+        )
+        self.assertIn("READ=panel.example.com/no", result.stderr)
+
+
+class TestPanelInventoryRead(unittest.TestCase):
+    """What the inventory read answers, and what it refuses to guess.
+
+    Only a Panel on this host can be read: its token sits in this host's
+    credentials file. A remote Panel's inventory is unverifiable here, and an
+    unreadable local one is a failure — neither may be reported as "the name is
+    free".
+    """
+
+    def read(self, address, local, credentials):
+        script = (
+            SOURCE_WIZARD
+            + "set +e\n"
+            f"CREDENTIALS_FILE={shlex.quote(credentials)}\n"
+            f"wizard_panel_inventory_names {shlex.quote(address)} {local}\n"
+            "printf 'RC=%d\\n' \"$?\"\n"
+        )
+        return bash(script)
+
+    def test_a_remote_panel_inventory_is_unverifiable_here(self):
+        result = self.read("panel.example.com", "no", "/nonexistent/credentials")
+        self.assertIn("RC=2", result.stdout, result.stderr)
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "RC=2", "an unverified inventory printed names")
+
+    def test_a_local_panel_without_a_credentials_file_is_a_failure_not_an_empty_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.read("127.0.0.1", "yes", str(Path(directory) / "absent.txt"))
+        self.assertIn("RC=1", result.stdout, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
 
 if __name__ == "__main__":

@@ -237,12 +237,25 @@ cmd_health() {
 }
 
 cmd_install() {
-    local install_mode
+    local install_mode plan_rc=0
     if wizard_should_run "$@"; then
-        wizard_collect_plan || return 1
-        wizard_review_plan || return 1
-        wizard_check_ssh_reachable || return 1
-        wizard_apply_plan || return 1
+        # A cancelled plan is not a failure: no server was changed, so the
+        # interactive session returns to its menu and a positional caller exits
+        # 0. Every other code keeps the failure the step reported.
+        wizard_collect_plan || plan_rc=$?
+        if (( plan_rc == 3 )); then
+            return 0
+        elif (( plan_rc != 0 )); then
+            return "$plan_rc"
+        fi
+        wizard_review_plan || plan_rc=$?
+        if (( plan_rc == 3 )); then
+            return 0
+        elif (( plan_rc != 0 )); then
+            return "$plan_rc"
+        fi
+        wizard_check_ssh_reachable || return $?
+        wizard_apply_plan || return $?
         install_mode="$GOWAVE_INSTALL_MODE"
     else
         if [[ $# -eq 0 ]]; then
@@ -267,6 +280,10 @@ cmd_install() {
             return 2
         fi
     fi
+    # The local node keeps the operator's own word for this server on a wizard
+    # run; an installation that never collected a plan keeps the historical
+    # name so its state, tags and remarks stay what earlier versions produced.
+    local local_node_name="${GOWAVE_PLAN_LOCAL_LABEL:-local-node}"
     acquire_lock
     local panel_domain="${GOWAVE_INSTALL_POSITIONAL[0]:-}"
     local reality_domain="${GOWAVE_INSTALL_POSITIONAL[1]:-}"
@@ -572,6 +589,7 @@ cmd_install() {
         GOWAVE_MIHOMO_X25519="${GOWAVE_MIHOMO_X25519:-}" \
         GOWAVE_REALITY_FINGERPRINT="${GOWAVE_REALITY_FINGERPRINT:-}" \
         GOWAVE_VISION_CERT_DIR="${vision_live}" \
+        GOWAVE_LOCAL_NODE_NAME="$local_node_name" \
         python3 - \
         "$SCRIPT_DIR" "$panel_domain" "$reality_domain" "$admin_user" \
         "$JOURNAL_FILE" "$STATE_FILE" "$CREDENTIALS_FILE" "$vision_domain" "$install_mode" 3<<< "$admin_pass" <<'PY'
@@ -584,6 +602,10 @@ import time
  journal_path, state_path, credentials_path, *extra) = sys.argv[1:]
 vision_domain = extra[0] if extra and extra[0] else None
 mode = extra[1] if len(extra) > 1 and extra[1] else "all-in-one"
+# The name the operator chose for this server. It reaches profile tags and Host
+# remarks, which is why the wizard validates it as an identifier before it gets
+# here; an installation without a plan keeps the name earlier versions wrote.
+local_node_name = (os.environ.get("GOWAVE_LOCAL_NODE_NAME") or "").strip() or "local-node"
 admin_password = os.fdopen(3, "r", encoding="utf-8").read().rstrip("\n")
 
 sys.path.insert(0, script_dir)
@@ -625,7 +647,7 @@ def stored_credentials(path):
     return values
 
 
-PROFILE_NAME = "GoWave MVP Unified Profile - local-node"
+PROFILE_NAME = f"GoWave MVP Unified Profile - {local_node_name}"
 
 existing_cc = "bbr"
 if os.path.exists(state_path):
@@ -679,7 +701,7 @@ else:
     x25519 = client.generate_x25519()
     short_ids = None
 raw_config = client.compile_config_profile(
-    "local-node", reality_domain, x25519["privateKey"], short_ids=short_ids,
+    local_node_name, reality_domain, x25519["privateKey"], short_ids=short_ids,
     public_key=x25519.get("publicKey"), vision_domain=vision_domain, panel_domain=panel_domain,
     vision_cert_dir=os.environ.get("GOWAVE_VISION_CERT_DIR") or None,
 )
@@ -690,7 +712,7 @@ inbound_uuids = [item["uuid"] for item in inbounds]
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
 
-node_uuid = client.associate_node("local-node", "127.0.0.1", 3002, profile_uuid, inbound_uuids)
+node_uuid = client.associate_node(local_node_name, "127.0.0.1", 3002, profile_uuid, inbound_uuids)
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
 
@@ -700,7 +722,7 @@ write_journal_atomically(journal_path, journal)
 
 client.provision_hosts(
     profile_uuid, inbounds, node_uuid, squad_uuid,
-    panel_domain, reality_domain, vision_domain=vision_domain
+    panel_domain, reality_domain, node_name=local_node_name, vision_domain=vision_domain
 )
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
@@ -727,7 +749,7 @@ state = {
     "squadUuid": squad_uuid,
     "defaultUserShortUuid": short_uuid,
     "nodes": [{
-        "name": "local-node",
+        "name": local_node_name,
         "address": "127.0.0.1",
         "port": 3002,
         "uuid": node_uuid,
@@ -992,13 +1014,14 @@ PY
 
             # 2. Register the node using argv for data and FD 3 for the password.
             # User-controlled values are never interpolated into Python source.
-            if ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
+            local register_rc=0
+            PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
                 XRAY_SERVER_VERSION="${XRAY_SERVER_VERSION:-}" \
                 GOWAVE_MIHOMO_X25519="${GOWAVE_MIHOMO_X25519:-}" \
                 GOWAVE_REALITY_FINGERPRINT="${GOWAVE_REALITY_FINGERPRINT:-}" \
                 python3 - \
                 "$SCRIPT_DIR" "$name" "$ip" "$worker_domain" "$reality_domain" \
-                "$node_port" "$admin_user" "$JOURNAL_FILE" "$STATE_FILE" "$vision_domain" 3<<< "$admin_pass" <<'PY'
+                "$node_port" "$admin_user" "$JOURNAL_FILE" "$STATE_FILE" "$vision_domain" 3<<< "$admin_pass" <<'PY' || register_rc=$?
 import ipaddress
 import json
 import os
@@ -1042,18 +1065,41 @@ if not admin_password:
     raise SystemExit("Panel admin password is missing; refusing node registration.")
 
 sys.path.insert(0, script_dir)
-from modules.api_client import GoWaveClient, atomic_write_state
+from modules.api_client import GoWaveClient, GoWaveNodeNameTaken, atomic_write_state
 from modules.recovery import write_journal_atomically
 
 state_data = json.loads(open(state_path, encoding="utf-8").read())
 nodes = state_data.get("nodes", [])
 if not isinstance(nodes, list):
     raise SystemExit("state.json nodes must be an array.")
-if any(isinstance(item, dict) and item.get("name") == name for item in nodes):
-    raise SystemExit(f"Worker name is already registered in state.json: {name}")
+for known in nodes:
+    if not isinstance(known, dict) or known.get("name") != name:
+        continue
+    # The same node answering again: the retry keeps its uuid and its address.
+    if str(known.get("address") or "") == address:
+        break
+    raise SystemExit(
+        f"state.json already registers the name {name} for the node at "
+        f"{known.get('address')}; choose another name or remove that entry first."
+    )
 
 client = GoWaveClient("http://127.0.0.1:3000")
 client.login(admin_user, admin_password)
+
+# The Panel is the authority on names, and a name it already holds belongs to
+# that node: adopting it would rewrite another server's address and move its
+# traffic endpoint. The refusal is therefore printed here, before the profile,
+# the inbounds and the Host records exist, so there is nothing to roll back.
+for held in client.list_nodes():
+    if not isinstance(held, dict) or str(held.get("name", "")).lower() != name.lower():
+        continue
+    if str(held.get("address") or "") == address and str(held.get("port")) == port:
+        continue  # this node, at this address: the retry of a known identity
+    sys.stderr.write(
+        f"Error: the Panel already has a node named {held.get('name')} at "
+        f"{held.get('address')}:{held.get('port')}; choose another name or delete that node first.\n"
+    )
+    raise SystemExit(3)
 
 journal = {
     "transaction_id": f"node_add_{name}",
@@ -1087,7 +1133,13 @@ journal["state"] = "NODE_ADD_APPLYING"
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
 
-node_uuid = client.associate_node(name, address, int(port), profile_uuid, inbound_uuids)
+# The pre-check above ran before the profile existed; a collision that appears
+# between the two is still the client's refusal, and the nonzero exit is what
+# makes the shell roll the profile back instead of leaving it behind.
+try:
+    node_uuid = client.associate_node(name, address, int(port), profile_uuid, inbound_uuids)
+except GoWaveNodeNameTaken as error:
+    raise SystemExit(f"Error: {error}. Choose another name or delete that node first.")
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
 
@@ -1133,7 +1185,12 @@ journal["state"] = "NODE_ADD_VERIFYING"
 journal["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 write_journal_atomically(journal_path, journal)
 PY
-            then
+            if (( register_rc == 3 )); then
+                # Nothing was written, so there is nothing to roll back.
+                echo "Worker name refused; the Panel and this host were not changed." >&2
+                return 1
+            fi
+            if (( register_rc != 0 )); then
                 echo "Worker API registration failed; attempting action-aware API rollback." >&2
                 if [[ -f "$JOURNAL_FILE" ]] && ! PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
 from modules.api_client import rollback_provisioning
@@ -1730,8 +1787,13 @@ wizard_add_node_to_panel() {
         return 1
     fi
 
-    # Now prompt for worker details
-    read -r -p "$(t menu.prompt.worker_name)" wname
+    # Now prompt for worker details. The name goes through the reader that holds
+    # the Panel's own inventory when the Panel is local, so it is trimmed,
+    # refused when blank, held to the rule the Panel enforces on registration,
+    # and refused when the Panel already has a node by that name — `node add`
+    # would otherwise reject it only after the SSH session and the temporary key
+    # were already set up.
+    wname=$(wizard_read_panel_worker_name "$panel_domain" "$panel_is_local") || return 1
     read -r -p "$(t menu.prompt.worker_ip)" wip
     read -r -p "$(t menu.prompt.worker_domain)" wdom
     read -r -p "$(t menu.prompt.camouflage_domain)" rdom
@@ -1743,10 +1805,37 @@ wizard_add_node_to_panel() {
     ssh_bootstrap_onboard_one "$wdom" "$rdom" "" "$wname" "$wip"
 }
 
+# An interactive screen stays on screen until the operator acknowledges it: the
+# menu starts with `clear`, so a status or a result that ended the branch was
+# erased before anyone could read it. A run with no terminal returns at once —
+# a positional `status` from a script or a CI case has nobody to press Enter.
+menu_pause() {
+    [[ -t 0 ]] || return 0
+    printf '%s' "$(t menu.prompt.return)" >&2
+    IFS= read -r _ || return 0
+    return 0
+}
+
+# One menu action. A failure is named and the session continues: dying on a
+# cancelled plan or a refused step would take the language choice and every
+# answer with it, which is the dead end this menu exists to avoid. The positional
+# CLI is untouched and still exits with the step's own code.
+menu_action() {
+    local code=0
+    "$@" || code=$?
+    if (( code != 0 )); then
+        printf '%s\n' "$(tf menu.action.failed "$code")" >&2
+    fi
+    menu_pause
+    return 0
+}
+
 main_menu() {
     local lang
     lang=$(wizard_language)
-    clear
+    # A terminal without TERM is still a terminal: `clear` failing must not take
+    # the menu down with it, and the redraw is what hides the screen just read.
+    clear 2>/dev/null || true
     tf menu.title
     echo ""
     printf ' 1) %s\n' "$(t menu.option.status)"
@@ -1761,30 +1850,35 @@ main_menu() {
     printf ' 0) %s\n' "$(t menu.option.exit)"
     echo ""
     local choice
-    read -r -p "$(t menu.prompt)" choice
+    if ! read -r -p "$(t menu.prompt)" choice; then
+        # End of input leaves the loop the way option 0 does, with a newline of
+        # our own so the shell prompt is not glued to the menu text.
+        printf '\n'
+        exit 0
+    fi
     case "$choice" in
-        1) cmd_status ;;
-        2) cmd_install ;;
-        3) wizard_add_node_to_panel ;;
+        1) menu_action cmd_status ;;
+        2) menu_action cmd_install ;;
+        3) menu_action wizard_add_node_to_panel ;;
         4)
             read -r -p "$(t menu.prompt.new_panel_domain)" np
             read -r -p "$(t menu.prompt.new_camouflage_domain)" nr
-            cmd_domain_change "$np" "$nr"
+            menu_action cmd_domain_change "$np" "$nr"
             ;;
         5)
             read -r -p "$(t menu.prompt.target_channel)" tch
-            switch_channel "$tch"
+            menu_action switch_channel "$tch"
             ;;
-        6) "$SCRIPT_DIR/assets/backup/gowave-backup.sh" backup ;;
+        6) menu_action "$SCRIPT_DIR/assets/backup/gowave-backup.sh" backup ;;
         7)
             read -r -p "$(t menu.prompt.archive_path)" arch_path
-            "$SCRIPT_DIR/assets/backup/gowave-backup.sh" restore "$arch_path"
+            menu_action "$SCRIPT_DIR/assets/backup/gowave-backup.sh" restore "$arch_path"
             ;;
         8)
             read -r -p "$(t menu.prompt.username)" uid
-            cmd_user_links "${uid:-default-user}"
+            menu_action cmd_user_links "${uid:-default-user}"
             ;;
-        9) cmd_uninstall ;;
+        9) menu_action cmd_uninstall ;;
         0) exit 0 ;;
         *) echo "Invalid option." ;;
     esac

@@ -140,6 +140,17 @@ class GoWaveAPIError(Exception):
         self.response_body = response_body
 
 
+class GoWaveNodeNameTaken(GoWaveAPIError):
+    """Another server already registered under the name this run asked for.
+
+    Kept apart from the general API error because it is not a failure of the
+    Panel: a repeated install of the same node meets its own name and must be
+    reconciled, while a different server meeting it must not be adopted — the
+    registration would rewrite that node's address and silently move another
+    deployment's traffic endpoint.
+    """
+
+
 def _extract_list(res, key):
     data = res.get("response", res) if isinstance(res, dict) else res
     if isinstance(data, list):
@@ -569,6 +580,15 @@ class GoWaveClient:
             inbounds_list = []
         return {"profile_uuid": profile_uuid, "inbounds": inbounds_list}
 
+    def list_nodes(self):
+        """The nodes the Panel already holds.
+
+        The wizard reads this before it asks for a name and the registration
+        reads it before it writes anything, so a name that is already taken is
+        refused instead of adopted.
+        """
+        return _extract_list(self.request("GET", "/api/nodes"), "nodes")
+
     def associate_node(self, node_name, node_address, node_port, profile_uuid, inbound_uuids, existing_node_uuid=None):
         payload = {
             "name": node_name,
@@ -610,6 +630,19 @@ class GoWaveClient:
                 # restarted on every repeated install.
                 if _same_node_configuration(existing_node, payload):
                     return found_uuid
+                # Same name, different address or port: this is another server,
+                # and updating it would move its traffic endpoint. The retry of
+                # one node is the caller that passes its address and port again,
+                # or names the uuid it already knows.
+                if (
+                    str(existing_node.get("address") or "") != str(node_address)
+                    or str(existing_node.get("port")) != str(node_port)
+                ):
+                    raise GoWaveNodeNameTaken(
+                        f"the Panel already has a node named {existing_node.get('name')} at "
+                        f"{existing_node.get('address')}:{existing_node.get('port')}, "
+                        f"not {node_address}:{node_port}"
+                    )
                 required_before = ("name", "address", "port", "configProfile")
                 if not all(k in existing_node for k in required_before):
                     raise GoWaveAPIError(f"Cannot safely update node {found_uuid}: rollback snapshot is incomplete")

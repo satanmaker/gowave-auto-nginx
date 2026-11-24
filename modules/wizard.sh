@@ -20,6 +20,9 @@ source "$_wizard_dir/ssh_bootstrap.sh"
 
 GOWAVE_PLAN_VARIANT=""
 GOWAVE_PLAN_SHARED_DOMAIN="no"
+# The certificate count whose shared-domain consent the operator already gave,
+# so re-running the checks at review does not ask the same question twice.
+GOWAVE_PLAN_SHARED_CONFIRMED_COUNT=""
 GOWAVE_PLAN_PANEL_VISION="no"
 GOWAVE_PLAN_PANEL_NAME=""
 GOWAVE_PLAN_CAMOUFLAGE_NAME=""
@@ -29,10 +32,15 @@ GOWAVE_PLAN_NODE_COUNT=0
 GOWAVE_PLAN_NODE_NAMES=()
 GOWAVE_PLAN_NODE_CAMOUFLAGE=()
 GOWAVE_PLAN_NODE_VISION=()
+# Display names for the Panel and the subscriptions, independent of DNS: the
+# local node's name and one per remote node. Empty means "the product default".
+GOWAVE_PLAN_LOCAL_LABEL=""
+GOWAVE_PLAN_NODE_LABELS=()
 
 wizard_reset_plan() {
     GOWAVE_PLAN_VARIANT=""
     GOWAVE_PLAN_SHARED_DOMAIN="no"
+    GOWAVE_PLAN_SHARED_CONFIRMED_COUNT=""
     GOWAVE_PLAN_PANEL_VISION="no"
     GOWAVE_PLAN_PANEL_NAME=""
     GOWAVE_PLAN_CAMOUFLAGE_NAME=""
@@ -42,6 +50,8 @@ wizard_reset_plan() {
     GOWAVE_PLAN_NODE_NAMES=()
     GOWAVE_PLAN_NODE_CAMOUFLAGE=()
     GOWAVE_PLAN_NODE_VISION=()
+    GOWAVE_PLAN_LOCAL_LABEL=""
+    GOWAVE_PLAN_NODE_LABELS=()
 }
 
 # The wizard is the only entrypoint that reads answers, and only when the
@@ -63,25 +73,28 @@ wizard_validate_email() {
     preflight_validate_email "$1"
 }
 
-# Every name the plan already holds, as "owner<TAB>name".
+# Every name the plan already holds, as "owner<TAB>name". The owner label comes
+# from the catalog because it is printed inside the duplicate refusal.
 _wizard_plan_pairs() {
     local i
     if [[ -n "$GOWAVE_PLAN_PANEL_NAME" ]]; then
-        printf 'Panel host\t%s\n' "$GOWAVE_PLAN_PANEL_NAME"
+        printf '%s\t%s\n' "$(t wizard.owner.panel_host)" "$GOWAVE_PLAN_PANEL_NAME"
     fi
     if [[ -n "$GOWAVE_PLAN_CAMOUFLAGE_NAME" ]]; then
-        printf 'Panel camouflage\t%s\n' "$GOWAVE_PLAN_CAMOUFLAGE_NAME"
+        printf '%s\t%s\n' "$(t wizard.owner.panel_camouflage)" "$GOWAVE_PLAN_CAMOUFLAGE_NAME"
     fi
     if [[ -n "$GOWAVE_PLAN_VISION_NAME" ]]; then
-        printf 'Panel Vision\t%s\n' "$GOWAVE_PLAN_VISION_NAME"
+        printf '%s\t%s\n' "$(t wizard.owner.panel_vision)" "$GOWAVE_PLAN_VISION_NAME"
     fi
     for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
-        printf 'node %s\t%s\n' "$((i + 1))" "${GOWAVE_PLAN_NODE_NAMES[$i]}"
+        printf '%s\t%s\n' "$(tf wizard.owner.node "$((i + 1))")" "${GOWAVE_PLAN_NODE_NAMES[$i]}"
         if [[ -n "${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}" ]]; then
-            printf 'node %s camouflage\t%s\n' "$((i + 1))" "${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}"
+            printf '%s\t%s\n' "$(tf wizard.owner.node_camouflage "$((i + 1))")" \
+                "${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}"
         fi
         if [[ -n "${GOWAVE_PLAN_NODE_VISION[$i]}" ]]; then
-            printf 'node %s Vision\t%s\n' "$((i + 1))" "${GOWAVE_PLAN_NODE_VISION[$i]}"
+            printf '%s\t%s\n' "$(tf wizard.owner.node_vision "$((i + 1))")" \
+                "${GOWAVE_PLAN_NODE_VISION[$i]}"
         fi
     done
 }
@@ -141,6 +154,110 @@ wizard_read_hostname() {
         fi
         printf '%s\n' "$(tf wizard.name.invalid "$answer")" >&2
     done
+}
+
+# A hostname the plan does not hold yet. A duplicate is refused at the field, so
+# the operator corrects that one answer and keeps every earlier one: losing the
+# card to a name the plan already has would discard the Panel and the previous
+# node. `pending` lists the names this card has already read (space separated).
+wizard_read_plan_hostname() {
+    local prompt="$1" allow_empty="${2:-no}" pending="${3:-}"
+    local answer owner name
+    while true; do
+        answer=$(wizard_read_hostname "$prompt" "$allow_empty") || return 1
+        if [[ -z "$answer" ]]; then
+            return 0
+        fi
+        if ! owner=$(wizard_plan_name_owner "$answer"); then
+            printf '%s\n' "$(tf wizard.name.duplicate "$answer" "$owner")" >&2
+            continue
+        fi
+        for name in $pending; do
+            if [[ "$(wizard_normalize_name "$name")" == "$answer" ]]; then
+                printf '%s\n' "$(tf wizard.name.duplicate "$answer" "$(t wizard.owner.same_card)")" >&2
+                continue 2
+            fi
+        done
+        printf '%s' "$answer"
+        return 0
+    done
+}
+
+# Display names for the Panel and the subscriptions, independent of DNS. Trimming
+# happens here rather than at the caller: " ams-01" and "ams-01 " are one name to
+# the product, and two names that differ only by case read as one in a list.
+wizard_normalize_label() {
+    local label="$1"
+    label="${label#"${label%%[![:space:]]*}"}"
+    label="${label%"${label##*[![:space:]]}"}"
+    printf '%s' "$label"
+}
+
+_wizard_label_pairs() {
+    local i
+    if [[ -n "$GOWAVE_PLAN_LOCAL_LABEL" ]]; then
+        printf '%s\t%s\n' "$(t wizard.owner.local_node)" "$GOWAVE_PLAN_LOCAL_LABEL"
+    fi
+    for i in "${!GOWAVE_PLAN_NODE_LABELS[@]}"; do
+        printf '%s\t%s\n' "$(tf wizard.owner.node_label "$((i + 1))")" "${GOWAVE_PLAN_NODE_LABELS[$i]}"
+    done
+}
+
+# Prints the owner of a label the plan already holds and returns 1; 0 when free.
+wizard_plan_label_owner() {
+    local candidate owner label
+    candidate=$(wizard_normalize_label "$1")
+    while IFS=$'\t' read -r owner label; do
+        [[ -n "$label" ]] || continue
+        if [[ "${label,,}" == "${candidate,,}" ]]; then
+            printf '%s' "$owner"
+            return 1
+        fi
+    done < <(_wizard_label_pairs)
+    return 0
+}
+
+# The name reaches profile tags, Host remarks and the `node add` positional, and
+# the Panel refuses a worker name it cannot register. This is that same rule
+# (see the node-registration guard in cmd_install), so a name the wizard accepts
+# is a name the Panel accepts, and the refusal states it instead of the operator
+# discovering it after the SSH session opened.
+wizard_validate_label() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
+}
+
+# A display name: trimmed, non-blank, unique in the plan. A refusal names the
+# owner and repeats only this question.
+wizard_read_label() {
+    local prompt="$1" answer owner
+    while true; do
+        answer=$(_wizard_prompt_read "$prompt") || return 1
+        answer=$(wizard_normalize_label "$answer")
+        if [[ -z "$answer" ]]; then
+            printf '%s\n' "$(t wizard.name.label_empty)" >&2
+            continue
+        fi
+        if ! wizard_validate_label "$answer"; then
+            printf '%s\n' "$(t wizard.name.label_charset)" >&2
+            continue
+        fi
+        if ! owner=$(wizard_plan_label_owner "$answer"); then
+            printf '%s\n' "$(tf wizard.name.label_duplicate "$answer" "$owner")" >&2
+            continue
+        fi
+        printf '%s' "$answer"
+        return 0
+    done
+}
+
+# Records a display name next to the host it belongs to.
+wizard_register_label() {
+    local role="$1" label="$2"
+    if [[ "$role" == "panel" ]]; then
+        GOWAVE_PLAN_LOCAL_LABEL="$label"
+    else
+        GOWAVE_PLAN_NODE_LABELS+=("$label")
+    fi
 }
 
 wizard_read_email() {
@@ -271,15 +388,15 @@ _wizard_owner_label() {
     local index=$(( ${#GOWAVE_PLAN_NODE_NAMES[@]} + 1 ))
     if [[ "$role" == "panel" ]]; then
         case "$kind" in
-            host) printf 'the Panel host' ;;
-            camouflage) printf 'the Panel camouflage' ;;
-            *) printf 'the Panel Vision' ;;
+            host) t wizard.owner.panel_host ;;
+            camouflage) t wizard.owner.panel_camouflage ;;
+            *) t wizard.owner.panel_vision ;;
         esac
     else
         case "$kind" in
-            host) printf 'node %s' "$index" ;;
-            camouflage) printf 'node %s camouflage' "$index" ;;
-            *) printf 'node %s Vision' "$index" ;;
+            host) tf wizard.owner.node "$index" ;;
+            camouflage) tf wizard.owner.node_camouflage "$index" ;;
+            *) tf wizard.owner.node_vision "$index" ;;
         esac
     fi
 }
@@ -343,7 +460,9 @@ wizard_plan_certificate_ceiling() {
 # Separate registered domains spend separate budgets; a shared one has to fit
 # the whole cluster inside the 50-per-7-days limit, and even then it needs an
 # explicit confirmation because the rest of that domain competes for the same
-# budget.
+# budget. The consent belongs to the plan it was given for, so it is recorded
+# against the certificate count: review re-runs this check, and a yes for twelve
+# certificates must not be read as a yes for twenty.
 wizard_certificate_preflight() {
     local count ceiling message
     count=$(wizard_plan_certificate_count)
@@ -356,10 +475,18 @@ wizard_certificate_preflight() {
     if (( count > 50 )); then
         printf '%s\n' "$(tf wizard.cert.shared_refused "$count")" >&2
         printf '%s\n' "$(tf wizard.cert.ceiling "$ceiling")" >&2
+        GOWAVE_PLAN_SHARED_CONFIRMED_COUNT=""
         return 1
     fi
+    if [[ "$GOWAVE_PLAN_SHARED_CONFIRMED_COUNT" == "$count" ]]; then
+        return 0
+    fi
     message=$(tf wizard.cert.shared_within "$count" "$ceiling")
-    wizard_read_yes_no "$message" no
+    if wizard_read_yes_no "$message" no; then
+        GOWAVE_PLAN_SHARED_CONFIRMED_COUNT="$count"
+        return 0
+    fi
+    return 1
 }
 
 wizard_resolve_name() {
@@ -574,13 +701,25 @@ wizard_verify_panel_api() {
     return 0
 }
 
+# The display name is the operator's own word for the server, so it is shown
+# beside the role rather than inside the catalog sentence: a translated
+# sentence cannot decide where the name reads best, and the name is data.
+_wizard_plan_role_label() {
+    local role="$1" name="${2:-}"
+    if [[ -n "$name" ]]; then
+        printf '%s (%s)' "$role" "$name"
+    else
+        printf '%s' "$role"
+    fi
+}
+
 wizard_plan_summary() {
     local i vision
     printf '%s\n' "$(t wizard.plan.summary)"
-    printf '%s\n' "$(tf wizard.plan.host "Panel" "$GOWAVE_PLAN_PANEL_NAME" "$GOWAVE_PLAN_CAMOUFLAGE_NAME" "${GOWAVE_PLAN_VISION_NAME:-none}")"
+    printf '%s\n' "$(tf wizard.plan.host "$(_wizard_plan_role_label "Panel" "$GOWAVE_PLAN_LOCAL_LABEL")" "$GOWAVE_PLAN_PANEL_NAME" "$GOWAVE_PLAN_CAMOUFLAGE_NAME" "${GOWAVE_PLAN_VISION_NAME:-none}")"
     for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
         vision="${GOWAVE_PLAN_NODE_VISION[$i]:-}"
-        printf '%s\n' "$(tf wizard.plan.host "node $((i + 1))" "${GOWAVE_PLAN_NODE_NAMES[$i]}" "${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}" "${vision:-none}")"
+        printf '%s\n' "$(tf wizard.plan.host "$(_wizard_plan_role_label "node $((i + 1))" "${GOWAVE_PLAN_NODE_LABELS[$i]:-}")" "${GOWAVE_PLAN_NODE_NAMES[$i]}" "${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}" "${vision:-none}")"
     done
     printf '%s\n' "$(tf wizard.plan.certificates "$(wizard_plan_certificate_count)")"
     if [[ "$GOWAVE_PLAN_SHARED_DOMAIN" == "yes" ]]; then
@@ -591,21 +730,26 @@ wizard_plan_summary() {
 }
 
 wizard_collect_plan() {
-    local panel camouflage vision i
+    local panel camouflage vision local_label i
 
     wizard_reset_plan
     wizard_select_language || return 1
     wizard_select_variant || return 1
 
-    panel=$(wizard_read_hostname "$(t wizard.name.panel)") || return 1
-    camouflage=$(wizard_read_hostname "$(t wizard.name.camouflage)") || return 1
+    panel=$(wizard_read_plan_hostname "$(t wizard.name.panel)") || return 1
+    camouflage=$(wizard_read_plan_hostname "$(t wizard.name.camouflage)" no "$panel") || return 1
     vision=""
     if [[ "$GOWAVE_PLAN_VARIANT" != "panel-only" ]]; then
         if wizard_read_yes_no "$(tf wizard.vision.prompt "$panel")" no; then
-            vision=$(wizard_read_hostname "$(t wizard.name.vision)" yes) || return 1
+            vision=$(wizard_read_plan_hostname "$(t wizard.name.vision)" yes "$panel $camouflage") || return 1
         fi
     fi
     wizard_register_host panel "$panel" "$camouflage" "$vision" || return 1
+    # A Panel-only host runs no local node, so there is no local node to name.
+    if [[ "$GOWAVE_PLAN_VARIANT" != "panel-only" ]]; then
+        local_label=$(wizard_read_label "$(t wizard.name.local_node_label)") || return 1
+        wizard_register_label panel "$local_label"
+    fi
 
     GOWAVE_PLAN_EMAIL=$(wizard_read_email) || return 1
 
@@ -615,14 +759,19 @@ wizard_collect_plan() {
         GOWAVE_PLAN_NODE_COUNT=$(wizard_read_node_count) || return 1
         for ((i = 1; i <= GOWAVE_PLAN_NODE_COUNT; i++)); do
             local node_name node_camouflage node_vision=""
-            node_name=$(wizard_read_hostname "$(tf wizard.name.worker "$i")") || return 1
-            node_camouflage=$(wizard_read_hostname "$(tf wizard.name.worker_camouflage "$i")") || return 1
+            node_name=$(wizard_read_plan_hostname "$(tf wizard.name.worker "$i")") || return 1
+            node_camouflage=$(wizard_read_plan_hostname \
+                "$(tf wizard.name.worker_camouflage "$i")" no "$node_name") || return 1
             if wizard_read_yes_no "$(tf wizard.vision.prompt "$node_name")" no; then
-                node_vision=$(wizard_read_hostname "$(t wizard.name.vision)" yes) || return 1
+                node_vision=$(wizard_read_plan_hostname \
+                    "$(t wizard.name.vision)" yes "$node_name $node_camouflage") || return 1
             fi
             if ! wizard_register_host worker "$node_name" "$node_camouflage" "$node_vision"; then
                 return 1
             fi
+            local node_label
+            node_label=$(wizard_read_label "$(tf wizard.name.node_label "$i")") || return 1
+            wizard_register_label worker "$node_label"
         done
     fi
 
@@ -635,267 +784,319 @@ wizard_collect_plan() {
     wizard_plan_summary
     wizard_certificate_preflight || return 1
     wizard_check_plan_names || return 1
-    if ! wizard_read_yes_no "$(t wizard.confirm)" no; then
-        printf '%s\n' "$(t wizard.aborted)" >&2
-        return 1
+    # The review that follows is the confirmation: it shows the same plan again
+    # and its start action re-runs these checks, so a [y/N] here would ask the
+    # operator to approve one plan twice.
+    return 0
+}
+
+# Current value of one review field. The action list and the field editor both
+# read it, and two copies of this case would drift.
+_wizard_review_value() {
+    local field="$1"
+    case "$field" in
+        variant) printf '%s' "$GOWAVE_PLAN_VARIANT" ;;
+        panel_domain) printf '%s' "$GOWAVE_PLAN_PANEL_NAME" ;;
+        camouflage_domain) printf '%s' "$GOWAVE_PLAN_CAMOUFLAGE_NAME" ;;
+        vision_domain) printf '%s' "${GOWAVE_PLAN_VISION_NAME:-}" ;;
+        email) printf '%s' "$GOWAVE_PLAN_EMAIL" ;;
+        shared_domain) printf '%s' "$GOWAVE_PLAN_SHARED_DOMAIN" ;;
+        node_count) printf '%s' "$GOWAVE_PLAN_NODE_COUNT" ;;
+        node_name_*) printf '%s' "${GOWAVE_PLAN_NODE_NAMES[${field#node_name_}]}" ;;
+        node_camouflage_*) printf '%s' "${GOWAVE_PLAN_NODE_CAMOUFLAGE[${field#node_camouflage_}]}" ;;
+        node_vision_*) printf '%s' "${GOWAVE_PLAN_NODE_VISION[${field#node_vision_}]:-}" ;;
+        local_node_label) printf '%s' "$GOWAVE_PLAN_LOCAL_LABEL" ;;
+        node_label_*) printf '%s' "${GOWAVE_PLAN_NODE_LABELS[${field#node_label_}]:-}" ;;
+    esac
+}
+
+# Localized label of one review field; a node field carries its ordinal.
+_wizard_review_label() {
+    local field="$1" index=0
+    case "$field" in
+        node_name_*|node_camouflage_*|node_vision_*|node_label_*)
+            index=$(( ${field##*_} + 1 ))
+            ;;
+    esac
+    case "$field" in
+        variant) t plan_review.field.variant ;;
+        panel_domain) t plan_review.field.panel_domain ;;
+        camouflage_domain) t plan_review.field.camouflage_domain ;;
+        vision_domain) t plan_review.field.vision_domain ;;
+        email) t plan_review.field.email ;;
+        shared_domain) t plan_review.field.shared_domain ;;
+        node_count) t plan_review.field.node_count ;;
+        node_name_*) tf plan_review.field.node_name "$index" ;;
+        node_camouflage_*) tf plan_review.field.node_camouflage "$index" ;;
+        node_vision_*) tf plan_review.field.node_vision "$index" ;;
+        local_node_label) t plan_review.field.local_node_label ;;
+        node_label_*) tf plan_review.field.node_label "$index" ;;
+    esac
+}
+
+# Applies one reviewed answer: 0 changed, 1 refused with the reason printed, 2
+# nothing to change. An empty answer keeps the current value everywhere except a
+# Vision domain, where it removes Vision — the one field where empty is a value.
+_wizard_review_apply() {
+    local field="$1" new_value="$2" node_idx taken owner
+    if [[ -z "$new_value" ]]; then
+        case "$field" in
+            vision_domain|node_vision_*) ;;
+            *) return 2 ;;
+        esac
+    fi
+    case "$field" in
+        variant)
+            case "${new_value,,}" in
+                1|all-in-one|all_in_one|aio) new_value="all-in-one" ;;
+                2|panel-only|panel_only|panel) new_value="panel-only" ;;
+                3|multi-node|multi_node|multi) new_value="multi-node" ;;
+                *) printf '%s\n' "$(t wizard.variant.invalid)" >&2; return 1 ;;
+            esac
+            GOWAVE_PLAN_VARIANT="$new_value"
+            ;;
+        panel_domain)
+            if ! wizard_validate_hostname "$new_value"; then
+                printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
+                return 1
+            fi
+            if [[ "$new_value" != "$GOWAVE_PLAN_PANEL_NAME" ]] \
+                && ! taken=$(wizard_plan_name_owner "$new_value"); then
+                printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
+                return 1
+            fi
+            GOWAVE_PLAN_PANEL_NAME="$new_value"
+            ;;
+        camouflage_domain)
+            if ! wizard_validate_hostname "$new_value"; then
+                printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
+                return 1
+            fi
+            if [[ "$new_value" != "$GOWAVE_PLAN_CAMOUFLAGE_NAME" ]] \
+                && ! taken=$(wizard_plan_name_owner "$new_value"); then
+                printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
+                return 1
+            fi
+            GOWAVE_PLAN_CAMOUFLAGE_NAME="$new_value"
+            ;;
+        vision_domain)
+            if [[ -n "$new_value" ]] && ! wizard_validate_hostname "$new_value"; then
+                printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
+                return 1
+            fi
+            if [[ -n "$new_value" && "$new_value" != "$GOWAVE_PLAN_VISION_NAME" ]] \
+                && ! taken=$(wizard_plan_name_owner "$new_value"); then
+                printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
+                return 1
+            fi
+            GOWAVE_PLAN_VISION_NAME="$new_value"
+            if [[ -n "$new_value" ]]; then
+                GOWAVE_PLAN_PANEL_VISION="yes"
+            else
+                GOWAVE_PLAN_PANEL_VISION="no"
+            fi
+            ;;
+        email)
+            if ! wizard_validate_email "$new_value"; then
+                printf '%s\n' "$(t wizard.email.invalid)" >&2
+                return 1
+            fi
+            GOWAVE_PLAN_EMAIL="$new_value"
+            ;;
+        shared_domain)
+            case "${new_value,,}" in
+                y|yes|д|да) new_value="yes" ;;
+                n|no|н|нет) new_value="no" ;;
+                *) printf '%s\n' "$(t wizard.yes_no.invalid)" >&2; return 1 ;;
+            esac
+            GOWAVE_PLAN_SHARED_DOMAIN="$new_value"
+            ;;
+        node_count)
+            if ! [[ "$new_value" =~ ^[0-9]+$ ]] || (( 10#$new_value < 1 )); then
+                printf '%s\n' "$(t wizard.nodes.invalid)" >&2
+                return 1
+            fi
+            new_value=$((10#$new_value))
+            if (( new_value > GOWAVE_PLAN_NODE_COUNT )); then
+                for ((node_idx = GOWAVE_PLAN_NODE_COUNT + 1; node_idx <= new_value; node_idx++)); do
+                    local node_name node_camouflage node_vision=""
+                    node_name=$(wizard_read_plan_hostname "$(tf wizard.name.worker "$node_idx")") || return 1
+                    node_camouflage=$(wizard_read_plan_hostname \
+                        "$(tf wizard.name.worker_camouflage "$node_idx")" no "$node_name") || return 1
+                    if wizard_read_yes_no "$(tf wizard.vision.prompt "$node_name")" no; then
+                        node_vision=$(wizard_read_plan_hostname \
+                            "$(t wizard.name.vision)" yes "$node_name $node_camouflage") || return 1
+                    fi
+                    if ! wizard_register_host worker "$node_name" "$node_camouflage" "$node_vision"; then
+                        return 1
+                    fi
+                    local node_label
+                    node_label=$(wizard_read_label "$(tf wizard.name.node_label "$node_idx")") || return 1
+                    wizard_register_label worker "$node_label"
+                done
+            elif (( new_value < GOWAVE_PLAN_NODE_COUNT )); then
+                GOWAVE_PLAN_NODE_NAMES=("${GOWAVE_PLAN_NODE_NAMES[@]:0:new_value}")
+                GOWAVE_PLAN_NODE_CAMOUFLAGE=("${GOWAVE_PLAN_NODE_CAMOUFLAGE[@]:0:new_value}")
+                GOWAVE_PLAN_NODE_VISION=("${GOWAVE_PLAN_NODE_VISION[@]:0:new_value}")
+            fi
+            GOWAVE_PLAN_NODE_COUNT="$new_value"
+            ;;
+        node_name_*)
+            node_idx="${field#node_name_}"
+            if ! wizard_validate_hostname "$new_value"; then
+                printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
+                return 1
+            fi
+            if [[ "$new_value" != "${GOWAVE_PLAN_NODE_NAMES[$node_idx]}" ]] \
+                && ! taken=$(wizard_plan_name_owner "$new_value"); then
+                printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
+                return 1
+            fi
+            GOWAVE_PLAN_NODE_NAMES[$node_idx]="$new_value"
+            ;;
+        node_camouflage_*)
+            node_idx="${field#node_camouflage_}"
+            if ! wizard_validate_hostname "$new_value"; then
+                printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
+                return 1
+            fi
+            if [[ "$new_value" != "${GOWAVE_PLAN_NODE_CAMOUFLAGE[$node_idx]}" ]] \
+                && ! taken=$(wizard_plan_name_owner "$new_value"); then
+                printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
+                return 1
+            fi
+            GOWAVE_PLAN_NODE_CAMOUFLAGE[$node_idx]="$new_value"
+            ;;
+        node_vision_*)
+            node_idx="${field#node_vision_}"
+            if [[ -n "$new_value" ]] && ! wizard_validate_hostname "$new_value"; then
+                printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
+                return 1
+            fi
+            if [[ -n "$new_value" && "$new_value" != "${GOWAVE_PLAN_NODE_VISION[$node_idx]}" ]] \
+                && ! taken=$(wizard_plan_name_owner "$new_value"); then
+                printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
+                return 1
+            fi
+            GOWAVE_PLAN_NODE_VISION[$node_idx]="$new_value"
+            ;;
+        local_node_label|node_label_*)
+            new_value=$(wizard_normalize_label "$new_value")
+            if [[ -z "$new_value" ]]; then
+                printf '%s
+' "$(t wizard.name.label_empty)" >&2
+                return 1
+            fi
+            if [[ "$new_value" != "$(_wizard_review_value "$field")" ]] \
+                && ! owner=$(wizard_plan_label_owner "$new_value"); then
+                printf '%s\n' "$(tf wizard.name.label_duplicate "$new_value" "$owner")" >&2
+                return 1
+            fi
+            if [[ "$field" == "local_node_label" ]]; then
+                GOWAVE_PLAN_LOCAL_LABEL="$new_value"
+            else
+                node_idx="${field#node_label_}"
+                GOWAVE_PLAN_NODE_LABELS[$node_idx]="$new_value"
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# One field: show the current value, read one answer, apply it. A refused answer
+# leaves the plan as it was and the editor open, so the operator fixes the field
+# instead of retyping the card that answered it.
+_wizard_review_edit_field() {
+    local field="$1" label new_value rc=0
+    label=$(_wizard_review_label "$field")
+    printf '%s\n' "$(tf plan_review.current_value "$(_wizard_review_value "$field")")"
+    if [[ "$field" == vision_domain || "$field" == node_vision_* ]]; then
+        new_value=$(_wizard_prompt_read "$(tf plan_review.enter_new_vision "$label")") || return 1
+    else
+        new_value=$(_wizard_prompt_read "$(tf plan_review.enter_new "$label")") || return 1
+    fi
+    _wizard_review_apply "$field" "$new_value" || rc=$?
+    if (( rc == 0 )) && wizard_certificate_preflight && wizard_check_plan_names; then
+        printf '%s\n' "$(t plan_review.updated)"
     fi
     return 0
 }
 
-# Plan review screen: displays the collected plan, allows editing any field,
-# re-runs dependent validations, and returns only when the operator confirms.
-wizard_review_plan() {
-    local choice field new_value node_idx
-
+# Numbered editor for one group of fields. Returns 1 only when the terminal stops
+# answering: a refused value keeps the editor open on the same group.
+_wizard_review_edit_group() {
+    local title="$1"
+    shift
+    local -a keys=("$@")
+    local choice index key
     while true; do
-        printf '\n%s\n' "$(t plan_review.title)"
-        wizard_plan_summary
-        printf '\n'
-
-        # Build the list of editable fields - fixed order for predictability
-        local -a field_keys=() field_labels=()
-        field_keys+=("variant")
-        field_labels+=("$(t plan_review.field.variant)")
-        field_keys+=("panel_domain")
-        field_labels+=("$(t plan_review.field.panel_domain)")
-        field_keys+=("camouflage_domain")
-        field_labels+=("$(t plan_review.field.camouflage_domain)")
-        field_keys+=("vision_domain")
-        field_labels+=("$(t plan_review.field.vision_domain)")
-        field_keys+=("email")
-        field_labels+=("$(t plan_review.field.email)")
-        field_keys+=("shared_domain")
-        field_labels+=("$(t plan_review.field.shared_domain)")
-
-        if (( GOWAVE_PLAN_NODE_COUNT > 0 )); then
-            field_keys+=("node_count")
-            field_labels+=("$(t plan_review.field.node_count)")
-            for ((node_idx = 0; node_idx < GOWAVE_PLAN_NODE_COUNT; node_idx++)); do
-                field_keys+=("node_name_$node_idx")
-                field_labels+=("$(tf plan_review.field.node_name "$((node_idx + 1))")")
-                field_keys+=("node_camouflage_$node_idx")
-                field_labels+=("$(tf plan_review.field.node_camouflage "$((node_idx + 1))")")
-                field_keys+=("node_vision_$node_idx")
-                field_labels+=("$(tf plan_review.field.node_vision "$((node_idx + 1))")")
-            done
-        fi
-
-        # Display menu
-        for ((choice = 0; choice < ${#field_keys[@]}; choice++)); do
-            local current=""
-            case "${field_keys[$choice]}" in
-                variant) current="$GOWAVE_PLAN_VARIANT" ;;
-                panel_domain) current="$GOWAVE_PLAN_PANEL_NAME" ;;
-                camouflage_domain) current="$GOWAVE_PLAN_CAMOUFLAGE_NAME" ;;
-                vision_domain) current="${GOWAVE_PLAN_VISION_NAME:-}" ;;
-                email) current="$GOWAVE_PLAN_EMAIL" ;;
-                shared_domain) current="$GOWAVE_PLAN_SHARED_DOMAIN" ;;
-                node_count) current="$GOWAVE_PLAN_NODE_COUNT" ;;
-                node_name_*) current="${GOWAVE_PLAN_NODE_NAMES[${field_keys[$choice]#node_name_}]}" ;;
-                node_camouflage_*) current="${GOWAVE_PLAN_NODE_CAMOUFLAGE[${field_keys[$choice]#node_camouflage_}]}" ;;
-                node_vision_*) current="${GOWAVE_PLAN_NODE_VISION[${field_keys[$choice]#node_vision_}]:-}" ;;
-            esac
-            printf '  %d) %s [%s]\n' "$((choice + 1))" "${field_labels[$choice]}" "$current"
+        printf '\n%s\n' "$title"
+        for ((index = 0; index < ${#keys[@]}; index++)); do
+            key="${keys[$index]}"
+            printf '  %d) %s [%s]\n' "$((index + 1))" \
+                "$(_wizard_review_label "$key")" "$(_wizard_review_value "$key")"
         done
-        printf '  0) %s\n' "$(t plan_review.confirm)"
-
-        # Read choice
-        choice=$(_wizard_prompt_read "$(t plan_review.edit_field)") || return 1
+        printf '  0) %s\n' "$(t plan_review.back)"
+        choice=$(_wizard_prompt_read "$(t plan_review.choose_field)") || return 1
         if [[ "$choice" == "0" ]]; then
             return 0
         fi
-        if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#field_keys[@]} )); then
+        if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#keys[@]} )); then
             printf '%s\n' "$(t plan_review.invalid_choice)" >&2
             continue
         fi
-
-        local idx=$((choice - 1))
-        field="${field_keys[$idx]}"
-        local current_value=""
-        case "$field" in
-            variant) current_value="$GOWAVE_PLAN_VARIANT" ;;
-            panel_domain) current_value="$GOWAVE_PLAN_PANEL_NAME" ;;
-            camouflage_domain) current_value="$GOWAVE_PLAN_CAMOUFLAGE_NAME" ;;
-            vision_domain) current_value="${GOWAVE_PLAN_VISION_NAME:-}" ;;
-            email) current_value="$GOWAVE_PLAN_EMAIL" ;;
-            shared_domain) current_value="$GOWAVE_PLAN_SHARED_DOMAIN" ;;
-            node_count) current_value="$GOWAVE_PLAN_NODE_COUNT" ;;
-            node_name_*) current_value="${GOWAVE_PLAN_NODE_NAMES[${field#node_name_}]}" ;;
-            node_camouflage_*) current_value="${GOWAVE_PLAN_NODE_CAMOUFLAGE[${field#node_camouflage_}]}" ;;
-            node_vision_*) current_value="${GOWAVE_PLAN_NODE_VISION[${field#node_vision_}]:-}" ;;
-        esac
-
-        printf '%s\n' "$(tf plan_review.current_value "$current_value")"
-        new_value=$(_wizard_prompt_read "$(t plan_review.enter_new)") || return 1
-
-        # Empty input means "keep current" for most fields, but for vision fields
-        # it means "remove vision". Handle this in the field-specific logic.
-        if [[ -z "$new_value" && "$field" != "vision_domain" && "$field" != node_vision_* ]]; then
-            continue
-        fi
-
-        # Apply the change and re-run validations
-        case "$field" in
-            variant)
-                case "${new_value,,}" in
-                    1|all-in-one|all_in_one|aio) new_value="all-in-one" ;;
-                    2|panel-only|panel_only|panel) new_value="panel-only" ;;
-                    3|multi-node|multi_node|multi) new_value="multi-node" ;;
-                    *) printf '%s\n' "$(t wizard.variant.invalid)" >&2; continue ;;
-                esac
-                GOWAVE_PLAN_VARIANT="$new_value"
-                ;;
-            panel_domain)
-                if ! wizard_validate_hostname "$new_value"; then
-                    printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
-                    continue
-                fi
-                # Skip duplicate check if value unchanged (avoids self-detection)
-                if [[ "$new_value" != "$GOWAVE_PLAN_PANEL_NAME" ]]; then
-                    if taken=$(wizard_plan_name_owner "$new_value"); then
-                        :
-                    else
-                        printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
-                        continue
-                    fi
-                fi
-                GOWAVE_PLAN_PANEL_NAME="$new_value"
-                ;;
-            camouflage_domain)
-                if ! wizard_validate_hostname "$new_value"; then
-                    printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
-                    continue
-                fi
-                if [[ "$new_value" != "$GOWAVE_PLAN_CAMOUFLAGE_NAME" ]]; then
-                    if taken=$(wizard_plan_name_owner "$new_value"); then
-                        :
-                    else
-                        printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
-                        continue
-                    fi
-                fi
-                GOWAVE_PLAN_CAMOUFLAGE_NAME="$new_value"
-                ;;
-            vision_domain)
-                if [[ -n "$new_value" ]] && ! wizard_validate_hostname "$new_value"; then
-                    printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
-                    continue
-                fi
-                if [[ -n "$new_value" && "$new_value" != "$GOWAVE_PLAN_VISION_NAME" ]]; then
-                    if taken=$(wizard_plan_name_owner "$new_value"); then
-                        :
-                    else
-                        printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
-                        continue
-                    fi
-                fi
-                GOWAVE_PLAN_VISION_NAME="$new_value"
-                if [[ -n "$new_value" ]]; then
-                    GOWAVE_PLAN_PANEL_VISION="yes"
-                else
-                    GOWAVE_PLAN_PANEL_VISION="no"
-                fi
-                ;;
-            email)
-                if ! wizard_validate_email "$new_value"; then
-                    printf '%s\n' "$(t wizard.email.invalid)" >&2
-                    continue
-                fi
-                GOWAVE_PLAN_EMAIL="$new_value"
-                ;;
-            shared_domain)
-                case "${new_value,,}" in
-                    y|yes|д|да) new_value="yes" ;;
-                    n|no|н|нет) new_value="no" ;;
-                    *) printf '%s\n' "$(t wizard.yes_no.invalid)" >&2; continue ;;
-                esac
-                GOWAVE_PLAN_SHARED_DOMAIN="$new_value"
-                ;;
-            node_count)
-                if ! [[ "$new_value" =~ ^[0-9]+$ ]] || (( 10#$new_value < 1 )); then
-                    printf '%s\n' "$(t wizard.nodes.invalid)" >&2
-                    continue
-                fi
-                new_value=$((10#$new_value))
-                # Adjust node arrays if count changed
-                if (( new_value > GOWAVE_PLAN_NODE_COUNT )); then
-                    for ((node_idx = GOWAVE_PLAN_NODE_COUNT + 1; node_idx <= new_value; node_idx++)); do
-                        local node_name node_camouflage node_vision=""
-                        node_name=$(wizard_read_hostname "$(tf wizard.name.worker "$node_idx")") || return 1
-                        node_camouflage=$(wizard_read_hostname "$(tf wizard.name.worker_camouflage "$node_idx")") || return 1
-                        if wizard_read_yes_no "$(tf wizard.vision.prompt "$node_name")" no; then
-                            node_vision=$(wizard_read_hostname "$(t wizard.name.vision)" yes) || return 1
-                        fi
-                        if ! wizard_register_host worker "$node_name" "$node_camouflage" "$node_vision"; then
-                            return 1
-                        fi
-                    done
-                elif (( new_value < GOWAVE_PLAN_NODE_COUNT )); then
-                    # Truncate arrays
-                    GOWAVE_PLAN_NODE_NAMES=("${GOWAVE_PLAN_NODE_NAMES[@]:0:new_value}")
-                    GOWAVE_PLAN_NODE_CAMOUFLAGE=("${GOWAVE_PLAN_NODE_CAMOUFLAGE[@]:0:new_value}")
-                    GOWAVE_PLAN_NODE_VISION=("${GOWAVE_PLAN_NODE_VISION[@]:0:new_value}")
-                fi
-                GOWAVE_PLAN_NODE_COUNT="$new_value"
-                ;;
-            node_name_*)
-                node_idx="${field#node_name_}"
-                if ! wizard_validate_hostname "$new_value"; then
-                    printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
-                    continue
-                fi
-                if [[ "$new_value" != "${GOWAVE_PLAN_NODE_NAMES[$node_idx]}" ]]; then
-                    if taken=$(wizard_plan_name_owner "$new_value"); then
-                        :
-                    else
-                        printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
-                        continue
-                    fi
-                fi
-                GOWAVE_PLAN_NODE_NAMES[$node_idx]="$new_value"
-                ;;
-            node_camouflage_*)
-                node_idx="${field#node_camouflage_}"
-                if ! wizard_validate_hostname "$new_value"; then
-                    printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
-                    continue
-                fi
-                if [[ "$new_value" != "${GOWAVE_PLAN_NODE_CAMOUFLAGE[$node_idx]}" ]]; then
-                    if taken=$(wizard_plan_name_owner "$new_value"); then
-                        :
-                    else
-                        printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
-                        continue
-                    fi
-                fi
-                GOWAVE_PLAN_NODE_CAMOUFLAGE[$node_idx]="$new_value"
-                ;;
-            node_vision_*)
-                node_idx="${field#node_vision_}"
-                if [[ -n "$new_value" ]] && ! wizard_validate_hostname "$new_value"; then
-                    printf '%s\n' "$(tf wizard.name.invalid "$new_value")" >&2
-                    continue
-                fi
-                if [[ -n "$new_value" && "$new_value" != "${GOWAVE_PLAN_NODE_VISION[$node_idx]}" ]]; then
-                    if taken=$(wizard_plan_name_owner "$new_value"); then
-                        :
-                    else
-                        printf '%s\n' "$(tf wizard.name.duplicate "$new_value" "$taken")" >&2
-                        continue
-                    fi
-                fi
-                GOWAVE_PLAN_NODE_VISION[$node_idx]="$new_value"
-                ;;
-        esac
-
-        # Re-run dependent validations
-        wizard_certificate_preflight || continue
-        wizard_check_plan_names || continue
-
-        printf '%s\n' "$(t plan_review.updated)"
+        _wizard_review_edit_field "${keys[$((choice - 1))]}" || return 1
     done
 }
 
+# Plan review: start, edit the Panel and plan settings, edit one node, or cancel.
+# Nothing here touches a server; start re-runs the dependent checks, so a plan
+# refused during editing cannot be started without passing them. Returns 0 to
+# deploy, 3 when the operator cancels, and 1 when the terminal stops answering.
+wizard_review_plan() {
+    local choice index
+    local -a panel_keys=(variant panel_domain camouflage_domain vision_domain)
+    if [[ "$GOWAVE_PLAN_VARIANT" != "panel-only" ]]; then
+        panel_keys+=(local_node_label)
+    fi
+    panel_keys+=(email shared_domain node_count)
+    while true; do
+        printf '\n%s\n' "$(t plan_review.title)"
+        wizard_plan_summary
+        printf '\n  1) %s\n' "$(t plan_review.confirm)"
+        printf '  2) %s\n' "$(t plan_review.edit_panel)"
+        for ((index = 0; index < GOWAVE_PLAN_NODE_COUNT; index++)); do
+            printf '  %d) %s\n' "$((index + 3))" "$(tf plan_review.edit_node "$((index + 1))")"
+        done
+        printf '  0) %s\n\n' "$(t plan_review.cancel)"
+        choice=$(_wizard_prompt_read "$(t plan_review.edit_field)") || return 1
+        case "$choice" in
+            1)
+                if wizard_certificate_preflight && wizard_check_plan_names; then
+                    return 0
+                fi
+                ;;
+            2)
+                _wizard_review_edit_group "$(t plan_review.panel_title)" \
+                    "${panel_keys[@]}" || return 1
+                ;;
+            0)
+                printf '%s\n' "$(t plan_review.cancelled)"
+                return 3
+                ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 3 && choice - 3 < GOWAVE_PLAN_NODE_COUNT )); then
+                    index=$((choice - 3))
+                    _wizard_review_edit_group "$(tf plan_review.node_title "$((index + 1))")" \
+                        "node_name_$index" "node_camouflage_$index" "node_vision_$index" \
+                        "node_label_$index" || return 1
+                else
+                    printf '%s\n' "$(t plan_review.invalid_choice)" >&2
+                fi
+                ;;
+        esac
+    done
+}
 # Hands the panel host to cmd_install exactly as the positional path would.
 wizard_apply_plan() {
     GOWAVE_INSTALL_POSITIONAL=()
@@ -915,6 +1116,88 @@ wizard_apply_plan() {
     return 0
 }
 
+# The nodes the Panel already holds, one "name<TAB>address" per line.
+#
+# Only a Panel on this host can be read: its bearer token lives in this host's
+# credentials file, and a remote Panel's token is not this installer's to hold.
+# 0 is a read inventory, 1 a local Panel that did not answer, 2 a remote Panel
+# whose inventory is unverifiable here — never a "the name is free" answer.
+wizard_panel_inventory_names() {
+    local panel_address="$1" panel_is_local="${2:-no}"
+    local root
+    if [[ "$panel_is_local" != "yes" && "$panel_address" != "127.0.0.1" && "$panel_address" != "localhost" ]]; then
+        return 2
+    fi
+    root=$(cd "$_wizard_dir/.." && pwd)
+    PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" python3 - \
+        "${CREDENTIALS_FILE:-/root/gowave-credentials.txt}" <<'PY'
+import sys
+
+from modules.api_client import GoWaveAPIError, GoWaveClient
+
+token = ""
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        for line in handle:
+            if line.startswith("SCOPED_API_TOKEN="):
+                token = line.split("=", 1)[1].strip()
+except OSError:
+    raise SystemExit(1)
+if not token:
+    raise SystemExit(1)
+client = GoWaveClient("http://127.0.0.1:3000", token=token)
+try:
+    nodes = client.list_nodes()
+except (GoWaveAPIError, OSError):
+    raise SystemExit(1)
+for node in nodes:
+    if isinstance(node, dict) and node.get("name"):
+        print("%s\t%s" % (node["name"], node.get("address") or "-"))
+PY
+}
+
+# Asks for the Worker name with the Panel's own inventory in hand.
+#
+# A collision is refused here, before the SSH session and before the remote
+# server is touched; an unreadable inventory is reported as unverified, so the
+# operator never hears that a name is free when nobody checked.
+wizard_read_panel_worker_name() {
+    local panel_address="$1" panel_is_local="${2:-no}"
+    local inventory="" count="" name taken rc=0
+
+    inventory=$(wizard_panel_inventory_names "$panel_address" "$panel_is_local") || rc=$?
+    if (( rc == 2 )); then
+        printf '%s\n' "$(t wizard.add_node.inventory_unverified)" >&2
+    else
+        while (( rc != 0 )); do
+            printf '%s\n' "$(tf wizard.add_node.inventory_unavailable "$panel_address")" >&2
+            if ! wizard_read_yes_no "$(t wizard.add_node.inventory_retry)" no; then
+                printf '%s\n' "$(t wizard.add_node.cancelled)" >&2
+                return 1
+            fi
+            rc=0
+            inventory=$(wizard_panel_inventory_names "$panel_address" "$panel_is_local") || rc=$?
+        done
+        count=0
+        [[ -n "$inventory" ]] && count=$(printf '%s\n' "$inventory" | wc -l)
+        printf '%s\n' "$(tf wizard.add_node.inventory_checked "$count")" >&2
+    fi
+
+    while true; do
+        name=$(wizard_read_label "$(t menu.prompt.worker_name)") || return 1
+        if (( rc == 0 )); then
+            taken=$(printf '%s\n' "$inventory" | awk -F'\t' -v want="$name" \
+                'tolower($1) == tolower(want) { print $2; exit }')
+            if [[ -n "$taken" ]]; then
+                printf '%s\n' "$(tf wizard.add_node.name_taken "$name" "$taken")" >&2
+                continue
+            fi
+        fi
+        printf '%s' "$name"
+        return 0
+    done
+}
+
 wizard_missing_terminal() {
     printf '%s\n' "$(t wizard.missing_tty)" >&2
     if [[ -n "${GOWAVE_INSTALL_USAGE:-}" ]]; then
@@ -928,7 +1211,7 @@ wizard_missing_terminal() {
 # Returns 0 if all nodes succeeded, 1 if all nodes failed, 2 if partial success.
 # Prints a per-node summary to stdout.
 wizard_onboard_nodes() {
-    local i host camouflage vision
+    local i host camouflage vision label
     local -a node_results=()
     local any_succeeded=0 any_failed=0
     local scratch stderr_file
@@ -947,10 +1230,11 @@ wizard_onboard_nodes() {
         host="${GOWAVE_PLAN_NODE_NAMES[$i]}"
         camouflage="${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}"
         vision="${GOWAVE_PLAN_NODE_VISION[$i]:-}"
+        label="${GOWAVE_PLAN_NODE_LABELS[$i]:-}"
 
         # Capture stdout and stderr separately to extract phase info
         local stdout_output stderr_output
-        stdout_output=$(ssh_bootstrap_onboard_one "$host" "$camouflage" "$vision" 2>"$stderr_file")
+        stdout_output=$(ssh_bootstrap_onboard_one "$host" "$camouflage" "$vision" "$label" 2>"$stderr_file")
         local result=$?
         stderr_output=$(cat "$stderr_file" 2>/dev/null || true)
         : > "$stderr_file"
@@ -1063,10 +1347,11 @@ _retry_single_node() {
         if [[ "${GOWAVE_PLAN_NODE_NAMES[$i]}" == "$host" ]]; then
             local camouflage="${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}"
             local vision="${GOWAVE_PLAN_NODE_VISION[$i]:-}"
+            local label="${GOWAVE_PLAN_NODE_LABELS[$i]:-}"
             local stdout_output stderr_output
             local stderr_file
             stderr_file=$(mktemp "${TMPDIR:-/tmp}/wizard_onboard_stderr.XXXXXX")
-            stdout_output=$(ssh_bootstrap_onboard_one "$host" "$camouflage" "$vision" 2>"$stderr_file")
+            stdout_output=$(ssh_bootstrap_onboard_one "$host" "$camouflage" "$vision" "$label" 2>"$stderr_file")
             local result=$?
             stderr_output=$(cat "$stderr_file" 2>/dev/null || true)
             rm -f "$stderr_file"

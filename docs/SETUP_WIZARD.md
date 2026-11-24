@@ -25,9 +25,9 @@ Running `gowave-auto.sh` without arguments (and with a terminal) enters the inte
 
 1. **Language selection** — `ru` or `en`, before any menu text is rendered
 2. **Menu** — numbered options for all lifecycle operations:
-   - Show status & health
-   - Install All-in-One GoWave stack
-   - Add Distributed Edge Worker Node
+   - Show installation status
+   - Deploy a new Panel (and optional nodes)
+   - Connect a remote server as a node to the existing Panel
    - Change domains
    - Switch channel (stable ↔ dev)
    - Create Backup
@@ -36,20 +36,80 @@ Running `gowave-auto.sh` without arguments (and with a terminal) enters the inte
    - Uninstall
    - Exit
 
+Every action stays on screen until Enter is pressed, and only then does the menu redraw: the menu starts
+with a clear, so a status report or a result that ended the branch would otherwise be erased before it
+could be read. End of input (Ctrl-D) leaves the menu the way Exit does. The positional `status` command
+never waits, because a script or a CI case has nobody to press Enter.
+
 ## The three deployment variants
 
 | Variant | What runs on this host | Production use |
 | --- | --- | --- |
-| Panel-only | Panel and a static camouflage site; stream `default` goes to the decoy at `:9443` | Yes, as the control plane |
-| All-in-One | Panel and a local Node, with Xray/REALITY/Vision on `:8443`/`:8444` | Trial and evaluation only |
-| All-in-One plus remote nodes | The All-in-One host, then each Worker onboarded over SSH | Yes, with Workers as the traffic plane |
+| Panel only | Panel and a static camouflage site; stream `default` goes to the decoy at `:9443` | Recommended: control plane only, no client traffic |
+| Panel and one node | Panel and a local Node, with Xray/REALITY/Vision on `:8443`/`:8444` | Evaluation and personal use only |
+| Panel and one node plus remote nodes | The same host, then each Worker onboarded over SSH | Not recommended: one host is both control plane and one of the traffic endpoints |
 
-All-in-One is not a production topology: one host would be both the control plane and the traffic plane.
+The recommended shape is Panel-only on this host with every node on a separate server: losing the
+Panel host then costs the control plane but no client endpoint. Every variant that runs a node here
+puts one traffic endpoint on the same host as the control plane, and no scheme moves clients between
+nodes automatically when one fails — failover is a property of the client configuration and the node
+inventory, not of this installer.
+
+## Naming servers
+
+Every server in the plan is given a name of the operator's own choosing, asked separately from its
+domain: the local node right after the Panel card, each remote node right after its own card. A
+Panel-only host runs no local node, so it asks for no local name and no Vision. The name is what the
+Panel, the subscriptions and the Host records call the server, so it is not derived from DNS and does
+not have to look like one — `ams-01` is a fine name for a host whose domain is `node1.example.com`.
+
+The same rules apply wherever a name is asked — during collection, in the review editor, and when
+adding a node to an existing Panel:
+
+- surrounding spaces are removed, so a pasted name is accepted as typed;
+- a blank name is refused and only that question is repeated;
+- letters, digits, dot, underscore and hyphen are allowed, and the first character is a letter or a
+  digit. This is the rule the Panel enforces on registration, so a name the wizard accepts is a name
+  `node add` accepts instead of failing after the SSH session opened;
+- two servers cannot share a name, and a difference in case alone is a shared name. The refusal names
+  the server that already holds it.
+
+The accepted name reaches everything the server is registered with: profile tags, Host remarks, the
+`node add` argument and `state.json`. An installation that collects no plan — a positional
+`gowave-auto.sh install …` run — keeps the historical `local-node` name, so a repeated non-interactive
+install does not register a second local node under a new name.
+
+## Reviewing the plan
+
+Collecting the answers builds a plan; nothing on a server changes until the review is started. A name
+the plan already holds — the Panel host, the Panel camouflage, a node's own two other names, or the
+name another server was given — is refused at the field that typed it and asked again, so a second
+node's cover domain cannot cost the Panel and the first node. The review prints the summary and four
+kinds of action:
+
+```
+  1) Start deployment with this plan
+  2) Edit the Panel and plan settings
+  3) Edit node 1
+  0) Cancel and return to the menu
+```
+
+Adding remote nodes puts one `Edit node N` line per node, so node 2 is always action 4 and cannot
+reach node 1's fields. Each editor lists that group's fields with their current values and a number
+for each, and `0` returns to the action list. An empty answer keeps the current value, except a
+Vision domain, where empty removes Vision; a refused value prints its reason and leaves the editor
+open, so the operator fixes that one field instead of retyping the whole card.
+
+Start re-runs the DNS check and the certificate-budget check, so a plan refused during editing cannot
+be started anyway. The shared-domain consent is remembered for the certificate count it was given
+for, and asked again only when the count changes. Cancel prints `Deployment cancelled. No server was
+changed.` and returns to the menu with the plan discarded: no lock is taken, and no install step
+runs.
 
 ## Adding nodes to an existing Panel (menu option 3)
 
-The "Add Distributed Edge Worker Node" menu option onboards a new Worker to a Panel that is already
-deployed. The flow is:
+The "Connect a remote server as a node to the existing Panel" menu option onboards a new Worker to a
+Panel that is already deployed. The flow is:
 
 1. **Local Panel detection** — If a `gowave.service` is active on this host, its domain is read from
    NGINX config, `state.json`, or `.env` and offered for confirmation.
@@ -70,9 +130,21 @@ deployed. The flow is:
      identity to verify.
    - A wrong target, an unverified certificate without confirmation, a bare address, and an
      unreachable API are all rejected before any Worker access or credential transmission.
-4. **Worker details** — Worker name, IP, domain, and camouflage domain are prompted.
+4. **Worker details** — Worker name, IP, domain, and camouflage domain are prompted. The name is
+   read with the same rules as in a deployment plan: trimmed, never blank, and only the characters
+   the Panel accepts, so a rejected name costs one question instead of a finished SSH session. The
+   question also holds the Panel's own node list: a name the Panel already lists is refused there
+   and answered with the address of the node that holds it, because registering it again would
+   rewrite that server's address and move its traffic. Only a Panel on this host is read — its API
+   token is in this host's credentials file, and a remote Panel's token is not this installer's to
+   hold. A remote Panel therefore prints that the name is checked when the node registers, and a
+   local Panel whose list cannot be read says so and offers to read it again before the question,
+   never treating an unread list as a free name.
 5. **Onboarding** — The Worker is registered via the Panel API and provisioned over SSH with
-   temporary key authorisation (same process as initial deployment).
+   temporary key authorisation (same process as initial deployment). The registration repeats the
+   name check against the live Panel, and a name held by a different address or port is refused
+   before any profile, inbound or Host record exists, so a collision that appeared since the
+   question costs no rollback.
 
 ## Temporary SSH access for remote nodes
 
@@ -107,33 +179,6 @@ at the end of `node add` on success and on failure.
 never written to `state.json`, because the language is not installation state. Unknown values fall back
 to English.
 
-## Temporary SSH access for remote nodes
-
-The wizard authorises an Ed25519 key on a Worker only after the operator types the Worker's host-key
-fingerprint in full. The flow prints the fingerprint the Worker presents, then asks for it, so the operator
-confirms that value against the one the provider's console shows; the question and the password prompt are
-written to the terminal, not to the captured diagnostic stream. Two variables provide the non-interactive
-inputs:
-
-- `GOWAVE_SSH_FINGERPRINT` — the SHA-256 fingerprint the operator read from the Worker. It must equal the
-  key the Worker presents; a mismatch refuses the onboarding before `authorized_keys` is touched.
-- `GOWAVE_SSH_PASSWORD_FILE` — a file containing the SSH password, mode `0600`. A file with any other mode
-  is refused. The password is read once, written into the private key directory, and never placed in a
-  command line: `ssh` reads it through an `SSH_ASKPASS` helper.
-
-```bash
-sudo GOWAVE_SSH_FINGERPRINT='SHA256:...' \
-     GOWAVE_SSH_PASSWORD_FILE=/root/worker-password.txt \
-     ./gowave-auto.sh install
-```
-
-The plan questions still come from the terminal; the two variables replace only the SSH prompts of the
-onboarding step. The wizard reads them around the `node add` it runs, so the operator is asked once per
-Worker.
-
-A systemd timer on the Worker removes the temporary entry within two hours, and the entry is also revoked
-at the end of `node add` on success and on failure.
-
 ## Domain and certificate policy
 
 The preflight counts `C = 2 + v_panel + 2N + k` certificates, where `v_panel` is 1 when the Panel host has
@@ -145,7 +190,7 @@ Let's Encrypt limit for a registered domain yields four node ceilings:
 | None | 24 nodes |
 | Panel host only | 23 nodes |
 | Everywhere, Panel-only Panel | 16 nodes |
-| Everywhere, All-in-One Panel | 15 nodes |
+| Everywhere, Panel and one node on this host | 15 nodes |
 
 Separate registered domains proceed without a question because each host spends its own budget. A shared
 domain within the ceiling proceeds only after an explicit confirmation that names the count and the
