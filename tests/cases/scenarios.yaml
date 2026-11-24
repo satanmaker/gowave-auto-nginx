@@ -239,7 +239,7 @@ environments:
     environment: partial
     partial_split: "Container witnesses the matrix one case per row, each at its own boundary; 'all 15 scenarios terminate at their designated boundaries' is a property of the suite's case list rather than a verdict one run can produce, and `catalog gaps` with the divergence table is what audits it."
   - requirement: 'Negative Scenario and Fault Injection Tests'
-    scenario: 'Duplicate Worker registration is rejected without mutation (NEG-14)'
+    scenario: 'A registered Worker name claimed for another address is rejected without mutation (NEG-14)'
     environment: container
   - requirement: 'Negative Scenario and Fault Injection Tests'
     scenario: 'Partial SSH deployment leaves no false COMMITTED journal state (NEG-13)'

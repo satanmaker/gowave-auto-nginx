@@ -6491,11 +6491,12 @@ _DUPLICATE_SURFACE = {
 
 
 class _DuplicatePodman:
-    """The Master's registration record and the operator's second `node add`."""
+    """The Master's registration record, its known_hosts and the operator's second `node add`."""
 
     def __init__(self, record=None, returncode=1,
-                 output=f"Worker name is already registered in state.json: "
-                        f"{topology.WORKER_NODE_NAME}\n",
+                 output=f"{multi_node.DUPLICATE_ADD_REFUSAL} {topology.WORKER_NODE_NAME} "
+                        f"for the node at 10.0.0.2; choose another name or remove that "
+                        f"entry first.\n",
                  mutate=None, on_attempt=None):
         self.record = dict(record or _DUPLICATE_STATE)
         self.returncode = returncode
@@ -6503,6 +6504,15 @@ class _DuplicatePodman:
         self.mutate = mutate
         self.on_attempt = on_attempt
         self.attempts = []
+        self.known_hosts = "10.0.0.2 ssh-ed25519 AAAArecorded\n"
+
+    def exec(self, container, argv, check=True, input_text=None, timeout=120):
+        if argv[:2] == ["cat", "/root/.ssh/known_hosts"]:
+            return subprocess.CompletedProcess(argv, 0, self.known_hosts, "")
+        if argv[:2] == ["bash", "-c"] and "/root/.ssh/known_hosts" in argv[2]:
+            self.known_hosts = input_text
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        raise AssertionError(f"unexpected command in {container}: {argv}")
 
     def exec_bash(self, container, script, check=True, input_text=None, timeout=120):
         if "state_digest" in script:
@@ -6521,15 +6531,31 @@ class _DuplicatePodman:
         raise AssertionError(f"unexpected script in {container}: {script[:120]}")
 
 
+class _DuplicatePlan:
+    worker_ip = "10.0.0.2"
+    second_node_ip = "10.0.0.9"
+
+
 class _DuplicateHost:
     target_name = "aio-master"
+    plan = _DuplicatePlan()
 
-    def node_add_script(self):
+    def __init__(self):
+        self.pinned = []
+
+    def node_add_script(self, name=None, address=None):
+        name = name or topology.WORKER_NODE_NAME
+        address = address or self.plan.worker_ip
         return (
             f"bash {topology.REPO_IN_CONTAINER}/gowave-auto.sh node add "
-            f"'{topology.WORKER_NODE_NAME}' '10.0.0.2' "
+            f"'{name}' '{address}' "
             "'worker.testbed.internal' 'reality.testbed.internal'"
         )
+
+    def pin_worker_address(self, address):
+        entry = f"{address} ssh-ed25519 AAAApinned"
+        self.pinned.append(entry)
+        return entry
 
 
 class _DuplicateProduct:
@@ -6569,6 +6595,29 @@ class TestDuplicateAddCase(unittest.TestCase):
         self.assertTrue(evidence["journal_unchanged"])
         self.assertTrue(evidence["inventory_unchanged"])
 
+    def test_the_attempt_claims_the_name_at_a_second_address(self):
+        # The same name at the same address is the retry of a known identity,
+        # which the product accepts on purpose; only another address makes it a
+        # duplicate.
+        evidence, podman = self.run_case()
+        _container, script = podman.attempts[0]
+        self.assertIn(f"'{_DuplicatePlan.second_node_ip}'", script)
+        self.assertNotIn(f"'{_DuplicatePlan.worker_ip}'", script)
+        self.assertEqual(evidence["second_address"], _DuplicatePlan.second_node_ip)
+        self.assertEqual(evidence["recorded_address"], _DuplicatePlan.worker_ip)
+
+    def test_the_second_address_is_pinned_and_the_pin_taken_out_again(self):
+        evidence, podman = self.run_case()
+        self.assertIn(_DuplicatePlan.second_node_ip, evidence["address_pinned"])
+        self.assertEqual(podman.known_hosts, "10.0.0.2 ssh-ed25519 AAAArecorded\n")
+        self.assertTrue(evidence["known_hosts_restored"])
+
+    def test_a_refusal_that_does_not_name_the_recorded_address_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.run_case(output=f"{multi_node.DUPLICATE_ADD_REFUSAL} "
+                                 f"{topology.WORKER_NODE_NAME} for the node at 10.0.0.9\n")
+        self.assertIn("does not name the address the record holds", str(caught.exception))
+
     def test_the_record_probe_reads_the_product_own_files(self):
         script = multi_node.duplicate_add_state_command()
         self.assertIn(multi_node.NODE_ADD_STATE, script)
@@ -6599,7 +6648,7 @@ class TestDuplicateAddCase(unittest.TestCase):
     def test_a_traceback_instead_of_the_refusal_fails_the_case(self):
         with self.assertRaises(AssertionError) as caught:
             self.run_case(output=f"{multi_node.DUPLICATE_ADD_REFUSAL}: "
-                                 f"{topology.WORKER_NODE_NAME}\n"
+                                 f"{topology.WORKER_NODE_NAME} for the node at 10.0.0.2\n"
                                  "Traceback (most recent call last):\n"
                                  "KeyError: 'nodes'\n")
         self.assertIn("crashed instead of being refused", str(caught.exception))

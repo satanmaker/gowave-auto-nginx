@@ -628,14 +628,25 @@ class TestMutatingScenariosStageTheRunsLease(unittest.TestCase):
         self.assertIn("cat /run/gowave-negative-lease", restore[0])
         self.assertEqual(fake.calls[-1], "rm -f -- /run/gowave-negative-lease")
 
-    def test_neg_14_stages_the_lease_for_the_duplicate_add(self):
-        from live_vps.negative import run_neg_14_duplicate_worker_registration
+    def test_neg_14_claims_the_registered_name_for_a_second_address(self):
+        from live_vps.negative import (
+            NEG14_DUPLICATE_REFUSAL,
+            NEG14_SECOND_ADDRESS,
+            run_neg_14_duplicate_worker_registration,
+        )
 
         def handler(cmd):
-            if cmd.startswith("sha256sum"):
+            if "sha256sum" in cmd and "state.json" in cmd:
                 return SSHResult(0, "abc123  /var/lib/gowave-auto-nginx/state.json\n", "")
+            if "sha256sum" in cmd and "known_hosts" in cmd:
+                return SSHResult(0, "kh-before\n", "")
             if "node add" in cmd:
-                return SSHResult(1, "", "Error: worker-1 is already registered in state.json\n")
+                return SSHResult(
+                    1,
+                    "",
+                    f"Error: {NEG14_DUPLICATE_REFUSAL} worker-1 for the node at "
+                    "203.0.113.30; choose another name or remove that entry first.\n",
+                )
             return SSHResult(0, "", "")
 
         fake = FakeSSH(handler)
@@ -653,12 +664,129 @@ class TestMutatingScenariosStageTheRunsLease(unittest.TestCase):
         )
 
         self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["recorded_address"], "203.0.113.30")
+        self.assertEqual(result["attempted_address"], NEG14_SECOND_ADDRESS)
+        self.assertTrue(result["known_hosts_restored"])
         self.assertTrue(result["lease_presented"])
         self.assert_the_token_travelled_as_stdin_only(fake)
         add = [call for call in fake.calls if "node add" in call]
         self.assertEqual(len(add), 1)
+        self.assertIn(NEG14_SECOND_ADDRESS, add[0])
+        self.assertNotIn(" 203.0.113.30 ", add[0])
         self.assertIn("cat /run/gowave-negative-lease", add[0])
-        self.assertIn("rm -f -- /run/gowave-negative-lease", fake.calls)
+        pinned = [call for call in fake.calls if "neg14-dummy-ed25519" in call and "ssh-keygen" in call]
+        self.assertEqual(len(pinned), 1)
+        self.assertIn(">> /root/.ssh/known_hosts", pinned[0])
+        restore = [
+            index for index, call in enumerate(fake.calls)
+            if "cat /tmp/neg14-known-hosts.bak > /root/.ssh/known_hosts" in call
+        ]
+        self.assertEqual(len(restore), 1)
+        lease_removed = [
+            index for index, call in enumerate(fake.calls)
+            if "rm -f -- /run/gowave-negative-lease" in call
+        ]
+        self.assertEqual(len(lease_removed), 1)
+        self.assertLess(lease_removed[0], restore[0])
+
+    def test_neg_14_a_refusal_that_does_not_name_the_recorded_address_fails(self):
+        from live_vps.negative import run_neg_14_duplicate_worker_registration
+
+        def handler(cmd):
+            if "sha256sum" in cmd and "state.json" in cmd:
+                return SSHResult(0, "abc123  state.json\n", "")
+            if "sha256sum" in cmd and "known_hosts" in cmd:
+                return SSHResult(0, "kh-before\n", "")
+            if "node add" in cmd:
+                return SSHResult(
+                    1, "",
+                    "Error: state.json already registers the name worker-1 for the node at "
+                    "198.51.100.7; choose another name or remove that entry first.\n",
+                )
+            return SSHResult(0, "", "")
+
+        panel_client = MagicMock()
+        for resource in ("get_nodes", "get_config_profiles", "get_internal_squads", "get_hosts"):
+            getattr(panel_client, resource).return_value = []
+        config = MagicMock(
+            worker_ssh_user="root", worker_ssh_port=22,
+            worker_domain="worker.example.com",
+            worker_reality_domain="worker-reality.example.com",
+        )
+
+        result = run_neg_14_duplicate_worker_registration(
+            FakeSSH(handler), "203.0.113.30", config, panel_client, lease_token=self.TOKEN
+        )
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertFalse(result["explicit_duplicate_rejection"])
+
+    def test_neg_14_a_known_hosts_left_changed_fails(self):
+        from live_vps.negative import run_neg_14_duplicate_worker_registration
+
+        reads = []
+
+        def handler(cmd):
+            if "sha256sum" in cmd and "state.json" in cmd:
+                return SSHResult(0, "abc123  state.json\n", "")
+            if "sha256sum" in cmd and "known_hosts" in cmd:
+                reads.append(cmd)
+                return SSHResult(0, f"kh-{len(reads)}\n", "")
+            if "node add" in cmd:
+                return SSHResult(
+                    1, "",
+                    "Error: state.json already registers the name worker-1 for the node at "
+                    "203.0.113.30; choose another name or remove that entry first.\n",
+                )
+            return SSHResult(0, "", "")
+
+        panel_client = MagicMock()
+        for resource in ("get_nodes", "get_config_profiles", "get_internal_squads", "get_hosts"):
+            getattr(panel_client, resource).return_value = []
+        config = MagicMock(
+            worker_ssh_user="root", worker_ssh_port=22,
+            worker_domain="worker.example.com",
+            worker_reality_domain="worker-reality.example.com",
+        )
+
+        result = run_neg_14_duplicate_worker_registration(
+            FakeSSH(handler), "203.0.113.30", config, panel_client, lease_token=self.TOKEN
+        )
+
+        self.assertEqual(result["status"], "FAIL")
+        self.assertTrue(result["explicit_duplicate_rejection"])
+        self.assertFalse(result["known_hosts_restored"])
+
+    def test_neg_14_a_pin_that_cannot_be_written_leaves_known_hosts_alone(self):
+        from live_vps.negative import run_neg_14_duplicate_worker_registration
+
+        def handler(cmd):
+            if "sha256sum" in cmd and "state.json" in cmd:
+                return SSHResult(0, "abc123  state.json\n", "")
+            if "sha256sum" in cmd and "known_hosts" in cmd:
+                return SSHResult(0, "kh-before\n", "")
+            if "neg14-dummy-ed25519" in cmd and "ssh-keygen" in cmd:
+                return SSHResult(1, "", "ssh-keygen: permission denied\n")
+            return SSHResult(0, "", "")
+
+        panel_client = MagicMock()
+        for resource in ("get_nodes", "get_config_profiles", "get_internal_squads", "get_hosts"):
+            getattr(panel_client, resource).return_value = []
+        config = MagicMock(
+            worker_ssh_user="root", worker_ssh_port=22,
+            worker_domain="worker.example.com",
+            worker_reality_domain="worker-reality.example.com",
+        )
+
+        fake = FakeSSH(handler)
+        result = run_neg_14_duplicate_worker_registration(
+            fake, "203.0.113.30", config, panel_client, lease_token=self.TOKEN
+        )
+
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertFalse([call for call in fake.calls if "node add" in call])
+        restore = [call for call in fake.calls if "neg14-known-hosts.bak" in call and "cat" in call]
+        self.assertTrue(restore, "a pin that never landed was left in known_hosts")
 
 
 if __name__ == "__main__":

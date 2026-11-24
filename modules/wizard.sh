@@ -1126,8 +1126,13 @@ wizard_apply_plan() {
 # The nodes the Panel already holds, one "name<TAB>address<TAB>port<TAB>uuid"
 # per line.
 #
-# Only a Panel on this host can be read: its bearer token lives in this host's
-# credentials file, and a remote Panel's token is not this installer's to hold.
+# Only a Panel on this host can be read: the administrative credentials that
+# read it live in this host's credentials file, and a remote Panel's are not
+# this installer's to hold. The read authenticates the way the registration
+# does, with `ADMIN_USERNAME`/`ADMIN_PASSWORD`, because the scoped API token in
+# the same file is issued for external subscription consumers and carries no
+# `nodes:read`: a readback behind that token answers 403 and would report every
+# registered node as unconfirmed.
 # 0 is a read inventory, 1 a local Panel that did not answer, 2 a remote Panel
 # whose inventory is unverifiable here — never a "the name is free" answer.
 wizard_panel_inventory_names() {
@@ -1143,18 +1148,22 @@ import sys
 
 from modules.api_client import GoWaveAPIError, GoWaveClient
 
-token = ""
+values = {}
 try:
     with open(sys.argv[1], encoding="utf-8") as handle:
         for line in handle:
-            if line.startswith("SCOPED_API_TOKEN="):
-                token = line.split("=", 1)[1].strip()
+            key, sep, value = line.partition("=")
+            if sep and not key.lstrip().startswith("#"):
+                values[key.strip()] = value.strip()
 except OSError:
     raise SystemExit(1)
-if not token:
+username = values.get("ADMIN_USERNAME", "")
+password = values.get("ADMIN_PASSWORD", "")
+if not username or not password:
     raise SystemExit(1)
-client = GoWaveClient("http://127.0.0.1:3000", token=token)
+client = GoWaveClient("http://127.0.0.1:3000")
 try:
+    client.login(username, password)
     nodes = client.list_nodes()
 except (GoWaveAPIError, OSError):
     raise SystemExit(1)

@@ -14,6 +14,7 @@ import pty
 import re
 import select
 import shlex
+import shutil
 import subprocess
 import tempfile
 import termios
@@ -39,6 +40,47 @@ SHIPPING_SCRIPTS = [
 CATALOG_CALL = re.compile(r"\b(?:t|tf)\s+(?:wizard|menu)\.")
 
 SOURCE_WIZARD = f"source {shlex.quote(str(WIZARD_SH))}\n"
+
+# The Panel client the inventory read resolves when a test substitutes the
+# module root: it records how it was authenticated, so a read that reached the
+# Panel behind a token with no `nodes:read` is visible rather than silent.
+FAKE_PANEL_CLIENT = '''\
+import os
+
+
+class GoWaveAPIError(Exception):
+    pass
+
+
+class GoWaveClient:
+    def __init__(self, base):
+        self.base = base
+        self.token = ""
+        self._log(f"base={base}")
+
+    def _log(self, line):
+        path = os.environ.get("FAKE_LOG")
+        if not path:
+            return
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(line + "\\n")
+
+    def login(self, username, password):
+        self._log(f"login={username}/{password}")
+        error = os.environ.get("FAKE_LOGIN_ERROR")
+        if error:
+            raise GoWaveAPIError(error)
+        self.token = "admin-session"
+        return self.token
+
+    def list_nodes(self):
+        if not self.token:
+            raise GoWaveAPIError("no session")
+        return [
+            {"name": "worker-1", "address": "10.1.2.3", "port": 3002, "uuid": "uuid-1"},
+            {"name": "local-node", "address": "10.0.0.1", "port": 3000, "uuid": "uuid-0"},
+        ]
+'''
 
 
 def change_document(name, filename):
@@ -2405,10 +2447,10 @@ class TestPanelWorkerName(unittest.TestCase):
 class TestPanelInventoryRead(unittest.TestCase):
     """What the inventory read answers, and what it refuses to guess.
 
-    Only a Panel on this host can be read: its token sits in this host's
-    credentials file. A remote Panel's inventory is unverifiable here, and an
-    unreadable local one is a failure — neither may be reported as "the name is
-    free".
+    Only a Panel on this host can be read: the administrative credentials that
+    read it sit in this host's credentials file. A remote Panel's inventory is
+    unverifiable here, and an unreadable local one is a failure — neither may be
+    reported as "the name is free".
     """
 
     def read(self, address, local, credentials):
@@ -2420,6 +2462,65 @@ class TestPanelInventoryRead(unittest.TestCase):
             "printf 'RC=%d\\n' \"$?\"\n"
         )
         return bash(script)
+
+    def read_with_fake_panel(self, credentials, env=None):
+        """Run the shipped read against a Panel client that records its calls.
+
+        The client module is what ``_wizard_dir`` points at, so the function's
+        own ``PYTHONPATH`` resolves to it: the payload under test is the shipped
+        text, only the Panel behind it is a double.
+        """
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        modules = Path(directory) / "modules"
+        modules.mkdir()
+        (modules / "__init__.py").write_text("", encoding="utf-8")
+        (modules / "api_client.py").write_text(FAKE_PANEL_CLIENT, encoding="utf-8")
+        log = Path(directory) / "calls.log"
+        creds = Path(directory) / "credentials.txt"
+        creds.write_text(credentials, encoding="utf-8")
+        script = (
+            SOURCE_WIZARD
+            + "set +e\n"
+            f"_wizard_dir={shlex.quote(str(modules))}\n"
+            f"CREDENTIALS_FILE={shlex.quote(str(creds))}\n"
+            "wizard_panel_inventory_names 127.0.0.1 yes\n"
+            "printf 'RC=%d\\n' \"$?\"\n"
+        )
+        result = bash(script, env={"FAKE_LOG": str(log), **(env or {})})
+        calls = log.read_text(encoding="utf-8") if log.exists() else ""
+        return result, calls
+
+    def test_the_readback_authenticates_as_the_administrator(self):
+        # The scoped token in the same file is issued for external subscription
+        # consumers and carries no `nodes:read`; a read behind it answers 403 and
+        # would report a registered node as unconfirmed.
+        result, calls = self.read_with_fake_panel(
+            "ADMIN_USERNAME=admin\n"
+            "ADMIN_PASSWORD=secret\n"
+            "SCOPED_API_TOKEN=token-without-nodes-read\n"
+        )
+        self.assertIn("RC=0", result.stdout, result.stderr)
+        self.assertIn("base=http://127.0.0.1:3000", calls)
+        self.assertIn("login=admin/secret", calls)
+        self.assertIn("worker-1\t10.1.2.3\t3002\tuuid-1", result.stdout)
+        self.assertNotIn("token-without-nodes-read", calls, "the scope-less token was used to read nodes")
+
+    def test_a_credentials_file_without_the_administrator_is_not_a_read(self):
+        result, calls = self.read_with_fake_panel("SCOPED_API_TOKEN=token-without-nodes-read\n")
+        self.assertIn("RC=1", result.stdout, result.stderr)
+        self.assertNotIn("login=", calls, "the read ran without administrative credentials")
+        self.assertNotIn("worker-1", result.stdout, "an unauthenticated read printed an inventory")
+
+    def test_a_panel_that_refuses_the_administrator_login_is_not_a_read(self):
+        result, calls = self.read_with_fake_panel(
+            "ADMIN_USERNAME=admin\nADMIN_PASSWORD=secret\n",
+            env={"FAKE_LOGIN_ERROR": "403"},
+        )
+        self.assertIn("RC=1", result.stdout, result.stderr)
+        self.assertIn("login=admin/secret", calls)
+        self.assertNotIn("worker-1", result.stdout, "a refused login still printed an inventory")
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_a_remote_panel_inventory_is_unverifiable_here(self):
         result = self.read("panel.example.com", "no", "/nonexistent/credentials")

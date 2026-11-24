@@ -124,7 +124,7 @@ be published.
 | DP-14 | container | pre-push | Data Plane is explicitly disabled | Data Plane E2E Traffic Through All VPN Endpoints |
 | DP-15 | container | pre-push | One or more mandatory runtime cases fail | Data Plane E2E Traffic Through All VPN Endpoints |
 | NEG-01 | partial | pre-push | Matrix of fifteen fault scenarios verified (NEG-01..NEG-15) | Negative Scenario and Fault Injection Tests |
-| NEG-02 | container | pre-push | Duplicate Worker registration is rejected without mutation (NEG-14) | Negative Scenario and Fault Injection Tests |
+| NEG-02 | container | pre-push | A registered Worker name claimed for another address is rejected without mutation (NEG-14) | Negative Scenario and Fault Injection Tests |
 | NEG-03 | container | pre-push | Partial SSH deployment leaves no false COMMITTED journal state (NEG-13) | Negative Scenario and Fault Injection Tests |
 | NEG-04 | partial | pre-push | Preflight, lifecycle, and protocol scenarios verified (NEG-01..NEG-10) | Negative Scenario and Fault Injection Tests |
 | NEG-05 | container | pre-push | Backup and restore negative scenarios verified (NEG-11, NEG-12) | Negative Scenario and Fault Injection Tests |

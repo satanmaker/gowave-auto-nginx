@@ -1,7 +1,7 @@
 version: 1
 schema: gowave-case-catalog/v1
 live_spec: openspec/specs/live-vps-e2e/spec.md
-live_spec_sha256: fcd3612038df6d2c480f56ffdd3a8348d0339cb1da26bb401566008e55d29155
+live_spec_sha256: eac9de45434a3a0eb02a4e3dfc0bb707af9a42fde14b02f73a933b8f96c69e7a
 counts:
   live_total: 125
   container: 111
@@ -1699,7 +1699,8 @@ cases:
   drivers:
     multi-node:
       driver: multi_node:case_worker_registration
-      evidence: [core_hole_control]
+      evidence:
+      - core_hole_control
   promotion_target: null
 - id: WRK-05
   requirement: Distributed Worker VPS Deployment Verification
@@ -3724,12 +3725,12 @@ cases:
     | **NEG-13**  | Worker Deploy    | SSH pipeline interrupted mid-execution | Master recovery journal
     does NOT enter `COMMITTED` |
 
-    | **NEG-14**  | Worker Deploy    | Duplicate `node add` when the worker name is already in `state.json`
-    | Explicit fail-fast rejection before API mutation; no duplicate DB entities or hosts |
+    | **NEG-14**  | Worker Deploy    | `node add` claims a name `state.json` already holds for another
+    address | Explicit fail-fast rejection before API mutation; no duplicate DB entities or hosts |
 
     | **NEG-15**  | Panel API Auth   | API request with expired or forged JWT | Panel returns 401 Unauthorized
     |'
-  assertion_sha256: d31528a0886a73f7929325ad2140462f3c3f0a1214b84c6c9e53a15b1aa41a0c
+  assertion_sha256: e70c9fe034cefa51b1231ddc17b9117e3a9eab61d7dd3f20e67aee2e611d56f5
   runs_in:
   - podman
   - live
@@ -3773,16 +3774,19 @@ cases:
   promotion_target: null
 - id: NEG-02
   requirement: Negative Scenario and Fault Injection Tests
-  live_scenario: Duplicate Worker registration is rejected without mutation (NEG-14)
-  assertion: '**GIVEN** `worker-1` is already present in Master `state.json` and all associated API objects
-    exist
+  live_scenario: A registered Worker name claimed for another address is rejected without mutation (NEG-14)
+  assertion: '**GIVEN** `worker-1` is registered in Master `state.json` for one address, and all associated
+    API objects exist
 
-    **WHEN** `gowave-auto.sh node add worker-1` is invoked again with the same parameters
+    **WHEN** `gowave-auto.sh node add worker-1` is invoked with the same name and a different address
 
-    **THEN** the command exits nonzero with the existing-name rejection before constructing `GoWaveClient`
-    or issuing any Panel API request; `state.json` is unchanged and the existing single node, profile,
-    hosts, and inbounds remain unchanged'
-  assertion_sha256: 974420bf9b4d57ed0a90d80ff250b57c972b4c3efaf7c63d44adc6e43aae2655
+    **THEN** the command exits nonzero with the existing-name rejection naming the address the record
+    holds, before constructing `GoWaveClient` or issuing any Panel API request; `state.json` is unchanged
+    and the existing single node, profile, hosts, and inbounds remain unchanged
+
+    **AND** the same name at the address the record already holds is the same node answering again — the
+    retry the wizard re-enters — so it is accepted and keeps that node''s uuid'
+  assertion_sha256: e8c7d66e5f66d7e60506394d67e89346c07d310365236754e350e2a94726c2cf
   runs_in:
   - podman
   - live
@@ -3797,12 +3801,16 @@ cases:
     multi-node:
       driver: multi_node:case_duplicate_add
       evidence:
+      - address_pinned
       - inventory
       - inventory_unchanged
       - journal_state
       - journal_unchanged
+      - known_hosts_restored
+      - recorded_address
       - refusal
       - returncode
+      - second_address
       - state_addresses
       - state_nodes
       - state_unchanged
@@ -8807,12 +8815,15 @@ cases:
 - id: MN-DUP-ADD
   requirement: Failure injection and recovery
   live_scenario: null
-  assertion: The operator's `gowave-auto.sh node add` run a second time for the Worker it already registered
-    exits nonzero with the existing-name refusal and no traceback, and the state file's bytes, the committed
-    recovery journal's bytes and the Panel's node, profile, squad, host and token inventory are what they
-    were before the attempt, so the refusal came from `state.json` before the Panel client was constructed
-    rather than after a partial registration.
-  assertion_sha256: 135e4f50e262ec56decbf56ac7aae490fdbdb731905efce010eab25e17bb1d1b
+  assertion: 'The operator''s `gowave-auto.sh node add` run for a name `state.json` already holds at another
+    address exits nonzero with the existing-name refusal, names the address the record holds, and prints
+    no traceback, and the state file''s bytes, the committed recovery journal''s bytes and the Panel''s
+    node, profile, squad, host and token inventory are what they were before the attempt, so the refusal
+    came from `state.json` before the Panel client was constructed rather than after a partial registration.
+    The same name at the address the record already holds is the same node answering again and is accepted
+    on purpose: the wizard''s per-node retry re-enters exactly that call, and the throwaway pin the case
+    writes for the second address is removed again.'
+  assertion_sha256: afab86bec9cb4dd8e455bb478f24b218ef7d83f90a484780c4bcd38f16da19cc
   runs_in:
   - podman
   state: incubating
@@ -8825,12 +8836,16 @@ cases:
     multi-node:
       driver: multi_node:case_duplicate_add
       evidence:
+      - address_pinned
       - inventory
       - inventory_unchanged
       - journal_state
       - journal_unchanged
+      - known_hosts_restored
+      - recorded_address
       - refusal
       - returncode
+      - second_address
       - state_addresses
       - state_nodes
       - state_unchanged

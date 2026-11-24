@@ -1233,11 +1233,17 @@ cases_by_requirement:
       token still reads the same route before and after, so neither the refusal
       nor the control can be a route that simply stopped answering.
       MN-DUP-ADD is the duplicate-registration row: the operator's own
-      `node add`, run a second time for the Worker it already registered, exits
-      nonzero with the existing-name refusal before the Panel client is
-      constructed, and the state file's bytes, the committed journal's bytes and
-      the Panel inventory are what they were, which is what distinguishes a
-      refusal from a second record that was created and then cleaned up. The
+      `node add`, run for a name that `state.json` already holds at another
+      address, exits nonzero with the existing-name refusal — naming the address
+      the record holds — before the Panel client is constructed, and the state
+      file's bytes, the committed journal's bytes and the Panel inventory are
+      what they were, which is what distinguishes a refusal from a second record
+      that was created and then cleaned up. The same name at the address the
+      record already holds is the same node answering again and is accepted on
+      purpose, because the wizard's per-node retry re-enters exactly that call;
+      the case pins the second address with a throwaway key first, since an
+      unpinned address is refused by the host-key check instead, and takes the
+      pin out again. The
       third row of that group, a corrupted database inside an otherwise valid
       archive, is a variant of `MN-BACKUP-BAD` and is traced through the backup
       scenario rather than as a case of its own. RED-01 and RED-02 are the two

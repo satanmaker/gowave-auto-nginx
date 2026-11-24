@@ -314,6 +314,18 @@ STATE_FILE_PATH = "/var/lib/gowave-auto-nginx/state.json"
 MUTATION_LOCK_PATH = "/run/lock/gowave-managed-mutation.lock"
 NEG13_TARGET_IP = "10.255.255.1"
 
+# NEG-14 claims a registered name for a second address. The address never has
+# to answer: `node add` refuses the duplicate from `state.json` before it opens
+# any SSH session, so the only thing the address needs is a pin, which the case
+# writes itself and takes out again. Keeping it unroutable means a case that
+# somehow got past the refusal could still not reach a real host.
+NEG14_SECOND_ADDRESS = "10.255.255.2"
+NEG14_KNOWN_HOSTS = "/root/.ssh/known_hosts"
+NEG14_KNOWN_HOSTS_BACKUP = "/tmp/neg14-known-hosts.bak"
+NEG14_DUMMY_KEY = "/tmp/neg14-dummy-ed25519"
+# The refusal the product ships when a name already belongs to another address.
+NEG14_DUPLICATE_REFUSAL = "state.json already registers the name"
+
 
 def _remote_sha256(ssh: SSHClient, path: str) -> Optional[str]:
     result = ssh.run(f"sha256sum -- {shlex.quote(path)} 2>/dev/null | awk '{{print $1}}'")
@@ -844,8 +856,21 @@ def run_neg_14_duplicate_worker_registration(
     panel_client: E2EPanelClient,
     lease_token: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """NEG-14: Duplicate node add must fail before any Panel API/state mutation."""
-    state_path = "/var/lib/gowave-auto-nginx/state.json"
+    """NEG-14: a registered name claimed for a second address is refused before any mutation.
+
+    The same name at the address `state.json` already holds is not a duplicate:
+    it is the same node answering again, the wizard's per-node retry re-enters
+    `node add` with exactly those inputs, and the product keeps that identity's
+    uuid and address. The refusal that remains is a name that belongs to one
+    address being claimed for another, and it is raised before `GoWaveClient`
+    exists, so no Panel object is created.
+
+    The second address is pinned with a throwaway key first, because `node add`
+    checks the pin before it reads `state.json`: without the pin that check
+    refuses the call instead, and the case would pass for the wrong reason. The
+    pin is removed in `finally`, so the Master's `known_hosts` is left as found.
+    """
+    state_path = STATE_FILE_PATH
     before_state = master_ssh.run(f"sha256sum {shlex.quote(state_path)}")
     if not before_state.ok or not before_state.stdout.strip():
         return {"scenario": "NEG-14", "status": "INCOMPLETE",
@@ -871,15 +896,42 @@ def run_neg_14_duplicate_worker_registration(
             identity[resource] = sorted(ids)
         return identity
 
+    # Read before the pin, so a Panel that cannot be inventoried leaves the
+    # Master's known_hosts untouched.
     try:
         before_api = api_identity()
     except Exception as exc:
         return {"scenario": "NEG-14", "status": "INCOMPLETE",
                 "message": f"Could not snapshot Panel API identities: {type(exc).__name__}"}
 
+    known_hosts_before = master_ssh.run(
+        f"sha256sum {shlex.quote(NEG14_KNOWN_HOSTS)} 2>/dev/null | awk '{{print $1}}'"
+    ).stdout.strip()
+
+    def restore_known_hosts() -> None:
+        """Put the Master's known_hosts back; idempotent, so any path may call it."""
+        master_ssh.run(
+            f"if [ -f {shlex.quote(NEG14_KNOWN_HOSTS_BACKUP)} ]; then "
+            f"cat {shlex.quote(NEG14_KNOWN_HOSTS_BACKUP)} > {shlex.quote(NEG14_KNOWN_HOSTS)}; "
+            f"rm -f {shlex.quote(NEG14_KNOWN_HOSTS_BACKUP)}; fi; "
+            f"rm -f {shlex.quote(NEG14_DUMMY_KEY)} {shlex.quote(NEG14_DUMMY_KEY)}.pub"
+        )
+
+    prepared = master_ssh.run(
+        f"cp -p {shlex.quote(NEG14_KNOWN_HOSTS)} {shlex.quote(NEG14_KNOWN_HOSTS_BACKUP)} && "
+        f"rm -f {shlex.quote(NEG14_DUMMY_KEY)} {shlex.quote(NEG14_DUMMY_KEY)}.pub && "
+        f"ssh-keygen -q -t ed25519 -N '' -f {shlex.quote(NEG14_DUMMY_KEY)} >/dev/null 2>&1 && "
+        f"awk '{{print \"{NEG14_SECOND_ADDRESS}\" \" \" $1 \" \" $2}}' "
+        f"{shlex.quote(NEG14_DUMMY_KEY)}.pub >> {shlex.quote(NEG14_KNOWN_HOSTS)}"
+    )
+    if not prepared.ok:
+        restore_known_hosts()
+        return {"scenario": "NEG-14", "status": "INCOMPLETE",
+                "message": "Could not pin a throwaway host key for the second address"}
+
     argv = [
         "/opt/gowave-auto-nginx/gowave-auto.sh", "node", "add", "worker-1",
-        worker_ip, config.worker_domain, config.worker_reality_domain,
+        NEG14_SECOND_ADDRESS, config.worker_domain, config.worker_reality_domain,
         config.worker_ssh_user, str(config.worker_ssh_port),
     ]
     add_cmd = " ".join(shlex.quote(value) for value in argv)
@@ -888,6 +940,10 @@ def run_neg_14_duplicate_worker_registration(
         result = master_ssh.run(_with_staged_lease(add_cmd, staged), timeout=300)
     finally:
         _remove_staged_lease(master_ssh)
+        restore_known_hosts()
+    known_hosts_after = master_ssh.run(
+        f"sha256sum {shlex.quote(NEG14_KNOWN_HOSTS)} 2>/dev/null | awk '{{print $1}}'"
+    ).stdout.strip()
     after_state = master_ssh.run(f"sha256sum {shlex.quote(state_path)}")
     try:
         after_api = api_identity()
@@ -897,24 +953,35 @@ def run_neg_14_duplicate_worker_registration(
 
     combined_output = result.stdout + chr(10) + result.stderr
     explicit_duplicate_rejection = (
-        not result.ok and "already registered in state.json" in combined_output
+        not result.ok
+        and NEG14_DUPLICATE_REFUSAL in combined_output
+        # The refusal has to name the address the record holds, or an operator
+        # cannot tell which entry to remove and the sentence proves nothing.
+        and worker_ip in combined_output
+        and "Traceback" not in combined_output
     )
     state_unchanged = (
         after_state.ok and before_state.stdout.split()[0] == after_state.stdout.split()[0]
     )
     api_unchanged = before_api == after_api
-    passed = explicit_duplicate_rejection and state_unchanged and api_unchanged
+    known_hosts_restored = bool(known_hosts_before) and known_hosts_before == known_hosts_after
+    passed = (
+        explicit_duplicate_rejection and state_unchanged and api_unchanged and known_hosts_restored
+    )
 
     return {
         "scenario": "NEG-14",
         "name": "Duplicate Worker Registration Rejection Before API Mutation",
         "status": "PASS" if passed else "FAIL",
         "explicit_duplicate_rejection": explicit_duplicate_rejection,
+        "recorded_address": worker_ip,
+        "attempted_address": NEG14_SECOND_ADDRESS,
+        "known_hosts_restored": known_hosts_restored,
         "state_unchanged": state_unchanged,
         "api_ids_unchanged": api_unchanged,
         "lease_presented": bool(staged),
-        "message": "Duplicate registration was rejected before Panel API operations and without state changes"
-                   if passed else "Duplicate registration did not prove fail-fast rejection with unchanged state and API IDs",
+        "message": "A second address claiming the registered name was rejected before Panel API operations, without state changes and with the throwaway pin removed"
+                   if passed else "The duplicate registration did not prove fail-fast rejection with unchanged state, API IDs and known_hosts",
     }
 
 def run_neg_15_panel_api_forged_jwt(panel_domain: str, ssl_context: ssl.SSLContext) -> Dict[str, Any]:

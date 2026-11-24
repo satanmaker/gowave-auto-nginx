@@ -420,16 +420,17 @@ NODE_ADD_TIMEOUT_SECONDS = topology.NODE_ADD_TIMEOUT_SECONDS
 NODE_HEALTH_TIMEOUT_SECONDS = 600
 NODE_HEALTH_INTERVAL_SECONDS = 5
 
-# A duplicate registration is refused from `state.json` before the Panel client is
-# constructed, so the case is one more `node add` against a pair that is already
-# committed: the bound covers the operator's command reaching its own first check,
-# not a Worker install.
+# A duplicate name at a second address is refused from `state.json` before the
+# Panel client is constructed, so the case is one more `node add` against a pair
+# that is already committed: the bound covers the operator's command reaching its
+# own first check, not a Worker install. The same name at the *same* address is
+# the retry of a known identity and is deliberately accepted by the product.
 DUPLICATE_ADD_CASE_ID = "MN-DUP-ADD"
 DUPLICATE_ADD_TIMEOUT_SECONDS = 300
 # Two file reads and two Panel reads surround the refused command, each bounded
 # by the probe's own timeout rather than by the deployment's.
 DUPLICATE_ADD_CASE_TIMEOUT_SECONDS = 900
-DUPLICATE_ADD_REFUSAL = "Worker name is already registered in state.json"
+DUPLICATE_ADD_REFUSAL = "state.json already registers the name"
 
 # The two wizard-orchestration cases below run no Worker deployment: one stubs
 # the SSH onboarding at that boundary and the other points the flow at an
@@ -3268,22 +3269,37 @@ def panel_inventory(surface: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def case_duplicate_add(product: MultiNodeProduct) -> Dict[str, Any]:
-    """NEG-14: a second registration of the Worker is refused before any mutation.
+    """NEG-14: a second server claiming a registered name is refused before any mutation.
 
-    The order is the assertion. The product reads ``state.json`` and refuses the
-    name before it constructs ``GoWaveClient``, so nothing a registration would
-    rewrite can have moved: the journal the first registration committed, the
-    state file that names the Worker, and the Panel inventory that record extends
-    are all read before and after the attempt, and a refusal that had reached the
-    client would show up in at least one of them.
+    Two ``node add`` runs look alike and are not. The same name at the same
+    address is the retry of a known identity: the installer keeps that Worker's
+    uuid, its Host records and its country, which is what a failed onboarding is
+    retried with, and refusing it would make the menu's per-node retry
+    impossible. The same name at a *different* address is a second server
+    claiming a name the record already gives to the first — the mistake this
+    case registers, and the one the product refuses from ``state.json`` before
+    it constructs ``GoWaveClient`` or opens an SSH session.
+
+    The order is the assertion. Nothing a registration would rewrite can have
+    moved: the journal the first registration committed, the state file that
+    names the Worker and the Panel inventory that record extends are read before
+    and after the attempt, and a refusal that had reached the client would show
+    up in at least one of them. The second address is pinned first, the way an
+    operator pins a key out of band, so the run is refused for the duplicate
+    name rather than for an unpinned host key — and the pin is taken out again,
+    because a key for an address no container holds would contradict the next
+    case's own pin of that address.
 
     The command is the operator's own verb with the operator's own arguments --
-    the same script the registration ran -- rather than a harness copy of the
-    check, so the case cannot pass on a rule the product does not ship.
+    the script the registration ran, given the other address -- rather than a
+    harness copy of the check, so the case cannot pass on a rule the product
+    does not ship.
     """
     case_id = DUPLICATE_ADD_CASE_ID
     host = product.require_worker()
     master = host.target_name
+    second_address = str(host.plan.second_node_ip)
+    known_hosts_path = "/root/.ssh/known_hosts"
     before = aio.probe_json(
         case_id, "the Master's registration record",
         product.podman.exec_bash(master, duplicate_add_state_command(), check=False, timeout=120),
@@ -3309,29 +3325,66 @@ def case_duplicate_add(product: MultiNodeProduct) -> Dict[str, Any]:
         "wrong reason",
     )
     before_inventory = panel_inventory(product.panel_surface(case_id).get("surface") or {})
+    known_hosts_before = product.podman.exec(
+        master, ["cat", known_hosts_path], check=False,
+    ).stdout
+
+    # Pinned before the attempt so the refusal under test is the name, not a key
+    # the operator never verified; taken out again in the ``finally`` below.
+    pinned = host.pin_worker_address(second_address)
 
     # The duplicate is not `host.node_add()`: that helper resets the Master-side
     # argv trace the observer case scans, and this attempt must not touch it.
-    attempt = product.podman.exec_bash(
-        master, host.node_add_script(), check=False, timeout=DUPLICATE_ADD_TIMEOUT_SECONDS,
-    )
-    output = (attempt.stdout or "") + (attempt.stderr or "")
+    try:
+        attempt = product.podman.exec_bash(
+            master,
+            host.node_add_script(name=topology.WORKER_NODE_NAME, address=second_address),
+            check=False, timeout=DUPLICATE_ADD_TIMEOUT_SECONDS,
+        )
+        output = (attempt.stdout or "") + (attempt.stderr or "")
+        require(
+            case_id,
+            attempt.returncode != 0,
+            f"the second registration of {topology.WORKER_NODE_NAME!r} at "
+            f"{second_address} exited 0, so the duplicate was accepted: "
+            f"{output.strip()[-600:]}",
+        )
+        require(
+            case_id,
+            DUPLICATE_ADD_REFUSAL in output,
+            f"the second registration was refused without naming the existing record "
+            f"({DUPLICATE_ADD_REFUSAL!r}): {output.strip()[-600:]}",
+        )
+        # The record names the address it already holds, so a refusal produced by
+        # anything else — an unpinned key, a bad domain — cannot pass this.
+        require(
+            case_id,
+            str(host.plan.worker_ip) in output,
+            f"the refusal does not name the address the record holds "
+            f"({host.plan.worker_ip}), so it was not the duplicate-name check: "
+            f"{output.strip()[-600:]}",
+        )
+        require(
+            case_id,
+            "Traceback" not in output,
+            f"the second registration crashed instead of being refused: {output.strip()[-600:]}",
+        )
+    finally:
+        product.podman.exec(
+            master,
+            ["bash", "-c", f"umask 077; cat > {shlex.quote(known_hosts_path)}"],
+            input_text=known_hosts_before,
+            timeout=120,
+        )
+    known_hosts_after = product.podman.exec(
+        master, ["cat", known_hosts_path], check=False,
+    ).stdout
+    known_hosts_restored = known_hosts_after == known_hosts_before
     require(
         case_id,
-        attempt.returncode != 0,
-        f"the second registration of {topology.WORKER_NODE_NAME!r} exited 0, so the "
-        f"duplicate was accepted: {output.strip()[-600:]}",
-    )
-    require(
-        case_id,
-        DUPLICATE_ADD_REFUSAL in output,
-        f"the second registration was refused without naming the existing record "
-        f"({DUPLICATE_ADD_REFUSAL!r}): {output.strip()[-600:]}",
-    )
-    require(
-        case_id,
-        "Traceback" not in output,
-        f"the second registration crashed instead of being refused: {output.strip()[-600:]}",
+        known_hosts_restored,
+        "the case's own pin of the second address is still in known_hosts, so the "
+        "next case's pin of that address would be refused as a changed key",
     )
 
     after = aio.probe_json(
@@ -3360,6 +3413,10 @@ def case_duplicate_add(product: MultiNodeProduct) -> Dict[str, Any]:
     return {
         "refusal": DUPLICATE_ADD_REFUSAL,
         "returncode": attempt.returncode,
+        "recorded_address": str(host.plan.worker_ip),
+        "second_address": second_address,
+        "address_pinned": pinned,
+        "known_hosts_restored": known_hosts_restored,
         "journal_state": after.get("journal_state"),
         "state_nodes": after.get("state_nodes"),
         "state_addresses": after.get("state_addresses"),

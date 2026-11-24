@@ -686,14 +686,15 @@ execute guaranteed cleanup and post-case baseline verification.
 | **NEG-11**  | Backup Restore   | Corrupted archive header / invalid tar format | Preflight check rejects before mutating live files |
 | **NEG-12**  | Backup Restore   | SQLite DB file in archive corrupted | SQLite integrity check fails before replacing live DB |
 | **NEG-13**  | Worker Deploy    | SSH pipeline interrupted mid-execution | Master recovery journal does NOT enter `COMMITTED` |
-| **NEG-14**  | Worker Deploy    | Duplicate `node add` when the worker name is already in `state.json` | Explicit fail-fast rejection before API mutation; no duplicate DB entities or hosts |
+| **NEG-14**  | Worker Deploy    | `node add` claims a name `state.json` already holds for another address | Explicit fail-fast rejection before API mutation; no duplicate DB entities or hosts |
 | **NEG-15**  | Panel API Auth   | API request with expired or forged JWT | Panel returns 401 Unauthorized |
 
-#### Scenario: Duplicate Worker registration is rejected without mutation (NEG-14)
+#### Scenario: A registered Worker name claimed for another address is rejected without mutation (NEG-14)
 
-- **GIVEN** `worker-1` is already present in Master `state.json` and all associated API objects exist
-- **WHEN** `gowave-auto.sh node add worker-1` is invoked again with the same parameters
-- **THEN** the command exits nonzero with the existing-name rejection before constructing `GoWaveClient` or issuing any Panel API request; `state.json` is unchanged and the existing single node, profile, hosts, and inbounds remain unchanged
+- **GIVEN** `worker-1` is registered in Master `state.json` for one address, and all associated API objects exist
+- **WHEN** `gowave-auto.sh node add worker-1` is invoked with the same name and a different address
+- **THEN** the command exits nonzero with the existing-name rejection naming the address the record holds, before constructing `GoWaveClient` or issuing any Panel API request; `state.json` is unchanged and the existing single node, profile, hosts, and inbounds remain unchanged
+- **AND** the same name at the address the record already holds is the same node answering again — the retry the wizard re-enters — so it is accepted and keeps that node's uuid
 
 #### Scenario: Partial SSH deployment leaves no false COMMITTED journal state (NEG-13)
 

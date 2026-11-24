@@ -728,13 +728,16 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "id": "MN-DUP-ADD",
         "requirement": "Failure injection and recovery",
         "assertion": (
-            "The operator's `gowave-auto.sh node add` run a second time for the Worker "
-            "it already registered exits nonzero with the existing-name refusal and no "
-            "traceback, and the state file's bytes, the committed recovery journal's "
-            "bytes and the Panel's node, profile, squad, host and token inventory are "
-            "what they were before the attempt, so the refusal came from `state.json` "
-            "before the Panel client was constructed rather than after a partial "
-            "registration."
+            "The operator's `gowave-auto.sh node add` run for a name `state.json` already "
+            "holds at another address exits nonzero with the existing-name refusal, names "
+            "the address the record holds, and prints no traceback, and the state file's "
+            "bytes, the committed recovery journal's bytes and the Panel's node, profile, "
+            "squad, host and token inventory are what they were before the attempt, so the "
+            "refusal came from `state.json` before the Panel client was constructed rather "
+            "than after a partial registration. The same name at the address the record "
+            "already holds is the same node answering again and is accepted on purpose: the "
+            "wizard's per-node retry re-enters exactly that call, and the throwaway pin the "
+            "case writes for the second address is removed again."
         ),
         "topology": ["multi-node"],
         "promotion_target": "Negative Scenario and Fault Injection Tests",
@@ -886,7 +889,7 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
     {
         "id": "MN-PARTIAL-SUCCESS",
         "requirement": "Distributed Worker VPS Deployment Verification",
-        "assertion": "A multi-node deployment where one Worker fails onboarding continues the Panel deployment and the successful sibling, records the failed node with its target, phase and diagnostic reason, exits with the partial-success code distinct from a failed Panel installation, and prints a per-node summary that distinguishes successful and failed nodes.",
+        "assertion": "A multi-node deployment where one Worker fails onboarding continues the Panel deployment and the successful sibling, records the failed node with its target, phase and diagnostic reason, exits with the partial-success code distinct from a failed Panel installation, and prints a per-node summary that names the successful node as registered and verified only with the uuid the Panel's own node list answered for it, while the failed node keeps its stage and reason.",
         "topology": ["multi-node"],
         "promotion_target": "Distributed Worker VPS Deployment Verification",
     },

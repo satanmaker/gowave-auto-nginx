@@ -101,8 +101,8 @@ MATRIX: Tuple[Row, ...] = (
         "NEG-03 interrupts a Worker deployment and requires the recovery journal never to "
         "reach COMMITTED."),
     Row("NEG-14", "Worker Deploy", "multi-node", "MN-DUP-ADD",
-        "MN-DUP-ADD runs the operator's `node add` a second time over a committed pair and "
-        "requires the refusal before the Panel client exists."),
+        "MN-DUP-ADD pins a second address, claims the committed pair's name there, and "
+        "requires the refusal to name the address the record holds, before the Panel client exists."),
     Row("NEG-15", "Panel API Auth", "aio", "AIO-AUTH-NEG",
         "AIO-AUTH-NEG sends forged and expired tokens and requires the Panel's 401."),
 )
