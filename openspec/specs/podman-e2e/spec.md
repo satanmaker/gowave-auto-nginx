@@ -66,6 +66,21 @@ The test framework MUST provide distinct Control, Master/Panel, and Worker roles
 - **AND** the command exits with the partial-success code distinct from a failed Panel installation
 - **AND** the per-node summary distinguishes successful and failed nodes
 
+#### Scenario: The composed wizard corrects a duplicate cover domain and retries one Worker
+
+- **GIVEN** a Multi-Node deployment whose Worker is registered and connected in the Panel
+- **WHEN** the interactive wizard reads a plan whose second Worker enters a cover domain the
+  plan already holds, onboards a batch in which that Worker fails and the registered one
+  succeeds, and offers the selective retry
+- **THEN** only the repeated cover-domain prompt is asked again and every earlier answer survives
+- **AND** the successful Worker is printed as registered and verified only with the uuid the
+  Panel's own node list answered for it
+- **AND** the failed Worker is recorded with its phase and diagnostic and the batch exits with
+  the partial-success code
+- **AND** the retry list names the failed Worker alone, only that node is onboarded again, and
+  the operator is returned to the menu
+- **AND** the Panel's node list is unchanged, because the plan was entered but never applied
+
 #### Scenario: Add-node refused by Panel API verification failure
 
 - **GIVEN** an existing Panel whose API identity or reachability verification fails

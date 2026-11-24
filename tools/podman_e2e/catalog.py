@@ -900,6 +900,13 @@ PODMAN_FIRST_CASES: List[Dict[str, Any]] = [
         "topology": ["multi-node", "panel-only"],
         "promotion_target": "Distributed Worker VPS Deployment Verification",
     },
+    {
+        "id": "MN-WIZARD-FLOW",
+        "requirement": "Independent Multi-Node acceptance topology",
+        "assertion": "Entering a plan whose second Worker's cover domain repeats a name the plan already holds re-asks that field alone and keeps every earlier answer; the composed batch that follows onboards one Worker and prints it as registered and verified only with the uuid the Panel's own node list answered for it, records the other with its phase and diagnostic, offers the retry for the failed Worker alone, exits with the partial-success code, and returns to the menu, while the Panel's node list stays as it was because the plan was never applied.",
+        "topology": ["multi-node"],
+        "promotion_target": "Distributed Worker VPS Deployment Verification",
+    },
 ]
 
 SCENARIO_RE = re.compile(r"^#### Scenario:\s*(.+?)\s*$")

@@ -215,6 +215,7 @@ SUITES = {
         "test_podman_multi_node.TestVisionCompensationCase",
         "test_podman_multi_node.TestAddNodeRefusedCase",
         "test_podman_multi_node.TestPartialSuccessCase",
+        "test_podman_multi_node.TestWizardFlowCase",
         "test_podman_multi_node.TestEnvContractCase",
         "test_podman_panel_only.TestPanelOnlySuite",
         "test_podman_panel_only.TestPanelOnlyInstallCase",

@@ -73,6 +73,12 @@ requirements:
         tests:
           - tests.test_podman_multi_node.TestPartialSuccessCase
         jobs: [Multi-Node Podman Acceptance]
+      - scenario: The composed wizard corrects a duplicate cover domain and retries one Worker
+        cases: [MN-WIZARD-FLOW]
+        topologies: [multi-node]
+        tests:
+          - tests.test_podman_multi_node.TestWizardFlowCase
+        jobs: [Multi-Node Podman Acceptance]
       - scenario: Add-node refused by Panel API verification failure
         cases: [MN-ADD-NODE-REFUSED]
         topologies: [multi-node]

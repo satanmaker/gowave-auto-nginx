@@ -278,7 +278,7 @@ behaviors:
     topology: [multi-node]
     gate: pre-push
     cases: [MN-INSTALL, MN-ARGV-OBSERVER, WRK-01, WRK-04, WRK-05, WRK-06, CLUS-01, CLUS-02, CLUS-03]
-    error_paths: [WRK-02, WRK-03, PODNET-MASTER-ADDR, MN-PARTIAL-SUCCESS]
+    error_paths: [WRK-02, WRK-03, PODNET-MASTER-ADDR, MN-PARTIAL-SUCCESS, MN-WIZARD-FLOW]
 
   # ------------------------------------------------ subscription representations
   - name: Every representation reaches the client family that consumes it

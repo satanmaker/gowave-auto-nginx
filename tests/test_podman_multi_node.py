@@ -7908,8 +7908,9 @@ class _WizardCaseTarget:
 class _WizardCasePodman:
     """Answers one shell run with prepared bytes; the cases read nothing else from it."""
 
-    def __init__(self, stdout="", returncode=0):
+    def __init__(self, stdout="", returncode=0, stderr=""):
         self.stdout = stdout
+        self.stderr = stderr
         self.returncode = returncode
         self.scripts = []
 
@@ -7919,7 +7920,9 @@ class _WizardCasePodman:
             return subprocess.CompletedProcess(
                 ["bash", "-lc", script], 0, refused_resolution_report(), "",
             )
-        return subprocess.CompletedProcess(["bash", "-lc", script], self.returncode, self.stdout, "")
+        return subprocess.CompletedProcess(
+            ["bash", "-lc", script], self.returncode, self.stdout, self.stderr,
+        )
 
 
 class _WizardCaseProduct:
@@ -7930,8 +7933,8 @@ class _WizardCaseProduct:
     hands back the recorded surfaces in order is the whole environment they need.
     """
 
-    def __init__(self, stdout="", returncode=0, surfaces=()):
-        self.podman = _WizardCasePodman(stdout, returncode)
+    def __init__(self, stdout="", returncode=0, surfaces=(), stderr=""):
+        self.podman = _WizardCasePodman(stdout, returncode, stderr)
         self._surfaces = list(surfaces)
 
     def require_installed(self):
@@ -8052,6 +8055,227 @@ class TestPartialSuccessCase(unittest.TestCase):
         with self.assertRaises(AssertionError) as caught:
             self.partial(before=(), after=())
         self.assertIn("absent before the partial run", str(caught.exception))
+
+
+WIZARD_FLOW_UUID = "b41d7f0e-25c9-4a63-8e51-0c7d9a3b6f28"
+
+WIZARD_FLOW_STDERR = """\
+Select language / Выберите язык [en/ru]: Select deployment scheme (where will the Panel and the nodes run?)
+1) Panel and one node on this server — for evaluation and personal use. Losing this server loses the Panel and its only node.
+2) Panel here, nodes on separate servers — recommended for failure isolation. This server manages the nodes and carries no client traffic.
+3) Panel and one node here, more nodes elsewhere — not recommended: losing this server takes out the Panel and one of the nodes.
+> Panel domain (the address you open in a browser): Camouflage domain (a different host that answers probes to the Panel domain): Enable Vision for panel.invalid? [y/N]: Local node name in the Panel and subscriptions (e.g. local-01): Email for Let's Encrypt notices (not the Panel login): How many remote nodes should be onboarded? Node 1 primary domain: Node 1 camouflage domain: Enable Vision for worker-1.invalid? [y/N]: Remote node 1 name in the Panel and subscriptions (e.g. ams-01): Node 2 primary domain: Node 2 camouflage domain: worker-2.invalid is already used by an answer you already gave in this card in this plan.
+Node 2 camouflage domain: cdn1.invalid is already used by node 1 camouflage domain in this plan.
+Node 2 camouflage domain: Enable Vision for worker-2.invalid? [y/N]: Remote node 2 name in the Panel and subscriptions (e.g. ams-01): Do all hosts share one registered domain? [y/N]: Choice: Retry onboarding for worker-2.invalid now? [y/N]: Choice: Select option [0-9]: """
+
+WIZARD_FLOW_OUTPUT = f"""\
+PLAN-BEGIN
+Installation plan:
+  Panel (local-01): panel=panel.invalid camouflage=cdn.invalid vision=none
+  node 1 (worker-1): panel=worker-1.invalid camouflage=cdn1.invalid vision=none
+  node 2 (worker-2): panel=worker-2.invalid camouflage=cdn2.invalid vision=none
+Certificates this plan spends: 6
+Exit country: asked of each node after it serves, so nothing here contacts a country service
+Registered domain: one per host
+Each host uses its own registered domain, so each host spends its own Let's Encrypt budget.
+
+PLAN-END rc=0
+PLAN-VARIANT\tmulti-node
+PLAN-PANEL\tpanel.invalid\tcdn.invalid\tlocal-01\tadmin@example.invalid
+PLAN-COUNT\t2
+PLAN-NODES\tworker-1.invalid worker-2.invalid
+PLAN-COVERS\tcdn1.invalid cdn2.invalid
+PLAN-LABELS\tworker-1 worker-2
+ONBOARD-BEGIN
+
+Could not read the SSH host key of worker-2.invalid.
+
+=== Node Onboarding Summary ===
+  Panel installed: https://panel.invalid
+  worker-1.invalid: registered and verified in the Panel (uuid {WIZARD_FLOW_UUID})
+  worker-2.invalid: failed (phase: scan, reason: Could not read the SSH host key of worker-2.invalid.)
+  Registered and verified in the Panel: 1 of 2.
+The Panel and the verified nodes stay as they are. Retry a failed node from the list below, or add one from the menu (option 3).
+
+=== Retry Diagnostics for worker-2.invalid ===
+No recovery journal found at /tmp/wizard-flow/journal-absent.json
+SSH reachability check...
+SSH host key: worker-2.invalid SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+VPS managed state check...
+VPS not managed (no SSH key auth).
+=== End Diagnostics ===
+
+Some nodes failed. Select a node to retry, or skip:
+  1) worker-2.invalid
+  2) Skip retry for all failed nodes
+Retrying worker-2.invalid...
+
+Permission denied (publickey) on worker-2.invalid.
+
+=== Node Onboarding Summary ===
+  Panel installed: https://panel.invalid
+  worker-1.invalid: registered and verified in the Panel (uuid {WIZARD_FLOW_UUID})
+  worker-2.invalid: failed (phase: authorise, reason: Permission denied (publickey) on worker-2.invalid.)
+  Registered and verified in the Panel: 1 of 2.
+The Panel and the verified nodes stay as they are. Retry a failed node from the list below, or add one from the menu (option 3).
+
+Some nodes failed. Select a node to retry, or skip:
+  1) worker-2.invalid
+  2) Skip retry for all failed nodes
+Retry skipped.
+
+ONBOARD-END rc=2
+CALLS-BEGIN
+worker-1.invalid\tscan add_node\tok
+worker-2.invalid\tscan\tfailed
+worker-2.invalid\tauthorise\tfailed
+CALLS-END
+MENU-BEGIN
+GoWave Auto NGINX Manager
+
+ 1) Status
+ 2) New installation
+ 3) Add a node to an existing Panel
+ 0) Exit
+
+MENU-END rc=0
+"""
+
+
+class TestWizardFlowCase(unittest.TestCase):
+    """MN-WIZARD-FLOW: one plan card, a mixed batch, one retry, the menu."""
+
+    def flow(self, *, stdout=WIZARD_FLOW_OUTPUT, stderr=WIZARD_FLOW_STDERR,
+             returncode=2, before=("worker-1",), after=("worker-1",), uuids=None):
+        product = _WizardCaseProduct(
+            stdout,
+            returncode,
+            stderr=stderr,
+            surfaces=[
+                panel_nodes(before, {"worker-1": True},
+                            uuids if uuids is not None else {"worker-1": WIZARD_FLOW_UUID}),
+                panel_nodes(after, {"worker-1": True}),
+            ],
+        )
+        return multi_node.case_wizard_flow(product), product
+
+    def test_the_flow_corrects_one_field_registers_one_node_and_retries_one(self):
+        facts, product = self.flow()
+        self.assertEqual(facts.get("plan_variant"), "multi-node")
+        self.assertEqual(facts.get("plan_nodes"), ["worker-1.invalid", "worker-2.invalid"])
+        self.assertEqual(facts.get("plan_cover_domains"), ["cdn1.invalid", "cdn2.invalid"])
+        self.assertEqual(facts.get("registered_uuid"), WIZARD_FLOW_UUID)
+        self.assertEqual(facts.get("failed_worker"), "worker-2.invalid")
+        self.assertEqual(facts.get("retry_attempted_only_for"), "worker-2.invalid")
+        self.assertEqual(facts.get("final_verified_count"), "1 of 2")
+        self.assertEqual(facts.get("menu_returncode"), 0)
+        self.assertEqual(facts.get("panel_node_names_after"), ["worker-1"])
+        self.assertEqual(
+            facts.get("onboarding_calls"),
+            ["worker-1.invalid\tscan add_node\tok",
+             "worker-2.invalid\tscan\tfailed",
+             "worker-2.invalid\tauthorise\tfailed"],
+        )
+        script = product.podman.scripts[-1]
+        self.assertIn("wizard_collect_plan", script)
+        self.assertIn("wizard_onboard_nodes", script)
+        self.assertIn("cmd_interactive", script)
+        self.assertIn("ssh_bootstrap_onboard_one()", script)
+        self.assertIn("NODE-IDENTITY:", script)
+        self.assertNotIn(WIZARD_FLOW_UUID, script,
+                         "the case wrote the uuid it then requires, so the summary proves nothing")
+
+    def test_the_card_carries_the_two_duplicate_cover_answers_then_the_correction(self):
+        _facts, product = self.flow()
+        script = product.podman.scripts[-1]
+        self.assertIn(
+            "\nworker-2.invalid\nworker-2.invalid\ncdn1.invalid\ncdn2.invalid\n", script,
+            "the card has to enter node 2's own domain as its cover answer and node 1's cover "
+            "domain before the corrected one",
+        )
+
+    def test_a_refusal_that_repeats_the_whole_card_fails_the_case(self):
+        damaged = WIZARD_FLOW_STDERR.replace(
+            "Panel domain (the address you open in a browser): ",
+            "Panel domain (the address you open in a browser): "
+            "Panel domain (the address you open in a browser): ",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stderr=damaged)
+        self.assertIn("instead of 1", str(caught.exception))
+
+    def test_a_refusal_that_does_not_name_the_colliding_role_fails_the_case(self):
+        damaged = WIZARD_FLOW_STDERR.replace(
+            "cdn1.invalid is already used by node 1 camouflage domain in this plan.", "",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stderr=damaged)
+        self.assertIn("did not name the role", str(caught.exception))
+
+    def test_a_plan_that_kept_the_duplicate_cover_fails_the_case(self):
+        damaged = WIZARD_FLOW_OUTPUT.replace(
+            "PLAN-COVERS\tcdn1.invalid cdn2.invalid",
+            "PLAN-COVERS\tcdn1.invalid worker-2.invalid",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stdout=damaged)
+        self.assertIn("PLAN-COVERS", str(caught.exception))
+
+    def test_a_batch_that_ends_at_a_clean_exit_code_fails_the_case(self):
+        damaged = WIZARD_FLOW_OUTPUT.replace("ONBOARD-END rc=2", "ONBOARD-END rc=0")
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stdout=damaged)
+        self.assertIn("partial-success code 2", str(caught.exception))
+
+    def test_a_retry_that_onboards_the_successful_node_again_fails_the_case(self):
+        damaged = WIZARD_FLOW_OUTPUT.replace(
+            "worker-1.invalid\tscan add_node\tok\n"
+            "worker-2.invalid\tscan\tfailed\n",
+            "worker-1.invalid\tscan add_node\tok\n"
+            "worker-1.invalid\tscan add_node\tok\n"
+            "worker-2.invalid\tscan\tfailed\n",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stdout=damaged)
+        self.assertIn("re-enter only the failed one", str(caught.exception))
+
+    def test_a_summary_that_quotes_a_uuid_the_panel_did_not_answer_fails_the_case(self):
+        damaged = WIZARD_FLOW_OUTPUT.replace(
+            WIZARD_FLOW_UUID, "00000000-0000-4000-8000-000000000000",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stdout=damaged)
+        self.assertIn("Panel's own uuid", str(caught.exception))
+
+    def test_a_retry_offer_that_names_the_registered_worker_fails_the_case(self):
+        damaged = WIZARD_FLOW_OUTPUT.replace(
+            "  1) worker-2.invalid\n",
+            "  1) worker-2.invalid\n  1) worker-1.invalid\n",
+        )
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stdout=damaged)
+        self.assertIn("named a node other than the failed one", str(caught.exception))
+
+    def test_a_flow_that_does_not_return_to_the_menu_fails_the_case(self):
+        damaged = WIZARD_FLOW_OUTPUT.replace("MENU-END rc=0", "MENU-END rc=1")
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(stdout=damaged)
+        self.assertIn("returned to a menu", str(caught.exception))
+
+    def test_a_plan_that_was_applied_fails_the_case(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(after=("worker-1", "worker-2.invalid"))
+        self.assertIn("applied the plan", str(caught.exception))
+
+    def test_a_panel_that_answers_no_uuid_leaves_nothing_to_compare(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(uuids={"worker-1": ""})
+        self.assertIn("reports no uuid", str(caught.exception))
+
+    def test_a_worker_absent_before_the_flow_blocks_with_its_name(self):
+        with self.assertRaises(AssertionError) as caught:
+            self.flow(before=("local-node",))
+        self.assertIn("is absent before the flow", str(caught.exception))
 
 
 class TestAddNodeRefusedCase(unittest.TestCase):

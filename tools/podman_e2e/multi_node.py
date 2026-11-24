@@ -75,6 +75,9 @@ ENV_CONTRACT_CASE_ID = "MN-ENV-CONTRACT"
 PARTIAL_SUCCESS_CASE_ID = "MN-PARTIAL-SUCCESS"
 # Add-node refused by Panel API verification failure.
 ADD_NODE_REFUSED_CASE_ID = "MN-ADD-NODE-REFUSED"
+# The composed wizard: one plan card, a mixed onboarding batch and the retry of
+# the one node that failed.
+WIZARD_FLOW_CASE_ID = "MN-WIZARD-FLOW"
 # One requirement, one case id: the AIO suite runs the same contract on its own
 # host, and a cluster runs it on both roles.
 NGINX_CONFIG_CASE_ID = aio.NGX_CONFIG_CASE_ID
@@ -3001,6 +3004,397 @@ def case_partial_success(product: MultiNodeProduct) -> Dict[str, Any]:
         "successful_sibling_connected_before": connected.get(topology.WORKER_NODE_NAME),
         "successful_sibling_connected_after": connected_after.get(topology.WORKER_NODE_NAME),
         "output_tail": outcome.tail(4000),
+    }
+
+
+# The plan card this case enters. The names are valid DNS names and nothing
+# else: the plan is never applied, so no certificate, record or Panel entry is
+# created for them, and the wizard's pre-flight resolver is stubbed to answer
+# them without a public zone.
+WIZARD_FLOW_PANEL_NAME = "panel.invalid"
+WIZARD_FLOW_CAMOUFLAGE_NAME = "cdn.invalid"
+WIZARD_FLOW_NODE_NAMES: Tuple[str, str] = ("worker-1.invalid", "worker-2.invalid")
+WIZARD_FLOW_NODE_COVERS: Tuple[str, str] = ("cdn1.invalid", "cdn2.invalid")
+WIZARD_FLOW_LOCAL_LABEL = "local-01"
+WIZARD_FLOW_EMAIL = "admin@example.invalid"
+WIZARD_FLOW_CERTIFICATES = "6"
+
+
+def wizard_flow_script(worker_name: str, worker_address: str, worker_port: int = NODE_PORT) -> str:
+    """The composed wizard: one plan card, a mixed batch, one retry, the menu.
+
+    Three screens of the shipped code are the subject. ``wizard_collect_plan``
+    reads the card, and the only answers that need care are node 2's: its own
+    primary domain entered again as its cover domain, then node 1's cover
+    domain, then the correction — the two refusals have to land on that field
+    alone. ``wizard_onboard_nodes`` is given a batch where the Worker the Panel
+    already holds registers and the second one fails, then offered the retry
+    that may only name the failed node. ``cmd_interactive`` is the screen the
+    operator is returned to when the batch ends.
+
+    Only the SSH hop and the plan's resolver are replaced. The successful stub
+    emits the identity marker the real onboarding emits, naming the Worker the
+    deployment really registered at the address the Panel holds it at, so the
+    readback that prints the uuid is the shipped one against the live Panel.
+    The retry gate reads a host that a plan name addresses: the journal this run
+    points away from is absent, so the stubbed scan is the record that answers.
+    """
+    node1, node2 = WIZARD_FLOW_NODE_NAMES
+    cover1, cover2 = WIZARD_FLOW_NODE_COVERS
+    answers = [
+        "en",
+        "3",
+        WIZARD_FLOW_PANEL_NAME,
+        WIZARD_FLOW_CAMOUFLAGE_NAME,
+        "n",
+        WIZARD_FLOW_LOCAL_LABEL,
+        WIZARD_FLOW_EMAIL,
+        "2",
+        node1,
+        cover1,
+        "n",
+        worker_name,
+        node2,
+        node2,
+        cover1,
+        cover2,
+        "n",
+        "worker-2",
+        "n",
+    ]
+    return "\n".join([
+        "set -Eeuo pipefail",
+        f"source {topology.REPO_IN_CONTAINER}/gowave-auto.sh",
+        "trap - ERR",
+        "set +e",
+        "work=$(mktemp -d)",
+        'GOWAVE_STATE_DIR="$work/state"',
+        'mkdir -p "$GOWAVE_STATE_DIR"',
+        "export GOWAVE_STATE_DIR",
+        # The retry gate reads the journal this host wrote for a node it once
+        # provisioned; this plan names hosts that never were, so the absent file
+        # is stated rather than inherited from the deployment.
+        'GOWAVE_JOURNAL_FILE="$work/journal-absent.json"',
+        "export GOWAVE_JOURNAL_FILE",
+        # The language is asked, not inherited from the container it runs in.
+        "unset GOWAVE_WIZARD_LANG",
+        # Nothing here is applied, so none of the planned names has a record to
+        # answer: the pre-flight resolves through a stub instead of public DNS.
+        'printf "%s\\n" "#!/usr/bin/env bash" "exit 0" > "$work/resolver"',
+        'chmod +x "$work/resolver"',
+        'GOWAVE_WIZARD_RESOLVER="$work/resolver"',
+        "export GOWAVE_WIZARD_RESOLVER",
+        'calls="$work/calls"',
+        ': > "$calls"',
+        "",
+        "printf 'PLAN-BEGIN\\n'",
+        "wizard_collect_plan <<'PLAN'",
+        *answers,
+        "PLAN",
+        "plan_rc=$?",
+        "printf '\\nPLAN-END rc=%d\\n' \"$plan_rc\"",
+        "printf 'PLAN-VARIANT\\t%s\\n' \"${GOWAVE_PLAN_VARIANT:-}\"",
+        "printf 'PLAN-PANEL\\t%s\\t%s\\t%s\\t%s\\n' \"${GOWAVE_PLAN_PANEL_NAME:-}\" "
+        "\"${GOWAVE_PLAN_CAMOUFLAGE_NAME:-}\" \"${GOWAVE_PLAN_LOCAL_LABEL:-}\" "
+        "\"${GOWAVE_PLAN_EMAIL:-}\"",
+        "printf 'PLAN-COUNT\\t%s\\n' \"${GOWAVE_PLAN_NODE_COUNT:-}\"",
+        "printf 'PLAN-NODES\\t%s\\n' \"${GOWAVE_PLAN_NODE_NAMES[*]-}\"",
+        "printf 'PLAN-COVERS\\t%s\\n' \"${GOWAVE_PLAN_NODE_CAMOUFLAGE[*]-}\"",
+        "printf 'PLAN-LABELS\\t%s\\n' \"${GOWAVE_PLAN_NODE_LABELS[*]-}\"",
+        "",
+        # The diagnostics ask a failed node's host key over SSH; the answer is
+        # the shape the real scan produces, computed by the shipped fingerprint
+        # helper from a key this run generates.
+        'ssh_key="$work/hostkey"',
+        "ssh-keygen -q -t ed25519 -N '' -f \"$ssh_key\" >/dev/null",
+        'host_key_line=$(cat "$ssh_key.pub")',
+        'ssh_bootstrap_scan() { printf \'%s\\n\' "$host_key_line"; }',
+        "ssh_bootstrap_onboard_one() {",
+        "  case \"$1\" in",
+        f"    {node1})",
+        "      printf 'PHASE:scan\\n' >&2",
+        "      printf 'PHASE:add_node\\n' >&2",
+        f"      printf 'NODE-IDENTITY:%s\\t{worker_address}\\t{worker_port}\\n'"
+        f" '{worker_name}' >&2",
+        "      printf '%s\\t%s\\t%s\\n' \"$1\" 'scan add_node' 'ok' >> \"$calls\"",
+        "      return 0 ;;",
+        f"    {node2})",
+        '      attempts=$(grep -c "^$1" "$calls" 2>/dev/null)',
+        "      attempts=${attempts:-0}",
+        "      if (( attempts == 0 )); then",
+        "        printf 'PHASE:scan\\n' >&2",
+        "        printf 'Could not read the SSH host key of %s.\\n' \"$1\" >&2",
+        "        printf '%s\\t%s\\t%s\\n' \"$1\" 'scan' 'failed' >> \"$calls\"",
+        "        return 1",
+        "      fi",
+        "      printf 'PHASE:authorise\\n' >&2",
+        "      printf 'Permission denied (publickey) on %s.\\n' \"$1\" >&2",
+        "      printf '%s\\t%s\\t%s\\n' \"$1\" 'authorise' 'failed' >> \"$calls\"",
+        "      return 1 ;;",
+        "  esac",
+        "  return 1",
+        "}",
+        "",
+        "printf 'ONBOARD-BEGIN\\n'",
+        f"wizard_onboard_nodes 'https://{WIZARD_FLOW_PANEL_NAME}' 127.0.0.1 yes <<'RETRY'",
+        # The failed node is the only entry the offer holds, so its number is
+        # one; after the retry fails again the list still holds it, and the
+        # second choice is the skip that ends the batch.
+        "1",
+        "y",
+        "2",
+        "RETRY",
+        "onboard_rc=$?",
+        "printf '\\nONBOARD-END rc=%d\\n' \"$onboard_rc\"",
+        "printf 'CALLS-BEGIN\\n'",
+        'cat "$calls"',
+        "printf 'CALLS-END\\n'",
+        "",
+        # The screen the operator is returned to once the batch is done.
+        "printf 'MENU-BEGIN\\n'",
+        "(",
+        "  cmd_interactive <<'MENU'",
+        "0",
+        "MENU",
+        ")",
+        "menu_rc=$?",
+        "printf '\\nMENU-END rc=%d\\n' \"$menu_rc\"",
+        "exit \"$onboard_rc\"",
+    ])
+
+
+def case_wizard_flow(product: MultiNodeProduct) -> Dict[str, Any]:
+    """``MN-WIZARD-FLOW``: the composed wizard corrects one field and retries one node.
+
+    The plan step is where a refused answer costs the operator every earlier
+    answer if it is handled at the end of the card; the batch step is where a
+    failed node costs the successful sibling its place in the summary if the
+    failure is treated as fatal; the retry is where the list has to be the
+    failure record rather than the plan. Each of those is read from the
+    screen the shipped code prints, and the registration line is compared with
+    the uuid the Panel's own node list answers.
+    """
+    facts = product.panel_surface(WIZARD_FLOW_CASE_ID)
+    nodes = (facts.get("surface") or {}).get("nodes") or {}
+    node1, node2 = WIZARD_FLOW_NODE_NAMES
+    require(
+        WIZARD_FLOW_CASE_ID,
+        topology.WORKER_NODE_NAME in (nodes.get("names") or []),
+        f"the deployed Worker {topology.WORKER_NODE_NAME!r} is absent before the flow, so the "
+        f"plan's first node has nothing to register: {nodes.get('names')!r}",
+    )
+    # Read here and not written by the script: what the summary prints has to be
+    # this value or the screen is quoting the case rather than the Panel.
+    panel_uuid = (nodes.get("uuids") or {}).get(topology.WORKER_NODE_NAME) or ""
+    require(
+        WIZARD_FLOW_CASE_ID,
+        bool(panel_uuid),
+        f"the Panel reports no uuid for {topology.WORKER_NODE_NAME!r}, so the verified line "
+        f"cannot be told apart from a value the case wrote: {nodes.get('uuids')!r}",
+    )
+
+    host = product.require_installed()
+    script = wizard_flow_script(
+        topology.WORKER_NODE_NAME, str(host.plan.worker_ip), NODE_PORT,
+    )
+    started = time.monotonic()
+    proc = product.podman.exec_bash(
+        host.target_name, script, check=False,
+        timeout=WIZARD_OFFLINE_TIMEOUT_SECONDS,
+    )
+    outcome = topology.InstallOutcome(
+        returncode=proc.returncode,
+        stdout=proc.stdout or "",
+        stderr=proc.stderr or "",
+        duration=time.monotonic() - started,
+        command=script,
+    )
+    stdout = outcome.stdout
+    stderr = outcome.stderr
+    output = f"{stdout}\n{stderr}"
+
+    require(
+        WIZARD_FLOW_CASE_ID,
+        "Traceback" not in output,
+        f"the composed wizard ended in a traceback:\n{output[-4000:]}",
+    )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        "PLAN-END rc=0" in stdout,
+        f"the plan card did not complete; a refused field has to be re-asked rather than "
+        f"ending the card:\n{output[-4000:]}",
+    )
+
+    # The two refusals land on node 2's cover domain alone, and each names what
+    # it collided with: the answer just given on this card, then node 1's role.
+    same_card = (
+        f"{node2} is already used by an answer you already gave in this card in this plan."
+    )
+    role_named = f"{WIZARD_FLOW_NODE_COVERS[0]} is already used by node 1 camouflage domain in this plan."
+    require(
+        WIZARD_FLOW_CASE_ID,
+        same_card in stderr,
+        f"repeating node 2's own primary domain as its cover domain was not refused on the "
+        f"card:\n{stderr[-4000:]}",
+    )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        role_named in stderr,
+        f"reusing node 1's cover domain for node 2 did not name the role it belongs to:\n"
+        f"{stderr[-4000:]}",
+    )
+    vision_prompt = f"Enable Vision for {node2}?"
+    for prompt, expected in (
+        ("Select deployment scheme", 1),
+        ("Node 2 primary domain: ", 1),
+        ("Node 2 camouflage domain: ", 3),
+        (vision_prompt, 1),
+        ("Panel domain (", 1),
+    ):
+        require(
+            WIZARD_FLOW_CASE_ID,
+            stderr.count(prompt) == expected,
+            f"the plan asked {prompt!r} {stderr.count(prompt)} time(s) instead of {expected}: "
+            f"a refusal has to repeat that one field and keep every earlier answer:\n"
+            f"{stderr[-4000:]}",
+        )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        stderr.index(same_card) < stderr.index(role_named) < stderr.index(vision_prompt),
+        f"the refusals were not asked where the field is: the correction has to happen before "
+        f"node 2's Vision question:\n{stderr[-4000:]}",
+    )
+
+    plan_expectations = {
+        "PLAN-VARIANT": "multi-node",
+        "PLAN-PANEL": "\t".join([
+            WIZARD_FLOW_PANEL_NAME, WIZARD_FLOW_CAMOUFLAGE_NAME,
+            WIZARD_FLOW_LOCAL_LABEL, WIZARD_FLOW_EMAIL,
+        ]),
+        "PLAN-COUNT": "2",
+        "PLAN-NODES": " ".join(WIZARD_FLOW_NODE_NAMES),
+        "PLAN-COVERS": " ".join(WIZARD_FLOW_NODE_COVERS),
+        "PLAN-LABELS": f"{topology.WORKER_NODE_NAME} worker-2",
+    }
+    for key, value in plan_expectations.items():
+        require(
+            WIZARD_FLOW_CASE_ID,
+            f"{key}\t{value}" in stdout,
+            f"the plan did not hold {key} = {value!r}:\n{stdout[-4000:]}",
+        )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        f"Certificates this plan spends: {WIZARD_FLOW_CERTIFICATES}" in stdout,
+        f"the reviewed plan was not costed at the corrected answers:\n{stdout[-4000:]}",
+    )
+
+    require(
+        WIZARD_FLOW_CASE_ID,
+        "ONBOARD-END rc=2" in stdout,
+        f"one failed Worker and one successful sibling must end the batch at the "
+        f"partial-success code 2:\n{output[-4000:]}",
+    )
+
+    calls = stdout.split("CALLS-BEGIN\n", 1)[-1].split("\nCALLS-END", 1)[0].strip()
+    require(
+        WIZARD_FLOW_CASE_ID,
+        calls.splitlines() == [
+            f"{node1}\tscan add_node\tok",
+            f"{node2}\tscan\tfailed",
+            f"{node2}\tauthorise\tfailed",
+        ],
+        f"the batch did not onboard the first node once and then re-enter only the failed one; "
+        f"the calls it made were:\n{calls}",
+    )
+
+    # The same panel uuid twice: the retry reprints the summary, and the sibling's
+    # row has to survive it untouched.
+    verified_line = f"{node1}: registered and verified in the Panel (uuid {panel_uuid})"
+    require(
+        WIZARD_FLOW_CASE_ID,
+        stdout.count(verified_line) == 2,
+        f"the successful sibling is not registered and verified with the Panel's own uuid in "
+        f"both summaries (Panel uuid {panel_uuid!r}):\n{stdout[-4000:]}",
+    )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        stdout.count("Registered and verified in the Panel: 1 of 2.") == 2,
+        f"the per-node count was not 1 of 2 in both summaries:\n{stdout[-4000:]}",
+    )
+    for phase, reason in (
+        ("scan", f"Could not read the SSH host key of {node2}."),
+        ("authorise", f"Permission denied (publickey) on {node2}."),
+    ):
+        require(
+            WIZARD_FLOW_CASE_ID,
+            f"{node2}: failed (phase: {phase}, reason: {reason})" in stdout,
+            f"the failed Worker is recorded without the stage and reason it stopped at "
+            f"({phase}):\n{stdout[-4000:]}",
+        )
+    offer = "Some nodes failed. Select a node to retry, or skip:"
+    require(
+        WIZARD_FLOW_CASE_ID,
+        stdout.count(offer) == 2,
+        f"the retry menu was printed {stdout.count(offer)} time(s) instead of twice — once for "
+        f"the offer and once after the failed retry:\n{stdout[-4000:]}",
+    )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        f"  1) {node2}" in stdout and f"  1) {node1}" not in stdout,
+        f"the retry offer named a node other than the failed one:\n{stdout[-4000:]}",
+    )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        f"Retrying {node2}..." in stdout and "Retry skipped." in stdout,
+        f"the retry was never started for the failed node, or the skip that ends the batch was "
+        f"not reported:\n{stdout[-4000:]}",
+    )
+
+    require(
+        WIZARD_FLOW_CASE_ID,
+        "MENU-END rc=0" in stdout,
+        f"the operator was not returned to a menu that reads its choice and exits:\n"
+        f"{stdout[-4000:]}",
+    )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        stdout.index("MENU-BEGIN") < stdout.index("GoWave Auto NGINX Manager")
+        < stdout.index("MENU-END"),
+        f"the menu was not drawn between the markers that bracket it:\n{stdout[-4000:]}",
+    )
+    require(
+        WIZARD_FLOW_CASE_ID,
+        "0) Exit" in stdout,
+        f"the screen the batch returned to carries no exit choice:\n{stdout[-4000:]}",
+    )
+
+    after = product.panel_surface(WIZARD_FLOW_CASE_ID)
+    nodes_after = (after.get("surface") or {}).get("nodes") or {}
+    require(
+        WIZARD_FLOW_CASE_ID,
+        nodes_after.get("names") == nodes.get("names"),
+        f"the flow applied the plan it only entered and exited: the Panel's node list is "
+        f"{nodes.get('names')!r} -> {nodes_after.get('names')!r}",
+    )
+
+    return {
+        "plan_variant": "multi-node",
+        "plan_nodes": list(WIZARD_FLOW_NODE_NAMES),
+        "plan_cover_domains": list(WIZARD_FLOW_NODE_COVERS),
+        "plan_certificate_count": int(WIZARD_FLOW_CERTIFICATES),
+        "duplicate_answers_refused": [node2, WIZARD_FLOW_NODE_COVERS[0]],
+        "cover_prompt_asked": 3,
+        "onboarding_exit_code": 2,
+        "onboarding_calls": calls.splitlines(),
+        "registered_worker": topology.WORKER_NODE_NAME,
+        "registered_uuid": panel_uuid,
+        "failed_worker": node2,
+        "retry_attempted_only_for": node2,
+        "final_verified_count": "1 of 2",
+        "menu_returncode": 0,
+        "panel_node_names_before": nodes.get("names"),
+        "panel_node_names_after": nodes_after.get("names"),
+        "output_tail": outcome.tail(6000),
     }
 
 
@@ -9476,6 +9870,11 @@ def cases(
              timeout_seconds=NODE_ADD_TIMEOUT_SECONDS + NODE_HEALTH_TIMEOUT_SECONDS),
         # Partial success: one Worker fails, another succeeds, Panel continues.
         Case(PARTIAL_SUCCESS_CASE_ID, "multi-node", lambda context: case_partial_success(product),
+             timeout_seconds=WIZARD_OFFLINE_TIMEOUT_SECONDS),
+        # The composed wizard above the same boundary: a plan card that refuses
+        # one duplicate field, a batch that mixes a real registration with a
+        # failed node, the retry of that node, and the menu it returns to.
+        Case(WIZARD_FLOW_CASE_ID, "multi-node", lambda context: case_wizard_flow(product),
              timeout_seconds=WIZARD_OFFLINE_TIMEOUT_SECONDS),
         # Add-node refused by Panel API verification failure.
         Case(ADD_NODE_REFUSED_CASE_ID, "multi-node", lambda context: case_add_node_refused(product),

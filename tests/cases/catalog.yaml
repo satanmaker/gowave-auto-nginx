@@ -7,8 +7,8 @@ counts:
   container: 111
   partial: 12
   live_only: 2
-  podman_first: 126
-  total: 251
+  podman_first: 127
+  total: 252
 run_starts:
 - step: acme
   started_by: tools/podman_e2e/topology.py
@@ -9290,6 +9290,46 @@ cases:
       - verification_failure_reported
       - verification_step_reached
       - wizard_returncode
+  promotion_target: Distributed Worker VPS Deployment Verification
+- id: MN-WIZARD-FLOW
+  requirement: Independent Multi-Node acceptance topology
+  live_scenario: null
+  assertion: Entering a plan whose second Worker's cover domain repeats a name the plan already holds
+    re-asks that field alone and keeps every earlier answer; the composed batch that follows onboards
+    one Worker and prints it as registered and verified only with the uuid the Panel's own node list answered
+    for it, records the other with its phase and diagnostic, offers the retry for the failed Worker alone,
+    exits with the partial-success code, and returns to the menu, while the Panel's node list stays as
+    it was because the plan was never applied.
+  assertion_sha256: 7583df93da06c270d84fb9994b16af016e79bdb45f5b1705c4021cbb486e45ef
+  runs_in:
+  - podman
+  state: incubating
+  environment: container
+  topology:
+  - multi-node
+  gate: pre-push
+  driver_status: implemented
+  drivers:
+    multi-node:
+      driver: multi_node:case_wizard_flow
+      evidence:
+      - cover_prompt_asked
+      - duplicate_answers_refused
+      - failed_worker
+      - final_verified_count
+      - menu_returncode
+      - onboarding_calls
+      - onboarding_exit_code
+      - output_tail
+      - panel_node_names_after
+      - panel_node_names_before
+      - plan_certificate_count
+      - plan_cover_domains
+      - plan_nodes
+      - plan_variant
+      - registered_uuid
+      - registered_worker
+      - retry_attempted_only_for
   promotion_target: Distributed Worker VPS Deployment Verification
 - id: AIO-DP-REALITY-xray
   requirement: Real client data-plane verification
