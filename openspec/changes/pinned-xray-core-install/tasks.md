@@ -177,7 +177,7 @@
 - [x] 5.5 Add the variable to the `node add` environment table in `README.md` (`:69-81`) with its default (the
   pinned version) and the `latest` opt-out.
   Verify: the table row is present and the default column states `26.11.9`, not `latest`.
-- [ ] 5.6 Document the operator-facing consequences next to the node installation instructions: an undeliverable
+- [x] 5.6 Document the operator-facing consequences next to the node installation instructions: an undeliverable
   pinned artifact stops the installation, the message names the artifact and `XRAY_SERVER_VERSION=latest`;
   `gowave-node core reset` answers "no managed stock core is available" on a host that never had a managed install
   (design D8); and the remaining network dependencies are named — the release zip and the geodata files still come

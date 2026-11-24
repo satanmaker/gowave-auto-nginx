@@ -112,8 +112,10 @@ this repository pins. Three consequences are worth knowing before an install:
   way out: it restores the previous behaviour and lets the installer fetch its own core.
 - On a host that never had a managed core installation, `gowave-node core reset` answers
   `no managed stock core is available`; the file this installer places has no `.stock` backup behind it.
-- The release archive and the geodata files still come from `github.com`. That path costs no API quota,
-  and this installer does not remove it.
+- Two downloads still come from `github.com`: the node's own release archive, and the geodata files
+  (`geoip.dat`, `geosite.dat`) that the node fetches whenever they are missing — pinning the core skips
+  neither. Neither download goes through the GitHub API, so neither costs API quota, and this installer
+  removes neither.
 
 ## Domain and certificate policy
 

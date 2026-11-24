@@ -1,5 +1,9 @@
 # Spec Delta
 
+## Purpose
+
+Deliver the pinned Xray core to a node before the upstream installer runs, so a default node installation needs no `api.github.com` request and the core the node runs is the version this repository pins.
+
 ## ADDED Requirements
 
 ### Requirement: Pinned Xray Core Delivery Before the Upstream Installer
