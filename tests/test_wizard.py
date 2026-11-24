@@ -966,7 +966,12 @@ class TestWizardEntry(unittest.TestCase):
         )
         self.assertEqual(
             callers,
-            ["gowave-auto.sh", "modules/ssh_bootstrap.sh", "modules/wizard.sh"],
+            [
+                "gowave-auto.sh",
+                "modules/geoip.sh",
+                "modules/ssh_bootstrap.sh",
+                "modules/wizard.sh",
+            ],
             "a shipped script outside the wizard renders a translated string",
         )
 

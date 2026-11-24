@@ -7807,7 +7807,7 @@ Could not read the SSH host key of worker-2.
   worker-1: registered and verified in the Panel (uuid {PARTIAL_SUCCESS_UUID})
   worker-2: failed (phase: scan, reason: Could not read the SSH host key of worker-2.)
   Registered and verified in the Panel: 1 of 2.
-The Panel and the verified nodes stay as they are. Retry the failed ones by running the installation again, or add one from the menu (option 3).
+The Panel and the verified nodes stay as they are. Retry a failed node from the list below, or add one from the menu (option 3).
 
 === Retry Diagnostics for worker-2 ===
 No recovery journal found at /opt/gowave/recovery/journal.json

@@ -17,6 +17,9 @@ source "$_wizard_dir/preflight.sh"
 # SSH bootstrap for unauthenticated reachability check
 # shellcheck source=modules/ssh_bootstrap.sh
 source "$_wizard_dir/ssh_bootstrap.sh"
+# The exit country asked of a traffic node after it serves.
+# shellcheck source=modules/geoip.sh
+source "$_wizard_dir/geoip.sh"
 
 GOWAVE_PLAN_VARIANT=""
 GOWAVE_PLAN_SHARED_DOMAIN="no"
@@ -722,6 +725,10 @@ wizard_plan_summary() {
         printf '%s\n' "$(tf wizard.plan.host "$(_wizard_plan_role_label "node $((i + 1))" "${GOWAVE_PLAN_NODE_LABELS[$i]:-}")" "${GOWAVE_PLAN_NODE_NAMES[$i]}" "${GOWAVE_PLAN_NODE_CAMOUFLAGE[$i]}" "${vision:-none}")"
     done
     printf '%s\n' "$(tf wizard.plan.certificates "$(wizard_plan_certificate_count)")"
+    # The exit country is a fact about a node's own outbound route, and that
+    # route only exists once the node does. Review therefore marks it as still to
+    # come instead of opening SSH to a server the operator has not agreed to yet.
+    printf '%s\n' "$(t wizard.plan.country_pending)"
     if [[ "$GOWAVE_PLAN_SHARED_DOMAIN" == "yes" ]]; then
         printf '%s\n' "$(t wizard.plan.shared)"
     else
@@ -1260,6 +1267,21 @@ wizard_missing_terminal() {
         printf '%s\n' "$GOWAVE_INSTALL_USAGE" >&2
     fi
     return 2
+}
+
+# The exit country of this server, asked once its node is serving.
+#
+# The request is made here, not on the Panel's behalf: it leaves through the same
+# outbound route the traffic does, which for the local node is this host. Nothing
+# is asked when no wizard is running, so a positional install neither prompts the
+# operator nor contacts a lookup service for them.
+#
+# Args: node label. Prints the confirmed code, or nothing.
+wizard_local_exit_country() {
+    local label="$1" suggestion=""
+    country_asking || return 0
+    suggestion=$(country_lookup_here)
+    country_confirm "$label" "$suggestion"
 }
 
 # One worker at a time: the Panel host holds the mutation lock and the

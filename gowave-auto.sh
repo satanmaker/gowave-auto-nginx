@@ -257,6 +257,10 @@ cmd_install() {
         wizard_check_ssh_reachable || return $?
         wizard_apply_plan || return $?
         install_mode="$GOWAVE_INSTALL_MODE"
+        # Only this branch asks a traffic node where it exits. The lookup is a
+        # request to a third party that sees the node's address, so a positional
+        # install — which has nobody to confirm the answer — makes none.
+        GOWAVE_COUNTRY_ASK="yes"
     else
         if [[ $# -eq 0 ]]; then
             wizard_missing_terminal || return $?
@@ -553,11 +557,15 @@ cmd_install() {
 
     # Step 7: Local Node Installation (the traffic plane is absent in Panel-only)
     CURRENT_STEP="install: local node"
+    local local_country=""
     if [[ "$install_mode" == "all-in-one" ]]; then
         local secret_key
         secret_key=$(extract_secret_key "$GOWAVE_DIR")
         install_local_node "$secret_key" 3002
         verify_node_mtls_health "$secret_key" 3002
+        # Asked only once this node serves: the answer is about the route its
+        # traffic leaves from, and a node that never came up has no such route.
+        local_country=$(wizard_local_exit_country "$local_node_name") || local_country=""
         configure_ufw false "" 3002
     else
         configure_ufw false ""
@@ -590,6 +598,7 @@ cmd_install() {
         GOWAVE_REALITY_FINGERPRINT="${GOWAVE_REALITY_FINGERPRINT:-}" \
         GOWAVE_VISION_CERT_DIR="${vision_live}" \
         GOWAVE_LOCAL_NODE_NAME="$local_node_name" \
+        GOWAVE_LOCAL_COUNTRY="$local_country" \
         python3 - \
         "$SCRIPT_DIR" "$panel_domain" "$reality_domain" "$admin_user" \
         "$JOURNAL_FILE" "$STATE_FILE" "$CREDENTIALS_FILE" "$vision_domain" "$install_mode" 3<<< "$admin_pass" <<'PY'
@@ -609,7 +618,7 @@ local_node_name = (os.environ.get("GOWAVE_LOCAL_NODE_NAME") or "").strip() or "l
 admin_password = os.fdopen(3, "r", encoding="utf-8").read().rstrip("\n")
 
 sys.path.insert(0, script_dir)
-from modules.api_client import GoWaveClient, atomic_write_state, save_credentials
+from modules.api_client import GoWaveClient, atomic_write_state, confirmed_country, save_credentials
 from modules.recovery import write_journal_atomically
 
 journal = {
@@ -650,12 +659,27 @@ def stored_credentials(path):
 PROFILE_NAME = f"GoWave MVP Unified Profile - {local_node_name}"
 
 existing_cc = "bbr"
+existing_state = {}
 if os.path.exists(state_path):
     try:
         with open(state_path, encoding="utf-8") as state_file:
-            existing_cc = json.load(state_file).get("congestionControl", "bbr")
+            existing_state = json.load(state_file)
     except Exception:
-        pass
+        existing_state = {}
+if not isinstance(existing_state, dict):
+    existing_state = {}
+existing_cc = existing_state.get("congestionControl", "bbr")
+
+# The exit country the operator confirmed for this server. A run that asked
+# nothing keeps the answer an earlier run stored, so a positional rerun cannot
+# erase a label the operator already confirmed.
+previous_local_country = ""
+for known in existing_state.get("nodes") or []:
+    if isinstance(known, dict) and known.get("name") == local_node_name:
+        previous_local_country = str(known.get("country") or "")
+local_country = confirmed_country(
+    os.environ.get("GOWAVE_LOCAL_COUNTRY"), previous_local_country
+)
 
 if mode == "panel-only":
     # Nothing exists that an inbound could reference, so the install stops at
@@ -737,6 +761,15 @@ write_journal_atomically(journal_path, journal)
 save_credentials(admin_user, admin_password, f"https://{panel_domain}",
                  token_info["token"], credentials_path)
 
+local_node_entry = {
+    "name": local_node_name,
+    "address": "127.0.0.1",
+    "port": 3002,
+    "uuid": node_uuid,
+}
+if local_country:
+    local_node_entry["country"] = local_country
+
 state = {
     "schemaVersion": 2,
     "installationMode": "all-in-one",
@@ -748,12 +781,7 @@ state = {
     "profileUuid": profile_uuid,
     "squadUuid": squad_uuid,
     "defaultUserShortUuid": short_uuid,
-    "nodes": [{
-        "name": local_node_name,
-        "address": "127.0.0.1",
-        "port": 3002,
-        "uuid": node_uuid,
-    }],
+    "nodes": [local_node_entry],
 }
 atomic_write_state(state, state_path)
 
@@ -1080,23 +1108,29 @@ if not admin_password:
     raise SystemExit("Panel admin password is missing; refusing node registration.")
 
 sys.path.insert(0, script_dir)
-from modules.api_client import GoWaveClient, GoWaveNodeNameTaken, atomic_write_state
+from modules.api_client import GoWaveClient, GoWaveNodeNameTaken, atomic_write_state, confirmed_country
 from modules.recovery import write_journal_atomically
 
 state_data = json.loads(open(state_path, encoding="utf-8").read())
 nodes = state_data.get("nodes", [])
 if not isinstance(nodes, list):
     raise SystemExit("state.json nodes must be an array.")
+# The country this node's entry already holds. A registration that asked nobody
+# — a positional `node add`, a retry with no terminal — keeps that answer rather
+# than dropping the operator's confirmed label from the managed identity.
+previous_country = ""
 for known in nodes:
     if not isinstance(known, dict) or known.get("name") != name:
         continue
     # The same node answering again: the retry keeps its uuid and its address.
     if str(known.get("address") or "") == address:
+        previous_country = str(known.get("country") or "")
         break
     raise SystemExit(
         f"state.json already registers the name {name} for the node at "
         f"{known.get('address')}; choose another name or remove that entry first."
     )
+node_country = confirmed_country(os.environ.get("GOWAVE_NODE_COUNTRY"), previous_country)
 
 client = GoWaveClient("http://127.0.0.1:3000")
 client.login(admin_user, admin_password)
@@ -1191,6 +1225,8 @@ node_entry = {
 }
 if vision_domain:
     node_entry["visionDomain"] = vision_domain
+if node_country:
+    node_entry["country"] = node_country
 nodes.append(node_entry)
 state_data["nodes"] = nodes
 atomic_write_state(state_data, state_path)
@@ -1763,6 +1799,11 @@ wizard_add_node_to_panel() {
     local panel_domain="" panel_is_local="no" confirm=""
     local detected_rc=0
     local wname="" wip="" wdom="" rdom=""
+
+    # This flow has an operator in front of it, so the Worker is asked where it
+    # exits: the request leaves through the Worker's own outbound route, which is
+    # the route its traffic takes and not the Panel's.
+    local GOWAVE_COUNTRY_ASK="yes"
 
     # Try to detect local Panel. The helper reports "no local Panel" through
     # its status, so a bare assignment would end the menu under errexit.

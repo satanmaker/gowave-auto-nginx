@@ -21,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 GOWAVE_AUTO = REPO_ROOT / "gowave-auto.sh"
 INSTALL_ARGS_SH = REPO_ROOT / "modules" / "install_args.sh"
 NGINX_SH = REPO_ROOT / "modules" / "nginx.sh"
+API_CLIENT = REPO_ROOT / "modules" / "api_client.py"
 sys.path.insert(0, str(REPO_ROOT))
 
 from modules.api_client import GoWaveClient  # noqa: E402
@@ -164,8 +165,18 @@ def _prepare_stub_tree(root):
     modules = root / "modules"
     modules.mkdir()
     (modules / "__init__.py").write_text("", encoding="utf-8")
+    # `confirmed_country` is the shipped helper rather than a stub copy: the
+    # country a node entry keeps across an unasked run is what these tests read,
+    # and a second implementation here could drift from the one that runs.
+    reexport = (
+        "import importlib.util as _importlib_util\n"
+        f"_spec = _importlib_util.spec_from_file_location('_shipped_api_client', {str(API_CLIENT)!r})\n"
+        "_shipped = _importlib_util.module_from_spec(_spec)\n"
+        "_spec.loader.exec_module(_shipped)\n"
+        "confirmed_country = _shipped.confirmed_country\n"
+    )
     (modules / "api_client.py").write_text(
-        "from json import dumps as _dumps\n" + STUB_CLIENT, encoding="utf-8"
+        "from json import dumps as _dumps\n" + reexport + STUB_CLIENT, encoding="utf-8"
     )
     (modules / "recovery.py").write_text(STUB_RECOVERY, encoding="utf-8")
 

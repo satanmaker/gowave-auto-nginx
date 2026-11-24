@@ -225,6 +225,42 @@ Menu option 3 prints its own outcome in the same vocabulary — a node addition 
 one it could not confirm, or one that failed at a named stage — and never a Panel installation
 statement.
 
+## The exit country of a node
+
+Each traffic node is asked once, after it serves, which country its traffic leaves from:
+
+```
+Exit country check: one request from the node itself to https://ipinfo.io/country, which sees the node's address and nothing else.
+Exit country of ams-01: 🇳🇱 Netherlands (NL)
+Press Enter to confirm, or type a two-letter country code:
+```
+
+The request is made by the node, not by the Panel on its behalf: on the local node it leaves through
+this host's own outbound route, and on a Worker it runs over the SSH session the temporary key was
+already authorised for. That is why the two nodes of one deployment can be offered different
+countries even when the Panel is somewhere else entirely. No name, domain, token or password is sent;
+the service necessarily sees the node's source address, and that disclosure is the sentence printed
+above the question. `GOWAVE_COUNTRY_LOOKUP_URL` moves the request to another service,
+`GOWAVE_COUNTRY_LOOKUP_TIMEOUT` (default 5 seconds) bounds it.
+
+Enter accepts the suggestion. A typed ISO 3166-1 alpha-2 code overrides it, in any case: `de` on a
+node offered `NL` is accepted as `DE` and shown as `🇩🇪 Germany (DE)`. Only assigned codes are
+countries, so `UK`, `EU` or a fragment of prose is refused with `That is not an assigned two-letter
+country code; try again.` and the same question is repeated — the answer is never replaced by a
+guess. The country is a label for the subscription and nothing else: no routing, firewall rule or
+inbound is changed by it.
+
+A lookup that does not answer asks for the code directly (`The country lookup did not answer for
+ams-01. Enter the two-letter code of its exit country: `) instead of ending the installation. The
+confirmed code is stored in the node entry of `state.json` and carried forward by a later run, so an
+install that asks nothing keeps the label the operator already confirmed.
+
+Only the interactive wizard and the add-node menu ask. A positional install — `gowave-auto.sh
+install …`, a scripted run, a CI case — neither prompts nor contacts the service, and a Panel-only
+host asks nothing because it runs no traffic node of its own; its Workers are asked when they are
+onboarded. The plan review names the country as still to come rather than opening SSH to a server
+before the operator starts the deployment.
+
 ## Temporary SSH access for remote nodes
 
 The wizard authorises an Ed25519 key on a Worker only after the operator types the Worker's host-key

@@ -11,6 +11,9 @@ set -Eeuo pipefail
 _ssh_bootstrap_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=modules/i18n.sh
 source "$_ssh_bootstrap_dir/i18n.sh"
+# The exit country asked of the Worker this module authorises access to.
+# shellcheck source=modules/geoip.sh
+source "$_ssh_bootstrap_dir/geoip.sh"
 
 GOWAVE_SSH_TEMP_ROOT=""
 GOWAVE_SSH_KEY=""
@@ -362,6 +365,37 @@ ssh_bootstrap_stop_agent() {
     GOWAVE_SSH_AGENT_SOCK=""
 }
 
+# Ask the Worker where it reaches the internet, and the operator to confirm it.
+#
+# The request runs on the Worker over the session the temporary key was just
+# authorised for, so the address the service sees is the Worker's own outbound
+# address and never the Panel's. The answer is a suggestion: the operator
+# confirms it or types the code this node actually exits from. A lookup that
+# fails asks for the code instead of aborting the onboarding.
+#
+# Args: SSH target, SSH port, node label. Prints the confirmed code, or nothing.
+ssh_bootstrap_country() {
+    local target="$1" port="$2" label="$3"
+    local payload="$GOWAVE_SSH_TEMP_ROOT/country.sh" suggestion="" code=""
+    country_asking || return 0
+    printf 'set -Eeuo pipefail\n' > "$payload"
+    country_lookup_command >> "$payload"
+    suggestion=$(ssh -T \
+        -o BatchMode=yes \
+        -o StrictHostKeyChecking=yes \
+        -o UserKnownHostsFile="$GOWAVE_SSH_KNOWN_HOSTS" \
+        -o ConnectTimeout=15 \
+        -o LogLevel=ERROR \
+        -p "$port" "root@$target" 'bash -s' < "$payload" 2>/dev/null) || suggestion=""
+    suggestion=$(printf '%s\n' "$suggestion" | country_parse)
+    # Onboarding captures a Worker's stderr, so a question written there is asked
+    # where nobody is looking. The terminal the run already bound is where the
+    # operator is, and stdin keeps carrying the answer.
+    code=$(GOWAVE_COUNTRY_PROMPT_OUT="${GOWAVE_SSH_PROMPT_OUT:-/dev/stderr}" \
+        country_confirm "$label" "$suggestion") || code=""
+    printf '%s' "$code"
+}
+
 # Pins the host key the operator just confirmed and the address `node add`
 # checks, so that command finds a pre-pinned entry rather than trusting a
 # fresh one.
@@ -384,7 +418,7 @@ ssh_bootstrap_onboard_one() {
     # key that gets pinned belongs to that address either way.
     local target="${node_ip:-$host}"
     local ip="" scanned="" expected="" password_file="" rc=0
-    local phase=""
+    local phase="" node_country=""
 
     # The terminal is bound before the first stage so every notice below has
     # somewhere the operator is actually looking.
@@ -454,6 +488,16 @@ ssh_bootstrap_onboard_one() {
         return 1
     fi
 
+    # Asked here, between the authorised session and the registration, because
+    # this is the last moment the node is reachable without the Panel holding a
+    # record of it: a country the operator walked away from leaves nothing to
+    # clean up. A run that never entered the wizard asks nothing at all.
+    if country_asking; then
+        _ssh_phase "country"
+        node_country=$(ssh_bootstrap_country "$target" "$port" "${node_name:-$host}") \
+            || node_country=""
+    fi
+
     _ssh_phase "add_node"
     # The identity `node add` is about to register, so the caller reads this
     # node back by exactly the name, address and port the Panel was told. A
@@ -465,7 +509,8 @@ ssh_bootstrap_onboard_one() {
     if [[ -n "$vision" ]]; then
         add_args=(add --vision-domain "$vision" "${node_name:-$host}" "$ip" "$host" "$camouflage")
     fi
-    SSH_KNOWN_HOSTS="$GOWAVE_SSH_KNOWN_HOSTS" cmd_node "${add_args[@]}" || rc=1
+    GOWAVE_NODE_COUNTRY="$node_country" \
+        SSH_KNOWN_HOSTS="$GOWAVE_SSH_KNOWN_HOSTS" cmd_node "${add_args[@]}" || rc=1
 
     _ssh_phase "revoke"
     ssh_bootstrap_revoke "$target" "$port" "$password_file" || rc=1

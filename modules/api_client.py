@@ -6,6 +6,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import ssl
 import stat
@@ -922,6 +923,24 @@ class GoWaveClient:
             if e.status_code == 404:
                 return None
             raise
+
+
+def confirmed_country(value, previous=""):
+    """The exit country to store for a node entry.
+
+    The value is a code the operator confirmed in the wizard, where the set of
+    assigned ISO 3166-1 alpha-2 codes lives. This function is the second reader,
+    not a second catalog: it accepts the shape and keeps whatever the entry
+    already held, so a run that was never asked cannot erase the label of a node
+    whose country the operator has already confirmed.
+    """
+    code = str(value or "").strip().upper()
+    if re.fullmatch(r"[A-Z]{2}", code):
+        return code
+    kept = str(previous or "").strip().upper()
+    if re.fullmatch(r"[A-Z]{2}", kept):
+        return kept
+    return ""
 
 
 def atomic_write_state(state_data, state_path="/var/lib/gowave-auto-nginx/state.json"):
