@@ -1307,7 +1307,7 @@ wizard_onboard_nodes() {
     # Offer the retry only for the partial case: with every node failed there is
     # nothing a per-node retry can add over running the installation again.
     if (( any_succeeded > 0 && any_failed > 0 )); then
-        _offer_selective_retry node_results "$panel_address" "$panel_is_local"
+        _offer_selective_retry node_results "$panel_address" "$panel_is_local" "$panel_display"
     fi
 
     if (( any_succeeded == 0 )); then
@@ -1512,11 +1512,17 @@ _store_node_results() {
     chmod 600 "$state_file"
 }
 
-# Retry a single failed node.
-# Args: host, panel address, panel is local
+# Retry a single failed node and put its new record back in the result list.
+#
+# Only the chosen node is onboarded again: the sibling's record, the Panel step
+# and everything the first pass completed are left where they are, and the row
+# that is replaced is this node's own.
+#
+# Args: results array, host, panel address, panel is local
 _retry_single_node() {
-    local host="$1" panel_address="${2:-127.0.0.1}" panel_is_local="${3:-yes}"
-    local i state record
+    local -n retry_results="$1"
+    local host="$2" panel_address="${3:-127.0.0.1}" panel_is_local="${4:-yes}"
+    local i j state record
     for i in "${!GOWAVE_PLAN_NODE_NAMES[@]}"; do
         if [[ "${GOWAVE_PLAN_NODE_NAMES[$i]}" == "$host" ]]; then
             record=""
@@ -1525,6 +1531,11 @@ _retry_single_node() {
                 "$panel_address" "$panel_is_local" || true
             state=""
             IFS=$'\t' read -r _ state _ _ <<< "$record"
+            for j in "${!retry_results[@]}"; do
+                if [[ "${retry_results[$j]%%$'\t'*}" == "$host" ]]; then
+                    retry_results[$j]="$record"
+                fi
+            done
             case "$state" in
                 VERIFIED | UNVERIFIED)
                     printf '%s\n' "$(tf wizard.retry.succeeded "$host")"
@@ -1543,12 +1554,20 @@ _retry_single_node() {
 
 # Read-only retry diagnostics for a failed node.
 # Reads the recovery journal through modules/recovery.py and checks VPS reachability.
+#
+# Returns 0 when the node's partial state answered at least one of the two
+# independent records — a journal it is named in, or an SSH server that answers —
+# and 1 when neither did. A retry is a mutation of a host whose state is then
+# unknown: it may be half-provisioned from the failed attempt, and rerunning the
+# onboarding over that is the one thing this check exists to avoid.
+#
 # Args: host
 _retry_diagnostics() {
     local host="$1"
     local journal_file="${GOWAVE_JOURNAL_FILE:-/opt/gowave/recovery/journal.json}"
     local state_file="${GOWAVE_STATE_FILE:-/opt/gowave/state.json}"
     local credentials_file="${GOWAVE_CREDENTIALS_FILE:-/root/gowave-credentials.txt}"
+    local journal_read=0 ssh_answered=0
 
     printf '\n%s\n' "$(tf wizard.diagnostics.header "$host")"
 
@@ -1581,6 +1600,7 @@ except Exception as e:
             if [[ -n "$error" ]]; then
                 printf '%s\n' "$(tf wizard.diagnostics.journal_error "$error")"
             else
+                journal_read=1
                 printf '%s\n' "$(tf wizard.diagnostics.journal_state "$op" "$state")"
                 if [[ -n "$node_state" ]]; then
                     printf '%s\n' "$(tf wizard.diagnostics.node_state "$node_state")"
@@ -1601,6 +1621,7 @@ except Exception as e:
         local fingerprint
         fingerprint=$(printf '%s\n' "$scanned" | ssh_bootstrap_fingerprint)
         if [[ -n "$fingerprint" ]]; then
+            ssh_answered=1
             printf '%s\n' "$(tf wizard.diagnostics.ssh_ok "$host" "$fingerprint")"
         else
             printf '%s\n' "$(t wizard.diagnostics.ssh_banner)"
@@ -1618,15 +1639,32 @@ except Exception as e:
     fi
 
     printf '%s\n' "$(t wizard.diagnostics.footer)"
+    (( journal_read == 1 || ssh_answered == 1 ))
 }
 
 # Offer selective retry of failed nodes.
-# Args: array_name (reference to array of results), panel address, panel is local
+#
+# The list is the failure record, so every failed node is offered; the choice is
+# where the run is refused. A node neither record answered for cannot be retried
+# safely, and a retry that the operator has not confirmed does not start. The
+# other results are read, not rewritten: the sibling's row and the Panel stay as
+# the first pass left them, and only the retried node's row is replaced. The menu
+# is printed again after each attempt so the numbers below a reprinted summary
+# still name the nodes that are still failed.
+#
+# Args: array_name (reference to array of results), panel address, panel is
+# local, panel display
 _offer_selective_retry() {
     local -n results="$1"
-    local panel_address="${2:-127.0.0.1}" panel_is_local="${3:-yes}"
+    local panel_address="${2:-127.0.0.1}" panel_is_local="${3:-yes}" panel_display="${4:-}"
     local -a failed_nodes=()
-    local result host state
+    local -a retryable=()
+    local -a still_retryable=()
+    local result host state i
+    # The helpers take an array by name. Passing them this function's own
+    # nameref name would make their `local -n` a reference to itself, which
+    # reads empty, so the caller's name travels instead.
+    local results_name="$1"
 
     for result in "${results[@]}"; do
         state=""
@@ -1640,30 +1678,70 @@ _offer_selective_retry() {
         return 0
     fi
 
-    # Show diagnostics for each failed node
+    # Show diagnostics for each failed node and keep which ones answered.
     for host in "${failed_nodes[@]}"; do
-        _retry_diagnostics "$host"
+        if _retry_diagnostics "$host"; then
+            retryable+=("$host")
+        fi
     done
 
-    printf '\n%s\n' "$(t wizard.retry.offer)"
-    local i=1
-    for host in "${failed_nodes[@]}"; do
-        printf '  %d) %s\n' "$i" "$host"
-        ((i++))
-    done
-    printf '  %d) %s\n' "$i" "$(t wizard.retry.skip)"
-
-    local choice
+    local choice retry_host confirmed
     while true; do
+        printf '\n%s\n' "$(t wizard.retry.offer)"
+        i=1
+        for host in "${failed_nodes[@]}"; do
+            printf '  %d) %s\n' "$i" "$host"
+            ((i++))
+        done
+        printf '  %d) %s\n' "$i" "$(t wizard.retry.skip)"
         printf '%s' "$(t wizard.retry.prompt)"
         if ! IFS= read -r choice; then
             printf '\n'
             return 1
         fi
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#failed_nodes[@]} )); then
-            local retry_host="${failed_nodes[choice-1]}"
+            retry_host="${failed_nodes[choice-1]}"
+            confirmed=0
+            for host in "${retryable[@]}"; do
+                [[ "$host" == "$retry_host" ]] && confirmed=1
+            done
+            if (( confirmed == 0 )); then
+                printf '%s\n' "$(tf wizard.retry.unverifiable "$retry_host")"
+                continue
+            fi
+            if ! wizard_read_yes_no "$(tf wizard.retry.confirm "$retry_host")" no; then
+                printf '%s\n' "$(tf wizard.retry.declined "$retry_host")"
+                continue
+            fi
             printf '%s\n' "$(tf wizard.retry.retrying "$retry_host")"
-            _retry_single_node "$retry_host" "$panel_address" "$panel_is_local"
+            _retry_single_node "$results_name" "$retry_host" "$panel_address" "$panel_is_local" || true
+            _store_node_results "$results_name"
+            _print_onboarding_summary "$results_name" "$panel_display"
+
+            # The list and the screen would otherwise disagree: the menu is
+            # rebuilt from the records the retry just wrote, so a node that now
+            # verified is no longer offered, and it is printed again under the
+            # summary so the numbers still name the nodes they are asked about.
+            failed_nodes=()
+            for result in "${results[@]}"; do
+                state=""
+                IFS=$'\t' read -r host state _ _ <<< "$result"
+                if [[ "$state" == "FAILED" ]]; then
+                    failed_nodes+=("$host")
+                fi
+            done
+            if (( ${#failed_nodes[@]} == 0 )); then
+                return 0
+            fi
+            still_retryable=()
+            for host in "${retryable[@]}"; do
+                for result in "${failed_nodes[@]}"; do
+                    if [[ "$result" == "$host" ]]; then
+                        still_retryable+=("$host")
+                    fi
+                done
+            done
+            retryable=("${still_retryable[@]}")
         elif (( choice == ${#failed_nodes[@]} + 1 )); then
             printf '%s\n' "$(t wizard.retry.skipped)"
             return 0

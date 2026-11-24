@@ -158,8 +158,8 @@ summary that states what the Panel itself holds:
   ams-01: registered and verified in the Panel (uuid 3d5c9a71-6f24-4b8e-9c07-2a1f5e8d4b63)
   fra-01: failed (phase: scan, reason: Could not read the SSH host key of fra-01.)
   Registered and verified in the Panel: 1 of 2.
-The Panel and the verified nodes stay as they are. Retry the failed ones by running the installation
-again, or add one from the menu (option 3).
+The Panel and the verified nodes stay as they are. The wizard then offers the failed nodes for a
+retry, and one can also be added from the menu (option 3).
 ```
 
 Each node is one of three states:
@@ -192,7 +192,34 @@ node's control plane, and the data path is proved by a client request, which the
 attempt.
 
 After a partial failure the wizard offers a retry that names only the failed nodes; a successful
-sibling is not offered, and choosing the skip entry leaves the completed work alone.
+sibling is not offered, and the Panel step is not repeated:
+
+```
+Some nodes failed. Select a node to retry, or skip:
+  1) fra-01
+  2) Skip retry for all failed nodes
+Choice: 1
+```
+
+Choosing a node prints that node's read-only diagnostics — whether the recovery journal names it,
+whether its SSH server answers, and whether the host already holds a managed install — and then asks
+`Retry onboarding for fra-01 now? [y/N]: `. Nothing is mutated before that `y`. A confirmed retry
+prints `Retrying fra-01...` and reruns the onboarding for that node alone: the Panel step and the
+sibling that succeeded are not touched, and the retried node's row in the summary and in the saved
+results file is the one that is replaced. The reply is `Retry succeeded: fra-01` followed by a
+reprinted summary of the Panel and every node with its state, or `Retry failed: fra-01` with the stage
+and reason of the new attempt. Declining answers `Retry declined, fra-01 was not touched.` and returns
+to the same list. The list is printed again under the summary after every attempt and holds only the
+nodes that still failed, so the numbers always name the node the next answer is about.
+
+A node that neither record answered for is refused before the question is asked: `Refusing to retry
+fra-01: neither its recovery journal nor its SSH server answered, so its state cannot be verified
+from here.` Its failed attempt may have left the host half-provisioned, and rerunning the onboarding
+over that is exactly what the inspection exists to prevent — finish a `node rollback` on it first.
+`Skip retry for all failed nodes` prints `Retry skipped.` and leaves everything as it was.
+
+The retry is offered only after a partial run. When every node failed, there is nothing a per-node
+retry adds over running the installation again.
 
 Menu option 3 prints its own outcome in the same vocabulary — a node addition that the Panel confirmed,
 one it could not confirm, or one that failed at a named stage — and never a Panel installation

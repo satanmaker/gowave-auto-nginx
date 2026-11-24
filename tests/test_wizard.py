@@ -1321,6 +1321,204 @@ class TestInstallCompletionScreen(unittest.TestCase):
         self.assertIn("multi-node | panel-only", body[guard:body.index("wizard_panel_installed_notice")])
 
 
+class TestSelectiveRetry(unittest.TestCase):
+    """The failed-node retry: inspected, confirmed, and alone in what it reruns.
+
+    The retry is the only place after a partial run that mutates a host, so the
+    three promises are read here: the list is the failed nodes only, a node no
+    record answered for is refused rather than rerun, and a confirmed retry
+    replaces that node's row while the sibling's row and the Panel stay as the
+    first pass left them.
+    """
+
+    PANEL_DISPLAY = "https://panel.example.com"
+
+    def offer(self, stdin, retryable=("worker-bad",), record="VERIFIED", inspect=True,
+              extra_failed=False):
+        """Run ``_offer_selective_retry`` over one verified and one failed node.
+
+        The onboarding itself is replaced by a stub that prints the node it was
+        asked for and writes the record the shipped code would write, so the
+        list, the confirmation, the row replacement and the reprinted screen are
+        exercised on the shipped functions. With ``inspect`` the inspection is
+        stubbed too, and ``retryable`` names the hosts whose state answered;
+        without it the shipped ``_retry_diagnostics`` decides against a host with
+        no journal and no SSH server, which is the refusal the caller must obey.
+        ``extra_failed`` adds a third node that failed, so a retry leaves a
+        failure behind to be offered again.
+        """
+        second = {
+            "VERIFIED": "uuid-bad\\t203.0.113.7:3002",
+            "FAILED": "verify\\tmissing",
+        }[record]
+        rows = [
+            "  $'worker-ok\\tVERIFIED\\tuuid-ok\\t203.0.113.7:3002'",
+            "  $'worker-bad\\tFAILED\\tscan\\tCould not read the SSH host key of worker-bad.'",
+        ]
+        names = "'worker-ok' 'worker-bad'"
+        camouflage = "'cam-ok.example' 'cam-bad.example'"
+        vision = "'' ''"
+        labels = "'' ''"
+        if extra_failed:
+            rows.append(
+                "  $'worker-bad2\\tFAILED\\tscan\\tCould not read the SSH host key of worker-bad2.'")
+            names += " 'worker-bad2'"
+            camouflage += " 'cam-bad2.example'"
+            vision += " ''"
+            labels += " ''"
+        if inspect:
+            cases = "\n".join(f"    {shlex.quote(host)}) return 0 ;;" for host in retryable)
+            inspection = (
+                "_retry_diagnostics() {\n"
+                "  case \"$1\" in\n"
+                f"{cases}\n"
+                "  esac\n"
+                "  return 1\n"
+                "}\n"
+            )
+        else:
+            inspection = (
+                "GOWAVE_JOURNAL_FILE=\"$GOWAVE_STATE_DIR/journal.json\"\n"
+                "GOWAVE_SSH_PORT=1\n"
+                "ssh_bootstrap_scan() { return 1; }\n"
+                "ssh() { return 1; }\n"
+            )
+        script = (
+            f"source {shlex.quote(str(I18N_SH))}\n"
+            + SOURCE_WIZARD
+            + "GOWAVE_STATE_DIR=$(mktemp -d)\n"
+            f"GOWAVE_PLAN_NODE_NAMES=({names})\n"
+            f"GOWAVE_PLAN_NODE_CAMOUFLAGE=({camouflage})\n"
+            f"GOWAVE_PLAN_NODE_VISION=({vision})\n"
+            f"GOWAVE_PLAN_NODE_LABELS=({labels})\n"
+            + inspection
+            + "_wizard_onboard_record() {\n"
+            "  printf 'RECORD:%s\\n' \"$2\"\n"
+            "  local -n out=\"$1\"\n"
+            f"  out=$(printf '%s\\t{record}\\t{second}' \"$2\")\n"
+            "  return 0\n"
+            "}\n"
+            + "node_results=(\n"
+            + "\n".join(rows)
+            + "\n)\n"
+            "set +e\n"
+            f"_offer_selective_retry node_results 127.0.0.1 yes {shlex.quote(self.PANEL_DISPLAY)}\n"
+            "printf 'RC=%d\\n' \"$?\"\n"
+            "printf 'ROWS:\\n%s\\n' \"$(printf '%s\\n' \"${node_results[@]}\" | tr '\\t' '|')\"\n"
+            "printf 'STORED:\\n%s\\n' \"$(tr '\\t' '|' < \"$GOWAVE_STATE_DIR/wizard_node_results\")\"\n"
+        )
+        return bash(script, stdin=stdin)
+
+    def test_only_the_failed_node_is_offered_and_skipping_touches_nothing(self):
+        result = self.offer("2\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        offer = result.stdout.split(
+            "Some nodes failed. Select a node to retry, or skip:", 1)[1].split("Choice: ", 1)[0]
+        self.assertIn("  1) worker-bad", offer)
+        self.assertNotIn("worker-ok", offer, "the offer named a node that already succeeded")
+        self.assertIn("Retry skipped.", result.stdout)
+        self.assertNotIn("RECORD:", result.stdout, "skipping reran an onboarding")
+
+    def test_a_retry_is_confirmed_before_it_reruns(self):
+        result = self.offer("1\nn\n2\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Retry onboarding for worker-bad now? [y/N]: ", result.stderr)
+        self.assertIn("Retry declined, worker-bad was not touched.", result.stdout)
+        self.assertNotIn("RECORD:", result.stdout, "a declined retry still ran the onboarding")
+        self.assertIn("Retry skipped.", result.stdout)
+
+    def test_a_confirmed_retry_reruns_only_that_node_and_reports_its_new_state(self):
+        result = self.offer("1\ny\n2\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("RECORD:worker-bad"), 1,
+                         f"the failed node was not onboarded exactly once:\n{result.stdout}")
+        self.assertNotIn("RECORD:worker-ok", result.stdout,
+                         "the sibling that succeeded was onboarded again")
+        self.assertIn("Retry succeeded: worker-bad", result.stdout)
+        rewritten = result.stdout.split("Retry succeeded: worker-bad", 1)[1]
+        self.assertIn(
+            "worker-bad: registered and verified in the Panel (uuid uuid-bad)", rewritten,
+            "the final screen did not carry the retried node's new verdict",
+        )
+        self.assertIn("Registered and verified in the Panel: 2 of 2.", rewritten)
+        self.assertIn(f"Panel installed: {self.PANEL_DISPLAY}", rewritten,
+                      "the reprinted screen dropped the Panel line")
+        stored = result.stdout.split("STORED:\n", 1)[1]
+        self.assertIn("worker-ok|VERIFIED|uuid-ok|203.0.113.7:3002", stored)
+        self.assertIn("worker-bad|VERIFIED|uuid-bad|203.0.113.7:3002", stored)
+
+    def test_the_menu_after_a_retry_names_only_the_nodes_still_failed(self):
+        # Two nodes failed; the first retry verifies one. The reprint is the
+        # final screen of that attempt, so it has to state the Panel, the count
+        # and a menu whose numbers still name the node it is about to ask about.
+        result = self.offer("1\ny\n2\n", retryable=("worker-bad", "worker-bad2"),
+                            extra_failed=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("RECORD:worker-bad2", result.stdout,
+                         "the node that was not chosen was onboarded")
+        after = result.stdout.split("Retry succeeded: worker-bad", 1)[1]
+        summary, _, menu = after.partition(
+            "Some nodes failed. Select a node to retry, or skip:")
+        self.assertIn(f"Panel installed: {self.PANEL_DISPLAY}", summary)
+        self.assertIn("Registered and verified in the Panel: 2 of 3.", summary)
+        self.assertIn("worker-bad2: failed (phase: scan", summary)
+        self.assertNotIn("worker-bad)", menu, "the menu re-offered a node that just verified")
+        self.assertIn("  1) worker-bad2", menu)
+        self.assertIn("  2) Skip retry for all failed nodes", menu)
+        self.assertIn("Retry skipped.", result.stdout)
+        stored = result.stdout.split("STORED:\n", 1)[1]
+        self.assertIn("worker-ok|VERIFIED|uuid-ok|203.0.113.7:3002", stored)
+        self.assertIn("worker-bad|VERIFIED|uuid-bad|203.0.113.7:3002", stored)
+        self.assertIn("worker-bad2|FAILED|scan|", stored)
+
+    def test_a_retry_that_fails_again_keeps_its_row_failed(self):
+        result = self.offer("1\ny\n2\n", record="FAILED")
+        self.assertIn("Retry failed: worker-bad", result.stderr)
+        self.assertIn("Registered and verified in the Panel: 1 of 2.", result.stdout)
+        stored = result.stdout.split("STORED:\n", 1)[1]
+        self.assertIn("worker-ok|VERIFIED|uuid-ok|203.0.113.7:3002", stored)
+        self.assertIn("worker-bad|FAILED|verify|missing", stored)
+
+    def test_a_node_no_record_answered_for_is_refused_without_rerunning(self):
+        result = self.offer("1\n2\n", inspect=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Refusing to retry worker-bad:", result.stdout)
+        self.assertIn("neither its recovery journal nor its SSH server answered", result.stdout)
+        self.assertNotIn("RECORD:", result.stdout, "an unverifiable node was onboarded anyway")
+        self.assertIn("Retry skipped.", result.stdout)
+
+    def test_the_inspection_answers_retryable_only_when_a_record_answered(self):
+        # Neither record: no journal on this host and no SSH server to ask.
+        unreachable = bash(
+            f"source {shlex.quote(str(I18N_SH))}\n"
+            + SOURCE_WIZARD
+            + "GOWAVE_JOURNAL_FILE=/nonexistent/journal.json\n"
+            "GOWAVE_SSH_PORT=1\n"
+            "ssh_bootstrap_scan() { return 1; }\n"
+            "ssh_bootstrap_fingerprint() { printf 'SHA256:deadbeef'; }\n"
+            "ssh() { return 1; }\n"
+            "set +e\n"
+            "_retry_diagnostics worker-bad >/dev/null\n"
+            "printf 'RC=%d\\n' \"$?\"\n"
+        )
+        self.assertIn("RC=1", unreachable.stdout)
+
+        # The Worker answers, so its state can be read from the host itself.
+        reachable = bash(
+            f"source {shlex.quote(str(I18N_SH))}\n"
+            + SOURCE_WIZARD
+            + "GOWAVE_JOURNAL_FILE=/nonexistent/journal.json\n"
+            "GOWAVE_SSH_PORT=1\n"
+            "ssh_bootstrap_scan() { printf 'worker-bad ssh-ed25519 AAAA'; }\n"
+            "ssh_bootstrap_fingerprint() { printf 'SHA256:deadbeef'; }\n"
+            "ssh() { return 1; }\n"
+            "set +e\n"
+            "_retry_diagnostics worker-bad >/dev/null\n"
+            "printf 'RC=%d\\n' \"$?\"\n"
+        )
+        self.assertIn("RC=0", reachable.stdout)
+
+
 class TestWizardDocumentation(unittest.TestCase):
     """The three domain limits and the two SSH variables are policy, not prose."""
 
@@ -1343,6 +1541,30 @@ class TestWizardDocumentation(unittest.TestCase):
         self.assertEqual(len(fragments), 3, f"the catalog did not answer three lines: {result.stdout!r}")
         for fragment in fragments:
             self.assertIn(fragment, document, f"the operator page does not name {fragment!r}")
+
+    def test_the_operator_document_names_every_retry_action(self):
+        # The retry is the one screen after the summary that still mutates a
+        # host, so the page has to name its actions in the words the wizard
+        # prints. Every sentence is rendered from the catalog for the node the
+        # page's example retries and looked for in the page's own text, with
+        # whitespace and inline-code marks removed so a wrapped line or a
+        # backtick does not count as a different sentence.
+        document = (REPO_ROOT / "docs/SETUP_WIZARD.md").read_text(encoding="utf-8")
+        result = bash(
+            f"source {shlex.quote(str(I18N_SH))}\n"
+            "GOWAVE_WIZARD_LANG=en\n"
+            "for key in wizard.retry.offer wizard.retry.skip wizard.retry.confirm "
+            "wizard.retry.declined wizard.retry.unverifiable wizard.retry.retrying "
+            "wizard.retry.succeeded wizard.retry.failed wizard.retry.skipped; do\n"
+            "  printf '%s\\n' \"$(tf \"$key\" fra-01)\"\n"
+            "done\n"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sentences = [" ".join(line.split()) for line in result.stdout.splitlines() if line]
+        self.assertEqual(len(sentences), 9, f"the catalog did not answer nine lines: {result.stdout!r}")
+        page = " ".join(document.replace("`", "").split())
+        for sentence in sentences:
+            self.assertIn(sentence, page, f"the operator page does not name {sentence!r}")
 
     def test_the_readme_names_the_three_limits_and_both_variables(self):
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8").lower()
