@@ -69,7 +69,43 @@ def reality_fingerprint():
     return value
 
 
-def host_projection(panel_domain, reality_domain, node_name="local-node", vision_domain=None):
+PROFILE_LABELS = {
+    "vless-reality": "VLESS · REALITY · Vision",
+    "vless-vision": "VLESS · TLS · Vision",
+    "vless-xhttp": "VLESS · XHTTP · TLS",
+    "vless-ws": "VLESS · WebSocket · TLS",
+    "trojan-grpc": "Trojan · gRPC · TLS",
+}
+
+
+def country_flag(code):
+    """The regional-indicator pair a two-letter code renders as, or nothing.
+
+    The Panel stores the code the wizard confirmed, where the set of assigned
+    ISO 3166-1 alpha-2 codes lives (`modules/geoip.sh`). This reader only
+    renders, so an entry that is not two letters produces no flag at all rather
+    than a label carrying a broken glyph.
+    """
+    letters = str(code or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", letters):
+        return ""
+    return "".join(chr(0x1F1E6 + ord(letter) - ord("A")) for letter in letters)
+
+
+def host_label(profile_key, node_name, country=""):
+    """The label a client sees for one enabled profile of one node.
+
+    ``🇳🇱 VLESS · REALITY · Vision — ams-01``. A node whose exit country was
+    never confirmed renders without the flag rather than with a guess, and the
+    node name keeps two nodes in one country apart.
+    """
+    flag = country_flag(country)
+    prefix = f"{flag} " if flag else ""
+    return f"{prefix}{PROFILE_LABELS[profile_key]} — {node_name}"
+
+
+def host_projection(panel_domain, reality_domain, node_name="local-node", vision_domain=None,
+                    country=""):
     """The Host record one provisioned inbound is posted with, keyed by profile tag.
 
     ``provision_hosts`` posts exactly this mapping to ``POST /api/hosts``. It is
@@ -77,11 +113,15 @@ def host_projection(panel_domain, reality_domain, node_name="local-node", vision
     compared with the record the install really writes instead of with a second
     hand-maintained copy: the matrix names the address role, SNI role, path,
     ALPN and ``securityLayer`` of every tuple it declares.
+
+    ``remark`` is the only field that is a label: the Panel derives the proxy
+    name in both the Xray JSON and the Mihomo YAML from it, and group references
+    follow that name. Everything else here is what a client dials.
     """
     v_domain = vision_domain or (f"vision.{panel_domain}" if panel_domain else panel_domain)
     return {
         "vless-reality": {
-            "remark": f"VLESS-REALITY-Vision@{node_name}",
+            "remark": host_label("vless-reality", node_name, country),
             "address": panel_domain,
             "port": 443,
             "sni": reality_domain,
@@ -92,7 +132,7 @@ def host_projection(panel_domain, reality_domain, node_name="local-node", vision
             "mihomoX25519": mihomo_x25519_enabled(),
         },
         "vless-vision": {
-            "remark": f"VLESS-Vision-TLS@{node_name}",
+            "remark": host_label("vless-vision", node_name, country),
             "address": v_domain,
             "port": 443,
             "sni": v_domain,
@@ -102,7 +142,7 @@ def host_projection(panel_domain, reality_domain, node_name="local-node", vision
             "fingerprint": "firefox",
         },
         "vless-xhttp": {
-            "remark": f"VLESS-XHTTP-TLS@{node_name}",
+            "remark": host_label("vless-xhttp", node_name, country),
             "address": panel_domain,
             "port": 443,
             "sni": panel_domain,
@@ -112,7 +152,7 @@ def host_projection(panel_domain, reality_domain, node_name="local-node", vision
             "fingerprint": "firefox",
         },
         "vless-ws": {
-            "remark": f"VLESS-WS-TLS@{node_name}",
+            "remark": host_label("vless-ws", node_name, country),
             "address": panel_domain,
             "port": 443,
             "sni": panel_domain,
@@ -122,7 +162,7 @@ def host_projection(panel_domain, reality_domain, node_name="local-node", vision
             "fingerprint": "firefox",
         },
         "trojan-grpc": {
-            "remark": f"Trojan-gRPC-TLS@{node_name}",
+            "remark": host_label("trojan-grpc", node_name, country),
             "address": panel_domain,
             "port": 443,
             "sni": panel_domain,
@@ -723,8 +763,8 @@ class GoWaveClient:
 
         return squad_uuid
 
-    def provision_hosts(self, profile_uuid, inbounds_list, node_uuid, squad_uuid, panel_domain, reality_domain, node_name="local-node", vision_domain=None, known_host_uuids=None):
-        proto_map = host_projection(panel_domain, reality_domain, node_name, vision_domain)
+    def provision_hosts(self, profile_uuid, inbounds_list, node_uuid, squad_uuid, panel_domain, reality_domain, node_name="local-node", vision_domain=None, known_host_uuids=None, country=""):
+        proto_map = host_projection(panel_domain, reality_domain, node_name, vision_domain, country)
 
         # Every Host the Panel holds is considered, because the remark is a label
         # and not an identity: it carries the country flag and the node name the

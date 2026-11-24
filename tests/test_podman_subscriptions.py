@@ -129,6 +129,17 @@ TROJAN_OUTBOUND = {
 }
 
 
+# What a client sees for the four inbounds below: the Host remark is the proxy
+# name in both representations, and a proxy group repeats it. No country is
+# confirmed in a Podman install, so these are the flagless forms.
+SERVED_LABELS = {
+    "reality": "VLESS · REALITY · Vision — local-node",
+    "xhttp": "VLESS · XHTTP · TLS — local-node",
+    "ws": "VLESS · WebSocket · TLS — local-node",
+    "trojan": "Trojan · gRPC · TLS — local-node",
+}
+
+
 def profile(outbound):
     """One served profile: a complete config with the Panel's own outbound first."""
     return {
@@ -141,7 +152,7 @@ def profile(outbound):
             {"tag": "direct", "protocol": "freedom"},
             {"tag": "block", "protocol": "blackhole"},
         ],
-        "remarks": outbound["tag"],
+        "remarks": SERVED_LABELS[outbound["tag"]],
     }
 
 
@@ -154,7 +165,7 @@ dns:
   nameserver:
     - 1.1.1.1
 proxies:
-  - name: REALITY
+  - name: "VLESS · REALITY · Vision — local-node"
     type: vless
     server: panel.testbed.internal
     network: tcp
@@ -164,7 +175,7 @@ proxies:
       public-key: Cb8_gedNWrtQ3bHsW8WBb1NugpsXIw-Tu-mu_Eyevjg
       short-id: 654854cb2af21ceb
     client-fingerprint: firefox
-  - name: XHTTP
+  - name: "VLESS · XHTTP · TLS — local-node"
     type: vless
     server: panel.testbed.internal
     network: xhttp
@@ -175,7 +186,7 @@ proxies:
     xhttp-opts:
       path: /xhttp-down/
       mode: stream-up
-  - name: WS
+  - name: "VLESS · WebSocket · TLS — local-node"
     type: vless
     server: panel.testbed.internal
     network: ws
@@ -185,7 +196,7 @@ proxies:
     ws-opts:
       path: /ws
       headers: {}
-  - name: TROJAN
+  - name: "Trojan · gRPC · TLS — local-node"
     type: trojan
     server: panel.testbed.internal
     alpn:
@@ -196,10 +207,10 @@ proxy-groups:
   - name: GoWave
     type: select
     proxies:
-      - REALITY
-      - XHTTP
-      - WS
-      - TROJAN
+      - "VLESS · REALITY · Vision — local-node"
+      - "VLESS · XHTTP · TLS — local-node"
+      - "VLESS · WebSocket · TLS — local-node"
+      - "Trojan · gRPC · TLS — local-node"
 rules:
   - MATCH,GoWave
 """
@@ -267,16 +278,16 @@ def served_facts(overrides=None):
         "hosts": {
             "status": 200,
             "records": [
-                {"remark": "VLESS-REALITY-Vision@local-node", "address": "panel.testbed.internal",
+                {"remark": "VLESS · REALITY · Vision — local-node", "address": "panel.testbed.internal",
                  "port": "443", "sni": "reality.testbed.internal", "path": "",
                  "security_layer": "DEFAULT", "alpn": "h2,http/1.1", "disabled": False},
-                {"remark": "VLESS-XHTTP-TLS@local-node", "address": "panel.testbed.internal",
+                {"remark": "VLESS · XHTTP · TLS — local-node", "address": "panel.testbed.internal",
                  "port": "443", "sni": "panel.testbed.internal", "path": "/xhttp",
                  "security_layer": "TLS", "alpn": "h2,http/1.1", "disabled": False},
-                {"remark": "VLESS-WS-TLS@local-node", "address": "panel.testbed.internal",
+                {"remark": "VLESS · WebSocket · TLS — local-node", "address": "panel.testbed.internal",
                  "port": "443", "sni": "panel.testbed.internal", "path": "/ws",
                  "security_layer": "TLS", "alpn": "http/1.1", "disabled": False},
-                {"remark": "Trojan-gRPC-TLS@local-node", "address": "panel.testbed.internal",
+                {"remark": "Trojan · gRPC · TLS — local-node", "address": "panel.testbed.internal",
                  "port": "443", "sni": "panel.testbed.internal", "path": "grpc",
                  "security_layer": "TLS", "alpn": "h2", "disabled": False},
             ],
@@ -341,17 +352,18 @@ def engine_representations(overrides=None):
         "mihomo": {"proxies": 4, "proxy_types": ["trojan", "vless"], "groups": 1, "rules": 1,
                    "match_rule": True, "exit": 0,
                    "rule_names": ["MATCH"], "duplicate_names": 0,
+                   "group_members": 4, "missing_group_references": [],
                    "client_fingerprints": ["firefox"], "private_keys": 0,
                    "proxy_details": [
-                       {"name": "REALITY", "type": "vless", "server": "panel.testbed.internal",
-                        "network": "tcp", "tls": "true",
+                       {"name": "VLESS · REALITY · Vision — local-node", "type": "vless",
+                        "server": "panel.testbed.internal", "network": "tcp", "tls": "true",
                         "servername": "reality.testbed.internal"},
-                       {"name": "XHTTP", "type": "vless", "server": "panel.testbed.internal",
-                        "network": "xhttp", "tls": "true"},
-                       {"name": "WS", "type": "vless", "server": "panel.testbed.internal",
-                        "network": "ws", "tls": "true"},
-                       {"name": "TROJAN", "type": "trojan", "server": "panel.testbed.internal",
-                        "network": "tcp", "tls": "true"},
+                       {"name": "VLESS · XHTTP · TLS — local-node", "type": "vless",
+                        "server": "panel.testbed.internal", "network": "xhttp", "tls": "true"},
+                       {"name": "VLESS · WebSocket · TLS — local-node", "type": "vless",
+                        "server": "panel.testbed.internal", "network": "ws", "tls": "true"},
+                       {"name": "Trojan · gRPC · TLS — local-node", "type": "trojan",
+                        "server": "panel.testbed.internal", "network": "tcp", "tls": "true"},
                    ]},
         "clash": {"proxies": 1, "proxy_types": ["trojan"], "groups": 1, "rules": 1,
                   "match_rule": True, "exit": 0,
@@ -482,16 +494,16 @@ class StubPanel:
         # is derived from, and the one the subscription has to agree with. The
         # four records are the install's own projection for the four inbounds.
         self.hosts = [
-            {"remark": "VLESS-REALITY-Vision@local-node", "address": "panel.testbed.internal",
+            {"remark": "VLESS · REALITY · Vision — local-node", "address": "panel.testbed.internal",
              "port": 443, "sni": "reality.testbed.internal", "path": None,
              "securityLayer": "DEFAULT", "alpn": "h2,http/1.1", "isDisabled": False},
-            {"remark": "VLESS-XHTTP-TLS@local-node", "address": "panel.testbed.internal",
+            {"remark": "VLESS · XHTTP · TLS — local-node", "address": "panel.testbed.internal",
              "port": 443, "sni": "panel.testbed.internal", "path": "/xhttp",
              "securityLayer": "TLS", "alpn": "h2,http/1.1", "isDisabled": False},
-            {"remark": "VLESS-WS-TLS@local-node", "address": "panel.testbed.internal",
+            {"remark": "VLESS · WebSocket · TLS — local-node", "address": "panel.testbed.internal",
              "port": 443, "sni": "panel.testbed.internal", "path": "/ws",
              "securityLayer": "TLS", "alpn": "http/1.1", "isDisabled": False},
-            {"remark": "Trojan-gRPC-TLS@local-node", "address": "panel.testbed.internal",
+            {"remark": "Trojan · gRPC · TLS — local-node", "address": "panel.testbed.internal",
              "port": 443, "sni": "panel.testbed.internal", "path": "grpc",
              "securityLayer": "TLS", "alpn": "h2", "isDisabled": False},
         ]
@@ -853,8 +865,8 @@ class TestPanelSubscriptionProbe(unittest.TestCase):
         hosts = facts["subscriptions"]["hosts"]
         self.assertEqual(hosts["status"], 200)
         self.assertEqual([record["remark"] for record in hosts["records"]],
-                         ["VLESS-REALITY-Vision@local-node", "VLESS-XHTTP-TLS@local-node",
-                          "VLESS-WS-TLS@local-node", "Trojan-gRPC-TLS@local-node"])
+                         ["VLESS · REALITY · Vision — local-node", "VLESS · XHTTP · TLS — local-node",
+                          "VLESS · WebSocket · TLS — local-node", "Trojan · gRPC · TLS — local-node"])
         self.assertEqual(hosts["records"][0]["sni"], "reality.testbed.internal")
         self.assertEqual(hosts["records"][0]["path"], "")
         self.assertEqual(hosts["records"][1]["path"], "/xhttp")
@@ -862,6 +874,35 @@ class TestPanelSubscriptionProbe(unittest.TestCase):
         self.assertEqual(hosts["records"][1]["security_layer"], "TLS")
         self.assertIs(hosts["records"][1]["disabled"], False)
         self.assertEqual(hosts["records"][1]["port"], "443")
+
+    def test_the_host_fixture_is_the_projection_the_install_posts(self):
+        """The four literals above are the client's own Host records, not a guess."""
+        from modules.api_client import host_projection
+
+        posted = host_projection("panel.testbed.internal", "reality.testbed.internal", "local-node")
+        keys = ["vless-reality", "vless-xhttp", "vless-ws", "trojan-grpc"]
+        labels = [posted[key]["remark"] for key in keys]
+        self.assertEqual([record["remark"] for record in served_facts()["hosts"]["records"]], labels)
+        self.assertEqual([record["remark"] for record in self.panel.hosts], labels)
+        self.assertEqual([record["address"] for record in self.panel.hosts],
+                         [posted[key]["address"] for key in keys])
+        self.assertEqual([record["port"] for record in self.panel.hosts],
+                         [posted[key]["port"] for key in keys])
+        self.assertEqual([record["sni"] for record in self.panel.hosts],
+                         [posted[key]["sni"] for key in keys])
+        self.assertEqual([record["securityLayer"] for record in self.panel.hosts],
+                         [posted[key]["securityLayer"] for key in keys])
+
+    def test_the_served_bodies_carry_the_same_names_the_hosts_do(self):
+        """A client resolves a group by name, so both representations agree."""
+        facts = subscription_probe.scan_mihomo(MIHOMO_YAML)
+        self.assertEqual(facts["duplicate_names"], 0)
+        self.assertEqual(facts["group_members"], 4)
+        self.assertEqual(facts["missing_group_references"], [])
+        self.assertEqual([entry["name"] for entry in facts["proxy_details"]],
+                         list(SERVED_LABELS.values()))
+        self.assertEqual([entry["remarks"] for entry in json.loads(JSON_BODY)],
+                         list(SERVED_LABELS.values()))
 
     def test_a_host_record_count_is_reported_and_no_value_is(self):
         """The hosts read is a fact, and the token that read it stays out of the output."""
@@ -1264,6 +1305,17 @@ class TestSubscriptionClientProbe(unittest.TestCase):
         self.assertEqual(facts["proxies"], 4)
         self.assertEqual(facts["groups"], 1)
         self.assertEqual(facts["rules"], 1)
+
+    def test_scan_mihomo_reports_a_group_member_no_proxy_defines(self):
+        text = MIHOMO_YAML.replace(
+            '      - "Trojan · gRPC · TLS — local-node"',
+            '      - "Trojan · gRPC · TLS — ams-99"',
+        )
+        facts = subscription_probe.scan_mihomo(text)
+        self.assertEqual(facts["proxies"], 4)
+        self.assertEqual(facts["group_members"], 4)
+        self.assertEqual(facts["missing_group_references"], ["Trojan · gRPC · TLS — ams-99"])
+        self.assertEqual(subscription_probe.scan_mihomo(MIHOMO_YAML)["missing_group_references"], [])
 
     def test_scan_mihomo_does_not_invent_a_match_rule(self):
         text = MIHOMO_YAML.replace("- MATCH,GoWave", "- DOMAIN-SUFFIX,testbed.internal,GoWave")

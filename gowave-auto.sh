@@ -751,7 +751,7 @@ write_journal_atomically(journal_path, journal)
 host_uuids = client.provision_hosts(
     profile_uuid, inbounds, node_uuid, squad_uuid,
     panel_domain, reality_domain, node_name=local_node_name, vision_domain=vision_domain,
-    known_host_uuids=previous_local_hosts,
+    known_host_uuids=previous_local_hosts, country=local_country,
 )
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)
@@ -1227,6 +1227,7 @@ host_uuids = client.provision_hosts(
     worker_domain, reality_domain, name,
     vision_domain=vision_domain or None,
     known_host_uuids=previous_hosts,
+    country=node_country,
 )
 journal["entities"] = client.transaction_entities
 write_journal_atomically(journal_path, journal)

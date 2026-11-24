@@ -100,6 +100,8 @@ class GoWaveClient:
         _log("provision_hosts", squad_uuid)
         if kwargs.get("known_host_uuids"):
             _log("provision_hosts_known", *kwargs["known_host_uuids"])
+        if kwargs.get("country"):
+            _log("provision_hosts_country", kwargs["country"])
         return ["host-stub"]
 
     def provision_user(self, username, squad_uuid, **kwargs):
@@ -352,7 +354,7 @@ class TestInstallSourceContract(unittest.TestCase):
 
 
 class TestInstallProvisioning(unittest.TestCase):
-    def run_install_heredoc(self, mode, vision=""):
+    def run_install_heredoc(self, mode, vision="", env=""):
         body = _heredoc_after(INSTALL_HEREDOC_MARKER)
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -366,7 +368,7 @@ class TestInstallProvisioning(unittest.TestCase):
             credentials = root / "credentials.txt"
             log = root / "calls.jsonl"
             command = (
-                f'CALL_LOG={shlex.quote(str(log))} python3 {shlex.quote(str(script))} '
+                f'CALL_LOG={shlex.quote(str(log))} {env}python3 {shlex.quote(str(script))} '
                 f'{_quote(script_dir, "panel.example.com", "cdn.example.com", "admin", journal, state, credentials, vision, mode)} '
                 f"3<<<'admin-password'"
             )
@@ -414,6 +416,16 @@ class TestInstallProvisioning(unittest.TestCase):
             [],
             "a first install has no recorded Hosts to reconcile",
         )
+
+    def test_the_confirmed_country_reaches_the_host_labels(self):
+        finished, calls, state, _credentials = self.run_install_heredoc(
+            "all-in-one", env="GOWAVE_LOCAL_COUNTRY=NL ",
+        )
+        self.assertEqual(finished.returncode, 0, finished.stderr)
+        labelled = [call for call in calls if call["name"] == "provision_hosts_country"]
+        self.assertEqual(len(labelled), 1, "the Host labels are rendered from the confirmed code")
+        self.assertEqual(labelled[0]["args"], ["'NL'"])
+        self.assertEqual(json.loads(state)["nodes"][0]["country"], "NL")
 
     def test_panel_only_stops_after_admin_token_and_default_user(self):
         finished, calls, state, credentials = self.run_install_heredoc("panel-only")
@@ -517,6 +529,8 @@ class TestNodeSquadProvisioning(unittest.TestCase):
         self.assertEqual(len(json.loads(state)["nodes"]), 1, "a retry updates its record, it does not add one")
         self.assertEqual(entry["hostUuids"], ["host-stub"])
         self.assertEqual(entry["country"], "DE", "a run that asked nothing keeps the confirmed country")
+        self.assertEqual([call["args"] for call in calls if call["name"] == "provision_hosts_country"],
+                         [["'DE'"]], "the relabelled records carry the country the entry already held")
 
     def test_an_already_assigned_user_does_not_stop_the_worker(self):
         # An All-in-One node add finds the user already holding the squad, so the

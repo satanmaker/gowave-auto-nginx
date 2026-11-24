@@ -309,6 +309,7 @@ def scan_mihomo(text: str) -> Dict[str, Any]:
     Mihomo happily loads as the wrong size.
     """
     proxies: List[Dict[str, str]] = []
+    members: List[str] = []
     groups = 0
     rules = 0
     match_rule = False
@@ -333,6 +334,11 @@ def scan_mihomo(text: str) -> Dict[str, Any]:
             if item_prefix is None:
                 item_prefix = prefix
             if prefix != item_prefix:
+                # A group lists the names it selects one level deeper. The Panel
+                # writes no member that is not a proxy, so a member a proxy does
+                # not define is a reference the client cannot resolve.
+                if section == "proxy-groups":
+                    members.append(stripped[2:].strip().strip("'\""))
                 continue
             header = stripped[2:].strip()
             if section == "proxies":
@@ -356,11 +362,14 @@ def scan_mihomo(text: str) -> Dict[str, Any]:
         key, _, value = stripped.partition(":")
         proxies[-1][key.strip()] = value.strip().strip("'\"")
     names = [entry.get("name", "") for entry in proxies if entry.get("name")]
+    missing = sorted({member for member in members if member not in set(names)})
     return {
         "proxies": len(proxies),
         "proxy_types": sorted({entry.get("type", "") for entry in proxies if entry.get("type")}),
         "proxy_details": proxies,
         "duplicate_names": len(names) - len(set(names)),
+        "group_members": len(members),
+        "missing_group_references": missing,
         "client_fingerprints": sorted(
             {entry.get("client-fingerprint", "") for entry in proxies if entry.get("client-fingerprint")}
         ),

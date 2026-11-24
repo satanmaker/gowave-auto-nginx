@@ -268,6 +268,30 @@ kept them, by the profile inbound and node they belong to; a remark on its own p
 Host it cannot claim that way stops the run and names it, and the rollback puts the previous labels
 back, so a refused relabel leaves the Panel as it was.
 
+### What a client sees
+
+The remark of a Host record is the name a subscription shows, so the country and the node name are
+in the client's proxy list: one line per enabled profile, in the same order on every node.
+
+```
+🇳🇱 VLESS · REALITY · Vision — ams-01
+🇳🇱 VLESS · TLS · Vision — ams-01
+🇳🇱 VLESS · XHTTP · TLS — ams-01
+🇳🇱 VLESS · WebSocket · TLS — ams-01
+🇳🇱 Trojan · gRPC · TLS — ams-01
+```
+
+The Vision line is the optional profile: a deployment that was not given a third domain publishes
+the other four, and a node whose country was never confirmed — a positional install, a scripted run
+— carries the same names without a flag rather than with a guessed one. Two nodes that exit through
+one country are told apart by the last part of the line, which is the node's name and nothing else.
+
+Only the label changes with either of them. The address a client dials, the SNI it presents, the
+ALPN it offers, the transport path and the protocol settings are the same records as before, and
+the deployment updates the Host it already owns. The Panel names the proxy in both the Xray JSON and
+the Mihomo YAML from that remark and lists the same names in the proxy group, so a client that had
+selected a proxy may need to reselect it once after the labels change and a refresh.
+
 ## Temporary SSH access for remote nodes
 
 The wizard authorises an Ed25519 key on a Worker only after the operator types the Worker's host-key
