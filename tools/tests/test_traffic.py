@@ -235,7 +235,7 @@ class TestTrafficModule(unittest.TestCase):
     def test_observed_sources_are_parsed_from_the_capture_report(self):
         report = (
             "SUMMARY 12 packets captured\n"
-            "SOURCE 92.62.60.71 9\n"
+            "SOURCE 192.0.2.71 9\n"
             "SOURCE 203.0.113.9 2\n"
             "SOURCE 2001:db8::1 1\n"
         )
@@ -243,7 +243,7 @@ class TestTrafficModule(unittest.TestCase):
             parse_ingress_evidence(report),
             {
                 "captured": 12,
-                "sources": {"92.62.60.71": 9, "203.0.113.9": 2, "2001:db8::1": 1},
+                "sources": {"192.0.2.71": 9, "203.0.113.9": 2, "2001:db8::1": 1},
             },
         )
         self.assertIsNone(parse_ingress_evidence("listening on any\n"))
@@ -281,7 +281,7 @@ class TestTrafficModule(unittest.TestCase):
         )
         worker.run.return_value = MagicMock(
             ok=True,
-            stdout="SUMMARY 6 packets captured\nSOURCE 195.154.10.20 6\n",
+            stdout="SUMMARY 6 packets captured\nSOURCE 192.0.2.20 6\n",
             stderr="",
         )
         evidence = finish_pair_ingress(
@@ -292,17 +292,17 @@ class TestTrafficModule(unittest.TestCase):
         )
         self.assertEqual(evidence["worker_captured"], 6)
         self.assertEqual(evidence["target_packets"], 0)
-        self.assertEqual(evidence["observed_other_sources"], {"195.154.10.20": 6})
+        self.assertEqual(evidence["observed_other_sources"], {"192.0.2.20": 6})
         self.assertEqual(classify_case_status(True, evidence), "INCOMPLETE")
 
     def test_control_ingress_ip_is_taken_from_the_target_ssh_session(self):
         ssh = MagicMock()
         ssh.run.return_value = MagicMock(
             ok=True,
-            stdout="92.62.60.71 51944 203.0.113.5 22\n92.62.60.71 51944 22\n",
+            stdout="192.0.2.71 51944 203.0.113.5 22\n192.0.2.71 51944 22\n",
             stderr="",
         )
-        self.assertEqual(get_control_ingress_ip(ssh), "92.62.60.71")
+        self.assertEqual(get_control_ingress_ip(ssh), "192.0.2.71")
         # A public echo service answers from a different carrier-NAT address than the one
         # that reaches the VPS, so its value must never be requested for the capture filter.
         self.assertNotIn("ipify", ssh.run.call_args.args[0])
@@ -316,9 +316,9 @@ class TestTrafficModule(unittest.TestCase):
 
     def test_attribution_requires_both_targets_to_see_one_control_address(self):
         master, worker = MagicMock(), MagicMock()
-        master.run.return_value = MagicMock(ok=True, stdout="92.62.60.71 5000 22\n", stderr="")
-        worker.run.return_value = MagicMock(ok=True, stdout="92.62.60.71 5001 22\n", stderr="")
-        self.assertEqual(resolve_attribution_source(master, worker), ("92.62.60.71", None))
+        master.run.return_value = MagicMock(ok=True, stdout="192.0.2.71 5000 22\n", stderr="")
+        worker.run.return_value = MagicMock(ok=True, stdout="192.0.2.71 5001 22\n", stderr="")
+        self.assertEqual(resolve_attribution_source(master, worker), ("192.0.2.71", None))
 
         worker.run.return_value = MagicMock(ok=True, stdout="198.51.100.7 5001 22\n", stderr="")
         source, error = resolve_attribution_source(master, worker)
