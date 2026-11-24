@@ -1,0 +1,34 @@
+name: Main Release Guard
+
+# main carries releases only: a pull request into it is accepted from develop and
+# from nowhere else, so the required check below fails for every other head and
+# the merge button stays grey. A fork cannot pass it either — its branch would
+# have to be called develop inside this repository.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  source-guard:
+    name: Only develop may merge into main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Refuse a pull request whose head is not develop
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+        run: |
+          if [ "$HEAD_REF" != "develop" ] || [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+            echo "::error::main takes releases from develop only; this pull request comes from '${HEAD_REPO}:${HEAD_REF}'."
+            exit 1
+          fi
+          echo "release pull request from develop: accepted"
