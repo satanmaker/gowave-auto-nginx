@@ -1432,7 +1432,7 @@ BOOT_SCRIPT = REPO_ROOT / "tests" / "systemd" / "boot.sh"
 TESTBED_SCRIPT = REPO_ROOT / "tests" / "podman_testbed.sh"
 ACCEPTANCE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "podman-acceptance.yml"
 SYSTEMD_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "systemd-acceptance.yml"
-COMPATIBILITY = REPO_ROOT / "openspec" / "changes" / "gowave-auto-nginx" / "COMPATIBILITY_MATRIX.md"
+COMPATIBILITY_NAME = "COMPATIBILITY_MATRIX.md"
 CODENAME_ARM = re.compile(r'^\s*([a-z]+-\d+(?:\.\d+)?)\)\s+OS_CODENAME="([a-z]+)"', re.MULTILINE)
 ARRAY_ENTRY = re.compile(r'^\s*"(docker\.io/library/[^"]+)"', re.MULTILINE)
 NGINX_VERSION = re.compile(r"(\d+\.\d+(?:\.\d+)?)\+?\s*(<|>=)\s*1\.25\.1")
@@ -1443,6 +1443,16 @@ def os_matrix_section() -> str:
     start = text.index(OS_MATRIX_HEADING)
     end = text.find("\n## ", start + 1)
     return text[start:end if end != -1 else len(text)]
+
+
+def compatibility_matrix():
+    """The matrix of the change that owns it, live or archived."""
+    matches = sorted(REPO_ROOT.glob(f"openspec/changes/**/{COMPATIBILITY_NAME}"))
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected exactly one {COMPATIBILITY_NAME} under openspec/changes/, found {matches}"
+        )
+    return matches[0]
 
 
 def os_matrix_rows():
@@ -1577,7 +1587,7 @@ class TestOsMatrixReconciliation(unittest.TestCase):
         self.assertIn(default, self.prose)
 
     def test_the_compatibility_matrix_claim_matches_the_execution(self):
-        text = COMPATIBILITY.read_text(encoding="utf-8")
+        text = compatibility_matrix().read_text(encoding="utf-8")
         self.assertNotIn("PODMAN_TESTBED_PLANNED", text,
                          "the matrix still calls a suite that runs a plan")
         statuses = {}

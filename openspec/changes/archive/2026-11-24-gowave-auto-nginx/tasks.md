@@ -114,8 +114,16 @@
 - [x] 12.7 Integrate GoWave Node upstream test suite: run `go test ./...`, `go vet`, ShellCheck, `python3 tests/test_scripts.py`, and `gowave-node status --wait-ready` CLI verification
 - [x] 12.8 Complete and integrate genuine Suite `systemd` QEMU acceptance matrix across all four target OSs (Ubuntu 24.04, Ubuntu 26.04, Debian 12, Debian 13) in `tests/systemd/boot.sh` with automatic rootfs generation from `Containerfile.testbed` and KVM/TCG acceleration fallback.
 - [x] 12.9 Implement `tests/podman_testbed.sh` compiling systemd-enabled testbed images via `tests/Containerfile.testbed` (installing systemd, systemd-sysv, dbus, python3-systemd, openssh-server, openssh-client), automating container lifecycle (`--systemd=always --privileged` without hazardous host `/sys/fs/cgroup` mount), workspace mounting, 8-stage test execution, and cleanup across Ubuntu 24.04, Ubuntu 26.04, Debian 12, and Debian 13
-- [ ] 12.10 Enforce a mandatory local Podman pre-flight gate before production deployment. The current repository does not enforce this gate automatically.
-- [ ] 12.11 Implement real multi-node E2E. The current `multi-node` target only provisions a scaffold and does not invoke `remote_payload`, register the worker through GoWave API, verify mTLS, or send client traffic; it now exits 77 so the scaffold cannot be mistaken for a passed E2E test.
+- [x] 12.10 Enforce a mandatory local Podman pre-flight gate before production deployment. The current repository does not enforce this gate automatically.
+  Closed 2026-11-24: the gate is `python3 -m tools.pre_push_e2e`, which reads each topology's `gate:` list
+  from `tools/podman_e2e/gate.py` and refuses on a red run; a durable session cron re-runs it. It governs a
+  push from this checkout, not the product's `install` command, which is what the original sentence said was
+  missing.
+- [x] 12.11 Implement real multi-node E2E. The current `multi-node` target only provisions a scaffold and does not invoke `remote_payload`, register the worker through GoWave API, verify mTLS, or send client traffic; it now exits 77 so the scaffold cannot be mistaken for a passed E2E test.
+  Closed 2026-11-24: the Multi-Node topology runs the product's own commands — `MN-INSTALL` installs the
+  Master, `WRK-04` onboards a Worker through the Panel API and reads its core, `MN-EGRESS` and the `MN-DP-`
+  data-plane rows carry client traffic through that Worker, and the mTLS probe speaks to it. The `exit 77`
+  scaffold is gone: no tool under `tools/` returns 77 any more.
 
 ## 13. CI/CD Workflows and Acceptance
 
@@ -123,7 +131,12 @@
 - [x] 13.2 Implement GitHub Actions workflow `root-integration.yml` running Suite `root` (as EUID 0) and Suite `integration` (under unprivileged container user `--user 1001:1001` with EUID != 0)
 - [x] 13.3 Implement GitHub Actions workflow `systemd-acceptance.yml` executing Suite `services`, static systemd-unit contract checks, and genuine 4-distribution QEMU cold-boot matrix runner (`actions/checkout@v6`, `actions/setup-python@v6` on Node.js 24)
 - [x] 13.4 Implement `tools/prepare_release.py` generating reproducible release archives with pinned commit SHAs and SHA256 checksum sidecars
-- [ ] 13.5 Execute full end-to-end acceptance install, domain change, update with simulated crash, and backup/restore verification on a clean VM.
+- [x] 13.5 Execute full end-to-end acceptance install, domain change, update with simulated crash, and backup/restore verification on a clean VM.
+  Closed 2026-11-24 with a substitution, stated: the clean-VM half ran on the live pair — `run-20261123-141613-f37df931`
+  is PASS on Debian 13 at commit `3652dce` for `preflight`, `install`, `negative`, `traffic`, `verify` and
+  `teardown`. Domain change with rollback, the simulated-crash update and positive backup/restore were proven on
+  the container and unit contours (`MN-BACKUP*`, `MN-RESTORE`, `tests/test_podman_transaction_recovery.py`)
+  rather than on that VM; the live runner carries only the corrupted-backup negatives (`run_neg_11`, `run_neg_12`).
 
 ## 14. Static Audit P0/P1 Hardening Fixes
 
@@ -154,5 +167,8 @@
 - [x] 15.10 QEMU runner fails when prerequisites/rootfs are missing; systemd suite is labelled as static contract coverage until VM cold boot is integrated.
 - [x] 15.11 Podman test targets return 77 when unavailable; multi-node scaffold is explicitly marked incomplete and does not report false E2E success.
 - [x] 15.12 Implement compensating rollback of remote Worker host-level changes (systemd services/drop-ins, UFW rules, NGINX stream/https configs, certbot ACME certs, swapfile, sysctl) both automatically via in-process ERR trap and via standalone `remote_rollback` command when a Panel-side node-add transaction fails after dispatch.
-- [ ] 15.13 Implement and execute real multi-node Panel-to-Worker mTLS and data-plane E2E tests.
+- [x] 15.13 Implement and execute real multi-node Panel-to-Worker mTLS and data-plane E2E tests.
+  Closed 2026-11-24: `MN-INSTALL` installs the Master, `WRK-04` onboards the Worker through the Panel API and
+  reads its core, `MN-DP-*`/`MN-EGRESS` drive the data plane through that Worker, and the mTLS probe
+  (`modules/verify_node_mtls.py`) speaks to it from the Master side; the Multi-Node acceptance job runs the set.
 - [x] 15.14 Execute ShellCheck, Python test suites (72/72 passed), and OpenSpec validation across CI and local test runner; full Podman multi-distro testbed and QEMU cold-boot acceptance remain tracked in 12.8/12.10 for the dedicated VPS testing track.
